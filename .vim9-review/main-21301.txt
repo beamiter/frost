@@ -1,0 +1,300 @@
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+
+        let mut list = column![].spacing(2);
+        if filtered.is_empty() {
+            list = list.push(self.popup_text("No tabs match").color(self.c_text_dim()));
+        } else {
+            for &(pos, idx) in filtered.iter() {
+                let selected = pos == state.selected;
+                let Some(tab) = self.tabs.get(idx) else {
+                    continue;
+                };
+                let label = self.tab_label(idx);
+                let id = tab.id;
+                let info = row![
+                    self.popup_text(format!("{:>2}", idx + 1))
+                        .color(self.c_text_dim()),
+                    self.popup_text(label),
+                    Space::new().width(Length::Fill),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center);
+                let accent = self.c_accent();
+                let body = container(info).width(Length::Fill).padding([3, 8]).style(
+                    move |_t: &iced::Theme| container::Style {
+                        background: if selected {
+                            Some(iced::Background::Color(Color { a: 0.28, ..accent }))
+                        } else {
+                            None
+                        },
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                );
+                let row_btn = mouse_area(body).on_press(Message::TabSwitcherJump(id));
+                list = list.push(row_btn);
+            }
+        }
+
+        let body = column![query_line, list].spacing(8);
+        let panel = container(body)
+            .width(Length::Fixed(420.0))
+            .max_height(420.0)
+            .padding(12)
+            .style(self.popup_style());
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::TabSwitcherClose);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
+    /// Ctrl+Shift+S remote host picker overlay. Enter/click opens the entry
+    /// in a new session; a host that fails validation is shown with its
+    /// reason rather than hidden, so a config typo is discovered here and not
+    /// by its absence.
+    fn remote_picker_view(&self, state: &RemotePickerState) -> Element<'_, Message> {
+        let mut list = column![].spacing(2);
+        if state.hosts.is_empty() {
+            list = list.push(
+                self.popup_text(
+                    "No [[remote_hosts]] configured. Add one in Settings (Ctrl+Shift+O, Remote hosts) or in config.toml:\n\n[[remote_hosts]]  # ssh\nname = \"dev\"\nhost = \"dev.example.com\"\nuser = \"yj\"\ndeploy = \"persist\"\nssh_args = [\"-p\", \"22\"]\n\n[[remote_hosts]]  # running container\nname = \"myubuntu\"\nhost = \"myubuntu\"\ndocker = true\ndeploy = \"persist\"",
+                )
+                .color(self.c_text_dim()),
+            );
+        }
+        for (index, host) in state
+            .hosts
+            .iter()
+            .take(config::MAX_REMOTE_HOST_UI_ROWS)
+            .enumerate()
+        {
+            let validation = config::validate_remote_host_at(&state.hosts, index);
+            let transport = if host.docker { "docker" } else { "ssh" };
+            let deploy = if host.deploy.is_empty() {
+                "off"
+            } else {
+                host.deploy.as_str()
+            };
+            let deploy = jterm_core::review_input::safe_inline_display(deploy, 64);
+            let display_name = config::remote_host_display_name(host, index);
+            match validation {
+                Ok(_) => {
+                    let info = row![
+                        self.popup_text(format!("{:>2}", index + 1))
+                            .color(self.c_text_dim()),
+                        self.popup_text(display_name),
+                        Space::new().width(Length::Fill),
+                        self.popup_text(format!("{transport} · deploy {deploy}"))
+                            .color(self.c_text_dim()),
+                    ]
+                    .spacing(10)
+                    .align_y(iced::Alignment::Center);
+                    let accent = self.c_accent();
+                    let highlighted = index == state.selected;
+                    let body = container(info).width(Length::Fill).padding([3, 8]).style(
+                        move |_t: &iced::Theme| container::Style {
+                            background: if highlighted {
+                                Some(iced::Background::Color(Color { a: 0.28, ..accent }))
+                            } else {
+                                None
+                            },
+                            border: iced::Border {
+                                radius: 4.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    );
+                    list = list.push(mouse_area(body).on_press(Message::RemotePickerConnect(
+                        state.identity.clone(),
+                        Box::new(host.clone()),
+                    )));
+                }
+                Err(problem) => {
+                    list = list.push(
+                        row![
+                            self.popup_text(display_name).color(self.c_text_dim()),
+                            Space::new().width(Length::Fill),
+                            self.popup_text(problem).color(self.c_text_dim()),
+                        ]
+                        .spacing(10)
+                        .align_y(iced::Alignment::Center),
+                    );
+                }
+            }
+        }
+        if state.hosts.len() > config::MAX_REMOTE_HOST_UI_ROWS {
+            list = list.push(
+                self.popup_text(format!(
+                    "{} additional drafts remain saved but are omitted from this bounded view.",
+                    state.hosts.len() - config::MAX_REMOTE_HOST_UI_ROWS
+                ))
+                .color(self.c_text_dim()),
+            );
+        }
+        list = list.push(
+            self.popup_text("deploy off connects plainly; persist/incognito bring jsh along.")
+                .color(self.c_text_dim()),
+        );
+
+        let body = column![
+            row![self.popup_text("🖧"), self.popup_text("Remote hosts")]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            list
+        ]
+        .spacing(8);
+        let panel = container(body)
+            .width(Length::Fixed(460.0))
+            .max_height(420.0)
+            .padding(12)
+            .style(self.popup_style());
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::RemotePickerClose);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
+    /// Ctrl+Shift+M workflow overlay (palette-style), the iced mirror of
+    /// anvil's palette workflow tier plus parameter dialog. Accepting a
+    /// workflow types the rendered command into the active pane for review;
+    /// nothing executes.
+    fn workflow_overlay_view(
+        &self,
+        overlay: &workflow_picker::WorkflowOverlay,
+    ) -> Element<'_, Message> {
+        match overlay {
+            workflow_picker::WorkflowOverlay::Picker(state) => self.workflow_picker_view(state),
+            workflow_picker::WorkflowOverlay::Args(form) => self.workflow_args_view(form),
+        }
+    }
+
+    /// The picker's searchable workflow list. Rows show the name, the first
+    /// tags, and the description; the command template stays visible in the
+    /// argument form that follows.
+    fn workflow_picker_view(
+        &self,
+        state: &workflow_picker::WorkflowPickerState,
+    ) -> Element<'_, Message> {
+        let filtered = state.filtered();
+        let snapshot = state.snapshot_identity();
+
+        let query: Element<'_, Message> = text_input("Run a workflow…", state.query())
+            .style(self.popup_input_style())
+            .font(self.mono)
+            .id(WORKFLOW_PICKER_INPUT_ID.clone())
+            .on_input(move |query| Message::WorkflowPickerInput(snapshot, query))
+            .size(self.effective_font_size())
+            .into();
+        let query_line = row![self.popup_text("⚙"), query]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+
+        let mut list = column![].spacing(2);
+        if filtered.is_empty() {
+            let hint = if state.is_empty() {
+                "No workflows found (~/.config/frost/workflows/, FROST_WORKFLOW_DIR, or bundled examples)"
+            } else {
+                "No workflows match"
+            };
+            list = list.push(self.popup_text(hint).color(self.c_text_dim()));
+        } else {
+            for (pos, workflow) in filtered.iter().enumerate() {
+                let selected = pos == state.selected();
+                let mut info = row![self
+                    .popup_text(crate::workflow_picker::bound_workflow_feedback(
+                        &workflow.name
+                    ))
+                    .size(self.effective_font_size())]
+                .spacing(10)
+                .align_y(iced::Alignment::Center);
+                if !workflow.args.is_empty() {
+                    info = info.push(
+                        self.popup_text(format!("{} args", workflow.args.len()))
+                            .color(self.c_text_dim()),
+                    );
+                }
+                info = info.push(Space::new().width(Length::Fill));
+                for tag in workflow.tags.iter().take(3) {
+                    info = info.push(
+                        self.popup_text(crate::workflow_picker::bound_workflow_feedback(tag))
+                            .color(self.c_text_dim()),
+                    );
+                }
+                let mut rows = column![info].spacing(2);
+                if !workflow.description.is_empty() {
+                    rows = rows.push(
+                        self.popup_text(crate::workflow_picker::bound_workflow_feedback(
+                            workflow.description.clone(),
+                        ))
+                        .color(self.c_text_dim()),
+                    );
+                }
+                let accent = self.c_accent();
+                let body = container(rows).width(Length::Fill).padding([3, 8]).style(
+                    move |_t: &iced::Theme| container::Style {
+                        background: if selected {
+                            Some(iced::Background::Color(Color { a: 0.28, ..accent }))
+                        } else {
+                            None
+                        },
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                );
+                let body = if selected {
+                    body.id(workflow_focus::PICKER_SELECTED_ID)
+                } else {
+                    body
+                };
+                let mut row_btn = mouse_area(body);
+                if let Some(choice) = state.choice_for(workflow) {
+                    row_btn = row_btn.on_press(Message::WorkflowPickerAccept(choice));
+                }
+                list = list.push(row_btn);
+            }
+        }
+
+        let panel_size =
+            workflow_panel_size(self.win_size, 64.0 + filtered.len().max(1) as f32 * 72.0);
+        let body = column![
+            query_line,
+            scrollable(list)
+                .id(workflow_focus::PICKER_SCROLL_ID)
+                .spacing(6)
+                .height(Length::Fill)
+        ]
+        .spacing(8);
+        let panel = container(body)
+            .id(workflow_focus::PICKER_ID)
+            .width(Length::Fixed(panel_size.width))
+            .height(Length::Fixed(panel_size.height))
+            .padding(12)
+            .style(self.popup_style());
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::WorkflowPickerClose(state.snapshot_identity()));
+        let centered = container(panel)
+            .center_x(Length::Fill)

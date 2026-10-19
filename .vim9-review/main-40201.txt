@@ -1,0 +1,300 @@
+            &keyboard::Key::Character("t".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::SHIFT,
+            Some("T"),
+            false,
+            KeyboardEnhancements {
+                kitty_flags: 0b11100,
+                report_all_keys: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            alternate_and_text.as_deref(),
+            Some(&b"\x1b[116:84;2;84u"[..])
+        );
+
+        // Ctrl+letter commits a control byte, which is never "associated text".
+        let ctrl_letter = encode_key(
+            &keyboard::Key::Character("t".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::CTRL,
+            Some("\u{14}"),
+            false,
+            KeyboardEnhancements {
+                kitty_flags: 0b11100,
+                report_all_keys: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctrl_letter.as_deref(), Some(&b"\x1b[116;5u"[..]));
+
+        let spoofed_text = encode_key(
+            &keyboard::Key::Character("t".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::SHIFT,
+            Some("T\u{202e}"),
+            false,
+            KeyboardEnhancements {
+                kitty_flags: 0b11100,
+                report_all_keys: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            spoofed_text.as_deref(),
+            Some(&b"\x1b[116:84;2;84u"[..]),
+            "bidi in associated text must not be forwarded"
+        );
+        let only_spoofing = encode_key(
+            &keyboard::Key::Character("t".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::SHIFT,
+            Some("\u{200b}"),
+            false,
+            KeyboardEnhancements {
+                kitty_flags: 0b11100,
+                report_all_keys: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(only_spoofing.as_deref(), Some(&b"\x1b[116;2u"[..]));
+    }
+
+    #[test]
+    fn enter_honors_key_location_in_application_keypad_mode() {
+        let plain = encode_key(
+            &keyboard::Key::Named(Named::Enter),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::default(),
+            None,
+            false,
+            KeyboardEnhancements::default(),
+        );
+        assert_eq!(plain.as_deref(), Some(&b"\r"[..]));
+
+        let standard_in_keypad_mode = encode_key(
+            &keyboard::Key::Named(Named::Enter),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::default(),
+            None,
+            false,
+            KeyboardEnhancements {
+                application_keypad: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(standard_in_keypad_mode.as_deref(), Some(&b"\r"[..]));
+
+        let numpad_in_keypad_mode = encode_key(
+            &keyboard::Key::Named(Named::Enter),
+            keyboard::Location::Numpad,
+            keyboard::Modifiers::default(),
+            None,
+            false,
+            KeyboardEnhancements {
+                application_keypad: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(numpad_in_keypad_mode.as_deref(), Some(&b"\x1bOM"[..]));
+    }
+
+    fn block_search_hit(zone_id: u64) -> block_mode::BlockSearchHit {
+        block_mode::BlockSearchHit {
+            zone_id,
+            is_output_line: false,
+            line_no: 0,
+            match_span: None,
+            line_text: String::new(),
+            command_preview: String::new(),
+        }
+    }
+
+    #[test]
+    fn block_search_build_identity_rejects_old_epochs_even_in_the_same_session() {
+        let mut epoch = 0;
+        let first = BlockSearchBuildIdentity {
+            session_id: 7,
+            epoch: next_block_search_epoch(&mut epoch).unwrap(),
+        };
+        let second = BlockSearchBuildIdentity {
+            session_id: 7,
+            epoch: next_block_search_epoch(&mut epoch).unwrap(),
+        };
+        assert_eq!(first.epoch, 1);
+        assert_eq!(second.epoch, 2);
+
+        let state = BlockSearchState {
+            session_id: 7,
+            epoch: second.epoch,
+            ..BlockSearchState::default()
+        };
+        assert!(!state.accepts_build(first));
+        assert!(state.accepts_build(second));
+        assert!(!state.accepts_build(BlockSearchBuildIdentity {
+            session_id: 8,
+            epoch: second.epoch,
+        }));
+
+        let mut exhausted = u64::MAX;
+        assert_eq!(next_block_search_epoch(&mut exhausted), None);
+        assert_eq!(exhausted, u64::MAX);
+    }
+
+    #[test]
+    fn block_search_memory_restores_only_bounded_matching_intent() {
+        let state = BlockSearchState {
+            session_id: 7,
+            epoch: 9,
+            query: "needle".to_string(),
+            case_sensitive: true,
+            regex: true,
+            whole_word: true,
+            scope: block_mode::BlockSearchScope::Output,
+            filter: BlockSearchFilter::Bookmarked,
+            selected: 4,
+            hits: vec![block_search_hit(42)],
+            ..BlockSearchState::default()
+        };
+        let mut memory = BlockSearchMemory::default();
+        memory.capture(&state);
+        let restored = memory.state_for(99);
+        assert_eq!(restored.session_id, 99);
+        assert_eq!(restored.query, "needle");
+        assert!(restored.case_sensitive && restored.regex && restored.whole_word);
+        assert_eq!(restored.scope, block_mode::BlockSearchScope::Output);
+        assert_eq!(restored.filter, BlockSearchFilter::Bookmarked);
+        assert_eq!(restored.epoch, 0);
+        assert_eq!(restored.selected, 0);
+        assert!(restored.hits.is_empty());
+        assert!(restored.cache.is_empty());
+
+        let oversized = BlockSearchState {
+            query: "x".repeat(block_mode::BLOCK_SEARCH_QUERY_MAX_BYTES + 1),
+            case_sensitive: true,
+            scope: block_mode::BlockSearchScope::Command,
+            filter: BlockSearchFilter::Failed,
+            ..BlockSearchState::default()
+        };
+        memory.capture(&oversized);
+        assert!(memory.query.is_empty());
+        assert!(memory.case_sensitive);
+        assert_eq!(memory.scope, block_mode::BlockSearchScope::Command);
+        assert_eq!(memory.filter, BlockSearchFilter::Failed);
+    }
+
+    #[test]
+    fn block_search_query_input_refuses_spoofing() {
+        let mut state = BlockSearchState {
+            query: "keep".to_string(),
+            ..BlockSearchState::default()
+        };
+        assert!(!state.apply_query_input("cargo\u{202e} test".to_string()));
+        assert_eq!(state.query, "keep");
+        assert!(state
+            .query_error
+            .as_deref()
+            .is_some_and(|error| error.contains("not saved")));
+        assert!(state.apply_query_input("cargo test".to_string()));
+        assert_eq!(state.query, "cargo test");
+    }
+
+    #[test]
+    fn block_search_reset_returns_every_intent_control_to_default() {
+        let mut state = BlockSearchState {
+            query: "needle".to_string(),
+            case_sensitive: true,
+            regex: true,
+            whole_word: true,
+            scope: block_mode::BlockSearchScope::Output,
+            filter: BlockSearchFilter::Bookmarked,
+            query_error: Some("old".to_string()),
+            selected: 9,
+            hits: vec![block_search_hit(42)],
+            ..BlockSearchState::default()
+        };
+        state.reset_intent();
+        assert!(state.query.is_empty());
+        assert!(!state.case_sensitive && !state.regex && !state.whole_word);
+        assert_eq!(state.scope, block_mode::BlockSearchScope::All);
+        assert_eq!(state.filter, BlockSearchFilter::All);
+        assert!(state.query_error.is_none());
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.hits.len(), 1, "recompute owns result replacement");
+    }
+
+    #[test]
+    fn block_search_refresh_preserves_identity_then_nearest_rank() {
+        let selected = block_search_hit(2);
+        let anchor = BlockSearchSelectionAnchor {
+            hit: selected.clone(),
+            index: 1,
+        };
+        assert_eq!(
+            block_search_refresh_selection_index(
+                &[block_search_hit(4), block_search_hit(3), selected],
+                Some(&anchor),
+            ),
+            2,
+            "a stable hit follows its identity when new rows shift it"
+        );
+        assert_eq!(
+            block_search_refresh_selection_index(
+                &[block_search_hit(4), block_search_hit(3)],
+                Some(&anchor),
+            ),
+            1,
+            "an evicted hit falls back to its closest surviving rank"
+        );
+        assert_eq!(
+            block_search_refresh_selection_index(&[block_search_hit(4)], Some(&anchor)),
+            0
+        );
+        assert_eq!(
+            block_search_refresh_selection_index(&[block_search_hit(4)], None),
+            0
+        );
+        assert_eq!(block_search_refresh_selection_index(&[], Some(&anchor)), 0);
+
+        let mut state = BlockSearchState {
+            query: "needle".to_string(),
+            hits: vec![block_search_hit(1), block_search_hit(2)],
+            selected: 1,
+            ..BlockSearchState::default()
+        };
+        state.refresh_intent = Some(state.intent());
+        let captured = state
+            .take_refresh_selection_anchor()
+            .expect("unchanged refresh intent preserves the live highlight");
+        assert_eq!(captured.hit.zone_id, 2);
+        assert_eq!(captured.index, 1);
+
+        state.refresh_intent = Some(state.intent());
+        state.query.push('x');
+        assert!(
+            state.take_refresh_selection_anchor().is_none(),
+            "an intent edit during the worker build must restart at the top"
+        );
+    }
+
+    #[test]
+    fn block_search_bookmarked_self_removal_keeps_the_closest_original_rank() {
+        let mut first_duplicate = block_search_hit(9);
+        first_duplicate.is_output_line = true;
+        first_duplicate.line_no = 1;
+        first_duplicate.line_text = "first".to_string();
+        let mut selected_duplicate = first_duplicate.clone();
+        selected_duplicate.line_no = 2;
+        selected_duplicate.line_text = "second".to_string();
+        let anchor = BlockSearchSelectionAnchor {
+            hit: selected_duplicate,
+            index: 2,
+        };
+
+        // Unbookmarking zone 9 removes both of its duplicate query hits. The
+        // original rank remains selected when one exists, then clamps only at
+        // the tail — never jumping back to the first row.
+        assert_eq!(
+            block_search_refresh_selection_index(
+                &[

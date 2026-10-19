@@ -1,0 +1,300 @@
+            }
+        }
+    };
+    terminal.output_buffer.extend_from_slice(&response);
+    None
+}
+
+fn complete_osc5522_read(
+    terminal: &mut TerminalState,
+    in_flight: &mut bool,
+    pending_refusals: &mut Option<usize>,
+    allow_clipboard_read: bool,
+    mime: &str,
+    data: &str,
+) {
+    *in_flight = false;
+    let response = if !allow_clipboard_read {
+        osc_5522_packet("type=read:status=EPERM", None)
+    } else if data.len() > MAX_CLIPBOARD_RESPONSE_BYTES {
+        osc_5522_packet("type=read:status=EFBIG", None)
+    } else if data.is_empty() {
+        osc_5522_packet("type=read:status=ENOSYS", None)
+    } else {
+        clipboard_5522_response_for_mime(mime, data.as_bytes())
+    };
+    terminal.output_buffer.extend_from_slice(&response);
+    for _ in 0..pending_refusals.take().unwrap_or_default() {
+        terminal
+            .output_buffer
+            .extend_from_slice(&osc_5522_packet("type=read:status=EBUSY", None));
+    }
+}
+
+/// Cached output of the per-frame block-chrome builders, stored per session.
+struct BlockChromeCache {
+    key: BlockChromeKey,
+    paint: Vec<terminal_view::BlockPaintRow>,
+    failed_markers: Vec<f32>,
+    bookmark_markers: Vec<f32>,
+}
+
+/// Complete input identity of the block-chrome builders. Everything
+/// `App::build_block_paint_rows` and the marker builders read is either a
+/// field here or rides on one (zone data and row identities move with the
+/// projection's source revisions).
+struct BlockChromeKey {
+    projection: terminal::ProjectionKey,
+    /// Theme RGBs the chrome consumes: ANSI 1/2/3 outcome stripes + the
+    /// accent. Keyed on the data rather than the theme name so a config
+    /// reload with an unchanged palette still hits.
+    theme_rgbs: [[u8; 3]; 4],
+    /// Badge-inset input (`metrics.cell_w`); font changes must repaint.
+    cell_w_bits: u32,
+    selection: block_mode::BlockSelection,
+    bookmarks: block_mode::BlockBookmarks,
+    /// Live `▶ elapsed` chip text; a change here alone must repaint the
+    /// chip, and it is the only wall-clock input of the builders.
+    running_badge: Option<String>,
+}
+
+fn agent_prompt_status_with_foreground(
+    terminal_status: terminal::AgentPromptStatus,
+    shell_pid: i32,
+    foreground_pgid: Option<i32>,
+) -> terminal::AgentPromptStatus {
+    if !terminal_status.is_ready() {
+        return terminal_status;
+    }
+    match foreground_pgid {
+        Some(pgid) if pgid == shell_pid => terminal::AgentPromptStatus::Ready,
+        Some(_) => terminal::AgentPromptStatus::Busy,
+        None => terminal::AgentPromptStatus::ShellIntegrationUnavailable,
+    }
+}
+
+/// Suffix appended to a session's label while it shows a held-open task
+/// transcript, so the dead tab reads differently from a live shell wherever
+/// the label appears (tab strip, dock, window title).
+const READ_ONLY_LABEL_SUFFIX: &str = " (exited)";
+
+/// Whether a session in this state refuses PTY-bound user bytes: a held-open
+/// task transcript's child has exited (that is exactly what `hold_after_exit`
+/// records), so its bytes would only hit EIO on the dead master fd. Ordinary
+/// sessions forward everything.
+fn user_input_blocked(hold_after_exit: bool) -> bool {
+    hold_after_exit
+}
+
+/// A session's strip/window label with the read-only suffix applied when the
+/// session shows a held-open task transcript.
+fn session_label(base: String, transcript_read_only: bool) -> String {
+    let base = if transcript_read_only {
+        format!("{base}{READ_ONLY_LABEL_SUFFIX}")
+    } else {
+        base
+    };
+    session_persistence::bound_tab_title_draft(base)
+}
+
+/// The `--session` identity a newly spawned interactive shell is launched with.
+///
+/// jsh only announces `session_id=` on its OSC 133 `C` packets, and only
+/// restores its per-session snapshot, when it was launched with `--session`.
+/// frost passed `None` here, so every jsh under it ran anonymously: the `C`
+/// envelope was permanently incomplete, `ExecutionLifecycle::from_command_meta`
+/// could never be satisfied, the journal submit was a silent no-op, and jsh's
+/// own `start` events recorded a null session.
+///
+/// The string is the one the task reducer already keys terminal bindings on,
+/// so one PTY session has one identity everywhere. It satisfies
+/// `is_valid_jsh_session_id` by construction; the filter is the fail-closed
+/// check on that rather than a formality, because a session id jsh refuses
+/// would take the shell down at launch instead of degrading to anonymous.
+///
+/// The "is the shell actually jsh?" half of the gate lives in
+/// `pty::new_with_cwd_env`, which is where the configured shell is finally
+/// resolved to a path; both argv shapes there append `--session` only for a
+/// jsh basename. An explicit `command_argv` is a one-shot helper — the jsh
+/// installer, a remote wrapper, an agent CLI — not the configured shell, so it
+/// gets no session identity at all.
+fn jsh_session_id(id: usize, command_argv: Option<&[String]>) -> Option<String> {
+    command_argv
+        .is_none()
+        .then(|| agent_task_ui::terminal_session_id(id))
+        .filter(|session| jterm_core::execution_journal::is_valid_jsh_session_id(session))
+}
+
+/// Mint the durable journal capability for one finished command from the Start
+/// identity OSC 133 `C` announced, and from nothing else.
+///
+/// `CompletedCommand::id` sits right beside the lifecycle and is not a
+/// substitute: that slot can be filled by a `D` alone, naming an execution this
+/// terminal never saw start. Core re-checks all four slots against the
+/// authoritative on-disk Start under the journal lock, so a guess assembled
+/// here would fail closed there anyway — after the whole block output had
+/// already been copied on the UI thread.
+fn journal_lifecycle(
+    start: &terminal::StartLifecycle,
+) -> Option<jterm_core::execution_journal::ExecutionLifecycle> {
+    jterm_core::execution_journal::ExecutionLifecycle::from_command_meta(
+        &jterm_core::parser::CommandMeta {
+            id: Some(start.id.clone()),
+            session_id: Some(start.session_id.clone()),
+            seq: Some(start.seq),
+            started_at_ms: Some(start.started_at_ms),
+            ..Default::default()
+        },
+    )
+}
+
+/// Tell a session's emulator which colours the theme paints for its defaults
+/// and ANSI palette. OSC 10/11/12/4 queries and the `CSI ? 996 n` colour
+/// scheme report read these; the renderer takes them from the theme directly.
+fn apply_theme_colors(terminal: &mut TerminalState, theme: &Theme) {
+    let rgb = |c: [u8; 3]| (c[0], c[1], c[2]);
+    let colors = &theme.terminal;
+    terminal.set_default_colors(
+        rgb(colors.foreground),
+        rgb(colors.background),
+        rgb(colors.cursor),
+    );
+    terminal.set_ansi_colors(colors.ansi_colors.map(rgb));
+}
+
+impl Session {
+    fn spawn(
+        config: &Config,
+        id: usize,
+        cols: usize,
+        rows: usize,
+        cwd: Option<&str>,
+    ) -> anyhow::Result<Session> {
+        Self::spawn_argv(config, id, cols, rows, cwd, None)
+    }
+
+    /// Spawn a session that runs an explicit argv instead of the configured
+    /// shell — used for one-shot helpers such as the jsh installer.
+    fn spawn_argv(
+        config: &Config,
+        id: usize,
+        cols: usize,
+        rows: usize,
+        cwd: Option<&str>,
+        command_argv: Option<&[String]>,
+    ) -> anyhow::Result<Session> {
+        Self::spawn_argv_env(config, id, cols, rows, cwd, command_argv, &[])
+    }
+
+    /// [`Self::spawn_argv`] plus explicit child-environment overrides. The
+    /// task-validation terminal uses this to neutralize shell startup files.
+    fn spawn_argv_env(
+        config: &Config,
+        id: usize,
+        cols: usize,
+        rows: usize,
+        cwd: Option<&str>,
+        command_argv: Option<&[String]>,
+        extra_env: &[(&str, &str)],
+    ) -> anyhow::Result<Session> {
+        let session_id = jsh_session_id(id, command_argv);
+        let pty = Pty::new_with_cwd_env(
+            cols,
+            rows,
+            cwd,
+            session_id.as_deref(),
+            config.shell.as_deref(),
+            command_argv,
+            extra_env,
+        )
+        .map_err(|error| anyhow::anyhow!("cannot create terminal session: {error}"))?;
+        let master_fd = pty.master_fd();
+        let reader_fd = unsafe { libc::fcntl(master_fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if reader_fd < 0 {
+            return Err(anyhow::anyhow!(
+                "cannot duplicate PTY reader: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` returned a fresh owned descriptor.
+        let reader_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(reader_fd) });
+        let mut terminal = TerminalState::new(cols, rows);
+        terminal.set_max_scrollback(config.scrollback_lines);
+        terminal.set_disable_alt_screen(config.disable_alt_screen);
+        let mut projection_policy = ProjectionPolicy::new();
+        projection_policy.set_chat(config.is_chat_mode());
+        // Native metadata headers plus card-edge insets provide separation;
+        // a full synthetic terminal row between cards is unnecessary.
+        projection_policy.set_native_chrome(
+            true,
+            native_status_rows(
+                config.ascii_organism_enabled,
+                config.ascii_organism_expanded,
+                Metrics::new(config.font_size, config.line_spacing, config.padding, true).cell_h,
+            ),
+        );
+        let mut projection_view_state = ProjectionViewState::new();
+        let projection = terminal.get_projected_viewport_with_state(
+            config.is_card_mode(),
+            &projection_policy,
+            &mut projection_view_state,
+        );
+        let cursor = terminal.get_cursor_pos();
+        let cursor_visible = terminal.is_cursor_visible();
+        Ok(Session {
+            id,
+            ime_identity: Arc::new(()),
+            terminal,
+            pty,
+            master_fd,
+            reader_fd,
+            watch_source: organism_watch::SourceAuthority::default(),
+            watch_receiver: organism_watch::SourceReceiver::default(),
+            projection,
+            projection_block_mode: config.is_card_mode(),
+            projection_policy,
+            projection_view_state,
+            cursor,
+            cursor_visible,
+            cwd_cache: None,
+            fg_proc_cache: None,
+            git_meta_cache: None,
+            last_exit: None,
+            hold_after_exit: false,
+            last_duration_ms: None,
+            block_selection: block_mode::BlockSelection::default(),
+            block_reading: block_review::ReadingHistory::default(),
+            block_bookmarks: block_mode::BlockBookmarks::default(),
+            block_chrome_cache: std::cell::RefCell::new(None),
+            write_queue: std::collections::VecDeque::new(),
+            write_queue_offset: 0,
+            queued_write_bytes: 0,
+            queued_response_bytes: 0,
+            clipboard_read_in_flight: false,
+            osc52_pending_refusals: None,
+            osc5522_pending_refusals: None,
+            managed_remote: false,
+        })
+    }
+
+    /// Tab label: prefer an OSC-set window title; otherwise show the foreground
+    /// process and/or cwd basename so a fresh shell with no title still tells
+    /// the user where they are. Falls back to "Session N" only when none of
+    /// those are known yet.
+    fn label(&self) -> String {
+        session_label(self.label_base(), self.transcript_read_only())
+    }
+
+    fn label_base(&self) -> String {
+        let t = self.terminal.window_title.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+        let cwd_short = self.cwd_cache.as_deref().and_then(Self::cwd_basename);
+        match (&self.fg_proc_cache, cwd_short) {
+            (Some(p), Some(d)) => format!("{p} · {d}"),
+            (Some(p), None) => p.clone(),
+            (None, Some(d)) => d,
+            (None, None) => format!("Session {}", self.id + 1),
+        }
+    }

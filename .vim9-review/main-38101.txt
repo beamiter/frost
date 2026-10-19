@@ -1,0 +1,300 @@
+
+    #[test]
+    fn block_spacer_projection_keeps_helpers_and_app_release_on_raw_cells() {
+        let mut terminal = terminal::TerminalState::new(24, 8);
+        terminal.process_input(
+            concat!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07LEFT\r\n\x1b]133;D;0\x07",
+                "\x1b]133;A\x07$ \x1b]133;B\x07two\r\n\x1b]133;C\x07RIGHT\r\n\x1b]133;D;0\x07",
+                "\x1b]133;A\x07$ \x1b]133;B\x07\x1b[?1002h\x1b[?1006h",
+            )
+            .as_bytes(),
+        );
+        let mut policy = terminal::ProjectionPolicy::new();
+        policy.set_block_spacing(true);
+        let projection = terminal.get_projected_viewport_with_policy(true, &policy, usize::MAX);
+        let gap = projection
+            .row_kinds()
+            .iter()
+            .position(|kind| matches!(kind, terminal::ProjectedRowKind::BlockSpacer { .. }))
+            .expect("real display spacer between completed blocks");
+        for col in 0..24 {
+            assert_eq!(
+                projected_live_grid_cell(&terminal, &projection, gap, col),
+                None
+            );
+        }
+        assert_eq!(
+            finalized_block_at_viewport_row(true, &terminal, &projection, gap),
+            None
+        );
+
+        let before = projection.view_row_absolute(gap - 1).unwrap();
+        let after = projection.view_row_absolute(gap + 1).unwrap();
+        assert_eq!(after, before + 1, "display spacer adds no raw row");
+        let current = projected_live_grid_cell(&terminal, &projection, gap + 1, 1);
+        assert_eq!(current, Some((1, after - terminal.scrollback_len())));
+        assert_eq!(
+            finalized_block_at_viewport_row(true, &terminal, &projection, gap + 1),
+            Some(terminal.command_zones[1].id),
+        );
+        assert_eq!(
+            project_search_match(
+                &terminal,
+                &projection,
+                &search::SearchMatch {
+                    line: after,
+                    col_start: 0,
+                    col_end: 1
+                },
+            ),
+            Some(search::SearchMatch {
+                line: gap + 1,
+                col_start: 0,
+                col_end: 1
+            }),
+        );
+        assert_eq!(
+            projected_kitty_anchor(&terminal, &projection, before, 0, 1, 2),
+            None,
+            "an image spanning a spacer cannot bridge two cards",
+        );
+        assert_eq!(
+            projected_kitty_anchor(&terminal, &projection, after, 0, 1, 1),
+            Some(terminal::ViewportCell {
+                row: gap + 1,
+                col: 0
+            }),
+        );
+
+        let live_row = terminal.live_prompt_row().expect("current prompt");
+        let live_origin = terminal.raw_cell_origin_at_absolute(live_row, 1).unwrap();
+        let live_view = projection
+            .raw_to_view(live_origin)
+            .expect("visible live prompt");
+        let live_cell =
+            projected_live_grid_cell(&terminal, &projection, live_view.row, live_view.col);
+        let mut gestures = [None; 3];
+        for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+            gestures[button.slot()] = Some(TerminalMouseGesture {
+                session_id: 7,
+                button,
+                report_to_app: true,
+                last_app_cell: None,
+                consumed: false,
+            });
+            let (col, row) = live_cell.unwrap();
+            assert!(terminal
+                .get_mouse_report(btn_code(button), col, row)
+                .is_some());
+            record_terminal_app_mouse_cell(&mut gestures, 7, button, (col, row));
+            let gap_cell = projected_live_grid_cell(&terminal, &projection, gap, 1);
+            assert_eq!(
+                gestures[button.slot()].unwrap().app_drag_cell(gap_cell),
+                None
+            );
+            assert_eq!(
+                overlay_release_disposition(gestures[button.slot()], 7, button),
+                OverlayReleaseDisposition::DispatchApp,
+            );
+            let released = take_terminal_mouse_gesture(&mut gestures, 7, button).unwrap();
+            let (release_col, release_row) = released.app_release_cell(gap_cell, 24, 8).unwrap();
+            assert_eq!((release_col, release_row), (col, row));
+            assert_eq!(
+                terminal.get_mouse_release_report(btn_code(button), release_col, release_row),
+                Some(format!("\x1b[<{};{};{}m", btn_code(button), col + 1, row + 1).into_bytes()),
+            );
+        }
+        // A narrower/shorter pane can invalidate saved raw coordinates while
+        // the pointer remains on a gap. The paired release stays in bounds.
+        for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+            gestures[button.slot()] = Some(TerminalMouseGesture {
+                session_id: 7,
+                button,
+                report_to_app: true,
+                last_app_cell: None,
+                consumed: false,
+            });
+            assert!(terminal.get_mouse_report(btn_code(button), 23, 7).is_some());
+            record_terminal_app_mouse_cell(&mut gestures, 7, button, (23, 7));
+        }
+        terminal.on_resize(12, 4);
+        let resized = terminal.get_projected_viewport_with_policy(true, &policy, usize::MAX);
+        let gap = resized
+            .row_kinds()
+            .iter()
+            .position(|kind| matches!(kind, terminal::ProjectedRowKind::BlockSpacer { .. }))
+            .expect("spacer remains visible after resize");
+        let gap_cell = projected_live_grid_cell(&terminal, &resized, gap, 0);
+        assert_eq!(gap_cell, None);
+        for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+            let released = take_terminal_mouse_gesture(&mut gestures, 7, button).unwrap();
+            let cell =
+                released.app_release_cell(gap_cell, terminal.grid.row_len(), terminal.grid.rows());
+            assert_eq!(cell, Some((11, 3)));
+            let (col, row) = cell.unwrap();
+            assert_eq!(
+                terminal.get_mouse_release_report(btn_code(button), col, row),
+                Some(format!("\x1b[<{};12;4m", btn_code(button)).into_bytes()),
+            );
+            assert_eq!(released.app_release_cell(gap_cell, 0, 4), None);
+            assert_eq!(released.app_release_cell(gap_cell, 12, 0), None);
+        }
+    }
+
+    #[test]
+    fn terminal_app_mouse_release_over_history_uses_the_paired_raw_cell() {
+        let mut terminal = terminal::TerminalState::new(24, 4);
+        terminal.process_input(b"old\r\nnew\r\nmore\r\nlast\r\nlive");
+        terminal.set_scroll_offset(terminal.scrollback_len());
+        let projection = terminal.get_projected_viewport(true);
+        assert!(terminal.scrollback_len() > 0);
+        assert_eq!(projection.view_row_absolute(0), Some(0));
+        let history_cell = projected_live_grid_cell(&terminal, &projection, 0, 1);
+        assert_eq!(history_cell, None);
+        let gesture = TerminalMouseGesture {
+            session_id: 7,
+            button: MouseButton::Left,
+            report_to_app: true,
+            last_app_cell: Some((2, 3)),
+            consumed: false,
+        };
+        assert_eq!(gesture.app_drag_cell(history_cell), None);
+        assert_eq!(gesture.app_release_cell(history_cell, 24, 8), Some((2, 3)));
+        let live_view = projection
+            .raw_to_view(
+                terminal
+                    .raw_cell_origin_at_absolute(terminal.scrollback_len(), 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        let current =
+            projected_live_grid_cell(&terminal, &projection, live_view.row, live_view.col);
+        assert_eq!(current, Some((1, 0)));
+        assert_eq!(gesture.app_release_cell(current, 24, 8), Some((1, 0)));
+    }
+
+    #[test]
+    fn overlay_only_dispatches_origin_app_release() {
+        let app_left = TerminalMouseGesture {
+            session_id: 7,
+            button: MouseButton::Left,
+            report_to_app: true,
+            last_app_cell: None,
+            consumed: false,
+        };
+        let local_right = TerminalMouseGesture {
+            session_id: 8,
+            button: MouseButton::Right,
+            report_to_app: false,
+            last_app_cell: None,
+            consumed: false,
+        };
+        let consumed_middle = TerminalMouseGesture {
+            session_id: 8,
+            button: MouseButton::Middle,
+            report_to_app: false,
+            last_app_cell: None,
+            consumed: true,
+        };
+
+        assert_eq!(
+            overlay_release_disposition(Some(app_left), 7, MouseButton::Left),
+            OverlayReleaseDisposition::DispatchApp
+        );
+        assert_eq!(
+            overlay_release_disposition(Some(app_left), 8, MouseButton::Left),
+            OverlayReleaseDisposition::Reject,
+            "a focused pane cannot steal another pane's button-up"
+        );
+        assert_eq!(
+            overlay_release_disposition(Some(local_right), 8, MouseButton::Right),
+            OverlayReleaseDisposition::ClearOnly,
+            "local release behind an overlay must not copy or move the caret"
+        );
+        assert_eq!(
+            overlay_release_disposition(Some(consumed_middle), 8, MouseButton::Middle),
+            OverlayReleaseDisposition::ClearOnly
+        );
+    }
+
+    #[test]
+    fn ctrl_link_requires_an_unshifted_single_left_press() {
+        for (name, over_grid, finalized, header, expected) in [
+            ("finished header", true, true, true, false),
+            ("finished output", true, true, false, true),
+            ("active/live", true, false, false, true),
+            ("alt/non-Block", true, false, false, true),
+            ("pre-zone history", true, false, false, true),
+            ("padding/scrollbar", false, false, false, false),
+        ] {
+            assert_eq!(
+                terminal_view::link_surface_eligible(over_grid, finalized, header),
+                expected,
+                "{name}"
+            );
+        }
+
+        assert!(terminal_view::ctrl_link_eligible(
+            MouseButton::Left,
+            1,
+            true,
+            false,
+            true,
+        ));
+        assert!(!terminal_view::ctrl_link_eligible(
+            MouseButton::Left,
+            1,
+            true,
+            true,
+            true,
+        ));
+        assert!(!terminal_view::ctrl_link_eligible(
+            MouseButton::Left,
+            2,
+            true,
+            false,
+            true,
+        ));
+        assert!(!terminal_view::ctrl_link_eligible(
+            MouseButton::Left,
+            3,
+            true,
+            false,
+            true,
+        ));
+        assert!(!terminal_view::ctrl_link_eligible(
+            MouseButton::Right,
+            1,
+            true,
+            false,
+            true,
+        ));
+        assert!(!terminal_view::ctrl_link_eligible(
+            MouseButton::Left,
+            1,
+            false,
+            false,
+            true,
+        ));
+        assert!(!terminal_view::ctrl_link_eligible(
+            MouseButton::Left,
+            1,
+            true,
+            false,
+            false, // finished command/header row
+        ));
+    }
+
+    #[test]
+    fn unknown_ai_block_status_is_not_presented_as_success() {
+        assert_eq!(agent_context_exit_label(-1), "no reported exit status");
+        assert_eq!(agent_context_exit_label(0), "exit 0");
+        assert_eq!(agent_context_exit_label(7), "exit 7");
+    }
+
+    #[test]
+    fn bookmark_toggle_has_no_implicit_latest_target() {
+        let ids = [10, 20, 30];
+        assert_eq!(active_bookmark_target(&ids, Some(20)), Some(20));
+        assert_eq!(active_bookmark_target(&ids, None), None);

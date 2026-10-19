@@ -1,0 +1,300 @@
+            changed
+        });
+        if changed {
+            self.session_dirty = true;
+            self.recompute_search();
+            self.reveal_current_search_match();
+            self.recompute_links();
+        }
+        if self.search.is_open
+            && self
+                .sessions
+                .get(self.active)
+                .is_some_and(|session| session.id == target.session_id)
+        {
+            find_focus::refocus(SEARCH_INPUT_ID.clone())
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Route a keypress into the search bar while it is open. Returns true if
+    /// the key was consumed (and must not reach the PTY).
+    fn handle_search_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+        text: Option<&str>,
+    ) -> bool {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        if !self.search.is_open {
+            return false;
+        }
+        if mods.control() && mods.shift() {
+            if let Key::Character(c) = key {
+                if c.eq_ignore_ascii_case("f") {
+                    self.search.close();
+                    return true;
+                }
+            }
+        }
+        match key {
+            Key::Named(Named::Escape) => {
+                self.search.close();
+                return true;
+            }
+            Key::Named(Named::Enter) => {
+                self.navigate_search(mods.shift());
+                return true;
+            }
+            Key::Named(Named::Backspace) => {
+                self.search.backspace();
+                self.recompute_search();
+                return true;
+            }
+            Key::Named(Named::ArrowUp) => {
+                self.search.history_prev();
+                self.search.current_match_index = 0;
+                self.recompute_search();
+                self.reveal_current_search_match();
+                return true;
+            }
+            Key::Named(Named::ArrowDown) => {
+                self.search.history_next();
+                self.search.current_match_index = 0;
+                self.recompute_search();
+                self.reveal_current_search_match();
+                return true;
+            }
+            // Ctrl+R toggles regex, Ctrl+I toggles case sensitivity (Alt is the
+            // JWM window-manager modifier, so it is avoided here).
+            Key::Character(c) if mods.control() => {
+                match c.chars().next().map(|c| c.to_ascii_lowercase()) {
+                    Some('r') => {
+                        self.search.toggle_regex();
+                        self.recompute_search();
+                        self.reveal_current_search_match();
+                    }
+                    Some('i') => {
+                        self.search.toggle_case_sensitive();
+                        self.recompute_search();
+                        self.reveal_current_search_match();
+                    }
+                    _ => {}
+                }
+                return true;
+            }
+            _ => {}
+        }
+        // Printable input appends to the query.
+        if !mods.control() && !mods.alt() {
+            if let Some(t) = text {
+                if self.search.push_query_text(t) {
+                    self.recompute_search();
+                    self.reveal_current_search_match();
+                    return true;
+                }
+            }
+        }
+        // Swallow any other key while the search bar owns the keyboard.
+        true
+    }
+
+    /// While the Find & Replace panel is open, swallow keys so they don't
+    /// reach the PTY; its text inputs handle their own events while focused.
+    /// Esc or the toggle chord closes the panel.
+    fn handle_search_replace_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+    ) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        if !self.search_replace.is_open {
+            return None;
+        }
+        let toggle_chord = key_to_binding_string(key, mods).is_some_and(|binding| {
+            self.keybindings.get_command(&binding)
+                == Some(keybindings::Command::SearchReplaceToggle)
+        });
+        if toggle_chord || matches!(key, Key::Named(Named::Escape)) {
+            self.search_replace.is_open = false;
+        }
+        Some(Task::none())
+    }
+
+    /// Run the Find & Replace panel against the active pane's selection and
+    /// route the result. Mirrors ember's semantics: the scrollback is
+    /// read-only program output and is never mutated — the transformed text
+    /// goes to the clipboard, or to the prompt via the paste path (bracketed
+    /// framing, bounded input queue, no trailing newline).
+    fn apply_search_replace(
+        &mut self,
+        action: search_replace_panel::SearchReplaceAction,
+    ) -> Task<Message> {
+        let selection = self
+            .sessions
+            .get(self.active)
+            .and_then(|s| s.terminal.copy_selection())
+            .filter(|t| !t.is_empty());
+        let Some(text) = selection else {
+            self.search_replace.status = "No selection".to_string();
+            return Task::none();
+        };
+        let Some(result) = self.search_replace.apply(&text) else {
+            return Task::none();
+        };
+        match action {
+            search_replace_panel::SearchReplaceAction::ReplaceToClipboard => {
+                iced::clipboard::write(result)
+            }
+            search_replace_panel::SearchReplaceAction::TypeIntoTerminal => {
+                self.search_replace.status = "Typed into terminal".to_string();
+                self.type_into_active_pane(result)
+            }
+        }
+    }
+
+    /// While the config panel is open, swallow keys so they don't reach the
+    /// PTY; Esc closes it. The panel's own widgets handle their own events.
+    fn handle_config_panel_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+    ) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        if !self.config_panel_open {
+            return None;
+        }
+        if mods.control() && mods.shift() {
+            if let Key::Character(c) = key {
+                if c.eq_ignore_ascii_case("o") {
+                    self.theme_editor = None;
+                    self.set_config_panel_open(false);
+                    return Some(Task::none());
+                }
+            }
+        }
+        if let Key::Named(Named::Escape) = key {
+            // Esc backs out of the theme editor first, then the panel itself.
+            if self.theme_editor.is_some() {
+                self.theme_editor = None;
+            } else {
+                self.set_config_panel_open(false);
+            }
+        }
+        Some(Task::none())
+    }
+
+    fn palette_snap_task(&self) -> Task<Message> {
+        let len = self.palette.filtered().len();
+        let y = match len {
+            0 | 1 => 0.0,
+            len => self.palette.selected.min(len - 1) as f32 / (len - 1) as f32,
+        };
+        iced::widget::operation::snap_to(
+            PALETTE_LIST_ID.clone(),
+            iced::widget::operation::RelativeOffset { x: 0.0, y },
+        )
+    }
+
+    fn palette_page_selection(&mut self, delta: isize) {
+        let len = self.palette.filtered().len();
+        if len == 0 {
+            self.palette.selected = 0;
+            return;
+        }
+        self.palette.selected = self
+            .palette
+            .selected
+            .saturating_add_signed(delta)
+            .min(len - 1);
+    }
+
+    /// Route a keypress into the command palette while it is open. Returns
+    /// `Some(task)` if consumed (and must not reach the PTY), `None` otherwise.
+    fn handle_palette_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+        text: Option<&str>,
+    ) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        if !self.palette.is_open {
+            return None;
+        }
+        if mods.control() && mods.shift() {
+            if let Key::Character(c) = key {
+                if c.eq_ignore_ascii_case("p") {
+                    self.palette.close();
+                    return Some(Task::none());
+                }
+            }
+        }
+        match key {
+            Key::Named(Named::Escape) => {
+                self.palette.close();
+                return Some(Task::none());
+            }
+            Key::Named(Named::Enter) => {
+                let action = self.palette.selected_action();
+                let greeting_target = self.palette.greeting_target();
+                self.palette.close();
+                return Some(match action {
+                    Some(a) => self.execute_palette_action(a, greeting_target),
+                    None => Task::none(),
+                });
+            }
+            Key::Named(Named::ArrowUp) => {
+                self.palette.select_prev();
+                return Some(self.palette_snap_task());
+            }
+            Key::Named(Named::ArrowDown) => {
+                self.palette.select_next();
+                return Some(self.palette_snap_task());
+            }
+            Key::Named(Named::PageUp) => {
+                self.palette_page_selection(-8);
+                return Some(self.palette_snap_task());
+            }
+            Key::Named(Named::PageDown) => {
+                self.palette_page_selection(8);
+                return Some(self.palette_snap_task());
+            }
+            Key::Named(Named::Home) => {
+                self.palette.selected = 0;
+                return Some(self.palette_snap_task());
+            }
+            Key::Named(Named::End) => {
+                self.palette.selected = self.palette.filtered().len().saturating_sub(1);
+                return Some(self.palette_snap_task());
+            }
+            Key::Named(Named::Backspace) => {
+                self.palette.backspace();
+                return Some(self.palette_snap_task());
+            }
+            _ => {}
+        }
+        // Printable input filters the list.
+        if !mods.control() && !mods.alt() {
+            if let Some(t) = text {
+                if self.palette.push_query_text(t) {
+                    return Some(self.palette_snap_task());
+                }
+            }
+        }
+        // Swallow any other key while the palette owns the keyboard.
+        Some(Task::none())
+    }
+
+    /// Common Copy behavior for both configurable keybindings and the command
+    /// palette: a visible terminal text selection wins, otherwise a whole-block
+    /// selection is copied in terminal order (`output_only` is Alt+Copy).
+    fn edit_copy_task(&mut self, output_only: bool) -> Task<Message> {
+        let text = self
+            .sessions
+            .get(self.active)
+            .and_then(|session| session.terminal.copy_selection())

@@ -1,0 +1,300 @@
+                        &intent.query,
+                        block_mode::BlockSearchOptions {
+                            case_sensitive: intent.case_sensitive,
+                            regex: intent.regex,
+                            whole_word: intent.whole_word,
+                        },
+                        intent.scope,
+                        |zone_id| eligible.contains(&zone_id),
+                        || !cancelled.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                    BlockSearchMatchBuild {
+                        cache,
+                        intent,
+                        eligible,
+                        result,
+                    }
+                })
+                .await
+                .map_err(|error| format!("block-search match worker failed: {error}"))
+            },
+            move |result| Message::BlockSearchMatched(identity, result),
+        )
+    }
+
+    /// Recompute-and-snap, plus returning focus to the query input.
+    ///
+    /// Clicking a filter chip or the `Aa`/`.*` toggles moves widget focus onto
+    /// that button, which silently demotes the query box: caret movement,
+    /// selection and paste stop working and typed characters only append
+    /// through the overlay's fallback path. Every chip click therefore hands
+    /// focus straight back.
+    fn block_search_refocus_task(&self) -> Task<Message> {
+        Task::batch([
+            iced::widget::operation::focus(BLOCK_SEARCH_INPUT_ID.clone()),
+            self.block_search_snap_task(),
+        ])
+    }
+
+    /// Keep the highlighted hit visible in the picker's scrollable list.
+    /// Rows are uniform, so snapping to `selected / (len - 1)` places the
+    /// selected row at that same fraction of the viewport — always inside
+    /// it, top row at the top, bottom row at the bottom.
+    fn block_search_snap_task(&self) -> Task<Message> {
+        let Some(state) = self.block_search.as_ref() else {
+            return Task::none();
+        };
+        if block_search_layout::compact(
+            block_search_layout::panel_size(self.win_size),
+            self.effective_font_size(),
+        ) {
+            return block_search_layout::reveal();
+        }
+        // The list widget holds only the windowed rows, so the fraction must
+        // be computed inside that window — against the full hit count it would
+        // scroll to the wrong row and lose the highlight.
+        let window = block_mode::block_search_view_window(
+            state.hits.len(),
+            state.selected,
+            BLOCK_SEARCH_VISIBLE_ROWS,
+        );
+        let y = block_mode::block_search_window_offset(&window, state.selected);
+        iced::widget::operation::snap_to(
+            BLOCK_SEARCH_LIST_ID.clone(),
+            iced::widget::operation::RelativeOffset { x: 0.0, y },
+        )
+    }
+
+    fn block_search_target_is_live(&self, session_id: usize, zone_id: u64) -> bool {
+        self.sessions.get(self.active).is_some_and(|session| {
+            session.id == session_id && session.terminal.zone_by_id(zone_id).is_some()
+        })
+    }
+
+    /// Toggle the bookmark for a picker hit without activating the row. Both
+    /// pointer and keyboard entry points use the same generation/list checks,
+    /// so a queued click cannot mutate a recycled zone id after a rebuild.
+    fn toggle_block_search_hit_bookmark(
+        &mut self,
+        requested: Option<block_mode::BlockSearchHit>,
+    ) -> Task<Message> {
+        let current = self.sessions.get(self.active).map(|session| {
+            (
+                session.id,
+                BlockSearchZoneVersion::from_terminal(&session.terminal),
+            )
+        });
+        let plan = match current {
+            Some((session_id, zone_version)) => self
+                .block_search
+                .as_ref()
+                .map(|state| state.bookmark_plan(requested.as_ref(), session_id, zone_version))
+                .unwrap_or(BlockSearchBookmarkPlan::RejectStale),
+            None => BlockSearchBookmarkPlan::RejectStale,
+        };
+        let zone_id = match plan {
+            BlockSearchBookmarkPlan::Toggle(zone_id) => zone_id,
+            BlockSearchBookmarkPlan::Busy => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.bookmark_notice = Some(BlockSearchBookmarkNotice::Busy);
+                }
+                return Task::none();
+            }
+            BlockSearchBookmarkPlan::NoSelection => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.bookmark_notice = Some(BlockSearchBookmarkNotice::NoSelection);
+                }
+                return Task::none();
+            }
+            BlockSearchBookmarkPlan::RejectStale => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.bookmark_notice = Some(BlockSearchBookmarkNotice::Stale);
+                }
+                return Task::none();
+            }
+        };
+        if !self.block_action_available() {
+            if let Some(state) = self.block_search.as_mut() {
+                state.bookmark_notice = Some(BlockSearchBookmarkNotice::Stale);
+            }
+            return Task::none();
+        }
+
+        let (filter, selection_anchor, owner) =
+            self.block_search
+                .as_ref()
+                .map(|state| {
+                    (
+                        state.filter,
+                        state.hits.get(state.selected).cloned().map(|hit| {
+                            BlockSearchSelectionAnchor {
+                                hit,
+                                index: state.selected,
+                            }
+                        }),
+                        state.session_id,
+                    )
+                })
+                .expect("bookmark plan requires an open block-search picker");
+        let bookmarked = self
+            .sessions
+            .get_mut(self.active)
+            .filter(|session| session.id == owner)
+            .and_then(|session| {
+                let ids: Vec<u64> = session
+                    .terminal
+                    .command_zones
+                    .iter()
+                    .map(|zone| zone.id)
+                    .collect();
+                session.block_bookmarks.retain(&ids);
+                ids.contains(&zone_id).then(|| {
+                    let bookmarked = session.block_bookmarks.toggle(zone_id);
+                    session.refresh();
+                    bookmarked
+                })
+            });
+        let Some(bookmarked) = bookmarked else {
+            if let Some(state) = self.block_search.as_mut() {
+                state.bookmark_notice = Some(BlockSearchBookmarkNotice::Stale);
+            }
+            return Task::none();
+        };
+
+        if filter == BlockSearchFilter::Bookmarked {
+            self.block_search_recompute_with_anchor(selection_anchor);
+        }
+        if let Some(state) = self.block_search.as_mut() {
+            state.bookmark_notice = Some(if bookmarked {
+                BlockSearchBookmarkNotice::Bookmarked
+            } else {
+                BlockSearchBookmarkNotice::Removed
+            });
+        }
+        self.block_search_refocus_task()
+    }
+
+    /// Block search picker key handling, mirroring
+    /// [`Self::handle_history_picker_key`]: typed text edits the query,
+    /// arrows move the selection, Enter selects and reveals the highlighted
+    /// hit's zone, Esc (or the block:search chord) dismisses. Runs BEFORE the
+    /// keybinding/`encode_key` layers, which is what keeps the picker's own
+    /// keystrokes from reaching the PTY and clearing the block selection.
+    fn handle_block_search_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+        text: Option<&str>,
+        repeat: bool,
+    ) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        if !self.config.is_block_mode()
+            || self
+                .sessions
+                .get(self.active)
+                .is_some_and(|sess| sess.terminal.is_alt_buffer_active())
+        {
+            // The overlay may have been open when asynchronous PTY output
+            // entered the alternate screen. Drop it and let this very key
+            // continue to the foreground application.
+            self.close_block_search();
+            return None;
+        }
+        // A fresh configurable toggle chord closes from inside; key repeat
+        // from the press that opened the picker is owned but cannot close it.
+        match block_search_toggle_key_route(key, mods, repeat, &self.keybindings) {
+            BlockSearchToggleKeyRoute::Close => {
+                self.close_block_search();
+                return Some(Task::none());
+            }
+            BlockSearchToggleKeyRoute::SuppressRepeat => return Some(Task::none()),
+            BlockSearchToggleKeyRoute::NotToggle => {}
+        }
+        if block_search_manual_refresh_key(key, mods, repeat) {
+            return Some(self.force_block_search_rebuild());
+        }
+        let bookmark_route = {
+            let state = self.block_search.as_mut()?;
+            block_search_bookmark_key_route(
+                key,
+                mods,
+                repeat,
+                &mut state.bookmark_key_held,
+                &mut state.bookmark_key_claimed,
+            )
+        };
+        match bookmark_route {
+            BlockSearchBookmarkKeyRoute::Toggle => {
+                let selected = self
+                    .block_search
+                    .as_ref()
+                    .and_then(|state| state.hits.get(state.selected))
+                    .cloned();
+                return Some(self.toggle_block_search_hit_bookmark(selected));
+            }
+            BlockSearchBookmarkKeyRoute::SuppressRepeat => return Some(Task::none()),
+            BlockSearchBookmarkKeyRoute::NotBookmark => {}
+        }
+        let state = self.block_search.as_mut()?;
+        match key {
+            Key::Named(Named::Escape) => {
+                self.close_block_search();
+                return Some(Task::none());
+            }
+            Key::Named(Named::Enter) => {
+                // Unlike the click path, this indexes `hits` directly instead
+                // of going through `accepts_hit`, so it must carry that
+                // check's `loading` gate itself: while a rebuild is in flight
+                // the retained hits describe the PREVIOUS index and may no
+                // longer name a live zone/line.
+                if state.query_error.is_some() || state.busy() {
+                    return Some(Task::none());
+                }
+                let owner = state.session_id;
+                let target = state.hits.get(state.selected).cloned();
+                let Some(hit) = target else {
+                    return Some(Task::none());
+                };
+                match block_search_activation(
+                    self.block_search_target_is_live(owner, hit.zone_id),
+                    mods.shift(),
+                ) {
+                    BlockSearchActivation::RejectStale => {
+                        // Recompute against the current zone set and keep the
+                        // picker open. Never advance from a result we did not
+                        // actually reveal.
+                        self.block_search_recompute();
+                        self.push_toast(
+                            "Search result is no longer available".to_string(),
+                            ToastKind::Info,
+                        );
+                        return Some(self.block_search_snap_task());
+                    }
+                    BlockSearchActivation::Close => {
+                        self.reveal_block_search_hit(&hit);
+                        self.close_block_search();
+                        return Some(Task::none());
+                    }
+                    BlockSearchActivation::Advance => {
+                        self.reveal_block_search_hit(&hit);
+                        if let Some(state) = self.block_search.as_mut() {
+                            state.select_next();
+                        }
+                        return Some(self.block_search_snap_task());
+                    }
+                }
+            }
+            Key::Named(Named::ArrowDown) => {
+                state.select_next();
+                return Some(self.block_search_snap_task());
+            }
+            Key::Named(Named::ArrowUp) => {
+                state.select_prev();
+                return Some(self.block_search_snap_task());
+            }
+            Key::Named(Named::Home) => {
+                state.select_first();
+                return Some(self.block_search_snap_task());
+            }
+            Key::Named(Named::End) => {

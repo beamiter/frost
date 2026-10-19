@@ -1,0 +1,300 @@
+fn remap_sidebar_location(
+    old_hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    new_hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    location: &remote_fs::FsLocation,
+) -> Option<remote_fs::FsLocation> {
+    match location {
+        remote_fs::FsLocation::Local => Some(remote_fs::FsLocation::Local),
+        remote_fs::FsLocation::Remote(old_index) => {
+            let old_profile = config::validate_remote_host_at(old_hosts, *old_index).ok()?;
+            unique_active_remote_profile_index(new_hosts, old_profile)
+                .map(remote_fs::FsLocation::Remote)
+        }
+        remote_fs::FsLocation::Transient(profile) => config::validate_remote_host(profile)
+            .ok()
+            .map(|()| remote_fs::FsLocation::Transient(profile.clone())),
+    }
+}
+
+fn sidebar_terminal_entry_copy(location: &remote_fs::FsLocation) -> (String, String) {
+    match location {
+        remote_fs::FsLocation::Local => (
+            "Terminal here".to_string(),
+            "Open a new local terminal at the current tree root".to_string(),
+        ),
+        remote_fs::FsLocation::Remote(_) => (
+            "Remote terminal\n(default dir)".to_string(),
+            "Open a new remote terminal for this profile at its default directory".to_string(),
+        ),
+        remote_fs::FsLocation::Transient(profile) => {
+            let endpoint = match &profile.user {
+                Some(user) => format!("{user}@{}", profile.host),
+                None => profile.host.clone(),
+            };
+            let endpoint = jterm_core::review_input::safe_inline_display(&endpoint, 256);
+            (
+                "SSH terminal\n(login shell)".to_string(),
+                format!("Open a plain interactive SSH login to {endpoint}; current SSH options are retained"),
+            )
+        }
+    }
+}
+
+/// UI state for one in-flight sidebar transfer: the shared byte/cancel handle
+/// plus the fixed label the progress notice is built from. `total` is known
+/// only for uploads (the local file's metadata size); downloads and relays
+/// show transferred bytes alone.
+#[derive(Clone)]
+struct SidebarTransferUi {
+    progress: std::sync::Arc<remote_fs::TransferProgress>,
+    verb: String,
+    name: String,
+    total: Option<u64>,
+}
+
+/// Retire only the worker that owns the live progress/cancel handle. A
+/// same-location operation has no owner; an obsolete completion cannot retire
+/// a newer transfer even when both reports share a Files context.
+fn retire_sidebar_transfer_owner(
+    transfer: &mut Option<SidebarTransferUi>,
+    completed: Option<&std::sync::Arc<remote_fs::TransferProgress>>,
+) -> bool {
+    let owns_current = transfer.as_ref().is_some_and(|current| {
+        completed.is_some_and(|owner| std::sync::Arc::ptr_eq(&current.progress, owner))
+    });
+    if owns_current {
+        *transfer = None;
+    }
+    owns_current
+}
+
+impl SidebarTransferUi {
+    /// "download name… 12.4 MiB" / "upload name… 2.0 KiB / 12.4 MiB".
+    fn status_text(&self) -> String {
+        let done = remote_fs::format_bytes(self.progress.bytes());
+        match self.total {
+            Some(total) => crate::sidebar::bound_sidebar_notice(format!(
+                "{} {}… {} / {}",
+                self.verb,
+                self.name,
+                done,
+                remote_fs::format_bytes(total)
+            )),
+            None => crate::sidebar::bound_sidebar_notice(format!(
+                "{} {}… {}",
+                self.verb, self.name, done
+            )),
+        }
+    }
+}
+
+/// A drop burst is capped at this many paths; more is a mistake, not an import.
+const MAX_DROP_ITEMS: usize = 256;
+/// The size pre-walk of a dropped directory descends no deeper than this.
+const MAX_DROP_WALK_DEPTH: usize = 64;
+
+/// One item of a drop plan: source, destination, kind, and a pre-flight error
+/// (name collision or unreadable source) that skips it at execution time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DropItem {
+    src: std::path::PathBuf,
+    dst: std::path::PathBuf,
+    is_dir: bool,
+    error: Option<String>,
+}
+
+/// A planned drop: per-item plan plus the pre-summed byte total.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DropPlan {
+    target_dir: std::path::PathBuf,
+    items: Vec<DropItem>,
+    total_bytes: u64,
+}
+
+/// Immutable interpretation of the first path in one OS drop burst.
+#[derive(Debug)]
+struct SidebarDropIntent {
+    generation: u64,
+    context_epoch: u64,
+    session_id: usize,
+    target_dir: std::path::PathBuf,
+    target_is_local: bool,
+}
+
+const MAX_PENDING_DROP_PLANS: usize = 4;
+
+#[derive(Default)]
+struct SidebarDropIntents {
+    collecting: Option<std::sync::Arc<SidebarDropIntent>>,
+    // Canceled size walks still occupy a slot until their reply arrives.
+    planning: Vec<(std::sync::Arc<SidebarDropIntent>, bool)>,
+}
+
+impl SidebarDropIntents {
+    fn clear(&mut self) {
+        self.collecting = None;
+        for (_, accepted) in &mut self.planning {
+            *accepted = false;
+        }
+    }
+
+    fn can_plan(&self) -> bool {
+        self.planning.len() < MAX_PENDING_DROP_PLANS
+    }
+
+    fn collecting_is(&self, intent: &std::sync::Arc<SidebarDropIntent>) -> bool {
+        self.collecting
+            .as_ref()
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, intent))
+    }
+
+    fn start_planning(&mut self, intent: &std::sync::Arc<SidebarDropIntent>) -> bool {
+        if !self.collecting_is(intent) || !self.can_plan() {
+            return false;
+        }
+        self.collecting = None;
+        self.planning.push((intent.clone(), true));
+        true
+    }
+
+    fn finish_planning(&mut self, intent: &std::sync::Arc<SidebarDropIntent>) -> bool {
+        let Some(index) = self
+            .planning
+            .iter()
+            .position(|(current, _)| std::sync::Arc::ptr_eq(current, intent))
+        else {
+            return false;
+        };
+        self.planning.remove(index).1
+    }
+}
+
+impl SidebarDropIntent {
+    fn capture(
+        generation: u64,
+        context_epoch: Option<u64>,
+        session_id: Option<usize>,
+        target_dir: Option<std::path::PathBuf>,
+        target_is_local: bool,
+    ) -> Option<std::sync::Arc<Self>> {
+        Some(std::sync::Arc::new(Self {
+            generation,
+            context_epoch: context_epoch?,
+            session_id: session_id?,
+            target_dir: target_dir?,
+            target_is_local,
+        }))
+    }
+
+    fn matches_context(
+        &self,
+        generation: u64,
+        epoch: Option<u64>,
+        session_id: Option<usize>,
+    ) -> bool {
+        self.generation == generation
+            && Some(self.context_epoch) == epoch
+            && Some(self.session_id) == session_id
+    }
+}
+
+/// Bounded size walk for one dropped item. Directories recurse to
+/// [`MAX_DROP_WALK_DEPTH`]; a symlinked directory is never followed — the
+/// link contributes its own size only (the local copier recreates it as a
+/// link, and `tar` archives it as one too).
+fn drop_item_size(path: &std::path::Path, depth: usize, max_bytes: u64) -> std::io::Result<u64> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(metadata.len());
+    }
+    if depth >= MAX_DROP_WALK_DEPTH {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is nested too deeply to import",
+                crate::sidebar::bound_sidebar_path_label(path)
+            ),
+        ));
+    }
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        total = total.saturating_add(drop_item_size(&entry.path(), depth + 1, max_bytes)?);
+        if total > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} is too large to import",
+                    crate::sidebar::bound_sidebar_path_label(path)
+                ),
+            ));
+        }
+    }
+    Ok(total)
+}
+
+/// Build the per-item plan for one drop burst, off the UI thread: only
+/// absolute local paths with a file name, at most [`MAX_DROP_ITEMS`] items,
+/// destinations never overwritten (a collision flags the item, never the
+/// whole drop), and a wholesale refusal when the bounded size walk passes
+/// [`remote_fs::MAX_TRANSFER_BYTES`].
+fn plan_drop(
+    paths: Vec<std::path::PathBuf>,
+    target_dir: std::path::PathBuf,
+    target_is_local: bool,
+) -> Result<DropPlan, String> {
+    plan_drop_with_caps(
+        paths,
+        target_dir,
+        target_is_local,
+        MAX_DROP_ITEMS,
+        remote_fs::MAX_TRANSFER_BYTES,
+    )
+}
+
+/// [`plan_drop`] with the caps as parameters, so tests stay small and fast.
+fn plan_drop_with_caps(
+    paths: Vec<std::path::PathBuf>,
+    target_dir: std::path::PathBuf,
+    target_is_local: bool,
+    max_items: usize,
+    max_bytes: u64,
+) -> Result<DropPlan, String> {
+    if paths.is_empty() {
+        return Err("nothing to import".to_string());
+    }
+    if paths.len() > max_items {
+        return Err(format!("a drop is limited to {max_items} items"));
+    }
+    let mut items = Vec::with_capacity(paths.len());
+    let mut total_bytes = 0u64;
+    for path in paths {
+        if !path.is_absolute() {
+            return Err(format!(
+                "{} is not an absolute path",
+                crate::sidebar::bound_sidebar_path_label(&path)
+            ));
+        }
+        let Some(name) = path.file_name() else {
+            return Err(format!(
+                "{} has no file name to import",
+                crate::sidebar::bound_sidebar_path_label(&path)
+            ));
+        };
+        let dst = target_dir.join(name);
+        let mut error = None;
+        let mut is_dir = false;
+        match std::fs::symlink_metadata(&path) {
+            Err(problem) => {
+                error = Some(crate::sidebar::bound_sidebar_notice(format!(
+                    "cannot inspect {}: {problem}",
+                    crate::sidebar::bound_sidebar_path_label(&path)
+                )))
+            }
+            Ok(metadata) => {
+                is_dir = metadata.is_dir();
+                // Remote destinations belong to a different namespace. Only
+                // their backend may check collisions; its no-clobber commit
+                // remains authoritative for every destination.
+                if target_is_local && std::fs::symlink_metadata(&dst).is_ok() {
+                    error = Some(crate::sidebar::bound_sidebar_notice(format!(

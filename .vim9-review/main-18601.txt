@@ -1,0 +1,300 @@
+                    &report.location,
+                    report.location_profile.as_ref(),
+                    self.sidebar_context_epoch,
+                    &self.sidebar.location,
+                    self.sidebar.hosts_snapshot(),
+                ) {
+                    return Task::none();
+                }
+                remap_sidebar_selection(
+                    &mut self.sidebar_selection,
+                    &mut self.sidebar_selection_anchor,
+                    &report.path_remaps,
+                );
+                // Even a failed or cancelled remote mutation may have reached
+                // the server before its transport failed. Re-scan every exact
+                // parent reported by the worker while preserving last-good
+                // children on any subsequent listing failure.
+                let refresh = self.refresh_sidebar_directories(&report.affected_parents);
+                if report.cancelled {
+                    // Neutral abort, not an error; the clipboard survives a
+                    // cancelled cut so nothing is silently consumed. A batch
+                    // brings its own "cancelled after k of N" summary.
+                    let (text, neutral) = report
+                        .warning
+                        .unwrap_or(("Transfer cancelled".to_string(), true));
+                    self.set_sidebar_notice(text, neutral);
+                    return refresh;
+                } else {
+                    match report.result {
+                        Ok(()) => {
+                            match report.warning {
+                                Some((text, neutral)) => {
+                                    self.set_sidebar_notice(text, neutral);
+                                }
+                                None => self.sidebar_notice = None,
+                            }
+                            return refresh;
+                        }
+                        Err(error) => {
+                            self.set_sidebar_notice(error, false);
+                            return refresh;
+                        }
+                    }
+                }
+            }
+            Message::SidebarTransferTick => {
+                if let Some(transfer) = &self.sidebar_transfer {
+                    self.set_sidebar_notice(transfer.status_text(), true);
+                }
+            }
+            Message::SidebarTransferCancel => {
+                // Retire queued drop work too: a late preflight must not
+                // launch another import after the visible transfer is canceled.
+                self.sidebar_drop_intents.clear();
+                self.sidebar_drop_burst.clear();
+                self.sidebar_drop_debounce_generation = None;
+                // The worker watchdog takes the group-kill path; its report
+                // decides the active transfer's final status.
+                if let Some(transfer) = &self.sidebar_transfer {
+                    transfer.progress.cancel();
+                }
+            }
+            Message::SidebarRowHover(generation, row) => {
+                if !self.sidebar.accepts_generation(generation) {
+                    return Task::none();
+                }
+                self.sidebar_hovered_row = row;
+                // Keep the drop hint's target in step with the row under the
+                // pointer while files are dragged over the panel.
+                if self.sidebar_drop_hint && self.sidebar_transfer.is_none() {
+                    if let Some(target) = self.sidebar_drop_target() {
+                        self.set_sidebar_notice(
+                            format!(
+                                "Release to import into {}",
+                                crate::sidebar::bound_sidebar_path_label(&target)
+                            ),
+                            true,
+                        );
+                    }
+                }
+            }
+            Message::SidebarFilterToggle => {
+                self.invalidate_sidebar_remote_follow_intent();
+                if self.sidebar_filter.is_some() {
+                    self.sidebar_filter = None;
+                } else {
+                    self.sidebar_filter = Some(String::new());
+                    return iced::widget::operation::focus(SIDEBAR_FILTER_INPUT_ID.clone());
+                }
+            }
+            Message::SidebarFilterInput(query) => {
+                self.invalidate_sidebar_remote_follow_intent();
+                self.sidebar_filter = crate::sidebar::accepted_sidebar_filter(query)
+                    .or_else(|| self.sidebar_filter.clone());
+            }
+            Message::FileDropped(path) => {
+                // Over the files panel a drop is an import; everywhere else it
+                // keeps today's terminal payload behavior.
+                if !(self.dock_open()
+                    && self.sidebar_panel == SidebarPanel::Files
+                    && self.sidebar_hovered)
+                {
+                    return self.update(Message::ImageDropped(path));
+                }
+                self.invalidate_sidebar_remote_follow_intent();
+                // iced supplies paths, not an OS drag identity. Keep the first
+                // destination throughout the 120ms burst, even if hover moves.
+                let generation = self.sidebar.generation();
+                let session_id = self.sessions.get(self.active).map(|session| session.id);
+                if self.sidebar_drop_debounce_generation != Some(generation)
+                    || !self
+                        .sidebar_drop_intents
+                        .collecting
+                        .as_ref()
+                        .is_some_and(|intent| {
+                            intent.matches_context(
+                                generation,
+                                self.sidebar_context_epoch,
+                                session_id,
+                            )
+                        })
+                {
+                    self.sidebar_drop_burst.clear();
+                    self.sidebar_drop_intents.collecting = None;
+                    self.sidebar_drop_debounce_generation = None;
+                }
+                if self.sidebar_drop_intents.collecting.is_none() {
+                    if !self.sidebar_drop_intents.can_plan() {
+                        self.set_sidebar_notice(
+                            "Drop planning is busy; wait and drop these files again".to_string(),
+                            false,
+                        );
+                        return Task::none();
+                    }
+                    let Some(intent) = SidebarDropIntent::capture(
+                        generation,
+                        self.sidebar_context_epoch,
+                        session_id,
+                        self.sidebar_drop_target(),
+                        self.sidebar.location == remote_fs::FsLocation::Local,
+                    ) else {
+                        return Task::none();
+                    };
+                    self.sidebar_drop_intents.collecting = Some(intent.clone());
+                    self.sidebar_drop_debounce_generation = Some(generation);
+                    self.sidebar_drop_burst.push(path);
+                    return Task::perform(
+                        async move { std::thread::sleep(std::time::Duration::from_millis(120)) },
+                        move |()| Message::SidebarDropFlush(intent),
+                    );
+                }
+                self.sidebar_drop_burst.push(path);
+            }
+            Message::SidebarDropFlush(intent) => {
+                if !self.sidebar_drop_intents.collecting_is(&intent) {
+                    return Task::none();
+                }
+                if self.sidebar_drop_debounce_generation != Some(intent.generation)
+                    || !intent.matches_context(
+                        self.sidebar.generation(),
+                        self.sidebar_context_epoch,
+                        self.sessions.get(self.active).map(|session| session.id),
+                    )
+                {
+                    self.sidebar_drop_intents.collecting = None;
+                    self.sidebar_drop_debounce_generation = None;
+                    self.sidebar_drop_burst.clear();
+                    return Task::none();
+                }
+                self.sidebar_drop_debounce_generation = None;
+                if self.sidebar_drop_hint {
+                    self.sidebar_drop_hint = false;
+                    self.sidebar_notice = None;
+                }
+                let paths = std::mem::take(&mut self.sidebar_drop_burst);
+                if paths.is_empty() {
+                    self.sidebar_drop_intents.collecting = None;
+                    return Task::none();
+                }
+                let target_dir = intent.target_dir.clone();
+                let target_is_local = intent.target_is_local;
+                if !self.sidebar_drop_intents.start_planning(&intent) {
+                    self.sidebar_drop_intents.collecting = None;
+                    self.set_sidebar_notice(
+                        "Drop planning is busy; wait and drop these files again".to_string(),
+                        false,
+                    );
+                    return Task::none();
+                }
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            plan_drop(paths, target_dir, target_is_local)
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(format!("Drop planner failed: {error}")))
+                    },
+                    move |plan| Message::SidebarDropPlanned(intent, plan),
+                );
+            }
+            Message::SidebarDropPlanned(intent, plan) => {
+                if !self.sidebar_drop_intents.finish_planning(&intent)
+                    || !intent.matches_context(
+                        self.sidebar.generation(),
+                        self.sidebar_context_epoch,
+                        self.sessions.get(self.active).map(|session| session.id),
+                    )
+                {
+                    return Task::none();
+                }
+                self.invalidate_sidebar_remote_follow_intent();
+                let plan = match plan {
+                    Ok(plan) => plan,
+                    Err(problem) => {
+                        self.set_sidebar_notice(problem, false);
+                        return Task::none();
+                    }
+                };
+                if self.sidebar_transfer.is_some() {
+                    self.set_sidebar_notice("A transfer is already running".to_string(), false);
+                    return Task::none();
+                }
+                let Some(context_epoch) = self.sidebar_context_epoch else {
+                    self.set_sidebar_notice(
+                        "Files operation identity exhausted; restart Frost before modifying files"
+                            .to_string(),
+                        false,
+                    );
+                    return Task::none();
+                };
+                let total_items = plan.items.len();
+                let target_dir = plan.target_dir.clone();
+                let handle = remote_fs::TransferProgress::new();
+                let ui = SidebarTransferUi {
+                    progress: handle.clone(),
+                    verb: "import".to_string(),
+                    name: format!(
+                        "{total_items} {} into {}",
+                        if total_items == 1 { "item" } else { "items" },
+                        crate::sidebar::bound_sidebar_path_label(&target_dir)
+                    ),
+                    total: Some(plan.total_bytes),
+                };
+                self.set_sidebar_notice(ui.status_text(), true);
+                self.sidebar_transfer = Some(ui);
+                return sidebar_op_task(
+                    context_epoch,
+                    self.sidebar.location.clone(),
+                    self.sidebar.hosts_snapshot().to_vec(),
+                    SidebarOp::BatchTransfer {
+                        src_loc: remote_fs::FsLocation::Local,
+                        items: plan.items,
+                        cut: false,
+                        verb: "Imported",
+                    },
+                    Some(handle),
+                    None,
+                );
+            }
+            Message::SidebarDropHover(inside) => {
+                if inside && self.sidebar_drop_hint {
+                    // Hint already up; nothing to refresh (the target row
+                    // tracks the pointer through SidebarRowHover).
+                } else if inside
+                    && self.dock_open()
+                    && self.sidebar_panel == SidebarPanel::Files
+                    && self.sidebar_transfer.is_none()
+                {
+                    let target = self
+                        .sidebar_drop_target()
+                        .map(crate::sidebar::bound_sidebar_path_label)
+                        .unwrap_or_else(|| {
+                            crate::sidebar::bound_sidebar_path_label(&self.sidebar.current_dir)
+                        });
+                    self.set_sidebar_notice(format!("Release to import into {target}"), true);
+                    self.sidebar_drop_hint = true;
+                } else if !inside && self.sidebar_drop_hint {
+                    self.sidebar_drop_hint = false;
+                    self.sidebar_notice = None;
+                }
+            }
+            Message::SearchToggleRegex => {
+                self.search.toggle_regex();
+                self.recompute_search();
+                self.reveal_current_search_match();
+                if self.search.is_open {
+                    post_update_task = find_focus::refocus(SEARCH_INPUT_ID.clone());
+                }
+            }
+            Message::SearchToggleCase => {
+                self.search.toggle_case_sensitive();
+                self.recompute_search();
+                self.reveal_current_search_match();
+                if self.search.is_open {
+                    post_update_task = find_focus::refocus(SEARCH_INPUT_ID.clone());
+                }
+            }
+            Message::SearchRevealMatch(target) => return self.reveal_hidden_search_match(&target),
+            Message::SearchRevealKey(target, event) => {
+                // Widget actions precede captured-key subscription messages.

@@ -1,0 +1,300 @@
+        );
+        let start = completed[0]
+            .lifecycle
+            .as_ref()
+            .expect("a complete C envelope carries a Start identity");
+        let lifecycle =
+            journal_lifecycle(start).expect("frost converts the Start jsh announced as-is");
+        assert_eq!(lifecycle.id(), "jsh-b8c6-1");
+        assert_eq!(lifecycle.session_id(), session);
+        assert_eq!(lifecycle.seq(), 3);
+        assert_eq!(lifecycle.started_at_ms(), 1_788_571_993_465);
+
+        // A `D` that never arrives closes the block at the next prompt. That
+        // completion is a guess about where output ended, so it carries no
+        // Start and there is nothing to journal it against.
+        let mut inferred = TerminalState::new(40, 8);
+        inferred.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n");
+        inferred.process_input(
+            format!(
+                "\x1b]133;C;id=jsh-b8c6-2;session_id={session};seq=4;\
+                 started_at_ms=1788571993466\x07hi\r\n"
+            )
+            .as_bytes(),
+        );
+        inferred.process_input(b"\x1b]133;A\x07$ ");
+        let completed = inferred.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].completion_provenance,
+            block_mode::CompletionProvenance::BoundaryInferred
+        );
+        assert!(
+            completed[0].lifecycle.is_none(),
+            "a boundary-inferred completion must not carry a journal capability"
+        );
+    }
+
+    /// Durable journal writes happen in exactly one place, behind both gates.
+    ///
+    /// The conversion above is only reachable if the PTY-output path still
+    /// calls it: neutering the loop body, inverting the capture gate, or
+    /// submitting straight from `completed.id` all compile and leave every
+    /// other test green while frost silently journals nothing (or journals
+    /// against a Start it never saw). Neither the gate nor the skip is
+    /// observable after the fact, so pin the shape.
+    #[test]
+    fn durable_journal_writes_are_gated_on_capture_and_a_start_lifecycle() {
+        let source = frost_source();
+        // Built rather than written out, so this test's own source does not
+        // count as one of the call sites it is looking for.
+        let submit = format!("execution_journal::{}(", "submit");
+        assert_eq!(
+            source.matches(&submit).count(),
+            1,
+            "journal output is published from one place or the gates below mean nothing"
+        );
+        let capture_gate = format!(
+            "if jterm_core::execution_journal::{}_enabled() {{",
+            "output_capture"
+        );
+        let gated = braced_block_after(&source, &capture_gate);
+        let submit_at = gated
+            .find(&submit)
+            .expect("the sole journal write sits inside the capture gate");
+        for (required, why) in [
+            (
+                "CompletionProvenance::ShellReported",
+                "a boundary-inferred completion is a guess and must never be journalled",
+            ),
+            (
+                "let Some(lifecycle) =",
+                "the write is bound to a capability, not to a bare id",
+            ),
+            (
+                "completed.lifecycle",
+                "the capability comes from the Start captured at OSC 133 C",
+            ),
+            (
+                "journal_lifecycle",
+                "the conversion under test is the one the submit path uses",
+            ),
+        ] {
+            let at = gated
+                .find(required)
+                .unwrap_or_else(|| panic!("{required} must guard the journal write: {why}"));
+            assert!(
+                at < submit_at,
+                "{required} must come before the write: {why}"
+            );
+        }
+    }
+
+    /// OSC 52 GET crosses the same trust boundary as a write, in the other
+    /// direction. `allow_clipboard_read` defaults closed; pin both the
+    /// permission check and the async host read it guards structurally.
+    #[test]
+    fn an_osc_52_clipboard_get_is_started_only_behind_the_read_permission() {
+        let source = frost_source();
+        let read = format!("iced::clipboard::{}(", "read");
+        let permitted = braced_block_after(&source, "if self.config.allow_clipboard_read {");
+        assert!(
+            permitted.contains(&read),
+            "an OSC 52 GET may only start a host read when the permission is granted"
+        );
+        let blocked =
+            braced_block_after(&source, "if self.host_clipboard_read_blocked_for(id, fd) {");
+        assert!(
+            !blocked.contains(&read),
+            "a blocked host read must not enqueue another iced clipboard read"
+        );
+    }
+
+    #[test]
+    fn an_osc_52_read_completion_honors_the_read_permission() {
+        let source = frost_source();
+        let service = "fn complete_osc52_read(";
+        let service_body = source
+            .split_once(service)
+            .and_then(|(_, rest)| rest.split("\nfn ").next())
+            .expect("complete_osc52_read must exist");
+        assert!(
+            service_body.contains("if allow_clipboard_read && content.len()"),
+            "OSC 52 completions must fail closed when the read permission is denied"
+        );
+        assert!(
+            service_body.contains("terminal.respond_osc52_clipboard(content, terminator)"),
+            "OSC 52 completions must answer through the bounded response path"
+        );
+    }
+
+    #[test]
+    fn osc52_clipboard_writes_are_rate_limited_within_a_window() {
+        let mut window_started = std::time::Instant::now();
+        let mut writes_in_window = 0usize;
+        assert!(admit_osc52_clipboard_write(
+            &mut window_started,
+            &mut writes_in_window
+        ));
+        assert!(admit_osc52_clipboard_write(
+            &mut window_started,
+            &mut writes_in_window
+        ));
+        assert!(
+            !admit_osc52_clipboard_write(&mut window_started, &mut writes_in_window),
+            "a third OSC 52 SET inside the same second must be refused"
+        );
+        assert_eq!(writes_in_window, 2);
+        // A new window resets the budget so a later permitted SET can land.
+        window_started = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        assert!(admit_osc52_clipboard_write(
+            &mut window_started,
+            &mut writes_in_window
+        ));
+        assert_eq!(writes_in_window, 1);
+    }
+
+    #[test]
+    fn an_osc_5522_read_completion_honors_the_read_permission() {
+        let source = frost_source();
+        let service = "fn complete_osc5522_read(";
+        let service_body = source
+            .split_once(service)
+            .and_then(|(_, rest)| rest.split("\nfn ").next())
+            .expect("complete_osc5522_read must exist");
+        assert!(
+            service_body.contains("if !allow_clipboard_read"),
+            "OSC 5522 completions must fail closed when the read permission is denied"
+        );
+        assert!(
+            service_body.contains("type=read:status=EPERM"),
+            "read-disabled OSC 5522 completions must answer EPERM without host data"
+        );
+    }
+
+    #[test]
+    fn an_osc_5522_clipboard_read_is_started_only_behind_the_read_permission() {
+        let source = frost_source();
+        let service = "fn service_osc5522_read(";
+        let service_body = source
+            .split_once(service)
+            .and_then(|(_, rest)| rest.split("\nfn ").next())
+            .expect("service_osc5522_read must exist");
+        assert!(
+            service_body.contains("if !allow_clipboard_read"),
+            "OSC 5522 reads must fail closed when the read permission is denied"
+        );
+        assert!(
+            service_body.contains("type=read:status=EPERM"),
+            "read-disabled OSC 5522 paths must answer EPERM without touching the host clipboard"
+        );
+        let call_site = source
+            .find("service_osc5522_read(")
+            .expect("OSC 5522 reads must go through service_osc5522_read");
+        let before_call = &source[..call_site];
+        assert!(
+            before_call.contains("allow_clipboard_read"),
+            "call sites must thread the read permission into service_osc5522_read"
+        );
+    }
+
+    /// An OSC 52 SET is PTY output asking to replace the host clipboard, so it
+    /// crosses the same trust boundary a read does, in the other direction: a
+    /// program on the far side of an ssh connection choosing what the user's
+    /// next paste produces. `allow_remote_clipboard_write` defaults closed, but
+    /// a default only matters where it is consulted — frost applied the write
+    /// unconditionally while gating reads, and the config test alone never saw
+    /// it. The application site has no runtime handle, so pin it structurally.
+    #[test]
+    fn an_osc_52_clipboard_set_is_applied_only_behind_the_write_permission() {
+        let source = frost_source();
+        // Built rather than written out, so this test's own source does not
+        // count as one of the call sites it is looking for.
+        let opener = format!("if let Some(text) = clip_{} {{", "set");
+        let applied = braced_block_after(&source, &opener);
+        let write = format!("iced::clipboard::{}(", "write");
+        assert_eq!(
+            applied.matches(&write).count(),
+            1,
+            "the OSC 52 SET path writes the clipboard once, or the gate below is bypassable"
+        );
+        let guard = "if self.config.allow_remote_clipboard_write";
+        let condition = applied
+            .split_once(guard)
+            .and_then(|(_, rest)| rest.split_once('{'))
+            .map(|(condition, _)| condition)
+            .expect("the remote clipboard permission guards a block");
+        assert!(condition.contains("&& admit_osc52_clipboard_write("));
+        let permitted = braced_block_after(&applied, &format!("{guard}{condition}{{"));
+        assert!(
+            permitted.contains(&write),
+            "a remote clipboard SET may only be applied with the permission granted"
+        );
+    }
+
+    /// Every interactive shell frost spawns gets a `--session` identity, and
+    /// it is the same string the task reducer binds terminals with. Without
+    /// one, jsh omits `session_id=` from its OSC 133 `C` packets, the Start
+    /// envelope is permanently incomplete, and durable journal output can
+    /// never be published for anything frost runs.
+    #[test]
+    fn every_interactive_shell_is_launched_with_a_valid_jsh_session_identity() {
+        for id in [0usize, 1, 7, usize::from(u8::MAX)] {
+            let session = jsh_session_id(id, None).expect("an interactive shell gets a session");
+            assert_eq!(session, agent_task_ui::terminal_session_id(id));
+            assert!(
+                jterm_core::execution_journal::is_valid_jsh_session_id(&session),
+                "{session} must satisfy jsh's own session grammar"
+            );
+        }
+        assert_ne!(jsh_session_id(1, None), jsh_session_id(2, None));
+
+        // A one-shot helper argv is not the configured shell, and `pty` never
+        // appends `--session` to one, so it is never handed an identity here
+        // either.
+        let helper = vec!["/usr/bin/env".to_string(), "true".to_string()];
+        assert_eq!(jsh_session_id(1, Some(&helper)), None);
+
+        // Minting the identity is only half of it — the spawn has to carry it.
+        // The blocker this round fixed was `Pty::new_with_cwd_env(..., None,
+        // ...)`: jsh then omits `session_id=` from every OSC 133 `C`, no Start
+        // envelope is ever complete, and the journal submit is a permanent
+        // silent no-op. Nothing about a real spawn is observable from a unit
+        // test, so the wiring is guarded structurally.
+        let source = frost_source();
+        // Built rather than written out, so this test's own source does not
+        // count as one of the call sites it is looking for.
+        let spawn = format!("Pty::new_with_cwd_env{}", "(");
+        let spawn_at: Vec<usize> = source
+            .match_indices(&spawn)
+            .map(|(at, _)| at)
+            // Prose about the call site is not a call site.
+            .filter(|at| {
+                let line_start = source[..*at].rfind('\n').map_or(0, |newline| newline + 1);
+                !source[line_start..*at].trim_start().starts_with("//")
+            })
+            .collect();
+        assert_eq!(
+            spawn_at.len(),
+            1,
+            "every session spawn goes through one PTY call site"
+        );
+        let spawn_at = spawn_at[0];
+        assert!(
+            paren_arguments(&source[spawn_at..]).contains("session_id.as_deref()"),
+            "the spawn must hand the minted identity to the PTY, not None"
+        );
+        let minted = source[..spawn_at]
+            .lines()
+            .rev()
+            .nth(1)
+            .expect("the spawn is not the first line of the file")
+            .trim();
+        assert!(
+            minted.starts_with("let session_id = jsh_session_id("),
+            "the identity the PTY receives is minted immediately above it, not \
+             smuggled in from somewhere that could go stale: {minted:?}"
+        );
+    }
+
+    /// frost's own source, for the structural guards over invariants that

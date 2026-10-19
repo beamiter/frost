@@ -1,0 +1,300 @@
+        .as_ref()
+        .and_then(|span| {
+            terminal.zone_output_match_row(hit.zone_id, hit.line_no, span.start, span.end)
+        })
+        .or_else(|| terminal.zone_output_line_row(hit.zone_id, hit.line_no))
+}
+
+/// Explicitly accepting an output hit may unfold only the block proven to
+/// hide its retained row. Query edits and selection movement never call this.
+fn expand_block_search_hit(
+    terminal: &terminal::TerminalState,
+    projection: &terminal::ProjectedViewport,
+    policy: &mut terminal::ProjectionPolicy,
+    hit: &block_mode::BlockSearchHit,
+) -> bool {
+    if projection.policy_revision() != policy.revision() {
+        return false;
+    }
+    let Some(row) = block_search_reveal_row(terminal, hit) else {
+        return false;
+    };
+    let Some(origin) = terminal.raw_cell_origin_at_absolute(row, 0) else {
+        return false;
+    };
+    matches!(
+        terminal.locate_raw_cell_in_projection(projection, origin),
+        terminal::ProjectedRawCellLocation::Hidden { zone_id } if zone_id == hit.zone_id
+    ) && policy.expand(hit.zone_id)
+}
+
+/// Change only finalized output presentation. Provenance is resolved again at
+/// the action boundary; the live prompt/running command is never a candidate.
+fn set_completed_output_collapsed(
+    terminal: &TerminalState,
+    policy: &mut ProjectionPolicy,
+    collapsed: bool,
+) -> usize {
+    if terminal.is_alt_buffer_active() {
+        return 0;
+    }
+    terminal
+        .command_zones
+        .iter()
+        .filter(|zone| {
+            if collapsed {
+                !policy.is_collapsed(zone.id)
+                    && terminal.finished_output_range(zone.id).is_some()
+                    && policy.collapse(zone.id)
+            } else {
+                policy.expand(zone.id)
+            }
+        })
+        .count()
+}
+
+/// Place a pointer-anchored overlay inside the visible window. Prefer below
+/// the pointer; flip above when the estimated panel height would cross the
+/// bottom edge. Tiny windows keep the panel's top-left reachable.
+fn anchored_overlay_position(
+    anchor: iced::Point,
+    window: iced::Size,
+    panel: iced::Size,
+    top_floor: f32,
+) -> iced::Point {
+    const GAP: f32 = 6.0;
+    let anchor_x = if anchor.x.is_finite() { anchor.x } else { 0.0 };
+    let anchor_y = if anchor.y.is_finite() {
+        anchor.y
+    } else {
+        top_floor
+    };
+    let max_x = (window.width - panel.width - GAP).max(GAP);
+    let x = (anchor_x + GAP).clamp(GAP, max_x);
+    let max_y = (window.height - panel.height - GAP).max(top_floor);
+    let below = anchor_y + GAP;
+    let preferred_y = if below + panel.height <= window.height - GAP {
+        below
+    } else {
+        anchor_y - panel.height - GAP
+    };
+    iced::Point::new(x, preferred_y.clamp(top_floor, max_y))
+}
+
+/// Stable target for the block action menu opened from a completed card.
+/// Session identity is stored alongside the zone id because zone ids restart
+/// at zero for every pane; actions fail closed if focus changed underneath it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BlockMenuState {
+    session_id: usize,
+    zone_id: u64,
+    anchor: iced::Point,
+    focused_action: Option<BlockMenuAction>,
+    chat_read_only: bool,
+}
+
+/// Review snapshots never own executable actions. Insert revalidates the live pane,
+/// exact selection and safe payload; ordinary Enter only stays in review.
+#[derive(Clone, Debug)]
+struct BlockReview {
+    session_id: usize,
+    ids: Vec<u64>,
+    title: String,
+    body: String,
+    commands: Option<String>,
+    command_error: Option<String>,
+    bracketed: bool,
+    comparison: Option<block_compare::ComparisonState>,
+}
+
+impl BlockReview {
+    fn matches_selection(
+        &self,
+        session_id: usize,
+        ids: &[u64],
+        commands: &str,
+        bracketed: bool,
+    ) -> bool {
+        self.matches_commands(session_id, ids, commands) && self.bracketed == bracketed
+    }
+
+    fn matches_commands(&self, session_id: usize, ids: &[u64], commands: &str) -> bool {
+        self.session_id == session_id
+            && self.ids == ids
+            && self.commands.as_deref() == Some(commands)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BlockMenuSelectionSummary {
+    selected_count: usize,
+    has_selected_commands: bool,
+    clicked_has_command: bool,
+}
+
+fn block_menu_selection_summary<'a, I>(
+    zones: I,
+    selection: &block_mode::BlockSelection,
+    clicked_id: u64,
+) -> BlockMenuSelectionSummary
+where
+    I: IntoIterator<Item = (u64, Option<&'a str>)>,
+{
+    let mut summary = BlockMenuSelectionSummary::default();
+    for (id, command) in zones {
+        let has_command = command.is_some_and(|command| !command.trim().is_empty());
+        if id == clicked_id {
+            summary.clicked_has_command = has_command;
+        }
+        if selection.contains(id) {
+            summary.selected_count += 1;
+            summary.has_selected_commands |= has_command;
+        }
+    }
+    summary
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockMenuAction {
+    Close,
+    Details,
+    CopyCommand,
+    AskAi,
+    CopyOutput,
+    CopyBlock,
+    CopyMarkdown,
+    RecallCommand,
+    ReinputSelected,
+    ToggleBookmark,
+    JumpTop,
+    JumpBottom,
+    Search,
+    ExportMarkdown,
+    ExportJson,
+    CollapseOutput,
+    ExpandOutput,
+    FixWithAgent,
+    ExplainWithAgent,
+    CreateTask,
+    Retry,
+    Clear,
+    UndoClear,
+}
+
+fn chat_read_only_menu_actions(has_command: bool) -> Vec<BlockMenuAction> {
+    use BlockMenuAction::*;
+    let mut actions = vec![Details, Close];
+    if has_command {
+        actions.push(CopyCommand);
+    }
+    actions.extend([CopyOutput, CopyBlock, CopyMarkdown]);
+    actions
+}
+
+fn chat_menu_target_is_current(
+    menu: BlockMenuState,
+    active_session_id: usize,
+    chat: bool,
+    alt: bool,
+    retained: bool,
+) -> bool {
+    menu.chat_read_only && menu.session_id == active_session_id && chat && !alt && retained
+}
+
+/// The same available actions gate pointer buttons and keyboard activation.
+fn block_menu_actions(
+    collapsed: Option<bool>,
+    selected_commands: bool,
+    clicked_command: bool,
+    failed: bool,
+    tasks_enabled: bool,
+) -> Vec<BlockMenuAction> {
+    use BlockMenuAction::*;
+    let mut actions = vec![Details, Close];
+    if let Some(collapsed) = collapsed {
+        actions.push(if collapsed {
+            ExpandOutput
+        } else {
+            CollapseOutput
+        });
+    }
+    if selected_commands {
+        actions.push(CopyCommand);
+    }
+    actions.push(AskAi);
+    if failed {
+        actions.extend([FixWithAgent, ExplainWithAgent, Retry]);
+        if tasks_enabled {
+            actions.push(CreateTask);
+        }
+    }
+    actions.extend([CopyOutput, CopyBlock, CopyMarkdown]);
+    if clicked_command {
+        actions.push(RecallCommand);
+    }
+    if selected_commands {
+        actions.push(ReinputSelected);
+    }
+    actions.extend([
+        ToggleBookmark,
+        Search,
+        JumpTop,
+        JumpBottom,
+        ExportMarkdown,
+        ExportJson,
+        Clear,
+        UndoClear,
+    ]);
+    actions
+}
+
+fn block_menu_keyboard_target(
+    available: bool,
+    preedit: &str,
+    selected: Option<u64>,
+    retained: bool,
+) -> Option<u64> {
+    if available && preedit.is_empty() && retained {
+        selected
+    } else {
+        None
+    }
+}
+
+fn block_menu_navigation(
+    actions: &[BlockMenuAction],
+    focused: Option<BlockMenuAction>,
+    key: &keyboard::Key,
+) -> Option<BlockMenuAction> {
+    use keyboard::{key::Named, Key};
+    if actions.is_empty() {
+        return None;
+    }
+    let index = focused.and_then(|action| actions.iter().position(|item| *item == action));
+    let index = match key {
+        Key::Named(Named::Home) => 0,
+        Key::Named(Named::End) => actions.len().checked_sub(1)?,
+        Key::Named(Named::ArrowDown) => index.map_or(0, |index| (index + 1) % actions.len()),
+        Key::Named(Named::ArrowUp) => index.map_or(actions.len().checked_sub(1)?, |index| {
+            if index == 0 {
+                actions.len() - 1
+            } else {
+                index - 1
+            }
+        }),
+        _ => return focused.filter(|action| actions.contains(action)),
+    };
+    actions.get(index).copied()
+}
+
+fn review_commands_menu_label(selected_count: usize) -> &'static str {
+    if selected_count > 1 {
+        "Review commands…"
+    } else {
+        "Review command…"
+    }
+}
+
+fn block_menu_command_hint(action: BlockMenuAction) -> Option<&'static str> {
+    match action {
+        BlockMenuAction::RecallCommand => Some("Fill prompt without running"),

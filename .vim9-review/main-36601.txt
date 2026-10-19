@@ -1,0 +1,300 @@
+            root: "/remote/home".into(),
+            listing: Some(remote_fs::DirectoryListing {
+                entries: vec![],
+                truncated: false,
+            }),
+        };
+        assert!(sidebar.commit_probed_location_listing(
+            location.clone(),
+            result.root.clone(),
+            result.listing.unwrap()
+        ));
+        assert_eq!(sidebar.location, location);
+        assert_eq!(sidebar.current_dir, result.root);
+        assert!(
+            sidebar.navigation_pending_target().is_none() && !sidebar.location_change_pending(),
+            "publication must finish before source authority is released"
+        );
+    }
+
+    #[test]
+    fn cancelled_ssh_follow_never_starts_home_or_listing() {
+        let cancellation = remote_fs::CancellationToken::new();
+        cancellation.cancel();
+        let result = probe_sidebar_remote_follow(
+            &remote_fs::FsLocation::Remote(usize::MAX),
+            &[],
+            false,
+            false,
+            &cancellation,
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn staged_ssh_follow_never_overrides_newer_file_tree_or_chrome_intent() {
+        let profile = sidebar_remote_profile("observed", "observed.example");
+        let mut sidebar = sidebar::Sidebar::new();
+        let pending = SidebarRemoteFollow {
+            cancellation: remote_fs::CancellationToken::new(),
+            token: 1,
+            intent_epoch: 0,
+            session_id: 3,
+            source_argv: vec!["ssh".to_string(), "observed.example".to_string()],
+            source_profile: profile.clone(),
+            source_control_path: None,
+            attempt: 0,
+            target_location: remote_fs::FsLocation::Transient(profile),
+            preserve_loaded_tree: false,
+            hosts_epoch: 0,
+            tree_generation: sidebar.generation(),
+            tree_location: sidebar.location.clone(),
+            tree_root: sidebar.current_dir.clone(),
+            sidebar_open: false,
+            sidebar_panel: SidebarPanel::Tabs,
+        };
+        assert!(sidebar_remote_follow_tree_is_current(
+            &pending,
+            &sidebar,
+            false,
+            SidebarPanel::Tabs,
+        ));
+        assert!(sidebar_remote_follow_context_is_current(
+            &pending,
+            &sidebar,
+            false,
+            SidebarPanel::Tabs,
+            0,
+            Some(0),
+            false,
+        ));
+        assert!(
+            !sidebar_remote_follow_context_is_current(
+                &pending,
+                &sidebar,
+                false,
+                SidebarPanel::Tabs,
+                0,
+                Some(2),
+                false,
+            ),
+            "A→B→A chrome values still carry a newer intent epoch"
+        );
+        assert!(
+            !sidebar_remote_follow_context_is_current(
+                &pending,
+                &sidebar,
+                false,
+                SidebarPanel::Tabs,
+                0,
+                Some(0),
+                true,
+            ),
+            "a file operation started after the probe owns the tree"
+        );
+        assert!(!sidebar_remote_follow_tree_is_current(
+            &pending,
+            &sidebar,
+            true,
+            SidebarPanel::Tabs,
+        ));
+        assert!(!sidebar_remote_follow_tree_is_current(
+            &pending,
+            &sidebar,
+            false,
+            SidebarPanel::Files,
+        ));
+        pending.cancellation.cancel();
+        assert!(
+            !sidebar_remote_follow_context_is_current(
+                &pending,
+                &sidebar,
+                false,
+                SidebarPanel::Tabs,
+                0,
+                Some(0),
+                false,
+            ),
+            "completed listing still belongs to the cancelled automatic request"
+        );
+        let _newer = sidebar.refresh();
+        assert!(!sidebar_remote_follow_tree_is_current(
+            &pending,
+            &sidebar,
+            false,
+            SidebarPanel::Tabs,
+        ));
+
+        let retry = (3, vec!["ssh".to_string(), "observed.example".to_string()]);
+        let mut observed = None;
+        let mut retry_once = Some(retry.clone());
+        suppress_armed_sidebar_retry(&mut observed, &mut retry_once);
+        assert_eq!(observed, Some(retry));
+        assert_eq!(retry_once, None);
+    }
+
+    #[test]
+    fn cut_settlement_is_exact_partial_and_aba_safe() {
+        let a = std::path::PathBuf::from("/src/a");
+        let nested = a.join("nested");
+        let b = std::path::PathBuf::from("/src/b");
+        let original = FsClipboard {
+            id: 7,
+            loc: remote_fs::FsLocation::Local,
+            items: vec![(a.clone(), true), (nested, false), (b.clone(), false)],
+            cut: true,
+        };
+        assert_eq!(
+            sidebar_clipboard_id_at_location(Some(&original), &remote_fs::FsLocation::Local),
+            Some(7)
+        );
+        assert_eq!(
+            sidebar_clipboard_id_at_location(Some(&original), &remote_fs::FsLocation::Remote(0)),
+            None,
+            "same path text in another backend must not authorize retirement"
+        );
+
+        let mut active = Some(original.clone());
+        settle_sidebar_clipboard_sources(&mut active, Some(7), std::slice::from_ref(&a));
+        assert_eq!(
+            active.as_ref().map(|clipboard| &clipboard.items),
+            Some(&vec![(b.clone(), false)]),
+            "only the moved source and its descendants retire"
+        );
+
+        let mut replacement = original.clone();
+        replacement.id = 8;
+        let mut active = Some(replacement.clone());
+        settle_sidebar_clipboard_sources(&mut active, Some(7), &[a, b]);
+        assert_eq!(
+            active.as_ref().map(|clipboard| clipboard.id),
+            Some(8),
+            "a newer same-payload Copy/Cut survives the old completion"
+        );
+
+        let mut copied = original;
+        copied.cut = false;
+        let mut active = Some(copied);
+        settle_sidebar_clipboard_sources(
+            &mut active,
+            Some(7),
+            &[std::path::PathBuf::from("/src/a")],
+        );
+        assert_eq!(
+            active.as_ref().map(|clipboard| clipboard.items.len()),
+            Some(1),
+            "rename/delete evidence also retires dangling Copy sources"
+        );
+
+        assert_eq!(next_sidebar_clipboard_id(0), Some(1));
+        assert_eq!(next_sidebar_clipboard_id(u64::MAX), None);
+        assert_eq!(next_sidebar_context_epoch(Some(0)), Some(1));
+        assert_eq!(next_sidebar_context_epoch(Some(u64::MAX)), None);
+        assert_eq!(next_sidebar_context_epoch(None), None);
+    }
+
+    #[test]
+    fn sidebar_menu_paste_rejects_a_new_same_payload_clipboard_intent() {
+        let first = FsClipboard {
+            id: 7,
+            loc: remote_fs::FsLocation::Local,
+            items: vec![(std::path::PathBuf::from("/same.txt"), false)],
+            cut: true,
+        };
+        let mut replacement = first.clone();
+        replacement.id = next_sidebar_clipboard_id(first.id).expect("fresh identity");
+
+        assert_eq!(replacement.loc, first.loc);
+        assert_eq!(replacement.items, first.items);
+        assert_eq!(replacement.cut, first.cut);
+        assert!(sidebar_menu_clipboard_is_current(
+            Some(first.id),
+            Some(first.id)
+        ));
+        assert!(
+            !sidebar_menu_clipboard_is_current(Some(first.id), Some(replacement.id)),
+            "payload equality must not let an old Paste row adopt a new Copy/Cut intent"
+        );
+    }
+
+    #[test]
+    fn sidebar_menu_opened_without_a_clipboard_cannot_adopt_one_later() {
+        assert!(sidebar_menu_clipboard_is_current(None, None));
+        assert!(
+            !sidebar_menu_clipboard_is_current(None, Some(1)),
+            "a disabled Paste row must not become authority for a later clipboard"
+        );
+        assert!(
+            !sidebar_menu_clipboard_is_current(Some(1), None),
+            "clearing the clipboard also expires the open Paste row"
+        );
+    }
+
+    #[test]
+    fn files_terminal_entry_states_its_real_start_directory() {
+        let (local_label, local_help) = sidebar_terminal_entry_copy(&remote_fs::FsLocation::Local);
+        assert!(local_label.contains("here"));
+        assert!(local_help.contains("current tree root"));
+
+        let (remote_label, remote_help) =
+            sidebar_terminal_entry_copy(&remote_fs::FsLocation::Remote(3));
+        assert!(remote_label.contains("default dir"));
+        assert!(remote_help.contains("default directory"));
+
+        let mut transient = sidebar_remote_profile(
+            "temporary",
+            "dsw-notebook-dsw-l8rnh0wm7vs81o7z6j-22.vpc.example.com",
+        );
+        transient.user = Some("root".to_string());
+        let (transient_label, transient_help) =
+            sidebar_terminal_entry_copy(&remote_fs::FsLocation::Transient(transient));
+        assert!(transient_label.contains("login shell"));
+        assert!(transient_help.contains("root@dsw-notebook"));
+        assert!(transient_help.contains("SSH options are retained"));
+    }
+
+    #[test]
+    fn remote_picker_navigation_skips_invalid_and_inactive_drafts() {
+        let mut invalid = config::default_remote_hosts()[0].clone();
+        invalid.host.clear();
+        let mut first = config::default_remote_hosts()[0].clone();
+        first.name = "first".into();
+        let mut second = first.clone();
+        second.name = "second".into();
+        let hosts = vec![invalid.clone(), first, invalid, second];
+
+        assert_eq!(first_runnable_remote_index(&hosts), Some(1));
+        assert_eq!(next_runnable_remote_index(&hosts, 1, true), Some(3));
+        assert_eq!(next_runnable_remote_index(&hosts, 3, true), Some(1));
+        assert_eq!(next_runnable_remote_index(&hosts, 1, false), Some(3));
+
+        let mut over_limit = vec![config::default_remote_hosts()[0].clone(); 129];
+        for host in over_limit.iter_mut().take(128) {
+            host.host.clear();
+        }
+        assert_eq!(first_runnable_remote_index(&over_limit), None);
+    }
+
+    #[test]
+    fn block_badge_treats_wide_continuations_as_occupied() {
+        let mut continuation = terminal::TerminalCell {
+            character: '\0',
+            ..terminal::TerminalCell::default()
+        };
+        continuation.flags.set_wide_continuation(true);
+        let chars = [' ', Frost::block_badge_cell_char(&continuation)];
+        assert!(!block_mode::badge_fits(chars.into_iter(), 1));
+
+        continuation.flags.set_wide_continuation(false);
+        let chars = [' ', Frost::block_badge_cell_char(&continuation)];
+        assert!(block_mode::badge_fits(chars.into_iter(), 1));
+    }
+
+    #[test]
+    fn held_transcript_blocks_user_input_and_marks_the_label() {
+        // The dead-PTY input guard: only a held-open task transcript refuses
+        // user bytes; ordinary sessions forward everything.
+        assert!(user_input_blocked(true));
+        assert!(!user_input_blocked(false));
+
+        // The chrome affordance rides the same predicate.

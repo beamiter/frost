@@ -1,0 +1,300 @@
+            Some(search::SearchMatch {
+                line: 0,
+                col_start: 0,
+                col_end: 2,
+            })
+        );
+        assert_eq!(
+            project_search_match(
+                &terminal,
+                &projection,
+                &search::SearchMatch {
+                    line: 0,
+                    col_start: 5,
+                    col_end: 8,
+                },
+            ),
+            None,
+            "trimmed trailing padding must not inherit the nearest origin"
+        );
+    }
+
+    #[test]
+    fn moving_from_hidden_search_match_clears_only_location_diagnostic() {
+        let mut hidden =
+            Some("Match is hidden in collapsed block #7; expand its output to reveal".to_string());
+        clear_stale_hidden_match_diagnostic(&mut hidden);
+        assert_eq!(hidden, None);
+
+        let mut regex_error = Some("invalid regular expression".to_string());
+        clear_stale_hidden_match_diagnostic(&mut regex_error);
+        assert_eq!(regex_error.as_deref(), Some("invalid regular expression"));
+    }
+
+    #[test]
+    fn collapsed_summary_target_is_stable_and_kitty_is_all_or_nothing() {
+        let mut terminal = terminal::TerminalState::new(24, 8);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07out\r\nmore\r\n\x1b]133;D;0\x07tail",
+        );
+        let zone = terminal.command_zones.back().expect("finished block");
+        let zone_id = zone.id;
+        let output_start = zone.output_start.expect("retained output start");
+        let output_col = zone.output_start_col;
+
+        let identity = terminal.get_projected_viewport(true);
+        assert!(
+            projected_kitty_anchor(&terminal, &identity, output_start, output_col, 1, 2).is_some()
+        );
+
+        let mut policy = terminal::ProjectionPolicy::new();
+        assert!(policy.collapse(zone_id));
+        let mut view_state = terminal::ProjectionViewState::new();
+        let collapsed = terminal.get_projected_viewport_with_state(true, &policy, &mut view_state);
+        let (summary_row, summary_key) = collapsed
+            .row_kinds()
+            .iter()
+            .enumerate()
+            .find_map(|(row, kind)| match kind {
+                terminal::ProjectedRowKind::CollapsedSummary { key, .. } => Some((row, *key)),
+                terminal::ProjectedRowKind::Raw
+                | terminal::ProjectedRowKind::Padding
+                | terminal::ProjectedRowKind::BlockSpacer { .. }
+                | terminal::ProjectedRowKind::BlockChrome { .. } => None,
+            })
+            .expect("visible collapsed summary");
+        let activation = SummaryActivation {
+            key: summary_key,
+            projection_key: collapsed.key(),
+        };
+        assert_eq!(
+            validated_summary_target(&collapsed, &activation),
+            Some(zone_id)
+        );
+        assert_eq!(
+            finalized_block_at_viewport_row(true, &terminal, &collapsed, summary_row),
+            Some(zone_id),
+            "summary retains the right-click block target"
+        );
+        assert_eq!(
+            projected_kitty_anchor(&terminal, &collapsed, output_start, output_col, 1, 2),
+            None,
+            "a placement touching hidden output must disappear as a whole"
+        );
+
+        // A placement whose anchor survives on a shared header/output row is
+        // still hidden when its horizontal extent crosses the collapsed
+        // suffix. Checking only the anchor would incorrectly draw the image.
+        let mut same_row = terminal::TerminalState::new(32, 4);
+        same_row.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07out\x1b]133;D;0\x07 tail",
+        );
+        let same_zone = same_row.command_zones.back().expect("same-row block");
+        let same_zone_id = same_zone.id;
+        let same_output_row = same_zone.output_start.expect("same-row output");
+        let same_output_col = same_zone.output_start_col;
+        assert!(same_output_col > 0);
+        let same_identity = same_row.get_projected_viewport(true);
+        assert!(projected_kitty_anchor(
+            &same_row,
+            &same_identity,
+            same_output_row,
+            same_output_col - 1,
+            2,
+            1,
+        )
+        .is_some());
+        let mut same_policy = terminal::ProjectionPolicy::new();
+        assert!(same_policy.collapse(same_zone_id));
+        let mut same_state = terminal::ProjectionViewState::new();
+        let same_collapsed =
+            same_row.get_projected_viewport_with_state(true, &same_policy, &mut same_state);
+        assert_eq!(
+            projected_kitty_anchor(
+                &same_row,
+                &same_collapsed,
+                same_output_row,
+                same_output_col - 1,
+                2,
+                1,
+            ),
+            None,
+            "horizontal overlap with a hidden suffix hides the whole placement"
+        );
+
+        let mut stale = activation.clone();
+        stale.projection_key.scroll_offset = stale.projection_key.scroll_offset.saturating_add(1);
+        assert_eq!(validated_summary_target(&collapsed, &stale), None);
+        let mut wrong_row = activation;
+        wrong_row.key.zone_id = wrong_row.key.zone_id.saturating_add(1);
+        assert_eq!(validated_summary_target(&collapsed, &wrong_row), None);
+    }
+
+    #[test]
+    fn projected_zone_sweep_is_linear_and_keeps_padding_unowned() {
+        let view_rows: Vec<_> = (0..512).map(|row| (row != 257).then_some(row)).collect();
+        let spans: Vec<_> = (0..256).map(|zone| (zone * 2, zone * 2 + 2)).collect();
+        let memberships = projected_zone_memberships(&view_rows, &spans);
+
+        assert!(memberships.scan_steps <= view_rows.len() + spans.len());
+        assert_eq!(memberships.rows[0], Some((0, 0)));
+        assert_eq!(memberships.rows[256], Some((128, 256)));
+        assert_eq!(memberships.rows[257], None);
+        assert_eq!(memberships.rows[511], Some((255, 511)));
+    }
+
+    #[test]
+    fn collapsed_summary_is_real_top_only_for_headerless_background() {
+        assert_eq!(
+            projected_card_real_top(None, Some(3), block_mode::BlockOutcome::Success,),
+            None,
+            "an offscreen command header remains a clipped card edge"
+        );
+        assert_eq!(
+            projected_card_real_top(None, Some(3), block_mode::BlockOutcome::Background,),
+            Some(3),
+            "a Background summary replaces the entire headerless card"
+        );
+        assert_eq!(
+            projected_card_real_top(Some(1), Some(3), block_mode::BlockOutcome::Background,),
+            Some(1),
+            "a visible real top always wins"
+        );
+    }
+
+    #[test]
+    fn empty_history_row_retains_finished_block_target_without_cell_origin() {
+        let mut terminal = terminal::TerminalState::new(8, 3);
+        let mut first = vec![terminal::TerminalCell::default(); 8];
+        first[0].character = 'A';
+        let empty = vec![terminal::TerminalCell::default(); 8];
+        let mut last = vec![terminal::TerminalCell::default(); 8];
+        last[0].character = 'Z';
+        terminal
+            .scrollback
+            .push_back(terminal::ScrollbackLine::compress(&first, false));
+        terminal
+            .scrollback
+            .push_back(terminal::ScrollbackLine::compress(&empty, false));
+        terminal
+            .scrollback
+            .push_back(terminal::ScrollbackLine::compress(&last, false));
+        terminal.command_zones.push_back(terminal::CommandZone {
+            id: 41,
+            prompt_start: 0,
+            command_start: Some(0),
+            output_start: Some(0),
+            output_start_col: 0,
+            output_end: Some(2),
+            exit_code: Some(0),
+            command: Some("fixture".into()),
+            duration_ms: None,
+            finished_at_ms: None,
+            command_truncated: false,
+            command_exact: false,
+            cwd: None,
+            captured_output: None,
+            captured_output_evicted: false,
+            output_preview: String::new(),
+            start_mark_seen: true,
+            completion_provenance: block_mode::CompletionProvenance::ShellReported,
+            rows_evicted: false,
+        });
+        terminal.set_scroll_offset(terminal.scrollback_len());
+        let projection = terminal.get_projected_viewport(true);
+        let blank_view_row = (0..projection.cells().len())
+            .find(|row| projection.view_row_absolute(*row) == Some(1))
+            .expect("pure empty history row remains projected");
+
+        assert_eq!(
+            projection.view_to_raw(terminal::ViewportCell {
+                row: blank_view_row,
+                col: 0,
+            }),
+            None,
+            "row ownership must not manufacture a selectable cell"
+        );
+        assert_eq!(
+            finalized_block_at_viewport_row(true, &terminal, &projection, blank_view_row),
+            Some(41),
+            "stripe/card and right-click target retain the finished zone"
+        );
+        assert_eq!(
+            validated_claimed_block_target(Some(41), Some(41), true),
+            Some(41)
+        );
+    }
+
+    #[test]
+    fn claimed_block_press_does_not_retarget_after_pty_viewport_shift() {
+        let mut terminal = terminal::TerminalState::new(24, 4);
+        for index in 0..4 {
+            let lifecycle = format!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07cmd{index}\r\n\x1b]133;C\x07out{index}\r\n\x1b]133;D;0\x07"
+            );
+            terminal.process_input(lifecycle.as_bytes());
+        }
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+
+        // Find one physical viewport row that names different finalized zones
+        // at two real scroll offsets. This models the render→update race: the
+        // press carries the first id while PTY/scroll activity changes the
+        // current row mapping before dispatch.
+        let rows = terminal.get_dimensions().1;
+        let mut mappings = Vec::new();
+        for offset in 0..=terminal.scrollback_len() {
+            terminal.set_scroll_offset(offset);
+            let projection = terminal.get_projected_viewport(true);
+            for row in 0..rows {
+                if let Some(id) = finalized_block_at_viewport_row(true, &terminal, &projection, row)
+                {
+                    mappings.push((offset, row, id));
+                }
+            }
+        }
+        let ((render_offset, row, rendered_id), (dispatch_offset, _, current_id)) = mappings
+            .iter()
+            .copied()
+            .enumerate()
+            .find_map(|(index, rendered)| {
+                mappings[index + 1..]
+                    .iter()
+                    .copied()
+                    .find(|current| current.1 == rendered.1 && current.2 != rendered.2)
+                    .map(|current| (rendered, current))
+            })
+            .expect("fixture must shift one viewport row onto a neighbouring block");
+
+        terminal.set_scroll_offset(render_offset);
+        let render_projection = terminal.get_projected_viewport(true);
+        assert_eq!(
+            finalized_block_at_viewport_row(true, &terminal, &render_projection, row),
+            Some(rendered_id)
+        );
+        terminal.set_scroll_offset(dispatch_offset);
+        let dispatch_projection = terminal.get_projected_viewport(true);
+        assert_eq!(
+            finalized_block_at_viewport_row(true, &terminal, &dispatch_projection, row),
+            Some(current_id)
+        );
+        assert!(terminal.zone_by_id(rendered_id).is_some());
+        assert_eq!(
+            validated_claimed_block_target(Some(rendered_id), Some(current_id), true),
+            None,
+            "the neighbour under the shifted viewport must never replace the painted id"
+        );
+        assert_eq!(
+            validated_claimed_block_target(Some(rendered_id), Some(rendered_id), true),
+            Some(rendered_id)
+        );
+        assert_eq!(
+            validated_claimed_block_target(Some(rendered_id), Some(rendered_id), false),
+            None,
+            "an evicted/non-finalized painted target fails closed"
+        );
+    }
+
+    #[test]
+    fn stale_or_exhausted_link_projection_revision_fails_closed() {
+        assert!(link_projection_matches(41, 41));
+        assert!(!link_projection_matches(41, 42));

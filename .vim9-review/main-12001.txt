@@ -1,0 +1,300 @@
+            self.config.is_chat_mode(),
+            sess.terminal.is_alt_buffer_active(),
+            zone.is_some(),
+        ) {
+            self.push_toast("Chat card is no longer available", ToastKind::Info);
+            return Task::none();
+        }
+        let allowed = chat_read_only_menu_actions(
+            zone.and_then(|zone| zone.command.as_deref())
+                .is_some_and(|command| !command.trim().is_empty()),
+        );
+        if !allowed.contains(&action) {
+            return Task::none();
+        }
+        if action == BlockMenuAction::Details {
+            return self.open_block_review(Some(menu.zone_id));
+        }
+        match Self::chat_card_copy_text(&sess.terminal, menu.zone_id, action) {
+            Ok(text) => {
+                self.push_toast("Copied Chat card text", ToastKind::Success);
+                iced::clipboard::write(text)
+            }
+            Err(error) => {
+                let message = match error {
+                    block_mode::SelectedClipboardError::Empty => "No retained text to copy",
+                    block_mode::SelectedClipboardError::OutputUnavailable => {
+                        "Output is no longer retained"
+                    }
+                    block_mode::SelectedClipboardError::TooLarge => {
+                        "Card text exceeds the clipboard limit"
+                    }
+                    block_mode::SelectedClipboardError::Unsafe => {
+                        "Card text cannot be copied safely"
+                    }
+                };
+                self.push_toast(message, ToastKind::Warning);
+                Task::none()
+            }
+        }
+    }
+
+    /// Attach one stable, right-clicked block to the existing Agent panel.
+    /// Output is bounded twice: terminal export never exceeds 1 MiB, then the
+    /// shared AI helper retains only the useful head/tail line window.
+    fn block_ask_ai_task(&mut self, id: u64) -> Task<Message> {
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let Some(semantic) = ad_hoc_block_semantic_context(sess, id, self.config.shell.as_deref())
+        else {
+            self.push_toast("Block no longer available".to_string(), ToastKind::Info);
+            return Task::none();
+        };
+        let context = agent_task::context::ad_hoc_block_context(&semantic);
+        if crate::agent::attached_block_context_is_unsafe(&context) {
+            self.push_toast(
+                "Block context contains control or visual-spoofing characters".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
+        let session_id = sess.id;
+        if !self.agent.is_open || self.agent.bound_session_id != Some(session_id) {
+            self.agent.open(&self.config, session_id);
+        }
+        self.agent.last_manual_completed = Some(context);
+        iced::widget::operation::focus(AGENT_INPUT_ID.clone())
+    }
+
+    /// Start a fresh Agent task for one failed block (ember's Fix/Explain,
+    /// adapted to frost's per-command-approval Shell Agent). The source
+    /// session is found by stable id — not by focus — so the task stays bound
+    /// to the terminal that produced the block. Every guard fails closed with
+    /// a toast and leaves any live Agent task untouched.
+    fn failed_block_agent_task(
+        &mut self,
+        session_id: usize,
+        zone_id: u64,
+        intent: FailedBlockAgentIntent,
+    ) -> Task<Message> {
+        let prepared = self
+            .sessions
+            .iter()
+            .find(|sess| sess.id == session_id)
+            .map(|sess| {
+                let Some(zone) = sess.terminal.zone_by_id(zone_id) else {
+                    return Err("Block menu target is no longer available".to_string());
+                };
+                if !matches!(
+                    block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                    block_mode::BlockOutcome::Failed(_)
+                ) {
+                    return Err(
+                        "Fix/Explain are available for failed command blocks".to_string()
+                    );
+                }
+                if let Some(reason) = block_mode::failed_block_agent_disabled_reason(
+                    zone.command.as_deref(),
+                    zone.command_truncated,
+                    zone.cwd.as_deref(),
+                ) {
+                    return Err(format!("Cannot start an Agent task: {reason}"));
+                }
+                // cwd provenance: the block's recorded cwd is self-reported
+                // OSC 133 data, so it must agree with an independent local
+                // observation of the shell process before it can anchor a
+                // task. SSH/tmux-style wrappers fail closed here.
+                let recorded = zone.cwd.clone().expect("eligibility guarantees a cwd");
+                let reported = sess.terminal.current_working_dir().map(str::to_string);
+                let process = jterm_core::process::process_cwd(sess.pty.get_child_pid());
+                if !block_mode::verified_local_command_cwd(
+                    &recorded,
+                    reported.as_deref(),
+                    process.as_deref(),
+                ) {
+                    return Err(
+                        "Cannot start an Agent task: the recorded cwd is not independently verified; return a local shell to the command's directory first"
+                            .to_string(),
+                    );
+                }
+                let Some(mut semantic) =
+                    ad_hoc_block_semantic_context(sess, zone_id, self.config.shell.as_deref())
+                else {
+                    return Err("Block menu target is no longer available".to_string());
+                };
+                // The verified cwd, not the zone's self-reported one: the
+                // provenance check above is what makes this block eligible to
+                // anchor an Agent task at all.
+                semantic.cwd = Some(recorded);
+                Ok(agent_task::context::ad_hoc_block_context(&semantic))
+            });
+        let context = match prepared {
+            Some(Ok(context)) => context,
+            Some(Err(message)) => {
+                self.push_toast(message, ToastKind::Warning);
+                return Task::none();
+            }
+            None => {
+                self.push_toast(
+                    "Block menu target is no longer available".to_string(),
+                    ToastKind::Info,
+                );
+                return Task::none();
+            }
+        };
+        // The instruction never interpolates command or output text: both are
+        // untrusted PTY evidence and travel only inside the framed context.
+        let prompt = match intent {
+            FailedBlockAgentIntent::Fix => "Fix the attached failed command. Diagnose the root cause from its captured output and propose the smallest safe fix; every command you propose is reviewed before it runs.",
+            FailedBlockAgentIntent::Explain => "Explain the attached failed command: identify the root cause, cite the relevant evidence in its captured output, and propose the smallest safe next step. Do not propose changes unless I ask.",
+        };
+        match self
+            .agent
+            .start_for_block(&self.config, session_id, context, prompt)
+        {
+            Ok(()) => {
+                self.push_toast(
+                    match intent {
+                        FailedBlockAgentIntent::Fix => "Agent is working on the failed command",
+                        FailedBlockAgentIntent::Explain => "Agent is explaining the failed command",
+                    },
+                    ToastKind::Success,
+                );
+                self.agent_drive_task().unwrap_or_else(Task::none)
+            }
+            Err(message) => {
+                self.push_toast(message, ToastKind::Warning);
+                Task::none()
+            }
+        }
+    }
+
+    /// Guarded semantic replay of one failed block's exact command into its
+    /// source pane (ember's Retry). Nothing is written unless the command is
+    /// exact, non-truncated, single-line and safe, its recorded cwd matches an
+    /// independently observed local shell cwd, and the pane sits at an idle,
+    /// empty, bracketed-paste prompt on the main screen. Every refusal fails
+    /// closed with a toast.
+    fn failed_block_retry_task(&mut self, session_id: usize, zone_id: u64) -> Task<Message> {
+        let Some(index) = self.sessions.iter().position(|sess| sess.id == session_id) else {
+            self.push_toast(
+                "Block menu target is no longer available".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        };
+        let prepared: Result<String, String> = {
+            let sess = &mut self.sessions[index];
+            (|| {
+                let Some(zone) = sess.terminal.zone_by_id(zone_id) else {
+                    return Err("Block menu target is no longer available".to_string());
+                };
+                if !matches!(
+                    block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                    block_mode::BlockOutcome::Failed(_)
+                ) {
+                    return Err("Retry is available for failed command blocks".to_string());
+                }
+                let command = zone.command.clone();
+                let command_truncated = zone.command_truncated;
+                let recorded = zone.cwd.clone();
+                let reported = sess.terminal.current_working_dir().map(str::to_string);
+                let process = jterm_core::process::process_cwd(sess.pty.get_child_pid());
+                if let Some(reason) = block_mode::retry_replay_disabled_reason(
+                    command.as_deref(),
+                    command_truncated,
+                    recorded.as_deref(),
+                    reported.as_deref(),
+                    process.as_deref(),
+                ) {
+                    return Err(format!("Command not retried: {reason}"));
+                }
+                if sess.terminal.is_alt_buffer_active() {
+                    return Err("Command not retried: a full-screen program is active".to_string());
+                }
+                if let Some(reason) = block_prompt_replace_blocker(sess.agent_prompt_status()) {
+                    return Err(format!("Command not retried: {reason}"));
+                }
+                if !sess.terminal.is_bracketed_paste_enabled() {
+                    return Err(
+                        "Command not retried: safe replay requires bracketed paste mode"
+                            .to_string(),
+                    );
+                }
+                let command = command.expect("eligibility guarantees a command");
+                let command = command.trim_end_matches(['\r', '\n']).to_string();
+                // Byte-exact replay: any control or visual spoof rejects the
+                // whole command instead of altering what will run.
+                crate::review_text::validate_single_line(
+                    &command,
+                    block_mode::FAILED_BLOCK_COMMAND_MAX_BYTES,
+                )
+                .map_err(|error| format!("Command not retried: {error}"))?;
+                Ok(command)
+            })()
+        };
+        let command = match prepared {
+            Ok(command) => command,
+            Err(message) => {
+                self.push_toast(message, ToastKind::Warning);
+                return Task::none();
+            }
+        };
+        // Final prompt-ownership re-check at the write boundary, same as
+        // reinput: the prompt that was safe above may have changed since.
+        if let Err(reason) = self.session_prompt_replace_ready(session_id) {
+            self.push_toast(format!("Command not retried: {reason}"), ToastKind::Warning);
+            return Task::none();
+        }
+        if self
+            .write_paste_to_session(session_id, &command, block_retry_policy(), true)
+            .written()
+        {
+            self.push_toast("Command queued to run", ToastKind::Success);
+        }
+        Task::none()
+    }
+
+    /// The active pane's target for the palette's failed-block actions: the
+    /// selected block when it is a failed one, otherwise the newest failed
+    /// block (the family's "selected (or latest)" rule).
+    fn palette_failed_block_target(&mut self) -> Option<(usize, u64)> {
+        let sess = self.sessions.get_mut(self.active)?;
+        let ids: Vec<u64> = sess
+            .terminal
+            .command_zones
+            .iter()
+            .map(|zone| zone.id)
+            .collect();
+        sess.block_selection.retain(&ids);
+        let is_failed = |zone: &&terminal::CommandZone| {
+            matches!(
+                block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                block_mode::BlockOutcome::Failed(_)
+            )
+        };
+        let target = sess
+            .block_selection
+            .active()
+            .filter(|id| {
+                sess.terminal
+                    .zone_by_id(*id)
+                    .is_some_and(|zone| is_failed(&zone))
+            })
+            .or_else(|| {
+                sess.terminal
+                    .command_zones
+                    .iter()
+                    .rev()
+                    .find(is_failed)
+                    .map(|zone| zone.id)
+            })?;
+        Some((sess.id, target))
+    }
+
+    /// Palette entry point for Fix/Explain on the active pane's failed block.
+    fn palette_failed_block_agent_task(&mut self, intent: FailedBlockAgentIntent) -> Task<Message> {
+        match self.palette_failed_block_target() {
+            Some((session_id, zone_id)) => {
+                self.failed_block_agent_task(session_id, zone_id, intent)

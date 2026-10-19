@@ -1,0 +1,300 @@
+                Task::none()
+            }
+            Some(text) => {
+                let n = text.chars().count();
+                self.push_toast(
+                    format!("Copied last output ({} chars)", n),
+                    ToastKind::Success,
+                );
+                iced::clipboard::write(text)
+            }
+            None => {
+                self.push_toast(
+                    self.block_absent_toast("command output to copy"),
+                    ToastKind::Info,
+                );
+                Task::none()
+            }
+        }
+    }
+
+    /// Select zone `id` in the active session and reveal its first row — the
+    /// shared tail of every "jump the selection somewhere" action (select
+    /// step, failed jumps, the block search picker). A zone whose rows were
+    /// trimmed out of scrollback is still selected (its metadata actions all
+    /// work) but cannot be scrolled to: it toasts instead, with ember's
+    /// wording. A vanished id — evicted by the 256-zone cap while (say) the
+    /// search picker held the hit — toasts too, with the same wording the
+    /// other block actions use for a gone zone, instead of silently doing
+    /// nothing.
+    fn select_and_reveal_block(&mut self, id: u64) {
+        let Some(sess) = self.sessions.get(self.active) else {
+            return;
+        };
+        let Some((prompt_row, rows_evicted)) = sess
+            .terminal
+            .zone_by_id(id)
+            .map(|zone| (zone.prompt_start, zone.rows_evicted))
+        else {
+            self.push_toast("Block no longer available".to_string(), ToastKind::Warning);
+            return;
+        };
+        if let Some(sess) = self.sessions.get_mut(self.active) {
+            sess.projection_view_state.release_reading_position();
+            sess.block_selection.replace(Some(id));
+            sess.block_reading.visit(id);
+            if !rows_evicted {
+                sess.reveal_absolute_cell(prompt_row, 0);
+            }
+            sess.refresh();
+        }
+        if rows_evicted {
+            self.push_toast(
+                "Command position is no longer in scrollback".to_string(),
+                ToastKind::Info,
+            );
+        }
+    }
+
+    /// Select a cross-block search result and reveal the physical soft-wrap row
+    /// containing its first match when those live rows still exist. Captured
+    /// snapshots can outlive or differ from scrollback, so an invalid span
+    /// falls back first to the logical line and then to the ordinary block
+    /// header reveal performed by `select_and_reveal_block`.
+    fn reveal_block_search_hit(&mut self, hit: &block_mode::BlockSearchHit) {
+        self.select_and_reveal_block(hit.zone_id);
+        if !hit.is_output_line || hit.line_no == 0 {
+            return;
+        }
+        let row = self
+            .sessions
+            .get(self.active)
+            .and_then(|sess| block_search_reveal_row(&sess.terminal, hit));
+        if let Some(row) = row {
+            if let Some(sess) = self.sessions.get_mut(self.active) {
+                if expand_block_search_hit(
+                    &sess.terminal,
+                    &sess.projection,
+                    &mut sess.projection_policy,
+                    hit,
+                ) {
+                    // Rebuild before resolving the same raw output row. Do
+                    // not send input or change the active prompt's draft.
+                    sess.refresh();
+                    self.session_dirty = true;
+                }
+                sess.reveal_absolute_cell(row, 0);
+            }
+        }
+    }
+
+    /// Select and reveal the oldest block whose command failed (exit reported
+    /// and nonzero). Shared by the keybinding and the command palette; works
+    /// even while block-mode rendering is disabled.
+    fn block_jump_first_failed(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Failed-block navigation") {
+            return Task::none();
+        }
+        let target = self
+            .sessions
+            .get(self.active)
+            .and_then(|sess| sess.terminal.first_failed_zone().map(|zone| zone.id));
+        match target {
+            Some(id) => self.select_and_reveal_block(id),
+            None => self.push_toast(
+                self.block_absent_toast("failed command block"),
+                ToastKind::Info,
+            ),
+        }
+        Task::none()
+    }
+
+    /// Step the block selection across FAILED zones only (`older` = toward
+    /// the top) — the failed-only counterpart of [`Self::block_select_step`],
+    /// classified exactly like the scrollbar's failure markers. No (or a
+    /// dangling) selection enters at the newest failure when moving older and
+    /// the oldest when moving newer; stepping past an edge wraps. Zero failed
+    /// zones toasts (jump-first-failed's wording).
+    fn block_jump_failed_step(&mut self, older: bool) -> Task<Message> {
+        if !self.ensure_block_action_available("Failed-block navigation") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let zones: Vec<(u64, bool)> = sess
+            .terminal
+            .command_zones
+            .iter()
+            .map(|zone| {
+                (
+                    zone.id,
+                    matches!(
+                        block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                        block_mode::BlockOutcome::Failed(_)
+                    ),
+                )
+            })
+            .collect();
+        if !zones.iter().any(|&(_, failed)| failed) {
+            self.push_toast(
+                self.block_absent_toast("failed command block"),
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
+        let current = sess.block_selection.active();
+        let Some(target) = block_mode::select_failed_neighbor(&zones, current, older) else {
+            return Task::none();
+        };
+        self.select_and_reveal_block(target);
+        Task::none()
+    }
+
+    /// Drop a block selection whose zone no longer exists (trimmed away with
+    /// old scrollback) and tell the user why nothing was copied or recalled.
+    fn clear_stale_block_selection(&mut self) {
+        if let Some(sess) = self.sessions.get_mut(self.active) {
+            sess.block_selection.clear();
+        }
+        self.push_toast("Block no longer available".to_string(), ToastKind::Warning);
+    }
+
+    /// Copy a live whole-block selection in terminal order. `None` means no
+    /// block selection exists and lets ordinary copy/fallback behavior proceed;
+    /// `Some` means block selection owned the request, including an error toast.
+    fn block_copy_selected_task(
+        &mut self,
+        mode: block_mode::SelectedClipboardMode,
+    ) -> Option<Task<Message>> {
+        let result = {
+            let sess = self.sessions.get_mut(self.active)?;
+            if !self.config.is_block_mode() || sess.terminal.is_alt_buffer_active() {
+                return None;
+            }
+            if sess.block_selection.is_empty() {
+                return None;
+            }
+            let ids: Vec<u64> = sess
+                .terminal
+                .command_zones
+                .iter()
+                .map(|zone| zone.id)
+                .collect();
+            if !sess.block_selection.retain(&ids) {
+                Err(block_mode::SelectedClipboardError::Empty)
+            } else {
+                block_mode::selected_clipboard_text(
+                    sess.terminal
+                        .command_zones
+                        .iter()
+                        .filter(|zone| sess.block_selection.contains(zone.id))
+                        .map(|zone| {
+                            let output = if mode == block_mode::SelectedClipboardMode::Commands {
+                                block_mode::ClipboardOutput::Empty
+                            } else {
+                                match sess.terminal.zone_output_export_capped(zone.id) {
+                                    Some(terminal::ZoneOutputExport::Available {
+                                        text, ..
+                                    }) => block_mode::ClipboardOutput::Available(text),
+                                    Some(terminal::ZoneOutputExport::Empty) => {
+                                        block_mode::ClipboardOutput::Empty
+                                    }
+                                    Some(terminal::ZoneOutputExport::Unavailable) | None => {
+                                        block_mode::ClipboardOutput::Unavailable
+                                    }
+                                }
+                            };
+                            (zone.id, zone.command.as_deref(), output)
+                        }),
+                    &sess.block_selection,
+                    mode,
+                    block_mode::SELECTED_CLIPBOARD_MAX_BYTES,
+                )
+            }
+        };
+
+        match result {
+            Ok(copied) => {
+                let noun = match mode {
+                    block_mode::SelectedClipboardMode::Commands => "command",
+                    block_mode::SelectedClipboardMode::Outputs => "output",
+                    block_mode::SelectedClipboardMode::Blocks => "block",
+                };
+                self.push_toast(
+                    format!(
+                        "Copied {} selected block {noun}{}",
+                        copied.block_count,
+                        if copied.block_count == 1 { "" } else { "s" }
+                    ),
+                    ToastKind::Success,
+                );
+                Some(iced::clipboard::write(copied.text))
+            }
+            Err(block_mode::SelectedClipboardError::Empty) => {
+                let message = match mode {
+                    block_mode::SelectedClipboardMode::Commands => {
+                        "Selected blocks have no commands to copy"
+                    }
+                    block_mode::SelectedClipboardMode::Outputs => {
+                        "Selected blocks have no output to copy"
+                    }
+                    block_mode::SelectedClipboardMode::Blocks => {
+                        "Selected blocks have no content to copy"
+                    }
+                };
+                self.push_toast(message.to_string(), ToastKind::Info);
+                Some(Task::none())
+            }
+            Err(block_mode::SelectedClipboardError::OutputUnavailable) => {
+                self.push_toast(
+                    "Selected block output is no longer retained; nothing was copied".to_string(),
+                    ToastKind::Warning,
+                );
+                Some(Task::none())
+            }
+            Err(block_mode::SelectedClipboardError::TooLarge) => {
+                self.push_toast(
+                    "Selected block content is too large to copy".to_string(),
+                    ToastKind::Warning,
+                );
+                Some(Task::none())
+            }
+            Err(block_mode::SelectedClipboardError::Unsafe) => {
+                self.push_toast(
+                    "Selected block content contains control or visual-spoofing characters; nothing was copied"
+                        .to_string(),
+                    ToastKind::Warning,
+                );
+                Some(Task::none())
+            }
+        }
+    }
+
+    /// The command line a block copy/recall action should act on, paired with
+    /// whether shell metadata or Frost's bounded capture marked it truncated.
+    /// With a block selected, only
+    /// THAT block may supply it: a vanished zone clears the selection, a
+    /// command-less zone toasts — never a silent substitution of a different
+    /// block. Only when no block is selected does this fall back to the
+    /// newest completed block with a command. `None` means "do nothing" and a
+    /// toast was already pushed (`verb` names the action in the no-fallback
+    /// message).
+    fn block_action_command(&mut self, verb: &str) -> Option<(String, bool)> {
+        let sess = self.sessions.get(self.active)?;
+        let Some(id) = sess.block_selection.active() else {
+            let fallback = sess.terminal.command_zones.iter().rev().find_map(|zone| {
+                zone.command
+                    .clone()
+                    .map(|command| (command, zone.command_truncated))
+            });
+            if fallback.is_none() {
+                self.push_toast(
+                    self.block_absent_toast(&format!("block command to {verb}")),
+                    ToastKind::Info,
+                );
+            }
+            return fallback;
+        };
+        let Some(zone) = sess.terminal.zone_by_id(id) else {
+            self.clear_stale_block_selection();

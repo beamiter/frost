@@ -1,0 +1,300 @@
+            ));
+        }
+        if i < last_idx {
+            menu = menu.push(row_btn(
+                "Close to Right",
+                Message::TabMenuAction(TabMenuAction::CloseToRight(id)),
+            ));
+        }
+        if marked_count > 0 {
+            menu = menu.push(row_btn(
+                &format!("Close Marked Tabs ({marked_count})"),
+                Message::TabMenuAction(TabMenuAction::CloseMarked),
+            ));
+        }
+        for (index, host) in self
+            .config
+            .remote_hosts
+            .iter()
+            .take(config::MAX_REMOTE_HOSTS)
+            .enumerate()
+        {
+            let unavailable =
+                config::validate_remote_host_at(&self.config.remote_hosts, index).is_err();
+            let mut label = config::remote_host_display_name(host, index);
+            if unavailable {
+                label.push_str(" (unavailable)");
+            }
+            menu = menu.push(row_btn(
+                &format!("Remote: {label}"),
+                Message::TabMenuAction(TabMenuAction::ConnectRemote(index)),
+            ));
+        }
+
+        // Item count for the height estimate the placement clamps against:
+        // the seven always-present entries plus the conditional ones.
+        let rows = 7
+            + usize::from(!only_one)
+            + usize::from(i < last_idx)
+            + usize::from(marked_count > 0)
+            + self.config.remote_hosts.len().min(config::MAX_REMOTE_HOSTS);
+        self.float_tab_menu(menu, rows)
+    }
+
+    /// Place an open tab menu at the pointer position that summoned it, over a
+    /// dismiss-on-outside-click sheet.
+    ///
+    /// The panel is a free-floating overlay, so it has to be positioned by
+    /// hand: iced has no popup anchored to a widget. Centering it (as this did
+    /// before) puts it nowhere near the tab that was right-clicked — obviously
+    /// wrong once the tab list is docked in the sidebar. `rows` drives the
+    /// height estimate that keeps the panel inside the window; being a little
+    /// off only shifts a menu that was near the bottom edge anyway.
+    fn float_tab_menu<'a>(
+        &'a self,
+        menu: iced::widget::Column<'a, Message>,
+        rows: usize,
+    ) -> Element<'a, Message> {
+        const EDGE_GAP: f32 = 4.0;
+        let size = theme::popup_menu_size(
+            self.effective_font_size(),
+            rows,
+            iced::Size::new(
+                (self.win_size.width - EDGE_GAP * 2.0).max(1.0),
+                (self.win_size.height - self.tab_bar_height() - EDGE_GAP * 2.0).max(1.0),
+            ),
+        );
+        let x = self
+            .tab_menu_at
+            .x
+            .min(self.win_size.width - size.width - EDGE_GAP)
+            .max(EDGE_GAP);
+        let y = self
+            .tab_menu_at
+            .y
+            .min(self.win_size.height - size.height - EDGE_GAP)
+            .max(self.tab_bar_height() + EDGE_GAP);
+
+        let panel = container(scrollable(menu).height(Length::Shrink))
+            .width(Length::Fixed(size.width))
+            .max_height(size.height)
+            .padding(8)
+            .style(self.popup_style());
+
+        // Dismiss-on-outside-click sheet behind the panel.
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::TabMenuClose);
+        let placed = container(panel)
+            .align_left(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(iced::Padding::from(0).top(y).left(x));
+        stack![Element::from(dismiss), Element::from(placed)].into()
+    }
+
+    /// Floating file-ops menu opened by right-clicking a file-tree row (or the
+    /// empty area below the tree, which targets the root dir). Placement is
+    /// the tab menu's: pointer-anchored and clamped into the window. With a
+    /// multi-row selection the node-scoped actions apply to all targets and
+    /// Rename/New are disabled (they only make sense for one row).
+    fn sidebar_menu_view(&self, state: &SidebarMenuState) -> Element<'_, Message> {
+        let multi = state.targets.len();
+        let header = if multi > 1 {
+            format!("{multi} items selected")
+        } else {
+            crate::sidebar::bound_sidebar_path_label(&state.path)
+        };
+        let mut menu = column![self
+            .popup_text(header)
+            .size(self.effective_font_size())
+            .color(self.c_text_dim())]
+        .spacing(2);
+        let paste_clip = self.sidebar_clipboard.as_ref();
+        let paste_label = match paste_clip {
+            Some(clip) => {
+                let verb = transfer_verb(
+                    &clip.loc,
+                    &self.sidebar.location,
+                    self.sidebar.hosts_snapshot(),
+                    clip.cut,
+                );
+                match clip.items.as_slice() {
+                    [(path, is_dir)] => {
+                        let name = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let suffix = if *is_dir { "/" } else { "" };
+                        format!("Paste {name}{suffix} ({verb})")
+                    }
+                    items => format!("Paste {} items ({verb})", items.len()),
+                }
+            }
+            None => "Paste".to_string(),
+        };
+        let actions = self.sidebar_menu_action_list(multi, state.is_dir);
+        for (index, (action, enabled, label)) in actions.into_iter().enumerate() {
+            let label = if action == SidebarMenuAction::Paste {
+                paste_label.clone()
+            } else {
+                label
+            };
+            let focused = index == state.cursor;
+            let row: Element<'_, Message> = if enabled {
+                let mut btn = button(self.popup_text(label))
+                    .on_press(Message::SidebarMenuAction(action))
+                    .padding([4, 10])
+                    .width(Length::Fill);
+                btn = if focused {
+                    btn.style(self.tab_btn_style(true))
+                } else {
+                    btn.style(self.ghost_btn_style())
+                };
+                btn.into()
+            } else {
+                button(self.popup_text(label).color(self.c_text_dim()))
+                    .padding([4, 10])
+                    .width(Length::Fill)
+                    .style(self.ghost_btn_style())
+                    .into()
+            };
+            menu = menu.push(row);
+        }
+
+        const EDGE_GAP: f32 = 4.0;
+        let action_rows = 9 + usize::from(multi == 1 && state.is_dir);
+        let size = theme::popup_menu_size(
+            self.effective_font_size(),
+            action_rows,
+            iced::Size::new(
+                (self.win_size.width - EDGE_GAP * 2.0).max(1.0),
+                (self.win_size.height - self.tab_bar_height() - EDGE_GAP * 2.0).max(1.0),
+            ),
+        );
+        let x = state
+            .at
+            .x
+            .min(self.win_size.width - size.width - EDGE_GAP)
+            .max(EDGE_GAP);
+        let y = state
+            .at
+            .y
+            .min(self.win_size.height - size.height - EDGE_GAP)
+            .max(self.tab_bar_height() + EDGE_GAP);
+        let panel = container(scrollable(menu).height(Length::Shrink))
+            .width(Length::Fixed(size.width))
+            .max_height(size.height)
+            .padding(8)
+            .style(self.popup_style());
+        // Dismiss-on-outside-click sheet behind the panel.
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::SidebarMenuClose);
+        let placed = container(panel)
+            .align_left(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(iced::Padding::from(0).top(y).left(x));
+        stack![Element::from(dismiss), Element::from(placed)].into()
+    }
+
+    /// Centered modal collecting a name for New File / New Folder / Rename.
+    /// Validation errors show inline and keep the dialog open; Enter submits,
+    /// Esc cancels (both also handled at the app key layer).
+    fn sidebar_dialog_view(&self, state: &SidebarDialogState) -> Element<'_, Message> {
+        let (title, placeholder, confirm) = match state.kind {
+            SidebarDialogKind::NewFile => ("New file", "file name", "Create"),
+            SidebarDialogKind::NewFolder => ("New folder", "folder name", "Create"),
+            SidebarDialogKind::Rename => ("Rename", "new name", "Rename"),
+        };
+        let mut body = column![
+            self.popup_text(title).size(self.effective_font_size()),
+            self.popup_text(crate::sidebar::bound_sidebar_notice(
+                state.path.display().to_string(),
+            ))
+            .size(self.effective_font_size())
+            .wrapping(text::Wrapping::Word)
+            .color(self.c_text_dim()),
+            text_input(placeholder, &state.input)
+                .font(self.mono)
+                .style(self.popup_input_style())
+                .id(SIDEBAR_DIALOG_INPUT_ID.clone())
+                .on_input(Message::SidebarDialogInput)
+                .on_submit(Message::SidebarDialogSubmit)
+                .size(self.effective_font_size()),
+        ]
+        .spacing(8);
+        if let Some(error) = &state.error {
+            body = body.push(
+                self.popup_text(crate::sidebar::bound_sidebar_notice(error))
+                    .size(self.effective_font_size())
+                    .style(text::danger),
+            );
+        }
+        body = body.push(
+            row![
+                button(self.popup_text("Cancel").size(self.effective_font_size()))
+                    .on_press(Message::SidebarDialogCancel)
+                    .padding([4, 12])
+                    .style(self.ghost_btn_style()),
+                Space::new().width(Length::Fill),
+                button(self.popup_text(confirm).size(self.effective_font_size()))
+                    .on_press(Message::SidebarDialogSubmit)
+                    .padding([4, 12]),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        );
+        let panel = container(scrollable(body).height(Length::Shrink))
+            .width(Length::Fixed(
+                (self.win_size.width - 16.0).clamp(1.0, 360.0),
+            ))
+            .padding(14)
+            .max_height((self.win_size.height - 16.0).max(1.0))
+            .style(self.popup_style());
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::SidebarDialogCancel);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
+    /// Centered modal confirming a deletion: the count up front, the first
+    /// few full paths spelled out. There is no trash and no undo, locally or
+    /// over ssh.
+    fn sidebar_delete_confirm_view(&self, paths: &[std::path::PathBuf]) -> Element<'_, Message> {
+        let count = paths.len();
+        let title = if count == 1 {
+            "Delete permanently?".to_string()
+        } else {
+            format!("Delete {count} items permanently?")
+        };
+        let mut body = column![self.popup_text(title).size(self.effective_font_size())].spacing(10);
+        for path in paths.iter().take(5) {
+            body = body.push(
+                self.popup_text(crate::sidebar::bound_sidebar_path_label(path))
+                    .size(self.effective_font_size())
+                    .wrapping(text::Wrapping::Word)
+                    .color(self.c_text_dim()),
+            );
+        }
+        if count > 5 {
+            body = body.push(
+                self.popup_text(format!("…and {} more", count - 5))
+                    .size(self.effective_font_size())
+                    .color(self.c_text_dim()),
+            );
+        }
+        body = body.push(
+            self.popup_text(
+                "Directories are removed with everything inside them. This cannot be undone.",

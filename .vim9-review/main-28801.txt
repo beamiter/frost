@@ -1,0 +1,300 @@
+
+    /// Enter the bounded, cancellable background preparation phase for a
+    /// native provider session (Codex app-server or Claude stream-json MVP).
+    /// Consent is re-evaluated here and again when the prepared result lands.
+    fn task_start_native(&mut self, task_id: agent_task::TaskId) {
+        if self.task_panel.selected == Some(task_id) {
+            self.task_panel.retire_follow_up();
+        }
+        let policy = agent_task_ui::prompt_policy(&self.config);
+        let provider = self.task_manager.get(task_id).map(|task| task.provider);
+        let Some(provider) = provider else {
+            self.push_toast("Agent task is no longer available", ToastKind::Warning);
+            return;
+        };
+        if !provider.supports_native_driver() {
+            self.task_open_terminal(task_id);
+            return;
+        }
+        if !policy.share_command_context {
+            self.push_toast(
+                format!(
+                    "Start {} requires AI and command-context sharing in Settings",
+                    crate::review_text::bound_provider_label(provider.display_name())
+                ),
+                ToastKind::Warning,
+            );
+            return;
+        }
+        let start = match provider {
+            agent_task::AgentProvider::Codex => {
+                self.agent_runtime
+                    .start_codex(&mut self.task_manager, task_id, policy)
+            }
+            agent_task::AgentProvider::Claude => {
+                self.agent_runtime
+                    .start_claude(&mut self.task_manager, task_id, policy)
+            }
+            agent_task::AgentProvider::Kimi => {
+                self.agent_runtime
+                    .start_kimi(&mut self.task_manager, task_id, policy)
+            }
+            agent_task::AgentProvider::OpenCode => {
+                self.task_open_terminal(task_id);
+                return;
+            }
+        };
+        match start {
+            Ok(()) => self.push_toast(
+                format!(
+                    "Preparing a native {} session…",
+                    crate::review_text::bound_provider_label(provider.display_name())
+                ),
+                ToastKind::Info,
+            ),
+            Err(error) => self.push_toast(
+                format!(
+                    "{error}. You can Open {} in a terminal instead.",
+                    crate::review_text::bound_provider_label(provider.display_name())
+                ),
+                ToastKind::Warning,
+            ),
+        }
+    }
+
+    /// Open a coding-agent CLI in a fresh tab at the active pane cwd.
+    fn agent_launch_in_tab(&mut self, provider: agent_task::AgentProvider) {
+        let executable = match provider.ensure_executable_available() {
+            Ok(path) => path,
+            Err(error) => {
+                self.push_toast(error.to_string(), ToastKind::Warning);
+                return;
+            }
+        };
+        let Some(argv0) = executable.to_str().map(str::to_owned) else {
+            self.push_toast(
+                format!(
+                    "{} path is not valid UTF-8",
+                    crate::review_text::bound_provider_label(provider.display_name())
+                ),
+                ToastKind::Warning,
+            );
+            return;
+        };
+        let cwd = self.sessions.get(self.active).and_then(|s| s.cwd());
+        match Session::spawn_argv(
+            &self.config,
+            self.next_id,
+            self.cols,
+            self.rows,
+            cwd.as_deref(),
+            Some(&[argv0]),
+        ) {
+            Ok(session) => {
+                self.session_diagnostic = None;
+                self.next_id += 1;
+                let insert = (self.active + 1).min(self.sessions.len());
+                self.sessions.insert(insert, session);
+                apply_theme_colors(&mut self.sessions[insert].terminal, &self.theme);
+                self.reindex_tabs_after_insert(insert);
+                self.open_tab_with(insert);
+                self.relayout();
+                self.refresh_active_context();
+                self.save_session_snapshot();
+                self.push_toast(
+                    format!(
+                        "Opened {} in a new tab",
+                        crate::review_text::bound_provider_label(provider.display_name())
+                    ),
+                    ToastKind::Success,
+                );
+            }
+            Err(error) => {
+                let message = error.to_string();
+                log::error!("[PTY] {message}");
+                self.session_diagnostic =
+                    Some(crate::review_text::bound_diagnostic_text(message.clone()));
+                self.push_toast(message, ToastKind::Warning);
+            }
+        }
+    }
+
+    /// Drain pending worktree creation, native provider events, and the diff
+    /// worker. Driven by the iced tick subscription; never blocks.
+    fn tasks_tick(&mut self) {
+        let pending = self
+            .task_panel
+            .pending_creation
+            .as_ref()
+            .map(|pending| pending.receiver.try_recv());
+        match pending {
+            None | Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {}
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.task_panel.pending_creation = None;
+                self.push_toast(
+                    "Task worktree worker stopped unexpectedly",
+                    ToastKind::Warning,
+                );
+            }
+            Some(Ok(Err(error))) => {
+                self.task_panel.pending_creation = None;
+                self.push_toast(
+                    format!("Could not create task worktree: {error}"),
+                    ToastKind::Warning,
+                );
+            }
+            Some(Ok(Ok(prepared))) => {
+                self.task_panel.pending_creation = None;
+                let provider_name =
+                    crate::review_text::bound_provider_label(prepared.provider.display_name());
+                let worktree = prepared.worktree;
+                let new_task = agent_task::NewTask {
+                    title: prepared.title,
+                    provider: prepared.provider,
+                    repo_root: worktree.repository,
+                    worktree_path: worktree.path,
+                    branch: worktree.branch,
+                    base_commit: worktree.head,
+                    source_context: Some(prepared.context),
+                };
+                match self.task_manager.create(new_task) {
+                    Ok(task_id) => {
+                        self.task_panel.select(Some(task_id));
+                        match prepared.provider {
+                            agent_task::AgentProvider::Codex => {
+                                self.push_toast(
+                                    format!(
+                                        "Created an isolated {provider_name} task; choose Start {provider_name}"
+                                    ),
+                                    ToastKind::Success,
+                                );
+                            }
+                            agent_task::AgentProvider::Claude | agent_task::AgentProvider::Kimi => {
+                                self.push_toast(
+                                    format!(
+                                        "Created an isolated {provider_name} task; starting native {provider_name}…"
+                                    ),
+                                    ToastKind::Success,
+                                );
+                                self.task_start_native(task_id);
+                            }
+                            agent_task::AgentProvider::OpenCode => {
+                                self.push_toast(
+                                    format!(
+                                        "Created an isolated {provider_name} task; starting {provider_name}…"
+                                    ),
+                                    ToastKind::Success,
+                                );
+                                self.task_open_terminal(task_id);
+                            }
+                        }
+                    }
+                    Err(error) => self.push_toast(
+                        format!("Worktree was preserved, but task registration failed: {error}"),
+                        ToastKind::Warning,
+                    ),
+                }
+            }
+        }
+
+        if self.agent_runtime.has_any_activity() {
+            let report = self.agent_runtime.poll(
+                &mut self.task_manager,
+                agent_task_ui::prompt_policy(&self.config),
+            );
+            for issue in report.issues {
+                self.push_toast(
+                    crate::review_text::visible_bounded(
+                        &issue.detail,
+                        agent_task_ui::MAX_TASK_DETAIL_DISPLAY_BYTES,
+                    ),
+                    ToastKind::Warning,
+                );
+            }
+            if let Some(message) = agent_task_ui::task_completion_feedback(
+                &self.task_manager,
+                report
+                    .completions
+                    .into_iter()
+                    .map(|completion| (completion.task_id, completion.outcome)),
+            ) {
+                // Passive feedback must not select a task or move terminal focus.
+                self.push_toast(message, ToastKind::Info);
+            }
+        }
+
+        self.task_panel.diff.poll();
+    }
+
+    fn task_terminal_index(
+        &self,
+        task_id: agent_task::TaskId,
+        role: agent_task::TaskTerminalRole,
+    ) -> Option<usize> {
+        let task = self.task_manager.get(task_id)?;
+        let binding = agent_task_ui::task_terminal_binding(task, role)?;
+        agent_task_ui::resolve_task_terminal(
+            Some(binding),
+            self.sessions
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| self.tab_of_session(*index).is_some())
+                .map(|(index, session)| (agent_task_ui::terminal_session_id(session.id), index)),
+        )
+    }
+
+    fn task_focus_terminal(
+        &mut self,
+        task_id: agent_task::TaskId,
+        role: agent_task::TaskTerminalRole,
+    ) {
+        if !agent_task_ui::task_focus_allowed(
+            self.config.experimental_task_sidebar
+                && self.sidebar_open
+                && self.sidebar_panel == SidebarPanel::Tasks,
+            self.task_panel.selected,
+            task_id,
+        ) {
+            return;
+        }
+        let Some(index) = self.task_terminal_index(task_id, role) else {
+            self.push_toast("Task terminal is no longer available", ToastKind::Info);
+            return;
+        };
+        self.native_enter_ownership.lock().claim_pressed();
+        if self.active != index {
+            self.pane_zoomed = false;
+        }
+        if !self.focus_session(index) {
+            self.push_toast("Task terminal is no longer available", ToastKind::Info);
+            return;
+        }
+        self.sidebar_files_focused = false;
+        self.relayout();
+        self.refresh_active_context();
+    }
+
+    /// Open the opaque PTY compatibility path: a new terminal tab running the
+    /// provider CLI directly inside the task worktree. Also implements the
+    /// explicit terminal fallback after an unsuccessful native session and
+    /// the retry of an exited task terminal (the new PTY atomically replaces
+    /// the exited transcript binding; sticky provenance is preserved).
+    fn task_open_terminal(&mut self, task_id: agent_task::TaskId) {
+        if self.agent_runtime.has_preparing(task_id) {
+            self.push_toast(
+                "Cancel native Agent preparation before starting a terminal",
+                ToastKind::Info,
+            );
+            return;
+        }
+        let failed_terminal_retry = self
+            .task_manager
+            .terminal_retry_session_id(task_id)
+            .ok()
+            .map(str::to_owned);
+        let native_recovery = failed_terminal_retry.is_none()
+            && self.agent_runtime.can_continue_in_terminal(task_id)
+            && self
+                .task_manager
+                .native_terminal_fallback_eligible(task_id)
+                .is_ok();

@@ -1,0 +1,300 @@
+        }
+    }
+
+    fn handle_mouse(&mut self, source_session_id: usize, input: MouseInput) -> Task<Message> {
+        self.sync_terminal_pane_owners();
+        let speed = self.config.scroll_speed.max(1) as isize;
+        // Validate the exact current cell before *any* terminal action,
+        // including clipboard reads and multi-click selection. Consume the
+        // whole rejected gesture so a later real-cell release cannot revive it.
+        if self.config.is_chat_mode() {
+            let projection = self
+                .sessions
+                .iter()
+                .find(|session| session.id == source_session_id)
+                .map(|session| session.projection.as_ref());
+            if let Some(button) = reject_chat_press(
+                projection,
+                source_session_id,
+                input,
+                &mut self.terminal_mouse_gestures,
+            ) {
+                if button == MouseButton::Left {
+                    self.click_tracker.cancel();
+                }
+                return Task::none();
+            }
+        }
+        // Block selection first. The widget snapshots the exact family action
+        // at press time and never arms native drag/release for a claimed card
+        // gesture. Re-resolve its stable pane and row target here: a
+        // completion/trim, focus switch, or alternate-screen transition
+        // between render and update must fail closed.
+        if let MouseInput::Press {
+            block: Some(action),
+            block_zone_id,
+            row,
+            button,
+            x,
+            y,
+            ..
+        } = input
+        {
+            self.terminal_mouse_gestures[button.slot()] = None;
+            if self.config.is_chat_mode() && action != BlockMouseAction::Menu {
+                return Task::none();
+            }
+            let Some(source) = self.session_index_by_id(source_session_id) else {
+                return Task::none();
+            };
+            let current_row_zone_id = self.block_at_viewport_row(source_session_id, row);
+            let retained_finalized = block_zone_id.is_some_and(|id| {
+                self.sessions[source]
+                    .terminal
+                    .zone_by_id(id)
+                    .is_some_and(|zone| !zone.rows_evicted)
+            });
+            let Some(id) = validated_claimed_block_target(
+                block_zone_id,
+                current_row_zone_id,
+                retained_finalized,
+            ) else {
+                return Task::none();
+            };
+            let Some(sess) = self.sessions.get_mut(source) else {
+                return Task::none();
+            };
+            let close_block_search = action == BlockMouseAction::Menu;
+            let ids: Vec<u64> = sess
+                .terminal
+                .command_zones
+                .iter()
+                .map(|zone| zone.id)
+                .collect();
+            sess.block_selection.retain(&ids);
+            match action {
+                BlockMouseAction::Replace => sess.block_selection.click(&ids, id, false, false),
+                BlockMouseAction::Range => sess.block_selection.click(&ids, id, false, true),
+                BlockMouseAction::Toggle => sess.block_selection.click(&ids, id, true, true),
+                BlockMouseAction::Collapse => {
+                    if sess.projection_policy.is_collapsed(id) {
+                        sess.projection_policy.expand(id);
+                    } else {
+                        sess.projection_policy.collapse(id);
+                    }
+                }
+                BlockMouseAction::Menu => {
+                    sess.block_selection.activate(&ids, id);
+                    self.block_menu = Some(BlockMenuState {
+                        session_id: sess.id,
+                        zone_id: id,
+                        anchor: iced::Point::new(x, y),
+                        focused_action: None,
+                        chat_read_only: self.config.is_chat_mode(),
+                    });
+                }
+            }
+            if action != BlockMouseAction::Menu {
+                self.block_menu = None;
+            }
+            // A claimed card gesture replaces any older native cell range.
+            // Otherwise the ordinary Copy shortcut would keep preferring a
+            // stale highlight over the block selection the user just made.
+            sess.terminal.clear_text_selection();
+            sess.refresh();
+            if close_block_search {
+                self.close_block_search();
+            }
+            return Task::none();
+        }
+
+        if let MouseInput::Press { button, .. } = input {
+            // An unclaimed left/middle press begins ordinary terminal text /
+            // paste interaction and exits historical card selection, whether
+            // it landed in completed output or the live/input surface.
+            if button != MouseButton::Right {
+                if let Some(source) = self.session_index_by_id(source_session_id) {
+                    let sess = &mut self.sessions[source];
+                    sess.block_selection.clear();
+                    sess.refresh();
+                }
+            }
+            self.block_menu = None;
+        }
+
+        // Link metadata is active-pane scoped. An inactive pane therefore
+        // cannot classify the link inside its widget; focusing it refreshes
+        // `self.links` before this handler runs. If that second, authoritative
+        // lookup claims the press, retain a consumed app-layer slot so the
+        // widget's already-armed Drag/Release sequence is swallowed whole.
+        if let MouseInput::Press {
+            col,
+            row,
+            button,
+            ctrl,
+            shift,
+            count,
+            link_eligible,
+            link: widget_claimed_link,
+            link_revision,
+            ..
+        } = input
+        {
+            let revision_matches = self
+                .session_index_by_id(source_session_id)
+                .and_then(|source| self.sessions.get(source))
+                .is_some_and(|session| {
+                    link_projection_matches(link_revision, session.projection.view_revision())
+                });
+            let current_link = revision_matches
+                .then(|| {
+                    terminal_view::ctrl_link_eligible(button, count, ctrl, shift, link_eligible)
+                        .then(|| {
+                            self.links
+                                .iter()
+                                .find(|link| {
+                                    link.line == row && col >= link.col_start && col < link.col_end
+                                })
+                                .cloned()
+                        })
+                        .flatten()
+                })
+                .flatten();
+            if widget_claimed_link || current_link.is_some() {
+                self.click_tracker.cancel();
+                self.terminal_mouse_gestures[button.slot()] =
+                    (!widget_claimed_link).then_some(TerminalMouseGesture {
+                        session_id: source_session_id,
+                        button,
+                        report_to_app: false,
+                        last_app_cell: None,
+                        consumed: true,
+                    });
+                if let Some(link) = current_link {
+                    let cwd = self
+                        .session_index_by_id(source_session_id)
+                        .and_then(|source| self.sessions.get(source))
+                        .and_then(|session| session.cwd_cache.clone().or_else(|| session.cwd()));
+                    if let Err(error) =
+                        link::open_link(&link, cwd.as_deref().map(std::path::Path::new))
+                    {
+                        self.push_toast(
+                            format!("Could not open link: {error}"),
+                            ToastKind::Warning,
+                        );
+                    }
+                }
+                return Task::none();
+            }
+        }
+
+        // Resolve each event to the stable pane chosen at press time. Focus may
+        // move (or an overlay may open) while buttons are held; neither may
+        // redirect the trailing event to the newly active PTY.
+        let (report_to_app, target_session_id, gesture) = match input {
+            MouseInput::Press {
+                button,
+                shift,
+                app_eligible,
+                ..
+            } => {
+                let Some(source) = self.session_index_by_id(source_session_id) else {
+                    return Task::none();
+                };
+                let report_to_app = app_owns_terminal_mouse(
+                    self.sessions[source].terminal.is_mouse_enabled(),
+                    shift,
+                    app_eligible,
+                    false,
+                );
+                let gesture = TerminalMouseGesture {
+                    session_id: source_session_id,
+                    button,
+                    report_to_app,
+                    last_app_cell: None,
+                    consumed: false,
+                };
+                self.terminal_mouse_gestures[button.slot()] = Some(gesture);
+                (report_to_app, source_session_id, Some(gesture))
+            }
+            MouseInput::Drag { .. } => {
+                let Some(gesture) = self.terminal_mouse_gestures[MouseButton::Left.slot()] else {
+                    return Task::none();
+                };
+                if gesture.button != MouseButton::Left
+                    || gesture.session_id != source_session_id
+                    || gesture.consumed
+                {
+                    return Task::none();
+                }
+                (gesture.report_to_app, gesture.session_id, Some(gesture))
+            }
+            MouseInput::Release { button, .. } => {
+                let Some(gesture) = take_terminal_mouse_gesture(
+                    &mut self.terminal_mouse_gestures,
+                    source_session_id,
+                    button,
+                ) else {
+                    return Task::none();
+                };
+                if gesture.consumed {
+                    return Task::none();
+                }
+                (gesture.report_to_app, gesture.session_id, Some(gesture))
+            }
+            MouseInput::Wheel {
+                shift,
+                app_eligible,
+                ..
+            } => {
+                let Some(source) = self.session_index_by_id(source_session_id) else {
+                    return Task::none();
+                };
+                (
+                    app_owns_terminal_wheel(
+                        self.sessions[source].terminal.is_mouse_enabled(),
+                        shift,
+                        app_eligible,
+                    ),
+                    source_session_id,
+                    None,
+                )
+            }
+            MouseInput::ScrollTo { .. } => (false, source_session_id, None),
+        };
+
+        // Click-to-place-cursor acts on release, so that a drag which happens
+        // to select nothing does not also walk the shell's cursor. Only the
+        // left-button sequence may mutate this tracker; interleaved right or
+        // middle presses must not cancel an in-flight local click.
+        let click_moves_cursor = self.config.click_moves_cursor;
+        let Some(target) = self.session_index_by_id(target_session_id) else {
+            return Task::none();
+        };
+        let clicked_cell = self.click_tracker.update(
+            input,
+            target_session_id,
+            self.sessions[target].projection.key(),
+            report_to_app,
+        );
+
+        let cancelled_click = self.click_tracker.cancelled;
+        let Some(sess) = self.sessions.get_mut(target) else {
+            return Task::none();
+        };
+
+        match input {
+            MouseInput::Press {
+                col,
+                row,
+                button,
+                alt,
+                count,
+                ..
+            } => {
+                if report_to_app {
+                    if let Some((grid_col, grid_row)) =
+                        projected_live_grid_cell(&sess.terminal, &sess.projection, row, col)
+                    {
+                        if let Some(report) =
+                            sess.terminal

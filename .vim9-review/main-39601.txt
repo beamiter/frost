@@ -1,0 +1,300 @@
+            vec![2, 0, 1, 3]
+        );
+        // The tab that was active (id 1) is still the active one.
+        assert_eq!(tabs[active].id, 1);
+
+        // Unpinning puts it back at the head of the unpinned group, and the
+        // active tab still does not move.
+        tabs[0].pinned = false;
+        let active = sort_pinned_first(&mut tabs, active);
+        assert_eq!(
+            tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![2, 0, 1, 3]
+        );
+        assert_eq!(tabs[active].id, 1);
+    }
+
+    #[test]
+    fn drag_reorder_clamps_both_sides_of_the_pinned_boundary() {
+        let mut tabs = vec![
+            Tab::new(0, 0),
+            Tab::new(1, 1),
+            Tab::new(2, 2),
+            Tab::new(3, 3),
+        ];
+        tabs[0].pinned = true;
+        tabs[1].pinned = true;
+
+        // An unpinned tab dropped on the first pinned tab lands immediately
+        // after the pinned prefix; the formerly active id 2 remains active.
+        let active = reorder_tabs_preserving_pinned_prefix(&mut tabs, 2, 3, 0).unwrap();
+        assert_eq!(
+            tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![0, 1, 3, 2]
+        );
+        assert_eq!(tabs[active].id, 2);
+        assert!(tabs[..2].iter().all(|tab| tab.pinned));
+        assert!(tabs[2..].iter().all(|tab| !tab.pinned));
+
+        // A pinned tab dropped on an unpinned tab stays at the other side of
+        // the same boundary instead of persisting an invalid mixed prefix.
+        let active = reorder_tabs_preserving_pinned_prefix(&mut tabs, active, 0, 3).unwrap();
+        assert_eq!(
+            tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![1, 0, 3, 2]
+        );
+        assert_eq!(tabs[active].id, 2);
+        assert!(tabs[..2].iter().all(|tab| tab.pinned));
+        assert!(tabs[2..].iter().all(|tab| !tab.pinned));
+    }
+
+    #[test]
+    fn a_new_unpinned_tab_never_splits_the_pinned_prefix() {
+        let mut tabs = vec![
+            Tab::new(0, 0),
+            Tab::new(1, 1),
+            Tab::new(2, 2),
+            Tab::new(3, 3),
+        ];
+        tabs[0].pinned = true;
+        tabs[1].pinned = true;
+        tabs[2].pinned = true;
+
+        assert_eq!(new_unpinned_tab_index(&tabs, 0), 3);
+        assert_eq!(new_unpinned_tab_index(&tabs, 2), 3);
+        assert_eq!(new_unpinned_tab_index(&tabs, 3), 4);
+    }
+
+    #[test]
+    fn a_restored_tab_may_hold_a_single_pane() {
+        // One leaf used to be rejected: it meant "not split" when there was a
+        // single global layout. It is the ordinary case for a tab.
+        assert!(valid_restored_layout(&PaneTree::Leaf(0), 1));
+        assert!(!valid_restored_layout(&PaneTree::Leaf(3), 1));
+    }
+
+    #[test]
+    fn swapping_two_panes_exchanges_only_them_and_keeps_the_shape() {
+        let original = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![
+                PaneTree::Leaf(0),
+                PaneTree::Split {
+                    axis: Axis::Horizontal,
+                    children: vec![PaneTree::Leaf(1), PaneTree::Leaf(2)],
+                    ratios: vec![0.3, 0.7],
+                },
+            ],
+            ratios: vec![0.6, 0.4],
+        };
+
+        let mut tree = original.clone();
+        swap_sessions_in_tree(&mut tree, 0, 2);
+        assert_eq!(tree.leaves(), vec![2, 1, 0]);
+
+        // Ratios and nesting describe the geometry; a swap must not touch them.
+        let ratios_of = |tree: &PaneTree| match tree {
+            PaneTree::Split {
+                ratios, children, ..
+            } => {
+                let nested = match &children[1] {
+                    PaneTree::Split { ratios, .. } => ratios.clone(),
+                    PaneTree::Leaf(_) => Vec::new(),
+                };
+                (ratios.clone(), nested)
+            }
+            PaneTree::Leaf(_) => (Vec::new(), Vec::new()),
+        };
+        assert_eq!(ratios_of(&tree), ratios_of(&original));
+
+        // Swapping back restores the original exactly; a two-pass remap would
+        // instead have collapsed both leaves onto one session.
+        swap_sessions_in_tree(&mut tree, 0, 2);
+        assert_eq!(tree, original);
+
+        // Swapping a pane with itself is a no-op rather than a corruption.
+        swap_sessions_in_tree(&mut tree, 1, 1);
+        assert_eq!(tree, original);
+    }
+
+    #[test]
+    fn session_last_targets_the_final_index_without_underflow() {
+        assert_eq!(last_session_index(0), None);
+        assert_eq!(last_session_index(1), Some(0));
+        assert_eq!(last_session_index(12), Some(11));
+    }
+
+    /// Replaces the old `bracketed_paste_framing_preserves_payload`, which
+    /// pinned the local encoder's *verbatim* framing — the bug. What must hold
+    /// now is that a payload cannot close the frame it is carried in.
+    #[test]
+    fn paste_framing_cannot_be_closed_by_its_own_payload() {
+        let policy = PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim);
+        let paste = pty_input::encode_paste(
+            "docs\x1b[201~\rrm -rf ~\r",
+            PasteModes { bracketed: true },
+            policy,
+        );
+
+        // One frame, and the terminator appears exactly once: at the end.
+        assert!(paste.bytes.starts_with(b"\x1b[200~"));
+        assert!(paste.bytes.ends_with(b"\x1b[201~"));
+        assert_eq!(
+            paste
+                .bytes
+                .windows(6)
+                .filter(|window| *window == b"\x1b[201~")
+                .count(),
+            1,
+            "payload still carries a frame terminator: {:?}",
+            String::from_utf8_lossy(&paste.bytes)
+        );
+        assert!(paste.risk.had_embedded_paste_marker);
+        // frost sends every line of an unbracketed multiline paste, unchanged.
+        assert_eq!(paste.echo_text, "docs\nrm -rf ~\n");
+    }
+
+    /// frost keeps `SendVerbatim`: a multiline paste into a shell that never
+    /// advertised DECSET 2004 is still sent whole, framing omitted.
+    #[test]
+    fn unbracketed_multiline_paste_stays_verbatim() {
+        let paste = pty_input::encode_paste(
+            "one\ntwo",
+            PasteModes { bracketed: false },
+            PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+        );
+        assert_eq!(paste.bytes, b"one\ntwo");
+        assert!(!paste.risk.truncated_to_first_line);
+    }
+
+    /// Search-replace, sidebar paths and recalled history can all contain
+    /// child/filesystem-controlled bytes. Production PromptInsert/Recall uses
+    /// this control-stripping policy; no untrusted route receives the raw
+    /// control-preserving prompt-insert policy.
+    #[test]
+    fn untrusted_prompt_payloads_strip_control_bytes() {
+        let modes = PasteModes { bracketed: true };
+        let sanitized = crate::review_text::sanitize_prompt_payload(
+            "printf '\x1b[31m'",
+            crate::review_text::MAX_PROMPT_INSERT_BYTES,
+        )
+        .unwrap();
+        let untrusted = pty_input::encode_paste(
+            &sanitized,
+            modes,
+            PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+        );
+        assert_eq!(untrusted.echo_text, "printf '[31m'");
+
+        // frost's pinned core has no visual-risk confirmation UI, so a pure
+        // clipboard paste containing hidden formatting must fail closed too.
+        assert!(matches!(
+            crate::review_text::sanitize_prompt_payload(
+                "printf safe\u{202e}hidden",
+                MAX_PTY_WRITE_QUEUE_BYTES,
+            ),
+            Err(crate::review_text::ReviewTextError::VisualSpoof)
+        ));
+    }
+
+    /// Replaces the raw `command + CR` write in `agent_run_approved`: the
+    /// approved command must replace the pending line (`Ctrl+U` first), carry
+    /// no frame terminator of its own, and submit *outside* the frame.
+    #[test]
+    fn an_approved_agent_command_replaces_the_line_and_submits_outside_the_frame() {
+        let paste = agent_command_payload("git status\x1b[201~; rm -rf ~", true).unwrap();
+        assert_eq!(paste.bytes[0], 0x15, "line kill must come first");
+        assert!(paste.bytes[1..].starts_with(b"\x1b[200~"));
+        assert!(paste.bytes.ends_with(b"\x1b[201~\r"));
+        // The embedded ESC control was stripped, leaving inert visible text.
+        assert_eq!(paste.echo_text, "git status[201~; rm -rf ~");
+        assert!(!paste.risk.had_embedded_paste_marker);
+
+        // A shell without DECSET 2004 still gets the kill and the submit.
+        let plain = agent_command_payload("echo hi", false).unwrap();
+        assert_eq!(plain.bytes, b"\x15echo hi\r");
+        assert!(matches!(
+            agent_command_payload("echo safe\u{202e}hidden", true),
+            Err(crate::review_text::ReviewTextError::VisualSpoof)
+        ));
+    }
+
+    /// `Message::PromptRecall` (history picker) kills the pending line before
+    /// typing; `Message::PromptInsert` (search-replace, sidebar path picks)
+    /// appends instead. Both use the control-stripping untrusted policy.
+    #[test]
+    fn history_recall_replaces_the_pending_line_and_inserts_append() {
+        let modes = PasteModes { bracketed: true };
+        let policy = PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim);
+        let recall = pty_input::encode_prompt_insert("cargo test", modes, policy, true);
+        assert_eq!(recall.bytes[0], 0x15);
+        assert_eq!(&recall.bytes[1..], b"\x1b[200~cargo test\x1b[201~");
+
+        let insert = pty_input::encode_prompt_insert("cargo test", modes, policy, false);
+        assert_eq!(insert.bytes, b"\x1b[200~cargo test\x1b[201~");
+    }
+
+    /// Why `SidebarInsertPath` routes through the paste choke point instead of
+    /// writing raw bytes: `shell_quote_path` protects the *shell parser*, but at
+    /// the input layer a filename carrying a raw CR would still submit the
+    /// pending line and an embedded `ESC[201~` would still close a paste frame.
+    #[test]
+    fn a_sidebar_path_pick_cannot_close_a_frame_or_submit_the_line() {
+        let hostile = "evil\x1b[201~\rrm -rf ~";
+        let mut quoted = jterm_core::process::shell_quote_path(hostile);
+        quoted.push(' ');
+        let quoted = crate::review_text::sanitize_prompt_payload(
+            &quoted,
+            crate::review_text::MAX_PROMPT_INSERT_BYTES,
+        )
+        .unwrap();
+        let paste = pty_input::encode_prompt_insert(
+            &quoted,
+            PasteModes { bracketed: true },
+            PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+            false,
+        );
+        // Exactly one frame terminator, and it is the frame's own.
+        assert_eq!(
+            paste
+                .bytes
+                .windows(6)
+                .filter(|window| *window == b"\x1b[201~")
+                .count(),
+            1
+        );
+        assert!(paste.bytes.ends_with(b"\x1b[201~"));
+        // The control-stripping prompt boundary removes the CR entirely, so no
+        // executable line break reaches the shell quote or paste frame.
+        assert!(!paste.echo_text.contains('\r'));
+        assert!(!paste.echo_text.contains('\n'));
+        assert!(!paste.bytes.ends_with(b"\x1b[201~\r"));
+
+        let rejected_path = jterm_core::process::shell_quote_path("safe\u{2066}hidden");
+        assert_eq!(rejected_path, "''", "the shared quoter fails closed");
+        let sanitized = crate::review_text::sanitize_prompt_payload(
+            &rejected_path,
+            crate::review_text::MAX_PROMPT_INSERT_BYTES,
+        )
+        .unwrap();
+        assert_eq!(sanitized, "''");
+    }
+
+    #[test]
+    fn tiny_pty_writes_are_coalesced_and_entry_bounded() {
+        let mut queue = std::collections::VecDeque::new();
+        for _ in 0..1000 {
+            Session::push_queue_copy(&mut queue, b"x", false);
+        }
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].data.len(), 1000);
+
+        Session::push_queue_copy(&mut queue, b"response", true);
+        Session::push_queue_copy(&mut queue, b"later-input", false);
+        assert_eq!(queue.len(), 3, "different classes must preserve FIFO order");
+        assert!(!queue[0].response);
+        assert!(queue[1].response);
+        assert!(!queue[2].response);
+
+        queue.resize_with(MAX_PTY_QUEUE_ENTRIES, || PtyWriteChunk {
+            data: Vec::new(),

@@ -1,0 +1,300 @@
+        let paste_available = self.sidebar_clipboard.is_some();
+        sidebar::files_menu_action_enabled(targets_len, is_dir, paste_available)
+            .into_iter()
+            .filter_map(|(id, enabled, _)| {
+                let action = match id {
+                    "open_directory" => SidebarMenuAction::OpenDirectory,
+                    "new_file" => SidebarMenuAction::NewFile,
+                    "new_folder" => SidebarMenuAction::NewFolder,
+                    "rename" => SidebarMenuAction::Rename,
+                    "delete" => SidebarMenuAction::Delete,
+                    "copy" => SidebarMenuAction::Copy,
+                    "cut" => SidebarMenuAction::Cut,
+                    "copy_path" => SidebarMenuAction::CopyPath,
+                    "paste" => SidebarMenuAction::Paste,
+                    "refresh" => SidebarMenuAction::Refresh,
+                    _ => return None,
+                };
+                Some((
+                    action,
+                    enabled,
+                    sidebar_menu_action_label(action, targets_len),
+                ))
+            })
+            .collect()
+    }
+
+    fn sidebar_menu_state(
+        &self,
+        path: std::path::PathBuf,
+        is_dir: bool,
+        targets: Vec<(std::path::PathBuf, bool)>,
+        generation: u64,
+    ) -> SidebarMenuState {
+        let actions = self.sidebar_menu_action_list(targets.len(), is_dir);
+        let enabled: Vec<bool> = actions.iter().map(|(_, on, _)| *on).collect();
+        SidebarMenuState {
+            path,
+            is_dir,
+            at: self.sidebar_pointer,
+            targets,
+            generation,
+            clipboard_id: self
+                .sidebar_clipboard
+                .as_ref()
+                .map(|clipboard| clipboard.id),
+            cursor: sidebar::first_enabled_menu_index(&enabled),
+        }
+    }
+
+    fn reveal_sidebar_tree_focus(&mut self) -> Task<Message> {
+        let Some(focus) = self.sidebar_tree_focus.clone() else {
+            return Task::none();
+        };
+        let items = self.sidebar_render_items();
+        let Some(index) = items
+            .iter()
+            .position(|item| item.node_path() == Some(focus.as_path()))
+        else {
+            return Task::none();
+        };
+        let offset = sidebar::sidebar_tree_reveal_offset(
+            index,
+            self.sidebar_tree_offset_y,
+            self.sidebar_tree_viewport_h,
+            items.len(),
+            self.sidebar_row_height(),
+        );
+        self.sidebar_tree_offset_y = offset;
+        iced::widget::operation::scroll_to(
+            SIDEBAR_TREE_SCROLL_ID.clone(),
+            iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: offset },
+        )
+    }
+
+    fn sidebar_render_items(&self) -> Vec<sidebar::SidebarRenderItem> {
+        let filter = self
+            .sidebar_filter
+            .as_deref()
+            .and_then(|query| filter_match_set(&self.sidebar.root, query));
+        sidebar::collect_sidebar_render_items(&self.sidebar.root, filter.as_ref())
+    }
+
+    fn handle_sidebar_menu_key(
+        &mut self,
+        key: &keyboard::Key,
+        modifiers: keyboard::Modifiers,
+    ) -> Task<Message> {
+        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+            self.sidebar_menu = None;
+            return Task::none();
+        }
+        let no_mod =
+            !modifiers.shift() && !modifiers.control() && !modifiers.alt() && !modifiers.logo();
+        let Some(menu) = self.sidebar_menu.as_ref() else {
+            return Task::none();
+        };
+        let actions = self.sidebar_menu_action_list(menu.targets.len(), menu.is_dir);
+        let enabled: Vec<bool> = actions.iter().map(|(_, on, _)| *on).collect();
+        let cursor = menu.cursor;
+        match key {
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown) if no_mod => {
+                if let Some(menu) = self.sidebar_menu.as_mut() {
+                    menu.cursor = sidebar::next_enabled_menu_index(&enabled, cursor, 1);
+                }
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowUp) if no_mod => {
+                if let Some(menu) = self.sidebar_menu.as_mut() {
+                    menu.cursor = sidebar::next_enabled_menu_index(&enabled, cursor, -1);
+                }
+            }
+            keyboard::Key::Named(keyboard::key::Named::Enter) if no_mod => {
+                if let Some((action, true, _)) = actions.get(cursor) {
+                    let action = *action;
+                    if let Some(menu) = self.sidebar_menu.take() {
+                        return self.execute_sidebar_menu_action(menu, action);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Task::none()
+    }
+
+    fn handle_sidebar_files_key(
+        &mut self,
+        key: &keyboard::Key,
+        modifiers: keyboard::Modifiers,
+        repeat: bool,
+    ) -> Option<Task<Message>> {
+        if !self.sidebar_files_focused
+            || !self.dock_open()
+            || self.sidebar_panel != SidebarPanel::Files
+        {
+            return None;
+        }
+        let no_mod =
+            !modifiers.shift() && !modifiers.control() && !modifiers.alt() && !modifiers.logo();
+        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) && no_mod {
+            self.sidebar_files_focused = false;
+            return Some(Task::none());
+        }
+        if modifiers.control()
+            && !modifiers.shift()
+            && !modifiers.alt()
+            && !modifiers.logo()
+            && matches!(key, keyboard::Key::Character(ch) if ch.eq_ignore_ascii_case("f"))
+            && !repeat
+        {
+            return Some(self.update(Message::SidebarFilterToggle));
+        }
+        let filter_typing = self.sidebar_filter.is_some();
+        if filter_typing
+            && !matches!(
+                key,
+                keyboard::Key::Named(
+                    keyboard::key::Named::ArrowUp
+                        | keyboard::key::Named::ArrowDown
+                        | keyboard::key::Named::ArrowLeft
+                        | keyboard::key::Named::ArrowRight
+                        | keyboard::key::Named::Enter
+                        | keyboard::key::Named::Delete
+                        | keyboard::key::Named::ContextMenu
+                        | keyboard::key::Named::F10
+                )
+            )
+        {
+            // Printable keys belong to the filter field while it is open.
+            return None;
+        }
+        let motion = match key {
+            keyboard::Key::Named(keyboard::key::Named::ArrowUp) if no_mod => {
+                Some(sidebar::TreeFocusMotion::Up)
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown) if no_mod => {
+                Some(sidebar::TreeFocusMotion::Down)
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) if no_mod && !repeat => {
+                Some(sidebar::TreeFocusMotion::Left)
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowRight) if no_mod && !repeat => {
+                Some(sidebar::TreeFocusMotion::Right)
+            }
+            _ => None,
+        };
+        if let Some(motion) = motion {
+            let rows = self.sidebar_visible_rows();
+            let current = self.sidebar_tree_focus.clone();
+            let outcome = sidebar::apply_tree_focus_motion(
+                &rows,
+                |path| self.sidebar.node_is_expanded(path),
+                current.as_deref(),
+                motion,
+            );
+            return Some(match outcome {
+                Some(sidebar::TreeFocusOutcome::Move(path)) => {
+                    self.sidebar_tree_focus = Some(path);
+                    self.reveal_sidebar_tree_focus()
+                }
+                Some(sidebar::TreeFocusOutcome::Collapse(path)) => {
+                    self.sidebar.collapse_node(&path);
+                    self.sidebar_tree_focus = Some(path);
+                    self.reveal_sidebar_tree_focus()
+                }
+                Some(sidebar::TreeFocusOutcome::Expand(path)) => {
+                    self.sidebar_tree_focus = Some(path.clone());
+                    let task = if let Some(request) = self.sidebar.expand_node(&path) {
+                        self.queue_sidebar_load(request)
+                    } else {
+                        Task::none()
+                    };
+                    Task::batch([task, self.reveal_sidebar_tree_focus()])
+                }
+                None => Task::none(),
+            });
+        }
+        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter)) && no_mod && !repeat {
+            let Some(path) = self.sidebar_tree_focus.clone() else {
+                return Some(Task::none());
+            };
+            let is_dir = self.sidebar.node(&path).is_some_and(|node| node.is_dir);
+            return Some(self.sidebar_row_click(path, is_dir));
+        }
+        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Space)) && no_mod && !repeat {
+            if let Some(path) = self.sidebar_tree_focus.clone() {
+                selection_toggle(&mut self.sidebar_selection, &path);
+                self.sidebar_selection_anchor = Some(path);
+            }
+            return Some(Task::none());
+        }
+        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Delete)) && no_mod && !repeat {
+            let Some(path) = self.sidebar_tree_focus.clone() else {
+                return Some(Task::none());
+            };
+            let is_dir = self.sidebar.node(&path).is_some_and(|node| node.is_dir);
+            let rows = self.sidebar_visible_rows();
+            let targets = match menu_targets(&self.sidebar_selection, &rows, &path) {
+                Some(targets) => targets,
+                None => vec![(path.clone(), is_dir)],
+            };
+            let menu = self.sidebar_menu_state(path, is_dir, targets, self.sidebar.generation());
+            return Some(self.execute_sidebar_menu_action(menu, SidebarMenuAction::Delete));
+        }
+        let open_menu = matches!(key, keyboard::Key::Named(keyboard::key::Named::ContextMenu))
+            && no_mod
+            && !repeat
+            || (matches!(key, keyboard::Key::Named(keyboard::key::Named::F10))
+                && modifiers.shift()
+                && !modifiers.control()
+                && !modifiers.alt()
+                && !modifiers.logo()
+                && !repeat);
+        if open_menu {
+            let Some(path) = self.sidebar_tree_focus.clone() else {
+                return Some(Task::none());
+            };
+            let is_dir = self.sidebar.node(&path).is_some_and(|node| node.is_dir);
+            return Some(self.update(Message::SidebarMenuOpen(
+                self.sidebar.generation(),
+                path,
+                is_dir,
+            )));
+        }
+        None
+    }
+
+    /// Run the confirmed deletion. The one absolute rule (never `/`) is
+    /// re-checked per path here, at dispatch time, not only in the menu layer.
+    fn confirm_sidebar_delete(&mut self) -> Task<Message> {
+        let Some(confirmation) = self.sidebar_delete_confirm.take() else {
+            return Task::none();
+        };
+        self.invalidate_sidebar_remote_follow_intent();
+        if !self.sidebar.accepts_generation(confirmation.generation) {
+            self.set_sidebar_notice(
+                "Files changed; select the items again before deleting".to_string(),
+                false,
+            );
+            return Task::none();
+        }
+        let paths = confirmation.paths;
+        for path in &paths {
+            if let Err(problem) = remote_fs::validate_delete_path(path) {
+                self.set_sidebar_notice(problem, false);
+                return Task::none();
+            }
+        }
+        let Some(context_epoch) = self.sidebar_context_epoch else {
+            self.set_sidebar_notice(
+                "Files operation identity exhausted; restart Frost before modifying files"
+                    .to_string(),
+                false,
+            );
+            return Task::none();
+        };
+        let consumed_clipboard_id = sidebar_clipboard_id_at_location(
+            self.sidebar_clipboard.as_ref(),
+            &self.sidebar.location,
+        );
+        sidebar_op_task(
+            context_epoch,

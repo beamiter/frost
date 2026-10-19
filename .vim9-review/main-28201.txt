@@ -1,0 +1,300 @@
+        let accepted = {
+            let Some(session) = self.command_corrections.get_current_mut(reference) else {
+                return Task::none();
+            };
+            let Some(proposal) = session.proposal.as_mut() else {
+                return Task::none();
+            };
+            // The engine re-validates the edited draft against this surface's
+            // own 16 KiB single-line budget and decides run-versus-insert from
+            // that same validated string, so the button's label and what this
+            // path submits cannot disagree.
+            match crate::command_correction::accept_correction(proposal) {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    proposal.set_feedback(Some(
+                        crate::command_correction::bound_correction_feedback(format!(
+                            "Cannot accept correction: {error}"
+                        )),
+                    ));
+                    return Task::none();
+                }
+            }
+        };
+        // Final prompt-ownership check at the write boundary, same as recall
+        // and guarded retry: the prompt that was clean when the card appeared
+        // may have received input or entered a foreground program since.
+        if let Err(reason) = self.session_prompt_replace_ready(session_id) {
+            if let Some(session) = self.command_corrections.get_mut(session_id) {
+                if let Some(proposal) = session.proposal.as_mut() {
+                    proposal.set_feedback(Some(
+                        crate::command_correction::bound_correction_feedback(format!(
+                            "Cannot accept correction: {reason}"
+                        )),
+                    ));
+                }
+            }
+            return Task::none();
+        }
+        let policy = if accepted.run_directly {
+            correction_run_policy()
+        } else {
+            block_reinput_policy()
+        };
+        let written = self
+            .write_paste_to_session(session_id, &accepted.command, policy, true)
+            .written();
+        if written {
+            self.command_corrections
+                .dismiss(session_id, reference.generation);
+        } else if let Some(session) = self.command_corrections.get_current_mut(reference) {
+            if let Some(proposal) = session.proposal.as_mut() {
+                proposal.set_feedback(Some(crate::command_correction::bound_correction_feedback(
+                    "The target prompt changed before the command could be queued.",
+                )));
+            }
+        }
+        Task::none()
+    }
+
+    // ===== AI chats library + inline AI command generation (ai_chats, ai_command) =====
+
+    /// Show or hide the persistent AI chats panel (palette entry and
+    /// Ctrl+Shift+Alt+A share this path). Disabled AI fails closed with a
+    /// toast and never opens; a broken provider still opens and explains
+    /// itself in the panel (anvil's restored-panel behavior).
+    fn toggle_ai_chats(&mut self) -> Task<Message> {
+        if self.ai_chats.is_open {
+            self.ai_chats.close(self.config.ai_redact_secrets);
+            return Task::none();
+        }
+        if !self.config.ai_enabled {
+            self.push_toast("AI features are disabled in Settings", ToastKind::Info);
+            return Task::none();
+        }
+        self.ai_chats.open(&self.config);
+        iced::widget::operation::focus(AI_CHATS_INPUT_ID.clone())
+    }
+
+    /// Run one chat request off the UI thread, streaming fragments when
+    /// `ai_stream` is on — the Agent panel's transport discipline, with the
+    /// store's `(chat_id, epoch)` token in place of the agent identity.
+    fn ai_chats_request_task(&mut self, request: ai_chats::ChatRequest) -> Task<Message> {
+        let ai_chats::ChatRequest {
+            token,
+            client,
+            system,
+            history,
+            cancellation,
+        } = request;
+        if self.config.ai_stream {
+            let (tx, rx) = iced::futures::channel::mpsc::unbounded::<Message>();
+            std::thread::spawn(move || {
+                let mut on_delta = |fragment: &str| {
+                    let _ = tx.unbounded_send(Message::AiChatsDelta(token, fragment.to_string()));
+                };
+                let result = client
+                    .send_turns_streaming_cancellable(
+                        Some(&system),
+                        &history,
+                        &cancellation,
+                        &mut on_delta,
+                    )
+                    .map_err(|error| error.to_string());
+                let _ = tx.unbounded_send(Message::AiChatsResult(token, result));
+            });
+            return Task::stream(rx);
+        }
+        Task::perform(
+            async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    client
+                        .send_turns_blocking_cancellable(Some(&system), &history, &cancellation)
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+                match result {
+                    Ok(result) => result,
+                    Err(error) => Err(format!("AI worker task failed: {error}")),
+                }
+            },
+            move |result| Message::AiChatsResult(token, result),
+        )
+    }
+
+    /// Open the inline "Ask AI" request overlay. The sources reach this flow
+    /// through the palette's `?` prefix and bind no chord, so frost's palette
+    /// entry is the only entry point. Preflight is fail-closed: with no usable
+    /// provider the overlay never opens and a toast explains why.
+    fn open_ai_ask(&mut self) -> Task<Message> {
+        if self.sessions.get(self.active).is_none() {
+            return Task::none();
+        }
+        if let Err(error) = agent::client_from_config(&self.config) {
+            self.push_toast(
+                format!("AI provider is unavailable: {error}"),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        self.ai_ask = Some(String::new());
+        iced::widget::operation::focus(AI_ASK_INPUT_ID.clone())
+    }
+
+    /// The overlay owns the keyboard while open (the history picker's
+    /// discipline): Enter drafts, Esc closes, typed text feeds the request
+    /// when the input itself did not capture it.
+    fn handle_ai_ask_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+        text: Option<&str>,
+    ) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        let query = self.ai_ask.as_mut()?;
+        match key {
+            Key::Named(Named::Escape) => {
+                self.ai_ask = None;
+                Some(Task::none())
+            }
+            Key::Named(Named::Enter) => Some(self.submit_ai_ask()),
+            Key::Named(Named::Backspace) => {
+                query.pop();
+                Some(Task::none())
+            }
+            _ => {
+                if !mods.control() && !mods.alt() && !mods.logo() {
+                    if let Some(t) = text {
+                        let next = ai_command::accepted_suggestion_request(format!("{query}{t}"));
+                        if let Some(next) = next {
+                            *query = next;
+                        }
+                        return Some(Task::none());
+                    }
+                }
+                // Swallow all other keys while the overlay owns the keyboard.
+                Some(Task::none())
+            }
+        }
+    }
+
+    /// Turn the overlay's natural-language request into the pane-bound,
+    /// review-only suggestion card and launch the drafting worker. The
+    /// selected block's command/output attaches only under the
+    /// `ai_share_command_context` consent.
+    fn submit_ai_ask(&mut self) -> Task<Message> {
+        // Owned: allocating the request id below needs `&mut self`.
+        let Some(query) = self.ai_ask.as_deref().map(str::trim).map(str::to_string) else {
+            return Task::none();
+        };
+        if query.is_empty() {
+            // The sources' empty-`?` entry is a harmless no-op explainer.
+            self.ai_ask = None;
+            return Task::none();
+        }
+        let client = match agent::client_from_config(&self.config) {
+            Ok(client) => client,
+            Err(error) => {
+                self.push_toast(
+                    format!("AI provider is unavailable: {error}"),
+                    ToastKind::Warning,
+                );
+                self.ai_ask = None;
+                return Task::none();
+            }
+        };
+        let Some(sess) = self.sessions.get(self.active) else {
+            self.ai_ask = None;
+            return Task::none();
+        };
+        let session_id = sess.id;
+        let cwd = sess
+            .cwd_cache
+            .clone()
+            .or_else(|| sess.cwd())
+            .filter(|cwd| cwd.len() <= command_correction::MAX_CORRECTION_CWD_BYTES)
+            .unwrap_or_else(|| ".".to_string());
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+        let block_context = if self.config.ai_share_command_context {
+            self.selected_block_context_for_ai(sess)
+        } else {
+            None
+        };
+        let provider = client.display_name();
+        let Some(generation) = self.next_ai_suggestion_generation() else {
+            self.ai_ask = None;
+            return Task::none();
+        };
+        let Some(session) = ai_command::CommandSuggestion::begin(
+            generation,
+            session_id,
+            query,
+            provider,
+            cwd,
+            shell,
+            block_context,
+        ) else {
+            self.ai_ask = None;
+            return Task::none();
+        };
+        self.ai_ask = None;
+        // Replacing any previous card cancels its worker via Drop, like
+        // anvil's `close_command_suggestion`.
+        self.ai_suggestion = Some(session);
+        self.ai_suggestion_worker_task(generation)
+    }
+
+    /// The selected block's bounded context for the suggestion request, or
+    /// None when nothing is selected. Extraction mirrors `block_ask_ai_task`.
+    fn selected_block_context_for_ai(
+        &self,
+        sess: &Session,
+    ) -> Option<jterm_core::ai::BlockContext> {
+        let zone_id = sess.block_selection.active()?;
+        let semantic = ad_hoc_block_semantic_context(sess, zone_id, self.config.shell.as_deref())?;
+        Some(agent_task::context::ad_hoc_block_context(&semantic))
+    }
+
+    /// Launch the suggestion's drafting worker for the live generation. A
+    /// provider failure is delivered through the normal reply path so the card
+    /// lands in its Retry-offering failed state instead of vanishing.
+    fn ai_suggestion_worker_task(&self, generation: u64) -> Task<Message> {
+        let Some(session) = self.ai_suggestion.as_ref().filter(|session| {
+            session.generation() == generation
+                && session.phase() == ai_command::SuggestionPhase::Drafting
+        }) else {
+            return Task::none();
+        };
+        let client = match agent::client_from_config(&self.config) {
+            Ok(client) => client,
+            Err(error) => {
+                return Task::done(Message::AiSuggestionResolved(generation, Err(error)));
+            }
+        };
+        let request = session.request.clone();
+        let cwd = session.cwd.clone();
+        let shell = session.shell.clone();
+        let block = session.block_context.clone();
+        let token = session.cancellation();
+        Task::perform(
+            async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    jterm_core::ai::nl_to_command_with_context_blocking_cancellable(
+                        &client,
+                        &request,
+                        &cwd,
+                        &shell,
+                        std::env::consts::OS,
+                        block.as_ref(),
+                        &token,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .await;
+                match result {
+                    Ok(result) => result,
+                    Err(error) => Err(format!("AI command worker failed: {error}")),
+                }
+            },
+            move |result| Message::AiSuggestionResolved(generation, result),

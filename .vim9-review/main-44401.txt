@@ -1,0 +1,300 @@
+            .split_once("C::BlockToggleBookmark =>")
+            .unwrap()
+            .0;
+        assert!(dispatch.contains("C::BlockMenu => return self.open_selected_block_menu()"));
+        assert!(dispatch
+            .contains("command_requires_block_context(&cmd) && !self.block_binding_available()"));
+    }
+    #[test]
+    fn keyboard_menu_mode_matrix_keeps_chat_and_normal_on_the_terminal_path() {
+        for mode in [
+            config::TerminalMode::Normal,
+            config::TerminalMode::Block,
+            config::TerminalMode::Chat,
+        ] {
+            let config = config::Config {
+                terminal_mode: Some(mode),
+                ..config::Config::default()
+            };
+            for alt in [false, true] {
+                for running in [false, true] {
+                    // These are the production block_action_available and
+                    // block_binding_available predicates, with real Config mode semantics.
+                    let available = config.is_block_mode() && !alt && !running;
+                    let target = block_menu_keyboard_target(available, "", Some(42), true);
+                    assert_eq!(
+                        target,
+                        if mode == config::TerminalMode::Block && !alt && !running {
+                            Some(42)
+                        } else {
+                            None
+                        }
+                    );
+                }
+            }
+        }
+        assert!(command_requires_block_context(
+            &keybindings::Command::BlockMenu
+        ));
+        let source = include_str!("main.rs");
+        let gate = source
+            .split_once("    fn block_action_available(")
+            .unwrap()
+            .1
+            .split_once("    fn ensure_block_action_available(")
+            .unwrap()
+            .0;
+        assert!(gate.contains("self.config.is_block_mode()"));
+        assert!(gate.contains("!session.terminal.is_alt_buffer_active()"));
+        assert!(gate.contains("!session.terminal.is_command_running()"));
+    }
+}
+
+#[cfg(test)]
+mod bounded_clipboard_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn revoke_aborts_task_clears_owner_and_preserves_ordered_refusals() {
+        for osc52 in [true, false] {
+            let (_task, handle) = Task::done(()).abortable();
+            let observed = handle.clone();
+            let mut task = Some(handle);
+            let mut owner = Some((7, 12));
+            let mut reply = Some(if osc52 {
+                HostClipboardReply::Osc52(b"\x1b\\")
+            } else {
+                HostClipboardReply::Osc5522("text/plain".into())
+            });
+            let first_reply = reply.take();
+            release_host_clipboard_state(&mut owner, &mut task, &mut reply, 7, 12);
+            assert!(observed.is_aborted());
+            assert!(owner.is_none() && task.is_none() && reply.is_none());
+            let mut terminal = TerminalState::new(80, 24);
+            let mut in_flight = true;
+            let mut pending52 = Some(std::collections::VecDeque::from([b"\x07".as_slice()]));
+            let mut pending5522 = Some(2);
+            refuse_host_clipboard_reply(
+                first_reply,
+                &mut terminal,
+                &mut in_flight,
+                &mut pending52,
+                &mut pending5522,
+            );
+            assert!(!in_flight);
+            if osc52 {
+                assert_eq!(terminal.output_buffer, b"\x1b]52;c;\x1b\\\x1b]52;c;\x07");
+                assert!(pending52.is_none());
+            } else {
+                let mut expected = osc_5522_packet("type=read:status=EPERM", None);
+                expected.extend(osc_5522_packet("type=read:status=EBUSY", None).repeat(2));
+                assert_eq!(terminal.output_buffer, expected);
+                assert!(pending5522.is_none());
+            }
+            assert!(!host_clipboard_completion_matches(owner, 4, 7, 12, 4));
+            owner = Some((7, 12)); // A newly granted read uses a new generation.
+            assert!(!host_clipboard_completion_matches(owner, 5, 7, 12, 4));
+            assert!(host_clipboard_completion_matches(owner, 5, 7, 12, 5));
+        }
+    }
+
+    #[test]
+    fn every_config_replacement_revokes_before_permission_change() {
+        let source = include_str!("main.rs");
+        let production = source.split("\n#[cfg(test)]").next().unwrap();
+        let compact: String = production
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        let compact = compact.replace(",)", ")");
+        let marker = "self.config=";
+        let mut remaining = compact.as_str();
+        let mut replacements = 0;
+        while let Some((before, after)) = remaining.split_once(marker) {
+            let (value, rest) = after.split_once(';').unwrap();
+            let expected =
+                format!("self.before_clipboard_permission_change({value}.allow_clipboard_read);");
+            assert!(
+                before.ends_with(&expected),
+                "missing pre-replacement permission gate"
+            );
+            replacements += 1;
+            remaining = rest;
+        }
+        assert_eq!(replacements, 7);
+    }
+
+    #[test]
+    fn revoke_regrant_rejects_already_queued_old_generation() {
+        assert!(host_clipboard_completion_matches(
+            Some((7, 12)),
+            4,
+            7,
+            12,
+            4
+        ));
+        assert!(!host_clipboard_completion_matches(None, 4, 7, 12, 4));
+        assert!(!host_clipboard_completion_matches(
+            Some((7, 12)),
+            5,
+            7,
+            12,
+            4
+        ));
+        assert!(host_clipboard_completion_matches(
+            Some((7, 12)),
+            5,
+            7,
+            12,
+            5
+        ));
+    }
+
+    #[test]
+    fn close_replacement_and_reused_fd_never_match_another_session() {
+        assert!(!host_clipboard_completion_matches(
+            Some((8, 12)),
+            4,
+            7,
+            12,
+            4
+        ));
+        assert!(!host_clipboard_completion_matches(
+            Some((7, 13)),
+            4,
+            7,
+            12,
+            4
+        ));
+        assert!(!host_clipboard_completion_matches(None, 4, 7, 12, 4));
+    }
+
+    #[test]
+    fn source_keeps_ownership_check_before_both_completion_side_effects() {
+        let source = include_str!("main.rs");
+        for marker in [
+            "            Message::Osc52Query(id, fd, generation, terminator, content) => {",
+            "            Message::Osc5522Data(id, fd, generation, mime, content) => {",
+        ] {
+            let body = source.split_once(marker).unwrap().1;
+            assert!(
+                body.find("finish_host_clipboard_read(id, fd, generation)")
+                    .unwrap()
+                    < body.find("session_by_identity(id, fd)").unwrap()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod startup_recovery_tests {
+    use super::{RestoredState, StartupRecovery};
+    use crate::recovery_report::{PreservationOutcome, RecoveryReport, RepairKind};
+
+    fn repaired(preservation: PreservationOutcome) -> StartupRecovery {
+        let mut report = RecoveryReport::default();
+        report.add(RepairKind::InvalidTitle, 2);
+        report.add(RepairKind::InvalidCwd, 1);
+        StartupRecovery::new(report, preservation)
+    }
+
+    #[test]
+    fn clean_startup_has_no_banner_or_write_block() {
+        let state = RestoredState::from_spawn_result(Ok::<_, &str>(()), 0);
+        assert!(!state.startup_recovery.visible());
+        assert_eq!(state.startup_recovery.banner_height(13.0), 0.0);
+        assert!(state.startup_recovery.report.is_empty());
+        assert!(!state.session_writes_blocked);
+        assert!(state.diagnostic.is_none());
+    }
+
+    #[test]
+    fn fallback_success_and_failure_keep_the_recovery_report() {
+        for preservation in [PreservationOutcome::Preserved, PreservationOutcome::Blocked] {
+            for result in [Ok(()), Err("default shell could not start")] {
+                let succeeds = result.is_ok();
+                let recovery = repaired(preservation);
+                let state = RestoredState::from_spawn_result(result, 4).with_recovery(recovery);
+                assert_eq!(state.sessions.len(), usize::from(succeeds));
+                assert_eq!(state.next_id, 4 + usize::from(succeeds));
+                assert_eq!(state.diagnostic.is_some(), !succeeds);
+                assert_eq!(state.startup_recovery.report, recovery.report);
+                assert_eq!(state.startup_recovery.preservation, preservation);
+                assert!(state.startup_recovery.visible());
+                assert_eq!(state.session_writes_blocked, preservation.writes_blocked());
+            }
+        }
+    }
+
+    #[test]
+    fn dismiss_retains_facts_and_never_unblocks_saving() {
+        let mut state = RestoredState::<()>::from_spawn_result(Err("shell failed"), 0)
+            .with_recovery(repaired(PreservationOutcome::Blocked));
+        let report = state.startup_recovery.report;
+        // Successful retry/new-tab paths clear the separate spawn diagnostic.
+        state.sessions.push(());
+        state.diagnostic = None;
+        assert!(state.startup_recovery.visible());
+        state.startup_recovery.dismiss();
+        state.startup_recovery.dismiss();
+        assert!(!state.startup_recovery.visible());
+        assert_eq!(state.startup_recovery.banner_height(13.0), 0.0);
+        assert_eq!(state.startup_recovery.report, report);
+        assert_eq!(
+            state.startup_recovery.preservation,
+            PreservationOutcome::Blocked
+        );
+        assert!(state.session_writes_blocked);
+    }
+
+    #[test]
+    fn attaching_recovery_cannot_clear_an_existing_write_block() {
+        let state = RestoredState::<()> {
+            session_writes_blocked: true,
+            ..RestoredState::default()
+        }
+        .with_recovery(repaired(PreservationOutcome::Preserved));
+        assert!(state.session_writes_blocked);
+    }
+
+    #[test]
+    fn banner_height_is_bounded_and_independent_of_repair_count() {
+        let mut recovery = repaired(PreservationOutcome::Preserved);
+        let height = recovery.banner_height(13.0);
+        recovery.report.add(RepairKind::InvalidTitle, usize::MAX);
+        assert_eq!(recovery.banner_height(13.0), height);
+        for size in [0.0, 8.0, 13.0, 32.0, 10000.0] {
+            assert!((1.0..=137.0).contains(&recovery.banner_height(size)));
+        }
+    }
+
+    #[test]
+    fn source_preserves_loaded_bytes_before_either_fallback() {
+        let source = include_str!("main.rs");
+        let restore = source
+            .split_once("    fn restore_or_spawn(")
+            .unwrap()
+            .1
+            .split_once("    fn save_session_snapshot(")
+            .unwrap()
+            .0;
+        assert!(restore.contains("original.as_deref()"));
+        assert!(
+            restore.find("prepare_repaired_snapshot(").unwrap()
+                < restore.find("if snapshot.sessions.is_empty()").unwrap()
+        );
+        assert!(
+            restore.find("prepare_repaired_snapshot(").unwrap()
+                < restore.find("if sessions.is_empty()").unwrap()
+        );
+        assert_eq!(
+            restore
+                .matches("default(0).with_recovery(startup_recovery)")
+                .count(),
+            2
+        );
+        assert!(restore
+            .contains("session_writes_blocked: startup_recovery.preservation.writes_blocked()"));
+        assert!(restore.contains("SnapshotLoad::Unreadable(reason)"));
+        assert!(restore.contains("quarantine_corrupt(&path)"));
+        assert!(restore.contains("state.session_writes_blocked = true;"));

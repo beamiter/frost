@@ -1,0 +1,300 @@
+            .max_height(560.0)
+            .padding(16)
+            .style(container::dark);
+        container(inner)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into()
+    }
+
+    /// Centered keybindings cheat-sheet (Ctrl+Shift+/). Pane direction chords
+    /// combine Ctrl with Alt so JWM's bare-Alt shortcuts remain untouched.
+    fn help_panel(&self) -> Element<'_, Message> {
+        let section = |title: &str| -> Element<'_, Message> {
+            text(title.to_string())
+                .size(self.effective_font_size())
+                .style(text::primary)
+                .into()
+        };
+        let kb = |key: &str, desc: &str| -> Element<'_, Message> {
+            row![
+                container(
+                    text(key.to_string())
+                        .size(self.effective_font_size())
+                        .font(iced::Font::MONOSPACE)
+                )
+                .width(Length::Fixed(190.0)),
+                text(desc.to_string())
+                    .size(self.effective_font_size())
+                    .style(text::secondary),
+            ]
+            .spacing(8)
+            .into()
+        };
+        // Every row whose chord is configurable reads the live binding table.
+        // These were literals, so the one panel whose whole job is to teach
+        // the keyboard showed frost's shipped defaults to a user who had
+        // rebound them — and still showed a chord for a command they had
+        // unbound. An unbound command now says so instead.
+        let bound = |command_id: &str, desc: &str| -> Element<'_, Message> {
+            let key = self
+                .keybindings
+                .shortcut_label(command_id)
+                .unwrap_or_else(|| "(unbound)".to_string());
+            kb(&key, desc)
+        };
+        // One row that stands for several related commands still names each
+        // one's real chord, in the order the description lists them.
+        let bound_group = |command_ids: &[&str], desc: &str| -> Element<'_, Message> {
+            let key = crate::keybindings::bound_shortcut_display(
+                command_ids
+                    .iter()
+                    .map(|command_id| {
+                        self.keybindings
+                            .shortcut_label(command_id)
+                            .unwrap_or_else(|| "(unbound)".to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" / "),
+            );
+            kb(&key, desc)
+        };
+
+        let body = column![
+            text("Keyboard Shortcuts").size(self.effective_font_size()),
+            section("Tabs / Sessions"),
+            bound("session:new", "New tab"),
+            bound("session:close", "Close current tab"),
+            bound("session:next", "Next tab"),
+            bound("session:prev", "Previous tab"),
+            bound_group(
+                &["session:jump:0", "session:jump:7"],
+                "Jump to tab 1-8 (first .. eighth)"
+            ),
+            bound("session:last", "Jump to last tab"),
+            kb("Ctrl+Shift+L", "Fuzzy tab switcher"),
+            section("Splits / Panes"),
+            bound(
+                "terminal:split_vertical",
+                "Add pane right (re-orients a row split)"
+            ),
+            bound(
+                "terminal:split_horizontal",
+                "Add pane below (re-orients a column split)"
+            ),
+            bound_group(
+                &[
+                    "pane:focus_left",
+                    "pane:focus_right",
+                    "pane:focus_up",
+                    "pane:focus_down",
+                ],
+                "Focus the pane left / right / up / down"
+            ),
+            bound_group(
+                &[
+                    "pane:resize_left",
+                    "pane:resize_right",
+                    "pane:resize_up",
+                    "pane:resize_down",
+                ],
+                "Resize the focused pane left / right / up / down"
+            ),
+            bound("pane:zoom_toggle", "Zoom focused pane (toggle)"),
+            bound("pane:swap", "Swap pane with the next one"),
+            kb("Double-click divider", "Equalize all panes"),
+            bound("terminal:close_pane", "Close focused pane / tab"),
+            section("Edit / Clipboard"),
+            bound("edit:copy", "Copy selection"),
+            bound("edit:paste", "Paste"),
+            bound(
+                "terminal:copy_last_output",
+                "Copy last command output (OSC 133)"
+            ),
+            kb(
+                "Ctrl+Shift+H",
+                "Command history picker (types into the prompt)"
+            ),
+            kb(
+                "Ctrl+Shift+M",
+                "Workflow picker (fill args, types into the prompt)"
+            ),
+            kb("Drag", "Select text"),
+            kb("Ctrl+Click", "Open link under cursor"),
+            section("Command Blocks"),
+            kb(
+                "(needs OSC 133)",
+                "Blocks require a shell that reports commands, e.g. jsh"
+            ),
+            kb("Header click", "Select one finalized block"),
+            kb("Shift+Click", "Select a range from any card row"),
+            kb("Ctrl+Shift+Click", "Toggle a block from any card row"),
+            kb(
+                "Right-click card",
+                "Open block actions without losing selection"
+            ),
+            bound(
+                "block:search",
+                "Search/filter blocks and reveal the matching line"
+            ),
+            bound("block:toggle_bookmark", "Toggle bookmark on selected block"),
+            bound_group(
+                &["block:jump_prev_bookmark", "block:jump_next_bookmark"],
+                "Previous / next bookmark (wraps)"
+            ),
+            bound_group(
+                &["block:fix_with_agent", "block:explain_with_agent"],
+                "Fix / explain selected (or latest) failed block with Agent"
+            ),
+            bound(
+                "block:retry_failed",
+                "Retry selected (or latest) failed block's command"
+            ),
+            bound_group(
+                &[
+                    "block:select_all",
+                    "block:reinput_selected_commands",
+                    "block:clear",
+                ],
+                "Select all / reinput / clear blocks"
+            ),
+            kb("Ctrl+↑", "Start selecting from the newest block"),
+            kb("↑ / ↓", "Move the selection to the adjacent block"),
+            kb("Shift+↑ / ↓", "Grow or shrink the selected range"),
+            bound(
+                "block:toggle_collapse",
+                "Collapse / expand the selected block's output"
+            ),
+            bound(
+                "block:menu",
+                "Open selected block actions (Block mode, idle terminal, outside IME)"
+            ),
+            kb("Ctrl+Shift+↑ / ↓", "Reveal selected block top / bottom"),
+            kb("Command palette", "Block copy, search, export, navigation"),
+            kb("Enter / Esc", "Reinput safe selection / clear selection"),
+            section("Scroll / Search"),
+            kb("Shift+Home", "Scroll to top"),
+            kb("Shift+End", "Scroll to bottom (live)"),
+            bound_group(
+                &["terminal:prompt_prev", "terminal:prompt_next"],
+                "Previous / next prompt (OSC 133)"
+            ),
+            bound("search:open", "Find"),
+            bound(
+                "search:replace:toggle",
+                "Find & replace in selection (clipboard / prompt)"
+            ),
+            section("Panels"),
+            bound("sidebar:toggle", "Toggle tabs / files sidebar"),
+            kb(
+                "F5 over Files or while focused",
+                "Refresh the current file-tree root",
+            ),
+            kb(
+                "Alt+Left/Right/Up/Home over Files or while focused",
+                "Back / Forward / Parent / location home",
+            ),
+            kb(
+                "Arrows / Enter / Space / Delete in focused Files",
+                "Walk the tree, open, multi-select, delete",
+            ),
+            kb("Ctrl+F in focused Files", "Filter loaded names"),
+            kb("Shift+F10 in focused Files", "File operations menu"),
+            kb("Right-click folder → Open Folder", "Enter that directory"),
+            kb("Ctrl+Shift+P", "Command palette"),
+            bound("config:toggle", "Settings"),
+            kb(
+                "Ctrl+Shift+P → Open Codex/Claude/OpenCode/Kimi",
+                "Launch agent CLI in a new tab"
+            ),
+            kb("F12", "Debug / diagnostics"),
+            kb("Ctrl+Shift+/", "This help"),
+            kb("Esc", "Close any panel"),
+            section("Appearance"),
+            bound_group(
+                &["font:zoom_in", "font:zoom_out"],
+                "Increase / decrease font size"
+            ),
+            bound("font:zoom_reset", "Reset font size"),
+            bound_group(
+                &["opacity:increase", "opacity:decrease"],
+                "Increase / decrease window opacity"
+            ),
+        ]
+        .spacing(6);
+
+        let panel_width = (self.win_size.width - 32.0).clamp(300.0, 560.0);
+        let panel_height = (self.win_size.height - 32.0).clamp(180.0, 620.0);
+        let inner = container(scrollable(body).height(Length::Shrink))
+            .width(Length::Fixed(panel_width))
+            .max_height(panel_height)
+            .padding(16)
+            .style(container::dark);
+        container(inner)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into()
+    }
+
+    /// Top-right diagnostics overlay (F12): live grid / session /
+    /// scrollback / Kitty-image / process-memory stats for the active session.
+    fn debug_panel(&self) -> Element<'_, Message> {
+        let stat = |label: &str, value: String| -> Element<'_, Message> {
+            row![
+                container(
+                    text(label.to_string())
+                        .size(self.effective_font_size())
+                        .style(text::primary)
+                )
+                .width(Length::Fixed(110.0)),
+                text(value)
+                    .size(self.effective_font_size())
+                    .font(iced::Font::MONOSPACE),
+            ]
+            .spacing(8)
+            .into()
+        };
+
+        let mut lines = column![text("Diagnostics").size(self.effective_font_size())].spacing(3);
+        let wakes = self.organism_wake_counts.snapshot();
+        lines = lines
+            .push(stat("Motion", format!("{:?} / {:?}", self.organism_motion_control.resolution(), self.organism_motion_control.source())))
+            .push(stat("Organism wake", format!("live {} preview {} maintenance {}", wakes.live_animation, wakes.preview_animation, wakes.maintenance)))
+            .push(stat("Expiry wake", format!("preview {}/{}/{} retreat {} completion {} attention {}", wakes.preview_boundary, wakes.preview_greeting, wakes.preview_cooldown, wakes.retreat_expiry, wakes.completion_expiry, wakes.live_attention)))
+            .push(text("Delivered organism causes since launch; not frame or application-wide wake counts.").size(self.effective_font_size()));
+        lines = lines
+            .push(stat("Grid", format!("{}x{}", self.cols, self.rows)))
+            .push(stat("Sessions", format!("{}", self.sessions.len())))
+            .push(stat("Active", format!("#{}", self.active + 1)))
+            .push(stat(
+                "Split",
+                if self.is_split() {
+                    format!(
+                        "{}/{} panes",
+                        self.focused_pane_pos() + 1,
+                        self.layout().leaf_count()
+                    )
+                } else {
+                    "Single".to_string()
+                },
+            ));
+        if let Some(sess) = self.sessions.get(self.active) {
+            lines = lines
+                .push(stat(
+                    "Scrollback",
+                    format!(
+                        "{} / {}",
+                        sess.terminal.scrollback_len(),
+                        self.config.scrollback_lines
+                    ),
+                ))
+                .push(stat(
+                    "Scroll Off",
+                    format!("{}", sess.terminal.scroll_offset),
+                ))
+                .push(stat(
+                    "Kitty Imgs",
+                    format!("{}", sess.terminal.kitty_graphics.image_count()),
+                ))
+                .push(stat(
+                    "Kitty Mem",

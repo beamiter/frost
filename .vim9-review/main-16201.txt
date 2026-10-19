@@ -1,0 +1,300 @@
+                            && !host_blocked
+                            && self.try_begin_host_clipboard_read(id, fd);
+                        if start_read {
+                            if let Some(index) = session_index {
+                                let sess = &mut self.sessions[index];
+                                sess.clipboard_read_in_flight = true;
+                                sess.osc52_pending_refusals = Some(Default::default());
+                            }
+                            let generation = self.host_clipboard_read_generation;
+                            self.host_clipboard_read_reply =
+                                Some(HostClipboardReply::Osc52(terminator));
+                            let (task, handle) = iced::clipboard::read()
+                                .map(move |c| {
+                                    Message::Osc52Query(id, fd, generation, terminator, c)
+                                })
+                                .abortable();
+                            self.host_clipboard_read_task = Some(handle.abort_on_drop());
+                            tasks.push(task);
+                        } else if let Some(index) = session_index {
+                            let sess = &mut self.sessions[index];
+                            // OSC 52 has no structured busy status; an empty response
+                            // is the interoperable refusal while another read runs.
+                            sess.terminal.respond_osc52_clipboard("", terminator);
+                            sess.flush_responses();
+                        }
+                    } else {
+                        // An empty OSC 52 response reports that clipboard reads are
+                        // unavailable without exposing host clipboard contents.
+                        if let Some(sess) = self.session_by_identity(id, fd) {
+                            sess.terminal.respond_osc52_clipboard("", terminator);
+                            sess.flush_responses();
+                        }
+                    }
+                }
+
+                // OSC 5522 extended-clipboard read requests. iced's clipboard is
+                // text-only, so we advertise a text MIME and serve text reads via
+                // an async clipboard read; non-text MIME types get ENOSYS.
+                for kind in clip_requests {
+                    let allow_clipboard_read = self.config.allow_clipboard_read;
+                    let host_blocked = self.host_clipboard_read_blocked_for(id, fd);
+                    let mime = session_index.and_then(|index| {
+                        let sess = &mut self.sessions[index];
+                        service_osc5522_read(
+                            &mut sess.terminal,
+                            &mut sess.clipboard_read_in_flight,
+                            &mut sess.osc5522_pending_refusals,
+                            allow_clipboard_read,
+                            host_blocked,
+                            kind,
+                        )
+                    });
+                    if let Some(mime) = mime {
+                        if self.try_begin_host_clipboard_read(id, fd) {
+                            let generation = self.host_clipboard_read_generation;
+                            self.host_clipboard_read_reply =
+                                Some(HostClipboardReply::Osc5522(mime.clone()));
+                            let (task, handle) = iced::clipboard::read()
+                                .map(move |c| {
+                                    Message::Osc5522Data(id, fd, generation, mime.clone(), c)
+                                })
+                                .abortable();
+                            self.host_clipboard_read_task = Some(handle.abort_on_drop());
+                            tasks.push(task);
+                        } else if let Some(index) = session_index {
+                            let sess = &mut self.sessions[index];
+                            sess.clipboard_read_in_flight = false;
+                            sess.osc5522_pending_refusals = None;
+                            sess.terminal
+                                .output_buffer
+                                .extend_from_slice(&osc_5522_packet(
+                                    "type=read:status=EBUSY",
+                                    None,
+                                ));
+                        }
+                    }
+                    if let Some(index) = session_index {
+                        let sess = &mut self.sessions[index];
+                        sess.flush_responses();
+                        sess.refresh();
+                    }
+                }
+
+                // Mirror captured command output into jsh's execution journal.
+                // The journal is on unless `JSH_EXECUTION_JOURNAL` explicitly
+                // turns it off, and the comment here used to say the opposite,
+                // which is how the clone below survived: `submit` repeats this
+                // check at the queue boundary, but only AFTER taking the whole
+                // block output by value. Asking first means a disabled journal
+                // costs nothing per finished command instead of one copy of up
+                // to `TerminalState::MAX_CAPTURED_OUTPUT_BYTES` on the UI
+                // thread.
+                if jterm_core::execution_journal::output_capture_enabled() {
+                    for completed in &completed_commands {
+                        if completed.completion_provenance
+                            != block_mode::CompletionProvenance::ShellReported
+                        {
+                            continue;
+                        }
+                        // Durable output may only be written against the exact
+                        // Start identity jsh announced on OSC 133 `C`; see
+                        // `journal_lifecycle` for why the plain `id` beside it
+                        // is not a substitute. A completion without one is
+                        // skipped rather than journalled against a guess.
+                        let Some(lifecycle) =
+                            completed.lifecycle.as_ref().and_then(journal_lifecycle)
+                        else {
+                            continue;
+                        };
+                        if let Err(error) = jterm_core::execution_journal::submit(
+                            jterm_core::execution_journal::CompletedExecution {
+                                lifecycle,
+                                output: completed.output.clone(),
+                                output_available: completed.output_available,
+                                truncated: completed.truncated,
+                                total_bytes: completed.total_bytes,
+                            },
+                        ) {
+                            log::warn!("cannot journal completed command output: {error:?}");
+                        }
+                    }
+                }
+
+                // Persist each finished command into the family-shared JSONL
+                // history index (anvil/forge file format) so the
+                // Ctrl+Shift+H picker recalls it across restarts. Writes go
+                // through jterm_core's bounded background writer; unsafe
+                // reconstructions (multiline heredoc text) are skipped rather
+                // than rejected noisily.
+                if !completed_commands.is_empty() {
+                    if let Some(path) = self.config.resolved_command_history_path() {
+                        if let Err(error) = persistence::prepare_command_history_path(&path, true) {
+                            log::warn!("unsafe command-history path rejected: {error}");
+                        } else {
+                            let max_entries = self.config.command_history_max_entries as usize;
+                            let cwd = self
+                                .session_by_identity(id, fd)
+                                .and_then(|sess| sess.cwd_cache.clone().or_else(|| sess.cwd()))
+                                .filter(|cwd| history_picker::sanitized_cwd(cwd).is_some());
+                            let end_time_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .ok()
+                                .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+                            for completed in &completed_commands {
+                                if completed.completion_provenance
+                                    != block_mode::CompletionProvenance::ShellReported
+                                {
+                                    continue;
+                                }
+                                let Some(command) =
+                                    history_picker::sanitized_command(&completed.command)
+                                else {
+                                    continue;
+                                };
+                                let Some(exit_code) = completed.exit_code else {
+                                    // The shared history schema requires a
+                                    // concrete status. Missing OSC status is
+                                    // Unknown, never an implicit success.
+                                    continue;
+                                };
+                                if let Err(error) = jterm_core::command_history::enqueue(
+                                    &path,
+                                    max_entries,
+                                    command,
+                                    cwd.as_deref(),
+                                    exit_code,
+                                    end_time_ms,
+                                ) {
+                                    log::warn!("command history: {error}");
+                                }
+                            }
+                        }
+                    }
+                }
+                for completed in &completed_commands {
+                    self.agent.handle_completed(id, completed);
+                }
+                if let Some(task) = self.agent_drive_task() {
+                    tasks.push(task);
+                }
+                // Review-first command correction: a shell-reported, non-Agent
+                // failure may resolve into a proposal card for that pane.
+                for completed in &completed_commands {
+                    if let Some(task) = self.maybe_start_command_correction(id, completed) {
+                        tasks.push(task);
+                    }
+                }
+                self.organism.freeze_watch(false);
+                if !tasks.is_empty() {
+                    return Task::batch(tasks);
+                }
+            }
+            Message::JshChecked(status) => {
+                if let Some(error) = &status.error {
+                    log::info!("jsh update check unavailable: {error}");
+                }
+                if let Some(other) = &status.shadowed_by {
+                    // Some other binary named jsh, earlier on PATH. Installing
+                    // does not fix PATH order, so the installer explains it in
+                    // the session; here it is only worth a log line.
+                    log::warn!("PATH resolves jsh to {other}, which frost does not manage");
+                }
+                self.jsh_prompt = jterm_core::jsh_install::prompt_for(&status);
+                if let Some(prompt) = &self.jsh_prompt {
+                    log::info!("jsh notice: {}", prompt.banner_title());
+                }
+            }
+            Message::JshInstall => self.install_or_update_jsh(),
+            Message::RemotePickerClose => self.remote_picker = None,
+            Message::RemotePickerConnect(identity, profile) => {
+                let Some(index) = remote_picker_target_index(
+                    self.remote_picker.as_ref(),
+                    &identity,
+                    &profile,
+                    &self.config.remote_hosts,
+                ) else {
+                    return Task::none();
+                };
+                self.remote_picker = None;
+                self.connect_remote_host(index);
+            }
+            Message::RemoteHostName(target, name) => {
+                let Some(index) = self.remote_host_row(&target) else {
+                    return Task::none();
+                };
+                if let Some(host) = self.config.remote_hosts.get_mut(index) {
+                    if let Some(name) = crate::config::accepted_config_text(
+                        name,
+                        crate::config::MAX_CONFIG_NAME_BYTES,
+                    ) {
+                        host.name = name;
+                        self.config_dirty = true;
+                        if let Some(request) = self.reconcile_sidebar_remote_hosts() {
+                            return self.queue_sidebar_load(request);
+                        }
+                    }
+                }
+            }
+            Message::RemoteHostHost(target, value) => {
+                let Some(index) = self.remote_host_row(&target) else {
+                    return Task::none();
+                };
+                if let Some(host) = self.config.remote_hosts.get_mut(index) {
+                    if let Some(value) = crate::config::accepted_config_text(
+                        value,
+                        crate::config::MAX_CONFIG_VALUE_BYTES,
+                    ) {
+                        host.host = value;
+                        self.config_dirty = true;
+                        if let Some(request) = self.reconcile_sidebar_remote_hosts() {
+                            return self.queue_sidebar_load(request);
+                        }
+                    }
+                }
+            }
+            Message::RemoteHostUser(target, user) => {
+                let Some(index) = self.remote_host_row(&target) else {
+                    return Task::none();
+                };
+                if let Some(host) = self.config.remote_hosts.get_mut(index) {
+                    // Blank clears the login/exec user rather than storing "".
+                    if let Some(user) = crate::config::accepted_config_text(
+                        user,
+                        crate::config::MAX_CONFIG_VALUE_BYTES,
+                    ) {
+                        host.user = Some(user).filter(|u| !u.trim().is_empty());
+                        self.config_dirty = true;
+                        if let Some(request) = self.reconcile_sidebar_remote_hosts() {
+                            return self.queue_sidebar_load(request);
+                        }
+                    }
+                }
+            }
+            Message::RemoteHostDocker(target, docker) => {
+                let Some(index) = self.remote_host_row(&target) else {
+                    return Task::none();
+                };
+                if let Some(host) = self.config.remote_hosts.get_mut(index) {
+                    host.docker = docker;
+                    self.config_dirty = true;
+                    if let Some(request) = self.reconcile_sidebar_remote_hosts() {
+                        return self.queue_sidebar_load(request);
+                    }
+                }
+            }
+            Message::RemoteHostDeploy(target, deploy) => {
+                let Some(index) = self.remote_host_row(&target) else {
+                    return Task::none();
+                };
+                if let Some(host) = self.config.remote_hosts.get_mut(index) {
+                    if let Some(deploy) = crate::config::accepted_config_text(
+                        deploy,
+                        crate::config::MAX_CONFIG_NAME_BYTES,
+                    ) {
+                        host.deploy = deploy;
+                        self.config_dirty = true;
+                        if let Some(request) = self.reconcile_sidebar_remote_hosts() {
+                            return self.queue_sidebar_load(request);
+                        }
+                    }

@@ -1,0 +1,300 @@
+                // rename starts from what the user just right-clicked.
+                let input = menu
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.sidebar_dialog = Some(SidebarDialogState {
+                    kind: SidebarDialogKind::Rename,
+                    path: menu.path,
+                    input,
+                    error: None,
+                    generation: menu.generation,
+                });
+                iced::widget::operation::focus(SIDEBAR_DIALOG_INPUT_ID.clone())
+            }
+            SidebarMenuAction::Delete => {
+                let paths: Vec<std::path::PathBuf> =
+                    menu.targets.iter().map(|(path, _)| path.clone()).collect();
+                self.sidebar_delete_confirm = Some(SidebarDeleteConfirmation {
+                    paths,
+                    generation: menu.generation,
+                });
+                Task::none()
+            }
+            SidebarMenuAction::Copy | SidebarMenuAction::Cut => {
+                let Some(next_id) = next_sidebar_clipboard_id(self.sidebar_next_clipboard_id)
+                else {
+                    self.set_sidebar_notice(
+                        "Files clipboard identity exhausted; restart Frost before copying again"
+                            .to_string(),
+                        false,
+                    );
+                    return Task::none();
+                };
+                self.sidebar_next_clipboard_id = next_id;
+                self.sidebar_clipboard = Some(FsClipboard {
+                    id: next_id,
+                    loc: self.sidebar.location.clone(),
+                    items: menu.targets,
+                    cut: action == SidebarMenuAction::Cut,
+                });
+                Task::none()
+            }
+            SidebarMenuAction::CopyPath => {
+                // The rows' full paths as plain text, newline-joined — remote
+                // rows keep the bare remote path, no prefix.
+                let mut parts = Vec::new();
+                for (path, _) in &menu.targets {
+                    let Some(text) = copy_path_payload(path) else {
+                        self.set_sidebar_notice(
+                            "Path not copied: it contains control or visual-spoofing characters"
+                                .to_string(),
+                            false,
+                        );
+                        return Task::none();
+                    };
+                    parts.push(text);
+                }
+                iced::clipboard::write(parts.join("\n"))
+            }
+            SidebarMenuAction::Paste => {
+                let live_clipboard_id = self
+                    .sidebar_clipboard
+                    .as_ref()
+                    .map(|clipboard| clipboard.id);
+                if !sidebar_menu_clipboard_is_current(menu.clipboard_id, live_clipboard_id) {
+                    self.set_sidebar_notice(
+                        "Files clipboard changed; reopen the menu before pasting".to_string(),
+                        false,
+                    );
+                    return Task::none();
+                }
+                let Some(clipboard) = self.sidebar_clipboard.clone() else {
+                    return Task::none();
+                };
+                let op = match sidebar_paste_op(&clipboard, &target_dir) {
+                    Ok(op) => op,
+                    Err(problem) => {
+                        self.set_sidebar_notice(problem, false);
+                        return Task::none();
+                    }
+                };
+                let Some(context_epoch) = self.sidebar_context_epoch else {
+                    self.set_sidebar_notice(
+                        "Files operation identity exhausted; restart Frost before modifying files"
+                            .to_string(),
+                        false,
+                    );
+                    return Task::none();
+                };
+                // Cross-location transfers can run long: give them a progress
+                // handle, a live notice, and a cancel button. One at a time:
+                // the cancel affordance addresses exactly one handle, so a
+                // second transfer is refused while one runs.
+                let mut progress = None;
+                if !remote_fs::same_files_location(
+                    &clipboard.loc,
+                    &self.sidebar.location,
+                    self.sidebar.hosts_snapshot(),
+                ) {
+                    if self.sidebar_transfer.is_some() {
+                        self.set_sidebar_notice("A transfer is already running".to_string(), false);
+                        return Task::none();
+                    }
+                    let handle = remote_fs::TransferProgress::new();
+                    // Uploads know the local total only for a single file.
+                    let total = match clipboard.items.as_slice() {
+                        [(path, false)] if clipboard.loc == remote_fs::FsLocation::Local => {
+                            std::fs::metadata(path).ok().map(|m| m.len())
+                        }
+                        _ => None,
+                    };
+                    let name = match clipboard.items.as_slice() {
+                        [(path, _)] => path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        items => format!("{} items", items.len()),
+                    };
+                    let ui = SidebarTransferUi {
+                        progress: handle.clone(),
+                        verb: transfer_verb(
+                            &clipboard.loc,
+                            &self.sidebar.location,
+                            self.sidebar.hosts_snapshot(),
+                            false,
+                        ),
+                        name,
+                        total,
+                    };
+                    self.set_sidebar_notice(ui.status_text(), true);
+                    self.sidebar_transfer = Some(ui);
+                    progress = Some(handle);
+                }
+                sidebar_op_task(
+                    context_epoch,
+                    self.sidebar.location.clone(),
+                    self.sidebar.hosts_snapshot().to_vec(),
+                    op,
+                    progress,
+                    clipboard.cut.then_some(clipboard.id),
+                )
+            }
+            SidebarMenuAction::Refresh => self
+                .sidebar
+                .refresh_directory(&target_dir)
+                .map_or_else(Task::none, |request| self.queue_sidebar_load(request)),
+        }
+    }
+
+    /// Validate the modal name input and turn it into a create/rename op.
+    /// A failed validation stays in the dialog as its inline error.
+    fn submit_sidebar_dialog(&mut self) -> Task<Message> {
+        let Some(dialog) = self.sidebar_dialog.clone() else {
+            return Task::none();
+        };
+        self.invalidate_sidebar_remote_follow_intent();
+        if !self.sidebar.accepts_generation(dialog.generation) {
+            self.sidebar_dialog = None;
+            self.set_sidebar_notice(
+                "Files changed; reopen the action before modifying anything".to_string(),
+                false,
+            );
+            return Task::none();
+        }
+        if let Err(problem) = remote_fs::validate_new_name(&dialog.input) {
+            if let Some(current) = self.sidebar_dialog.as_mut() {
+                current.error = Some(crate::sidebar::bound_sidebar_notice(problem));
+            }
+            return Task::none();
+        }
+        let Some(context_epoch) = self.sidebar_context_epoch else {
+            self.set_sidebar_notice(
+                "Files operation identity exhausted; restart Frost before modifying files"
+                    .to_string(),
+                false,
+            );
+            return Task::none();
+        };
+        self.sidebar_dialog = None;
+        let op = match dialog.kind {
+            SidebarDialogKind::NewFile => SidebarOp::CreateFile(dialog.path.join(&dialog.input)),
+            SidebarDialogKind::NewFolder => SidebarOp::CreateDir(dialog.path.join(&dialog.input)),
+            SidebarDialogKind::Rename => {
+                let Some(parent) = dialog.path.parent() else {
+                    return Task::none();
+                };
+                let dst = parent.join(&dialog.input);
+                if dst == dialog.path {
+                    // Unchanged name: nothing to do, and the probe would
+                    // (correctly) refuse it as already-existing.
+                    return Task::none();
+                }
+                SidebarOp::Rename {
+                    src: dialog.path,
+                    dst,
+                }
+            }
+        };
+        let consumed_clipboard_id = if matches!(&op, SidebarOp::Rename { .. }) {
+            sidebar_clipboard_id_at_location(
+                self.sidebar_clipboard.as_ref(),
+                &self.sidebar.location,
+            )
+        } else {
+            None
+        };
+        sidebar_op_task(
+            context_epoch,
+            self.sidebar.location.clone(),
+            self.sidebar.hosts_snapshot().to_vec(),
+            op,
+            None,
+            consumed_clipboard_id,
+        )
+    }
+
+    /// The directory a drop over the files panel imports into: a directory
+    /// row takes it itself, a file row its parent, anything else in the panel
+    /// the current root. `None` when the files panel is not the drop surface
+    /// (dock closed, another panel, pointer over the terminal) — those drops
+    /// keep the terminal's own drop behavior.
+    fn sidebar_drop_target(&self) -> Option<std::path::PathBuf> {
+        if !(self.dock_open() && self.sidebar_panel == SidebarPanel::Files && self.sidebar_hovered)
+        {
+            return None;
+        }
+        Some(match &self.sidebar_hovered_row {
+            Some((path, true)) => path.clone(),
+            Some((path, false)) => path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| self.sidebar.current_dir.clone()),
+            None => self.sidebar.current_dir.clone(),
+        })
+    }
+
+    /// The rows the tree currently shows (filter applied), in display order —
+    /// the shared basis for shift-click ranges and menu target lists.
+    fn sidebar_visible_rows(&self) -> Vec<(std::path::PathBuf, bool)> {
+        let filter = self
+            .sidebar_filter
+            .as_deref()
+            .and_then(|query| filter_match_set(&self.sidebar.root, query));
+        let mut rows = Vec::new();
+        visible_row_list(&self.sidebar.root, filter.as_ref(), &mut rows);
+        rows
+    }
+
+    /// Modifier-aware row click: Ctrl toggles the row's selection membership,
+    /// Shift ranges from the anchor within the visible order, a plain click
+    /// collapses the selection to the row and keeps the classic behavior
+    /// (dirs toggle, files type their path). Modifier clicks never toggle or
+    /// insert.
+    fn sidebar_row_click(&mut self, path: std::path::PathBuf, is_dir: bool) -> Task<Message> {
+        self.sidebar_files_focused = true;
+        self.sidebar_tree_focus = Some(path.clone());
+        self.invalidate_sidebar_remote_follow_intent();
+        if self.modifiers.control() {
+            selection_toggle(&mut self.sidebar_selection, &path);
+            self.sidebar_selection_anchor = Some(path);
+            return Task::none();
+        }
+        if self.modifiers.shift() {
+            let rows = self.sidebar_visible_rows();
+            let anchor = self
+                .sidebar_selection_anchor
+                .clone()
+                .unwrap_or_else(|| path.clone());
+            let range = selection_range(&rows, &anchor, &path);
+            if !range.is_empty() {
+                self.sidebar_selection = range;
+            }
+            return Task::none();
+        }
+        self.sidebar_selection = vec![path.clone()];
+        self.sidebar_selection_anchor = Some(path.clone());
+        if is_dir {
+            if let Some(request) = self.sidebar.toggle_node(&path) {
+                return self.queue_sidebar_load(request);
+            }
+            return Task::none();
+        }
+        self.update(Message::SidebarInsertPath(path))
+    }
+
+    fn files_shortcut_scope(&self) -> bool {
+        files_shortcut_scope(
+            self.dock_open(),
+            self.sidebar_panel == SidebarPanel::Files,
+            self.sidebar_hovered,
+            self.sidebar_files_focused,
+        )
+    }
+
+    fn sidebar_menu_action_list(
+        &self,
+        targets_len: usize,
+        is_dir: bool,
+    ) -> Vec<(SidebarMenuAction, bool, String)> {

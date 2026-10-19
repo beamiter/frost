@@ -1,0 +1,300 @@
+                    location,
+                });
+            }
+            let selected = choices
+                .iter()
+                .find(|choice| choice.location == self.sidebar.location)
+                .cloned()
+                .or_else(|| choices.first().cloned());
+            let hosts_epoch = self.sidebar_hosts_epoch;
+            let picker = pick_list(choices, selected, move |choice| {
+                Message::SidebarSetLocation(hosts_epoch, choice.location)
+            })
+            .text_size(self.chrome_font_size())
+            .width(Length::Fill);
+            rows.push(container(picker).padding([0, 6]).into());
+        }
+        // Transient op feedback (validation failures, ssh errors) lives in the
+        // panel itself, where the user is looking; progress and cancellation
+        // get the neutral style, errors the danger one. A running transfer
+        // adds Cancel; an SSH join that exhausted its automatic retry keeps a
+        // bounded explicit Retry action while that exact command remains live.
+        if let Some((notice, neutral)) = &self.sidebar_notice {
+            let transferring = self.sidebar_transfer.is_some();
+            let notice_action: Element<'_, Message> = if transferring {
+                button(text("×").size(self.chrome_font_size()))
+                    .on_press(Message::SidebarTransferCancel)
+                    .padding([0, 5])
+                    .style(self.ghost_btn_style())
+                    .into()
+            } else if self.sidebar_follow_retry_available.is_some() {
+                button(text("Retry").size(self.chrome_font_size()))
+                    .on_press(Message::SidebarRemoteFollowRetry)
+                    .padding([1, 6])
+                    .style(self.ghost_btn_style())
+                    .into()
+            } else {
+                Space::new().into()
+            };
+            rows.push(
+                container(
+                    row![
+                        text(crate::sidebar::bound_sidebar_notice(notice))
+                            .size(self.chrome_font_size())
+                            .wrapping(text::Wrapping::Word)
+                            .width(Length::Fill)
+                            .style(if *neutral {
+                                text::secondary
+                            } else {
+                                text::danger
+                            }),
+                        notice_action,
+                    ]
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding([2, 8])
+                .into(),
+            );
+        }
+        match &self.sidebar.root.state {
+            sidebar::DirectoryState::Loading => rows.push(
+                container(
+                    text(
+                        if self.sidebar.request_phase(&self.sidebar.root.path)
+                            == Some(sidebar::DirectoryRequestPhase::Queued)
+                        {
+                            "Queued…"
+                        } else {
+                            "Loading…"
+                        },
+                    )
+                    .size(self.chrome_font_size())
+                    .style(text::secondary),
+                )
+                .padding([4, 8])
+                .into(),
+            ),
+            sidebar::DirectoryState::Refreshing => rows.push(
+                container(
+                    text(
+                        if self.sidebar.request_phase(&self.sidebar.root.path)
+                            == Some(sidebar::DirectoryRequestPhase::Queued)
+                        {
+                            "Refresh queued…"
+                        } else {
+                            "Refreshing…"
+                        },
+                    )
+                    .size(self.chrome_font_size())
+                    .style(text::secondary),
+                )
+                .padding([4, 8])
+                .into(),
+            ),
+            sidebar::DirectoryState::Error(error) => rows.push(
+                container(
+                    row![
+                        text(crate::sidebar::bound_sidebar_notice(error.to_string()))
+                            .size(self.chrome_font_size())
+                            .wrapping(text::Wrapping::Word)
+                            .width(Length::Fill)
+                            .style(text::danger),
+                        button(text("Retry").size(self.chrome_font_size()))
+                            .on_press(Message::SidebarRetry(
+                                self.sidebar.generation(),
+                                self.sidebar.root.path.clone(),
+                            ))
+                            .padding([1, 6])
+                            .style(self.ghost_btn_style()),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding([4, 8])
+                .into(),
+            ),
+            sidebar::DirectoryState::RefreshError(error) => rows.push(
+                container(
+                    row![
+                        text(crate::sidebar::bound_sidebar_notice(format!(
+                            "Refresh failed: {error}"
+                        )))
+                        .size(self.chrome_font_size())
+                        .wrapping(text::Wrapping::Word)
+                        .width(Length::Fill)
+                        .style(text::danger),
+                        button(text("Retry").size(self.chrome_font_size()))
+                            .on_press(Message::SidebarRetry(
+                                self.sidebar.generation(),
+                                self.sidebar.root.path.clone(),
+                            ))
+                            .padding([1, 6])
+                            .style(self.ghost_btn_style()),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding([4, 8])
+                .into(),
+            ),
+            sidebar::DirectoryState::Loaded if self.sidebar.root.children.is_empty() => rows.push(
+                container(
+                    text("Empty directory")
+                        .size(self.chrome_font_size())
+                        .style(text::secondary),
+                )
+                .padding([4, 8])
+                .into(),
+            ),
+            _ => {}
+        }
+        let mut status_bits = Vec::new();
+        let mut status_stale = false;
+        if queued_scans + running_scans > 0 {
+            status_bits.push(format!("{running_scans} running · {queued_scans} queued"));
+        }
+        if let Some(loaded_at) = self.sidebar.root.last_loaded_at {
+            let age = std::time::Instant::now().saturating_duration_since(loaded_at);
+            let (copy, stale) = sidebar_snapshot_age_copy(age);
+            status_stale = stale;
+            status_bits.push(copy);
+        }
+        if self.sidebar.root.truncated {
+            status_bits.push(format!(
+                "first {} entries",
+                remote_fs::MAX_DIRECTORY_ENTRIES
+            ));
+        }
+        if !status_bits.is_empty() {
+            rows.push(
+                container(
+                    text(status_bits.join(" · "))
+                        .size(self.chrome_font_size())
+                        .style(if status_stale {
+                            text::warning
+                        } else {
+                            text::secondary
+                        }),
+                )
+                .padding([1, 8])
+                .into(),
+            );
+        }
+        // The filter's match set is computed once per frame and shared by the
+        // row walk below; an empty match set under a non-empty query gets its
+        // own status row instead of a bare void.
+        let filter = self
+            .sidebar_filter
+            .as_deref()
+            .and_then(|query| filter_match_set(&self.sidebar.root, query));
+        if filter.as_ref().is_some_and(|set| set.is_empty()) {
+            rows.push(
+                container(
+                    text("No matches")
+                        .size(self.chrome_font_size())
+                        .style(text::secondary),
+                )
+                .padding([4, 8])
+                .into(),
+            );
+        }
+        let chrome = mouse_area(iced::widget::Column::with_children(rows).spacing(1))
+            .on_press(Message::SidebarFilesFocus);
+        let items = sidebar::collect_sidebar_render_items(&self.sidebar.root, filter.as_ref());
+        let (start, count, pad_top, pad_bottom) = sidebar::sidebar_tree_window(
+            self.sidebar_tree_offset_y,
+            self.sidebar_tree_viewport_h,
+            items.len(),
+            self.sidebar_row_height(),
+        );
+        let mut tree_rows: Vec<Element<'_, Message>> = Vec::new();
+        if pad_top > 0.0 {
+            tree_rows.push(Space::new().height(Length::Fixed(pad_top)).into());
+        }
+        let drop_target = if self.sidebar_drop_hint {
+            self.sidebar_drop_target()
+        } else {
+            None
+        };
+        for item in items.iter().skip(start).take(count) {
+            tree_rows.push(
+                container(self.sidebar_render_item(item, drop_target.as_deref()))
+                    .clip(true)
+                    .height(Length::Fixed(
+                        self.sidebar_row_height() + sidebar::SIDEBAR_TREE_ROW_GAP,
+                    ))
+                    .into(),
+            );
+        }
+        if pad_bottom > 0.0 {
+            tree_rows.push(Space::new().height(Length::Fixed(pad_bottom)).into());
+        }
+        let tree = iced::widget::Column::with_children(tree_rows).spacing(0);
+        let tree: Element<'_, Message> = scrollable(tree)
+            .id(SIDEBAR_TREE_SCROLL_ID.clone())
+            .height(Length::Fill)
+            .on_scroll(|viewport| {
+                Message::SidebarTreeScrolled(viewport.absolute_offset().y, viewport.bounds().height)
+            })
+            .into();
+        let tree = mouse_area(tree)
+            .on_right_press(Message::SidebarMenuOpenRoot(self.sidebar.generation()))
+            .on_press(Message::SidebarFilesFocus);
+        column![chrome, container(tree).height(Length::Fill)]
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// Vertical session tab list shown in the dock. Mirrors the top tab strip:
+    /// click to select, hover to reveal close, and a trailing "new tab" button.
+    fn sidebar_tabs_view(&self) -> Element<'_, Message> {
+        let mut list = column![].spacing(2).padding([2, 4]);
+        for i in 0..self.tabs.len() {
+            let id = self.tabs[i].id;
+            let active = i == self.active_tab;
+            let label = self.tab_label(i);
+            let label = if label.chars().count() > 22 {
+                let truncated: String = label.chars().take(21).collect();
+                format!("{truncated}…")
+            } else {
+                label
+            };
+            let hovered = self.hovered_tab == Some(id);
+            let dragging_this = self.dragging_tab == Some(id);
+            let label = format!("{}{label}", self.tab_state_prefix(i));
+            let tab_label = container(
+                text(label)
+                    .size(self.chrome_font_size())
+                    .wrapping(text::Wrapping::None),
+            )
+            .width(Length::Fill)
+            .padding([4, 8]);
+            // Right-click opens the same tab menu the top strip uses — this is
+            // the tab list in Side mode, so it must offer the same actions.
+            let tab: Element<'_, Message> = mouse_area(tab_label)
+                .on_press(Message::TabDragStart(id))
+                .on_release(Message::TabDragEnd(id))
+                .on_right_press(Message::TabMenuOpen(id))
+                .into();
+            // Reveal the close button on the active or hovered tab only.
+            let show_close = active || hovered;
+            let close_inner: Element<'_, Message> = if show_close {
+                button(text("×").size(self.chrome_font_size()))
+                    .on_press(Message::CloseTab(id))
+                    .padding([4, 6])
+                    .style(self.tab_close_btn_style())
+                    .into()
+            } else {
+                Space::new().into()
+            };
+            let close = container(close_inner)
+                .width(Length::Fixed((self.chrome_font_size() * 2.0).max(24.0)))
+                .center_x(Length::Fixed((self.chrome_font_size() * 2.0).max(24.0)));
+            let cell = container(row![tab, close].align_y(iced::Alignment::Center))
+                .width(Length::Fill)
+                .style(self.tab_container_style(active, hovered, dragging_this));
+            list = list.push(
+                mouse_area(cell)
+                    .on_enter(Message::TabHover(Some(id)))
+                    .on_exit(Message::TabHover(None)),
+            );

@@ -1,0 +1,255 @@
+    }
+
+    #[test]
+    fn source_banner_is_in_layout_and_dismiss_preserves_permissions() {
+        let source = include_str!("main.rs");
+        let banner = source
+            .split_once("    fn session_recovery_banner(")
+            .unwrap()
+            .1
+            .split_once("    fn diagnostics_overlay(")
+            .unwrap()
+            .0;
+        assert!(banner.contains("bound_diagnostic_text"));
+        assert!(banner.contains("scrollable(details)"));
+        assert!(!banner.contains("stack!["));
+        assert!(!banner.contains("mouse_area("));
+        assert!(!banner.contains("operation::focus"));
+        let view = source
+            .split_once("    fn view(&self)")
+            .unwrap()
+            .1
+            .split_once("    fn search_bar(")
+            .unwrap()
+            .0;
+        assert_eq!(view.matches("self.session_recovery_banner()").count(), 2);
+        assert!(view.contains("column![banner, empty]"));
+        assert!(view.contains("chrome = chrome.push(banner)"));
+        let zoom = source
+            .split_once("    fn font_zoom_enabled(")
+            .unwrap()
+            .1
+            .split_once("    fn font_zoom_region<'a>(")
+            .unwrap()
+            .0;
+        assert!(!zoom.contains("startup_recovery"));
+        let dismiss = source
+            .split_once("            Message::SessionRecoveryDismiss => {")
+            .unwrap()
+            .1
+            .split_once("            Message::AgentClose")
+            .unwrap()
+            .0;
+        assert!(dismiss.contains("self.startup_recovery.dismiss()"));
+        assert!(!dismiss.contains("session_writes_blocked"));
+        assert!(!dismiss.contains("session_diagnostic"));
+        assert!(dismiss.contains("self.relayout()"));
+    }
+}
+
+#[cfg(test)]
+mod layout_reference_recovery_tests {
+    use super::{inspect_restored_snapshot, restored_tab_candidates};
+    use crate::recovery_report::{PreservationOutcome, RecoveryReport, RepairKind};
+    use crate::session_persistence::{
+        PaneTreeSnapshot, SessionSnapshot, SessionsSnapshot, SnapshotLoad, SplitSnapshot,
+        TabSnapshot,
+    };
+
+    fn leaf(session: usize) -> PaneTreeSnapshot {
+        PaneTreeSnapshot::Leaf { session }
+    }
+
+    fn split(sessions: &[usize]) -> PaneTreeSnapshot {
+        PaneTreeSnapshot::Split {
+            axis: "vertical".to_string(),
+            ratios: vec![1.0 / sessions.len() as f32; sessions.len()],
+            children: sessions.iter().copied().map(leaf).collect(),
+        }
+    }
+
+    fn tab(tree: PaneTreeSnapshot, focus: Option<usize>) -> TabSnapshot {
+        TabSnapshot {
+            tree,
+            focus,
+            title: None,
+            pinned: false,
+            marked: false,
+            private_title: false,
+        }
+    }
+
+    fn snapshot(tabs: Vec<TabSnapshot>) -> SessionsSnapshot {
+        SessionsSnapshot::new(
+            vec![SessionSnapshot { cwd: None }; 3],
+            Some(2),
+            tabs,
+            Some(0),
+        )
+    }
+
+    #[test]
+    fn original_invalid_and_duplicate_references_are_not_hidden_by_pruning() {
+        for tree in [split(&[0, 9]), split(&[0, 0])] {
+            let mut saved = snapshot(vec![tab(tree, None), tab(leaf(1), None)]);
+            let report = inspect_restored_snapshot(&saved);
+            assert_eq!(report.count(RepairKind::ReferencesAdjusted), 1);
+            saved.retain_restored_sessions(&[true, true, true]);
+            // The preflight report stays true even if later pruning fixes a tree.
+            assert_eq!(report.count(RepairKind::ReferencesAdjusted), 1);
+            assert_eq!(saved.sessions.len(), 3);
+        }
+    }
+
+    #[test]
+    fn cross_tab_ownership_reports_once_and_keeps_existing_restore_behavior() {
+        let saved = snapshot(vec![
+            tab(leaf(0), Some(0)),
+            tab(leaf(0), Some(0)),
+            tab(leaf(1), None),
+        ]);
+        let mut report = RecoveryReport::default();
+        let candidates = restored_tab_candidates(&saved.tabs, None, None, 2, &mut report);
+        let (tabs, active, _) =
+            super::build_restored_tabs_with_report(candidates, 3, 2, Some(2), true, &mut report);
+        assert_eq!(report.count(RepairKind::ReferencesAdjusted), 1);
+        assert_eq!(tabs.len(), 3);
+        assert_eq!(
+            tabs.iter().map(|tab| tab.sessions()).collect::<Vec<_>>(),
+            vec![vec![0], vec![1], vec![2]]
+        );
+        assert_eq!(tabs[active].focus, 1);
+        let plain = super::build_restored_tabs(
+            restored_tab_candidates(&saved.tabs, None, None, 2, &mut RecoveryReport::default()),
+            3,
+            2,
+            Some(2),
+        );
+        assert_eq!(plain.1, active);
+        assert_eq!(
+            plain.0.iter().map(|tab| tab.sessions()).collect::<Vec<_>>(),
+            tabs.iter().map(|tab| tab.sessions()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn explicit_invalid_focus_reports_but_absent_focus_is_normal() {
+        let explicit = snapshot(vec![tab(leaf(0), Some(2))]);
+        assert_eq!(
+            inspect_restored_snapshot(&explicit).count(RepairKind::ReferencesAdjusted),
+            1
+        );
+        let implicit = snapshot(vec![tab(leaf(0), None)]);
+        assert!(inspect_restored_snapshot(&implicit).is_empty());
+    }
+
+    #[test]
+    fn legacy_migration_orphan_adoption_and_spawn_remapping_are_silent() {
+        let mut legacy = snapshot(Vec::new());
+        legacy.version = 1;
+        legacy.active_tab = None;
+        // The active session is an orphan, so the migration's synthesized focus
+        // is outside this tree. That is an ordinary default, not damaged data.
+        legacy.tree = Some(split(&[0, 1]));
+        assert!(inspect_restored_snapshot(&legacy).is_empty());
+        let mut current = snapshot(vec![tab(leaf(0), Some(0)), tab(leaf(1), None)]);
+        assert!(inspect_restored_snapshot(&current).is_empty());
+        current.retain_restored_sessions(&[false, true, true]);
+        assert!(inspect_restored_snapshot(&current).is_empty());
+    }
+
+    #[test]
+    fn rejected_conversion_reports_and_still_uses_legacy_fallback() {
+        let mut saved = snapshot(Vec::new());
+        saved.tree = Some(PaneTreeSnapshot::Split {
+            axis: "invalid".to_string(),
+            ratios: vec![0.5, 0.5],
+            children: vec![leaf(0), leaf(1)],
+        });
+        saved.split = Some(SplitSnapshot {
+            mode: "vertical".to_string(),
+            ratios: vec![0.5, 0.5],
+            panes: vec![0, 1],
+            focused: 0,
+        });
+        let mut report = RecoveryReport::default();
+        let converted = restored_tab_candidates(
+            &saved.tabs,
+            saved.tree.as_ref(),
+            saved.split.as_ref(),
+            2,
+            &mut report,
+        );
+        assert_eq!(report.count(RepairKind::ReferencesAdjusted), 1);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].tree.leaves(), vec![0, 1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reference_only_repair_preserves_exact_loaded_bytes_before_any_save() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("frost-r07-references-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("session_history.json");
+        let raw = "{\n  \"version\": 2, \"sessions\": [{\"cwd\":null},{\"cwd\":null}], \"tabs\": [{\"tree\":{\"kind\":\"leaf\",\"session\":0}},{\"tree\":{\"kind\":\"leaf\",\"session\":0}}]\n}\n";
+        crate::persistence::write_new_private_file(&path, raw.as_bytes(), 1024 * 1024).unwrap();
+        let SnapshotLoad::Loaded {
+            snapshot,
+            mut report,
+            original,
+        } = SessionsSnapshot::load(&path)
+        else {
+            panic!("reference-only damage is recoverable");
+        };
+        assert!(
+            report.is_empty(),
+            "decoder shape/field repair is not involved"
+        );
+        report.merge(inspect_restored_snapshot(&snapshot));
+        assert_eq!(report.count(RepairKind::ReferencesAdjusted), 1);
+        assert_eq!(original.as_deref(), Some(raw));
+        assert_eq!(
+            crate::session_persistence::prepare_repaired_snapshot(
+                &path,
+                &report,
+                original.as_deref()
+            ),
+            PreservationOutcome::Preserved
+        );
+        let backup = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|entry| *entry != path)
+            .unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), raw.as_bytes());
+        assert_eq!(std::fs::read(&path).unwrap(), raw.as_bytes());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_preflight_precedes_preservation_and_spawn_result_pruning() {
+        let source = include_str!("main.rs");
+        let restore = source
+            .split_once("    fn restore_or_spawn(")
+            .unwrap()
+            .1
+            .split_once("    fn save_session_snapshot(")
+            .unwrap()
+            .0;
+        assert!(
+            restore
+                .find("report.merge(inspect_restored_snapshot(&snapshot))")
+                .unwrap()
+                < restore.find("prepare_repaired_snapshot(").unwrap()
+        );
+        assert!(
+            restore
+                .find("report.merge(inspect_restored_snapshot(&snapshot))")
+                .unwrap()
+                < restore.find("snapshot.retain_restored_sessions(").unwrap()
+        );
+    }
+}

@@ -1,0 +1,300 @@
+            }
+            None => Space::new().into(),
+        };
+
+        // A finished task can be followed up (same transcript, budget
+        // permitting). Cancelled/restored review-only history can only be
+        // replaced by a fresh task in the current binding.
+        let (can_continue, can_restart) = match session {
+            Some(session) => (
+                session.can_continue_after_completion(),
+                self.agent.can_start_new_task(),
+            ),
+            None => (false, false),
+        };
+        let followup_row: Element<'_, Message> = if can_continue || can_restart {
+            let mut buttons = row![].spacing(6);
+            if can_continue {
+                buttons = buttons.push(
+                    button(text("Continue task").size(self.effective_font_size()))
+                        .on_press(Message::AgentContinueTask),
+                );
+            }
+            if can_restart {
+                buttons = buttons.push(
+                    button(text("New task").size(self.effective_font_size()))
+                        .style(button::secondary)
+                        .on_press(Message::AgentNewTask),
+                );
+            }
+            buttons.into()
+        } else {
+            Space::new().into()
+        };
+
+        let mut input = text_input(
+            "What do you want to do? Every command needs your approval.",
+            &self.agent.input,
+        )
+        .id(AGENT_INPUT_ID.clone())
+        .size(self.effective_font_size());
+        if can_submit {
+            input = input
+                .on_input(Message::AgentInput)
+                .on_submit(Message::AgentSubmit);
+        }
+        let mut send = button(text("Send").size(self.effective_font_size()));
+        if can_submit {
+            send = send.on_press(Message::AgentSubmit);
+        }
+
+        let inner = container(
+            column![
+                header,
+                scrollable(transcript).height(Length::Fill).anchor_bottom(),
+                status_line,
+                context_line,
+                followup_row,
+                row![input, send].spacing(6),
+            ]
+            .spacing(8),
+        )
+        .width(Length::Fixed(560.0))
+        .height(Length::Fixed(520.0))
+        .padding(12)
+        .style(container::dark);
+        container(inner)
+            .align_right(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(10)
+            .into()
+    }
+
+    /// The review-first correction card for the active pane, using the Agent
+    /// approval card idiom: evidence badge, reason, an editable command draft,
+    /// and explicit primary/dismiss actions. The draft input is the same
+    /// single-line review gate as every other command entry; editing a
+    /// verified proposal downgrades the primary action from "Run verified
+    /// command" to "Insert for review".
+    fn correction_card(&self) -> Option<Element<'_, Message>> {
+        let session_id = self.sessions.get(self.active).map(|sess| sess.id)?;
+        let session = self.command_corrections.get(session_id)?;
+        let reference = command_correction::CorrectionRef {
+            session_id,
+            generation: session.generation(),
+        };
+        let proposal = session.proposal.as_ref()?;
+        let candidate = proposal.candidate();
+        // Recomputed against the live draft on every keystroke: any edit
+        // downgrades even a verified proposal to insert-only, and the engine
+        // answers this about exactly the string `accept()` would submit.
+        let direct_run = proposal.run_allowed();
+
+        let header = row![
+            text(crate::command_correction::bound_correction_feedback(
+                candidate.display_title()
+            ))
+            .size(self.effective_font_size()),
+            Space::new().width(Length::Fill),
+            text(crate::command_correction::bound_correction_feedback(
+                candidate.display_badge(session.exit_code)
+            ))
+            .size(self.effective_font_size())
+            .style(text::secondary),
+            button(text("✕").size(self.effective_font_size()))
+                .style(button::secondary)
+                .on_press(Message::CommandCorrectionDismiss(reference)),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
+        // Both halves are pre-sanitised by the engine, which keeps no raw
+        // model prose at all: this card used to interpolate a
+        // provider-controlled message straight into a label sitting directly
+        // above an editable, pre-filled, auto-focused command field.
+        let description = text(crate::command_correction::bound_correction_feedback(
+            candidate.display_description(&session.original_command),
+        ))
+        .size(self.effective_font_size())
+        .wrapping(text::Wrapping::Word)
+        .style(text::secondary);
+
+        let draft = text_input("corrected command", proposal.draft())
+            .id(CORRECTION_INPUT_ID.clone())
+            .on_input(move |draft| Message::CommandCorrectionInput(reference, draft))
+            .on_submit(Message::CommandCorrectionAccept(reference))
+            .size(self.effective_font_size())
+            .font(iced::Font::MONOSPACE);
+
+        let actions = row![
+            button(
+                text(if direct_run {
+                    "Run verified command"
+                } else {
+                    "Insert for review"
+                })
+                .size(self.effective_font_size())
+            )
+            .style(if direct_run {
+                button::primary
+            } else {
+                button::secondary
+            })
+            .on_press(Message::CommandCorrectionAccept(reference)),
+            button(text("Dismiss").size(self.effective_font_size()))
+                .style(button::secondary)
+                .on_press(Message::CommandCorrectionDismiss(reference)),
+        ]
+        .spacing(6);
+
+        let mut card = column![header, description].spacing(8);
+        // The same destructive-risk label the Agent approval card carries, on
+        // the live draft. `is_dangerous` never gates whether a candidate is
+        // *offered* — it only gates the direct-run decision, which is already
+        // false for every unverified proposal — so `rm -rf ~/work` reaches
+        // this card and used to arrive in exactly the chrome `git status` got.
+        if let Some(reason) = proposal.risk() {
+            card = card.push(
+                text(format!(
+                    "⚠ destructive: {}",
+                    crate::command_correction::bound_correction_feedback(reason)
+                ))
+                .size(self.effective_font_size())
+                .style(text::danger),
+            );
+        }
+        card = card.push(draft).push(actions);
+        // Safe to render: the engine sanitises and bounds inline feedback on
+        // the way in, which matters because a provider-shaped parse error is
+        // one of the strings that lands here.
+        if let Some(feedback) = proposal.feedback() {
+            card = card.push(
+                text(crate::command_correction::bound_correction_feedback(
+                    feedback,
+                ))
+                .size(self.effective_font_size())
+                .style(text::danger),
+            );
+        }
+
+        let inner = container(card)
+            .width(Length::Fixed(560.0))
+            .padding(12)
+            .style(container::dark);
+        Some(
+            container(inner)
+                .align_right(Length::Fill)
+                .align_bottom(Length::Fill)
+                .padding(10)
+                .into(),
+        )
+    }
+
+    /// The persistent AI chats library panel, ported from anvil's AI panel to
+    /// frost's iced overlay idiom (the Agent panel's layer and chrome). The
+    /// header carries the library, new-chat, and close actions; the chat page
+    /// renders the store's active conversation and composer, the library page
+    /// the searchable chat list (conversation switching/history browsing).
+    fn ai_chats_panel(&self) -> Element<'_, Message> {
+        use ai_chats::ChatsPage;
+
+        let chats = &self.ai_chats;
+        let header = row![
+            text("AI Chats").size(self.effective_font_size()),
+            text(if chats.provider_label.is_empty() {
+                "not configured".to_string()
+            } else {
+                chats.provider_label.clone()
+            })
+            .size(self.effective_font_size())
+            .style(text::secondary),
+            Space::new().width(Length::Fill),
+            button(text("Chats").size(self.effective_font_size()))
+                .style(button::secondary)
+                .on_press(Message::AiChatsShowLibrary),
+            button(text("+ New").size(self.effective_font_size()))
+                .style(button::secondary)
+                .on_press(Message::AiChatsNewChat),
+            button(text("✕").size(self.effective_font_size()))
+                .style(button::secondary)
+                .on_press(Message::AiChatsClose),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+        let page: Element<'_, Message> = match chats.page {
+            ChatsPage::Chat => self.ai_chats_chat_page(),
+            ChatsPage::Library => self.ai_chats_library_page(),
+        };
+
+        let inner = container(column![header, page].spacing(8))
+            .width(Length::Fixed(560.0))
+            .height(Length::Fixed(520.0))
+            .padding(12)
+            .style(container::dark);
+        container(inner)
+            .align_right(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(10)
+            .into()
+    }
+
+    /// The viewed chat: title editor, transcript, status, consent-gated
+    /// recent-context toggle, and the composer row. The composer is
+    /// single-line like the Agent panel's; the store keeps the draft so
+    /// switching chats never loses it.
+    fn ai_chats_chat_page(&self) -> Element<'_, Message> {
+        let chats = &self.ai_chats;
+        let store = &chats.store;
+        let busy = store.active_request_token().is_some();
+        let archived = store.active_archived();
+
+        let title = text_input("Chat title", &chats.title_draft)
+            .on_input(Message::AiChatsTitleInput)
+            .size(self.effective_font_size());
+
+        let mut transcript = column![].spacing(8);
+        // Every row borrows the store's text rather than cloning it: `view()`
+        // runs on each redraw, and frost redraws continuously while a PTY is
+        // producing output, so cloning here copies the whole visible chat many
+        // times a second — up to the store's live ceiling of 100 turns x 256
+        // KiB per assistant reply. `active_history()` borrows from `&self`,
+        // which is exactly the lifetime the returned Element already carries.
+        for turn in store.active_history() {
+            let (label, body): (&str, Element<'_, Message>) = match turn.role {
+                jterm_core::ai::Role::User => (
+                    "You",
+                    text(crate::ai_chats::display_chat_turn(turn.text.as_str()))
+                        .size(self.effective_font_size())
+                        .into(),
+                ),
+                jterm_core::ai::Role::Assistant => (
+                    "Assistant",
+                    text(crate::ai_chats::display_chat_turn(turn.text.as_str()))
+                        .size(self.effective_font_size())
+                        .wrapping(text::Wrapping::Word)
+                        .into(),
+                ),
+            };
+            transcript = transcript.push(
+                column![
+                    text(label)
+                        .size(self.effective_font_size())
+                        .style(text::secondary),
+                    container(body)
+                        .padding(6)
+                        .style(container::bordered_box)
+                        .width(Length::Fill),
+                ]
+                .spacing(2),
+            );
+        }
+        // While a reply streams in, its fragments grow in place of the static
+        // waiting line; the completed reply replaces them with a real turn.
+        let partial = store.active_partial();
+        if !partial.is_empty() {
+            transcript = transcript.push(
+                column![
+                    text("Assistant")
+                        .size(self.effective_font_size())
+                        .style(text::secondary),

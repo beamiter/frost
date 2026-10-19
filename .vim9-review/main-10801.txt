@@ -1,0 +1,300 @@
+    }
+
+    /// Look up a key event in the configurable keybindings and run the bound
+    /// command. Returns the resulting task when a binding matched and applied,
+    /// or `None` to let the key fall through to other handlers / the PTY.
+    fn handle_keybinding(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+        retreat_before_key: Option<std::time::Instant>,
+    ) -> Option<Task<Message>> {
+        let cmd = resolve_keybinding_command(&self.keybindings, key, mods)?;
+        if cmd == keybindings::Command::OrganismHello {
+            // This key is an application action after all higher-priority owners
+            // have declined it. Keep prior real input retreat, but do not let
+            // this action's own entry retreat make every greeting unavailable.
+            // Cancellation already happened; no old visit or hold is restored.
+            self.organism
+                .restore_retreat_after_app_action(retreat_before_key);
+        }
+        self.dispatch_command(cmd)
+    }
+
+    /// Execute a bound [`keybindings::Command`]. Returns `None` for commands
+    /// that don't apply in the current context (e.g. search navigation while
+    /// the search bar is closed) so the key can fall through.
+    fn dispatch_command(&mut self, cmd: keybindings::Command) -> Option<Task<Message>> {
+        use keybindings::Command as C;
+        if command_requires_block_context(&cmd) && !self.block_binding_available() {
+            return None;
+        }
+        // Write raw bytes to the focused session's PTY (control-key commands).
+        let mut send = |bytes: &[u8]| {
+            if self
+                .sessions
+                .get(self.active)
+                .is_some_and(Session::transcript_read_only)
+            {
+                self.hint_read_only_transcript();
+                return;
+            }
+            if let Some(sess) = self.sessions.get_mut(self.active) {
+                // A PTY-bound keystroke dismisses the block selection.
+                sess.block_selection.clear();
+                sess.terminal.scroll_to_bottom();
+                sess.projection_view_state.scroll_to_bottom();
+                if sess.write_pty(bytes)
+                    && !sess.managed_remote
+                    && self.organism.is_local(sess.id)
+                    && !matches!(
+                        sess.fg_proc_cache.as_deref(),
+                        Some("ssh" | "mosh" | "telnet")
+                    )
+                {
+                    self.organism.accepted_input();
+                }
+                sess.refresh();
+            }
+        };
+        let task = match cmd {
+            C::SessionNew => {
+                self.new_session();
+                Task::none()
+            }
+            // Closing "the session" from a keybinding means the tab, panes
+            // and all; a single pane is TerminalClosePane.
+            C::SessionClose => return Some(self.request_close_tab(self.active_tab)),
+            C::WindowClose => return Some(self.request_window_close()),
+            C::SessionNext => {
+                self.next_session();
+                Task::none()
+            }
+            C::SessionPrev => {
+                self.prev_session();
+                Task::none()
+            }
+            C::SessionJump(n) => {
+                self.jump_session(n);
+                Task::none()
+            }
+            C::SessionLast => {
+                if let Some(last) = last_session_index(self.tabs.len()) {
+                    self.jump_session(last);
+                }
+                Task::none()
+            }
+            C::EditCopy | C::EditCopyBlockOutput => {
+                self.edit_copy_task(matches!(cmd, C::EditCopyBlockOutput))
+            }
+            C::EditPaste => {
+                let id = self.sessions.get(self.active)?.id;
+                iced::clipboard::read().map(move |text| Message::Pasted(id, text))
+            }
+            C::SearchOpen => {
+                self.search.toggle();
+                self.recompute_search();
+                self.reveal_current_search_match();
+                if self.search.is_open {
+                    iced::widget::operation::focus(SEARCH_INPUT_ID.clone())
+                } else {
+                    Task::none()
+                }
+            }
+            C::SearchClose => {
+                if !self.search.is_open {
+                    return None;
+                }
+                self.search.close();
+                Task::none()
+            }
+            C::SearchNext => {
+                if !self.search.is_open {
+                    return None;
+                }
+                self.navigate_search(false);
+                Task::none()
+            }
+            C::SearchPrev => {
+                if !self.search.is_open {
+                    return None;
+                }
+                self.navigate_search(true);
+                Task::none()
+            }
+            C::SearchHistoryPrev => {
+                if !self.search.is_open {
+                    return None;
+                }
+                self.search.history_prev();
+                self.search.current_match_index = 0;
+                self.recompute_search();
+                self.reveal_current_search_match();
+                Task::none()
+            }
+            C::SearchHistoryNext => {
+                if !self.search.is_open {
+                    return None;
+                }
+                self.search.history_next();
+                self.search.current_match_index = 0;
+                self.recompute_search();
+                self.reveal_current_search_match();
+                Task::none()
+            }
+            C::SearchReplaceToggle => {
+                self.search_replace.toggle();
+                if self.search_replace.is_open {
+                    iced::widget::operation::focus(SEARCH_REPLACE_FIND_ID.clone())
+                } else {
+                    Task::none()
+                }
+            }
+            C::TerminalSendSigint => {
+                send(&[0x03]);
+                Task::none()
+            }
+            C::TerminalSendEof => {
+                send(&[0x04]);
+                Task::none()
+            }
+            C::TerminalClear => {
+                send(&[0x0c]);
+                Task::none()
+            }
+            C::TerminalScrollUp | C::TerminalScrollDown => {
+                let older = matches!(cmd, C::TerminalScrollUp);
+                let block_navigation = self.sessions.get_mut(self.active).map_or(
+                    block_mode::SelectionNavigation::Passthrough,
+                    |sess| {
+                        let ids: Vec<u64> = sess
+                            .terminal
+                            .command_zones
+                            .iter()
+                            .map(|zone| zone.id)
+                            .collect();
+                        sess.block_selection.retain(&ids);
+                        ctrl_scroll_block_navigation(
+                            self.config.is_block_mode(),
+                            older,
+                            sess.terminal.is_alt_buffer_active(),
+                            sess.terminal.is_command_running(),
+                            &ids,
+                            sess.block_selection.active(),
+                            sess.block_selection.len(),
+                        )
+                    },
+                );
+                match block_navigation {
+                    block_mode::SelectionNavigation::Select(target) => {
+                        self.select_and_reveal_block(target);
+                        return Some(Task::none());
+                    }
+                    block_mode::SelectionNavigation::Clear => {
+                        if let Some(sess) = self.sessions.get_mut(self.active) {
+                            sess.block_selection.clear();
+                            sess.refresh();
+                        }
+                        self.push_toast("Block selection cleared".to_string(), ToastKind::Info);
+                        return Some(Task::none());
+                    }
+                    block_mode::SelectionNavigation::Passthrough => {}
+                }
+                let speed = self.config.scroll_speed.max(1) as isize;
+                let delta = if older { speed } else { -speed };
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    sess.scroll(delta);
+                }
+                Task::none()
+            }
+            C::TerminalCopyLastOutput => self.copy_last_output_task(),
+            C::BlockJumpFirstFailed => self.block_jump_first_failed(),
+            C::BlockJumpPrevFailed => self.block_jump_failed_step(true),
+            C::BlockJumpNextFailed => self.block_jump_failed_step(false),
+            C::BlockCopyCommand => self.block_copy_command_task(),
+            C::BlockCopyOutput => self.block_copy_output_task(),
+            C::BlockRecallCommand => self.block_recall_command_task(),
+            C::BlockSelectAll => self.block_select_all(),
+            C::BlockClear => self.request_block_clear(),
+            C::BlockUndoClear => self.undo_block_clear(),
+            C::BlockSelectPrev => self.block_select_step(true),
+            C::BlockSelectNext => self.block_select_step(false),
+            C::BlockReinputSelectedCommands => self.block_reinput_selected_commands_task(),
+            C::BlockCopyBlock => self.block_copy_block_task(),
+            C::BlockCopyMarkdown => self.block_copy_markdown_task(),
+            C::BlockExportSessionMarkdown => {
+                self.block_export_session_task(block_export::SessionExportFormat::Markdown)
+            }
+            C::BlockExportSessionJson => {
+                self.block_export_session_task(block_export::SessionExportFormat::Json)
+            }
+            C::BlockCompareSelected => self.block_compare_selected_task(false),
+            C::BlockExportSelectedMarkdown => {
+                self.block_export_selected_task(block_export::SessionExportFormat::Markdown, false)
+            }
+            C::BlockExportSelectedJson => {
+                self.block_export_selected_task(block_export::SessionExportFormat::Json, false)
+            }
+            C::BlockSearch => self.toggle_block_search(),
+            C::BlockMenu => return self.open_selected_block_menu(),
+            C::BlockToggleBookmark => {
+                let target = {
+                    let sess = self.sessions.get_mut(self.active)?;
+                    let ids: Vec<u64> = sess
+                        .terminal
+                        .command_zones
+                        .iter()
+                        .map(|zone| zone.id)
+                        .collect();
+                    sess.block_selection.retain(&ids);
+                    active_bookmark_target(&ids, sess.block_selection.active())
+                }?;
+                self.block_toggle_bookmark(target)
+            }
+            C::BlockJumpPrevBookmark => self.block_jump_bookmark(true),
+            C::BlockJumpNextBookmark => self.block_jump_bookmark(false),
+            C::BlockFixWithAgent => {
+                self.palette_failed_block_agent_task(FailedBlockAgentIntent::Fix)
+            }
+            C::BlockExplainWithAgent => {
+                self.palette_failed_block_agent_task(FailedBlockAgentIntent::Explain)
+            }
+            C::BlockRetryFailed => self.palette_failed_block_retry_task(),
+            C::BlockToggleCollapse => self.block_toggle_selected_collapse(),
+            C::TerminalPromptPrev | C::TerminalPromptNext => {
+                self.jump_prompt_with_feedback(matches!(cmd, C::TerminalPromptPrev))
+            }
+            C::TerminalSplitVertical => {
+                self.split(Axis::Vertical);
+                Task::none()
+            }
+            C::TerminalSplitHorizontal => {
+                self.split(Axis::Horizontal);
+                Task::none()
+            }
+            C::TerminalClosePane => return Some(self.close_focused_pane()),
+            C::PaneFocusNext => {
+                self.focus_next_pane();
+                Task::none()
+            }
+            C::PaneFocusPrev => {
+                self.focus_prev_pane();
+                Task::none()
+            }
+            C::PaneFocusLeft => {
+                self.focus_pane_direction(PaneDirection::Left);
+                Task::none()
+            }
+            C::PaneFocusRight => {
+                self.focus_pane_direction(PaneDirection::Right);
+                Task::none()
+            }
+            C::PaneFocusUp => {
+                self.focus_pane_direction(PaneDirection::Up);
+                Task::none()
+            }
+            C::PaneFocusDown => {
+                self.focus_pane_direction(PaneDirection::Down);
+                Task::none()
+            }
+            C::PaneResizeLeft => {

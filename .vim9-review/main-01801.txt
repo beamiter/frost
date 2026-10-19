@@ -1,0 +1,300 @@
+
+    /// Three lines of chrome with local scrolling for longer summaries. A fixed
+    /// height keeps layout/PTY geometry exact without measuring untrusted text.
+    fn banner_height(&self, font_size: f32) -> f32 {
+        if self.visible() {
+            (font_size.clamp(8.0, 32.0) * 1.3 * 3.0 + 12.0).ceil()
+        } else {
+            0.0
+        }
+    }
+}
+
+/// What `restore_or_spawn` recovered: the sessions it could bring back, plus
+/// the snapshot's layout fields, which the caller validates against them.
+/// The generic session type permits fallback tests without starting a PTY.
+struct RestoredState<S = Session> {
+    sessions: Vec<S>,
+    active: usize,
+    next_id: usize,
+    tabs: Vec<session_persistence::TabSnapshot>,
+    active_tab: Option<usize>,
+    /// v1 fallbacks: one global tree, or the even older flat single-axis split.
+    legacy_tree: Option<session_persistence::PaneTreeSnapshot>,
+    legacy_split: Option<session_persistence::SplitSnapshot>,
+    diagnostic: Option<String>,
+    startup_recovery: StartupRecovery,
+    /// The configured snapshot was unreadable or repaired and its original
+    /// bytes could not be preserved.
+    /// Preserve its bytes for this process lifetime instead of letting the
+    /// first autosave destroy the only recoverable copy.
+    session_writes_blocked: bool,
+}
+
+impl<S> Default for RestoredState<S> {
+    fn default() -> Self {
+        Self {
+            sessions: Vec::new(),
+            active: 0,
+            next_id: 0,
+            tabs: Vec::new(),
+            active_tab: None,
+            legacy_tree: None,
+            legacy_split: None,
+            diagnostic: None,
+            startup_recovery: StartupRecovery::default(),
+            session_writes_blocked: false,
+        }
+    }
+}
+
+impl<S> RestoredState<S> {
+    /// Pure state assembly shared by disabled/missing, empty-load and failed-
+    /// restore fallbacks. The caller supplies the result of any actual spawn.
+    fn from_spawn_result<E: std::fmt::Display>(result: Result<S, E>, id_start: usize) -> Self {
+        match result {
+            Ok(session) => Self {
+                sessions: vec![session],
+                next_id: id_start + 1,
+                ..Self::default()
+            },
+            Err(error) => Self {
+                next_id: id_start,
+                diagnostic: Some(crate::review_text::bound_diagnostic_text(error.to_string())),
+                ..Self::default()
+            },
+        }
+    }
+
+    fn with_recovery(mut self, startup_recovery: StartupRecovery) -> Self {
+        self.session_writes_blocked |= startup_recovery.preservation.writes_blocked();
+        self.startup_recovery = startup_recovery;
+        self
+    }
+}
+
+/// State for the Ctrl+Shift+L quick tab switcher overlay.
+#[derive(Debug, Clone, Default)]
+struct TabSwitcherState {
+    query: String,
+    /// Highlighted row in the filtered list.
+    selected: usize,
+}
+
+impl TabSwitcherState {
+    /// One-line overlay query budget, shared with the other pickers.
+    const MAX_QUERY_BYTES: usize = jterm_core::workflows::MAX_PICKER_QUERY_BYTES;
+
+    fn set_query(&mut self, query: impl Into<String>) {
+        let mut query: String = query
+            .into()
+            .chars()
+            .filter_map(|character| {
+                if character.is_control() {
+                    None
+                } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                    Some('\u{fffd}')
+                } else {
+                    Some(character)
+                }
+            })
+            .collect();
+        if query.len() > Self::MAX_QUERY_BYTES {
+            let mut end = Self::MAX_QUERY_BYTES;
+            while end > 0 && !query.is_char_boundary(end) {
+                end -= 1;
+            }
+            query.truncate(end);
+        }
+        if query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(&query)
+        {
+            return;
+        }
+        self.query = query;
+        self.selected = 0;
+    }
+
+    fn push_query_text(&mut self, text: &str) -> bool {
+        let previous = self.query.clone();
+        let mut query = previous.clone();
+        query.push_str(text);
+        self.set_query(query);
+        self.query != previous
+    }
+
+    fn backspace(&mut self) -> bool {
+        if self.query.pop().is_none() {
+            return false;
+        }
+        self.selected = 0;
+        true
+    }
+}
+
+/// State for the `block:search` cross-block search picker (Ctrl+Alt+F): a
+/// case-insensitive substring query over every completed zone's command and
+/// output (captured-snapshot-first, so trimmed-away zones still match).
+///
+/// Zone text is extracted into a bounded cache; lowercasing is performed on a
+/// worker. One cancellable matcher owns that cache at a time; new edits replace
+/// only the pending intent. The owning session and monotonic work epoch reject
+/// late worker results. Finalized-zone
+/// version changes rebuild the open picker so newly completed blocks appear.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BlockSearchFilter {
+    #[default]
+    All,
+    Failed,
+    Success,
+    Slow,
+    Bookmarked,
+    Unread,
+    Background,
+}
+
+/// Metadata that can change without adding or removing a finalized zone.
+/// Checking this stamp never scans retained command/output text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockSearchFilterContext {
+    Stable,
+    Slow(u64),
+    Unread(Option<u64>),
+}
+
+impl BlockSearchFilter {
+    /// Display order of the filter chips, which is also the order Tab walks.
+    const ORDER: [Self; 7] = [
+        Self::All,
+        Self::Failed,
+        Self::Success,
+        Self::Slow,
+        Self::Bookmarked,
+        Self::Unread,
+        Self::Background,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Failed => "Failed",
+            Self::Success => "Success",
+            Self::Slow => "Slow",
+            Self::Bookmarked => "Bookmarked",
+            Self::Unread => "Unread",
+            Self::Background => "Background",
+        }
+    }
+
+    fn context(
+        self,
+        seen_through: Option<u64>,
+        slow_threshold_ms: u64,
+    ) -> BlockSearchFilterContext {
+        match self {
+            Self::Slow => BlockSearchFilterContext::Slow(slow_threshold_ms),
+            Self::Unread => BlockSearchFilterContext::Unread(seen_through),
+            _ => BlockSearchFilterContext::Stable,
+        }
+    }
+
+    fn matches(
+        self,
+        zone: &terminal::CommandZone,
+        bookmarked: bool,
+        seen_through: Option<u64>,
+        slow_threshold_ms: u64,
+    ) -> bool {
+        match self {
+            Self::All => true,
+            Self::Failed => matches!(
+                block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                block_mode::BlockOutcome::Failed(_)
+            ),
+            Self::Success => matches!(
+                block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                block_mode::BlockOutcome::Success
+            ),
+            Self::Slow => zone
+                .duration_ms
+                .is_some_and(|duration| duration >= slow_threshold_ms),
+            Self::Bookmarked => bookmarked,
+            Self::Unread => seen_through.is_none_or(|seen| zone.id > seen),
+            Self::Background => matches!(
+                block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                block_mode::BlockOutcome::Background
+            ),
+        }
+    }
+
+    /// Next/previous filter, wrapping. Keyboard-only users could otherwise
+    /// never reach the chips: the overlay owns every key while it is open.
+    fn cycled(self, forward: bool) -> Self {
+        let order = Self::ORDER;
+        let at = order.iter().position(|&f| f == self).unwrap_or(0);
+        let len = order.len();
+        let next = if forward {
+            (at + 1) % len
+        } else {
+            (at + len - 1) % len
+        };
+        order[next]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockSearchBuildIdentity {
+    session_id: usize,
+    epoch: u64,
+}
+
+/// One background operation for the entire window, including close/reopen and
+/// pane switches. The next desired request lives only in the open picker; it
+/// replaces any earlier pending intent instead of retaining another index.
+struct BlockSearchJob {
+    identity: BlockSearchBuildIdentity,
+    matching: bool,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BlockSearchJob {
+    fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn finish_block_search_job(
+    slot: &mut Option<BlockSearchJob>,
+    identity: BlockSearchBuildIdentity,
+    matching: bool,
+) -> bool {
+    if !slot
+        .as_ref()
+        .is_some_and(|job| job.identity == identity && job.matching == matching)
+    {
+        return false;
+    }
+    *slot = None;
+    true
+}
+
+#[derive(Clone, Debug)]
+struct BlockSearchMatchBuild {
+    /// Ownership returns to the UI only after the matcher has stopped. An
+    /// index refresh therefore never overlaps the old and new caches.
+    cache: Vec<block_mode::CachedBlockSearchZone>,
+    intent: BlockSearchIntent,
+    eligible: std::collections::HashSet<u64>,
+    result: Option<Result<block_mode::BlockSearchResults, block_mode::BlockSearchQueryError>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BlockSearchZoneVersion {
+    len: usize,
+    oldest: Option<u64>,
+    newest: Option<u64>,
+}
+
+impl BlockSearchZoneVersion {
+    fn from_terminal(terminal: &terminal::TerminalState) -> Self {
+        Self {

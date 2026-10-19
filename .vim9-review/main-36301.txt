@@ -1,0 +1,300 @@
+            &mut anchor,
+            &mut hovered,
+            &mut menu,
+            &mut dialog,
+            &mut delete_confirm,
+            &mut drop_burst,
+            &mut drop_generation,
+            &mut drop_hint,
+        );
+        assert_eq!(selection, vec![remapped.clone()]);
+        assert_eq!(anchor, Some(remapped.clone()));
+
+        prune_sidebar_context_after_reconcile(
+            &sidebar,
+            &destination,
+            &mut selection,
+            &mut anchor,
+            &mut hovered,
+            &mut menu,
+            &mut dialog,
+            &mut delete_confirm,
+            &mut drop_burst,
+            &mut drop_generation,
+            &mut drop_hint,
+        );
+        assert!(selection.is_empty());
+        assert!(anchor.is_none());
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn sidebar_remote_location_rebinds_only_one_complete_profile_identity() {
+        use remote_fs::FsLocation;
+
+        let alpha = sidebar_remote_profile("alpha", "alpha.example");
+        let beta = sidebar_remote_profile("beta", "beta.example");
+        let old = vec![alpha.clone(), beta.clone()];
+
+        assert_eq!(
+            remap_sidebar_location(&old, &[beta.clone(), alpha.clone()], &FsLocation::Remote(0)),
+            Some(FsLocation::Remote(1)),
+            "a unique unchanged profile follows a safe reorder"
+        );
+        assert_eq!(
+            remap_sidebar_location(&old, std::slice::from_ref(&beta), &FsLocation::Remote(0)),
+            None,
+            "a removed profile cannot inherit its old numeric slot"
+        );
+
+        let mut edited = alpha.clone();
+        edited.user = Some("different-login".to_string());
+        assert_eq!(
+            remap_sidebar_location(&old, &[edited, beta], &FsLocation::Remote(0)),
+            None,
+            "every profile field participates in identity"
+        );
+        assert_eq!(
+            remap_sidebar_location(
+                &old,
+                &[alpha.clone(), alpha.clone()],
+                &FsLocation::Remote(0),
+            ),
+            None,
+            "duplicate identities are ambiguous"
+        );
+        let mut duplicate_beyond_active = vec![old[0].clone()];
+        duplicate_beyond_active.extend((1..config::MAX_REMOTE_HOSTS).map(|index| {
+            sidebar_remote_profile(
+                &format!("filler-{index}"),
+                &format!("filler-{index}.example"),
+            )
+        }));
+        duplicate_beyond_active.push(old[0].clone());
+        assert_eq!(
+            remap_sidebar_location(&old, &duplicate_beyond_active, &FsLocation::Remote(0)),
+            None,
+            "a retained inactive duplicate still makes the full identity ambiguous"
+        );
+        assert_eq!(
+            remap_sidebar_location(&old, &[], &FsLocation::Local),
+            Some(FsLocation::Local)
+        );
+        assert_eq!(
+            remap_sidebar_location(&old, &old, &FsLocation::Remote(99)),
+            None
+        );
+
+        let mut invalid = alpha.clone();
+        invalid.host.clear();
+        assert_eq!(
+            remap_sidebar_location(
+                std::slice::from_ref(&invalid),
+                std::slice::from_ref(&invalid),
+                &FsLocation::Remote(0)
+            ),
+            None,
+            "an invalid old identity cannot authorize a remap"
+        );
+        assert_eq!(
+            unique_active_remote_profile_index(std::slice::from_ref(&invalid), &invalid),
+            None,
+            "an exact but invalid candidate is not runnable authority"
+        );
+
+        let transient = FsLocation::Transient(alpha.clone());
+        assert_eq!(
+            remap_sidebar_location(&old, &[], &transient),
+            Some(transient),
+            "an observed session target is independent of configured profile indices"
+        );
+    }
+
+    #[test]
+    fn observed_ssh_prefers_one_saved_transport_but_not_an_ambiguous_pair() {
+        let mut observed = sidebar_remote_profile("root@box", "box.example");
+        observed.user = Some("root".to_string());
+        observed.deploy = "off".to_string();
+
+        let mut saved = observed.clone();
+        saved.name = "production".to_string();
+        saved.remote_shell = "bash".to_string();
+        saved.deploy = "persist".to_string();
+        assert_eq!(
+            unique_active_ssh_transport_index(std::slice::from_ref(&saved), &observed),
+            Some(0),
+            "display and terminal-launch policy do not change Files transport identity"
+        );
+
+        let mut other_port = saved.clone();
+        other_port.ssh_args = vec!["-p".to_string(), "2200".to_string()];
+        assert_eq!(
+            unique_active_ssh_transport_index(&[other_port, saved.clone()], &observed),
+            Some(1)
+        );
+        assert_eq!(
+            unique_active_ssh_transport_index(&[saved.clone(), saved], &observed),
+            None,
+            "duplicate saved transports fall back to an explicit transient target"
+        );
+    }
+
+    #[test]
+    fn long_dsw_ssh_and_jsh_wrapper_keep_one_files_target() {
+        use jterm_core::jsh_remote::{observed_ssh_target, ObservedSshTarget};
+
+        const HOST: &str = "dsw-notebook-dsw-l8rnh0wm7vs81o7z6j-22.vpc-0jlbz3pri2042fd5xw2ov.instance-forward.dsw.cn-wulanchabu.aliyuncs.com";
+        let direct = vec![
+            "ssh".to_string(),
+            format!("root@{HOST}"),
+            "-p".to_string(),
+            "22".to_string(),
+        ];
+        let ObservedSshTarget::Target(profile) = observed_ssh_target(&direct) else {
+            panic!("the reported DSW command must be a safe interactive SSH target");
+        };
+        assert_eq!(profile.host, HOST);
+        assert_eq!(profile.user.as_deref(), Some("root"));
+        assert_eq!(profile.ssh_args, ["-p", "22"]);
+        assert_eq!(
+            interactive_ssh_argv(&profile),
+            ["ssh", "-p", "22", "--", &format!("root@{HOST}")]
+        );
+
+        let wrapper = vec![
+            "/bin/sh".to_string(),
+            "/home/root/.cache/jsh/jsh-remote.sh".to_string(),
+            "--persist".to_string(),
+            "--local-jsh".to_string(),
+            "/usr/local/bin/jsh".to_string(),
+            format!("root@{HOST}"),
+            "--".to_string(),
+            "-p".to_string(),
+            "22".to_string(),
+        ];
+        let ObservedSshTarget::Target(wrapped) = observed_ssh_target(&wrapper) else {
+            panic!("the jsh launcher must preserve the same Files target");
+        };
+        assert!(same_ssh_files_transport(&profile, &wrapped));
+    }
+
+    #[test]
+    fn live_control_path_is_execution_metadata_and_plain_login_stays_plain() {
+        let base = sidebar_remote_profile("production", "box.example");
+        let mut observed = base.clone();
+        observed.name = "root@box.example".to_string();
+        observed
+            .ssh_args
+            .extend(["-S".to_string(), "/run/user/1000/jsh/cm-%C".to_string()]);
+
+        assert!(same_ssh_files_transport(&base, &observed));
+        assert_eq!(
+            unique_active_ssh_transport_index(std::slice::from_ref(&base), &observed),
+            Some(0),
+            "a live socket must not fork stable Files identity"
+        );
+        let argv = interactive_ssh_argv(&observed);
+        assert_eq!(argv.first().map(String::as_str), Some("ssh"));
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["-S", "/run/user/1000/jsh/cm-%C"]));
+        assert!(!argv.iter().any(|argument| argument == "jsh"));
+    }
+
+    #[test]
+    fn stale_sidebar_op_report_cannot_mutate_a_new_transfer_context() {
+        use remote_fs::FsLocation;
+
+        let alpha = sidebar_remote_profile("alpha", "alpha.example");
+        let beta = sidebar_remote_profile("beta", "beta.example");
+        let reordered = vec![beta.clone(), alpha.clone()];
+
+        assert!(
+            sidebar_op_report_matches_context(
+                7,
+                &FsLocation::Remote(0),
+                Some(&alpha),
+                Some(7),
+                &FsLocation::Remote(1),
+                &reordered,
+            ),
+            "one exact profile may finish after a safe index reorder"
+        );
+        assert!(sidebar_op_report_matches_context(
+            7,
+            &FsLocation::Remote(1),
+            Some(&alpha),
+            Some(7),
+            &FsLocation::Remote(1),
+            &reordered,
+        ));
+        assert!(!sidebar_op_report_matches_context(
+            6,
+            &FsLocation::Remote(0),
+            Some(&alpha),
+            Some(7),
+            &FsLocation::Remote(1),
+            &reordered,
+        ));
+        assert!(!sidebar_op_report_matches_context(
+            7,
+            &FsLocation::Remote(0),
+            Some(&beta),
+            Some(7),
+            &FsLocation::Remote(1),
+            &reordered,
+        ));
+        assert!(!sidebar_op_report_matches_context(
+            7,
+            &FsLocation::Local,
+            None,
+            Some(7),
+            &FsLocation::Remote(1),
+            &reordered,
+        ));
+        assert!(!sidebar_op_report_matches_context(
+            7,
+            &FsLocation::Remote(1),
+            Some(&alpha),
+            None,
+            &FsLocation::Remote(1),
+            &reordered,
+        ));
+
+        let mut invalid = alpha.clone();
+        invalid.host.clear();
+        assert!(!sidebar_op_report_matches_context(
+            7,
+            &FsLocation::Remote(0),
+            Some(&invalid),
+            Some(7),
+            &FsLocation::Remote(0),
+            std::slice::from_ref(&invalid),
+        ));
+
+        assert!(sidebar_op_report_matches_context(
+            7,
+            &FsLocation::Transient(alpha.clone()),
+            Some(&alpha),
+            Some(7),
+            &FsLocation::Transient(alpha.clone()),
+            &[],
+        ));
+        assert!(!sidebar_op_report_matches_context(
+            7,
+            &FsLocation::Transient(alpha.clone()),
+            Some(&alpha),
+            Some(7),
+            &FsLocation::Transient(beta),
+            &[],
+        ));
+    }
+
+    #[test]
+    fn combined_ssh_listing_has_no_second_navigation_completion() {
+        let mut sidebar = sidebar::Sidebar::new();
+        let location = remote_fs::FsLocation::Transient(sidebar_remote_profile(
+            "observed",
+            "observed.example",
+        ));
+        let result = SidebarRemoteFollowResult {

@@ -1,0 +1,300 @@
+        let launch = self.task_manager.get(task_id).and_then(|task| {
+            ((task.status == agent_task::TaskStatus::Created && task.terminal_session_id.is_none())
+                || (native_recovery && task.terminal_session_id.is_none())
+                || failed_terminal_retry
+                    .as_deref()
+                    .is_some_and(|old| task.terminal_session_id.as_deref() == Some(old)))
+            .then(|| {
+                (
+                    task.provider,
+                    task.repo_root.clone(),
+                    task.worktree_path.clone(),
+                )
+            })
+        });
+        let Some((provider, repository, worktree)) = launch else {
+            self.push_toast(
+                "Task is no longer waiting for an Agent terminal",
+                ToastKind::Info,
+            );
+            return;
+        };
+        let launch = match agent_task::AgentLaunchSpec::resolve(provider, &repository, &worktree) {
+            Ok(launch) => launch,
+            Err(error) => {
+                if failed_terminal_retry.is_none() && !native_recovery {
+                    let _ = self.task_manager.update_status(
+                        task_id,
+                        agent_task::TaskStatus::Created,
+                        Some(error.to_string()),
+                    );
+                }
+                self.push_toast(error.to_string(), ToastKind::Warning);
+                return;
+            }
+        };
+        if failed_terminal_retry.is_none() && !native_recovery {
+            let _ =
+                self.task_manager
+                    .update_status(task_id, agent_task::TaskStatus::Starting, None);
+        }
+        let session_id = self.next_id;
+        let session_key = agent_task_ui::terminal_session_id(session_id);
+        let spawned = Session::spawn_argv(
+            &self.config,
+            session_id,
+            self.cols,
+            self.rows,
+            worktree.to_str(),
+            Some(&launch.argv),
+        );
+        let session = match spawned {
+            Ok(session) => session,
+            Err(error) => {
+                if failed_terminal_retry.is_none() && !native_recovery {
+                    let _ = self.task_manager.update_status(
+                        task_id,
+                        agent_task::TaskStatus::Created,
+                        Some(error.to_string()),
+                    );
+                }
+                self.push_toast(
+                    format!(
+                        "Could not start {}: {error}",
+                        crate::review_text::bound_provider_label(provider.display_name())
+                    ),
+                    ToastKind::Warning,
+                );
+                return;
+            }
+        };
+        let binding = if let Some(old_session) = failed_terminal_retry.as_deref() {
+            self.task_manager
+                .bind_terminal_retry_session(task_id, old_session, session_key.clone())
+        } else if native_recovery {
+            self.task_manager
+                .bind_native_terminal_fallback_session(task_id, session_key.clone())
+        } else {
+            self.task_manager
+                .bind_terminal_session(task_id, session_key)
+        };
+        if let Err(error) = binding {
+            // The PTY is live but never gained task authority; tear it down
+            // and restore the pre-spawn task state.
+            let mut session = session;
+            let _ = session.pty.terminate();
+            if failed_terminal_retry.is_none() && !native_recovery {
+                let _ = self.task_manager.update_status(
+                    task_id,
+                    agent_task::TaskStatus::Created,
+                    Some(error.to_string()),
+                );
+            }
+            self.push_toast(error.to_string(), ToastKind::Warning);
+            return;
+        }
+        if native_recovery {
+            self.agent_runtime.clear_retained(task_id);
+        }
+        self.session_diagnostic = None;
+        self.next_id += 1;
+        let insert = (self.active + 1).min(self.sessions.len());
+        self.sessions.insert(insert, session);
+        apply_theme_colors(&mut self.sessions[insert].terminal, &self.theme);
+        self.reindex_tabs_after_insert(insert);
+        self.open_tab_with(insert);
+        self.relayout();
+        self.refresh_active_context();
+        self.save_session_snapshot();
+        self.push_toast(
+            format!(
+                "Opened {} in an isolated task terminal; task context stays in Frost",
+                crate::review_text::bound_provider_label(provider.display_name())
+            ),
+            ToastKind::Success,
+        );
+    }
+
+    /// Re-run the task's exact source command in a separate validation
+    /// terminal inside the isolated worktree. Preflight re-proves the Git
+    /// registration and pins the cwd through an open directory descriptor
+    /// before any PTY exists.
+    fn task_start_validation(&mut self, task_id: agent_task::TaskId) {
+        if let Err(error) = self.task_manager.next_validation_attempt(task_id) {
+            self.push_toast(error.to_string(), ToastKind::Warning);
+            return;
+        }
+        let prepared = {
+            let Some(task) = self.task_manager.get(task_id) else {
+                self.push_toast("Task is no longer available", ToastKind::Info);
+                return;
+            };
+            match agent_task::prepare_task_validation(task) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.push_toast(error.to_string(), ToastKind::Warning);
+                    return;
+                }
+            }
+        };
+        let argv = match agent_task_ui::validation_command_argv(
+            Some(&prepared.source_shell),
+            &prepared.command,
+        ) {
+            Ok(argv) => argv,
+            Err(error) => {
+                self.push_toast(error, ToastKind::Warning);
+                return;
+            }
+        };
+        let session_id = self.next_id;
+        let session_key = agent_task_ui::terminal_session_id(session_id);
+        // The child chdirs through the pinned descriptor path, so a replaced
+        // worktree directory cannot redirect validation after preflight.
+        let pinned_cwd = prepared.pinned_cwd.proc_path();
+        let spawned = Session::spawn_argv_env(
+            &self.config,
+            session_id,
+            self.cols,
+            self.rows,
+            pinned_cwd.to_str(),
+            Some(&argv),
+            &agent_task_ui::VALIDATION_ENV_OVERRIDES,
+        );
+        let session = match spawned {
+            Ok(session) => session,
+            Err(error) => {
+                self.push_toast(
+                    format!("Could not start the validation terminal: {error}"),
+                    ToastKind::Warning,
+                );
+                return;
+            }
+        };
+        if let Err(error) = self
+            .task_manager
+            .bind_validation_session(task_id, session_key)
+        {
+            let mut session = session;
+            let _ = session.pty.terminate();
+            self.push_toast(error.to_string(), ToastKind::Warning);
+            return;
+        }
+        self.session_diagnostic = None;
+        self.next_id += 1;
+        let insert = (self.active + 1).min(self.sessions.len());
+        self.sessions.insert(insert, session);
+        apply_theme_colors(&mut self.sessions[insert].terminal, &self.theme);
+        self.reindex_tabs_after_insert(insert);
+        self.open_tab_with(insert);
+        self.relayout();
+        self.refresh_active_context();
+        self.save_session_snapshot();
+        self.push_toast(
+            "Running the exact source command in a validation terminal",
+            ToastKind::Info,
+        );
+    }
+
+    /// The Tasks dashboard dock panel: task list plus the selected task card.
+    fn sidebar_tasks_view(&self) -> Element<'_, Message> {
+        if !self.config.experimental_task_sidebar {
+            return text("Enable the experimental Tasks dashboard in Settings")
+                .size(self.chrome_font_size())
+                .style(text::secondary)
+                .into();
+        }
+        let mut body = column![].spacing(6);
+        if let Some(picker) = self.task_panel.provider_picker.as_ref() {
+            let context = &picker.context;
+            let reference = picker.reference();
+            let command = context.command.as_deref().unwrap_or("failed command");
+            body = body.push(text("Create task with").size(self.chrome_font_size()));
+            body = body.push(
+                text(crate::review_text::visible_bounded(
+                    command,
+                    agent_task_ui::MAX_TASK_TITLE_DISPLAY_BYTES,
+                ))
+                .size(self.chrome_font_size())
+                .style(text::secondary),
+            );
+            let preferred =
+                agent_task::AgentProvider::from_config_value(&self.config.preferred_agent_provider)
+                    .unwrap_or(agent_task::AgentProvider::Codex);
+            let mut ordered = Vec::with_capacity(agent_task::AgentProvider::ALL.len());
+            ordered.push(preferred);
+            for provider in agent_task::AgentProvider::ALL {
+                if provider != preferred {
+                    ordered.push(provider);
+                }
+            }
+            let mut providers = row![].spacing(6);
+            for (index, provider) in ordered.into_iter().enumerate() {
+                let style = if index == 0 {
+                    button::primary
+                } else {
+                    button::secondary
+                };
+                providers = providers.push(
+                    button(
+                        text(crate::review_text::bound_provider_label(
+                            provider.display_name(),
+                        ))
+                        .size(self.chrome_font_size()),
+                    )
+                    .style(style)
+                    .on_press(Message::TaskCreateWithProvider(reference.clone(), provider)),
+                );
+            }
+            body = body.push(providers);
+            body = body.push(
+                button(text("Cancel").size(self.chrome_font_size()))
+                    .style(button::secondary)
+                    .on_press(Message::TaskCreateProviderCancel(reference)),
+            );
+        }
+        if self.task_panel.pending_creation.is_some() {
+            body = body.push(
+                text("Creating isolated worktree…")
+                    .size(self.chrome_font_size())
+                    .style(text::secondary),
+            );
+        }
+        body = body.push(
+            text_input(
+                "Search tasks, providers or repositories · Enter to open",
+                &self.task_panel.dashboard_query,
+            )
+            .on_input(Message::TaskDashboardQuery)
+            .on_submit(Message::TaskDashboardOpenResult)
+            .size(self.chrome_font_size()),
+        );
+        let dashboard = agent_task::DashboardSnapshot::project(
+            self.task_manager
+                .tasks()
+                .iter()
+                .filter(|task| task.status != agent_task::TaskStatus::Archived),
+            |id| agent_task::DashboardActivity {
+                has_active_agent_stream: self.task_manager.has_active_agent_event_stream(id),
+                native_preparing: self.agent_runtime.has_preparing(id),
+                ..Default::default()
+            },
+            agent_task::DashboardFilter {
+                text: &self.task_panel.dashboard_query,
+                view: self.task_panel.dashboard_view,
+                ..Default::default()
+            },
+        );
+        let mut filters = row![].spacing(4);
+        for view in [
+            agent_task::DashboardView::All,
+            agent_task::DashboardView::NeedsAttention,
+            agent_task::DashboardView::Running,
+            agent_task::DashboardView::NotStarted,
+            agent_task::DashboardView::Review,
+            agent_task::DashboardView::Finished,
+        ] {
+            filters = filters.push(
+                button(
+                    text(agent_task_ui::dashboard_filter_label(
+                        view,

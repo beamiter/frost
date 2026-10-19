@@ -1,0 +1,300 @@
+                    format!("{} MB", sess.terminal.kitty_graphics.image_memory_mb()),
+                ));
+        }
+        lines = lines.push(stat(
+            "Memory",
+            match read_rss_mb() {
+                Some(mb) => format!("{:.1} MB", mb),
+                None => "N/A".to_string(),
+            },
+        ));
+        lines = lines.push(stat("Links", format!("{}", self.links.len())));
+        // Ingest cost of the last PTY-output batch. bytes/µs is numerically equal
+        // to MB/s, so the throughput needs no extra scaling.
+        let ingest = if self.last_ingest_us > 0 {
+            format!(
+                "{} B / {} µs ({:.0} MB/s)",
+                self.last_ingest_bytes,
+                self.last_ingest_us,
+                self.last_ingest_bytes as f64 / self.last_ingest_us as f64,
+            )
+        } else {
+            format!("{} B / <1 µs", self.last_ingest_bytes)
+        };
+        lines = lines.push(stat("Ingest", ingest));
+
+        let inner = container(lines)
+            .width(Length::Fixed(240.0))
+            .padding(10)
+            .style(container::dark);
+        container(inner)
+            .align_right(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(8)
+            .into()
+    }
+
+    /// Launch the next agent model request (if the protocol is waiting on
+    /// the model) as a blocking task off the UI thread.
+    fn agent_drive_task(&mut self) -> Option<Task<Message>> {
+        if !self.agent.is_open {
+            return None;
+        }
+        let cwd = self
+            .agent
+            .bound_session_id
+            .and_then(|sid| self.sessions.iter().find(|s| s.id == sid))
+            .and_then(|s| s.cwd_cache.clone());
+        let request = self
+            .agent
+            .next_model_request(&self.config, cwd.as_deref())?;
+        let agent::ModelRequest {
+            identity,
+            client,
+            system,
+            user,
+            token,
+        } = request;
+        let turns = [jterm_core::ai::Turn {
+            role: jterm_core::ai::Role::User,
+            text: user,
+        }];
+        if self.config.ai_stream {
+            // Streaming: a dedicated worker thread runs the request and
+            // forwards each assistant fragment (and finally the complete
+            // reply) as Messages through an unbounded channel the runtime
+            // drains as a Task stream. The complete returned text is the
+            // single source of truth — `AgentUi::model_reply` records it
+            // exactly as the blocking path would; fragments only feed the
+            // live preview. The same cancellation token kills curl
+            // mid-stream when the panel closes.
+            let (tx, rx) = iced::futures::channel::mpsc::unbounded::<Message>();
+            std::thread::spawn(move || {
+                let mut on_delta = |fragment: &str| {
+                    let _ =
+                        tx.unbounded_send(Message::AgentModelDelta(identity, fragment.to_string()));
+                };
+                let result = client
+                    .send_turns_streaming_cancellable(Some(&system), &turns, &token, &mut on_delta)
+                    .map_err(|error| error.to_string());
+                let _ = tx.unbounded_send(Message::AgentModelReply(identity, result));
+            });
+            return Some(Task::stream(rx));
+        }
+        Some(Task::perform(
+            async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    client
+                        .send_turns_blocking_cancellable(Some(&system), &turns, &token)
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+                match result {
+                    Ok(result) => result,
+                    Err(error) => Err(format!("AI worker task failed: {error}")),
+                }
+            },
+            move |result| Message::AgentModelReply(identity, result),
+        ))
+    }
+
+    /// Approve a proposal, put it on the bound session's prompt in place of the
+    /// pending line, submit it, then continue driving the protocol.
+    fn agent_run_approved(
+        &mut self,
+        reference: agent::ProposalRef,
+        edited: Option<String>,
+    ) -> Option<Task<Message>> {
+        if !self.agent.proposal_is_current(reference) {
+            return None;
+        }
+        let bound = self.agent.bound_session_id?;
+        let Some(session_index) = self.sessions.iter().position(|session| session.id == bound)
+        else {
+            self.agent
+                .set_status("Agent session's terminal no longer exists".to_string());
+            return None;
+        };
+
+        // Gate *before* approving in the pure Agent state machine. A rejected
+        // gate therefore leaves the proposal pending and reviewable.
+        let prompt_status = self.sessions[session_index].agent_prompt_status();
+        if !prompt_status.is_ready() {
+            self.agent
+                .set_status(prompt_status.blocked_message().to_string());
+            return None;
+        }
+        if !self.sessions[session_index].can_queue_user_bytes(MAX_AGENT_APPROVAL_PAYLOAD_BYTES) {
+            self.agent
+                .set_status("Agent command not run: PTY input queue is full".to_string());
+            return None;
+        }
+
+        let approved = self.agent.approve(reference, edited)?;
+        let sess = &mut self.sessions[session_index];
+        let paste = match agent_command_payload(
+            &approved.command,
+            sess.terminal.is_bracketed_paste_enabled(),
+        ) {
+            Ok(paste) => paste,
+            Err(error) => {
+                self.agent.execution_start_failed(
+                    approved.generation,
+                    format!("Agent command rejected at the PTY boundary: {error}"),
+                );
+                return None;
+            }
+        };
+        if let Err(status) = sess
+            .terminal
+            .arm_agent_execution(approved.generation, &approved.command)
+        {
+            self.agent.execution_start_failed(
+                approved.generation,
+                format!("{}; Agent session stopped", status.blocked_message()),
+            );
+            return None;
+        }
+        sess.terminal.scroll_to_bottom();
+        sess.projection_view_state.scroll_to_bottom();
+        if !sess.write_agent_pty(&paste.bytes) {
+            sess.terminal.disarm_agent_execution(approved.generation);
+            self.agent.execution_start_failed(
+                approved.generation,
+                "Agent command could not be written; Agent session stopped",
+            );
+            return None;
+        }
+        sess.refresh();
+        self.agent_drive_task()
+    }
+
+    // ===== Review-first command correction (command_correction) =====
+
+    /// Offer a review-first correction after a narrowly classified Block-mode
+    /// failure in the session `id`. Any finished command first retires the
+    /// pane's previous card/request; the shared engine then decides whether
+    /// this failure is one it reacts to at all, verified local evidence wins
+    /// over the strict-JSON AI fallback, and nothing runs without an explicit
+    /// card action. Returns the worker task when a request was started.
+    fn maybe_start_command_correction(
+        &mut self,
+        session_id: usize,
+        completed: &terminal::CompletedCommand,
+    ) -> Option<Task<Message>> {
+        // A newly finished command makes any visible card or in-flight request
+        // for this pane stale before this failure is even classified.
+        self.command_corrections.close(session_id);
+        let enabled = command_correction::correction_monitor_enabled(
+            self.config.ai_enabled,
+            self.config.command_correction_enabled,
+            self.agent.is_open,
+        );
+        // `should_start` re-checks this, and it is the engine that owns every
+        // other refusal. Answering frost's own composite gate first still pays
+        // for itself: this runs for every finished command, and the session
+        // lookup plus the command and cwd copies below are pure waste when the
+        // feature is off (the default). The block output itself is no longer
+        // part of that cost — `CompletionFacts::output` is a `&str` now, so the
+        // whole finished block is borrowed rather than copied on the UI thread.
+        if !enabled {
+            return None;
+        }
+        let sess = self.sessions.iter().find(|sess| sess.id == session_id)?;
+        let facts = command_correction::CompletionFacts {
+            command: completed.command.clone(),
+            // A shell that reported no exit status gives no failure signal,
+            // and inventing one would put a "did you mean" card under a
+            // command that may well have succeeded.
+            exit_code: completed.exit_code,
+            // Whole, not sampled, and borrowed: `should_start` reduces this to
+            // the engine's own bounded head/tail sample before anything
+            // classifies it, and sampling twice elides real content out of the
+            // middle of the first sample. Borrowing means a block at the
+            // `MAX_CAPTURED_OUTPUT_BYTES` ceiling costs nothing here even with
+            // the feature on.
+            output: &completed.output,
+            cwd: sess
+                .cwd_cache
+                .clone()
+                .or_else(|| sess.cwd())
+                .filter(|cwd| cwd.len() <= command_correction::MAX_CORRECTION_CWD_BYTES),
+            remote: sess.managed_remote,
+            // Agent-approved commands already went through review; correcting
+            // them would compete with the Agent session's own loop.
+            agent_issued: completed.agent_generation.is_some(),
+            // Only a shell-reported completion is failure evidence: a
+            // boundary-inferred one attributes stale scrollback and a guessed
+            // status to a command, so the classifier would read "command not
+            // found" out of the *previous* command's output.
+            trusted_completion: completed.completion_provenance
+                == block_mode::CompletionProvenance::ShellReported,
+        };
+        // The whole trigger is one decision in the engine — the toggles, the
+        // two refusals above, the missing status, the output sample and the
+        // narrow classifier — so no copy of this surface can forget one of
+        // them again.
+        let request = command_correction::should_start(enabled, facts)?;
+        let deadline = std::time::Instant::now() + command_correction::CORRECTION_REQUEST_TIMEOUT;
+        let (generation, token) = self.command_corrections.begin(
+            session_id,
+            request.command().to_string(),
+            request.exit_code(),
+            deadline,
+        )?;
+        // A missing credential disables only the AI fallback inside the
+        // worker; the verified local resolvers run regardless.
+        let client = agent::client_from_config(&self.config).ok();
+        // Stated per request, because `ai_share_command_context` is a live
+        // config value: with it off the local resolvers still run and the
+        // provider is never contacted.
+        let policy = command_correction::correction_policy(self.config.ai_share_command_context);
+        Some(Task::perform(
+            async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    command_correction::resolve_correction_blocking(
+                        &policy,
+                        &request,
+                        client.as_ref(),
+                        &token,
+                        deadline,
+                    )
+                })
+                .await;
+                match result {
+                    Ok(result) => result,
+                    Err(error) => Err(format!("command correction worker failed: {error}")),
+                }
+            },
+            move |result| Message::CommandCorrectionResolved(session_id, generation, result),
+        ))
+    }
+
+    /// The card is scoped to the active pane: only Escape belongs to it
+    /// (dismiss); every other key keeps flowing to the terminal, or to the
+    /// card's focused draft input through widget capture.
+    fn correction_card_visible(&self) -> bool {
+        self.sessions
+            .get(self.active)
+            .and_then(|sess| self.command_corrections.get(sess.id))
+            .is_some_and(|session| session.proposal.is_some())
+    }
+
+    fn dismiss_active_correction(&mut self) {
+        if let Some(session_id) = self.sessions.get(self.active).map(|sess| sess.id) {
+            if let Some(session) = self.command_corrections.get(session_id) {
+                let generation = session.generation();
+                self.command_corrections.dismiss(session_id, generation);
+            }
+        }
+    }
+
+    /// The card's primary action. A verified proposal the user left unchanged
+    /// (and that is not dangerous) runs after this one explicit action; an
+    /// unverified or edited draft is inserted at the prompt for review and the
+    /// user still presses Enter.
+    fn accept_command_correction(
+        &mut self,
+        reference: command_correction::CorrectionRef,
+    ) -> Task<Message> {
+        let session_id = reference.session_id;

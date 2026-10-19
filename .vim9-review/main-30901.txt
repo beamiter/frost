@@ -1,0 +1,300 @@
+                    .spacing(6),
+                );
+            }
+        }
+        if let Some(feedback) = session.feedback.as_deref() {
+            card = card.push(
+                text(crate::review_text::bound_toast_text(feedback))
+                    .size(self.effective_font_size())
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::danger),
+            );
+        }
+        // The sources' invariant, shown verbatim on the card.
+        card = card.push(
+            text("Enter uses the labelled action · generated commands never run automatically")
+                .size(self.effective_font_size())
+                .wrapping(text::Wrapping::Word)
+                .style(text::secondary),
+        );
+
+        let inner = container(card)
+            .width(Length::Fixed(560.0))
+            .padding(12)
+            .style(container::dark);
+        Some(
+            container(inner)
+                .align_right(Length::Fill)
+                .align_bottom(Length::Fill)
+                .padding(10)
+                .into(),
+        )
+    }
+
+    /// The inline "Ask AI" request overlay (palette entry only, like the
+    /// sources' `?` prefix): one natural-language line in, one review card
+    /// out. Nothing is drafted, inserted, or run until the card's explicit
+    /// action.
+    fn ai_ask_overlay(&self) -> Element<'_, Message> {
+        let query = self.ai_ask.as_deref().unwrap_or("");
+        let input: Element<'_, Message> = text_input(
+            "Describe the command you need… (e.g. find files modified today)",
+            query,
+        )
+        .id(AI_ASK_INPUT_ID.clone())
+        .on_input(Message::AiAskInput)
+        .on_submit(Message::AiAskSubmit)
+        .size(self.effective_font_size())
+        .into();
+        let body = column![
+            row![text("?").size(self.effective_font_size()), input]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            text("AI drafts one shell command for your review. It is typed at the prompt only after you approve it and never runs automatically.")
+                .size(self.effective_font_size())
+                .wrapping(text::Wrapping::Word)
+                .style(text::secondary),
+        ]
+        .spacing(8);
+        let panel = container(body)
+            .width(Length::Fixed(560.0))
+            .padding(12)
+            .style(container::dark);
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::AiAskClose);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        // An already-held key belongs to the currently visible recall surface,
+        // including a positive focus snapshot that produced no Iced key event.
+        if self.history_picker.is_some()
+            || self.palette.is_open
+            || self.workflow_overlay.is_some()
+            || self.block_review.is_some()
+        {
+            self.native_enter_ownership.lock().claim_held();
+        }
+
+        let mut subs: Vec<Subscription<Message>> = self
+            .sessions
+            .iter()
+            .map(|s| {
+                pty_subscription(PtySubscriptionKey {
+                    id: s.id,
+                    master_fd: s.master_fd,
+                    reader_fd: Arc::clone(&s.reader_fd),
+                    watch_source: s.watch_source.clone(),
+                    child_pid: s.pty.get_child_pid(),
+                })
+            })
+            .collect();
+        let events = iced::event::listen_with(|event, status, id| match event {
+            iced::Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
+                Some(Message::ModifiersChanged(m))
+            }
+            // When an overlay text input is focused it captures the keys it
+            // consumes (typing, Backspace, cursor movement). Dropping captured
+            // keyboard events here keeps them from also reaching the terminal,
+            // so editing the search/palette query never double-inputs.
+            // ...except Escape. A focused iced text_input consumes Escape to
+            // blur itself and captures the event, so the first press never
+            // reached the overlay that should have closed — every panel took
+            // two presses, with the query input silently dead in between. The
+            // handler re-delivers this only while an overlay owns Escape, so
+            // it can never become a stray byte to the foreground program.
+            iced::Event::Keyboard(event) if status == iced::event::Status::Captured => {
+                if captured_key_is_overlay_escape(&event) {
+                    Some(Message::OverlayEscape(event))
+                } else if let keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                    ..
+                } = &event
+                {
+                    Some(Message::CapturedEnterPress(id, event))
+                } else if captured_key_is_enter_release(&event)
+                    || matches!(
+                        &event,
+                        keyboard::Event::KeyReleased { key, .. }
+                            if block_search_is_bookmark_key(key)
+                    )
+                {
+                    // A focused widget may capture a release owned by history
+                    // confirmation or block search. Let the corresponding latch
+                    // see it; this does not redispatch captured key presses.
+                    Some(Message::WindowKey(id, event))
+                } else {
+                    None
+                }
+            }
+            iced::Event::Keyboard(k) => Some(Message::WindowKey(id, k)),
+            iced::Event::InputMethod(iced::advanced::input_method::Event::Commit(_))
+                if status == iced::event::Status::Captured =>
+            {
+                Some(Message::ImeCancelledCommit)
+            }
+            iced::Event::InputMethod(_) if status == iced::event::Status::Captured => None,
+            iced::Event::InputMethod(ime) => Some(Message::Ime(ime)),
+            iced::Event::Window(iced::window::Event::Resized(size)) => Some(Message::Resized(size)),
+            // Drop routing lives in the handler: listen_with takes a plain fn
+            // pointer, so no state can be captured here.
+            iced::Event::Window(iced::window::Event::FileDropped(path)) => {
+                Some(Message::FileDropped(path))
+            }
+            // Hovered files drive the import hint; the position the drop lands
+            // at comes from the row-hover tracking, these events carry none.
+            iced::Event::Window(iced::window::Event::FileHovered(_)) => {
+                Some(Message::SidebarDropHover(true))
+            }
+            iced::Event::Window(iced::window::Event::FilesHoveredLeft) => {
+                Some(Message::SidebarDropHover(false))
+            }
+            iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
+            iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
+            iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::WindowClose),
+            // Catch every left-button release so a tab drag that ends outside
+            // any tab still clears `dragging_tab`. When the release lands on a
+            // tab, mouse_area's on_release fires Message::TabDragEnd first
+            // (which already consumes `dragging_tab`), so this becomes a no-op.
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+                Some(Message::TabDragCancel)
+            }
+            iced::Event::Touch(
+                iced::touch::Event::FingerLifted { .. } | iced::touch::Event::FingerLost { .. },
+            ) => Some(Message::TabDragCancel),
+            _ => None,
+        });
+        subs.push(events);
+        if let Some(epoch) = self.organism_motion_control.subscription_epoch() {
+            subs.push(
+                organism_system_motion::subscription(epoch).map(Message::OrganismSystemMotion),
+            );
+        }
+        let preview_visible = self.organism_preview_visible();
+        let live_layout = self.organism_layout();
+        let attention_facts = self.organism_attention_facts();
+        // Reuse the existing maintenance timer. A scrolled-out/alternate-screen
+        // inline companion owns no cadence when neither status nor body paints.
+        let native_visible = !self.config.is_card_mode()
+            || self.organism_body_hover_available()
+            || self.sessions.get(self.active).is_some_and(|session| {
+                session
+                    .projection
+                    .chat_rows()
+                    .iter()
+                    .any(|row| row.status_line.is_some())
+                    || session.projection.row_kinds().iter().any(|kind| {
+                        matches!(
+                            kind,
+                            terminal::ProjectedRowKind::BlockChrome {
+                                boundary: terminal::ChromeBoundary {
+                                    kind: terminal::ChromeKind::Organism,
+                                    ..
+                                },
+                                ..
+                            }
+                        )
+                    })
+            });
+        let live_visible = live_layout.maintenance_eligible(self.focused) && native_visible;
+        let effective = self.organism_motion_control.resolution().effective;
+        let preview_full = preview_visible
+            && self.organism.preview_animation_enabled()
+            && effective == jterm_core::organism_motion::Motion::Full;
+        if let Some(reason) = organism_wake_plan::periodic(organism_wake_plan::ScheduleFacts {
+            motion: effective,
+            focused: self.focused,
+            live_presentable: live_layout.presentable(),
+            native_visible,
+            live_owner: self.organism_owner().is_some(),
+            preview_visible,
+            preview_animation_enabled: self.organism.preview_animation_enabled(),
+        }) {
+            subs.push(
+                iced::time::every(reason.interval())
+                    .with(reason)
+                    .map(|(reason, _)| {
+                        Message::OrganismTick(organism_wake_plan::WakeCause::Periodic(reason))
+                    }),
+            );
+        }
+        // Preserve the existing absolute one-shots. Attribution groups equal
+        // timestamps, without postponing expiry or adding a maintenance timer.
+        use organism_wake_plan::{DeadlineReason, DeadlineRequest};
+        let now = std::time::Instant::now();
+        let mut deadlines = [None; 6];
+        if preview_visible && !preview_full {
+            if let Some((at, reason)) = self.organism.preview_deadline() {
+                deadlines[0] = Some(DeadlineRequest {
+                    at,
+                    reason,
+                    generation: 0,
+                });
+            }
+        }
+        if let Some(owner) = self.organism_observation_owner() {
+            if let Some(at) = self.organism.retreat_deadline() {
+                deadlines[3] = Some(DeadlineRequest {
+                    at,
+                    reason: DeadlineReason::RetreatExpiry,
+                    generation: owner as u64,
+                });
+            }
+            if let Some(at) = self.organism.reaction_deadline(owner) {
+                deadlines[4] = Some(DeadlineRequest {
+                    at,
+                    reason: DeadlineReason::CompletionExpiry,
+                    generation: owner as u64,
+                });
+            }
+        }
+        if organism_pointer_observation_needed(
+            live_visible,
+            live_layout.glyph || (self.config.is_card_mode() && live_layout.presentable()),
+            self.organism.explicit_greeting_active(attention_facts),
+            !self.organism_pointer_buttons.is_empty(),
+            self.organism_effective_motion(),
+        ) {
+            // Observe without consuming or rerouting the original mouse event.
+            // A narrow explicit hold observes input only while active; after a
+            // press cancels it, retain the listener through release cleanup.
+            // Iced supplies no native snapshot of buttons pressed outside this
+            // window; only observed button-down/drag state is claimed here.
+            subs.push(iced::event::listen_with(if live_visible {
+                |event, _status, _id| organism_pointer_event(event, true)
+            } else {
+                |event, _status, _id| organism_pointer_event(event, false)
+            }));
+        }
+        if self.organism_interaction_eligible() {
+            if let Some(at) = self.organism.live_greeting_deadline(attention_facts) {
+                deadlines[5] = Some(DeadlineRequest {
+                    at,
+                    reason: DeadlineReason::LiveAttention,
+                    generation: self.organism_geometry_epoch,
+                });
+            }
+        }
+        for wake in organism_wake_plan::deadlines(now, deadlines) {
+            subs.push(organism_deadline_subscription(wake));
+        }
+        // A right-press on a tab carries no coordinates, so the context menu
+        // needs the pointer tracked separately. Track it only while a tab is
+        // hovered: a motion message per event over the whole window would
+        // rebuild the view (grid included) on every mouse move, which is why
+        // the terminal itself only reports motion while dragging.
+        if self.hovered_tab.is_some() {
+            subs.push(iced::event::listen_with(
+                |event, _status, _id| match event {
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                        Some(Message::TabPointerMoved(position))
+                    }
+                    _ => None,
+                },

@@ -1,0 +1,300 @@
+        // Already even: nothing left to move. A lone leaf has no divider.
+        assert!(!equalize_pane_tree(&mut tree));
+        assert!(!equalize_pane_tree(&mut PaneTree::Leaf(0)));
+    }
+
+    fn split_tab(id: usize, sessions: &[usize]) -> Tab {
+        Tab {
+            id,
+            title: None,
+            pinned: false,
+            marked: false,
+            private_title: false,
+            tree: PaneTree::Split {
+                axis: Axis::Vertical,
+                children: sessions.iter().map(|&s| PaneTree::Leaf(s)).collect(),
+                ratios: vec![1.0 / sessions.len() as f32; sessions.len()],
+            },
+            focus: sessions[0],
+        }
+    }
+
+    #[test]
+    fn tab_split_drop_zones_choose_the_nearest_edge_and_keep_a_dead_center() {
+        let rect = pane_layout::Rect {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 80.0,
+        };
+        assert_eq!(
+            split_drop_direction(rect, iced::Point::new(11.0, 60.0)),
+            Some(PaneDirection::Left)
+        );
+        assert_eq!(
+            split_drop_direction(rect, iced::Point::new(109.0, 60.0)),
+            Some(PaneDirection::Right)
+        );
+        assert_eq!(
+            split_drop_direction(rect, iced::Point::new(60.0, 21.0)),
+            Some(PaneDirection::Up)
+        );
+        assert_eq!(
+            split_drop_direction(rect, iced::Point::new(60.0, 99.0)),
+            Some(PaneDirection::Down)
+        );
+        assert_eq!(
+            split_drop_direction(rect, iced::Point::new(60.0, 60.0)),
+            None
+        );
+        assert_eq!(
+            split_drop_direction(rect, iced::Point::new(110.0, 60.0)),
+            None
+        );
+        assert_eq!(
+            split_drop_direction(rect, iced::Point::new(f32::NAN, 60.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn tab_split_commit_revalidates_visible_target_zoom_and_capacity() {
+        assert!(tab_split_commit_allowed(
+            Some(0),
+            true,
+            1,
+            Some(1),
+            2,
+            false
+        ));
+        assert!(!tab_split_commit_allowed(
+            Some(0),
+            true,
+            1,
+            Some(2),
+            2,
+            false
+        ));
+        assert!(!tab_split_commit_allowed(
+            Some(0),
+            true,
+            1,
+            Some(1),
+            2,
+            true
+        ));
+        assert!(!tab_split_commit_allowed(
+            Some(0),
+            true,
+            1,
+            Some(1),
+            MAX_PANES,
+            false
+        ));
+        assert!(!tab_split_commit_allowed(
+            Some(0),
+            false,
+            1,
+            Some(1),
+            2,
+            false
+        ));
+    }
+
+    #[test]
+    fn drag_hover_switch_requires_the_same_target_for_the_full_delay() {
+        let almost = std::time::Duration::from_millis(TAB_DRAG_HOVER_SWITCH_MS - 1);
+        let ready = std::time::Duration::from_millis(TAB_DRAG_HOVER_SWITCH_MS);
+        assert!(!tab_drag_hover_ready(
+            Some(1),
+            true,
+            Some(3),
+            Some(2),
+            2,
+            almost
+        ));
+        assert!(tab_drag_hover_ready(
+            Some(1),
+            true,
+            Some(3),
+            Some(2),
+            2,
+            ready
+        ));
+        assert!(!tab_drag_hover_ready(
+            Some(1),
+            true,
+            Some(3),
+            Some(4),
+            2,
+            ready
+        ));
+        assert!(!tab_drag_hover_ready(
+            Some(2),
+            true,
+            Some(3),
+            Some(2),
+            2,
+            ready
+        ));
+        assert!(!tab_drag_hover_ready(
+            None,
+            true,
+            Some(3),
+            Some(2),
+            2,
+            ready
+        ));
+        assert!(!tab_drag_hover_ready(
+            Some(1),
+            false,
+            Some(3),
+            Some(2),
+            2,
+            ready
+        ));
+        // Hovering the page that is already active must not invoke
+        // `activate_tab` and unexpectedly clear that page's zoom state.
+        assert!(!tab_drag_hover_ready(
+            Some(1),
+            true,
+            Some(2),
+            Some(2),
+            2,
+            ready
+        ));
+    }
+
+    #[test]
+    fn a_drag_returning_to_its_source_restores_origin_but_a_click_activates() {
+        assert!(tab_drag_hover_left_source(Some(2), None));
+        assert!(tab_drag_hover_left_source(Some(2), Some(3)));
+        assert!(!tab_drag_hover_left_source(Some(2), Some(2)));
+        assert_eq!(
+            tab_drag_release_action(Some(2), Some(2), false),
+            TabDragReleaseAction::Activate(2)
+        );
+        assert_eq!(
+            tab_drag_release_action(Some(2), Some(2), true),
+            TabDragReleaseAction::RestoreOrigin
+        );
+        assert_eq!(
+            tab_drag_release_action(Some(2), Some(3), true),
+            TabDragReleaseAction::Reorder { from: 2, to: 3 }
+        );
+        assert_eq!(
+            tab_drag_release_action(None, Some(3), true),
+            TabDragReleaseAction::RestoreOrigin
+        );
+    }
+
+    #[test]
+    fn ordinary_tab_moves_to_each_direction_without_duplicating_its_session() {
+        let cases = [
+            (PaneDirection::Left, Axis::Vertical, vec![0, 1]),
+            (PaneDirection::Right, Axis::Vertical, vec![1, 0]),
+            (PaneDirection::Up, Axis::Horizontal, vec![0, 1]),
+            (PaneDirection::Down, Axis::Horizontal, vec![1, 0]),
+        ];
+        for (direction, expected_axis, expected_leaves) in cases {
+            let mut tabs = vec![Tab::new(10, 0), Tab::new(20, 1)];
+            let result = move_plain_tab_into_split(&mut tabs, 10, 1, direction);
+
+            assert_eq!(result, Some((0, 0)), "{direction:?}");
+            assert_eq!(tabs.len(), 1, "{direction:?}");
+            assert_eq!(tabs[0].sessions(), expected_leaves, "{direction:?}");
+            assert_eq!(tabs[0].focus, 0, "{direction:?}");
+            let PaneTree::Split { axis, .. } = &tabs[0].tree else {
+                panic!("directional drop did not create a split")
+            };
+            assert_eq!(*axis, expected_axis, "{direction:?}");
+            let all = tabs.iter().flat_map(Tab::sessions).collect::<Vec<_>>();
+            assert_eq!(all.iter().filter(|session| **session == 0).count(), 1);
+        }
+    }
+
+    #[test]
+    fn invalid_tab_to_split_drops_are_transactional_no_ops() {
+        let mut split_source = vec![split_tab(10, &[0, 1]), Tab::new(20, 2)];
+        let before = split_source
+            .iter()
+            .map(|tab| (tab.id, tab.sessions(), tab.focus))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            move_plain_tab_into_split(&mut split_source, 10, 2, PaneDirection::Left),
+            None
+        );
+        assert_eq!(
+            split_source
+                .iter()
+                .map(|tab| (tab.id, tab.sessions(), tab.focus))
+                .collect::<Vec<_>>(),
+            before
+        );
+
+        let target_sessions = (1..=MAX_PANES).collect::<Vec<_>>();
+        let mut full_target = vec![Tab::new(10, 0), split_tab(20, &target_sessions)];
+        let before = full_target
+            .iter()
+            .map(|tab| (tab.id, tab.sessions(), tab.focus))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            move_plain_tab_into_split(&mut full_target, 10, 1, PaneDirection::Right),
+            None
+        );
+        assert_eq!(
+            full_target
+                .iter()
+                .map(|tab| (tab.id, tab.sessions(), tab.focus))
+                .collect::<Vec<_>>(),
+            before
+        );
+
+        let mut same_tab = vec![Tab::new(10, 0), Tab::new(20, 1)];
+        assert_eq!(
+            move_plain_tab_into_split(&mut same_tab, 10, 0, PaneDirection::Down),
+            None
+        );
+        assert_eq!(same_tab[0].sessions(), vec![0]);
+    }
+
+    #[test]
+    fn nested_split_pane_promotes_to_one_new_tab_and_collapses_its_source() {
+        let mut tabs = vec![
+            Tab {
+                id: 7,
+                tree: PaneTree::Split {
+                    axis: Axis::Vertical,
+                    children: vec![
+                        PaneTree::Leaf(0),
+                        PaneTree::Split {
+                            axis: Axis::Horizontal,
+                            children: vec![PaneTree::Leaf(1), PaneTree::Leaf(2)],
+                            ratios: vec![0.5, 0.5],
+                        },
+                    ],
+                    ratios: vec![0.4, 0.6],
+                },
+                focus: 1,
+                title: None,
+                pinned: false,
+                marked: false,
+                private_title: false,
+            },
+            Tab::new(8, 3),
+        ];
+        let mut next_id = 9;
+
+        let promoted = promote_split_pane_to_tab(&mut tabs, &mut next_id, 1, Some(8));
+
+        assert_eq!(promoted, Some((2, 1)));
+        assert_eq!(next_id, 10);
+        assert_eq!(tabs[0].sessions(), vec![0, 2]);
+        assert_eq!(tabs[0].focus, 0);
+        assert_eq!(tabs[2].id, 9);
+        assert_eq!(tabs[2].sessions(), vec![1]);
+        let mut all = tabs.iter().flat_map(Tab::sessions).collect::<Vec<_>>();
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 1, 2, 3]);
+    }
+

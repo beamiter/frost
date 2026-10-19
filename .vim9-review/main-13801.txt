@@ -1,0 +1,300 @@
+                                .get_mouse_report(btn_code(button), grid_col, grid_row)
+                        {
+                            if sess.write_pty(&report) {
+                                record_terminal_app_mouse_cell(
+                                    &mut self.terminal_mouse_gestures,
+                                    target_session_id,
+                                    button,
+                                    (grid_col, grid_row),
+                                );
+                            }
+                        }
+                    }
+                    return Task::none();
+                }
+                match button {
+                    MouseButton::Left => match count {
+                        2 => sess
+                            .terminal
+                            .select_word_in_projection(&sess.projection, row, col),
+                        n if n >= 3 => sess
+                            .terminal
+                            .select_line_in_projection(&sess.projection, row),
+                        _ if alt => sess.terminal.start_selection_in_projection(
+                            &sess.projection,
+                            (row, col),
+                            terminal::SelectionMode::Block,
+                        ),
+                        _ => sess.terminal.start_selection_in_projection(
+                            &sess.projection,
+                            (row, col),
+                            terminal::SelectionMode::Normal,
+                        ),
+                    },
+                    MouseButton::Middle => {
+                        let id = sess.id;
+                        return iced::clipboard::read_primary()
+                            .map(move |text| Message::Pasted(id, text));
+                    }
+                    MouseButton::Right => {}
+                }
+            }
+            MouseInput::Drag { col, row, count } => {
+                if report_to_app {
+                    if sess.terminal.is_mouse_motion_enabled() {
+                        let current =
+                            projected_live_grid_cell(&sess.terminal, &sess.projection, row, col);
+                        if let Some((grid_col, grid_row)) =
+                            gesture.and_then(|gesture| gesture.app_drag_cell(current))
+                        {
+                            if let Some(report) =
+                                sess.terminal.get_mouse_report(32, grid_col, grid_row)
+                            {
+                                if sess.write_pty(&report) {
+                                    record_terminal_app_mouse_cell(
+                                        &mut self.terminal_mouse_gestures,
+                                        target_session_id,
+                                        MouseButton::Left,
+                                        (grid_col, grid_row),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    return Task::none();
+                }
+                match count {
+                    2 => sess.terminal.extend_word_selection_in_projection(
+                        &sess.projection,
+                        row,
+                        col,
+                    ),
+                    n if n >= 3 => sess
+                        .terminal
+                        .extend_line_selection_in_projection(&sess.projection, row),
+                    _ => sess
+                        .terminal
+                        .update_selection_in_projection(&sess.projection, (row, col)),
+                }
+            }
+            MouseInput::Release { col, row, button } => {
+                if report_to_app {
+                    let current =
+                        projected_live_grid_cell(&sess.terminal, &sess.projection, row, col);
+                    if let Some((grid_col, grid_row)) = gesture.and_then(|gesture| {
+                        gesture.app_release_cell(
+                            current,
+                            sess.terminal.grid.row_len(),
+                            sess.terminal.grid.rows(),
+                        )
+                    }) {
+                        if let Some(report) = sess.terminal.get_mouse_release_report(
+                            btn_code(button),
+                            grid_col,
+                            grid_row,
+                        ) {
+                            sess.write_pty(&report);
+                        }
+                    }
+                    return Task::none();
+                }
+                if button == MouseButton::Left {
+                    // A plain click must be handled before the selection copy:
+                    // the press already anchored a one-cell selection, so
+                    // `copy_selection` would return that cell's character and
+                    // swallow the click.
+                    if let Some(cell) = clicked_cell {
+                        sess.terminal.clear_text_selection();
+                        let bytes = projected_live_grid_cell(
+                            &sess.terminal,
+                            &sess.projection,
+                            cell.row.max(0) as usize,
+                            cell.col.max(0) as usize,
+                        )
+                        .map(|(grid_col, grid_row)| {
+                            sess.terminal
+                                .click_cursor_move(grid_row, grid_col, click_moves_cursor)
+                        })
+                        .unwrap_or_default();
+                        if !bytes.is_empty() {
+                            sess.write_pty(&bytes);
+                        }
+                        sess.refresh();
+                    } else if let Some(text) = sess
+                        .terminal
+                        .copy_selection()
+                        .filter(|t| !cancelled_click && !t.is_empty())
+                    {
+                        if crate::block_mode::clipboard_multiline_is_unsafe(&text) {
+                            self.push_toast(
+                                "Selection not copied: it contains control or visual-spoofing characters"
+                                    .to_string(),
+                                ToastKind::Warning,
+                            );
+                            return Task::none();
+                        }
+                        return iced::clipboard::write_primary(text);
+                    }
+                }
+            }
+            MouseInput::Wheel {
+                col,
+                row,
+                up,
+                ctrl,
+                shift: _,
+                lines,
+                ..
+            } => {
+                if ctrl {
+                    // Ctrl+wheel belongs exclusively to the layout-scoped
+                    // font router, never to a focused/session mouse callback.
+                    return Task::none();
+                }
+                if report_to_app {
+                    let code = if up { 64 } else { 65 };
+                    if let Some((grid_col, grid_row)) =
+                        projected_live_grid_cell(&sess.terminal, &sess.projection, row, col)
+                    {
+                        // One wheel report per line so apps see the full magnitude.
+                        for _ in 0..lines.max(1) {
+                            if let Some(report) =
+                                sess.terminal.get_mouse_report(code, grid_col, grid_row)
+                            {
+                                sess.write_pty(&report);
+                            }
+                        }
+                    }
+                    return Task::none();
+                }
+                let step = speed * lines.max(1) as isize;
+                sess.scroll(if up { step } else { -step });
+            }
+            MouseInput::ScrollTo { offset } => {
+                sess.set_scroll_offset(offset);
+            }
+        }
+        Task::none()
+    }
+
+    /// Shift+Page/Home/End scrolls the scrollback viewport. Returns true if the
+    /// keypress was consumed.
+    fn handle_scroll_shortcut(&mut self, key: &keyboard::Key, mods: keyboard::Modifiers) -> bool {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        if !mods.shift() {
+            return false;
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return false;
+        };
+        // Page by the active pane's own row count, not the whole window — when
+        // split, a pane is shorter than `self.rows`.
+        let page = sess.terminal.grid.rows().saturating_sub(1).max(1) as isize;
+        match key {
+            Key::Named(Named::PageUp) => sess.scroll(page),
+            Key::Named(Named::PageDown) => sess.scroll(-page),
+            Key::Named(Named::Home) => {
+                let len = sess.projection.max_scroll_offset();
+                sess.set_scroll_offset(len);
+            }
+            Key::Named(Named::End) => sess.scroll_to_bottom(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Re-run the search over the active session's full scrollback + live grid.
+    /// Match rows remain absolute, so scrolling does not invalidate them.
+    ///
+    /// This stays a full re-scan rather than an incremental tail scan on
+    /// purpose: PTY output can rewrite already-searched grid rows in place
+    /// (`\r` progress lines, cursor-addressed redraws), and no cheap revision
+    /// signal distinguishes pure appends from those rewrites, so a tail-only
+    /// refresh could leave stale matches behind indefinitely. The 300 ms
+    /// `SearchRefreshTick` debounce plus the zero-copy `search_lines` text
+    /// keep the full refresh cheap enough.
+    fn recompute_search(&mut self) {
+        self.search_dirty = false;
+        if !self.search.is_open {
+            return;
+        }
+        let Some(sess) = self.sessions.get(self.active) else {
+            self.search.matches.clear();
+            return;
+        };
+        self.search
+            .refresh_matches(sess.terminal.search_lines(), sess.id);
+    }
+
+    fn navigate_search(&mut self, previous: bool) {
+        if let Some(session) = self.sessions.get(self.active) {
+            self.search.navigate(
+                session.terminal.search_lines(),
+                &mut self.search_dirty,
+                session.id,
+                previous,
+            );
+        } else {
+            self.search.matches.clear();
+            self.search_dirty = false;
+        }
+        self.reveal_current_search_match();
+    }
+
+    /// Reveal the active full-buffer search result and refresh the session's
+    /// visible snapshot. Kept separate from recomputation so streaming PTY
+    /// output never steals the user's manually chosen scroll position.
+    fn reveal_current_search_match(&mut self) {
+        // This is a location diagnostic for the previously active match, not
+        // a search-engine error. Recompute it for the new target.
+        clear_stale_hidden_match_diagnostic(&mut self.search.error_message);
+        let Some(found) = self.search.current_match() else {
+            return;
+        };
+        if let Some(sess) = self.sessions.get_mut(self.active) {
+            let Some(origin) = sess
+                .terminal
+                .raw_cell_origin_at_absolute(found.line, found.col_start)
+            else {
+                return;
+            };
+            match sess
+                .terminal
+                .locate_raw_cell_in_projection(&sess.projection, origin)
+            {
+                terminal::ProjectedRawCellLocation::Hidden { zone_id } => {
+                    self.search.set_error_message(Some(format!(
+                        "Match is hidden in collapsed block #{zone_id}; expand its output to reveal"
+                    )));
+                }
+                terminal::ProjectedRawCellLocation::Visible(_) => {}
+                terminal::ProjectedRawCellLocation::Retained => {
+                    if sess.terminal.reveal_raw_cell_in_projection(
+                        &sess.projection_policy,
+                        &mut sess.projection_view_state,
+                        origin,
+                    ) {
+                        sess.refresh();
+                    }
+                }
+                terminal::ProjectedRawCellLocation::Unmapped => {}
+            }
+        }
+        self.links_cache_key = None;
+    }
+
+    fn reveal_hidden_search_match(&mut self, target: &SearchRevealTarget) -> Task<Message> {
+        let changed = self.sessions.get_mut(self.active).is_some_and(|session| {
+            let changed = apply_search_reveal(
+                target,
+                &self.search,
+                self.search_dirty,
+                session.id,
+                &session.terminal,
+                &session.projection,
+                &mut session.projection_policy,
+            );
+            if changed {
+                session.refresh();
+            }

@@ -1,0 +1,300 @@
+
+/// A link press is meaningful only in the immutable projection it was painted
+/// from. Revision zero means the projection identity counter exhausted and is
+/// deliberately never activatable.
+fn link_projection_matches(rendered_revision: u64, current_revision: u64) -> bool {
+    rendered_revision != 0 && rendered_revision == current_revision
+}
+
+fn validated_summary_target(
+    projection: &ProjectedViewport,
+    activation: &SummaryActivation,
+) -> Option<u64> {
+    let key = activation.key;
+    (projection.key() == activation.projection_key
+        && key.policy_revision == projection.policy_revision()
+        && projection.effective_collapsed().contains(&key.zone_id)
+        && projection.row_kinds().iter().any(|kind| {
+            matches!(
+                kind,
+                terminal::ProjectedRowKind::CollapsedSummary { key: current, .. }
+                    if *current == key
+            )
+        }))
+    .then_some(key.zone_id)
+}
+
+fn agent_context_exit_label(exit_code: i32) -> String {
+    if exit_code == agent_task::context::UNKNOWN_EXIT_STATUS_SENTINEL {
+        "no reported exit status".to_string()
+    } else {
+        format!("exit {exit_code}")
+    }
+}
+
+/// The lenient semantic snapshot of one finished block, for the three surfaces
+/// that attach a block as untrusted evidence rather than as a task's subject.
+///
+/// Deliberately lenient where [`agent_task::SemanticCommandContext::to_block_context`]
+/// is strict: a background block with no command, no cwd and no reported
+/// status is still attachable evidence. What it must never do is launder that
+/// missing evidence, which is why the conversion is
+/// [`agent_task::context::ad_hoc_block_context`] — the family's shared
+/// adapter — and not a fourth hand-rolled `BlockContext` literal.
+fn ad_hoc_block_semantic_context(
+    sess: &Session,
+    zone_id: u64,
+    configured_shell: Option<&str>,
+) -> Option<agent_task::SemanticCommandContext> {
+    let zone = sess.terminal.zone_by_id(zone_id)?;
+    let (output_text, output_truncated, output_available) =
+        match sess.terminal.zone_output_export_capped(zone_id)? {
+            terminal::ZoneOutputExport::Available { text, truncated } => (text, truncated, true),
+            terminal::ZoneOutputExport::Empty => (String::new(), false, true),
+            // Not empty output: the rows and the snapshot are both gone. The
+            // adapter substitutes the family's placeholder and marks the
+            // context truncated rather than presenting silence as a result.
+            terminal::ZoneOutputExport::Unavailable => (String::new(), false, false),
+        };
+    Some(agent_task::SemanticCommandContext {
+        source_session_id: agent_task_ui::terminal_session_id(sess.id),
+        source_execution_id: format!("zone-{zone_id}"),
+        source_sequence: zone_id,
+        source_shell: pty::resolved_shell_identity(configured_shell, zone.cwd.as_deref()),
+        command: zone.command.clone(),
+        command_exact: zone.command_exact,
+        command_truncated: zone.command_truncated,
+        cwd: zone.cwd.clone(),
+        cwd_after: None,
+        exit_code: zone.exit_code,
+        duration_ms: zone.duration_ms,
+        output_total_bytes: output_text.len(),
+        output_text,
+        output_available,
+        output_truncated,
+        started_at: None,
+        finished_at: None,
+    })
+}
+
+/// A rendered reveal button names one search result, never the pane's next result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SearchRevealTarget {
+    session_id: usize,
+    query: String,
+    use_regex: bool,
+    case_sensitive: bool,
+    found: search::SearchMatch,
+    origin: terminal::RawCellOrigin,
+    zone_id: u64,
+    policy_revision: u64,
+}
+
+fn search_reveal_target(
+    search: &search::SearchState,
+    dirty: bool,
+    session_id: usize,
+    terminal: &terminal::TerminalState,
+    projection: &terminal::ProjectedViewport,
+    policy: &terminal::ProjectionPolicy,
+) -> Option<SearchRevealTarget> {
+    if !search.is_open || dirty {
+        return None;
+    }
+    let found = search.current_match()?;
+    let origin = terminal.raw_cell_origin_at_absolute(found.line, found.col_start)?;
+    let terminal::ProjectedRawCellLocation::Hidden { zone_id } =
+        terminal.locate_raw_cell_in_projection(projection, origin)
+    else {
+        return None;
+    };
+    Some(SearchRevealTarget {
+        session_id,
+        query: search.query.clone(),
+        use_regex: search.use_regex,
+        case_sensitive: search.case_sensitive,
+        found,
+        origin,
+        zone_id,
+        policy_revision: policy.revision(),
+    })
+}
+
+fn apply_search_reveal(
+    target: &SearchRevealTarget,
+    search: &search::SearchState,
+    dirty: bool,
+    session_id: usize,
+    terminal: &terminal::TerminalState,
+    projection: &terminal::ProjectedViewport,
+    policy: &mut terminal::ProjectionPolicy,
+) -> bool {
+    if search_reveal_target(search, dirty, session_id, terminal, projection, policy).as_ref()
+        != Some(target)
+    {
+        return false;
+    }
+    // A click is rare: recheck the actual bounded search instead of granting
+    // mutation authority to a cached row whose contents may have changed.
+    let (matches, error) = search::SearchEngine::search_lines(
+        terminal.search_lines(),
+        &search.query,
+        search.use_regex,
+        search.case_sensitive,
+        &mut search.regex_cache.clone(),
+    );
+    error.is_none() && matches.contains(&target.found) && policy.expand(target.zone_id)
+}
+
+fn clear_stale_hidden_match_diagnostic(error: &mut Option<String>) {
+    if error
+        .as_deref()
+        .is_some_and(|message| message.starts_with("Match is hidden in collapsed block #"))
+    {
+        *error = None;
+    }
+}
+
+/// Commands whose configured chords must fall through to the PTY whenever
+/// block history is hidden/unsafe (Block Mode off or alternate screen). This
+/// preflight is keybinding-only; palette/menu actions still explain refusal
+/// with a toast through `ensure_block_action_available`.
+fn command_requires_block_context(command: &keybindings::Command) -> bool {
+    use keybindings::Command as C;
+    matches!(
+        command,
+        C::TerminalPromptPrev
+            | C::TerminalPromptNext
+            | C::TerminalCopyLastOutput
+            | C::BlockJumpFirstFailed
+            | C::BlockJumpPrevFailed
+            | C::BlockJumpNextFailed
+            | C::BlockCopyCommand
+            | C::BlockCopyOutput
+            | C::BlockRecallCommand
+            | C::BlockSelectAll
+            | C::BlockClear
+            | C::BlockUndoClear
+            | C::BlockSelectPrev
+            | C::BlockSelectNext
+            | C::BlockReinputSelectedCommands
+            | C::BlockCopyBlock
+            | C::BlockCopyMarkdown
+            | C::BlockExportSessionMarkdown
+            | C::BlockExportSessionJson
+            | C::BlockCompareSelected
+            | C::BlockExportSelectedMarkdown
+            | C::BlockExportSelectedJson
+            | C::BlockSearch
+            | C::BlockToggleBookmark
+            | C::BlockJumpPrevBookmark
+            | C::BlockJumpNextBookmark
+            | C::BlockFixWithAgent
+            | C::BlockExplainWithAgent
+            | C::BlockRetryFailed
+            | C::BlockToggleCollapse
+            | C::BlockMenu
+    )
+}
+
+/// Shared refusal reason for block actions that replace the shell's editable
+/// command line. A stopped command is not enough evidence: OSC 133 must also
+/// identify an empty prompt and the shell must still own the foreground PTY.
+fn block_prompt_replace_blocker(
+    prompt_status: terminal::AgentPromptStatus,
+) -> Option<&'static str> {
+    use terminal::AgentPromptStatus;
+    match prompt_status {
+        AgentPromptStatus::Ready => None,
+        AgentPromptStatus::Busy => Some("the terminal is busy"),
+        AgentPromptStatus::InputNotEmpty => Some("the prompt already contains input"),
+        AgentPromptStatus::UnsafeCommand => Some("the prompt state is unsafe"),
+        AgentPromptStatus::ShellIntegrationUnavailable => {
+            Some("waiting for an empty OSC 133 shell prompt")
+        }
+    }
+}
+
+/// Captured command history is untrusted terminal input. Keep controls
+/// stripped and, crucially, never send embedded newlines without bracketed
+/// paste: the first-line fallback prevents later selected commands executing.
+fn block_reinput_policy() -> PastePolicy {
+    PastePolicy::prompt_insert(UnbracketedMultiline::FirstLineOnly)
+}
+
+/// Guarded failed-block retry auto-submits: the same de-fanging as reinput,
+/// plus a trailing CR after the bracketed frame. Only reached for exact,
+/// non-truncated, single-line commands whose recorded cwd was verified.
+fn block_retry_policy() -> PastePolicy {
+    PastePolicy {
+        submit: true,
+        ..block_reinput_policy()
+    }
+}
+
+/// A verified, unchanged correction runs after one explicit card action with
+/// the Agent-approval payload's de-fanging: controls stripped, prompt line
+/// cleared first, and the submitting CR outside the bracketed frame. The
+/// insert path uses [`block_reinput_policy`] instead (never submits).
+fn correction_run_policy() -> PastePolicy {
+    PastePolicy {
+        submit: true,
+        ..PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim)
+    }
+}
+/// Height of the status strip above each pane while split. A single pane has
+/// no strip: the tab bar and status bar already name it, and the row would
+/// only cost a terminal line.
+const PANE_HEADER_H: f32 = 20.0;
+/// Maximum total leaves (panes) across the whole layout tree; a PTY guard.
+const MAX_PANES: usize = 12;
+/// Fraction of a pane reserved for directional tab-to-split drop zones.
+/// Keeping a generous dead zone in the middle makes an accidental drop a
+/// harmless cancel instead of unexpectedly rearranging a running workspace.
+const SPLIT_DROP_EDGE_FRACTION: f32 = 0.28;
+/// Hovering another tab for this long during a drag previews its page. A quick
+/// pass across the strip remains a pure reorder gesture.
+const TAB_DRAG_HOVER_SWITCH_MS: u64 = 450;
+const SPLIT_RATIO_KEY_STEP: f32 = 0.05;
+/// Two presses on the same divider within this window count as a double-click
+/// (equalizes every pane).
+const DIVIDER_DOUBLE_CLICK_MS: u64 = 400;
+/// Bound pending user/protocol input while a child is not reading its PTY.
+const MAX_PTY_WRITE_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+/// Responses are retried separately so a full user-input queue cannot discard
+/// terminal protocol replies. The combined per-session backlog remains bounded.
+const MAX_PTY_RESPONSE_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+/// Byte caps alone do not cover allocator/Vec metadata for one-byte writes.
+const MAX_PTY_QUEUE_ENTRIES: usize = 4096;
+const PTY_QUEUE_COALESCE_BYTES: usize = 64 * 1024;
+/// Maximum queued input written during one UI update.
+const PTY_WRITE_DRAIN_BUDGET: usize = 256 * 1024;
+/// jagent accepts at most 16 KiB per proposed command; reserve framing,
+/// Ctrl+U and submitting CR before moving the state machine to approved.
+const MAX_AGENT_APPROVAL_PAYLOAD_BYTES: usize = 16 * 1024 + 32;
+/// Never reflect an unexpectedly huge host clipboard through a terminal escape.
+const MAX_CLIPBOARD_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Keep the physical viewport fixed while the application-level UI scale
+/// changes. iced updates its logical viewport for this case without emitting a
+/// window `Resized` event, so the terminal must mirror that conversion itself.
+fn logical_viewport_after_scale(size: Size, old_scale: f32, new_scale: f32) -> Size {
+    let ratio = old_scale / new_scale;
+    Size::new(size.width * ratio, size.height * ratio)
+}
+
+/// Stable widget ids so the overlays' text inputs can be focused on open.
+static SEARCH_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-search-input"));
+static PALETTE_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-palette-input"));
+static PALETTE_LIST_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-palette-list"));
+static AGENT_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-agent-input"));
+static AGENT_EDIT_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-agent-edit-input"));
+static TAB_SWITCHER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-tab-switcher-input"));
+static HISTORY_PICKER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-history-picker-input"));

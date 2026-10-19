@@ -1,0 +1,300 @@
+            }
+        }
+
+        let keys = self.popup_text(if compact {
+            "↑/↓ select · Enter insert · Esc close"
+        } else {
+            "↑/↓ select · Enter insert · Esc close · Ctrl+D directory · Ctrl+O status · Ctrl+U unique"
+        })
+        .width(Length::Fill)
+        .wrapping(text::Wrapping::Word)
+        .color(self.c_text_dim());
+        let list_height = (filtered.len().max(1) as f32 * 44.0).min(300.0);
+        let body = column![
+            query_line,
+            filters,
+            summary,
+            scrollable(list)
+                .id(HISTORY_PICKER_LIST_ID.clone())
+                .height(if scroll_panel {
+                    Length::Fixed(list_height.min(120.0))
+                } else {
+                    Length::Fill
+                }),
+            keys
+        ]
+        .spacing(8);
+        // Reserve the query, filters and footer before giving the result list
+        // the remaining height. Very short windows scroll the whole panel so
+        // no control is clipped offscreen.
+        let body: Element<'_, Message> = if scroll_panel {
+            scrollable(body).height(Length::Fill).into()
+        } else {
+            body.into()
+        };
+        let panel = container(body)
+            .width(Length::Fixed(panel_width))
+            .height(Length::Fixed(panel_height))
+            .padding(12)
+            .style(self.popup_style());
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::HistoryPickerClose);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
+    /// Ctrl+Alt+F cross-block search picker overlay (palette-style). Enter or
+    /// a click selects the hit's zone and reveals it; nothing executes.
+    fn block_search_view(&self, state: &BlockSearchState) -> Element<'_, Message> {
+        let panel_size = block_search_layout::panel_size(self.win_size);
+        let compact = block_search_layout::compact(panel_size, self.effective_font_size());
+        let owner = self
+            .sessions
+            .iter()
+            .find(|sess| sess.id == state.session_id);
+        let filter_counts = BlockSearchFilter::ORDER.map(|filter| {
+            owner.map_or(0, |sess| {
+                sess.terminal
+                    .command_zones
+                    .iter()
+                    .filter(|zone| {
+                        filter.matches(
+                            zone,
+                            sess.block_bookmarks.contains(zone.id),
+                            sess.block_reading.seen_through,
+                            self.config.notify_long_block_threshold_ms,
+                        )
+                    })
+                    .count()
+            })
+        });
+        let case_toggle = button(text("Aa").size(self.effective_font_size()))
+            .on_press(Message::BlockSearchSetCaseSensitive(!state.case_sensitive))
+            .padding([3, 7])
+            .style(if state.case_sensitive {
+                button::primary
+            } else {
+                button::secondary
+            });
+        let regex_toggle = button(text(".*").size(self.effective_font_size()))
+            .on_press(Message::BlockSearchSetRegex(!state.regex))
+            .padding([3, 7])
+            .style(if state.regex {
+                button::primary
+            } else {
+                button::secondary
+            });
+        let whole_word_toggle = button(text("W").size(self.effective_font_size()))
+            .on_press(Message::BlockSearchSetWholeWord(!state.whole_word))
+            .padding([3, 7])
+            .style(if state.whole_word {
+                button::primary
+            } else {
+                button::secondary
+            });
+        let reset = button(text("Reset").size(self.effective_font_size()))
+            .on_press(Message::BlockSearchReset)
+            .padding([3, 7])
+            .style(button::secondary);
+        let refresh = tooltip(
+            button(text("Refresh").size(self.effective_font_size()))
+                .on_press(Message::BlockSearchRefresh)
+                .padding([3, 7])
+                .style(button::secondary),
+            container(
+                text("Rebuild the index from the latest completed blocks (F5)")
+                    .size(self.effective_font_size()),
+            )
+            .padding(6)
+            .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        // The query stays fixed even when a short window scrolls the controls,
+        // results and help together. Wrapping keeps the controls reachable
+        // below the former 280 px panel minimum, without shrinking the input.
+        let query_line = || {
+            row![
+                text("⌕").size(self.effective_font_size()),
+                text_input("Search or browse completed blocks…", &state.query)
+                    .id(BLOCK_SEARCH_INPUT_ID.clone())
+                    .on_input(Message::BlockSearchInput)
+                    .size(self.effective_font_size())
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+        };
+        let matching_actions = row![case_toggle, regex_toggle, whole_word_toggle, refresh, reset]
+            .spacing(4)
+            .align_y(iced::Alignment::Center)
+            .wrap();
+        let scope_btn = |label: &str, scope: block_mode::BlockSearchScope| {
+            button(text(label.to_string()).size(self.effective_font_size()))
+                .on_press(Message::BlockSearchSetScope(scope))
+                .padding([3, 7])
+                .style(if state.scope == scope {
+                    button::primary
+                } else {
+                    button::secondary
+                })
+        };
+        let scopes = row![
+            text("Scope").size(self.effective_font_size()),
+            scope_btn("All", block_mode::BlockSearchScope::All),
+            scope_btn("Cmd", block_mode::BlockSearchScope::Command),
+            scope_btn("Out", block_mode::BlockSearchScope::Output),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center)
+        .wrap();
+        let filter_btn = |filter: BlockSearchFilter| {
+            let index = BlockSearchFilter::ORDER
+                .iter()
+                .position(|value| *value == filter)
+                .unwrap_or(0);
+            button(
+                text(format!("{} {}", filter.label(), filter_counts[index]))
+                    .size(self.effective_font_size()),
+            )
+            .on_press(Message::BlockSearchSetFilter(filter))
+            .padding([3, 7])
+            .style(if state.filter == filter {
+                button::primary
+            } else {
+                button::secondary
+            })
+        };
+        let filters_top = row![
+            filter_btn(BlockSearchFilter::All),
+            filter_btn(BlockSearchFilter::Failed),
+            filter_btn(BlockSearchFilter::Success),
+            filter_btn(BlockSearchFilter::Slow),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center)
+        .wrap();
+        let filters_bottom = row![
+            filter_btn(BlockSearchFilter::Bookmarked),
+            filter_btn(BlockSearchFilter::Unread),
+            filter_btn(BlockSearchFilter::Background),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center)
+        .wrap();
+        let filters = column![scopes, filters_top, filters_bottom].spacing(4);
+        let can_collapse = owner.is_some_and(|sess| {
+            sess.terminal.command_zones.iter().any(|zone| {
+                !sess.projection_policy.is_collapsed(zone.id)
+                    && sess.terminal.finished_output_range(zone.id).is_some()
+            })
+        });
+        let can_expand =
+            owner.is_some_and(|sess| sess.projection_policy.collapsed_zone_ids().next().is_some());
+        let folding = row![
+            text("Completed output").size(self.effective_font_size()),
+            button(text("Collapse all").size(self.effective_font_size()))
+                .on_press_maybe(
+                    can_collapse.then_some(Message::BlockSetAllCollapsed(state.session_id, true))
+                )
+                .padding([3, 7])
+                .style(button::secondary),
+            button(text("Expand all").size(self.effective_font_size()))
+                .on_press_maybe(
+                    can_expand.then_some(Message::BlockSetAllCollapsed(state.session_id, false))
+                )
+                .padding([3, 7])
+                .style(button::secondary),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center)
+        .wrap();
+
+        // Outcome/duration for each hit's block, resolved once instead of
+        // rescanning the zone deque per drawn row.
+        let (zone_badges, bookmarked_zone_ids): (
+            std::collections::HashMap<u64, String>,
+            std::collections::HashSet<u64>,
+        ) = self
+            .sessions
+            .iter()
+            .find(|sess| sess.id == state.session_id)
+            .map(|sess| {
+                let badges = sess
+                    .terminal
+                    .command_zones
+                    .iter()
+                    .map(|zone| {
+                        let outcome = block_mode::classify(zone.command.as_deref(), zone.exit_code);
+                        let badge = block_mode::badge_text_with_lifecycle(
+                            outcome,
+                            zone.duration_ms,
+                            zone.start_mark_seen,
+                            zone.completion_provenance,
+                        )
+                        .unwrap_or_default();
+                        (zone.id, badge)
+                    })
+                    .collect();
+                let bookmarks = sess
+                    .terminal
+                    .command_zones
+                    .iter()
+                    .filter(|zone| sess.block_bookmarks.contains(zone.id))
+                    .map(|zone| zone.id)
+                    .collect();
+                (badges, bookmarks)
+            })
+            .unwrap_or_default();
+        // A pane whose shell emits no OSC 133 has nothing to search; blaming
+        // the query for that sends the user off tweaking a working filter.
+        let pane_has_blocks = !zone_badges.is_empty();
+
+        // Normal panels keep the count and controls outside the windowed hit
+        // list. Short panels have one bounded scroll area below the query, so
+        // these controls cannot consume the space needed for results or help.
+        let mut body = if compact {
+            column![]
+        } else {
+            column![query_line()]
+        }
+        .push(matching_actions)
+        .push(filters)
+        .push(
+            text(format!(
+                "Counts: retained blocks · newest first · Slow ≥ {}",
+                block_mode::format_duration(self.config.notify_long_block_threshold_ms)
+            ))
+            .size(self.effective_font_size())
+            .wrapping(text::Wrapping::Word)
+            .style(text::secondary),
+        )
+        .push(folding)
+        .spacing(8);
+        if state.busy() && state.hits.is_empty() {
+            body = body.push(
+                container(
+                    text(if state.loading || state.rebuild_pending {
+                        "Indexing blocks…"
+                    } else {
+                        "Searching blocks…"
+                    })
+                    .size(self.effective_font_size())
+                    .style(text::secondary),
+                )
+                .id(block_search_layout::FEEDBACK_ID),
+            );
+        } else if let Some(error) = &state.query_error {
+            body = body.push(
+                container(
+                    text(crate::review_text::bound_query_error(error))
+                        .size(self.effective_font_size())
+                        .style(text::danger),
+                )
+                .id(block_search_layout::FEEDBACK_ID),
+            );
+        } else if !pane_has_blocks {

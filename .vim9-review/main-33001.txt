@@ -1,0 +1,300 @@
+        assert!(update.find("self.sync_terminal_ime_owner()").unwrap() < dispatch);
+        assert!(update.rfind("self.sync_terminal_ime_owner()").unwrap() > dispatch);
+        let ime = source
+            .split_once("            Message::Ime(event) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::ModifiersChanged")
+            .unwrap()
+            .0;
+        assert!(
+            ime.find("self.terminal_ime.admit(&event)").unwrap()
+                < ime.find("sess.write_pty").unwrap()
+        );
+        let sync = source
+            .split_once("    fn sync_terminal_ime_owner(")
+            .unwrap()
+            .1
+            .split_once("    fn terminal_input_active(")
+            .unwrap()
+            .0;
+        for required in [
+            "self.focused",
+            "self.terminal_input_active()",
+            "session.ime_identity",
+            "clear_preedit",
+        ] {
+            assert!(sync.contains(required));
+        }
+        let keys = source
+            .split_once("            Message::WindowKey(id, event) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::Key(event)")
+            .unwrap()
+            .0;
+        assert!(keys.contains("native.claim_pressed()"));
+        assert!(keys.contains("native.acknowledge(id, &event)"));
+        assert!(keys.contains("if native_owned || ime_owned"));
+        assert!(
+            keys.find("native.acknowledge(id, &event)").unwrap()
+                < keys.find("native.claim_pressed()").unwrap()
+        );
+        assert!(source.contains("Some(Message::ImeCancelledCommit)"));
+        assert!(source.contains(
+            "Message::ImeCancelledCommit => self.terminal_ime.retire_cancelled_commit()"
+        ));
+    }
+
+    fn chat_card_fixture(output: &str) -> terminal::TerminalState {
+        let mut terminal = terminal::TerminalState::new(80, 20);
+        terminal.process_input(format!(
+            "\x1b]133;A\x07$ \x1b]133;B\x07printf example\r\n\x1b]133;C\x07{output}\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07draft stays"
+        ).as_bytes());
+        terminal
+    }
+
+    #[test]
+    fn chat_completed_projection_hits_copy_only_the_proven_card() {
+        let mut terminal = chat_card_fixture("first\r\nsecond\r\n");
+        let mut policy = terminal::ProjectionPolicy::new();
+        policy.set_chat(true);
+        let view = terminal.get_projected_viewport_with_policy(true, &policy, usize::MAX);
+        let id = terminal.command_zones.front().unwrap().id;
+        let mut hits = 0;
+        for (row, chat) in view.chat_rows().iter().enumerate() {
+            if let Some(hit) = chat_completed_zone_at_row(&terminal, &view, row) {
+                hits += 1;
+                assert_eq!(hit, id);
+                assert!(matches!(
+                    chat.role,
+                    chat_mode::ChatRole::Command | chat_mode::ChatRole::Output
+                ));
+                assert!(matches!(
+                    view.row_kinds()[row],
+                    terminal::ProjectedRowKind::Raw
+                ));
+                let actions = chat_read_only_menu_actions(true);
+                assert!(actions.contains(&BlockMenuAction::Details));
+                assert!(actions.contains(&BlockMenuAction::CopyOutput));
+                assert!(!actions.contains(&BlockMenuAction::ReinputSelected));
+                assert!(!actions.contains(&BlockMenuAction::CollapseOutput));
+                let output =
+                    Frost::chat_card_copy_text(&terminal, hit, BlockMenuAction::CopyOutput)
+                        .unwrap();
+                assert!(output.contains("first") && output.contains("second"));
+                assert!(!output.contains("draft stays"));
+                let details = Frost::block_details_snapshot(&terminal, 17, hit).unwrap();
+                assert_eq!(details.session_id, 17);
+                assert_eq!(details.ids, vec![hit]);
+                assert!(details.body.contains("first") && details.body.contains("second"));
+                assert!(!details.body.contains("draft stays"));
+                assert!(details.commands.is_none() && details.command_error.is_none());
+                assert!(!details.bracketed);
+            } else if !matches!(
+                chat.role,
+                chat_mode::ChatRole::Command | chat_mode::ChatRole::Output
+            ) {
+                assert_eq!(chat_completed_zone_at_row(&terminal, &view, row), None);
+            }
+        }
+        assert!(
+            hits > 0,
+            "real Chat projection must expose completed raw cells"
+        );
+        let cursor = terminal.get_cursor_pos();
+        for action in [
+            BlockMenuAction::CopyCommand,
+            BlockMenuAction::CopyBlock,
+            BlockMenuAction::CopyMarkdown,
+        ] {
+            let text = Frost::chat_card_copy_text(&terminal, id, action).unwrap();
+            assert!(text.contains("printf example"));
+            assert!(!text.contains("draft stays"));
+        }
+        assert_eq!(terminal.get_cursor_pos(), cursor);
+    }
+
+    #[test]
+    fn chat_card_actions_reject_stale_sessions_eviction_and_alt_screen() {
+        let mut terminal = chat_card_fixture("saved\r\n");
+        let other = chat_card_fixture("other session\r\n");
+        let id = terminal.command_zones.front().unwrap().id;
+        assert_eq!(other.command_zones.front().unwrap().id, id);
+        let menu = BlockMenuState {
+            session_id: 17,
+            zone_id: id,
+            anchor: iced::Point::ORIGIN,
+            focused_action: None,
+            chat_read_only: true,
+        };
+        assert!(chat_menu_target_is_current(menu, 17, true, false, true));
+        for (session, chat, alt, retained) in [
+            (18, true, false, true),
+            (17, false, false, true),
+            (17, true, true, true),
+            (17, true, false, false),
+        ] {
+            assert!(!chat_menu_target_is_current(
+                menu, session, chat, alt, retained
+            ));
+        }
+        terminal.command_zones.front_mut().unwrap().rows_evicted = true;
+        assert!(Frost::chat_card_copy_text(&terminal, id, BlockMenuAction::CopyOutput).is_err());
+        let mut policy = terminal::ProjectionPolicy::new();
+        policy.set_chat(true);
+        let view = terminal.get_projected_viewport_with_policy(true, &policy, usize::MAX);
+        assert!((0..view.chat_rows().len())
+            .all(|row| chat_completed_zone_at_row(&terminal, &view, row).is_none()));
+        terminal.clear_completed_blocks();
+        assert!(Frost::chat_card_copy_text(&terminal, id, BlockMenuAction::CopyCommand).is_err());
+    }
+
+    #[test]
+    fn chat_empty_output_does_not_copy_live_draft_or_execute() {
+        let terminal = chat_card_fixture("");
+        let id = terminal.command_zones.front().unwrap().id;
+        assert_eq!(
+            Frost::chat_card_copy_text(&terminal, id, BlockMenuAction::CopyOutput),
+            Err(block_mode::SelectedClipboardError::Empty)
+        );
+        assert!(
+            Frost::chat_card_copy_text(&terminal, id, BlockMenuAction::ReinputSelected).is_err()
+        );
+        assert!(!chat_read_only_menu_actions(false).contains(&BlockMenuAction::CopyCommand));
+    }
+
+    #[test]
+    fn chat_read_only_dispatch_and_details_never_insert_into_prompt() {
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let dispatch = source
+            .split_once("    fn execute_chat_read_only_menu_action(")
+            .unwrap()
+            .1
+            .split_once("    /// Attach one stable")
+            .unwrap()
+            .0;
+        assert!(dispatch.contains("chat_menu_target_is_current("));
+        assert!(dispatch.contains("allowed.contains(&action)"));
+        assert!(dispatch.contains("self.open_block_review(Some(menu.zone_id))"));
+        for forbidden in [
+            "write_pty",
+            "insert_command",
+            "reinput_selected",
+            "block_ask_ai",
+        ] {
+            assert!(!dispatch.contains(forbidden));
+        }
+        let details = source
+            .split_once("    fn block_details_snapshot(")
+            .unwrap()
+            .1
+            .split_once("    fn block_reinput_selected_commands_task")
+            .unwrap()
+            .0;
+        assert!(details.contains("commands: None"));
+        assert!(details.contains("bracketed: false"));
+        assert!(!details.contains("write_pty"));
+        let execute = source
+            .split_once("    fn execute_block_menu_action(")
+            .unwrap()
+            .1
+            .split_once("    fn chat_card_copy_text(")
+            .unwrap()
+            .0;
+        assert!(
+            execute.find("BlockMenuAction::Close").unwrap()
+                < execute.find("menu.chat_read_only").unwrap()
+        );
+    }
+    #[test]
+    fn chat_running_controls_share_visible_timer_and_validate_generation() {
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let status = source
+            .split_once("    fn chat_running_status(&self)")
+            .unwrap()
+            .1
+            .split_once("    /// The top bar doubles")
+            .unwrap()
+            .0;
+        assert!(status.contains("ChatSurface::Running"));
+        assert!(status.contains("contains_session(self.active)"));
+        assert!(status.contains("watch_generation()?"));
+        let handler = source
+            .split_once(
+                "            Message::ChatInterrupt(token) | Message::ChatSubmit(token) => {",
+            )
+            .unwrap()
+            .1
+            .split_once("            Message::SetTerminalMode")
+            .unwrap()
+            .0;
+        assert!(handler.contains("self.chat_input_ready(token.session)"));
+        assert!(handler.contains("session.id == token.session"));
+        assert!(
+            handler.find("if !sess.try_chat_control").unwrap()
+                < handler.find("self.organism.accepted_input()").unwrap()
+        );
+        assert!(!handler.contains("write_pty"));
+        let admission = source
+            .split_once("    fn try_chat_control(")
+            .unwrap()
+            .1
+            .split_once("    /// Queue data in-order")
+            .unwrap()
+            .0;
+        for gate in [
+            "chat_mode::control_enabled",
+            "self.pty.is_alive()",
+            "self.chat_control_token",
+            "chat_mode::admit_control",
+            "self.pty.write(byte)",
+            "if accepted",
+        ] {
+            assert!(admission.contains(gate), "missing writer gate {gate}");
+        }
+        assert!(!admission.contains("flush_write_queue"));
+        assert!(!admission.contains("push_queue"));
+        let owner = source
+            .split_once("    fn chat_control_token(")
+            .unwrap()
+            .1
+            .split_once("    fn enabled_chat_control(")
+            .unwrap()
+            .0;
+        for gate in [
+            "ChatSurface::Prompt",
+            "ChatSurface::Running",
+            "self.terminal.watch_generation()?",
+            "tty_foreground_pgid(self.master_fd)?",
+            "self.pty.get_child_pid()",
+        ] {
+            assert!(owner.contains(gate), "missing action ownership {gate}");
+        }
+        assert!(source.contains("chat_mode::press_control("));
+        assert!(source.contains("token.map(Message::ChatInterrupt)"));
+        let visibility = source
+            .split_once("        let native_visible =")
+            .unwrap()
+            .1
+            .split_once("        let live_visible")
+            .unwrap()
+            .0;
+        assert!(visibility.contains("!self.config.is_card_mode()"));
+        assert!(!visibility.contains("self.config.is_chat_mode()"));
+        assert!(visibility.contains("row.status_line.is_some()"));
+        let bytes = encode_key(
+            &keyboard::Key::Character("c".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::CTRL,
+            None,
+            false,
+            KeyboardEnhancements::default(),
+        )
+        .unwrap();

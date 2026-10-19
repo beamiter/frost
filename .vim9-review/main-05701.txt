@@ -1,0 +1,300 @@
+
+    /// Pane-header title. Same preference order as [`Session::label`], minus
+    /// the foreground process: the header shows that in its own field, and
+    /// repeating it there would crowd out the directory.
+    fn pane_title(&self) -> String {
+        let title = self.terminal.window_title.trim();
+        let title = if !title.is_empty() {
+            title.to_string()
+        } else {
+            self.cwd_cache
+                .as_deref()
+                .and_then(Self::cwd_basename)
+                .unwrap_or_else(|| format!("Session {}", self.id + 1))
+        };
+        session_persistence::bound_tab_title_draft(title)
+    }
+
+    /// Full working directory for the pane header, with `$HOME` collapsed to
+    /// `~`. `None` while the cwd is unknown.
+    fn cwd_display(&self) -> Option<String> {
+        let cwd = self.cwd_cache.as_deref()?;
+        let Some(home) = std::env::var_os("HOME") else {
+            return Some(session_persistence::bound_tab_title_draft(cwd));
+        };
+        let home = home.to_string_lossy();
+        if home.is_empty() {
+            return Some(session_persistence::bound_tab_title_draft(cwd));
+        }
+        if cwd == home {
+            return Some("~".to_string());
+        }
+        // Only substitute at a component boundary: `/home/user2` merely shares
+        // a prefix with `/home/user` and is a different directory.
+        match cwd.strip_prefix(home.as_ref()) {
+            Some(rest) if rest.starts_with('/') => Some(
+                session_persistence::bound_tab_title_draft(format!("~{rest}")),
+            ),
+            _ => Some(session_persistence::bound_tab_title_draft(cwd)),
+        }
+    }
+
+    /// Git metadata for the pane header and bottom bar, probed through the
+    /// coalesced background worker in `jterm_core::git_meta` (bounded UI wait,
+    /// git runs off-thread). Callers cache the result; None outside a
+    /// repository or while `cwd_cache` is unknown.
+    fn git_meta(&self) -> Option<jterm_core::git_meta::RepoMeta> {
+        let cwd = self.cwd_cache.as_deref()?;
+        jterm_core::git_meta::read(std::path::Path::new(cwd))
+    }
+
+    /// Short, human-friendly form of an absolute cwd: "~" for $HOME, just the
+    /// basename otherwise. Returns None for "/" or unparsable paths.
+    fn cwd_basename(cwd: &str) -> Option<String> {
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = home.to_string_lossy();
+            if cwd == home {
+                return Some("~".to_string());
+            }
+        }
+        let p = std::path::Path::new(cwd);
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+
+    /// Foreground process name on the PTY, or None when it's the shell itself
+    /// (so the tab label doesn't redundantly show "bash" / "zsh" / "fish").
+    fn fg_proc(&self) -> Option<String> {
+        let pgid = jterm_core::process::tty_foreground_pgid(self.master_fd)?;
+        // Hide when the foreground process *is* the shell — that's the idle case.
+        if pgid == self.pty.get_child_pid() {
+            return None;
+        }
+        let comm = jterm_core::process::process_comm(pgid)?;
+        // App policy: also hide other interactive shells so the tab label never
+        // redundantly shows a shell name (e.g. a nested `zsh` under bash).
+        const SHELLS: &[&str] = &["bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh"];
+        if SHELLS.contains(&comm.as_str()) {
+            return None;
+        }
+        crate::review_text::bound_foreground_process_name(comm)
+    }
+
+    fn observed_ssh_command(&self) -> Option<jterm_core::process::ObservedSshCommand> {
+        jterm_core::process::observed_ssh_command(self.master_fd, self.pty.get_child_pid())
+    }
+
+    /// Agent approval requires both a trusted terminal-state boundary and the
+    /// interactive shell itself owning the foreground process group. OSC 133
+    /// emitted by a running editor/test process must not make that process the
+    /// recipient of an approved shell command.
+    fn agent_prompt_status(&mut self) -> terminal::AgentPromptStatus {
+        let status = self.terminal.agent_prompt_status();
+        if !status.is_ready() {
+            return status;
+        }
+        if !self.pty.is_alive() {
+            return terminal::AgentPromptStatus::ShellIntegrationUnavailable;
+        }
+        agent_prompt_status_with_foreground(
+            status,
+            self.pty.get_child_pid(),
+            jterm_core::process::tty_foreground_pgid(self.master_fd),
+        )
+    }
+
+    fn refresh(&mut self) {
+        if self.block_selection.is_empty() {
+            self.projection_view_state.release_reading_position();
+        }
+        // The identity/P0 hot path must not allocate or scan every retained
+        // zone on each PTY batch. Reconcile only after a transform exists.
+        if !self.projection_policy.is_identity() {
+            let stale_collapses: Vec<u64> = self
+                .projection_policy
+                .collapsed_zone_ids()
+                .filter(|id| {
+                    self.terminal
+                        .zone_by_id(*id)
+                        .is_none_or(|zone| zone.rows_evicted)
+                })
+                .collect();
+            for id in stale_collapses {
+                self.projection_policy.expand(id);
+            }
+        }
+        self.projection = self.terminal.get_projected_viewport_with_state(
+            self.projection_block_mode,
+            &self.projection_policy,
+            &mut self.projection_view_state,
+        );
+        if self.projection.is_identity() {
+            debug_assert_eq!(
+                self.projection.uses_identity_fast_path(),
+                self.terminal.scroll_offset == 0
+            );
+        }
+        if let Some(id) = self.block_selection.active() {
+            if self.projection_block_mode && !self.terminal.is_alt_buffer_active() {
+                self.projection_view_state
+                    .hold_reading_position(&self.projection);
+            }
+            self.block_reading.visit(id);
+        }
+        if self.projection.scroll_offset() == 0
+            && self.block_selection.is_empty()
+            && !self.terminal.is_alt_buffer_active()
+        {
+            self.block_reading.seen_through = self.terminal.command_zones.back().map(|z| z.id);
+        }
+        let raw_cursor = self.terminal.get_cursor_pos();
+        if self.projection.mode() == terminal::ProjectionMode::Transformed {
+            let absolute_row = self.terminal.scrollback_len().saturating_add(raw_cursor.0);
+            let mapped = self
+                .terminal
+                .raw_cell_origin_at_absolute(absolute_row, raw_cursor.1)
+                .and_then(|origin| self.projection.raw_to_view(origin));
+            self.cursor = mapped
+                .map(|cell| (cell.row, cell.col))
+                .unwrap_or(raw_cursor);
+            self.cursor_visible = self
+                .terminal
+                .is_mapped_cursor_visible(&self.projection, mapped.is_some());
+        } else {
+            self.cursor = raw_cursor;
+            self.cursor_visible = self.terminal.is_cursor_visible();
+        }
+    }
+
+    fn scroll(&mut self, lines: isize) {
+        self.projection_view_state.release_reading_position();
+        if self.projection.mode() == terminal::ProjectionMode::Transformed {
+            self.projection_view_state.scroll(lines, &self.projection);
+        } else {
+            self.terminal.scroll(lines);
+        }
+        self.refresh();
+    }
+
+    fn set_scroll_offset(&mut self, offset: usize) {
+        self.projection_view_state.release_reading_position();
+        if self.projection.mode() == terminal::ProjectionMode::Transformed {
+            self.projection_view_state
+                .set_offset(offset, &self.projection);
+        } else {
+            self.terminal.set_scroll_offset(offset);
+        }
+        self.refresh();
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.terminal.scroll_to_bottom();
+        self.projection_view_state.scroll_to_bottom();
+        self.refresh();
+    }
+
+    /// Navigate OSC 133 prompt boundaries in the currently displayed
+    /// document. Transformed history owns a projected offset, so its prompt
+    /// jumps reveal stable raw headers instead of mutating the dormant legacy
+    /// scroll offset.
+    fn jump_prompt(&mut self, older: bool) -> bool {
+        if self.projection.mode() != terminal::ProjectionMode::Transformed {
+            let moved = if older {
+                self.terminal.jump_to_prev_prompt()
+            } else {
+                self.terminal.jump_to_next_prompt()
+            };
+            if moved {
+                self.refresh();
+            }
+            return moved;
+        }
+
+        let top = self
+            .projection
+            .row_kinds()
+            .iter()
+            .enumerate()
+            .skip(self.projection.top_padding())
+            .find_map(|(row, kind)| match kind {
+                terminal::ProjectedRowKind::Raw => self.projection.view_row_absolute(row),
+                terminal::ProjectedRowKind::CollapsedSummary { key, .. } => self
+                    .terminal
+                    .zone_by_id(key.zone_id)
+                    .and_then(|zone| zone.output_start)
+                    .or_else(|| {
+                        self.terminal
+                            .zone_by_id(key.zone_id)
+                            .map(|zone| zone.prompt_start)
+                    }),
+                terminal::ProjectedRowKind::Padding
+                | terminal::ProjectedRowKind::BlockSpacer { .. }
+                | terminal::ProjectedRowKind::BlockChrome { .. } => None,
+            })
+            .unwrap_or_else(|| self.terminal.scrollback_len());
+        let active_prompt = self
+            .terminal
+            .running_zone_start()
+            .or(self.terminal.live_prompt_row());
+        let target = prompt_jump_target(
+            self.terminal
+                .command_zones
+                .iter()
+                .filter(|zone| !zone.rows_evicted)
+                .map(|zone| zone.prompt_start)
+                .chain(active_prompt),
+            top,
+            older,
+        );
+
+        match target {
+            Some(row) => {
+                let Some(origin) = self.terminal.raw_cell_origin_at_absolute(row, 0) else {
+                    return false;
+                };
+                let moved = self.terminal.reveal_raw_cell_in_projection(
+                    &self.projection_policy,
+                    &mut self.projection_view_state,
+                    origin,
+                );
+                if moved {
+                    self.refresh();
+                }
+                moved
+            }
+            None if !older && self.projection.scroll_offset() > 0 => {
+                self.scroll_to_bottom();
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn reveal_absolute_cell(&mut self, absolute_row: usize, col: usize) -> bool {
+        self.projection_view_state.release_reading_position();
+        let Some(origin) = self.terminal.raw_cell_origin_at_absolute(absolute_row, col) else {
+            return false;
+        };
+        match self
+            .terminal
+            .locate_raw_cell_in_projection(&self.projection, origin)
+        {
+            terminal::ProjectedRawCellLocation::Visible(_) => true,
+            terminal::ProjectedRawCellLocation::Retained => {
+                let revealed = self.terminal.reveal_raw_cell_in_projection(
+                    &self.projection_policy,
+                    &mut self.projection_view_state,
+                    origin,
+                );
+                if revealed {
+                    self.refresh();
+                }
+                revealed
+            }
+            terminal::ProjectedRawCellLocation::Hidden { .. }
+            | terminal::ProjectedRawCellLocation::Unmapped => false,
+        }
+    }
+

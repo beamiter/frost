@@ -1,0 +1,300 @@
+static HISTORY_PICKER_LIST_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-history-picker-list"));
+static WORKFLOW_PICKER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-workflow-picker-input"));
+/// The first argument input of the workflow form; Tab/Shift+Tab traverse the
+/// remaining fields from here.
+static WORKFLOW_ARG_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-workflow-arg-input"));
+/// Hit rows the picker builds widgets for at once. Comfortably larger than
+/// the panel's visible area so the wheel and drag scrollbar still work inside
+/// the page; the page only shifts when the highlight leaves it.
+const BLOCK_SEARCH_VISIBLE_ROWS: usize = 48;
+const BLOCK_SEARCH_PAGE_STEP: usize = 10;
+
+static BLOCK_SEARCH_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-block-search-input"));
+static BLOCK_SEARCH_LIST_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-block-search-list"));
+static TAB_RENAME_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-tab-rename-input"));
+static SIDEBAR_DIALOG_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-sidebar-dialog-input"));
+static SIDEBAR_FILTER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-sidebar-filter-input"));
+static SIDEBAR_PATH_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-sidebar-path-input"));
+static SIDEBAR_TREE_SCROLL_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-sidebar-tree-scroll"));
+static SEARCH_REPLACE_FIND_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-search-replace-find"));
+static CORRECTION_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-correction-input"));
+static AI_CHATS_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-ai-chats-input"));
+static AI_CHATS_SEARCH_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-ai-chats-search"));
+static AI_ASK_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-ai-ask-input"));
+static AI_SUGGESTION_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-ai-suggestion-input"));
+
+/// Toast kind drives the accent color of the floating notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToastKind {
+    Info,
+    Success,
+    Warning,
+}
+
+/// Transient bottom-right notification. `expires_at` is absolute monotonic time.
+#[derive(Debug, Clone)]
+struct Toast {
+    text: String,
+    kind: ToastKind,
+    expires_at: std::time::Instant,
+}
+
+/// A pane-header press that may turn into a rearrange drag.
+///
+/// The source is held by stable session id rather than index: a background
+/// session can exit mid-drag, which shifts every later index and would
+/// otherwise make the release swap two unrelated panes.
+///
+/// A press that never leaves its own pane simply focuses it, exactly like
+/// clicking into the terminal; only a release over a *different* pane swaps.
+#[derive(Debug, Clone)]
+struct PaneDrag {
+    session_id: usize,
+    /// Stable session id the pointer is currently over, when it differs from
+    /// the source. `None` means releasing in the pane area would do nothing.
+    target: Option<usize>,
+}
+
+/// A validated directional target shown while an ordinary tab is dragged over
+/// the visible pane tree. Both identities survive session-vector reindexing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TabSplitDrop {
+    target_session_id: usize,
+    direction: PaneDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabDragReleaseAction {
+    Activate(usize),
+    Reorder { from: usize, to: usize },
+    RestoreOrigin,
+}
+
+fn tab_drag_release_action(
+    source: Option<usize>,
+    target: Option<usize>,
+    moved: bool,
+) -> TabDragReleaseAction {
+    match (source, target) {
+        (Some(from), Some(to)) if from != to => TabDragReleaseAction::Reorder { from, to },
+        (Some(tab), Some(_)) if !moved => TabDragReleaseAction::Activate(tab),
+        _ => TabDragReleaseAction::RestoreOrigin,
+    }
+}
+
+fn tab_drag_hover_left_source(source: Option<usize>, hovered: Option<usize>) -> bool {
+    source.is_some_and(|source| hovered != Some(source))
+}
+
+fn tab_split_commit_allowed(
+    source_tab: Option<usize>,
+    source_is_plain: bool,
+    active_tab: usize,
+    target_tab: Option<usize>,
+    target_pane_count: usize,
+    zoomed: bool,
+) -> bool {
+    source_is_plain
+        && source_tab.is_some_and(|source| source != active_tab)
+        && target_tab == Some(active_tab)
+        && target_pane_count < MAX_PANES
+        && !zoomed
+}
+
+/// A tab and the panes it owns.
+///
+/// Tabs own their panes: splitting only touches the active tab's tree, so it
+/// never adds a row to the tab bar, and closing a tab closes every session in
+/// it. Previously one global tree held every session while the tab bar showed
+/// one tab per session — a pane and a tab were the same object seen from two
+/// places, so a split spawned a tab and clicking a tab reached into a split to
+/// swap that session into the focused pane.
+struct Tab {
+    /// Stable identity for UI events. Tab-bar gestures (drag, close, context
+    /// menu) must survive index shifts *and* focus moving between this tab's
+    /// panes, so they cannot key off a session id.
+    id: usize,
+    /// tmux-style recursive pane layout. `Leaf(s)` when this tab has one pane.
+    tree: PaneTree,
+    /// Session shown by the pane holding keyboard focus in this tab. The tab's
+    /// label and the focus restored when the tab is activated both read this.
+    focus: usize,
+    /// Title set from the context menu's Rename. `None` falls back to the
+    /// focused session's own label, so a renamed tab keeps its name while an
+    /// untouched one keeps following the shell.
+    title: Option<String>,
+    /// Pinned tabs sort to the front of the strip and stay there.
+    pinned: bool,
+    /// Marking is this family's multi-select model: "Close Marked Tabs" acts
+    /// on exactly the marked set.
+    marked: bool,
+    /// Redact the tab's real title everywhere outside its terminal content.
+    private_title: bool,
+}
+
+impl Tab {
+    fn new(id: usize, session: usize) -> Self {
+        Tab {
+            id,
+            tree: PaneTree::Leaf(session),
+            focus: session,
+            title: None,
+            pinned: false,
+            marked: false,
+            private_title: false,
+        }
+    }
+
+    fn sessions(&self) -> Vec<usize> {
+        self.tree.leaves()
+    }
+
+    fn contains(&self, session: usize) -> bool {
+        self.tree.contains_session(session)
+    }
+
+    /// Keep `focus` pointing at a pane this tab still owns.
+    fn repair_focus(&mut self) {
+        if !self.tree.contains_session(self.focus) {
+            if let Some(&first) = self.tree.leaves().first() {
+                self.focus = first;
+            }
+        }
+    }
+}
+
+/// One tab as it came out of a snapshot: the pane tree plus the per-tab state
+/// that rides along with it. The caller validates every index before any of
+/// this becomes a live [`Tab`].
+struct RestoredTab {
+    tree: PaneTree,
+    focus: Option<usize>,
+    title: Option<String>,
+    pinned: bool,
+    marked: bool,
+    private_title: bool,
+}
+
+impl RestoredTab {
+    /// A tab recovered from a layout that carries no per-tab state (the v1
+    /// single-tree snapshots, and the tests).
+    fn plain(tree: PaneTree, focus: Option<usize>) -> Self {
+        RestoredTab {
+            tree,
+            focus,
+            title: None,
+            pinned: false,
+            marked: false,
+            private_title: false,
+        }
+    }
+}
+
+/// Stable-partition `tabs` so pinned ones lead, and report where the tab at
+/// `active` ended up. Mirrors anvil's `reorder_pinned_first`: relative order
+/// inside the pinned and unpinned groups is preserved, and the active tab
+/// stays active — pinning a tab must never switch which session is on screen.
+fn sort_pinned_first(tabs: &mut [Tab], active: usize) -> usize {
+    let active_id = tabs.get(active).map(|tab| tab.id);
+    tabs.sort_by_key(|tab| !tab.pinned);
+    active_id
+        .and_then(|id| tabs.iter().position(|tab| tab.id == id))
+        .unwrap_or(active)
+}
+
+/// Reorder one tab without ever crossing the pinned/unpinned boundary. `to`
+/// keeps the existing strip semantics (dropping on a later tab places the
+/// source after it), while the returned index follows the previously active
+/// tab by identity.
+fn reorder_tabs_preserving_pinned_prefix(
+    tabs: &mut Vec<Tab>,
+    active: usize,
+    from: usize,
+    to: usize,
+) -> Option<usize> {
+    if from >= tabs.len() || to >= tabs.len() || from == to {
+        return None;
+    }
+    let moved = tabs.remove(from);
+    let pinned_boundary = tabs.iter().take_while(|tab| tab.pinned).count();
+    let requested = to.min(tabs.len());
+    let insert_at = if moved.pinned {
+        requested.min(pinned_boundary)
+    } else {
+        requested.max(pinned_boundary)
+    };
+    tabs.insert(insert_at, moved);
+    Some(match active {
+        index if index == from => insert_at,
+        index if from < insert_at && index > from && index <= insert_at => index - 1,
+        index if insert_at < from && index >= insert_at && index < from => index + 1,
+        index => index,
+    })
+}
+
+/// New tabs are unpinned and therefore belong after the complete pinned
+/// prefix, even when the active tab sits inside that prefix.
+fn new_unpinned_tab_index(tabs: &[Tab], active: usize) -> usize {
+    let first_unpinned = tabs
+        .iter()
+        .position(|tab| !tab.pinned)
+        .unwrap_or(tabs.len());
+    active.saturating_add(1).max(first_unpinned).min(tabs.len())
+}
+
+/// What a confirmed close should actually tear down. Closing a tab takes every
+/// pane in it, so the confirmation has to remember which of the two was asked
+/// for rather than always closing the one busy session it named.
+#[derive(Debug, Clone, Copy)]
+enum PendingClose {
+    /// Close this one session (one pane), then optionally activate another tab.
+    Session { activate_after: Option<usize> },
+    /// Close the whole tab that owns the named session.
+    Tab,
+}
+
+/// Startup-only repair facts survive fallback, successful terminal actions and
+/// dismissal. This is separate from transient spawn diagnostics and never gates
+/// input or font zoom. Dismissal changes visibility, not preservation or saving.
+#[derive(Clone, Copy, Debug, Default)]
+struct StartupRecovery {
+    report: session_persistence::RecoveryReport,
+    preservation: session_persistence::PreservationOutcome,
+    dismissed: bool,
+}
+
+impl StartupRecovery {
+    fn new(
+        report: session_persistence::RecoveryReport,
+        preservation: session_persistence::PreservationOutcome,
+    ) -> Self {
+        Self {
+            report,
+            preservation,
+            dismissed: false,
+        }
+    }
+
+    fn visible(&self) -> bool {
+        !self.dismissed && !self.report.is_empty()
+    }
+
+    fn dismiss(&mut self) {
+        self.dismissed = true;
+    }

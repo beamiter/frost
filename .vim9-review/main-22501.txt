@@ -1,0 +1,300 @@
+        session_id: usize,
+        id: u64,
+    ) -> Option<BlockReview> {
+        let zone = terminal.zone_by_id(id)?;
+        let status = block_mode::badge_text_with_lifecycle(
+            block_mode::classify(zone.command.as_deref(), zone.exit_code),
+            zone.duration_ms,
+            zone.start_mark_seen,
+            zone.completion_provenance,
+        )
+        .unwrap_or_else(|| "Background output".into());
+        let status = if zone.command_truncated
+            && zone
+                .command
+                .as_deref()
+                .is_none_or(|command| command.trim().is_empty())
+        {
+            "Command unavailable; completion metadata retained".to_string()
+        } else {
+            status
+        };
+        let body = format!(
+            "Command\n{}\n\nWorking directory\n{}\n\nResult\n{}\nDuration: {}\nFinished (Unix ms): {}\n\nProvenance\n{}\nCommand: {}{}\nRows: {}\nOutput source: {}\n\nOutput (text preview; images remain in the terminal)\n{}",
+            block_review::preview(zone.command.as_deref().unwrap_or(if zone.command_truncated { "Command unavailable" } else { "No command: background output" }), 65536),
+            block_review::preview(zone.cwd.as_deref().unwrap_or("Not reported"), 8192), status,
+            zone.duration_ms.map(|ms| format!("{ms} ms")).unwrap_or_else(|| "Not reported".into()),
+            zone.finished_at_ms.map(|ms| ms.to_string()).unwrap_or_else(|| "Not reported".into()),
+            block_mode::lifecycle_detail(zone.start_mark_seen, zone.completion_provenance),
+            if zone.command_exact { "Exact shell metadata" } else { "Reconstructed / not exact" },
+            if zone.command_truncated { "; TRUNCATED or unavailable, cannot recall" } else { "" },
+            if zone.rows_evicted { "Evicted; retained snapshot may still be available" } else { "Retained" },
+            if zone.captured_output.is_some() { "Finalization snapshot" } else if zone.captured_output_evicted { "Snapshot evicted; live rows used only if retained" } else { "Live retained rows / no text capture" },
+            match terminal.zone_output_export_capped(id) {
+                Some(terminal::ZoneOutputExport::Available { text, truncated }) => format!("Capture: {}\nPreview: {}\n\n{}", if truncated { "TRUNCATED by terminal budget" } else { "Available retained text" }, if text.len() > 65536 { "Clipped to 64 KiB; copy/export retains the available capture" } else { "Retained text shown below" }, block_review::preview(&text, 65536)),
+                Some(terminal::ZoneOutputExport::Unavailable) => "Unavailable: captured output was evicted".into(),
+                _ => "No non-blank text output captured".into(),
+            }
+        );
+        Some(BlockReview {
+            session_id,
+            ids: vec![id],
+            title: format!("Block #{id} · details"),
+            body,
+            commands: None,
+            command_error: None,
+            bracketed: false,
+            comparison: None,
+        })
+    }
+
+    fn open_block_review(&mut self, target: Option<u64>) -> Task<Message> {
+        let chat_details = self.config.is_chat_mode() && target.is_some();
+        if !chat_details && !self.ensure_block_action_available("Block details") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+        if sess.terminal.is_alt_buffer_active() {
+            return Task::none();
+        }
+        let id = target
+            .or(sess.block_selection.active())
+            .or_else(|| sess.terminal.command_zones.back().map(|z| z.id));
+        let Some(zone) = id.and_then(|id| sess.terminal.zone_by_id(id)) else {
+            self.push_toast("No retained block to review", ToastKind::Info);
+            return Task::none();
+        };
+        let id = zone.id;
+        let review = Self::block_details_snapshot(&sess.terminal, sess.id, id);
+        sess.block_selection.replace(Some(id));
+        sess.projection_view_state
+            .hold_reading_position(&sess.projection);
+        sess.block_reading.visit(id);
+        self.block_review = review;
+        Task::none()
+    }
+
+    fn block_reinput_selected_commands_task(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Review commands") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let commands = block_mode::selected_commands(
+            sess.terminal
+                .command_zones
+                .iter()
+                .map(|z| (z.id, z.command.as_deref(), z.command_truncated)),
+            &sess.block_selection,
+            crate::review_text::MAX_PROMPT_INSERT_BYTES,
+        );
+        if sess.block_selection.is_empty() {
+            self.push_toast(
+                "Select at least one retained block to review",
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
+        // Inspection is independent of whether any command can safely leave
+        // this surface. Never make an incomplete batch look like a partial success.
+        let (commands, command_error) = match commands {
+            Ok(commands) if sess.block_selection.len() <= 128 => (Some(commands), None),
+            result => (None, Some(match result {
+                Err(block_mode::SelectedCommandsError::Empty) => "No command text in this selection; background output can still be inspected.",
+                Err(block_mode::SelectedCommandsError::Truncated) => "A selected command is truncated or unavailable. Copy and Insert refuse the entire selection.",
+                Err(block_mode::SelectedCommandsError::Unsafe) => "A selected command contains unsafe controls or visual-spoofing characters. Copy and Insert refuse the entire selection.",
+                _ => "Selection exceeds the safe review budget. Copy and Insert refuse the entire selection; select fewer blocks.",
+            }.to_string())),
+        };
+        let bracketed = sess.terminal.is_bracketed_paste_enabled();
+        let ids = sess
+            .terminal
+            .command_zones
+            .iter()
+            .filter(|z| sess.block_selection.contains(z.id))
+            .map(|z| z.id)
+            .collect::<Vec<_>>();
+        let mut sources = String::new();
+        for zone in sess
+            .terminal
+            .command_zones
+            .iter()
+            .filter(|z| sess.block_selection.contains(z.id))
+        {
+            if sources.len() >= 8192 {
+                sources.push_str(
+                    "\n[Further source metadata omitted; all safe commands remain below]",
+                );
+                break;
+            }
+            sources.push_str(&format!(
+                "#{} · exit {} · cwd {}\n",
+                zone.id,
+                zone.exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                block_review::preview(zone.cwd.as_deref().unwrap_or("not reported"), 256)
+            ));
+        }
+        let mut preview = String::new();
+        for zone in sess
+            .terminal
+            .command_zones
+            .iter()
+            .filter(|z| ids.contains(&z.id))
+            .take(128)
+        {
+            if preview.len() >= 65536 {
+                preview.push_str("\n[Selection preview clipped]");
+                break;
+            }
+            preview.push_str(&format!(
+                "#{}{}\n{}\n\n",
+                zone.id,
+                if zone.command_truncated {
+                    " · TRUNCATED / unavailable"
+                } else {
+                    ""
+                },
+                block_review::preview(
+                    zone.command
+                        .as_deref()
+                        .unwrap_or("No retained command text"),
+                    65536usize.saturating_sub(preview.len())
+                )
+            ));
+        }
+        let body = format!("{} selected block(s), in terminal order.{}\n{}\nInsertion uses the current prompt folder; it does not change to the original folders shown below.\n\nSources\n{}\nCommands (safe display)\n{}",
+            sess.block_selection.len(), if sess.block_selection.len() > 128 { " Only the first 128 are shown." } else { "" },
+            if bracketed { "Insert places commands in the editable prompt. It does not run them." }
+            else { "Bracketed paste is disabled: ONLY THE FIRST LOGICAL LINE will be inserted. Nothing is run." },
+            sources, preview);
+        self.block_review = Some(BlockReview {
+            session_id: sess.id,
+            ids,
+            title: "Review selected commands".into(),
+            body,
+            commands: commands.map(|commands| commands.text),
+            command_error,
+            bracketed,
+            comparison: None,
+        });
+        Task::none()
+    }
+
+    /// Clipboard and prompt admission resolve current retained IDs and raw text,
+    /// not the escaped review display. Copy deliberately ignores prompt state.
+    fn block_review_is_current(&self, review: &BlockReview, insertion: bool) -> bool {
+        self.sessions.get(self.active).is_some_and(|sess| {
+            if !self.config.is_block_mode()
+                || sess.terminal.is_alt_buffer_active()
+                || sess.id != review.session_id
+                || (insertion && sess.terminal.is_bracketed_paste_enabled() != review.bracketed)
+            {
+                return false;
+            }
+            let ids = sess
+                .terminal
+                .command_zones
+                .iter()
+                .filter(|z| sess.block_selection.contains(z.id))
+                .map(|z| z.id)
+                .collect::<Vec<_>>();
+            let commands = block_mode::selected_commands(
+                sess.terminal
+                    .command_zones
+                    .iter()
+                    .map(|z| (z.id, z.command.as_deref(), z.command_truncated)),
+                &sess.block_selection,
+                crate::review_text::MAX_PROMPT_INSERT_BYTES,
+            );
+            commands.ok().is_some_and(|commands| {
+                if insertion {
+                    review.matches_selection(
+                        sess.id,
+                        &ids,
+                        &commands.text,
+                        sess.terminal.is_bracketed_paste_enabled(),
+                    )
+                } else {
+                    review.matches_commands(sess.id, &ids, &commands.text)
+                }
+            })
+        })
+    }
+
+    fn copy_block_review(&mut self) -> Task<Message> {
+        let Some(review) = self.block_review.as_ref() else {
+            return Task::none();
+        };
+        if !self.block_review_is_current(review, false) {
+            self.push_toast(
+                "Selection changed or cannot be copied safely. Review it again.",
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        let commands = review.commands.clone().expect("validated command payload");
+        self.push_toast(
+            "Selected commands copied. Nothing was sent to the terminal.",
+            ToastKind::Info,
+        );
+        iced::clipboard::write(commands)
+    }
+
+    fn confirm_block_review(&mut self) -> Task<Message> {
+        let Some(review) = self.block_review.take() else {
+            return Task::none();
+        };
+        self.native_enter_ownership.lock().claim_pressed();
+        self.prompt_recall_enter_latch.begin_recall();
+        if !self.block_review_is_current(&review, true) {
+            self.push_toast(
+                "Review changed or expired. Review the selection again before inserting.",
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        self.insert_reviewed_block_commands()
+    }
+
+    fn block_review_view<'a>(&'a self, review: &'a BlockReview) -> Element<'a, Message> {
+        let live = self.sessions.get(self.active).is_some_and(|sess| {
+            sess.id == review.session_id
+                && !sess.terminal.is_alt_buffer_active()
+                && (self.config.is_block_mode()
+                    || (self.config.is_chat_mode() && review.commands.is_none()))
+                && review
+                    .ids
+                    .iter()
+                    .all(|id| sess.terminal.zone_by_id(*id).is_some())
+        });
+        // View construction is an immutable snapshot. Rebuild/validate the
+        // full selected payload once, then derive the paste-mode distinction.
+        // Copy/Insert still revalidate again when their messages are handled.
+        let valid_commands =
+            review.commands.is_some() && self.block_review_is_current(review, false);
+        let valid_insertion = valid_commands
+            && self
+                .sessions
+                .get(self.active)
+                .is_some_and(|sess| sess.terminal.is_bracketed_paste_enabled() == review.bracketed);
+        let mut actions = row![button(text("Close · Esc").size(self.effective_font_size()))
+            .on_press(Message::BlockReviewClose)
+            .style(self.ghost_btn_style())]
+        .spacing(8);
+        let current_sources = self.block_review_sources_current(review);
+        if review.comparison.is_some() {
+            actions = actions.push(
+                button(text("Copy comparison").size(self.effective_font_size())).on_press_maybe(
+                    review
+                        .comparison
+                        .as_ref()
+                        .is_some_and(|state| state.ready)
+                        .then_some(Message::BlockComparisonCopy),
+                ),
+            );
+        } else if review.ids.len() == 2 {

@@ -1,0 +1,300 @@
+        use keyboard::Key;
+        if chrome_shortcut(key, mods) == Some(ChromeShortcut::TabSwitcher) {
+            self.tab_switcher = None;
+            return Some(Task::none());
+        }
+        let labels = self.tab_labels();
+        let state = self.tab_switcher.as_mut()?;
+        // Recompute the visible order once so Enter/arrows agree with what's drawn.
+        let filtered = tab_switcher_filtered(&labels, &state.query);
+        match key {
+            Key::Named(Named::Escape) => {
+                self.tab_switcher = None;
+                return Some(Task::none());
+            }
+            Key::Named(Named::Enter) => {
+                let target = tab_switcher_target_id(&self.tabs, &filtered, state.selected);
+                self.tab_switcher = None;
+                return Some(match target {
+                    Some(id) => self.update(Message::TabSwitcherJump(id)),
+                    None => Task::none(),
+                });
+            }
+            Key::Named(Named::ArrowDown) => {
+                if !filtered.is_empty() {
+                    state.selected = (state.selected + 1) % filtered.len();
+                }
+                return Some(Task::none());
+            }
+            Key::Named(Named::ArrowUp) => {
+                if !filtered.is_empty() {
+                    state.selected = if state.selected == 0 {
+                        filtered.len() - 1
+                    } else {
+                        state.selected - 1
+                    };
+                }
+                return Some(Task::none());
+            }
+            Key::Named(Named::Backspace) => {
+                state.backspace();
+                return Some(Task::none());
+            }
+            _ => {}
+        }
+        if !mods.control() && !mods.alt() {
+            if let Some(t) = text {
+                if state.push_query_text(t) {
+                    return Some(Task::none());
+                }
+            }
+        }
+        // Swallow all other keys while the overlay owns the keyboard.
+        Some(Task::none())
+    }
+
+    /// Open the history picker over a bounded recent slice of the persisted
+    /// command index. Shared by Ctrl+Shift+H and the command palette so both
+    /// entry points behave identically, including the disabled-history hint.
+    fn open_history_picker(&mut self) -> Task<Message> {
+        let Some(path) = self.config.resolved_command_history_path() else {
+            self.push_toast(
+                "Command history is disabled (command_history_enabled = false)",
+                ToastKind::Info,
+            );
+            return Task::none();
+        };
+        let cwd = self
+            .sessions
+            .get(self.active)
+            .and_then(|session| session.cwd());
+        let mut state = history_picker::HistoryPickerState::load(&path);
+        state.set_current_directory(cwd);
+        self.history_picker = Some(state);
+        iced::widget::operation::focus(HISTORY_PICKER_INPUT_ID.clone())
+    }
+
+    /// Whether an on-screen overlay claims Escape for itself.
+    ///
+    /// Mirrors, in the same order, the overlays whose Escape arms live in the
+    /// `Message::Key` dispatch chain. It exists so a captured Escape — one a
+    /// focused text input swallowed to blur itself — can be re-delivered to
+    /// that chain without ever reaching the PTY fallthrough. The Agent panel
+    /// is deliberately absent: its input has no Escape owner, so forwarding
+    /// there would send a stray ESC to the foreground program.
+    fn overlay_owns_escape(&self) -> bool {
+        self.block_clear_confirm.is_some()
+            || self.tab_close_confirm.is_some()
+            || self.block_menu.is_some()
+            || self.block_review.is_some()
+            || self.sidebar_dialog.is_some()
+            || self.sidebar_delete_confirm.is_some()
+            || self.sidebar_menu.is_some()
+            || self.sidebar_files_focused
+            || self.sidebar_filter.is_some()
+            || self.tab_menu.is_some()
+            || self.tab_switcher.is_some()
+            || self.remote_picker.is_some()
+            || self.history_picker.is_some()
+            || self.workflow_overlay.is_some()
+            || self.block_search.is_some()
+            || self.help_open
+            || self.debug_open
+            || self.config_panel_open
+            || self.palette.is_open
+            || self.search_replace.is_open
+            || self.search.is_open
+            || self.correction_card_visible()
+            || self.ai_ask.is_some()
+            // Only the pane the card belongs to; an off-pane card must not
+            // claim the Escape of whatever the user is actually looking at.
+            || self.ai_suggestion_visible()
+            // The chats panel is an input-owning overlay: while it is up its
+            // Escape closes it instead of reaching the shell behind it.
+            || self.ai_chats.is_open
+    }
+
+    /// The suggestion card is bound to the pane that asked for it: it renders,
+    /// owns Escape, and accepts an insert only while that pane is the active
+    /// one. frost's correction card has always been scoped this way
+    /// (`correction_card_visible`), and the insert writes to the bound pane —
+    /// a review-first affordance the user cannot see is not a review.
+    fn ai_suggestion_bound_session(&self) -> Option<&ai_command::CommandSuggestion> {
+        let active_id = self.sessions.get(self.active).map(|sess| sess.id);
+        self.ai_suggestion
+            .as_ref()
+            .filter(|session| session.is_bound_to_active_pane(active_id))
+    }
+
+    fn ai_suggestion_visible(&self) -> bool {
+        self.ai_suggestion_bound_session().is_some()
+    }
+
+    fn active_pane_has_prompt_marks(&self) -> bool {
+        self.sessions
+            .get(self.active)
+            .is_some_and(|session| session.terminal.has_prompt_marks())
+    }
+
+    /// Explain a block action that found nothing to act on.
+    ///
+    /// These toasts used to name OSC 133 unconditionally, which is wrong in
+    /// both directions. On a shell that *does* emit marks it blamed shell
+    /// integration for what is really "this pane has no failed block yet". On
+    /// one that does not, it named a prerequisite without saying how to satisfy
+    /// it — and nothing else in the app or the README did either, so the whole
+    /// feature was a dead end for anyone not already running jsh.
+    fn block_absent_toast(&self, subject: &str) -> String {
+        if self.active_pane_has_prompt_marks() {
+            format!("No {subject} in this pane")
+        } else {
+            format!(
+                "No {subject}: this shell is not reporting commands — run \
+                 \"Install or update jsh\" from the command palette for shell integration"
+            )
+        }
+    }
+
+    /// One gate for commands that act on block history. Block chrome is hidden
+    /// in the alternate screen, so neither keybindings nor palette actions may
+    /// mutate or read an invisible selection there.
+    fn block_action_available(&self) -> bool {
+        self.config.is_block_mode()
+            && self
+                .sessions
+                .get(self.active)
+                .is_some_and(|session| !session.terminal.is_alt_buffer_active())
+    }
+
+    /// Physical chords defer to a foreground command even on the primary
+    /// screen. Explicit palette/menu clicks may still inspect history while a
+    /// command runs, but a terminal key must never be stolen from that app.
+    fn block_binding_available(&self) -> bool {
+        self.block_action_available()
+            && self
+                .sessions
+                .get(self.active)
+                .is_some_and(|session| !session.terminal.is_command_running())
+    }
+
+    fn ensure_block_action_available(&mut self, action: &str) -> bool {
+        if !self.config.is_block_mode() {
+            self.push_toast(
+                format!("{action} unavailable: block mode is disabled"),
+                ToastKind::Info,
+            );
+            return false;
+        }
+        if !self.block_action_available() {
+            self.push_toast(
+                format!("{action} unavailable while a full-screen program is active"),
+                ToastKind::Info,
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Prompt-to-prompt navigation that says why nothing moved.
+    ///
+    /// The chord is consumed by the block-context preflight even on a pane
+    /// whose shell emits no OSC 133, so it used to scroll nothing, toast
+    /// nothing, and pass nothing through to the program — indistinguishable
+    /// from a broken key. The wording keys on whether any prompt mark exists
+    /// rather than on the move result, because a projected/collapsed row can
+    /// also refuse a move that has nothing to do with shell integration.
+    fn jump_prompt_with_feedback(&mut self, older: bool) -> Task<Message> {
+        if !self.ensure_block_action_available("Prompt navigation") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+        if sess.jump_prompt(older) {
+            return Task::none();
+        }
+        let message = if sess.terminal.has_prompt_marks() {
+            if older {
+                "No earlier command prompt"
+            } else {
+                "Already at the newest command prompt"
+            }
+        } else {
+            "Prompt navigation needs shell integration — run \"Install or update jsh\" \
+             from the command palette"
+        };
+        self.push_toast(message, ToastKind::Info);
+        Task::none()
+    }
+
+    /// Reveal one edge of a finalized block without changing the current
+    /// multi-selection. The bottom edge is the last row before the next block
+    /// or live prompt, matching the same span used by gutter paint/hit-tests.
+    fn block_reveal_edge(&mut self, zone_id: u64, bottom: bool) -> Task<Message> {
+        if !self.ensure_block_action_available("Block navigation") {
+            return Task::none();
+        }
+        let target = self.sessions.get(self.active).and_then(|sess| {
+            let terminal = &sess.terminal;
+            let total = terminal.scrollback_len() + terminal.grid.rows();
+            let live_boundary = terminal
+                .running_zone_start()
+                .or(terminal.live_prompt_row())
+                .unwrap_or(total);
+            let zones: Vec<&terminal::CommandZone> = terminal
+                .command_zones
+                .iter()
+                .filter(|zone| !zone.rows_evicted)
+                .collect();
+            let starts: Vec<usize> = zones.iter().map(|zone| zone.prompt_start).collect();
+            zones
+                .iter()
+                .zip(block_mode::spans(&starts, live_boundary))
+                .find(|(zone, _)| zone.id == zone_id)
+                .map(|(zone, (start, end))| {
+                    if bottom {
+                        end.saturating_sub(1).max(start)
+                    } else {
+                        zone.prompt_start
+                    }
+                })
+        });
+        let Some(target) = target else {
+            self.push_toast(
+                "Block rows are no longer retained".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        };
+        if let Some(sess) = self.sessions.get_mut(self.active) {
+            let revealed = if bottom && sess.projection.effective_collapsed().contains(&zone_id) {
+                let revealed = sess.terminal.reveal_collapsed_summary(
+                    &sess.projection_policy,
+                    &mut sess.projection_view_state,
+                    zone_id,
+                );
+                if revealed {
+                    sess.refresh();
+                }
+                revealed
+            } else {
+                sess.reveal_absolute_cell(target, 0)
+            };
+            if !revealed {
+                self.push_toast(
+                    "Block position is no longer available".to_string(),
+                    ToastKind::Info,
+                );
+            }
+        }
+        Task::none()
+    }
+
+    fn block_toggle_bookmark(&mut self, zone_id: u64) -> Task<Message> {
+        if !self.ensure_block_action_available("Block bookmark") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+        let ids: Vec<u64> = sess

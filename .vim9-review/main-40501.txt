@@ -1,0 +1,300 @@
+                    block_search_hit(10),
+                    block_search_hit(8),
+                    block_search_hit(7),
+                ],
+                Some(&anchor),
+            ),
+            2
+        );
+        assert_eq!(
+            block_search_refresh_selection_index(
+                &[block_search_hit(10), block_search_hit(8)],
+                Some(&anchor),
+            ),
+            1
+        );
+        assert_eq!(block_search_refresh_selection_index(&[], Some(&anchor)), 0);
+    }
+
+    #[test]
+    fn block_search_manual_refresh_fails_fast_on_errors_and_coalesces_while_busy() {
+        let mut state = BlockSearchState {
+            query: "[".to_string(),
+            query_error: Some("invalid regex".to_string()),
+            hits: vec![block_search_hit(7)],
+            selected: 0,
+            ..BlockSearchState::default()
+        };
+
+        assert!(!state.request_manual_refresh());
+        assert!(!state.loading);
+        assert!(!state.manual_refresh_pending);
+        assert_eq!(state.query_error.as_deref(), Some("invalid regex"));
+        assert_eq!(state.hits, vec![block_search_hit(7)]);
+
+        state.query_error = None;
+        state.loading = true;
+        assert!(!state.request_manual_refresh());
+        assert!(state.manual_refresh_pending);
+        assert!(!state.request_manual_refresh(), "repeat F5 stays coalesced");
+        state.loading = false;
+        assert!(state.request_manual_refresh());
+        assert!(!state.manual_refresh_pending);
+    }
+
+    #[test]
+    fn block_search_busy_followup_skips_invalid_queries_but_refreshes_all_browsing() {
+        let mut state = BlockSearchState {
+            manual_refresh_pending: true,
+            query: "needle".to_string(),
+            ..BlockSearchState::default()
+        };
+        assert!(state.take_manual_refresh_followup());
+        assert!(!state.manual_refresh_pending);
+
+        state.manual_refresh_pending = true;
+        state.query.clear();
+        state.filter = BlockSearchFilter::All;
+        assert!(state.take_manual_refresh_followup());
+        assert!(!state.manual_refresh_pending);
+
+        // Empty-query metadata browsing still consumes the cache, so a
+        // coalesced request remains meaningful for every filter, including All.
+        state.manual_refresh_pending = true;
+        state.filter = BlockSearchFilter::Failed;
+        assert!(state.take_manual_refresh_followup());
+
+        state.manual_refresh_pending = true;
+        state.query = "[".to_string();
+        state.regex = true;
+        state.query_error = Some("invalid regex".into());
+        assert!(!state.take_manual_refresh_followup());
+        assert!(!state.manual_refresh_pending);
+
+        state.manual_refresh_pending = true;
+        state.query_error = None;
+        state.query = "x".repeat(block_mode::BLOCK_SEARCH_QUERY_MAX_BYTES + 1);
+        assert!(!state.take_manual_refresh_followup());
+        assert!(!state.manual_refresh_pending);
+
+        state.query = "valid".to_string();
+        state.regex = false;
+        assert!(!state.take_manual_refresh_followup(), "no pending request");
+    }
+
+    #[test]
+    fn block_search_manual_refresh_key_accepts_only_bare_f5() {
+        let f5 = keyboard::Key::Named(Named::F5);
+        let flags = [
+            keyboard::Modifiers::SHIFT,
+            keyboard::Modifiers::CTRL,
+            keyboard::Modifiers::ALT,
+            keyboard::Modifiers::LOGO,
+        ];
+
+        for repeat in [false, true] {
+            for mask in 0u8..(1 << flags.len()) {
+                let modifiers = flags
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| mask & (1 << index) != 0)
+                    .fold(keyboard::Modifiers::NONE, |mods, (_, flag)| mods | *flag);
+                assert_eq!(
+                    block_search_manual_refresh_key(&f5, modifiers, repeat),
+                    mask == 0 && !repeat,
+                    "unexpected F5 decision for modifiers {modifiers:?}, repeat={repeat}",
+                );
+            }
+        }
+
+        assert!(!block_search_manual_refresh_key(
+            &keyboard::Key::Named(Named::F6),
+            keyboard::Modifiers::NONE,
+            false,
+        ));
+    }
+
+    #[test]
+    fn files_f5_refresh_is_scoped_and_never_steals_terminal_input() {
+        let f5 = keyboard::Key::Named(Named::F5);
+        assert!(sidebar_files_manual_refresh_key(
+            &f5,
+            keyboard::Modifiers::NONE,
+            false,
+            true,
+        ));
+        assert!(
+            !sidebar_files_manual_refresh_key(&f5, keyboard::Modifiers::NONE, false, false,),
+            "F5 outside the Files dock (and without Files focus) must continue to the PTY",
+        );
+        assert!(!sidebar_files_manual_refresh_key(
+            &f5,
+            keyboard::Modifiers::CTRL,
+            false,
+            true,
+        ));
+        assert!(!sidebar_files_manual_refresh_key(
+            &f5,
+            keyboard::Modifiers::NONE,
+            true,
+            true,
+        ));
+        assert!(!sidebar_files_manual_refresh_key(
+            &keyboard::Key::Named(Named::F6),
+            keyboard::Modifiers::NONE,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn files_alt_navigation_is_scoped_and_exact() {
+        let alt = keyboard::Modifiers::ALT;
+        assert_eq!(
+            sidebar_files_navigation_key(&keyboard::Key::Named(Named::ArrowLeft), alt, false, true,),
+            Some(SidebarNavigationKey::Back)
+        );
+        assert_eq!(
+            sidebar_files_navigation_key(
+                &keyboard::Key::Named(Named::ArrowRight),
+                alt,
+                false,
+                true,
+            ),
+            Some(SidebarNavigationKey::Forward)
+        );
+        assert_eq!(
+            sidebar_files_navigation_key(&keyboard::Key::Named(Named::ArrowUp), alt, false, true,),
+            Some(SidebarNavigationKey::Parent)
+        );
+        assert_eq!(
+            sidebar_files_navigation_key(&keyboard::Key::Named(Named::Home), alt, false, true,),
+            Some(SidebarNavigationKey::Home)
+        );
+        assert_eq!(
+            sidebar_files_navigation_key(&keyboard::Key::Named(Named::ArrowUp), alt, false, false,),
+            None,
+            "outside Files, Alt+Up remains PTY input"
+        );
+        assert_eq!(
+            sidebar_files_navigation_key(
+                &keyboard::Key::Named(Named::Home),
+                alt | keyboard::Modifiers::SHIFT,
+                false,
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            sidebar_files_navigation_key(&keyboard::Key::Named(Named::Home), alt, true, true,),
+            None
+        );
+    }
+
+    #[test]
+    fn files_shortcut_scope_is_hover_or_keyboard_focus() {
+        assert!(files_shortcut_scope(true, true, true, false));
+        assert!(files_shortcut_scope(true, true, false, true));
+        assert!(!files_shortcut_scope(true, true, false, false));
+        assert!(!files_shortcut_scope(false, true, true, true));
+        assert!(!files_shortcut_scope(true, false, true, true));
+    }
+
+    #[test]
+    fn sidebar_breadcrumbs_are_exact_safe_and_bounded() {
+        let crumbs = sidebar_breadcrumbs(std::path::Path::new("/a/b/c/d/e"), 4);
+        assert_eq!(crumbs.len(), 4);
+        assert_eq!(crumbs[0], ("/".to_string(), std::path::PathBuf::from("/")));
+        assert_eq!(crumbs[1].0, "…");
+        assert_eq!(crumbs[1].1, std::path::PathBuf::from("/a/b/c"));
+        assert_eq!(crumbs[2].1, std::path::PathBuf::from("/a/b/c/d"));
+        assert_eq!(crumbs[3].1, std::path::PathBuf::from("/a/b/c/d/e"));
+        assert!(sidebar_breadcrumbs(std::path::Path::new("relative"), 4).is_empty());
+    }
+
+    #[test]
+    fn sidebar_snapshot_age_copy_marks_the_five_minute_boundary() {
+        assert_eq!(
+            sidebar_snapshot_age_copy(std::time::Duration::from_secs(59)),
+            ("Updated just now".to_string(), false)
+        );
+        assert_eq!(
+            sidebar_snapshot_age_copy(std::time::Duration::from_secs(60)),
+            ("Updated 1m ago".to_string(), false)
+        );
+        assert_eq!(
+            sidebar_snapshot_age_copy(std::time::Duration::from_secs(299)),
+            ("Updated 4m ago".to_string(), false)
+        );
+        assert_eq!(
+            sidebar_snapshot_age_copy(std::time::Duration::from_secs(300)),
+            ("Updated 5m ago · stale".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn block_search_toggle_repeat_is_consumed_without_closing_the_picker() {
+        let bindings = keybindings::KeyBindings::default_bindings();
+        let key = keyboard::Key::Character("f".into());
+        let modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT;
+        assert_eq!(
+            block_search_toggle_key_route(&key, modifiers, false, &bindings),
+            BlockSearchToggleKeyRoute::Close
+        );
+        assert_eq!(
+            block_search_toggle_key_route(&key, modifiers, true, &bindings),
+            BlockSearchToggleKeyRoute::SuppressRepeat
+        );
+        assert_eq!(
+            block_search_toggle_key_route(
+                &keyboard::Key::Named(Named::F5),
+                keyboard::Modifiers::NONE,
+                true,
+                &bindings,
+            ),
+            BlockSearchToggleKeyRoute::NotToggle
+        );
+
+        let mut custom = keybindings::KeyBindings::new();
+        custom
+            .bindings
+            .insert("ctrl+shift+g".to_string(), "block:search".to_string());
+        let custom_modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        assert_eq!(
+            block_search_toggle_key_route(
+                &keyboard::Key::Character("g".into()),
+                custom_modifiers,
+                true,
+                &custom,
+            ),
+            BlockSearchToggleKeyRoute::SuppressRepeat,
+            "runtime-remapped toggle chords need the same repeat guard"
+        );
+    }
+
+    #[test]
+    fn block_search_bookmark_chord_is_exact_and_latched_until_b_release() {
+        let lower = keyboard::Key::Character("b".into());
+        let upper = keyboard::Key::Character("B".into());
+        let chord = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        let mut held = false;
+        let mut claimed = false;
+
+        assert_eq!(
+            block_search_bookmark_key_route(&lower, chord, false, &mut held, &mut claimed,),
+            BlockSearchBookmarkKeyRoute::Toggle
+        );
+        assert!(held && claimed);
+        // Ctrl/Shift can be released before B. Both repeated and anomalous
+        // non-repeat presses remain consumed while the physical key is held.
+        assert_eq!(
+            block_search_bookmark_key_route(
+                &lower,
+                keyboard::Modifiers::NONE,
+                true,
+                &mut held,
+                &mut claimed,
+            ),
+            BlockSearchBookmarkKeyRoute::SuppressRepeat
+        );
+        assert_eq!(

@@ -1,0 +1,300 @@
+        );
+        assert!(
+            key.find("self.handle_keybinding(&key, modifiers, retreat_before_key)")
+                .unwrap()
+                < key
+                    .find("self.handle_tab_shortcut(&key, modifiers, retreat_before_key)")
+                    .unwrap()
+        );
+        let chrome = source
+            .split_once("    fn handle_tab_shortcut(")
+            .unwrap()
+            .1
+            .split_once("    fn handle_tab_switcher_key(")
+            .unwrap()
+            .0;
+        assert!(
+            chrome.find("if self.palette.is_open").unwrap()
+                < chrome.find("restore_retreat_after_app_action").unwrap()
+        );
+        assert_eq!(
+            chrome.matches("restore_retreat_after_app_action").count(),
+            1
+        );
+        let query = source
+            .split_once("    fn handle_palette_key(")
+            .unwrap()
+            .1
+            .split_once("    fn edit_copy_task(")
+            .unwrap()
+            .0;
+        assert!(!query.contains(".retreat("));
+        let input = source
+            .split_once("    fn terminal_input_active(")
+            .unwrap()
+            .1
+            .split_once("    fn terminal_mouse_active(")
+            .unwrap()
+            .0;
+        assert!(input.contains("!self.palette.is_open"));
+    }
+
+    #[test]
+    fn hover_candidate_cue_stays_inside_glyph_slot_and_uses_existing_admission() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let bar = source
+            .split_once("    fn status_bar(")
+            .unwrap()
+            .1
+            .split_once("    fn jsh_notice(")
+            .unwrap()
+            .0;
+        let glyph = bar.split_once("        if layout.glyph {").unwrap().1;
+        assert!(glyph.contains("let candidate_visible = self.organism_hover_eligible()"));
+        assert!(glyph.contains(".live_greeting_candidate_visible(id, attention_facts)"));
+        assert!(glyph.contains("background: candidate_visible.then_some(cue_color.into())"));
+        assert!(glyph.contains(".width(Length::Fixed(2.0))"));
+        assert!(glyph.contains(".height(Length::Fixed(2.0))"));
+        assert!(glyph.contains(".width(Length::Fixed(64.0))"));
+        assert!(glyph.contains("companion_compact_slot("));
+        assert!(!bar.contains("time::"));
+        assert!(!bar.contains("Behavior::"));
+        assert_eq!(
+            bar.matches(".on_enter(Message::OrganismHoverEnter(")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn live_hover_is_passive_owner_bound_and_deadline_driven() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let bar = source
+            .split_once("    fn status_bar(")
+            .unwrap()
+            .1
+            .split_once("    fn jsh_notice(")
+            .unwrap()
+            .0;
+        assert!(bar.contains("companion_compact_slot("));
+        assert!(bar.contains(".on_enter(Message::OrganismHoverEnter("));
+        assert!(bar.contains("self.organism.live_greeting_offer(id)"));
+        assert!(bar.contains(".on_exit(Message::OrganismHoverExit(id, ticket))"));
+        assert!(!bar.contains(".on_press("));
+        assert!(!bar.contains("write_pty"));
+        let eligible = source
+            .split_once("    fn organism_hover_eligible(")
+            .unwrap()
+            .1
+            .split_once("    fn status_bar(")
+            .unwrap()
+            .0;
+        assert!(eligible.contains("self.organism_owner().is_some()"));
+        assert!(eligible.contains("Some(organism::Motion::Static)"));
+        assert!(eligible.contains("self.organism_pointer_buttons.is_empty()"));
+        assert!(eligible.contains("self.terminal_mouse_gestures.iter().all(Option::is_none)"));
+        assert!(eligible.contains("!session.terminal.is_command_running()"));
+        let hover = source
+            .split_once("            Message::OrganismHoverEnter(id, epoch) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::OrganismTick(cause) => {")
+            .unwrap()
+            .0;
+        assert!(hover.contains("self.organism_owner() == Some(id)"));
+        assert!(!hover.contains("write_pty"));
+        assert!(!hover.contains("set_focus"));
+        let subscriptions = source
+            .split_once("        let preview_visible =")
+            .unwrap()
+            .1
+            .split_once("        // A right-press on a tab")
+            .unwrap()
+            .0;
+        assert!(subscriptions.contains("if self.organism_interaction_eligible()"));
+        assert!(subscriptions.contains(".live_greeting_deadline(attention_facts)"));
+    }
+
+    #[test]
+    fn organism_preview_retreat_and_completion_use_one_shot_deadlines() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let subscription = source
+            .split_once("        let preview_visible =")
+            .unwrap()
+            .1
+            .split_once("        // A right-press on a tab")
+            .unwrap()
+            .0;
+        assert!(
+            subscription.contains("organism_wake_plan::periodic(organism_wake_plan::ScheduleFacts")
+        );
+        assert!(subscription.contains("preview_visible,"));
+        assert!(subscription.contains("live_presentable: live_layout.presentable()"));
+        assert!(subscription.contains("if preview_visible && !preview_full"));
+        assert!(subscription.contains("self.organism.preview_deadline()"));
+        assert!(subscription.contains("if let Some(owner) = self.organism_observation_owner()"));
+        assert!(subscription.contains("self.organism.retreat_deadline()"));
+        assert!(subscription.contains("self.organism.reaction_deadline(owner)"));
+        assert_eq!(subscription.matches("iced::time::every(").count(), 1);
+        let deadline = source
+            .split_once("fn organism_deadline_subscription(")
+            .unwrap()
+            .1
+            .split_once("fn pty_subscription(")
+            .unwrap()
+            .0;
+        assert!(deadline.contains("Subscription::run_with(wake"));
+        assert!(deadline.contains("stream::once"));
+        assert!(deadline.contains("sleep_until(wake.at.into())"));
+        assert!(deadline.contains("WakeCause::Deadline(wake)"));
+        assert!(subscription.contains("organism_wake_plan::deadlines(now, deadlines)"));
+        assert!(subscription.contains("organism_deadline_subscription(wake)"));
+    }
+
+    #[test]
+    fn completion_expiry_wake_uses_the_current_eligible_observation_owner() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let owner = source
+            .split_once("    fn organism_observation_owner(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_watch_owner(")
+            .unwrap()
+            .0;
+        for gate in [
+            "!self.config.ascii_organism_enabled",
+            "!self.config.bottom_bar",
+            "!self.focused",
+            "!self.terminal_input_active()",
+            "!self.organism_layout().presentable()",
+            ".get(self.active)",
+            "!s.managed_remote",
+            "!s.transcript_read_only()",
+            "!s.terminal.is_alt_buffer_active()",
+            "self.organism.is_local(s.id)",
+            "Some(\"ssh\" | \"mosh\" | \"telnet\")",
+        ] {
+            assert!(owner.contains(gate), "missing expiry owner gate: {gate}");
+        }
+        let expiry = source
+            .split_once("        if let Some(owner) = self.organism_observation_owner() {")
+            .unwrap()
+            .1
+            .split_once("        if organism_pointer_observation_needed(")
+            .unwrap()
+            .0;
+        assert!(expiry.contains("self.organism.reaction_deadline(owner)"));
+        assert!(expiry.contains("reason: DeadlineReason::CompletionExpiry"));
+        assert!(expiry.contains("generation: owner as u64"));
+        let dispatch = source
+            .split_once("        for wake in organism_wake_plan::deadlines(now, deadlines) {")
+            .unwrap()
+            .1
+            .split_once("        // A right-press on a tab")
+            .unwrap()
+            .0;
+        assert!(dispatch.contains("organism_deadline_subscription(wake)"));
+        assert!(!expiry.contains("time::every"));
+        assert!(!expiry.contains("sessions.iter()"));
+    }
+
+    #[test]
+    fn organism_observation_reuses_terminal_input_ownership() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let owner = source
+            .split_once("    fn organism_observation_owner(")
+            .unwrap()
+            .1
+            .split_once("    fn status_bar(")
+            .unwrap()
+            .0;
+        assert!(owner.contains("|| !self.terminal_input_active()"));
+        let display_owner = source
+            .split_once("    fn organism_owner(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_observation_owner(")
+            .unwrap()
+            .0;
+        assert!(display_owner.contains("self.organism_observation_owner()"));
+        let tick = source
+            .split_once("            Message::OrganismTick(cause) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SetBottomBar(")
+            .unwrap()
+            .0;
+        assert!(tick.contains("let owner = self.organism_observation_owner();"));
+        assert!(tick.contains("self.organism.tick(owner, running, any_running);"));
+    }
+
+    #[test]
+    fn modal_ai_surfaces_gate_terminal_input_and_mouse_ownership() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        for (start, end) in [
+            (
+                "    fn terminal_input_active(",
+                "    fn terminal_mouse_active(",
+            ),
+            (
+                "    fn terminal_mouse_active(",
+                "    fn local_sidebar_fallback_root(",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
+            assert!(body.contains("&& !self.ai_chats.is_open"));
+            assert!(body.contains("&& self.ai_ask.is_none()"));
+        }
+        for (start, end) in [
+            (
+                "            Message::Ime(event) => {",
+                "            Message::ModifiersChanged(",
+            ),
+            (
+                "            Message::ImageDropped(path) => {",
+                "            Message::Pasted(id, Some(text))",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
+            assert!(body.contains("if !self.terminal_input_active()"));
+        }
+        let pane = source
+            .split_once("    fn pane_view(")
+            .unwrap()
+            .1
+            .split_once("    fn sidebar_view(")
+            .unwrap()
+            .0;
+        assert!(pane.contains("self.focused && is_active && self.terminal_input_active()"));
+    }
+
+    #[test]
+    fn direct_session_save_failure_remains_eligible_for_periodic_retry() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let save = source
+            .split_once("    fn save_session_snapshot(&mut self) {")
+            .unwrap()
+            .1
+            .split_once("    fn new_session(&mut self)")
+            .unwrap()
+            .0;
+        let mark_pending = save.find("self.session_dirty = true;").unwrap();
+        assert!(save.find("self.sessions.is_empty() || !self.config.restore_session || !self.is_first_instance").unwrap()
+            < mark_pending);
+        assert!(save.find("if self.session_writes_blocked {").unwrap() < mark_pending);
+        let inactive = save
+            .split_once("        if self.session_writes_blocked {")
+            .unwrap()
+            .0;

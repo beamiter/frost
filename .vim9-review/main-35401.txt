@@ -1,0 +1,300 @@
+            false,
+            terminal::ClipboardReadKind::MimeData("text/plain".into()),
+        )
+        .is_some());
+        // Both discovery and unsupported data requests share the same reply
+        // stream, even when permission changes during the outstanding read.
+        for index in 0..100 {
+            let request = if index % 2 == 0 {
+                terminal::ClipboardReadKind::MimeList
+            } else {
+                terminal::ClipboardReadKind::MimeData("image/png".into())
+            };
+            assert!(service_osc5522_read(
+                &mut terminal,
+                &mut in_flight,
+                &mut pending,
+                index < 50,
+                false,
+                request,
+            )
+            .is_none());
+        }
+        assert_eq!(pending, Some(8));
+        assert!(terminal.output_buffer.is_empty());
+
+        let mut other_terminal = TerminalState::new(80, 24);
+        let mut other_in_flight = false;
+        let mut other_pending = None;
+        assert!(service_osc5522_read(
+            &mut other_terminal,
+            &mut other_in_flight,
+            &mut other_pending,
+            true,
+            true,
+            terminal::ClipboardReadKind::MimeData("text/plain".into()),
+        )
+        .is_none());
+        assert_eq!(
+            other_terminal.output_buffer,
+            osc_5522_packet("type=read:status=EBUSY", None)
+        );
+        assert!(!other_in_flight);
+        assert!(other_pending.is_none());
+
+        complete_osc5522_read(
+            &mut terminal,
+            &mut in_flight,
+            &mut pending,
+            false,
+            "text/plain",
+            "secret",
+        );
+        let mut expected = osc_5522_packet("type=read:status=EPERM", None);
+        expected.extend_from_slice(&osc_5522_packet("type=read:status=EBUSY", None).repeat(8));
+        assert_eq!(terminal.output_buffer, expected);
+        assert!(pending.is_none());
+        assert!(!in_flight);
+        // Completing this read releases its own slot for a fresh request.
+        assert!(service_osc5522_read(
+            &mut terminal,
+            &mut in_flight,
+            &mut pending,
+            true,
+            false,
+            terminal::ClipboardReadKind::MimeData("text/plain".into()),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn osc5522_host_read_is_globally_single_flight() {
+        let mut first = TerminalState::new(80, 24);
+        let mut first_in_flight = false;
+        let mut first_pending = None;
+        let request = || terminal::ClipboardReadKind::MimeData("text/plain".to_string());
+        assert_eq!(
+            service_osc5522_read(
+                &mut first,
+                &mut first_in_flight,
+                &mut first_pending,
+                true,
+                false,
+                request(),
+            ),
+            Some("text/plain".to_string())
+        );
+
+        let mut second = TerminalState::new(80, 24);
+        let mut second_in_flight = false;
+        let mut second_pending = None;
+        assert!(service_osc5522_read(
+            &mut second,
+            &mut second_in_flight,
+            &mut second_pending,
+            true,
+            true,
+            request(),
+        )
+        .is_none());
+        assert_eq!(
+            second.output_buffer,
+            osc_5522_packet("type=read:status=EBUSY", None)
+        );
+    }
+
+    /// Execute the real callback arm and owner methods with synthetic platform
+    /// sinks. The harness also rejects deliberate identity/permission/cap bugs.
+    #[test]
+    fn osc52_async_callback_ownership_regressions() {
+        let status = std::process::Command::new("python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/test-osc52-ownership.py"
+            ))
+            .status()
+            .expect("python3 must run the OSC52 ownership regression harness");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn osc52_response_byte_cap_is_checked_before_real_base64_encoding() {
+        for size in [
+            MAX_CLIPBOARD_RESPONSE_BYTES,
+            MAX_CLIPBOARD_RESPONSE_BYTES + 1,
+        ] {
+            let mut terminal = TerminalState::new(80, 24);
+            let mut pending = Some(Default::default());
+            let content = "x".repeat(size);
+            complete_osc52_read(&mut terminal, &mut pending, true, &content, b"\x07");
+            if size > MAX_CLIPBOARD_RESPONSE_BYTES {
+                assert_eq!(terminal.output_buffer, b"\x1b]52;c;\x07");
+            } else {
+                assert_eq!(terminal.output_buffer.len(), 7 + size.div_ceil(3) * 4 + 1);
+                assert!(terminal.output_buffer.starts_with(b"\x1b]52;c;eHh4"));
+                assert_eq!(terminal.output_buffer.last(), Some(&7));
+            }
+            assert!(pending.is_none());
+        }
+    }
+
+    #[test]
+    fn osc52_real_parser_and_encoder_bound_query_bursts_without_private_text() {
+        let mut terminal = TerminalState::new(80, 24);
+        for _ in 0..100 {
+            terminal.process_input(b"\x1b]52;c;?\x07");
+        }
+        let queries: Vec<_> =
+            std::iter::from_fn(|| terminal.take_osc52_clipboard_query()).collect();
+        assert_eq!(queries.len(), 8);
+        for terminator in queries {
+            let mut pending = Some(Default::default());
+            complete_osc52_read(
+                &mut terminal,
+                &mut pending,
+                false,
+                "synthetic-private",
+                terminator,
+            );
+        }
+        assert_eq!(terminal.output_buffer, b"\x1b]52;c;\x07".repeat(8));
+    }
+
+    #[test]
+    fn osc52_slow_read_keeps_cross_batch_refusals_in_request_order() {
+        let mut terminal = TerminalState::new(80, 24);
+        let mut pending = Some(Default::default());
+        // Separate invocations stand for separate PTY batches while iced's
+        // read remains unresolved; the callback has not emitted any bytes.
+        assert!(defer_osc52_refusal(&mut pending, b"\x07"));
+        assert!(defer_osc52_refusal(&mut pending, b"\x1b\\"));
+        assert!(terminal.output_buffer.is_empty());
+        let mut other_session = None;
+        assert!(!defer_osc52_refusal(&mut other_session, b"\x07"));
+        complete_osc52_read(&mut terminal, &mut pending, true, "first", b"\x1b\\");
+        assert_eq!(
+            terminal.output_buffer,
+            b"\x1b]52;c;Zmlyc3Q=\x1b\\\x1b]52;c;\x07\x1b]52;c;\x1b\\"
+        );
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn osc52_disabled_completion_remains_ordered_and_refusals_are_bounded() {
+        let mut terminal = TerminalState::new(80, 24);
+        let mut pending = Some(Default::default());
+        // A read launched while allowed returns a secret after revocation.
+        // The completion gate must refuse it before flushing the FIFO suffix.
+        for _ in 0..100 {
+            assert!(defer_osc52_refusal(&mut pending, b"\x07"));
+        }
+        assert_eq!(pending.as_ref().unwrap().len(), 8);
+        complete_osc52_read(&mut terminal, &mut pending, false, "secret", b"\x1b\\");
+        let expected = [
+            b"\x1b]52;c;\x1b\\".as_slice(),
+            b"\x1b]52;c;\x07".repeat(8).as_slice(),
+        ]
+        .concat();
+        assert_eq!(terminal.output_buffer, expected);
+        assert!(!defer_osc52_refusal(&mut pending, b"\x07"));
+    }
+
+    /// There is exactly one way out of the process, and it is the one that
+    /// flushes.
+    ///
+    /// Closing the last session used to leave on its own after writing only
+    /// the session snapshot, so the Agent transcript, the AI-chat store, the
+    /// jsh execution journal and the command-history index were abandoned
+    /// mid-flight — the durability of a whole session depended on which quit
+    /// gesture the user happened to use. Nothing is observable once both paths
+    /// have exited the process, so the guard is structural: the exit task is
+    /// constructed in exactly one place, which is the function that flushes.
+    #[test]
+    fn the_process_has_exactly_one_exit_and_it_flushes_first() {
+        // Built rather than written out, so this test's own source does not
+        // count as one of the call sites it is looking for.
+        let needle = format!("iced::{}()", "exit");
+        let source = frost_source();
+        let call_sites: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains(&needle) && !line.starts_with("//"))
+            .collect();
+        assert_eq!(
+            call_sites,
+            [needle.as_str()],
+            "every quit gesture must return through exit_flushing_durable_state"
+        );
+
+        let exit_body = source
+            .split_once("fn exit_flushing_durable_state")
+            .expect("the single flushing exit exists")
+            .1;
+        let exit_body = &exit_body[..exit_body.find(&needle).expect("it ends by exiting")];
+        for durable in [
+            "self.agent.persist()",
+            "self.ai_chats.persist(",
+            "self.save_session_snapshot()",
+            "execution_journal::flush(",
+            "command_history::flush_pending(",
+        ] {
+            assert!(
+                exit_body.contains(durable),
+                "{durable} must run before the process leaves"
+            );
+        }
+    }
+
+    /// The last-session quit flushes while its child is still alive.
+    ///
+    /// `save_session_snapshot` records each pane's working directory, and for
+    /// a shell without OSC 7 integration — plain bash, say — that value can
+    /// only come from `/proc/<pid>/cwd` of the live child. `Pty::terminate`
+    /// returns as soon as SIGHUP/SIGTERM are away and its reaper waits 50 ms
+    /// before reaping, so a snapshot taken after it reads the cwd link of a
+    /// zombie: gone, and the session is persisted with no directory at all.
+    /// Signal ordering around a real child is not observable from a unit test,
+    /// so the guard is structural.
+    #[test]
+    fn the_last_session_close_flushes_before_it_signals_the_child() {
+        let source = frost_source();
+        let branch = braced_block_after(&source, "if self.sessions.len() == 1 {");
+        // Built rather than written out, so this test's own source does not
+        // count as one of the call sites it is looking for.
+        let signal = format!("pty.{}()", "terminate");
+        let flush = format!("self.exit_flushing_durable_state{}", "()");
+        let signal_at = branch
+            .find(&signal)
+            .expect("the last session's child is still signalled");
+        let flush_at = branch
+            .find(&flush)
+            .expect("closing the last session is the flushing quit path");
+        assert!(
+            flush_at < signal_at,
+            "the durable flush must run while the child can still report its cwd"
+        );
+    }
+
+    /// A complete OSC 133 `C` envelope is the only thing that mints a durable
+    /// journal capability, and `journal_lifecycle` is the exact conversion the
+    /// PTY-output path performs before it submits. Drop any one of the four
+    /// slots on the way through and the capability is refused, so nothing is
+    /// ever written against a half-known Start.
+    #[test]
+    fn a_complete_osc_133_start_mints_the_capability_frost_journals_with() {
+        let session = agent_task_ui::terminal_session_id(7);
+        let mut terminal = TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n");
+        terminal.process_input(
+            format!(
+                "\x1b]133;C;id=jsh-b8c6-1;session_id={session};seq=3;\
+                 started_at_ms=1788571993465\x07hi\r\n"
+            )
+            .as_bytes(),
+        );
+        terminal.process_input(b"\x1b]133;D;0;id=jsh-b8c6-1;duration_ms=4\x07");
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].completion_provenance,
+            block_mode::CompletionProvenance::ShellReported

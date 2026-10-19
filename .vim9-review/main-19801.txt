@@ -1,0 +1,300 @@
+                    return Task::none();
+                }
+                let owner = self.block_search.as_ref().map(|state| state.session_id);
+                self.close_block_search();
+                let target_is_live = owner.is_some_and(|session_id| {
+                    self.block_search_target_is_live(session_id, hit.zone_id)
+                });
+                if target_is_live && self.ensure_block_action_available("Block search") {
+                    self.reveal_block_search_hit(&hit);
+                }
+            }
+            Message::BlockSearchToggleBookmark(hit) => {
+                return self.toggle_block_search_hit_bookmark(Some(hit));
+            }
+            Message::BlockReviewSelected => return self.block_reinput_selected_commands_task(),
+            Message::BlockBrowse => return self.toggle_block_search(),
+            Message::BlockReviewOpen => return self.open_block_review(None),
+            Message::BlockReviewClose => self.block_review = None,
+            Message::BlockReviewKeepOpen => {}
+            Message::BlockReviewInsert => return self.confirm_block_review(),
+            Message::BlockReviewCopy => return self.copy_block_review(),
+            Message::BlockReviewCompare => return self.block_compare_selected_task(true),
+            Message::BlockReviewExport(format) => {
+                return self.block_export_selected_task(format, true)
+            }
+            Message::BlockComparisonFinished(result) => self.finish_block_comparison(result),
+            Message::BlockComparisonCopy => return self.copy_block_comparison(),
+            Message::BlockReadingNavigate(older) => {
+                if self.ensure_block_action_available("Reading history") {
+                    let target = self.sessions.get_mut(self.active).and_then(|sess| {
+                        let ids = sess
+                            .terminal
+                            .command_zones
+                            .iter()
+                            .map(|z| z.id)
+                            .collect::<Vec<_>>();
+                        sess.block_reading.navigate(&ids, older)
+                    });
+                    if let Some(id) = target {
+                        self.select_and_reveal_block(id);
+                    }
+                }
+            }
+            Message::BlockGoLive => {
+                self.block_review = None;
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    sess.block_selection.clear();
+                    sess.scroll_to_bottom();
+                }
+            }
+            Message::BlockSetAllCollapsed(session_id, collapsed) => {
+                if self.block_action_available() {
+                    let changed = self
+                        .sessions
+                        .get_mut(self.active)
+                        .filter(|sess| sess.id == session_id)
+                        .map(|sess| {
+                            let changed = set_completed_output_collapsed(
+                                &sess.terminal,
+                                &mut sess.projection_policy,
+                                collapsed,
+                            );
+                            if changed > 0 {
+                                sess.refresh();
+                            }
+                            changed
+                        })
+                        .unwrap_or(0);
+                    if changed > 0 {
+                        self.refresh_active_context();
+                    }
+                }
+            }
+            Message::BlockMenuClose => self.block_menu = None,
+            Message::BlockMenuAction(action) => {
+                return self.execute_block_menu_action(action);
+            }
+            Message::BlockClearConfirmNo => self.block_clear_confirm = None,
+            Message::BlockClearConfirmYes => return self.confirm_block_clear(),
+            Message::BlockExportFinished(format, result) => {
+                self.block_export_in_flight = false;
+                match result {
+                    Ok(path) => self.push_toast(
+                        format!("Exported {} blocks to {}", format.label(), path.display()),
+                        ToastKind::Success,
+                    ),
+                    Err(error) => self.push_toast(
+                        format!("Could not export {} blocks: {error}", format.label()),
+                        ToastKind::Warning,
+                    ),
+                }
+            }
+            Message::HistoryPickerInput(q) => {
+                if let Some(s) = self.history_picker.as_mut() {
+                    s.set_query(q);
+                }
+                return self.history_picker_snap_task();
+            }
+            Message::HistoryPickerFilter(action) => {
+                if let Some(state) = self.history_picker.as_mut() {
+                    state.apply_filter(action);
+                }
+                return Task::batch([
+                    self.history_picker_snap_task(),
+                    iced::widget::operation::focus(HISTORY_PICKER_INPUT_ID.clone()),
+                ]);
+            }
+            Message::HistoryPickerAccept(record) => {
+                let command =
+                    history_picker::accept_clicked_record(&mut self.history_picker, &record);
+                return match command {
+                    Some(command) => self.recall_into_active_pane(command),
+                    None => Task::none(),
+                };
+            }
+            Message::WorkflowPickerInput(snapshot, q) => {
+                let Some(workflow_picker::WorkflowOverlay::Picker(state)) =
+                    self.workflow_overlay.as_mut()
+                else {
+                    return Task::none();
+                };
+                if !state.set_query_from_snapshot(snapshot, q) {
+                    return Task::none();
+                }
+                return workflow_focus::reveal_picker();
+            }
+            Message::WorkflowPickerClose(snapshot) => {
+                if self
+                    .workflow_overlay
+                    .as_ref()
+                    .is_some_and(|overlay| overlay.accepts_picker_close(snapshot))
+                {
+                    self.workflow_overlay = None;
+                }
+            }
+            Message::WorkflowPickerAccept(choice) => return self.accept_workflow_choice(choice),
+            Message::WorkflowArgInput(identity, index, value) => {
+                if let Some(workflow_picker::WorkflowOverlay::Args(form)) =
+                    self.workflow_overlay.as_mut()
+                {
+                    if !form.accepts(&identity) {
+                        return Task::none();
+                    }
+                    form.set_value(index, value);
+                    return if form.feedback.is_some() {
+                        workflow_focus::reveal_error()
+                    } else {
+                        workflow_focus::reveal()
+                    };
+                }
+            }
+            Message::WorkflowArgReset(identity, index) => {
+                if let Some(workflow_picker::WorkflowOverlay::Args(form)) =
+                    self.workflow_overlay.as_mut()
+                {
+                    if !form.accepts(&identity) {
+                        return Task::none();
+                    }
+                    form.reset_value(index);
+                }
+            }
+            Message::WorkflowArgSubmit(identity) => {
+                if matches!(self.workflow_overlay.as_ref(), Some(workflow_picker::WorkflowOverlay::Args(form)) if form.accepts(&identity))
+                {
+                    return self.submit_workflow_args();
+                }
+            }
+            Message::WorkflowArgClose(identity) => {
+                if matches!(self.workflow_overlay.as_ref(), Some(workflow_picker::WorkflowOverlay::Args(form)) if form.accepts(&identity))
+                {
+                    self.workflow_overlay = None;
+                }
+            }
+            Message::WorkflowArgDeliver(attempt, id, command) => {
+                return self.deliver_workflow_args(attempt, id, command);
+            }
+            Message::TabCloseConfirmNo => {
+                self.tab_close_confirm = None;
+            }
+            Message::TabCloseConfirmYes => {
+                if let Some((id, _, pending)) = self.tab_close_confirm.take() {
+                    if let Some(index) = self.session_index_by_id(id) {
+                        return self.execute_pending_close(index, pending);
+                    }
+                }
+            }
+        }
+        self.recompute_links();
+        self.refresh_kitty_handles();
+        post_update_task
+    }
+
+    /// Cache crops in the active pane with an aggregate pixel
+    /// budget independent of the protocol's decoded-image budget. Otherwise a
+    /// thousand distinct crops can amplify one retained image into GiB of copies.
+    fn refresh_kitty_handles(&mut self) {
+        const MAX_KITTY_HANDLE_BYTES: usize = 256 * 1024 * 1024;
+        let Some(sess) = self.sessions.get(self.active) else {
+            self.kitty_handles.clear();
+            return;
+        };
+        let kg = &sess.terminal.kitty_graphics;
+        let crops = kg.render_crops(MAX_KITTY_HANDLE_BYTES);
+        let live: std::collections::HashMap<KittyHandleKey, u64> = crops
+            .into_iter()
+            .filter_map(|(image_id, crop)| {
+                kg.get_image(image_id)
+                    .map(|image| ((sess.id, image_id, crop), image.generation))
+            })
+            .collect();
+        // Drop stale/over-budget handles before copying replacements. Never hold
+        // a second, unbounded batch of pending RGBA buffers beside the cache.
+        self.kitty_handles.retain(|key, (_, generation)| {
+            live.get(key).is_some_and(|current| current == generation)
+        });
+        for (key, generation) in live {
+            if self.kitty_handles.contains_key(&key) {
+                continue;
+            }
+            let (_, image_id, crop) = key;
+            let Some(image) = kg.get_image(image_id) else {
+                continue;
+            };
+            let handle = iced::advanced::image::Handle::from_rgba(
+                crop.2,
+                crop.3,
+                kitty_graphics::crop_rgba(image, crop),
+            );
+            self.kitty_handles.insert(key, (handle, generation));
+        }
+    }
+
+    /// Build the renderable image list for a session from its placements and the
+    /// cached handles. Placements are already z-sorted by the graphics state.
+    fn kitty_images(&self, sess: &Session) -> Vec<KittyRender> {
+        let kg = &sess.terminal.kitty_graphics;
+        kg.get_placements()
+            .iter()
+            .filter_map(|p| {
+                let img = kg.get_image(p.image_id)?;
+                let crop = kitty_graphics::placement_crop(img, p)?;
+                let (handle, _) = self.kitty_handles.get(&(sess.id, p.image_id, crop))?;
+                // `row` records the protocol-time screen coordinate; retained
+                // rendering deliberately keys off the stable `buffer_row`.
+                let _protocol_screen_row = p.row;
+                let rows = (p.rows as usize).max(1);
+                let anchor = projected_kitty_anchor(
+                    &sess.terminal,
+                    &sess.projection,
+                    p.buffer_row,
+                    p.col as usize,
+                    (p.cols as usize).max(1),
+                    rows,
+                )?;
+                Some(KittyRender {
+                    handle: handle.clone(),
+                    col: anchor.col,
+                    row: anchor.row,
+                    cols: (p.cols as usize).max(1),
+                    rows,
+                    id: p.image_id,
+                    px_w: crop.2,
+                    px_h: crop.3,
+                })
+            })
+            .collect()
+    }
+
+    /// Re-detect links in the active session's visible grid. Version-gated so it
+    /// is a no-op when neither the grid, the scroll position, nor the tab changed.
+    fn recompute_links(&mut self) {
+        let Some(sess) = self.sessions.get(self.active) else {
+            self.links.clear();
+            return;
+        };
+        let key = (sess.id, sess.projection.key());
+        let cacheable = sess.projection.view_revision() != 0;
+        if cacheable && self.links_cache_key == Some(key.clone()) {
+            return;
+        }
+        self.links_cache_key = cacheable.then_some(key);
+        let mut links = self
+            .link_detector
+            .detect_links_in_visible_cells_with_wrapping(
+                sess.projection.cells(),
+                sess.projection.row_wrapped(),
+            );
+        // OSC 8 is metadata rather than visible URL text. Give its exact cell
+        // spans precedence over heuristic matches, while still routing every
+        // target through the same `is_openable_url` policy in the terminal,
+        // here, and once more immediately before the opener is spawned.
+        let osc8_links = sess
+            .terminal
+            .osc8_links_in_visible_cells(sess.projection.cells());
+        links.retain(|detected| {
+            !osc8_links.iter().any(|explicit| {
+                detected.line == explicit.line
+                    && detected.col_start < explicit.col_end
+                    && explicit.col_start < detected.col_end
+            })

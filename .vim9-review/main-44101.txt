@@ -1,0 +1,300 @@
+            .unwrap()
+            .1
+            .split_once("\n    fn ")
+            .unwrap()
+            .0;
+        assert!(view.contains("state.identity.clone()"));
+        assert!(view.contains("Box::new(host.clone())"));
+        assert!(view.contains("config::validate_remote_host_at(&state.hosts, index)"));
+        assert!(!view.contains("self.config.remote_hosts"));
+        let callback = source
+            .split_once("            Message::RemotePickerConnect(identity, profile) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::RemoteHostName(")
+            .unwrap()
+            .0;
+        assert!(
+            callback.find("remote_picker_target_index(").unwrap()
+                < callback.find("self.connect_remote_host(index)").unwrap()
+        );
+        assert!(callback.contains("return Task::none();"));
+    }
+    #[test]
+    fn block_menu_shortcut_commands_match_equivalent_actions_only() {
+        for (action, command) in [
+            (BlockMenuAction::CopyCommand, "block:copy_command"),
+            (BlockMenuAction::CopyOutput, "block:copy_output"),
+            (BlockMenuAction::CopyBlock, "block:copy_block"),
+            (BlockMenuAction::CopyMarkdown, "block:copy_markdown"),
+            (BlockMenuAction::RecallCommand, "block:recall_command"),
+            (
+                BlockMenuAction::ReinputSelected,
+                "block:reinput_selected_commands",
+            ),
+            (BlockMenuAction::ToggleBookmark, "block:toggle_bookmark"),
+            (BlockMenuAction::Search, "block:search"),
+            (BlockMenuAction::CollapseOutput, "block:toggle_collapse"),
+            (BlockMenuAction::ExpandOutput, "block:toggle_collapse"),
+        ] {
+            assert_eq!(block_menu_shortcut_command(action), Some(command));
+            assert!(command.parse::<keybindings::Command>().is_ok());
+        }
+        for action in [
+            BlockMenuAction::Details,
+            BlockMenuAction::Retry,
+            BlockMenuAction::ExportMarkdown,
+            BlockMenuAction::ExportJson,
+            BlockMenuAction::CreateTask,
+        ] {
+            assert_eq!(block_menu_shortcut_command(action), None);
+        }
+    }
+
+    #[test]
+    fn block_menu_shortcut_labels_use_live_bindings_without_default_fallback() {
+        let command = block_menu_shortcut_command(BlockMenuAction::CopyOutput).unwrap();
+        let mut bindings = keybindings::KeyBindings::default_bindings();
+        bindings.bindings.clear();
+        assert_eq!(bindings.shortcut_label(command), None);
+        bindings
+            .bindings
+            .insert("ctrl+alt+o".into(), command.into());
+        let first = bindings.shortcut_label(command).unwrap();
+        bindings.bindings.clear();
+        bindings
+            .bindings
+            .insert("ctrl+shift+y".into(), command.into());
+        assert_ne!(bindings.shortcut_label(command).unwrap(), first);
+        bindings.bindings.clear();
+        assert_eq!(bindings.shortcut_label(command), None);
+    }
+    #[test]
+    fn block_menu_keyboard_traverses_only_renderable_actions_in_order() {
+        use keyboard::{key::Named, Key};
+        for collapsed in [None, Some(false), Some(true)] {
+            for selected in [false, true] {
+                for clicked in [false, true] {
+                    for failed in [false, true] {
+                        for tasks in [false, true] {
+                            let actions =
+                                block_menu_actions(collapsed, selected, clicked, failed, tasks);
+                            assert_eq!(actions.contains(&BlockMenuAction::CopyCommand), selected);
+                            assert_eq!(
+                                actions.contains(&BlockMenuAction::ReinputSelected),
+                                selected
+                            );
+                            assert_eq!(actions.contains(&BlockMenuAction::RecallCommand), clicked);
+                            assert_eq!(
+                                actions.contains(&BlockMenuAction::CreateTask),
+                                failed && tasks
+                            );
+                            assert_eq!(actions.contains(&BlockMenuAction::Retry), failed);
+                            assert_eq!(
+                                actions.contains(&BlockMenuAction::CollapseOutput),
+                                collapsed == Some(false)
+                            );
+                            assert_eq!(
+                                actions.contains(&BlockMenuAction::ExpandOutput),
+                                collapsed == Some(true)
+                            );
+                            let mut focused = None;
+                            for action in &actions {
+                                focused = block_menu_navigation(
+                                    &actions,
+                                    focused,
+                                    &Key::Named(Named::ArrowDown),
+                                );
+                                assert_eq!(focused, Some(*action));
+                            }
+                            assert_eq!(
+                                block_menu_navigation(
+                                    &actions,
+                                    focused,
+                                    &Key::Named(Named::ArrowDown)
+                                ),
+                                actions.first().copied()
+                            );
+                            assert_eq!(
+                                block_menu_navigation(&actions, None, &Key::Named(Named::ArrowUp)),
+                                actions.last().copied()
+                            );
+                            assert_eq!(
+                                block_menu_navigation(&actions, focused, &Key::Named(Named::Home)),
+                                actions.first().copied()
+                            );
+                            assert_eq!(
+                                block_menu_navigation(&actions, None, &Key::Named(Named::End)),
+                                actions.last().copied()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_menu_focus_never_retargets_a_removed_action() {
+        use keyboard::{key::Named, Key};
+        let actions = [
+            BlockMenuAction::Details,
+            BlockMenuAction::ExpandOutput,
+            BlockMenuAction::Close,
+        ];
+        assert_eq!(
+            block_menu_navigation(
+                &actions,
+                Some(BlockMenuAction::CollapseOutput),
+                &Key::Named(Named::Enter)
+            ),
+            None
+        );
+        assert_eq!(
+            block_menu_navigation(&[], None, &Key::Named(Named::ArrowDown)),
+            None
+        );
+        assert_eq!(
+            block_menu_navigation(&[BlockMenuAction::Close], None, &Key::Named(Named::End)),
+            Some(BlockMenuAction::Close)
+        );
+    }
+
+    #[test]
+    fn block_menu_enter_cannot_repeat_into_the_shell_or_a_confirmation() {
+        let mut latch = PromptRecallEnterLatch::default();
+        let press = history_enter_event(true, false, keyboard::Location::Standard);
+        let repeat = history_enter_event(true, true, keyboard::Location::Standard);
+        let release = history_enter_event(false, false, keyboard::Location::Standard);
+        assert!(!latch.consume(&press, true));
+        assert!(latch.consume(&repeat, false));
+        assert!(latch.consume(&press, true));
+        assert!(latch.consume(&release, false));
+        assert!(!latch.consume(&press, false));
+    }
+
+    #[test]
+    fn block_menu_keyboard_dispatch_and_render_share_availability_and_modal_ownership() {
+        let source = include_str!("main.rs");
+        let handle = source
+            .split_once("    fn handle_block_menu_key(")
+            .unwrap()
+            .1
+            .split_once("    fn block_menu_view(")
+            .unwrap()
+            .0;
+        assert!(handle.contains("self.available_block_menu_actions(menu)"));
+        let compact: String = handle.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(compact.contains("menu.focused_action.filter(|action|actions.contains(action))"));
+        assert!(handle.contains("self.execute_block_menu_action(action)"));
+        assert!(handle.contains("self.block_menu = None"));
+        assert!(!handle.contains("set_focus("));
+        let view = source
+            .split_once("    fn block_menu_view(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_layout(")
+            .unwrap()
+            .0;
+        assert!(view.contains("self.available_block_menu_actions(state)"));
+        assert!(view.contains(".on_press_maybe("));
+        assert!(view.contains("block-menu-selected"));
+        assert!(view.contains("block-menu-scroll"));
+        let ownership = source
+            .split_once("let recall_surface_open =")
+            .unwrap()
+            .1
+            .split_once(';')
+            .unwrap()
+            .0;
+        assert!(ownership.contains("self.block_menu.is_some()"));
+        let gate = source
+            .split_once("if self.block_menu.is_some() {")
+            .unwrap()
+            .1;
+        assert!(gate.starts_with(
+            "\n                        return self.handle_block_menu_key(&key, modifiers);"
+        ));
+    }
+    #[test]
+    fn review_and_recall_menu_labels_distinguish_confirmation_from_direct_fill() {
+        assert_eq!(review_commands_menu_label(1), "Review command…");
+        assert_eq!(review_commands_menu_label(2), "Review commands…");
+        assert_eq!(
+            block_menu_command_hint(BlockMenuAction::RecallCommand),
+            Some("Fill prompt without running")
+        );
+        assert_eq!(
+            block_menu_command_hint(BlockMenuAction::ReinputSelected),
+            Some("Review first; insert only after confirmation")
+        );
+        assert_eq!(block_menu_command_hint(BlockMenuAction::Retry), None);
+        let source = include_str!("main.rs");
+        let view = source
+            .split_once("    fn block_menu_view(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_layout(")
+            .unwrap()
+            .0;
+        assert!(view.contains("review_commands_menu_label(selection.selected_count)"));
+        assert!(view.contains("block_menu_command_hint(action)"));
+        assert!(view.contains("Recall this command"));
+        assert!(view.contains("BlockMenuAction::ReinputSelected"));
+    }
+    #[test]
+    fn keyboard_menu_requires_a_retained_selection_and_never_claims_composition() {
+        for available in [false, true] {
+            for preedit in ["", " composing ", "中"] {
+                for selected in [None, Some(0), Some(42)] {
+                    for retained in [false, true] {
+                        assert_eq!(
+                            block_menu_keyboard_target(available, preedit, selected, retained),
+                            if available && preedit.is_empty() && retained {
+                                selected
+                            } else {
+                                None
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keyboard_menu_open_preserves_selection_prompt_and_normal_key_fallback() {
+        let source = include_str!("main.rs");
+        let open = source
+            .split_once("    fn open_selected_block_menu(")
+            .unwrap()
+            .1
+            .split_once("    fn available_block_menu_actions(")
+            .unwrap()
+            .0;
+        for required in [
+            "self.terminal_input_active() && self.block_binding_available()",
+            "&sess.terminal.preedit_text",
+            "sess.block_selection.active()",
+            "sess.terminal.zone_by_id(id)",
+            "session_id = sess.id",
+            "jterm_core::process::tty_foreground_pgid(sess.master_fd)",
+            "Some(sess.pty.get_child_pid())",
+            "pane.session == self.active",
+            "focused_action: Some(BlockMenuAction::Details)",
+        ] {
+            assert!(open.contains(required), "missing gate: {required}");
+        }
+        for forbidden in [
+            "write_pty",
+            "block_selection.replace",
+            "block_selection.clear",
+            "scroll_to_bottom",
+            "recall_into",
+        ] {
+            assert!(!open.contains(forbidden));
+        }
+        let dispatch = source
+            .split_once("    fn dispatch_command(")
+            .unwrap()
+            .1

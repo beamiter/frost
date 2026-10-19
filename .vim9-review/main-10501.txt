@@ -1,0 +1,300 @@
+    }
+
+    /// The whole terminal-area rectangle the pane tree is laid out within.
+    fn layout_area(&self) -> pane_layout::Rect {
+        pane_layout::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: self.term_width(),
+            height: self.term_height(),
+        }
+    }
+
+    /// Every leaf's session index and pixel rectangle, in render order.
+    fn pane_rects(&self) -> Vec<PaneRect> {
+        let mut out = Vec::new();
+        collect_pane_rects(self.layout(), self.layout_area(), DIVIDER, &mut out);
+        out
+    }
+
+    /// The focused leaf's position in depth-first order (for status readouts).
+    fn focused_pane_pos(&self) -> usize {
+        self.layout()
+            .leaves()
+            .iter()
+            .position(|&s| s == self.active)
+            .unwrap_or(0)
+    }
+
+    fn grid_pixel_size(&self, cols: usize, rows: usize) -> (u32, u32) {
+        let width = (cols as f32 * self.metrics.cell_w).round().max(0.0) as u32;
+        let height = (rows as f32 * self.metrics.cell_h).round().max(0.0) as u32;
+        (width, height)
+    }
+
+    /// Resize one session's terminal + PTY (no-op when already that size).
+    fn resize_session(&mut self, index: usize, cols: usize, rows: usize) -> Option<usize> {
+        let (pixel_w, pixel_h) = self.grid_pixel_size(cols, rows);
+        if let Some(sess) = self.sessions.get_mut(index) {
+            sess.terminal.set_viewport_pixel_size(pixel_w, pixel_h);
+            let old_dimensions = sess.terminal.get_dimensions();
+            if old_dimensions != (cols, rows) {
+                sess.terminal.on_resize(cols, rows);
+                let _ = sess.pty.resize(cols, rows);
+            }
+            sess.refresh();
+            return (old_dimensions.0 != cols).then_some(sess.id);
+        }
+        None
+    }
+
+    /// Resize every session once for the current layout. Background tabs use the
+    /// full terminal area; sessions displayed in a split use their pane size.
+    /// While a pane is zoomed every session gets the full area, so the zoomed
+    /// pane renders full-size and unzooming is a plain relayout.
+    fn relayout(&mut self) {
+        // Retire old raw coordinates before resizing or replacing projections.
+        self.sync_terminal_pane_owners();
+        let mut targets = vec![(self.cols, self.rows); self.sessions.len()];
+        if self.is_split() && !self.pane_zoomed {
+            for pane in self.pane_rects() {
+                if pane.session < targets.len() {
+                    let w = (pane.rect.width - terminal_view::SCROLLBAR_WIDTH).max(0.0);
+                    // The header strip sits inside the pane rect, above the
+                    // grid. Charging the PTY for those pixels would make the
+                    // shell believe it has one row more than it can show.
+                    let h = (pane.rect.height - self.pane_header_height()).max(0.0);
+                    targets[pane.session] = self.metrics.grid_size(w, h);
+                }
+            }
+        }
+        let mut width_changed = false;
+        for (index, (cols, rows)) in targets.into_iter().enumerate() {
+            if let Some(id) = self.resize_session(index, cols, rows) {
+                self.history_reflow_sessions.insert(id);
+                width_changed = true;
+            }
+        }
+        if width_changed {
+            self.history_reflow_due =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+        }
+    }
+
+    /// Split the focused pane along `axis`, spawning a fresh session at its cwd
+    /// (tmux `split-window`). If the focused leaf's parent already splits along
+    /// `axis` the new pane joins as a sibling; otherwise the leaf becomes a
+    /// nested split. Capped at [`MAX_PANES`] total leaves as a PTY guard.
+    fn split(&mut self, axis: Axis) {
+        if self.layout().leaf_count() >= MAX_PANES {
+            self.push_toast(
+                format!("Split limit reached ({MAX_PANES} panes)"),
+                ToastKind::Warning,
+            );
+            return;
+        }
+        let cwd = self.sessions.get(self.active).and_then(|s| s.cwd());
+        match Session::spawn(
+            &self.config,
+            self.next_id,
+            self.cols,
+            self.rows,
+            cwd.as_deref(),
+        ) {
+            Ok(session) => {
+                self.session_diagnostic = None;
+                self.next_id += 1;
+                self.sessions.push(session);
+                if let Some(session) = self.sessions.last_mut() {
+                    apply_theme_colors(&mut session.terminal, &self.theme);
+                }
+                // Appending keeps every existing index valid, so no tab needs
+                // reindexing here.
+                let new_idx = self.sessions.len() - 1;
+                let focused = self.active;
+                self.layout_mut().split_leaf(focused, axis, new_idx);
+                self.set_focus(new_idx);
+                // Splitting while zoomed lands in the new multi-pane layout.
+                self.pane_zoomed = false;
+                self.relayout();
+                self.refresh_active_context();
+                self.save_session_snapshot();
+            }
+            Err(error) => {
+                let message = error.to_string();
+                log::error!("[PTY] {message}");
+                self.session_diagnostic =
+                    Some(crate::review_text::bound_diagnostic_text(message.clone()));
+                self.push_toast(message, ToastKind::Warning);
+            }
+        }
+    }
+
+    /// Move keyboard focus to the next leaf in render order (wraps).
+    fn focus_next_pane(&mut self) {
+        let leaves = self.layout().leaves();
+        if leaves.len() < 2 {
+            return;
+        }
+        let pos = leaves.iter().position(|&s| s == self.active).unwrap_or(0);
+        self.set_focus(leaves[(pos + 1) % leaves.len()]);
+        self.refresh_active_context();
+    }
+
+    /// Move keyboard focus to the previous leaf in render order (wraps).
+    fn focus_prev_pane(&mut self) {
+        let leaves = self.layout().leaves();
+        if leaves.len() < 2 {
+            return;
+        }
+        let pos = leaves.iter().position(|&s| s == self.active).unwrap_or(0);
+        self.set_focus(leaves[(pos + leaves.len() - 1) % leaves.len()]);
+        self.refresh_active_context();
+    }
+
+    /// Current index of the session with this stable id, if it is still open.
+    /// Anything held across UI events must go through here: indices shift when
+    /// a session is closed or the tabs are reordered.
+    fn session_index_by_id(&self, id: usize) -> Option<usize> {
+        self.sessions.iter().position(|sess| sess.id == id)
+    }
+
+    /// Exchange the sessions shown by two panes. Only the contents move: the
+    /// split topology and every ratio the user arranged stay exactly as they
+    /// were, and focus follows the dragged session into its new pane.
+    fn swap_pane_sessions(&mut self, dragged: usize, target: usize) {
+        if dragged == target
+            || !self.layout().contains_session(dragged)
+            || !self.layout().contains_session(target)
+        {
+            return;
+        }
+        swap_sessions_in_tree(self.layout_mut(), dragged, target);
+        self.set_focus(dragged);
+        self.session_dirty = true;
+        // The two panes usually differ in size, so both shells need a resize.
+        self.relayout();
+        self.refresh_active_context();
+        self.save_session_snapshot();
+    }
+
+    /// Move keyboard focus to the pane physically adjacent in `direction`
+    /// (tmux-style spatial navigation across nesting). No wrap at the edges.
+    fn focus_pane_direction(&mut self, direction: PaneDirection) {
+        let rects = self.pane_rects();
+        if let Some(session) = directional_focus_target(&rects, self.active, direction) {
+            self.set_focus(session);
+            self.refresh_active_context();
+        }
+    }
+
+    /// Grow/shrink the focused pane toward `direction` by nudging the divider on
+    /// that side. Walks up to the nearest ancestor split whose axis matches the
+    /// direction; no-op if there is no such divider.
+    fn resize_pane_direction(&mut self, direction: PaneDirection) {
+        let Some(path) = self.layout().path_to_session(self.active) else {
+            return;
+        };
+        let wanted = direction.axis();
+        let forward = direction.forward();
+        // From the deepest ancestor outward, find a split on the wanted axis
+        // that has a divider on `direction`'s side of the focused subtree.
+        for k in (0..path.len()).rev() {
+            let node_path = &path[..k];
+            let child = path[k];
+            let Some(PaneTree::Split {
+                axis,
+                children,
+                ratios,
+            }) = self.layout_mut().node_at_path_mut(node_path)
+            else {
+                continue;
+            };
+            if *axis != wanted {
+                continue;
+            }
+            let gap = if forward {
+                (child + 1 < children.len()).then_some(child)
+            } else {
+                child.checked_sub(1)
+            };
+            let Some(gap) = gap else {
+                continue;
+            };
+            let step = if forward {
+                SPLIT_RATIO_KEY_STEP
+            } else {
+                -SPLIT_RATIO_KEY_STEP
+            };
+            let first = ratios[gap] + step;
+            if set_divider_share(ratios, gap, first, false) {
+                self.session_dirty = true;
+                self.relayout();
+                self.refresh_active_context();
+            }
+            return;
+        }
+    }
+
+    /// Toggle tmux-style zoom: the focused pane temporarily takes the whole
+    /// terminal area without destroying the split. No-op when not split.
+    fn toggle_pane_zoom(&mut self) {
+        if !self.is_split() {
+            return;
+        }
+        self.pane_zoomed = !self.pane_zoomed;
+        self.relayout();
+        self.refresh_active_context();
+    }
+
+    /// Exchange the focused pane's session with the next leaf's (render order);
+    /// geometry stays put and focus follows the moved session, tmux-style.
+    fn swap_panes(&mut self) {
+        let leaves = self.layout().leaves();
+        if leaves.len() < 2 {
+            return;
+        }
+        let pos = leaves.iter().position(|&s| s == self.active).unwrap_or(0);
+        let other = leaves[(pos + 1) % leaves.len()];
+        self.swap_pane_sessions(self.active, other);
+    }
+
+    /// Reset every split divider in the focused tab to an even share (ember's
+    /// Pane Equalize). Like the divider double-click and drag paths, this only
+    /// relayouts; frost persists ratio changes with the usual session-dirty
+    /// flow rather than saving here.
+    fn equalize_panes(&mut self) {
+        if equalize_pane_tree(self.layout_mut()) {
+            self.session_dirty = true;
+            self.relayout();
+            self.refresh_active_context();
+            self.push_toast(
+                "Pane dividers reset to 50/50".to_string(),
+                ToastKind::Success,
+            );
+        } else {
+            self.push_toast(
+                "Pane dividers are already equal".to_string(),
+                ToastKind::Info,
+            );
+        }
+    }
+
+    /// Close the focused pane's session; the remaining panes keep the split
+    /// (which collapses on its own once only one pane is left).
+    fn close_focused_pane(&mut self) -> Task<Message> {
+        if !self.is_split() {
+            return self.request_close_session(self.active);
+        }
+        let victim = self.active;
+        // Focus lands on the preceding leaf (or the next when closing the first),
+        // matching where the freed space goes.
+        let leaves = self.layout().leaves();
+        let pos = leaves.iter().position(|&s| s == victim).unwrap_or(0);
+        let keep = if pos > 0 {
+            leaves.get(pos - 1)
+        } else {
+            leaves.get(1)
+        };
+        let keep_id = keep.and_then(|&idx| self.sessions.get(idx).map(|session| session.id));
+        self.request_close_session_then(victim, keep_id)

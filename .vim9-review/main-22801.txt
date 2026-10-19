@@ -1,0 +1,300 @@
+            actions = actions.push(
+                button(text("Compare output").size(self.effective_font_size()))
+                    .on_press_maybe(current_sources.then_some(Message::BlockReviewCompare)),
+            );
+        }
+        for (label, format) in [
+            (
+                "Export selection MD",
+                block_export::SessionExportFormat::Markdown,
+            ),
+            (
+                "Export selection JSON",
+                block_export::SessionExportFormat::Json,
+            ),
+        ] {
+            actions = actions.push(
+                button(text(label).size(self.effective_font_size())).on_press_maybe(
+                    (current_sources && !self.block_export_in_flight)
+                        .then_some(Message::BlockReviewExport(format)),
+                ),
+            );
+        }
+        if review.commands.is_some() || review.command_error.is_some() {
+            actions = actions.push(
+                button(text("Copy commands").size(self.effective_font_size()))
+                    .on_press_maybe(valid_commands.then_some(Message::BlockReviewCopy)),
+            );
+            let blocker = self
+                .sessions
+                .get(self.active)
+                .and_then(|sess| block_prompt_replace_blocker(sess.terminal.agent_prompt_status()));
+            let mut insert =
+                button(text("Insert into prompt · not run").size(self.effective_font_size()));
+            if live && valid_insertion && blocker.is_none() {
+                insert = insert.on_press(Message::BlockReviewInsert);
+            }
+            actions = actions.push(insert);
+        }
+        let status = if review.comparison.is_some() {
+            if current_sources {
+                "Read-only comparison of the two captured outputs. Copy includes source details and any limits."
+            } else {
+                "Original comparison snapshot. Selection changed; reopen Review before exporting."
+            }
+        } else if let Some(reason) = review.command_error.as_deref() {
+            reason
+        } else if !live {
+            "Source changed or was evicted. Close and reopen to review the current pane."
+        } else if review.commands.is_some() && !valid_commands {
+            "Source text or selection changed. Close and review again before copying or inserting."
+        } else if review.commands.is_some() && !valid_insertion {
+            "Paste mode changed. Copy is available; close and review again before inserting."
+        } else if review.commands.is_some() {
+            self.sessions
+                .get(self.active)
+                .and_then(|sess| block_prompt_replace_blocker(sess.terminal.agent_prompt_status()))
+                .unwrap_or("Enter does not insert. Use the explicit button after review.")
+        } else {
+            "Read-only snapshot. Copy/export actions remain available from the block menu."
+        };
+        let panel_size = block_review_panel_size(self.win_size);
+        let title = text(&review.title).size(self.effective_font_size());
+        let status = text(status)
+            .size(self.effective_font_size())
+            .wrapping(text::Wrapping::Word);
+        let preview = text(&review.body)
+            .size(self.effective_font_size())
+            .font(iced::Font::MONOSPACE)
+            .wrapping(text::Wrapping::Word)
+            .width(Length::Fill);
+        // A short/narrow window cannot reserve a wrapped heading, status and
+        // actions as well as a useful preview. Let the heading scroll in that
+        // case; the action row still owns its measured height outside the
+        // single reading scroll area, so no controls overlap or disappear.
+        let reading: Element<'_, Message> = if block_review_scrolls_heading(panel_size) {
+            scrollable(column![title, status, preview].spacing(12))
+                .height(Length::Fill)
+                .into()
+        } else {
+            column![title, status, scrollable(preview).height(Length::Fill)]
+                .spacing(12)
+                .height(Length::Fill)
+                .into()
+        };
+        let panel = container(column![reading, actions.wrap()].spacing(12))
+            .padding(18)
+            .width(Length::Fixed(panel_size.width))
+            .height(Length::Fixed(panel_size.height))
+            .style(container::dark);
+        let backdrop = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::BlockReviewClose);
+        stack![
+            Element::from(backdrop),
+            Element::from(
+                container(mouse_area(panel).on_press(Message::BlockReviewKeepOpen))
+                    .center(Length::Fill)
+            )
+        ]
+        .into()
+    }
+
+    /// Selected-block shortcut only: never choose history implicitly or edit the prompt.
+    /// Returning None on any failed guard preserves the ordinary key/PTY path.
+    fn open_selected_block_menu(&mut self) -> Option<Task<Message>> {
+        let sess = self.sessions.get(self.active)?;
+        // Fail closed on missing foreground proof as well as OSC busy state.
+        // A primary-screen child must retain its keys even with stale shell marks.
+        if jterm_core::process::tty_foreground_pgid(sess.master_fd)
+            != Some(sess.pty.get_child_pid())
+        {
+            return None;
+        }
+        let selected = sess.block_selection.active();
+        let zone_id = block_menu_keyboard_target(
+            self.terminal_input_active() && self.block_binding_available(),
+            &sess.terminal.preedit_text,
+            selected,
+            selected.is_some_and(|id| sess.terminal.zone_by_id(id).is_some()),
+        )?;
+        let session_id = sess.id;
+        let rect = self
+            .pane_rects()
+            .into_iter()
+            .find(|pane| pane.session == self.active)?
+            .rect;
+        self.block_menu = Some(BlockMenuState {
+            session_id,
+            zone_id,
+            anchor: iced::Point::new(rect.x + 12.0, rect.y + self.pane_header_height() + 12.0),
+            focused_action: Some(BlockMenuAction::Details),
+            chat_read_only: false,
+        });
+        Some(Task::none())
+    }
+
+    fn available_block_menu_actions(&self, state: BlockMenuState) -> Vec<BlockMenuAction> {
+        let Some(sess) = self
+            .sessions
+            .iter()
+            .find(|sess| sess.id == state.session_id)
+        else {
+            return vec![BlockMenuAction::Close];
+        };
+        let Some(zone) = sess.terminal.zone_by_id(state.zone_id) else {
+            return vec![BlockMenuAction::Close];
+        };
+        if state.chat_read_only {
+            if !chat_menu_target_is_current(
+                state,
+                self.sessions[self.active].id,
+                self.config.is_chat_mode(),
+                sess.terminal.is_alt_buffer_active(),
+                !zone.rows_evicted,
+            ) {
+                return vec![BlockMenuAction::Close];
+            }
+            return chat_read_only_menu_actions(
+                zone.command
+                    .as_deref()
+                    .is_some_and(|command| !command.trim().is_empty()),
+            );
+        }
+        let selection = block_menu_selection_summary(
+            sess.terminal
+                .command_zones
+                .iter()
+                .map(|zone| (zone.id, zone.command.as_deref())),
+            &sess.block_selection,
+            zone.id,
+        );
+        let collapsed = sess.projection_policy.is_collapsed(zone.id);
+        block_menu_actions(
+            (collapsed || sess.terminal.finished_output_range(zone.id).is_some())
+                .then_some(collapsed),
+            selection.has_selected_commands,
+            selection.clicked_has_command,
+            matches!(
+                block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                block_mode::BlockOutcome::Failed(_)
+            ),
+            self.config.experimental_task_sidebar,
+        )
+    }
+
+    fn handle_block_menu_key(
+        &mut self,
+        key: &keyboard::Key,
+        modifiers: keyboard::Modifiers,
+    ) -> Task<Message> {
+        use keyboard::{key::Named, Key};
+        if matches!(key, Key::Named(Named::Escape)) {
+            self.block_menu = None;
+            return Task::none();
+        }
+        let Some(menu) = self.block_menu else {
+            return Task::none();
+        };
+        if modifiers.shift() || modifiers.control() || modifiers.alt() || modifiers.logo() {
+            return Task::none();
+        }
+        let actions = self.available_block_menu_actions(menu);
+        if matches!(key, Key::Named(Named::Enter)) {
+            if let Some(action) = menu
+                .focused_action
+                .filter(|action| actions.contains(action))
+            {
+                return self.execute_block_menu_action(action);
+            }
+            return Task::none();
+        }
+        if matches!(
+            key,
+            Key::Named(Named::ArrowUp | Named::ArrowDown | Named::Home | Named::End)
+        ) {
+            if let Some(state) = self.block_menu.as_mut() {
+                state.focused_action = block_menu_navigation(&actions, menu.focused_action, key);
+            }
+            return block_search_layout::reveal_target(
+                "block-menu-panel",
+                "block-menu-scroll",
+                "block-menu-selected",
+            );
+        }
+        // Text, shortcuts, and all other keys remain owned by the menu.
+        Task::none()
+    }
+
+    fn block_menu_view(&self, state: BlockMenuState) -> Element<'_, Message> {
+        let target = self
+            .sessions
+            .iter()
+            .find(|sess| sess.id == state.session_id)
+            .and_then(|sess| {
+                sess.terminal
+                    .zone_by_id(state.zone_id)
+                    .map(|zone| (sess, zone))
+            });
+        let actions = self.available_block_menu_actions(state);
+        let row_btn = |label: &str, action: BlockMenuAction| -> Element<'_, Message> {
+            let focused = state.focused_action == Some(action) && actions.contains(&action);
+            let mut content = column![self.popup_text(label.to_string())].spacing(2);
+            if let Some(hint) = block_menu_command_hint(action) {
+                content = content.push(
+                    self.popup_text(hint)
+                        .color(self.c_text_dim())
+                        .wrapping(text::Wrapping::Word),
+                );
+            }
+            if let Some(shortcut) = (!state.chat_read_only)
+                .then(|| block_menu_shortcut_command(action))
+                .flatten()
+                .and_then(|command| self.keybindings.shortcut_label(command))
+            {
+                // A second wrapping line keeps paired actions usable in narrow menus.
+                content = content.push(
+                    self.popup_text(shortcut)
+                        .color(self.c_text_dim())
+                        .wrapping(text::Wrapping::Word),
+                );
+            }
+            let button = button(content)
+                .on_press_maybe(
+                    actions
+                        .contains(&action)
+                        .then_some(Message::BlockMenuAction(action)),
+                )
+                .padding([5, 9])
+                .width(Length::Fill)
+                .style(move |theme, status| {
+                    if focused {
+                        button::primary(theme, status)
+                    } else if action == BlockMenuAction::Clear {
+                        button::danger(theme, status)
+                    } else {
+                        self.ghost_btn_style()(theme, status)
+                    }
+                });
+            let item = container(button).width(Length::Fill);
+            if focused {
+                item.id("block-menu-selected").into()
+            } else {
+                item.into()
+            }
+        };
+
+        let mut body = column![].spacing(7);
+        if let Some((sess, zone)) = target {
+            let command = zone
+                .command
+                .as_deref()
+                .unwrap_or(if zone.command_truncated {
+                    "Command unavailable"
+                } else {
+                    "Background output"
+                });
+            let preview = history_picker::display_command(command);

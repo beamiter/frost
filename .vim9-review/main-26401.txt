@@ -1,0 +1,300 @@
+            });
+
+        // The same higher-priority modals that block pane interaction also
+        // shadow Find. Its input may still retain widget focus underneath.
+        let reveal_key = reveal
+            .as_ref()
+            .filter(|_| self.terminal_mouse_active())
+            .map(|target| {
+                let target = target.clone();
+                Box::new(move |event| Message::SearchRevealKey(Box::new(target.clone()), event))
+                    as Box<dyn Fn(keyboard::Event) -> Message>
+            });
+        let input = find_focus::input(
+            SEARCH_INPUT_ID.clone(),
+            &self.search.query,
+            text_input("search…", &self.search.query)
+                .on_input(Message::SearchInput)
+                .size(self.effective_font_size())
+                .width(Length::Fixed(220.0)),
+            reveal_key,
+            self.terminal_mouse_active(),
+        );
+        let mut bar = row![text("Find:").size(self.effective_font_size()), input]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+        if !status.is_empty() {
+            bar = bar.push(text(status).size(self.effective_font_size()));
+        }
+        bar = bar.push(regex_btn).push(case_btn);
+        let mut content = column![bar].spacing(6);
+        if let Some(target) = reveal {
+            content = content.push(
+                row![
+                    text("Match is hidden in a collapsed block").size(self.effective_font_size()),
+                    button(text("Reveal match (Ctrl+Enter)").size(self.effective_font_size()))
+                        .on_press(Message::SearchRevealMatch(Box::new(target)))
+                        .padding([4, 8]),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+        let inner = container(content).padding([4, 10]).style(container::dark);
+        container(inner)
+            .align_right(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(8)
+            .into()
+    }
+
+    /// Centered Find & Replace modal (Ctrl+Alt+R). The scrollback is read-only
+    /// program output, so the replacement runs on the current selection and the
+    /// result goes to the clipboard or — without a trailing newline — to the
+    /// active pane's prompt.
+    fn search_replace_panel(&self) -> Element<'_, Message> {
+        let label = |s: &str| {
+            container(text(s.to_string()).size(self.effective_font_size()))
+                .width(Length::Fixed(64.0))
+        };
+        let find_input = text_input("find…", &self.search_replace.search_input)
+            .id(SEARCH_REPLACE_FIND_ID.clone())
+            .on_input(Message::SearchReplaceFindInput)
+            .size(self.effective_font_size());
+        let replace_input = text_input("replace with…", &self.search_replace.replace_input)
+            .on_input(Message::SearchReplaceReplaceInput)
+            .size(self.effective_font_size());
+        let inputs = column![
+            row![label("Find:"), find_input]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            row![label("Replace:"), replace_input]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+        ]
+        .spacing(6);
+
+        let toggles = row![
+            checkbox(self.search_replace.config.use_regex)
+                .label("Regex")
+                .text_size(self.effective_font_size())
+                .on_toggle(|_| Message::SearchReplaceToggleRegex),
+            checkbox(self.search_replace.config.case_sensitive)
+                .label("Case")
+                .text_size(self.effective_font_size())
+                .on_toggle(|_| Message::SearchReplaceToggleCase),
+            checkbox(self.search_replace.config.whole_word)
+                .label("Word")
+                .text_size(self.effective_font_size())
+                .on_toggle(|_| Message::SearchReplaceToggleWord),
+            checkbox(self.search_replace.options.replace_all)
+                .label("All")
+                .text_size(self.effective_font_size())
+                .on_toggle(|_| Message::SearchReplaceToggleAll),
+        ]
+        .spacing(12);
+
+        let actions = row![
+            button(text("Replace → Clipboard").size(self.effective_font_size())).on_press(
+                Message::SearchReplaceApply(
+                    search_replace_panel::SearchReplaceAction::ReplaceToClipboard
+                )
+            ),
+            button(text("Type into terminal").size(self.effective_font_size())).on_press(
+                Message::SearchReplaceApply(
+                    search_replace_panel::SearchReplaceAction::TypeIntoTerminal
+                )
+            ),
+        ]
+        .spacing(8);
+
+        let title = row![
+            text("Find & Replace").size(self.effective_font_size()),
+            Space::new().width(Length::Fill),
+            button(text("✕").size(self.effective_font_size()))
+                .padding([2, 6])
+                .style(button::text)
+                .on_press(Message::SearchReplaceClose),
+        ]
+        .align_y(iced::Alignment::Center);
+
+        let mut body = column![title, inputs, toggles, actions].spacing(10);
+        if !self.search_replace.status.is_empty() {
+            body = body.push(
+                text(crate::review_text::bound_query_error(
+                    self.search_replace.status.clone(),
+                ))
+                .size(self.effective_font_size())
+                .style(text::secondary),
+            );
+        }
+        body = body.push(
+            text("Runs on the current selection · Esc close")
+                .size(self.effective_font_size())
+                .style(text::secondary),
+        );
+
+        // Stay inside the window like the settings modal does.
+        let panel_width = (self.win_size.width - 32.0).clamp(240.0, 380.0);
+        let panel = container(body)
+            .width(Length::Fixed(panel_width))
+            .padding(12)
+            .style(container::dark);
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::SearchReplaceClose);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
+    /// Centered, fuzzy-filtered command palette overlay. Keys are handled at
+    /// the app level (`handle_palette_key`); rows are also mouse-clickable.
+    fn command_palette(&self) -> Element<'_, Message> {
+        let epoch = self.palette.epoch();
+        let input_epoch = std::sync::Arc::clone(&epoch);
+        let query = text_input("Type to filter…", &self.palette.query)
+            .style(self.popup_input_style())
+            .font(self.mono)
+            .id(PALETTE_INPUT_ID.clone())
+            .on_input(move |value| {
+                Message::PaletteInput(std::sync::Arc::clone(&input_epoch), value)
+            })
+            .size(self.effective_font_size());
+        let query_line = row![self.popup_text("›"), query]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+
+        let mut list = column![].spacing(2);
+        let filtered = self.palette.filtered();
+        if filtered.is_empty() {
+            list = list.push(self.popup_text("No commands").color(self.c_text_dim()));
+        } else {
+            for (pos, (idx, item)) in filtered.iter().enumerate() {
+                let labels = column![
+                    self.popup_text(item.name),
+                    self.popup_text(item.description)
+                        .wrapping(text::Wrapping::None)
+                        .color(self.c_text_dim()),
+                ]
+                .spacing(1)
+                .width(Length::Fill);
+                let mut info = row![labels, Space::new().width(Length::Fill)]
+                    .spacing(10)
+                    .align_y(iced::Alignment::Center);
+                // Read from the live binding table, not from a baked-in
+                // default: a user who rebound or unbound this command must be
+                // shown what they actually have.
+                if let Some(shortcut) = item.shortcut_label(&self.keybindings) {
+                    info = info.push(self.popup_text(shortcut).color(self.c_text_dim()));
+                }
+                let row_btn = button(info)
+                    .on_press(Message::PaletteExecute(std::sync::Arc::clone(&epoch), *idx))
+                    .width(Length::Fill)
+                    .padding([4, 8])
+                    .style(if pos == self.palette.selected {
+                        button::primary
+                    } else {
+                        button::text
+                    });
+                if let Some(identity) = self.palette.row_identity(*idx) {
+                    list = list.push(widget_identity_scope::scope(identity, row_btn));
+                }
+            }
+        }
+
+        let footer = self
+            .popup_text("↑↓ navigate · PgUp/PgDn jump · Enter run · Esc close")
+            .size(self.effective_font_size())
+            .color(self.c_text_dim());
+        let panel_width = (self.win_size.width - 32.0).clamp(300.0, 640.0);
+        let panel_height = (self.win_size.height - 48.0).clamp(220.0, 520.0);
+        let inner = container(
+            column![
+                query_line,
+                scrollable(list)
+                    .id(PALETTE_LIST_ID.clone())
+                    .height(Length::Shrink),
+                footer
+            ]
+            .spacing(8),
+        )
+        .width(Length::Fixed(panel_width))
+        .max_height(panel_height)
+        .padding(12)
+        .style(self.popup_style());
+        widget_identity_scope::scope(
+            epoch,
+            container(inner)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+    }
+
+    /// The same gate admits preview actions and their timer subscription.
+    fn organism_preview_visible(&self) -> bool {
+        organism_preview::preview_visible(
+            self.focused,
+            self.config_panel_open,
+            self.theme_editor.is_some(),
+        )
+    }
+
+    /// Centered settings overlay (Ctrl+Shift+O). Controls live-apply on change;
+    /// Save persists to disk, Reset restores defaults.
+    fn organism_settings(&self) -> Element<'_, Message> {
+        let poses: Vec<organism::Pose> = jterm_core::organism_daily::PreviewPose::ALL
+            .into_iter()
+            .map(organism::Pose)
+            .collect();
+        let motion = organism::MotionChoice::from_config(self.config.ascii_organism_motion);
+        let preview = self
+            .organism
+            .preview_presentation(self.organism_effective_motion());
+        let availability = preview.hello;
+        use organism_preview::PreviewAction;
+        let demo_button = |action, label: &'static str| -> Element<'_, Message> {
+            widget_identity_scope::scope(
+                self.organism.preview_action_identity(action),
+                button(text(label)).on_press(Message::OrganismPreviewAction(
+                    self.organism.preview_request(action),
+                )),
+            )
+        };
+        let (demo_controls, demo_caption): (Element<'_, Message>, String) =
+            if let Some(step) = preview.demo_step {
+                let (action, label) = if preview.demo_paused {
+                    (PreviewAction::Resume, "Resume demo")
+                } else {
+                    (PreviewAction::Pause, "Pause demo")
+                };
+                (
+                    row![
+                        demo_button(action, label),
+                        demo_button(PreviewAction::Stop, "Stop demo")
+                    ]
+                    .spacing(8)
+                    .into(),
+                    format!(
+                        "Demo {step}/5: {} (example){} No command runs.",
+                        preview.pose.label(),
+                        if preview.demo_paused {
+                            " · Paused."
+                        } else {
+                            "."
+                        }
+                    ),
+                )
+            } else {
+                (
+                    demo_button(PreviewAction::Play, "Play demo"),
+                    "A 10-second example sequence. No command runs.".to_string(),
+                )
+            };
+        let mut hello_button = button(text("Say hello"));
+        if availability == organism::HelloAvailability::Available {
+            hello_button = hello_button.on_press(Message::OrganismPreviewAction(

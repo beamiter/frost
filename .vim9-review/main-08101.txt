@@ -1,0 +1,300 @@
+            self.invalidate_sidebar_pending_work();
+            self.sidebar_selection.clear();
+            self.sidebar_selection_anchor = None;
+            self.sidebar_filter = None;
+            self.sidebar_path_input = None;
+            self.set_sidebar_notice(format!("Following {label}"), true);
+            self.apply_config();
+        }
+        Task::none()
+    }
+
+    /// Reconcile the file tree's immutable host snapshot after a config
+    /// replacement. Numeric indices are never trusted across snapshots: the
+    /// complete old profile must have exactly one active match in the new one.
+    /// A selected profile that cannot be proved identical falls back to Local.
+    fn reconcile_sidebar_remote_hosts(&mut self) -> Option<sidebar::DirectoryRequest> {
+        let old_hosts = self.sidebar.hosts_snapshot().to_vec();
+        if old_hosts == self.config.remote_hosts {
+            return None;
+        }
+        let new_hosts = self.config.remote_hosts.clone();
+        let old_location = self.sidebar.location.clone();
+        let rebound = remap_sidebar_location(&old_hosts, &new_hosts, &self.sidebar.location);
+        let clipboard_rebound = self
+            .sidebar_clipboard
+            .as_ref()
+            .map(|clipboard| remap_sidebar_location(&old_hosts, &new_hosts, &clipboard.loc));
+        self.sidebar_hosts_epoch = self.sidebar_hosts_epoch.wrapping_add(1);
+        self.invalidate_sidebar_remote_follow_intent();
+        // Config identity really did change, so let the still-live command be
+        // reconsidered against the new saved-profile set on the next tick.
+        self.sidebar_follow_observed = None;
+        let Some(location) = rebound else {
+            return Some(self.reset_sidebar_to_local_with_hosts(
+                new_hosts,
+                "Remote profile changed or is ambiguous; Files returned to Local. Choose a destination again."
+                .to_string(),
+            ));
+        };
+        self.sidebar.set_hosts(new_hosts);
+        let reindexed = location != old_location;
+        if !reindexed {
+            self.sidebar.location = location.clone();
+        }
+
+        if let Some(remapped) = clipboard_rebound {
+            match remapped {
+                Some(location) => {
+                    if let Some(clipboard) = self.sidebar_clipboard.as_mut() {
+                        clipboard.loc = location;
+                    }
+                }
+                None => {
+                    self.sidebar_clipboard = None;
+                    self.set_sidebar_notice("File clipboard cleared because its remote profile changed or became ambiguous"
+                            .to_string(), false);
+                }
+            }
+        }
+        if reindexed {
+            // The exact profile survived but moved to another numeric slot.
+            // Old filesystem requests still own a safe immutable snapshot, but
+            // proactively replacing them prevents a policy change from ever
+            // leaving this tree in Loading and makes all later ops use the new
+            // slot immediately. File workers keep their exact old profile
+            // identity and may still report against the unique new slot.
+            self.clear_sidebar_tree_intent();
+            return Some(self.sidebar.rebind_location_and_refresh(location));
+        }
+        None
+    }
+
+    fn open_sidebar_terminal(&mut self) {
+        match self.sidebar.location.clone() {
+            remote_fs::FsLocation::Local => {
+                let Some(cwd) = self.sidebar.current_dir.to_str().map(ToOwned::to_owned) else {
+                    self.push_toast(
+                        "Cannot open a terminal here: the directory name is not valid UTF-8",
+                        ToastKind::Warning,
+                    );
+                    return;
+                };
+                self.new_session_at(Some(&cwd));
+            }
+            remote_fs::FsLocation::Remote(index) => self.connect_remote_host(index),
+            remote_fs::FsLocation::Transient(profile) => {
+                self.connect_remote_profile(profile, "temporary SSH target".to_string(), true)
+            }
+        }
+    }
+
+    fn navigate_sidebar_to(&mut self, path: std::path::PathBuf) -> Task<Message> {
+        self.invalidate_sidebar_remote_follow_intent();
+        self.sidebar
+            .begin_navigation(path)
+            .map_or_else(Task::none, |request| self.queue_sidebar_load(request))
+    }
+
+    fn navigate_sidebar_back(&mut self) -> Task<Message> {
+        self.invalidate_sidebar_remote_follow_intent();
+        self.sidebar
+            .navigate_back()
+            .map_or_else(Task::none, |request| self.queue_sidebar_load(request))
+    }
+
+    fn navigate_sidebar_forward(&mut self) -> Task<Message> {
+        self.invalidate_sidebar_remote_follow_intent();
+        self.sidebar
+            .navigate_forward()
+            .map_or_else(Task::none, |request| self.queue_sidebar_load(request))
+    }
+
+    fn navigate_sidebar_parent(&mut self) -> Task<Message> {
+        self.sidebar
+            .current_dir
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .map_or_else(Task::none, |parent| self.navigate_sidebar_to(parent))
+    }
+
+    fn navigate_sidebar_home(&mut self) -> Task<Message> {
+        self.sidebar
+            .home_dir()
+            .map(std::path::Path::to_path_buf)
+            .map_or_else(Task::none, |home| self.navigate_sidebar_to(home))
+    }
+
+    fn begin_sidebar_path_edit(&mut self) -> Task<Message> {
+        let Some(path) = self.sidebar.current_dir.to_str().map(ToOwned::to_owned) else {
+            self.set_sidebar_notice(
+                "This path is not valid UTF-8 and cannot be edited safely".to_string(),
+                false,
+            );
+            return Task::none();
+        };
+        if sidebar::validate_absolute_navigation_path(&path).is_err() {
+            self.set_sidebar_notice(
+                "This path contains characters that cannot be edited safely".to_string(),
+                false,
+            );
+            return Task::none();
+        }
+        self.sidebar_path_input = Some(path);
+        iced::widget::operation::focus(SIDEBAR_PATH_INPUT_ID.clone())
+    }
+
+    fn submit_sidebar_path(&mut self) -> Task<Message> {
+        let Some(input) = self.sidebar_path_input.as_deref() else {
+            return Task::none();
+        };
+        let path = match sidebar::validate_absolute_navigation_path(input) {
+            Ok(path) => path,
+            Err(error) => {
+                self.set_sidebar_notice(error.to_string(), false);
+                return iced::widget::operation::focus(SIDEBAR_PATH_INPUT_ID.clone());
+            }
+        };
+        self.sidebar_path_input = None;
+        self.navigate_sidebar_to(path)
+    }
+
+    fn queue_sidebar_load(&mut self, request: sidebar::DirectoryRequest) -> Task<Message> {
+        let rejected = self.sidebar_scans.enqueue(request);
+        let mut tasks: Vec<Task<Message>> = rejected
+            .into_iter()
+            .map(|request| {
+                Task::done(Message::SidebarLoaded(sidebar::DirectoryResult::failed(
+                    request,
+                    sidebar::DirectoryError::busy(format!(
+                        "Directory scan queue is full ({} pending); retry after another scan finishes",
+                        sidebar::MAX_DIRECTORY_SCANS_TOTAL
+                    )),
+                )))
+            })
+            .collect();
+        let dispatch = self.dispatch_sidebar_scans();
+        if tasks.is_empty() {
+            dispatch
+        } else {
+            tasks.push(dispatch);
+            Task::batch(tasks)
+        }
+    }
+
+    fn dispatch_sidebar_scans(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for request in self.sidebar_scans.take_ready() {
+            if self.sidebar.mark_request_running(&request) {
+                tasks.push(sidebar_scan_task(request));
+            } else {
+                self.sidebar_scans
+                    .finish(request.generation, request.request_id);
+            }
+        }
+        if tasks.is_empty() {
+            Task::none()
+        } else {
+            Task::batch(tasks)
+        }
+    }
+
+    /// Refresh only loaded directory snapshots the completed mutation could
+    /// have changed. Collapsed directories retain their cached subtree and are
+    /// reconciled just like expanded ones; paths outside the visible root are
+    /// intentionally ignored.
+    fn refresh_sidebar_directories(&mut self, directories: &[std::path::PathBuf]) -> Task<Message> {
+        self.sidebar.invalidate_cached_directories(directories);
+        let requests: Vec<_> = directories
+            .iter()
+            .filter_map(|path| self.sidebar.refresh_directory(path))
+            .collect();
+        if requests.is_empty() {
+            return Task::none();
+        }
+        let tasks = requests
+            .into_iter()
+            .map(|request| self.queue_sidebar_load(request))
+            .collect::<Vec<_>>();
+        Task::batch(tasks)
+    }
+
+    /// Toggle the left dock and refresh its file root when it becomes visible.
+    /// Keeping this in one place makes the toolbar, shortcut, and command
+    /// palette behave identically.
+    fn toggle_sidebar(&mut self) -> Task<Message> {
+        self.task_panel.retire_panel_callbacks();
+        self.invalidate_sidebar_remote_follow_intent();
+        self.sidebar_open = !self.sidebar_open;
+        self.sidebar_files_focused = self.sidebar_open && self.sidebar_panel == SidebarPanel::Files;
+        // The cwd follow is local-only, exactly as in SetSidebarPanel.
+        let follow_local = self.sidebar.location == remote_fs::FsLocation::Local;
+        let request = if self.sidebar_open && self.sidebar_panel == SidebarPanel::Files {
+            if follow_local {
+                if let Some(cwd) = self
+                    .sessions
+                    .get(self.active)
+                    .and_then(|s| s.cwd_cache.clone().or_else(|| s.cwd()))
+                {
+                    Some(self.sidebar.set_current_dir(std::path::PathBuf::from(cwd)))
+                } else {
+                    Some(self.sidebar.refresh())
+                }
+            } else {
+                Some(self.sidebar.refresh())
+            }
+        } else {
+            None
+        };
+        self.apply_config();
+        request.map_or_else(Task::none, |request| self.queue_sidebar_load(request))
+    }
+
+    /// Dispatch one file-tree context-menu action against its frozen target.
+    /// Directory-scope actions (New File/New Folder/Paste) act inside the
+    /// clicked directory, or inside the clicked file's parent.
+    fn execute_sidebar_menu_action(
+        &mut self,
+        menu: SidebarMenuState,
+        action: SidebarMenuAction,
+    ) -> Task<Message> {
+        self.invalidate_sidebar_remote_follow_intent();
+        if !self.sidebar.accepts_generation(menu.generation) {
+            self.set_sidebar_notice(
+                "Files changed; reopen the menu before modifying anything".to_string(),
+                false,
+            );
+            return Task::none();
+        }
+        let target_dir = if menu.is_dir {
+            menu.path.clone()
+        } else {
+            menu.path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| menu.path.clone())
+        };
+        match action {
+            SidebarMenuAction::OpenDirectory => {
+                if menu.is_dir {
+                    self.navigate_sidebar_to(menu.path)
+                } else {
+                    Task::none()
+                }
+            }
+            SidebarMenuAction::NewFile | SidebarMenuAction::NewFolder => {
+                self.sidebar_dialog = Some(SidebarDialogState {
+                    kind: if action == SidebarMenuAction::NewFile {
+                        SidebarDialogKind::NewFile
+                    } else {
+                        SidebarDialogKind::NewFolder
+                    },
+                    path: target_dir,
+                    input: String::new(),
+                    error: None,
+                    generation: menu.generation,
+                });
+                iced::widget::operation::focus(SIDEBAR_DIALOG_INPUT_ID.clone())
+            }
+            SidebarMenuAction::Rename => {
+                // Seed the editor with the clicked node's current name, so a

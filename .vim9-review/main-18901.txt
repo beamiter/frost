@@ -1,0 +1,300 @@
+                // Claim the same native hold before revealing, and respect a
+                // terminal IME candidate whose owner changed to this overlay.
+                self.native_enter_ownership.lock().claim_pressed();
+                if self.terminal_ime.claim_enter(&event)
+                    || !self.focused
+                    || !self.terminal_mouse_active()
+                {
+                    return Task::none();
+                }
+                return self.reveal_hidden_search_match(&target);
+            }
+            Message::SearchInput(value) => {
+                self.search.set_query(value);
+                self.recompute_search();
+                self.reveal_current_search_match();
+            }
+            Message::SearchReplaceFindInput(value) => {
+                self.search_replace.set_search_input(value);
+            }
+            Message::SearchReplaceReplaceInput(value) => {
+                self.search_replace.set_replace_input(value);
+            }
+            Message::SearchReplaceToggleRegex => {
+                self.search_replace.config.use_regex = !self.search_replace.config.use_regex;
+            }
+            Message::SearchReplaceToggleCase => {
+                self.search_replace.config.case_sensitive =
+                    !self.search_replace.config.case_sensitive;
+            }
+            Message::SearchReplaceToggleWord => {
+                self.search_replace.config.whole_word = !self.search_replace.config.whole_word;
+            }
+            Message::SearchReplaceToggleAll => {
+                self.search_replace.options.replace_all = !self.search_replace.options.replace_all;
+            }
+            Message::SearchReplaceApply(action) => {
+                return self.apply_search_replace(action);
+            }
+            Message::SearchReplaceClose => self.search_replace.is_open = false,
+            Message::PaletteInput(epoch, value) => {
+                if self.palette.accepts_epoch(&epoch) {
+                    self.palette.set_query(value);
+                    return self.palette_snap_task();
+                }
+            }
+            Message::PaletteExecute(epoch, i) => {
+                if let Some(action) = self.palette.action_at(&epoch, i) {
+                    let greeting_target = self.palette.greeting_target();
+                    self.palette.close();
+                    return self.execute_palette_action(action, greeting_target);
+                }
+            }
+            Message::ToggleConfigPanel => {
+                self.set_config_panel_open(!self.config_panel_open);
+            }
+            Message::BlinkTick => {
+                self.blink_on = !self.blink_on;
+            }
+            Message::BlockElapsedTick => {}
+            Message::PtyWriteTick => {
+                let mut failed = false;
+                for session in &mut self.sessions {
+                    if !session.flush_write_queue() {
+                        failed = true;
+                    }
+                }
+                if failed {
+                    self.push_toast("Terminal input write failed", ToastKind::Warning);
+                }
+            }
+            Message::SearchRefreshTick => {
+                let active_reflow_pending = self
+                    .sessions
+                    .get(self.active)
+                    .is_some_and(|session| self.history_reflow_sessions.contains(&session.id));
+                if self.search_dirty && !active_reflow_pending {
+                    self.recompute_search();
+                }
+            }
+            Message::HistoryReflowTick => {
+                if self
+                    .history_reflow_due
+                    .is_some_and(|due| std::time::Instant::now() >= due)
+                {
+                    let pending = std::mem::take(&mut self.history_reflow_sessions);
+                    let mut normalized_any = false;
+                    for session in &mut self.sessions {
+                        if pending.contains(&session.id) {
+                            if session.terminal.normalize_scrollback_width() {
+                                normalized_any = true;
+                            } else {
+                                self.history_reflow_sessions.insert(session.id);
+                            }
+                            session.refresh();
+                        }
+                    }
+                    self.history_reflow_due = (!self.history_reflow_sessions.is_empty())
+                        .then(|| std::time::Instant::now() + std::time::Duration::from_millis(500));
+                    let active_reflow_pending = self
+                        .sessions
+                        .get(self.active)
+                        .is_some_and(|session| self.history_reflow_sessions.contains(&session.id));
+                    if self.search.is_open
+                        && !active_reflow_pending
+                        && (normalized_any || self.search_dirty)
+                    {
+                        self.recompute_search();
+                        // Reflow is maintenance, not a new navigation request.
+                        // Preserve any newer manual scroll or Go live intent.
+                    }
+                    self.links_cache_key = None;
+                }
+            }
+            Message::SetTheme(name) => {
+                if let Some(name) =
+                    crate::config::accepted_config_text(name, crate::config::MAX_CONFIG_NAME_BYTES)
+                {
+                    self.config.theme = name;
+                    self.config_dirty = true;
+                    self.apply_config();
+                }
+            }
+            Message::SetFontSize(v) => {
+                self.config.set_content_font_size(v);
+                self.config_dirty = true;
+                self.apply_config();
+            }
+            Message::SetChromeFontSize(v) => {
+                self.set_chrome_font_size(v);
+            }
+            Message::SetUiScale(v) => {
+                let old_scale = self.scale_factor();
+                let new_scale = v.clamp(0.5, 4.0);
+                self.win_size = logical_viewport_after_scale(self.win_size, old_scale, new_scale);
+                self.config.ui_scale = Some(new_scale);
+                self.config_dirty = true;
+                self.apply_config();
+            }
+            Message::SetLineSpacing(v) => {
+                self.config.line_spacing = Config::clamp_line_spacing(v);
+                self.config_dirty = true;
+                self.apply_config();
+            }
+            Message::SetPadding(v) => {
+                self.config.padding = Config::clamp_padding(v);
+                self.config_dirty = true;
+                self.apply_config();
+            }
+            Message::SetOpacity(v) => {
+                // Read directly at view/style time, so no apply_config rebuild.
+                self.config.opacity = Config::clamp_opacity(v);
+                self.config_dirty = true;
+            }
+            Message::SetScrollback(v) => {
+                self.config.scrollback_lines = Config::clamp_scrollback_lines(v as usize);
+                self.config_dirty = true;
+                self.apply_config();
+            }
+            Message::SetScrollSpeed(v) => {
+                self.config.scroll_speed = Config::clamp_scroll_speed(v);
+                self.config_dirty = true;
+            }
+            Message::SetFontFamily(name) => {
+                if let Some(name) =
+                    crate::config::accepted_config_text(name, crate::config::MAX_CONFIG_NAME_BYTES)
+                {
+                    self.config.font_family = name;
+                    self.config_dirty = true;
+                    self.apply_config();
+                }
+            }
+            Message::SetScrollbarAlways(always) => {
+                self.config.scrollbar_visibility = if always {
+                    config::ScrollbarVisibility::Always
+                } else {
+                    config::ScrollbarVisibility::Auto
+                };
+                self.config_dirty = true;
+            }
+            Message::SetDisableAltScreen(disable) => {
+                self.config.disable_alt_screen = disable;
+                self.config_dirty = true;
+                self.apply_config();
+            }
+            Message::SetAllowClipboardRead(allow) => {
+                self.before_clipboard_permission_change(allow);
+                self.config.allow_clipboard_read = allow;
+                self.config_dirty = true;
+            }
+            Message::SetAllowRemoteClipboardWrite(allow) => {
+                self.config.allow_remote_clipboard_write = allow;
+                self.config_dirty = true;
+            }
+            Message::SetNotifyLongBlocks(enabled) => {
+                self.config.notify_long_blocks = enabled;
+                self.config_dirty = true;
+            }
+            Message::ChatInterrupt(token) | Message::ChatSubmit(token) => {
+                let input_ready = self.chat_input_ready(token.session);
+                let Some(sess) = self
+                    .sessions
+                    .get_mut(self.active)
+                    .filter(|session| session.id == token.session)
+                else {
+                    return Task::none();
+                };
+                // No UI FIFO admission is called acceptance. Revalidate the
+                // displayed action at the native single-byte write boundary.
+                if !sess.try_chat_control(&token, input_ready) {
+                    return Task::none();
+                }
+                if token.kind() == chat_mode::ControlKind::Submit {
+                    sess.block_selection.clear();
+                    sess.terminal.scroll_to_bottom();
+                    sess.projection_view_state.scroll_to_bottom();
+                }
+                if !sess.managed_remote
+                    && self.organism.is_local(sess.id)
+                    && !matches!(
+                        sess.fg_proc_cache.as_deref(),
+                        Some("ssh" | "mosh" | "telnet")
+                    )
+                {
+                    self.organism.accepted_input();
+                }
+                sess.refresh();
+            }
+            Message::SetTerminalMode(mode) => {
+                self.config.terminal_mode = Some(mode);
+                self.config_dirty = true;
+                self.apply_config();
+            }
+            Message::SetBlockCompact(compact) => {
+                // Density changes only card paint. Neither mode reserves a
+                // full blank terminal row between native metadata headers.
+                self.config.block_compact = compact;
+                self.config_dirty = true;
+                self.sync_organism_geometry();
+                self.refresh_active_context();
+            }
+            Message::SetShowRepoStrip(show) => {
+                self.config.show_repo_strip = show;
+                // Hide immediately; the periodic tick would otherwise show a
+                // stale strip until the next refresh. The bottom bar reads the
+                // same cache, so keep it while the bar still wants git.
+                if !show && !self.config.bottom_bar {
+                    for sess in self.sessions.iter_mut() {
+                        sess.git_meta_cache = None;
+                    }
+                }
+                self.config_dirty = true;
+            }
+            Message::SetAsciiOrganism(enabled) => {
+                self.config.ascii_organism_enabled = enabled;
+                self.config_dirty = true;
+                self.apply_config();
+            }
+            Message::SetOrganismExpanded(expanded) => {
+                self.config.ascii_organism_expanded = expanded;
+                self.config_dirty = true;
+                self.apply_config();
+            }
+            Message::SetOrganismMotion(choice) => {
+                let next = choice.configured();
+                self.prepare_organism_motion_config(next);
+                self.config.ascii_organism_motion = next;
+                self.config_dirty = true;
+            }
+            Message::SetOrganismPose(pose) => self.organism.select_pose(pose),
+            Message::OrganismPreviewAction(request) => {
+                if self.organism_preview_visible() {
+                    self.organism.apply_preview_request(&request);
+                }
+            }
+            Message::OrganismBodyObserved(id, epoch, projection, block, observation) => {
+                // Even a withdrawal carries the originating native snapshot.
+                // An old None must not erase a newly visible body in this pane.
+                if epoch == self.organism_geometry_epoch
+                    && block == self.organism_block_key()
+                    && self
+                        .sessions
+                        .get(self.active)
+                        .is_some_and(|s| s.id == id && s.projection.key() == projection)
+                {
+                    self.observe_organism_body(id, observation);
+                }
+            }
+            Message::OrganismHoverEnter(id, epoch) => {
+                if !self.config.is_block_mode() && self.organism_owner() == Some(id) {
+                    let facts = self.organism_attention_facts();
+                    self.organism.enter_live_greeting(id, epoch, facts);
+                }
+            }
+            Message::OrganismHoverExit(id, epoch) => {
+                let facts = self.organism_attention_facts();
+                self.organism.exit_live_greeting(id, epoch, facts);
+            }
+            Message::OrganismPointerButton(button, pressed) => {
+                organism_hover::update_pressed_button(
+                    &mut self.organism_pointer_buttons,

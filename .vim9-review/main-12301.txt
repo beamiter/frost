@@ -1,0 +1,300 @@
+            }
+            None => {
+                self.push_toast(
+                    self.block_absent_toast("failed command block"),
+                    ToastKind::Info,
+                );
+                Task::none()
+            }
+        }
+    }
+
+    /// Palette entry point for Retry on the active pane's failed block.
+    fn palette_failed_block_retry_task(&mut self) -> Task<Message> {
+        match self.palette_failed_block_target() {
+            Some((session_id, zone_id)) => self.failed_block_retry_task(session_id, zone_id),
+            None => {
+                self.push_toast(
+                    self.block_absent_toast("failed command block"),
+                    ToastKind::Info,
+                );
+                Task::none()
+            }
+        }
+    }
+
+    /// Toggle the cross-block search picker (`block:search`). While it is
+    /// open its own key handler owns the chord, so dispatch normally only
+    /// sees the closed state — the guard here covers the palette entry.
+    /// Opening snapshots at most 8 MiB of newest source text, then lowercases
+    /// it under a 16 MiB resident-cache budget on a worker. Matching also runs
+    /// on that single worker, with pending edits coalesced to the latest intent.
+    fn toggle_block_search(&mut self) -> Task<Message> {
+        if self.block_search.is_some() {
+            self.close_block_search();
+            return Task::none();
+        }
+        if !self.ensure_block_action_available("Block search") {
+            return Task::none();
+        }
+        let Some(session_id) = self.sessions.get(self.active).map(|sess| sess.id) else {
+            return Task::none();
+        };
+        self.block_search = Some(self.block_search_memory.state_for(session_id));
+        let build = self.begin_block_search_rebuild();
+        Task::batch(vec![
+            iced::widget::operation::focus(BLOCK_SEARCH_INPUT_ID.clone()),
+            build,
+        ])
+    }
+
+    /// Snapshot the newest source zones without exceeding the UI-thread
+    /// extraction budget. The iterator is lazy: after the first over-budget
+    /// zone, older live rows are not rendered into throwaway Strings.
+    fn block_search_source_snapshot(sess: &Session) -> block_mode::BlockSearchSourceSnapshot {
+        block_mode::bounded_block_search_sources(
+            sess.terminal.command_zones.iter().rev().map(|zone| {
+                block_mode::BlockSearchSource::new(
+                    zone.id,
+                    zone.command.clone(),
+                    sess.terminal.zone_output_text(zone.id),
+                )
+            }),
+            block_mode::BLOCK_SEARCH_SOURCE_MAX_BYTES,
+        )
+    }
+
+    /// Start (or restart) one bounded cache build. Clearing the prior cache
+    /// before source extraction prevents a live refresh from retaining two
+    /// multi-megabyte indexes at once. Query/filter text survives and is
+    /// evaluated when the matching build result arrives.
+    fn begin_block_search_rebuild(&mut self) -> Task<Message> {
+        let Some(session_id) = self.block_search.as_ref().map(|state| state.session_id) else {
+            return Task::none();
+        };
+        // This slot survives picker close/reopen and pane changes. Wait for a
+        // previous matcher/build to release its cache before extracting new
+        // source text, so there is never an old+source+new cache peak.
+        if let Some(job) = &self.block_search_job {
+            if job.matching {
+                job.cancel();
+            }
+            if let Some(state) = self.block_search.as_mut() {
+                state.rebuild_pending = true;
+            }
+            return Task::none();
+        }
+        let Some(version) = self
+            .sessions
+            .get(self.active)
+            .filter(|sess| sess.id == session_id)
+            .map(|sess| BlockSearchZoneVersion::from_terminal(&sess.terminal))
+        else {
+            self.close_block_search();
+            return Task::none();
+        };
+        let Some(epoch) = next_block_search_epoch(&mut self.next_block_search_epoch) else {
+            log::error!("block-search epoch space exhausted; closing picker");
+            self.close_block_search();
+            return Task::none();
+        };
+        let identity = BlockSearchBuildIdentity { session_id, epoch };
+        if let Some(state) = self.block_search.as_mut() {
+            state.epoch = epoch;
+            state.loading = true;
+            state.matching = false;
+            state.match_pending = false;
+            state.rebuild_pending = false;
+            state.manual_refresh_pending = false;
+            state.zone_version = version;
+            if state.refresh_intent.is_none() {
+                state.refresh_intent = Some(state.intent());
+            }
+            // Drop allocations before the 8 MiB source snapshot is extracted:
+            // peak is old-or-(source+new), never old+source+new.
+            state.release_index_for_rebuild();
+        }
+        let Some(snapshot) = self
+            .sessions
+            .get(self.active)
+            .filter(|sess| sess.id == session_id)
+            .map(Self::block_search_source_snapshot)
+        else {
+            self.close_block_search();
+            return Task::none();
+        };
+
+        self.block_search_job = Some(BlockSearchJob {
+            identity,
+            matching: false,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    block_mode::build_block_search_cache(
+                        snapshot,
+                        block_mode::BLOCK_SEARCH_CACHE_MAX_BYTES,
+                    )
+                })
+                .await
+                .map_err(|error| format!("block-search cache worker failed: {error}"))
+            },
+            move |result| Message::BlockSearchCacheBuilt(identity, result),
+        )
+    }
+
+    /// Force a rebuild even when finalized-zone identity is unchanged.
+    /// Repeated F5 presses while a worker runs coalesce into one follow-up.
+    fn force_block_search_rebuild(&mut self) -> Task<Message> {
+        let should_start = self
+            .block_search
+            .as_mut()
+            .is_some_and(BlockSearchState::request_manual_refresh);
+        if should_start {
+            self.begin_block_search_rebuild()
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Close the block search picker because the session landscape changed
+    /// under it: the active session switched (tab/pane focus) or a session
+    /// closed. Its hits and cache were computed against ONE session, zone
+    /// ids restart at 0 per session, and session indices shift on close —
+    /// resolving a held hit afterwards could silently select a block of the
+    /// WRONG session. Dropping the whole state (query, hits, cache) is the
+    /// reset; a closed picker cannot hold stale hits. Matching intent is kept
+    /// separately and is safe to apply to the newly active session.
+    fn close_block_search_on_session_change(&mut self) {
+        self.close_block_search();
+        self.block_menu = None;
+        self.block_clear_confirm = None;
+    }
+
+    fn close_block_search(&mut self) {
+        if let Some(job) = &self.block_search_job {
+            job.cancel();
+        }
+        if let Some(state) = self.block_search.take() {
+            self.block_search_memory.capture(&state);
+        }
+    }
+
+    /// Replace the pending matching intent. The update wrapper dispatches at
+    /// most one worker after the reducer, including reducers with early returns.
+    fn block_search_recompute(&mut self) {
+        self.block_search_recompute_with_anchor(None);
+    }
+
+    /// Recompute while optionally preserving an explicit result/rank anchor.
+    /// Bookmark removal uses this to let a Bookmarked row remove every hit for
+    /// its zone while keeping the highlight at the closest surviving rank.
+    fn block_search_recompute_with_anchor(
+        &mut self,
+        selection_anchor: Option<BlockSearchSelectionAnchor>,
+    ) {
+        let Some(state) = self.block_search.as_mut() else {
+            return;
+        };
+        state.bookmark_notice = None;
+        state.match_pending = true;
+        state.query_error = None;
+        state.match_anchor = selection_anchor.or_else(|| state.take_refresh_selection_anchor());
+        if let Some(job) = &self.block_search_job {
+            if job.matching {
+                job.cancel();
+            }
+        }
+    }
+
+    fn block_search_eligible(&self, filter: BlockSearchFilter) -> std::collections::HashSet<u64> {
+        self.sessions
+            .get(self.active)
+            .map(|sess| {
+                sess.terminal
+                    .command_zones
+                    .iter()
+                    .filter(|zone| {
+                        filter.matches(
+                            zone,
+                            sess.block_bookmarks.contains(zone.id),
+                            sess.block_reading.seen_through,
+                            self.config.notify_long_block_threshold_ms,
+                        )
+                    })
+                    .map(|zone| zone.id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Schedule only the latest pending work. No matching/regex compilation
+    /// runs in the event loop, and no queued request owns a second index.
+    fn dispatch_block_search_work(&mut self) -> Task<Message> {
+        if self.block_search_job.is_some() {
+            return Task::none();
+        }
+        let Some(open) = self.block_search.as_ref() else {
+            return Task::none();
+        };
+        let current = self
+            .sessions
+            .get(self.active)
+            .filter(|sess| sess.id == open.session_id && !sess.terminal.is_alt_buffer_active())
+            .map(|sess| {
+                (
+                    BlockSearchZoneVersion::from_terminal(&sess.terminal),
+                    open.filter.context(
+                        sess.block_reading.seen_through,
+                        self.config.notify_long_block_threshold_ms,
+                    ),
+                )
+            });
+        let Some((current_version, filter_context)) = current else {
+            self.close_block_search();
+            return Task::none();
+        };
+        if open.rebuild_pending || current_version != open.zone_version {
+            return self.begin_block_search_rebuild();
+        }
+        let state = self.block_search.as_mut().expect("current picker");
+        state.observe_filter_context(filter_context);
+        if state.loading || !state.match_pending {
+            return Task::none();
+        }
+        let filter = state.filter;
+        let eligible = self.block_search_eligible(filter);
+        let Some(state) = self.block_search.as_mut() else {
+            return Task::none();
+        };
+        let intent = state.intent();
+        if state.matched_intent.as_ref() == Some(&intent) && state.matched_eligible == eligible {
+            state.match_pending = false;
+            state.match_anchor = None;
+            return Task::none();
+        }
+        let Some(epoch) = next_block_search_epoch(&mut self.next_block_search_epoch) else {
+            self.close_block_search();
+            return Task::none();
+        };
+        let identity = BlockSearchBuildIdentity {
+            session_id: state.session_id,
+            epoch,
+        };
+        let cache = std::mem::take(&mut state.cache);
+        state.epoch = epoch;
+        state.matching = true;
+        state.match_pending = false;
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.block_search_job = Some(BlockSearchJob {
+            identity,
+            matching: true,
+            cancelled: Arc::clone(&cancelled),
+        });
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let result = block_mode::browse_or_search_blocks(
+                        &cache,

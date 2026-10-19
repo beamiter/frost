@@ -1,0 +1,300 @@
+            }
+            Message::TaskCancelDiscardSavedDrafts(reference) => {
+                self.task_panel.cancel_discard_saved_drafts(&reference);
+            }
+            Message::TaskDiscardSavedDrafts(reference) => {
+                self.task_panel.discard_saved_drafts(&reference);
+            }
+            Message::TaskFollowUpInput(reference, value) => {
+                if self.task_follow_up_is_current(&reference) {
+                    self.task_panel
+                        .edit_follow_up(&reference, reference.completed_turns, value);
+                }
+            }
+            Message::TaskFollowUpSend(reference) => {
+                if !self.task_follow_up_is_current(&reference) {
+                    return Task::none();
+                }
+                let Some(text) = self
+                    .task_panel
+                    .begin_follow_up_send(&reference, reference.completed_turns)
+                else {
+                    return Task::none();
+                };
+                // The task and immutable draft are admitted together before
+                // calling the existing core authorization/consent boundary.
+                match self.agent_runtime.prompt_codex(
+                    &self.task_manager,
+                    reference.task_id,
+                    &text,
+                    agent_task_ui::prompt_policy(&self.config),
+                ) {
+                    Ok(()) => self.task_panel.clear_follow_up(),
+                    Err(error) => self.push_toast(error.to_string(), ToastKind::Warning),
+                }
+            }
+            Message::TaskApprovalDeny(task_id, approval_id) => {
+                if let Err(error) = self.agent_runtime.decide_approval(
+                    task_id,
+                    approval_id,
+                    agent_task::ApprovalDecision::Deny { reason: None },
+                ) {
+                    self.push_toast(
+                        format!("Could not deny approval: {error}"),
+                        ToastKind::Warning,
+                    );
+                } else {
+                    self.push_toast(
+                        "Denied managed approval request (accepting stays disabled)",
+                        ToastKind::Info,
+                    );
+                }
+            }
+            Message::TaskDiffOpen(task_id) => {
+                if self.task_panel.selected != Some(task_id)
+                    || !self.config.experimental_task_sidebar
+                    || !self.dock_open()
+                    || self.sidebar_panel != SidebarPanel::Tasks
+                {
+                    return Task::none();
+                }
+                if let Some(task) = self.task_manager.get(task_id) {
+                    let result = self.task_panel.request_diff(
+                        task_id,
+                        task.worktree_path.clone(),
+                        task.base_commit.clone(),
+                    );
+                    if let Err(error) = result {
+                        self.push_toast(error.to_string(), ToastKind::Warning);
+                    }
+                }
+            }
+            Message::TaskDiffClose(reference) => {
+                self.task_panel.close_current_diff(&reference);
+            }
+            Message::TaskValidationStart(task_id) => self.task_start_validation(task_id),
+            Message::TaskMarkComplete(task_id) => {
+                match self.task_manager.complete_after_validation(task_id) {
+                    Ok(()) => self.push_toast("Task marked complete", ToastKind::Success),
+                    Err(error) => self.push_toast(error.to_string(), ToastKind::Warning),
+                }
+            }
+            Message::TaskTerminalOpen(task_id) => self.task_open_terminal(task_id),
+            Message::TaskFocusTerminal(task_id) => {
+                self.task_focus_terminal(task_id, agent_task::TaskTerminalRole::Agent)
+            }
+            Message::TaskFocusValidation(task_id) => {
+                self.task_focus_terminal(task_id, agent_task::TaskTerminalRole::Validation)
+            }
+            Message::TaskTick => self.tasks_tick(),
+            Message::AgentInput(value) => self.agent.set_input(value),
+            Message::AgentSubmit => {
+                self.agent.submit_input();
+                if let Some(task) = self.agent_drive_task() {
+                    return task;
+                }
+            }
+            Message::AgentApprove(id) => {
+                if let Some(task) = self.agent_run_approved(id, None) {
+                    return task;
+                }
+            }
+            Message::AgentEditStart(reference, command) => {
+                self.agent.start_edit(reference, command);
+            }
+            Message::AgentEditInput(reference, value) => {
+                self.agent.update_edit(reference, value);
+            }
+            Message::AgentEditCancel(reference) => self.agent.cancel_edit(reference),
+            Message::AgentEditApprove(reference) => {
+                if let Some(edited) = self.agent.take_edited_command(reference) {
+                    if let Some(task) = self.agent_run_approved(reference, Some(edited)) {
+                        return task;
+                    }
+                }
+            }
+            Message::AgentReject(id) => {
+                self.agent.reject(id);
+                if let Some(task) = self.agent_drive_task() {
+                    return task;
+                }
+            }
+            Message::AgentModelDelta(identity, fragment) => {
+                self.agent.model_delta(identity, &fragment);
+            }
+            Message::AgentModelReply(identity, result) => {
+                self.agent.model_reply(identity, result);
+                if let Some(task) = self.agent_drive_task() {
+                    return task;
+                }
+            }
+            Message::AgentContinueTask => {
+                self.agent.continue_task();
+            }
+            Message::AgentNewTask => {
+                self.agent.new_task();
+            }
+            Message::AgentClearContext => {
+                self.agent.last_manual_completed = None;
+            }
+            Message::SetAiEnabled(enabled) => {
+                self.config.ai_enabled = enabled;
+                self.config_dirty = true;
+            }
+            Message::SetAiProvider(provider) => {
+                if let Some(provider) = crate::config::accepted_config_text(
+                    provider,
+                    crate::config::MAX_CONFIG_NAME_BYTES,
+                ) {
+                    self.config.ai_provider = provider;
+                    self.config_dirty = true;
+                }
+            }
+            Message::SetAiModel(model) => {
+                if let Some(model) =
+                    crate::config::accepted_config_text(model, crate::config::MAX_CONFIG_NAME_BYTES)
+                {
+                    self.config.ai_model = model;
+                    self.config_dirty = true;
+                }
+            }
+            Message::SetAiBaseUrl(url) => {
+                if let Some(url) =
+                    crate::config::accepted_config_text(url, crate::config::MAX_CONFIG_VALUE_BYTES)
+                {
+                    self.config.ai_base_url = url;
+                    self.config_dirty = true;
+                }
+            }
+            Message::SetAiMaxTokens(tokens) => {
+                self.config.ai_max_tokens = tokens.clamp(64, 32_768);
+                self.config_dirty = true;
+            }
+            Message::SetAiTemperature(raw) => {
+                // Keep the raw editing text; only a valid value reaches config.
+                if let Some(raw) = crate::config::accepted_ai_temperature_draft(raw) {
+                    self.config.ai_temperature = raw
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|t| t.is_finite() && (0.0..=2.0).contains(t));
+                    self.ai_temperature_draft = raw;
+                    self.config_dirty = true;
+                }
+            }
+            Message::SetAiRedactSecrets(redact) => {
+                self.config.ai_redact_secrets = redact;
+                self.config_dirty = true;
+            }
+            Message::SetAiShareCommandContext(share) => {
+                self.config.ai_share_command_context = share;
+                self.config_dirty = true;
+            }
+            Message::SetExperimentalTaskSidebar(enabled) => {
+                self.config.experimental_task_sidebar = enabled;
+                self.config_dirty = true;
+                if !enabled && self.sidebar_panel == SidebarPanel::Tasks {
+                    self.task_panel.retire_panel_callbacks();
+                    self.sidebar_panel = SidebarPanel::Tabs;
+                }
+            }
+            Message::SetPreferredAgentProvider(provider) => {
+                if let Some(parsed) = agent_task::AgentProvider::from_config_value(&provider) {
+                    self.config.preferred_agent_provider = parsed.config_value().to_string();
+                    self.config_dirty = true;
+                }
+            }
+            Message::SetAiStream(stream) => {
+                self.config.ai_stream = stream;
+                self.config_dirty = true;
+            }
+            Message::SetAiKeyFile(path) => {
+                // Only an exactly empty edit clears selection. Whitespace
+                // must reach the strict reader/writer unchanged and fail there.
+                if let Some(path) = crate::config::accepted_ai_key_path_draft(path) {
+                    self.config.ai_api_key_file = Some(path).filter(|p| !p.is_empty());
+                    self.config_dirty = true;
+                } else {
+                    self.push_toast(
+                        "Key file path unchanged: unsafe characters or more than 16 KiB",
+                        ToastKind::Warning,
+                    );
+                }
+            }
+            Message::SetAiKeyDraft(value) => {
+                if let Some(value) = crate::persistence::accepted_api_key_draft(value) {
+                    self.ai_key_draft = value;
+                }
+            }
+            Message::StoreAiKey => {
+                let key = self.ai_key_draft.clone();
+                if key.is_empty() {
+                    self.push_toast("Paste an API key first", ToastKind::Warning);
+                } else if self.config_write_blocked {
+                    self.push_toast(
+                        "API key not stored: config cannot safely record its credential-file path",
+                        ToastKind::Warning,
+                    );
+                } else {
+                    // Same write target rule as forge: the configured path,
+                    // otherwise the per-app default. The environment override
+                    // stays read-only and is never chosen as a write target.
+                    let path = self
+                        .config
+                        .ai_api_key_file
+                        .clone()
+                        .filter(|p| !p.is_empty())
+                        .unwrap_or_else(jterm_core::ai::default_api_key_path);
+                    match persistence::write_api_key_file(&path, &key) {
+                        Ok(()) => {
+                            let mut candidate = self.config.clone();
+                            candidate.ai_api_key_file = Some(path.clone());
+                            let candidate = candidate.normalized();
+                            let needs_config_save = self.config_dirty
+                                || candidate.ai_api_key_file != self.config.ai_api_key_file;
+                            self.ai_key_draft.clear();
+                            if needs_config_save {
+                                self.config_save_retry.reset();
+                                match candidate.save_if_unchanged(self.config_revision.as_ref()) {
+                                    Ok(revision) => {
+                                        self.before_clipboard_permission_change(
+                                            candidate.allow_clipboard_read,
+                                        );
+                                        self.config = candidate;
+                                        self.config_revision = Some(revision);
+                                        self.config_dirty = false;
+                                        self.config_save_retry.reset();
+                                        self.push_toast(
+                                            "API key stored (0600) and config path saved",
+                                            ToastKind::Success,
+                                        );
+                                    }
+                                    Err(error) => {
+                                        let message = error.to_string();
+                                        if let Some(revision) = error.committed_revision().cloned()
+                                        {
+                                            // The pointer-bearing config is
+                                            // already visible. Keep memory in
+                                            // lockstep with it and retry the
+                                            // uncertain durability boundary.
+                                            self.before_clipboard_permission_change(
+                                                candidate.allow_clipboard_read,
+                                            );
+                                            self.config = candidate;
+                                            self.config_revision = Some(revision);
+                                            self.config_dirty = true;
+                                        }
+                                        self.note_config_save_error(&error);
+                                        self.push_toast(
+                                            format!(
+                                                "Key file was stored securely, but config persistence needs attention: {message}"
+                                            ),
+                                            ToastKind::Warning,
+                                        );
+                                    }
+                                }
+                            } else {
+                                self.push_toast("API key stored (0600)", ToastKind::Success);
+                            }
+                        }
+                        Err(error) => self

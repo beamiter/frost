@@ -1,0 +1,300 @@
+                    '^' => 0x1e,
+                    '_' => 0x1f,
+                    ' ' => 0,
+                    _ => return text.map(|t| t.as_bytes().to_vec()),
+                };
+                let mut v = Vec::new();
+                if alt {
+                    v.push(0x1b);
+                }
+                v.push(ctrl_byte);
+                Some(v)
+            } else if let Some(t) = text {
+                let mut v = Vec::new();
+                if alt {
+                    v.push(0x1b);
+                }
+                v.extend_from_slice(t.as_bytes());
+                Some(v)
+            } else {
+                let mut v = Vec::new();
+                if alt {
+                    v.push(0x1b);
+                }
+                v.extend_from_slice(s.as_bytes());
+                Some(v)
+            }
+        }
+        Key::Unidentified => text.map(|t| t.as_bytes().to_vec()),
+    }
+}
+
+/// Encode the legacy xterm/terminfo functional-key family. Modified cursor,
+/// editing, and function keys carry a parameter instead of losing Ctrl/Shift
+/// or being represented as an ambiguous ESC prefix.
+fn legacy_function_key_sequence(
+    named: &keyboard::key::Named,
+    mods: keyboard::Modifiers,
+    app_cursor: bool,
+    force_modifier: bool,
+) -> Option<Vec<u8>> {
+    use keyboard::key::Named;
+
+    let csi = |body: &str| format!("\x1b[{body}").into_bytes();
+    let ss3 = |final_byte: char| format!("\x1bO{final_byte}").into_bytes();
+    let has_modifier = mods.shift() || mods.alt() || mods.control() || mods.logo();
+    let modified = force_modifier || has_modifier;
+    let modifier = keyboard_modifier_value(mods);
+    let cursor = |final_byte: char| {
+        if modified {
+            csi(&format!("1;{modifier}{final_byte}"))
+        } else if app_cursor {
+            ss3(final_byte)
+        } else {
+            csi(&final_byte.to_string())
+        }
+    };
+    let tilde = |code: u8| {
+        if modified {
+            csi(&format!("{code};{modifier}~"))
+        } else {
+            csi(&format!("{code}~"))
+        }
+    };
+    let function = |final_byte: char| {
+        if modified {
+            csi(&format!("1;{modifier}{final_byte}"))
+        } else {
+            ss3(final_byte)
+        }
+    };
+
+    Some(match named {
+        Named::ArrowUp => cursor('A'),
+        Named::ArrowDown => cursor('B'),
+        Named::ArrowRight => cursor('C'),
+        Named::ArrowLeft => cursor('D'),
+        Named::Home => cursor('H'),
+        Named::End => cursor('F'),
+        Named::PageUp => tilde(5),
+        Named::PageDown => tilde(6),
+        Named::Delete => tilde(3),
+        Named::Insert => tilde(2),
+        Named::F1 => function('P'),
+        Named::F2 => function('Q'),
+        Named::F3 => function('R'),
+        Named::F4 => function('S'),
+        Named::F5 => tilde(15),
+        Named::F6 => tilde(17),
+        Named::F7 => tilde(18),
+        Named::F8 => tilde(19),
+        Named::F9 => tilde(20),
+        Named::F10 => tilde(21),
+        Named::F11 => tilde(23),
+        Named::F12 => tilde(24),
+        _ => return None,
+    })
+}
+
+/// The base Unicode codepoint a key reports under the Kitty keyboard protocol.
+/// Kitty uses the unshifted/lowercase form for text keys and C0 values for the
+/// handful of named keys that have legacy control-byte encodings.
+fn kitty_text_key_code(key: &keyboard::Key) -> Option<u32> {
+    use keyboard::key::Named;
+    use keyboard::Key;
+
+    match key {
+        Key::Character(s) => s.chars().next()?.to_lowercase().next().map(u32::from),
+        Key::Named(Named::Escape) => Some(27),
+        Key::Named(Named::Enter) => Some(13),
+        Key::Named(Named::Tab) => Some(9),
+        Key::Named(Named::Backspace) => Some(127),
+        Key::Named(Named::Space) => Some(32),
+        _ => None,
+    }
+}
+
+/// Codepoint for the xterm modifyOtherKeys report; like [`kitty_text_key_code`]
+/// but prefers iced's committed text, which carries the character the keyboard
+/// layout actually produced. Shift is not the only way to reach the upper case
+/// form — Caps Lock produces "A" with no modifier set at all — so the committed
+/// text wins whenever no modifier rewrote the key into a control byte.
+fn text_key_code(
+    key: &keyboard::Key,
+    mods: keyboard::Modifiers,
+    text: Option<&str>,
+) -> Option<u32> {
+    let codepoint = kitty_text_key_code(key)?;
+    if !(mods.control() || mods.alt() || mods.logo()) {
+        if let Some(character) = first_committed_key_char(text) {
+            return Some(character as u32);
+        }
+    }
+    if mods.shift() {
+        if let Some(character) = first_committed_key_char(text) {
+            return Some(character as u32);
+        }
+        if let keyboard::Key::Character(s) = key {
+            return s.chars().next()?.to_uppercase().next().map(u32::from);
+        }
+    }
+    Some(codepoint)
+}
+
+fn first_committed_key_char(text: Option<&str>) -> Option<char> {
+    text.and_then(|value| {
+        value.chars().find(|character| {
+            !character.is_control()
+                && !jterm_core::review_input::is_visual_spoofing_character(*character)
+        })
+    })
+}
+
+/// The CSI-u / modifyOtherKeys modifier value: a bitfield + 1.
+fn keyboard_modifier_value(mods: keyboard::Modifiers) -> u8 {
+    let mut bits = 0u8;
+    if mods.shift() {
+        bits |= 0b1;
+    }
+    if mods.alt() {
+        bits |= 0b10;
+    }
+    if mods.control() {
+        bits |= 0b100;
+    }
+    if mods.logo() {
+        bits |= 0b1000;
+    }
+    bits + 1
+}
+
+/// Encode a key press as a Kitty keyboard protocol report (`CSI codepoint;mod u`)
+/// when the app has enabled disambiguation or report-all-keys. Returns `None`
+/// when the protocol is inactive or the key needs no special report.
+fn kitty_encode_key(
+    key: &keyboard::Key,
+    mods: keyboard::Modifiers,
+    text: Option<&str>,
+    kitty_flags: u16,
+) -> Option<Vec<u8>> {
+    let disambiguate = (kitty_flags & 0b1) != 0;
+    let report_alternate_keys = (kitty_flags & 0b100) != 0;
+    let report_all_keys = (kitty_flags & 0b1000) != 0;
+    let report_associated_text = (kitty_flags & 0b10000) != 0;
+    if !disambiguate && !report_all_keys {
+        return None;
+    }
+    let codepoint = kitty_text_key_code(key)?;
+    let legacy_c0_exception = matches!(
+        key,
+        keyboard::Key::Named(
+            keyboard::key::Named::Enter
+                | keyboard::key::Named::Tab
+                | keyboard::key::Named::Backspace
+        )
+    );
+    if legacy_c0_exception && !report_all_keys {
+        return None;
+    }
+    let is_escape = matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape));
+    let should_encode = report_all_keys || is_escape || mods.control() || mods.alt() || mods.logo();
+    if !should_encode {
+        return None;
+    }
+    // The key code is always the unshifted key, so the shifted character has to
+    // travel in the fields the app asked for: the alternate-key field (flag 4)
+    // and/or the associated-text field (flag 16). Without them an app in
+    // report-all-keys mode has to derive the case itself.
+    let committed: Option<String> = text.and_then(|t| {
+        let cleaned: String = t
+            .chars()
+            .filter(|character| {
+                !character.is_control()
+                    && !jterm_core::review_input::is_visual_spoofing_character(*character)
+            })
+            .collect();
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
+    });
+    let mut key_field = codepoint.to_string();
+    if report_alternate_keys && mods.shift() {
+        if let Some(shifted) = committed
+            .as_deref()
+            .and_then(|t| t.chars().next())
+            .map(u32::from)
+            .filter(|shifted| *shifted != codepoint)
+        {
+            key_field = format!("{codepoint}:{shifted}");
+        }
+    }
+    let mut sequence = format!("\x1b[{};{}", key_field, keyboard_modifier_value(mods));
+    if report_associated_text {
+        if let Some(t) = committed.as_deref() {
+            let codepoints: Vec<String> = t.chars().map(|c| u32::from(c).to_string()).collect();
+            sequence.push(';');
+            sequence.push_str(&codepoints.join(":"));
+        }
+    }
+    sequence.push('u');
+    Some(sequence.into_bytes())
+}
+
+/// Encode a key press under xterm's modifyOtherKeys/formatOtherKeys regime.
+fn xterm_modify_other_keys_encode(
+    key: &keyboard::Key,
+    mods: keyboard::Modifiers,
+    text: Option<&str>,
+    modify_other_keys: u16,
+    format_other_keys: u16,
+    report_all_keys: bool,
+) -> Option<Vec<u8>> {
+    let codepoint = text_key_code(key, mods, text)?;
+    let modifier_value = keyboard_modifier_value(mods);
+    let has_non_shift_modifier = mods.control() || mods.alt() || mods.logo();
+    // xterm builds these reports for keys "modified by Control-, Alt- or
+    // Meta-modifiers" — Shift is not one of them, because a shifted printable
+    // key already produced its own character. Escaping Shift at level 2 turned
+    // every capital letter into a CSI report the app had not asked for.
+    let should_encode = if report_all_keys {
+        true
+    } else {
+        match modify_other_keys {
+            0 => false,
+            1 => mods.alt() || mods.logo(),
+            2 => has_non_shift_modifier,
+            _ => true,
+        }
+    };
+    if !should_encode {
+        return None;
+    }
+    if format_other_keys == 1 || report_all_keys {
+        Some(format!("\x1b[{};{}u", codepoint, modifier_value).into_bytes())
+    } else {
+        Some(format!("\x1b[27;{};{}~", modifier_value, codepoint).into_bytes())
+    }
+}
+
+#[cfg(test)]
+mod block_browser_tests;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ime_owner_sync_brackets_every_reducer_and_admission_precedes_pty_write() {
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let update = source
+            .split_once("    fn update(&mut self, message: Message)")
+            .unwrap()
+            .1
+            .split_once("    fn update_message(")
+            .unwrap()
+            .0;
+        assert_eq!(update.matches("self.sync_terminal_ime_owner()").count(), 2);
+        let dispatch = update.find("self.update_message(message)").unwrap();

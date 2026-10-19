@@ -1,0 +1,300 @@
+            } else {
+                empty
+            };
+            return if self.config_diagnostic.is_some() || !self.keybindings_diagnostics.is_empty() {
+                stack![empty, self.diagnostics_overlay()].into()
+            } else {
+                empty
+            };
+        }
+        let panes_body: Element<'_, Message> = if self.is_split() && self.pane_zoomed {
+            // Zoomed: the focused pane fills the whole area; the hidden panes
+            // keep running in the background exactly like inactive tabs.
+            self.pane_view(self.active)
+        } else {
+            // Recursive tiled layout with a draggable divider between each pair
+            // of siblings. Integer FillPortions approximate the float shares.
+            self.render_tree(self.layout(), &[])
+        };
+        let panes_body: Element<'_, Message> = if self.tab_split_drag_eligible() {
+            stack![panes_body, self.tab_to_split_instruction()].into()
+        } else {
+            panes_body
+        };
+        // While dragging the divider, wrap the panes in a mouse_area so pointer
+        // moves drive the resize and release ends it. The handler is attached
+        // only during a drag to avoid emitting a message on every idle move.
+        let panes_body: Element<'_, Message> = if self.dragging_divider.is_some() {
+            mouse_area(panes_body)
+                .on_move(Message::DividerDragMove)
+                .on_release(Message::DividerDragEnd)
+                .on_exit(Message::DividerDragEnd)
+                .into()
+        } else if self.pane_drag.is_some() {
+            // Same pattern as the divider drag: pointer moves track which pane
+            // is under the cursor and release commits the swap. Leaving the
+            // pane area preserves the source so the tab strip can promote it.
+            mouse_area(panes_body)
+                .on_move(Message::PaneDragMove)
+                .on_release(Message::PaneDragEnd)
+                .on_exit(Message::PaneDragLeavePaneArea)
+                .interaction(iced::mouse::Interaction::Grabbing)
+                .into()
+        } else if self.dragging_tab.is_some() {
+            // An ordinary tab can be moved into any edge of the visible page.
+            // Movement arms one explicit edge; release in the center cancels.
+            mouse_area(panes_body)
+                .on_move(Message::TabDragMove)
+                .on_release(Message::TabSplitDrop)
+                .on_exit(Message::TabDragLeavePaneArea)
+                .interaction(iced::mouse::Interaction::Grabbing)
+                .into()
+        } else {
+            panes_body
+        };
+        let panes_body = terminal_panes_body(
+            self.config
+                .is_block_mode()
+                .then(|| self.block_reading_bar()),
+            panes_body,
+        );
+        let body = container(panes_body)
+            .width(Length::Fill)
+            .height(Length::Fill);
+        let body = self.font_zoom_region(font_zoom::Group::Content, body);
+        let body: Element<'_, Message> = if self.config_panel_open {
+            let overlay = if self.theme_editor.is_some() {
+                self.theme_editor_view()
+            } else {
+                self.config_panel()
+            };
+            stack![body, overlay].into()
+        } else if self.palette.is_open {
+            stack![body, self.command_palette()].into()
+        } else if self.search_replace.is_open {
+            stack![body, self.search_replace_panel()].into()
+        } else if self.search.is_open {
+            stack![body, self.search_bar()].into()
+        } else {
+            body
+        };
+        // Help and the debug panel float above any other overlay so they can be
+        // summoned at any time (and the debug panel can sit alongside others).
+        // Agent panel floats above the terminal but below help/debug.
+        let body: Element<'_, Message> = if self.agent.is_open {
+            stack![body, self.agent_panel()].into()
+        } else {
+            body
+        };
+        // The correction card is scoped to the active pane and floats above
+        // the terminal at the same layer as the Agent panel.
+        let body: Element<'_, Message> = if let Some(card) = self.correction_card() {
+            stack![body, card].into()
+        } else {
+            body
+        };
+        // The persistent chats panel stacks beside the Agent panel, and the
+        // AI command-suggestion card shares the correction card's layer and
+        // review-first idiom (above the panels, like the correction card).
+        let body: Element<'_, Message> = if self.ai_chats.is_open {
+            stack![body, self.ai_chats_panel()].into()
+        } else {
+            body
+        };
+        let body: Element<'_, Message> = if let Some(card) = self.ai_suggestion_card() {
+            stack![body, card].into()
+        } else {
+            body
+        };
+        let body: Element<'_, Message> = if self.help_open {
+            stack![body, self.help_panel()].into()
+        } else if self.debug_open {
+            stack![body, self.debug_panel()].into()
+        } else {
+            body
+        };
+
+        // Optional left dock (file tree and/or tab list) beside the terminal,
+        // separated by a draggable resize divider. Enter/exit tracking on the
+        // dock gates the window-space pointer subscription the file-ops menu
+        // anchors to (the tab strip does the same for its menu).
+        let main_area: Element<'_, Message> = if self.dock_open() {
+            let dock =
+                mouse_area(self.font_zoom_region(font_zoom::Group::Chrome, self.sidebar_view()))
+                    .on_enter(Message::SidebarHover(true))
+                    .on_exit(Message::SidebarHover(false));
+            let dock_row = row![dock, self.sidebar_divider(), body]
+                .width(Length::Fill)
+                .height(Length::Fill);
+            // While dragging, pointer moves drive the resize and release ends it.
+            if self.dragging_sidebar {
+                mouse_area(dock_row)
+                    .on_move(Message::SidebarDragMove)
+                    .on_release(Message::SidebarDragEnd)
+                    .on_exit(Message::SidebarDragEnd)
+                    .into()
+            } else {
+                dock_row.into()
+            }
+        } else {
+            body
+        };
+        // The top bar is always present: in Top mode it holds the tab strip; in
+        // Side mode it holds the dock toggle so chrome never overlaps the grid.
+        // The jsh notice, when there is one, sits directly under it.
+        let mut chrome = column![self.font_zoom_region(font_zoom::Group::Chrome, self.tab_bar())];
+        if let Some(notice) = self.jsh_notice() {
+            chrome = chrome.push(notice);
+        }
+        if let Some(banner) = self.session_recovery_banner() {
+            chrome = chrome.push(banner);
+        }
+        chrome = chrome.push(main_area);
+        if self.config.bottom_bar {
+            chrome =
+                chrome.push(self.font_zoom_region(font_zoom::Group::Content, self.status_bar()));
+        }
+        let root: Element<'_, Message> = chrome.width(Length::Fill).height(Length::Fill).into();
+        // Tab context menu, tab switcher, history picker, and toasts float
+        // above everything so they remain accessible regardless of which
+        // other panel is open.
+        let root = if let Some(i) = self.tab_menu {
+            stack![root, self.tab_context_menu(i)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(s) = &self.tab_switcher {
+            stack![root, self.tab_switcher_view(s)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(s) = &self.history_picker {
+            stack![root, self.history_picker_view(s)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(s) = &self.workflow_overlay {
+            stack![root, self.workflow_overlay_view(s)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if self.ai_ask.is_some() {
+            stack![root, self.ai_ask_overlay()].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(s) = &self.block_search {
+            stack![root, self.block_search_view(s)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(review) = &self.block_review {
+            stack![root, self.block_review_view(review)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(menu) = self.block_menu {
+            stack![root, self.block_menu_view(menu)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(state) = self.remote_picker.as_ref() {
+            stack![root, self.remote_picker_view(state)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(confirm) = self.block_clear_confirm {
+            stack![root, self.block_clear_confirm_view(confirm)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some((id, process, _)) = &self.tab_close_confirm {
+            stack![root, self.tab_close_confirm_view(*id, process)].into()
+        } else {
+            root
+        };
+        // The file tree's own overlays: menu below the modals, deletion last
+        // (top-most) since it is the destructive one.
+        let root: Element<'_, Message> = if let Some(menu) = &self.sidebar_menu {
+            stack![root, self.sidebar_menu_view(menu)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(dialog) = &self.sidebar_dialog {
+            stack![root, self.sidebar_dialog_view(dialog)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(confirmation) = &self.sidebar_delete_confirm {
+            stack![root, self.sidebar_delete_confirm_view(&confirmation.paths)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if self.config_diagnostic.is_some()
+            || self.session_diagnostic.is_some()
+            || !self.keybindings_diagnostics.is_empty()
+        {
+            stack![root, self.diagnostics_overlay()].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if self.toasts.is_empty() {
+            root
+        } else {
+            stack![root, self.toast_overlay()].into()
+        };
+        // Resize grips sit above everything, including the overlays: the
+        // window border has to stay grabbable whatever panel is open.
+        stack![root, self.window_resize_edges()].into()
+    }
+
+    /// Search bar overlaid at the top-right of the terminal. The query is an
+    /// editable `text_input`; Enter/Esc/arrows are still handled at the app level
+    /// (the input deliberately has no `on_submit` so Shift+Enter can mean "prev").
+    fn search_bar(&self) -> Element<'_, Message> {
+        let reveal = self.sessions.get(self.active).and_then(|session| {
+            search_reveal_target(
+                &self.search,
+                self.search_dirty,
+                session.id,
+                &session.terminal,
+                &session.projection,
+                &session.projection_policy,
+            )
+        });
+        let status = if reveal.is_some() {
+            format!(
+                "{}/{}",
+                self.search.current_match_index + 1,
+                self.search.matches.len()
+            )
+        } else if let Some(err) = &self.search.error_message {
+            crate::review_text::bound_query_error(err)
+        } else if !self.search.matches.is_empty() {
+            format!(
+                "{}/{}",
+                self.search.current_match_index + 1,
+                self.search.matches.len()
+            )
+        } else if !self.search.query.is_empty() {
+            "No matches".to_string()
+        } else {
+            String::new()
+        };
+
+        // Clickable mode toggles (also bound to Ctrl+R / Ctrl+I).
+        let regex_btn = button(text(".*").size(self.effective_font_size()))
+            .on_press(Message::SearchToggleRegex)
+            .padding([2, 6])
+            .style(if self.search.use_regex {
+                button::primary
+            } else {
+                button::secondary
+            });
+        let case_btn = button(text("Aa").size(self.effective_font_size()))
+            .on_press(Message::SearchToggleCase)
+            .padding([2, 6])
+            .style(if self.search.case_sensitive {
+                button::primary
+            } else {
+                button::secondary

@@ -1,0 +1,300 @@
+    BlockMenuAction(BlockMenuAction),
+    /// Confirm or cancel permanently clearing the active pane's completed
+    /// block records. Every entry point opens this same counted modal.
+    BlockClearConfirmYes,
+    BlockClearConfirmNo,
+    /// Background whole-session export completed.
+    BlockExportFinished(
+        block_export::SessionExportFormat,
+        Result<std::path::PathBuf, String>,
+    ),
+    /// User confirmed closing a tab with a running foreground process.
+    TabCloseConfirmYes,
+    /// User cancelled the close-confirmation overlay.
+    TabCloseConfirmNo,
+}
+
+/// Context-menu actions that target a stable tab id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabMenuAction {
+    Close(usize),
+    CloseOthers(usize),
+    CloseToRight(usize),
+    /// Close every marked tab at once (marking is the multi-select model).
+    CloseMarked,
+    Duplicate(usize),
+    NewTab,
+    TogglePinned(usize),
+    ToggleMarked(usize),
+    TogglePrivateTitle(usize),
+    /// Open a `[[remote_hosts]]` entry (by config index) in a new tab.
+    ConnectRemote(usize),
+}
+
+/// Subscription identity plus a reader descriptor duplicated synchronously when
+/// the session is created. Equality/hash intentionally ignore the descriptor
+/// object: the monotonic session id and original fd identify the iced stream.
+#[derive(Clone)]
+struct PtySubscriptionKey {
+    id: usize,
+    master_fd: RawFd,
+    reader_fd: Arc<OwnedFd>,
+    watch_source: organism_watch::SourceAuthority,
+    /// The session leader's pid. The reader thread probes it to tell a closed
+    /// slave stream (a possibly transient hangup) apart from a real child
+    /// exit — observing only, never reaping: reaping stays with the
+    /// session's `Pty`.
+    child_pid: i32,
+}
+
+struct PtyWriteChunk {
+    data: Vec<u8>,
+    response: bool,
+}
+
+impl PartialEq for PtySubscriptionKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.master_fd == other.master_fd
+    }
+}
+
+impl Eq for PtySubscriptionKey {}
+
+impl Hash for PtySubscriptionKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.master_fd.hash(state);
+    }
+}
+
+/// In-progress custom theme being edited in the theme editor overlay. UI-chrome
+/// colors are inherited from `base`; only the terminal palette is editable here.
+struct ThemeEditState {
+    base: Theme,
+    name: String,
+    /// Hex buffers aligned with `Theme::editable_color_labels()` (19 entries).
+    hexes: Vec<String>,
+    error: Option<String>,
+}
+
+/// A single terminal session: its own PTY child and terminal state.
+struct Session {
+    id: usize,
+    ime_identity: Arc<()>,
+    terminal: TerminalState,
+    pty: Pty,
+    master_fd: RawFd,
+    reader_fd: Arc<OwnedFd>,
+    watch_source: organism_watch::SourceAuthority,
+    watch_receiver: organism_watch::SourceReceiver,
+    /// One immutable materialization shared by rendering, links, and stable
+    /// coordinate consumers for this refresh.
+    projection: Arc<ProjectedViewport>,
+    projection_block_mode: bool,
+    /// User-owned transforms survive Block Mode/alternate-screen bypass. The
+    /// companion view state owns scrolling only while a transform is active.
+    projection_policy: ProjectionPolicy,
+    projection_view_state: ProjectionViewState,
+    cursor: (usize, usize),
+    cursor_visible: bool,
+    /// Cached working directory, refreshed periodically so the status bar can
+    /// display it without a `readlink` syscall on every render frame.
+    cwd_cache: Option<String>,
+    /// Cached foreground process name (via `tcgetpgrp` + `/proc/<pgid>/comm`),
+    /// refreshed on the same cadence as `cwd_cache`. Empty/None when the
+    /// shell itself is in the foreground so tab labels can hide it.
+    fg_proc_cache: Option<String>,
+    /// Git metadata for `cwd_cache`, refreshed on the same cadence (plus once
+    /// when a command finishes) via the coalesced background probe in
+    /// `jterm_core::git_meta` — the pane header and bottom bar only ever read
+    /// this cache, so git never runs per frame. None outside a repo.
+    git_meta_cache: Option<jterm_core::git_meta::RepoMeta>,
+    /// Exit code of the last OSC 133 command that finished in this session,
+    /// retained for the bottom bar. None until a command completes (or when
+    /// the shell omitted the code).
+    last_exit: Option<i32>,
+    /// Task-bound terminals (Agent CLI fallback, validation runs) stay open
+    /// after the child exits so their transcript remains reviewable; ordinary
+    /// sessions still close on exit. Set when the exit reducer ran.
+    hold_after_exit: bool,
+    /// Wall-clock duration of that command, when the shell reported an
+    /// execution phase.
+    last_duration_ms: Option<u64>,
+    /// Warp-style block-mode multi-selection, keyed by stable command-zone id.
+    /// It survives scrollback row trimming; the terminal's bounded zone cap is
+    /// reconciled before actions. Native text/prompt presses or PTY-bound input
+    /// clears the whole selection.
+    block_selection: block_mode::BlockSelection,
+    block_reading: block_review::ReadingHistory,
+    /// Pane-local bookmarks for important finalized blocks. Reconciled against
+    /// the bounded zone deque before paint/navigation and cleared with blocks.
+    block_bookmarks: block_mode::BlockBookmarks,
+    /// Frame cache for the block-chrome builders (paint rows + scrollbar
+    /// markers). The view pass is `&self`, so the cache lives behind a
+    /// `RefCell`; it is only borrowed inside `App::block_chrome` for one key
+    /// comparison or refill. The key covers every builder input, so a hit is
+    /// identical to a fresh build.
+    block_chrome_cache: std::cell::RefCell<Option<BlockChromeCache>>,
+    /// Non-blocking PTY writes may be partial. Keep the remainder here and let a
+    /// short-lived timer drain it without ever stalling iced's UI thread.
+    write_queue: std::collections::VecDeque<PtyWriteChunk>,
+    write_queue_offset: usize,
+    queued_write_bytes: usize,
+    queued_response_bytes: usize,
+    /// Host clipboard access is asynchronous. Limit PTY-originated reads to one
+    /// per session so a hostile child cannot accumulate work across UI batches.
+    clipboard_read_in_flight: bool,
+    /// Busy/disabled OSC 52 replies wait behind the untagged asynchronous read.
+    /// The bounded queue persists across PTY batches and belongs to this session.
+    osc52_pending_refusals: Option<std::collections::VecDeque<&'static [u8]>>,
+    /// Later OSC 5522 requests receive bounded busy refusals after the active
+    /// MIME read completes; these responses carry no correlation identifier.
+    osc5522_pending_refusals: Option<usize>,
+    /// True for a connection Frost launched from its own remote picker. The
+    /// automatic Files follower targets SSH typed inside an ordinary local
+    /// shell and must not open a duplicate sidecar for managed remote tabs.
+    managed_remote: bool,
+}
+
+/// The first response metadata retained until completion or explicit revocation.
+enum HostClipboardReply {
+    Osc52(&'static [u8]),
+    Osc5522(String),
+}
+
+fn release_host_clipboard_state(
+    owner: &mut Option<(usize, RawFd)>,
+    task: &mut Option<iced::task::Handle>,
+    reply: &mut Option<HostClipboardReply>,
+    id: usize,
+    fd: RawFd,
+) {
+    if *owner == Some((id, fd)) {
+        if let Some(handle) = task.take() {
+            handle.abort();
+        }
+        *owner = None;
+        *reply = None;
+    }
+}
+
+fn refuse_host_clipboard_reply(
+    reply: Option<HostClipboardReply>,
+    terminal: &mut TerminalState,
+    in_flight: &mut bool,
+    osc52_pending: &mut Option<std::collections::VecDeque<&'static [u8]>>,
+    osc5522_pending: &mut Option<usize>,
+) {
+    *in_flight = false;
+    match reply {
+        Some(HostClipboardReply::Osc52(terminator)) => {
+            complete_osc52_read(terminal, osc52_pending, false, "", terminator)
+        }
+        Some(HostClipboardReply::Osc5522(mime)) => {
+            complete_osc5522_read(terminal, in_flight, osc5522_pending, false, &mime, "")
+        }
+        None => {}
+    }
+}
+
+fn host_clipboard_completion_matches(
+    owner: Option<(usize, RawFd)>,
+    current_generation: u64,
+    id: usize,
+    fd: RawFd,
+    generation: u64,
+) -> bool {
+    owner == Some((id, fd)) && current_generation == generation
+}
+
+/// An OSC 52 query has no correlation ID. Retain at most eight refusal
+/// terminators while the older read is unresolved, dropping overflow instead
+/// of returning a response that the child would mistake for that read.
+fn defer_osc52_refusal(
+    pending: &mut Option<std::collections::VecDeque<&'static [u8]>>,
+    terminator: &'static [u8],
+) -> bool {
+    let Some(refusals) = pending else {
+        return false;
+    };
+    if refusals.len() < 8 {
+        refusals.push_back(terminator);
+    }
+    true
+}
+
+fn complete_osc52_read(
+    terminal: &mut TerminalState,
+    pending: &mut Option<std::collections::VecDeque<&'static [u8]>>,
+    allow_clipboard_read: bool,
+    content: &str,
+    terminator: &'static [u8],
+) {
+    let content = if allow_clipboard_read && content.len() <= MAX_CLIPBOARD_RESPONSE_BYTES {
+        content
+    } else {
+        ""
+    };
+    terminal.respond_osc52_clipboard(content, terminator);
+    for terminator in pending.take().into_iter().flatten() {
+        terminal.respond_osc52_clipboard("", terminator);
+    }
+}
+
+/// Admit at most two OSC 52 SET writes per rolling second. A remote PTY that
+/// spam-sets the host clipboard would otherwise replace the user's paste
+/// buffer unboundedly once writes are permitted.
+fn admit_osc52_clipboard_write(
+    window_started: &mut std::time::Instant,
+    writes_in_window: &mut usize,
+) -> bool {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+    const MAX_WRITES_PER_WINDOW: usize = 2;
+
+    let now = std::time::Instant::now();
+    if now.duration_since(*window_started) >= WINDOW {
+        *window_started = now;
+        *writes_in_window = 0;
+    }
+    if *writes_in_window >= MAX_WRITES_PER_WINDOW {
+        return false;
+    }
+    *writes_in_window += 1;
+    true
+}
+
+/// Return the MIME type only when a new asynchronous host read should start.
+fn service_osc5522_read(
+    terminal: &mut TerminalState,
+    in_flight: &mut bool,
+    pending_refusals: &mut Option<usize>,
+    allow_clipboard_read: bool,
+    host_read_blocked: bool,
+    kind: terminal::ClipboardReadKind,
+) -> Option<String> {
+    if let Some(refusals) = pending_refusals {
+        // Apply this before permission and MIME checks: any OSC 5522 reply
+        // here would otherwise be mistaken for the older unresolved read.
+        // Match the parser's eight-request bound across asynchronous batches.
+        *refusals = (*refusals + 1).min(8);
+        return None;
+    }
+    let response = if !allow_clipboard_read {
+        osc_5522_packet("type=read:status=EPERM", None)
+    } else {
+        match kind {
+            terminal::ClipboardReadKind::MimeList => {
+                terminal.build_paste_event(&["text/plain;charset=utf-8".to_string()])
+            }
+            terminal::ClipboardReadKind::MimeData(mime) => {
+                if mime.starts_with("text") {
+                    if *in_flight || host_read_blocked {
+                        osc_5522_packet("type=read:status=EBUSY", None)
+                    } else {
+                        *in_flight = true;
+                        *pending_refusals = Some(0);
+                        return Some(mime);
+                    }
+                } else {
+                    osc_5522_packet("type=read:status=ENOSYS", None)
+                }

@@ -1,0 +1,300 @@
+            }
+            PendingClose::Tab => match self.tab_of_session(index) {
+                Some(tab) => self.close_tab(tab),
+                None => self.close_session(index),
+            },
+        }
+    }
+
+    fn close_session(&mut self, index: usize) -> Task<Message> {
+        if index >= self.sessions.len() {
+            return Task::none();
+        }
+        for gesture in retire_closing_terminal_mouse_gestures(
+            self.sessions[index].id,
+            &mut self.terminal_mouse_gestures,
+            &mut self.click_tracker,
+        ) {
+            self.finish_cancelled_terminal_mouse_gesture(gesture);
+        }
+        self.invalidate_sidebar_remote_follow_intent();
+        // Session removal can invalidate a tab/pane drag source or target and
+        // reindex every remaining leaf. Cancel while all stable identities are
+        // still resolvable, then perform the close from a clean UI state.
+        self.cancel_layout_drags();
+        // ANY session close (user close, close_tab, an async `PtyExited`)
+        // invalidates the block search picker: session indices shift and the
+        // close may hand `active` to a different session whose zone ids —
+        // they restart at 0 per session — would silently resolve a held
+        // hit against the wrong session. Close it; see
+        // `close_block_search_on_session_change`.
+        self.close_block_search_on_session_change();
+        // Closing the last session quits the app, and quitting has to be the
+        // same thing however it is reached.
+        if self.sessions.len() == 1 {
+            // Flush first, signal second. `save_session_snapshot` records each
+            // pane's working directory, and for a shell without OSC 7
+            // integration that value can only come from the live child's
+            // /proc/<pid>/cwd link. `terminate` returns as soon as the signals
+            // are away, leaving a zombie whose cwd link is already gone, so
+            // signalling first would persist the last session with no
+            // directory at all and reopen it somewhere else next launch.
+            let exit = self.exit_flushing_durable_state();
+            let _ = self.sessions[0].pty.terminate();
+            return exit;
+        }
+        if index == self.active {
+            self.sidebar_drop_intents.clear();
+            self.sidebar_drop_burst.clear();
+            self.sidebar_drop_debounce_generation = None;
+        }
+        let previous_owner = self.sessions.get(self.active).map(|session| session.id);
+        let mut sess = self.sessions.remove(index);
+        let closed_id = sess.id;
+        self.organism.forget_session(closed_id);
+        let closed_fd = sess.master_fd;
+        if sess.clipboard_read_in_flight {
+            sess.clipboard_read_in_flight = false;
+            self.release_host_clipboard_read(closed_id, closed_fd);
+        }
+        // A user-initiated close of a task-bound terminal cancels the binding
+        // (no child exit status was observed). Sessions already reported
+        // through `handle_terminal_session_exit` are in a terminal state, so
+        // this is a no-op for them.
+        self.task_manager
+            .handle_terminal_session_closed(&agent_task_ui::terminal_session_id(closed_id));
+        self.history_reflow_sessions.remove(&closed_id);
+        // A closed pane's correction request/card goes with it (cancels any
+        // in-flight probe or AI call for that pane).
+        self.command_corrections.close(closed_id);
+        // A suggestion card bound to the closed pane likewise goes away; its
+        // Drop cancels the drafting worker.
+        if self
+            .ai_suggestion
+            .as_ref()
+            .is_some_and(|session| session.session_id == closed_id)
+        {
+            self.ai_suggestion = None;
+        }
+        // The strip's transient state is keyed by tab id; a closed tab is
+        // dropped from it in `prune_closed_pane` once we know whether the tab
+        // itself went away.
+
+        let _ = sess.pty.terminate();
+        // `prune_closed_pane` is authoritative for `active` (it must pick a
+        // neighbor leaf when the focused pane's session is the one closing).
+        let old_active = self.active;
+        self.prune_closed_pane(index, old_active);
+        let next_owner = self.sessions.get(self.active).map(|session| session.id);
+        self.organism.owner_changed(previous_owner, next_owner);
+        self.refresh_active_context_caches();
+        self.save_session_snapshot();
+        Task::none()
+    }
+
+    /// Reconcile every tab after `sessions[index]` was removed (in old index
+    /// space): the owning tab drops its leaf — folding its share into a
+    /// neighbor and collapsing any split left with one child — or, if that was
+    /// its only pane, the whole tab goes away. Every tab then shifts the
+    /// indices above the removed slot down by one.
+    ///
+    /// When the removed pane held keyboard focus, focus follows the freed
+    /// space into the preceding leaf of the same tab. `old_active` is the
+    /// focused session before removal.
+    fn prune_closed_pane(&mut self, index: usize, old_active: usize) {
+        let owner = self.tab_of_session(index);
+        // Neighbor of the closing leaf, computed in old index space before the
+        // tree mutates (previous leaf in render order, else the next).
+        let neighbor = owner.and_then(|tab| {
+            let leaves = self.tabs[tab].sessions();
+            let pos = leaves.iter().position(|&s| s == index)?;
+            if pos > 0 {
+                leaves.get(pos - 1).copied()
+            } else {
+                leaves.get(1).copied()
+            }
+        });
+        if let (Some(tab), Some(neighbor)) = (owner, neighbor) {
+            // Keep the tab focused on a surviving pane before the reindex, so
+            // `repair_focus` does not have to guess.
+            if self.tabs[tab].focus == index {
+                self.tabs[tab].focus = neighbor;
+            }
+        }
+
+        // A tab whose only pane just closed has nothing left to show.
+        let emptied = owner.filter(|&tab| self.tabs[tab].tree.leaf_count() <= 1);
+        self.pane_zoomed = pane_zoom_after_tab_close(
+            self.pane_zoomed,
+            self.tabs.get(self.active_tab).map(|tab| tab.id),
+            emptied.and_then(|tab| self.tabs.get(tab).map(|tab| tab.id)),
+        );
+        if let Some(tab) = emptied {
+            if self.tabs.len() > 1 {
+                self.tabs.remove(tab);
+                if tab < self.active_tab {
+                    self.active_tab -= 1;
+                }
+                self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+            }
+        }
+
+        self.reindex_tabs_after_removal(index);
+
+        let remap = |s: usize| if s > index { s - 1 } else { s };
+        let fallback = remap(old_active).min(self.sessions.len().saturating_sub(1));
+        self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+        self.active = self
+            .tabs
+            .get(self.active_tab)
+            .map(|tab| tab.focus)
+            .unwrap_or(fallback);
+        if emptied.is_some() {
+            self.hovered_divider = None;
+            self.dragging_divider = None;
+        }
+        self.relayout();
+    }
+
+    fn busy_session_name(&self, index: usize) -> Option<String> {
+        self.sessions
+            .get(index)
+            .and_then(|session| session.fg_proc_cache.clone().or_else(|| session.fg_proc()))
+    }
+
+    /// Public entry point for close requests originating from user actions.
+    /// Pops a confirmation overlay when the target tab is running a non-shell
+    /// foreground process; otherwise closes immediately. Batch close operations
+    /// preflight every affected session before reaching the force-close helper.
+    fn request_close_session(&mut self, index: usize) -> Task<Message> {
+        self.request_close_session_then(index, None)
+    }
+
+    fn request_close_session_then(
+        &mut self,
+        index: usize,
+        activate_after: Option<usize>,
+    ) -> Task<Message> {
+        let busy = self.busy_session_name(index);
+        if let Some(name) = busy {
+            if let Some(session) = self.sessions.get(index) {
+                self.tab_close_confirm =
+                    Some((session.id, name, PendingClose::Session { activate_after }));
+            }
+            return Task::none();
+        }
+        self.close_session_then(index, activate_after)
+    }
+
+    fn close_session_then(&mut self, index: usize, activate_after: Option<usize>) -> Task<Message> {
+        let task = self.close_session(index);
+        if let Some(id) = activate_after {
+            if let Some(remaining) = self.sessions.iter().position(|session| session.id == id) {
+                // The target lives in some tab's pane; switch to it there
+                // instead of pulling it into the current tab.
+                self.focus_session(remaining);
+                self.relayout();
+                self.refresh_active_context();
+                self.save_session_snapshot();
+            }
+        }
+        task
+    }
+
+    /// Refuse a whole-window exit while a foreground job is still attached.
+    /// The user can inspect and close that tab explicitly, which uses the normal
+    /// per-process confirmation flow instead of silently terminating work.
+    fn request_window_close(&mut self) -> Task<Message> {
+        if let Some((index, process)) = (0..self.sessions.len())
+            .find_map(|index| self.busy_session_name(index).map(|name| (index, name)))
+        {
+            self.focus_session(index);
+            self.relayout();
+            self.refresh_active_context();
+            self.push_toast(
+                format!("{process} is still running — close its tab first"),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        self.exit_flushing_durable_state()
+    }
+
+    /// The one way out of the process.
+    ///
+    /// frost has two quit gestures — the window-close request and closing the
+    /// last session — and only the first one used to be durable. The second
+    /// wrote the session snapshot and left immediately, so the Agent
+    /// transcript, the AI-chat store, the jsh execution journal and the shared
+    /// command-history index were all abandoned mid-flight: whether a whole
+    /// session's work survived depended on which gesture the user happened to
+    /// close with. Both writers hand work to bounded background threads, so
+    /// "abandoned" means the last commands of the session simply never
+    /// appeared, with nothing logged.
+    ///
+    /// Each flush has its own short deadline rather than one shared budget,
+    /// because a stalled state filesystem must not turn quitting into a hang;
+    /// a missed deadline is logged and the exit continues.
+    fn exit_flushing_durable_state(&mut self) -> Task<Message> {
+        if let Some((id, fd)) = self.host_clipboard_read_owner {
+            self.release_host_clipboard_read(id, fd);
+        }
+        self.organism.set_enabled(false);
+        self.organism.close_preview();
+        const EXIT_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+        self.agent.persist();
+        self.ai_chats.persist(self.config.ai_redact_secrets);
+        self.save_session_snapshot();
+        if !jterm_core::execution_journal::flush(EXIT_FLUSH_TIMEOUT) {
+            log::warn!("jsh execution journal did not flush before exit");
+        }
+        if let Err(error) = jterm_core::command_history::flush_pending(EXIT_FLUSH_TIMEOUT) {
+            log::warn!("command history did not flush before exit: {error}");
+        }
+        self.flush_config_on_exit();
+        iced::exit()
+    }
+
+    /// Backoff must not strand a pending setting when the process exits.
+    /// One best-effort CAS attempt; no reload side effects or retry loop.
+    fn flush_config_on_exit(&mut self) {
+        if !self.config_dirty || self.config_write_blocked {
+            return;
+        }
+        if let Err(error) = self.save_config_checked() {
+            // Always report the final unconfirmed save, even when an earlier
+            // automatic attempt already reported the same failure.
+            log::warn!("Config persistence was not confirmed before exit: {error}");
+        }
+    }
+
+    /// Next/Prev walk tabs, not the session vector: the extra sessions a split
+    /// creates live inside a tab, and cycling through them here would treat
+    /// panes as tabs. Moving between panes is PaneNext/PanePrev.
+    fn next_session(&mut self) {
+        if self.tabs.len() > 1 {
+            self.activate_tab((self.active_tab + 1) % self.tabs.len());
+        }
+    }
+
+    fn prev_session(&mut self) {
+        if self.tabs.len() > 1 {
+            self.activate_tab((self.active_tab + self.tabs.len() - 1) % self.tabs.len());
+        }
+    }
+
+    /// Alt+N selects the Nth tab, matching the order in the strip.
+    fn jump_session(&mut self, index: usize) {
+        self.activate_tab(index);
+    }
+
+    fn set_sidebar_notice(&mut self, text: impl Into<String>, neutral: bool) {
+        self.sidebar_notice = Some((crate::sidebar::bound_sidebar_notice(text.into()), neutral));
+    }
+
+    /// Push a transient bottom-right toast. Auto-expires; dismissable.
+    fn push_toast(&mut self, text: impl Into<String>, kind: ToastKind) {
+        const TOAST_TTL_MS: u64 = 2400;
+        const MAX_TOASTS: usize = 4;
+        let text = crate::review_text::bound_toast_text(text);
+        let expires_at = std::time::Instant::now() + std::time::Duration::from_millis(TOAST_TTL_MS);

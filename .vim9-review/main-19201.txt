@@ -1,0 +1,300 @@
+                    button,
+                    pressed,
+                );
+                if pressed {
+                    self.organism.cancel_live_greeting();
+                }
+            }
+            Message::OrganismPointerLeft => {
+                self.organism_pointer_buttons.clear();
+                let facts = self.organism_attention_facts();
+                self.organism.leave_live_greeting(facts);
+            }
+            Message::OrganismSystemMotion(event) => {
+                let transition = self.organism_motion_control.observe(event);
+                self.apply_organism_motion_transition(transition);
+            }
+            Message::OrganismTick(cause) => {
+                self.organism_wake_counts.record(&cause);
+                if self.config.ascii_organism_enabled {
+                    // Closing a pane removes its life by stable ID. Animation
+                    // needs only the active owner; never rescan/reallocate the
+                    // complete pane set just to retain it on every frame.
+                    self.organism.observe_work_day(organism_local_day());
+                    if let Some(sess) = self.sessions.get(self.active) {
+                        if !sess.managed_remote && !sess.transcript_read_only() {
+                            self.organism
+                                .prime_session(sess.id, sess.terminal.is_command_running());
+                            if self.organism.remote_probe_due(sess.id) {
+                                self.organism
+                                    .set_remote(sess.id, sess.observed_ssh_command().is_some());
+                            }
+                            self.organism.observe_work_context(
+                                sess.id,
+                                sess.terminal.organism_idle_working_dir(),
+                            );
+                        }
+                    }
+                }
+                let owner = self.organism_observation_owner();
+                let running = self
+                    .sessions
+                    .get(self.active)
+                    .is_some_and(|s| s.terminal.is_command_running());
+                let any_running = self.sessions.iter().any(|s| {
+                    !s.managed_remote
+                        && self.organism.is_local(s.id)
+                        && s.terminal.is_command_running()
+                        && !matches!(s.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
+                });
+                self.sync_organism_watch();
+                self.organism.tick(owner, running, any_running);
+                let interaction_owner = self.sessions.get(self.active).map(|session| session.id);
+                let facts = self.organism_attention_facts();
+                self.organism.poll_live_greeting(interaction_owner, facts);
+            }
+            Message::SetBottomBar(show) => {
+                self.config.bottom_bar = show;
+                self.config_dirty = true;
+                // The bar's row returns to (or leaves) the grid; resize now.
+                self.apply_config();
+            }
+            Message::ThemeEditOpen => {
+                self.remote_host_editor.retire();
+                // Seed the editor from the current theme; suggest a fresh name so
+                // saving doesn't silently overwrite a builtin.
+                let base = self.theme.clone();
+                let suggested = if Theme::is_builtin(&base.name) {
+                    format!("{}-custom", base.name)
+                } else {
+                    base.name.clone()
+                };
+                let hexes = base.editable_color_hexes();
+                self.theme_editor = Some(ThemeEditState {
+                    base,
+                    name: suggested,
+                    hexes,
+                    error: None,
+                });
+            }
+            Message::ThemeEditClose => {
+                self.theme_editor = None;
+            }
+            Message::ThemeEditName(name) => {
+                if let Some(ed) = &mut self.theme_editor {
+                    if let Some(name) = crate::theme::accepted_custom_theme_name(name) {
+                        ed.name = name;
+                    }
+                }
+            }
+            Message::ThemeEditColor(idx, hex) => {
+                if let Some(ed) = &mut self.theme_editor {
+                    if let Some(slot) = ed.hexes.get_mut(idx) {
+                        *slot = crate::theme::bound_theme_hex_draft(hex);
+                    }
+                }
+            }
+            Message::ThemeEditSave => {
+                let mut save_error: Option<String> = None;
+                if let Some(ed) = &mut self.theme_editor {
+                    let name = ed.name.trim().to_string();
+                    if let Err(message) = crate::theme::validate_saved_custom_theme_name(&name) {
+                        ed.error = Some(crate::theme::bound_theme_editor_error(message));
+                    } else if Theme::is_builtin(&name) {
+                        ed.error = Some(crate::theme::bound_theme_editor_error(
+                            "Name collides with a builtin theme".to_string(),
+                        ));
+                    } else if let Some(bad) =
+                        ed.hexes.iter().position(|h| Theme::hex_to_rgb(h).is_none())
+                    {
+                        let labels = Theme::editable_color_labels();
+                        ed.error = Some(crate::theme::bound_theme_editor_error(format!(
+                            "Invalid hex for {}",
+                            labels[bad]
+                        )));
+                    } else {
+                        let mut theme = ed.base.clone();
+                        theme.name = name.clone();
+                        for (i, h) in ed.hexes.iter().enumerate() {
+                            theme.set_editable_color(i, h);
+                        }
+                        match theme.save_custom_theme() {
+                            Ok(()) => {
+                                self.config.theme = name.clone();
+                                self.config_dirty = true;
+                                self.theme_editor = None;
+                                self.apply_config();
+                                self.push_toast(
+                                    format!("Saved theme \"{}\"", name),
+                                    ToastKind::Success,
+                                );
+                            }
+                            Err(e) => {
+                                let msg = format!("Save failed: {}", e);
+                                ed.error =
+                                    Some(crate::theme::bound_theme_editor_error(msg.clone()));
+                                save_error = Some(msg);
+                            }
+                        }
+                    }
+                }
+                if let Some(msg) = save_error {
+                    self.push_toast(format!("Theme {}", msg), ToastKind::Warning);
+                }
+            }
+            Message::ThemeDelete(name) => {
+                let result = crate::theme::apply_custom_theme_deletion(
+                    Theme::delete_custom_theme(&name),
+                    &name,
+                    &mut self.config.theme,
+                    &mut self.config_dirty,
+                );
+                match result {
+                    Ok(changed) => {
+                        if changed {
+                            self.apply_config();
+                        }
+                        self.push_toast(format!("Deleted theme \"{}\"", name), ToastKind::Info);
+                    }
+                    Err(e) => self.push_toast(format!("Delete failed: {}", e), ToastKind::Warning),
+                }
+            }
+            Message::ConfigSave => {
+                if self.config_write_blocked {
+                    self.push_toast(
+                        "Config not saved: fix the file error or Reset explicitly",
+                        ToastKind::Warning,
+                    );
+                } else {
+                    self.config_save_retry.reset();
+                    match self.save_config_checked() {
+                        Ok(()) => {
+                            let (invalid, inactive) =
+                                config::remote_host_problem_counts(&self.config.remote_hosts);
+                            if invalid > 0 || inactive > 0 {
+                                let mut details = Vec::new();
+                                if invalid > 0 {
+                                    details.push(format!(
+                                        "{invalid} active remote draft(s) are invalid and cannot run"
+                                    ));
+                                }
+                                if inactive > 0 {
+                                    details.push(format!(
+                                        "{inactive} remote draft(s) beyond the {}-host limit remain retained",
+                                        config::MAX_REMOTE_HOSTS
+                                    ));
+                                }
+                                self.push_toast(
+                                    format!("Config saved: {}", details.join("; ")),
+                                    ToastKind::Warning,
+                                );
+                            } else {
+                                self.push_toast("Config saved", ToastKind::Success);
+                            }
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            self.note_config_save_error(&error);
+                            self.push_toast(format!("Save failed: {message}"), ToastKind::Warning);
+                        }
+                    }
+                }
+            }
+            Message::ConfigReset => {
+                // Stage and durably persist first: a failed reset must not say
+                // "applied" while only mutating this process's memory.
+                let reset = Config::default();
+                let mut sidebar_request = None;
+                match reset.save_force_revision() {
+                    Ok(revision) => {
+                        let old_scale = self.scale_factor();
+                        self.task_panel.retire_panel_callbacks();
+                        self.prepare_organism_motion_config(reset.ascii_organism_motion);
+                        self.remote_host_editor.retire();
+                        self.before_clipboard_permission_change(reset.allow_clipboard_read);
+                        self.config = reset;
+                        self.config_revision = Some(revision);
+                        self.win_size = logical_viewport_after_scale(
+                            self.win_size,
+                            old_scale,
+                            self.scale_factor(),
+                        );
+                        self.config_dirty = false;
+                        self.config_save_retry.reset();
+                        self.config_write_blocked = false;
+                        self.config_diagnostic = None;
+                        self.ai_temperature_draft.clear();
+                        self.sync_tab_position_ui();
+                        self.apply_config();
+                        sidebar_request = self.reconcile_sidebar_remote_hosts();
+                        self.push_toast("Config reset to defaults", ToastKind::Info);
+                    }
+                    Err(error) => {
+                        if let Some(revision) = error.committed_revision().cloned() {
+                            // The reset inode is already visible even though
+                            // the final directory sync failed. Reflect it in
+                            // memory and retry it as dirty on the next tick.
+                            let old_scale = self.scale_factor();
+                            self.task_panel.retire_panel_callbacks();
+                            self.prepare_organism_motion_config(reset.ascii_organism_motion);
+                            self.remote_host_editor.retire();
+                            self.before_clipboard_permission_change(reset.allow_clipboard_read);
+                            self.config = reset;
+                            self.config_revision = Some(revision);
+                            self.win_size = logical_viewport_after_scale(
+                                self.win_size,
+                                old_scale,
+                                self.scale_factor(),
+                            );
+                            self.config_dirty = true;
+                            self.config_write_blocked = false;
+                            self.config_diagnostic = None;
+                            self.config_save_retry.reset();
+                            self.note_config_save_error(&error);
+                            self.ai_temperature_draft.clear();
+                            self.sync_tab_position_ui();
+                            self.apply_config();
+                            sidebar_request = self.reconcile_sidebar_remote_hosts();
+                            self.push_toast(
+                                format!(
+                                    "Config reset is visible but needs a durability retry: {error}"
+                                ),
+                                ToastKind::Warning,
+                            );
+                        } else {
+                            self.push_toast(
+                                format!("Reset not applied: {error}"),
+                                ToastKind::Warning,
+                            );
+                        }
+                    }
+                }
+                if let Some(request) = sidebar_request {
+                    return self.queue_sidebar_load(request);
+                }
+            }
+            Message::ConfigTick => {
+                // Reconcile external writers before local auto-save so a dirty
+                // instance cannot erase a newer file without noticing it.
+                let sidebar_reload_request = self.reload_config_if_changed();
+                self.persist_live_config();
+                // Debounced persistence for chat drafts: keystrokes mark the
+                // library dirty, this tick flushes it.
+                self.ai_chats.flush_if_dirty(self.config.ai_redact_secrets);
+
+                let keybindings_changed = keybindings::KeyBindings::config_revision()
+                    .map(|revision| self.keybindings_revision.as_ref() != Some(&revision))
+                    // A transient read failure must be retried; never record it
+                    // as the last-known-good revision.
+                    .unwrap_or(true);
+                if keybindings_changed {
+                    let keybindings::KeyBindingsLoad {
+                        bindings,
+                        diagnostics,
+                        usable,
+                        revision,
+                    } = keybindings::KeyBindings::load_with_diagnostics();
+                    if usable {
+                        self.keybindings = bindings;
+                    }
+                    if let Some(revision) = revision {

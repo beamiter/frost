@@ -1,0 +1,300 @@
+                        "{} already exists",
+                        crate::sidebar::bound_sidebar_path_label(&dst)
+                    )));
+                } else {
+                    match drop_item_size(&path, 0, max_bytes) {
+                        Ok(size) => {
+                            total_bytes = total_bytes.saturating_add(size);
+                            if total_bytes > max_bytes {
+                                return Err(format!(
+                                    "drop exceeds the {} limit",
+                                    remote_fs::format_bytes(max_bytes)
+                                ));
+                            }
+                        }
+                        Err(problem) => {
+                            error = Some(crate::sidebar::bound_sidebar_notice(problem.to_string()))
+                        }
+                    }
+                }
+            }
+        }
+        items.push(DropItem {
+            src: path,
+            dst,
+            is_dir,
+            error,
+        });
+    }
+    Ok(DropPlan {
+        target_dir,
+        items,
+        total_bytes,
+    })
+}
+
+/// One filesystem mutation handed to a worker task. Single-item creates and
+/// renames stay dedicated; everything multi-item (paste batches, drop
+/// imports, deletes) runs as one sequential job so failures continue past and
+/// summarize, and one shared progress handle covers the whole batch.
+#[derive(Clone, Debug)]
+enum SidebarOp {
+    CreateFile(std::path::PathBuf),
+    CreateDir(std::path::PathBuf),
+    Rename {
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+    },
+    /// Batch delete: continue past per-item errors, summarize at the end.
+    DeleteBatch(Vec<std::path::PathBuf>),
+    /// N items from `src_loc` into the current location, item by item:
+    /// same-location copy, or rename for a same-location cut; cross-location
+    /// `transfer()` (download/upload/relay) with the batch progress handle,
+    /// deleting a cut item's source only after its copy landed. `verb` is the
+    /// summary's past-tense word ("Imported" for drops, "Pasted"/"Moved" for
+    /// paste).
+    BatchTransfer {
+        src_loc: remote_fs::FsLocation,
+        items: Vec<DropItem>,
+        cut: bool,
+        verb: &'static str,
+    },
+}
+
+/// Worker report for a finished [`SidebarOp`], matched back against the
+/// tree's current location before any refresh is issued. `location` is the
+/// tree the op changed (the destination for transfers). `warning` is an
+/// optional post-op notice with a neutral/error styling flag: partial
+/// successes (a cut whose source would not delete), import summaries.
+/// `cancelled` is a neutral user abort — never styled as an error.
+#[derive(Clone, Debug)]
+struct SidebarOpReport {
+    context_epoch: u64,
+    /// Identity of this worker's progress UI, independent of Files navigation.
+    transfer_owner: Option<std::sync::Arc<remote_fs::TransferProgress>>,
+    location: remote_fs::FsLocation,
+    location_profile: Option<jterm_core::jsh_remote::RemoteHostConfig>,
+    consumed_clipboard_id: Option<u64>,
+    /// Sources the backend proved no longer exist at their old path: completed
+    /// cut moves plus successful explicit Rename/Delete items. This can retire
+    /// dangling Copy as well as Cut entries and is settled before the report's
+    /// UI-context gate.
+    consumed_paths: Vec<std::path::PathBuf>,
+    /// Destination-side directory snapshots whose immediate children may
+    /// have changed, including ambiguous remote failures.
+    affected_parents: Vec<std::path::PathBuf>,
+    /// Backend-confirmed same-location moves. Selection and its anchor follow
+    /// these exact path-prefix rewrites before reconciliation prunes rows.
+    path_remaps: Vec<SidebarPathRemap>,
+    warning: Option<(String, bool)>,
+    cancelled: bool,
+    result: Result<(), String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SidebarPathRemap {
+    from: std::path::PathBuf,
+    to: std::path::PathBuf,
+}
+
+struct SidebarWorkerOutcome {
+    location: remote_fs::FsLocation,
+    warning: Option<(String, bool)>,
+    cancelled: bool,
+    result: std::io::Result<()>,
+    consumed_paths: Vec<std::path::PathBuf>,
+    affected_parents: Vec<std::path::PathBuf>,
+    path_remaps: Vec<SidebarPathRemap>,
+}
+
+fn sidebar_op_report_matches_context(
+    report_epoch: u64,
+    report_location: &remote_fs::FsLocation,
+    report_profile: Option<&jterm_core::jsh_remote::RemoteHostConfig>,
+    current_epoch: Option<u64>,
+    current_location: &remote_fs::FsLocation,
+    current_hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+) -> bool {
+    if Some(report_epoch) != current_epoch {
+        return false;
+    }
+    match (report_location, current_location, report_profile) {
+        (remote_fs::FsLocation::Local, remote_fs::FsLocation::Local, None) => true,
+        (
+            remote_fs::FsLocation::Remote(_report_index),
+            remote_fs::FsLocation::Remote(current_index),
+            Some(profile),
+        ) => unique_active_remote_profile_index(current_hosts, profile) == Some(*current_index),
+        (
+            remote_fs::FsLocation::Transient(report_profile),
+            remote_fs::FsLocation::Transient(current_profile),
+            Some(profile),
+        ) => report_profile == profile && current_profile == profile,
+        _ => false,
+    }
+}
+
+/// One entry of the file tree's location picker: a location plus the label
+/// built from the current config (`Local`, `ssh: dev`, `docker: myubuntu`).
+#[derive(Clone, Debug, PartialEq)]
+struct SidebarLocationChoice {
+    location: remote_fs::FsLocation,
+    label: String,
+}
+
+#[derive(Clone, Debug)]
+struct SidebarRemoteFollow {
+    cancellation: std::sync::Arc<remote_fs::CancellationToken>,
+    token: u64,
+    intent_epoch: u64,
+    session_id: usize,
+    source_argv: Vec<String>,
+    source_profile: jterm_core::jsh_remote::RemoteHostConfig,
+    source_control_path: Option<String>,
+    attempt: u8,
+    target_location: remote_fs::FsLocation,
+    preserve_loaded_tree: bool,
+    hosts_epoch: u64,
+    tree_generation: u64,
+    tree_location: remote_fs::FsLocation,
+    tree_root: std::path::PathBuf,
+    sidebar_open: bool,
+    sidebar_panel: SidebarPanel,
+}
+
+/// The first listing remains part of the original automatic follow request.
+/// `None` is only for a same-namespace execution-overlay rebind.
+#[derive(Clone, Debug)]
+struct SidebarRemoteFollowResult {
+    root: std::path::PathBuf,
+    listing: Option<remote_fs::DirectoryListing>,
+}
+
+fn probe_sidebar_remote_follow(
+    location: &remote_fs::FsLocation,
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    show_hidden: bool,
+    preserve_loaded_tree: bool,
+    cancellation: &remote_fs::CancellationToken,
+) -> std::io::Result<SidebarRemoteFollowResult> {
+    let check_cancelled = || {
+        if cancellation.is_cancelled() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "SSH Files follow cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check_cancelled()?;
+    let root = remote_fs::start_dir_cancellable(location, hosts, cancellation)?;
+    check_cancelled()?;
+    let listing = if preserve_loaded_tree {
+        None
+    } else {
+        Some(remote_fs::list_dir_listing_with_hidden_cancellable(
+            location,
+            hosts,
+            &root,
+            show_hidden,
+            Some(cancellation),
+        )?)
+    };
+    check_cancelled()?;
+    Ok(SidebarRemoteFollowResult { root, listing })
+}
+
+fn sidebar_remote_follow_tree_is_current(
+    pending: &SidebarRemoteFollow,
+    sidebar: &sidebar::Sidebar,
+    sidebar_open: bool,
+    sidebar_panel: SidebarPanel,
+) -> bool {
+    sidebar.generation() == pending.tree_generation
+        && sidebar.location == pending.tree_location
+        && sidebar.current_dir == pending.tree_root
+        && sidebar_open == pending.sidebar_open
+        && sidebar_panel == pending.sidebar_panel
+}
+
+fn sidebar_remote_follow_context_is_current(
+    pending: &SidebarRemoteFollow,
+    sidebar: &sidebar::Sidebar,
+    sidebar_open: bool,
+    sidebar_panel: SidebarPanel,
+    hosts_epoch: u64,
+    intent_epoch: Option<u64>,
+    files_busy: bool,
+) -> bool {
+    !pending.cancellation.is_cancelled()
+        && sidebar_remote_follow_tree_is_current(pending, sidebar, sidebar_open, sidebar_panel)
+        && hosts_epoch == pending.hosts_epoch
+        && intent_epoch == Some(pending.intent_epoch)
+        && !files_busy
+}
+
+fn suppress_armed_sidebar_retry(
+    observed: &mut Option<(usize, Vec<String>)>,
+    retry_once: &mut Option<(usize, Vec<String>)>,
+) {
+    if let Some(retry) = retry_once.take() {
+        *observed = Some(retry);
+    }
+}
+
+impl std::fmt::Display for SidebarLocationChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChromeShortcut {
+    CommandPalette,
+    Help,
+    TabSwitcher,
+    HistoryPicker,
+    RemoteHosts,
+    Workflows,
+    Debug,
+}
+
+fn chrome_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Option<ChromeShortcut> {
+    use keyboard::key::Named;
+    use keyboard::Key;
+
+    if matches!(key, Key::Named(Named::F12)) {
+        return Some(ChromeShortcut::Debug);
+    }
+    if !(modifiers.control() && modifiers.shift()) {
+        return None;
+    }
+    let Key::Character(s) = key else {
+        return None;
+    };
+    match s.chars().next()?.to_ascii_lowercase() {
+        'p' => Some(ChromeShortcut::CommandPalette),
+        '/' | '?' => Some(ChromeShortcut::Help),
+        'l' => Some(ChromeShortcut::TabSwitcher),
+        // Same chord as forge's history palette (Ctrl+R stays with readline).
+        'h' => Some(ChromeShortcut::HistoryPicker),
+        // Same chord as the rest of the family's remote host picker.
+        's' => Some(ChromeShortcut::RemoteHosts),
+        // Same chord as anvil/forge's workflow picker.
+        'm' => Some(ChromeShortcut::Workflows),
+        _ => None,
+    }
+}
+
+/// The visible list and its selection belong to one opening of the picker.
+/// A callback retains the allocation, so an older opening's identity cannot be
+/// reused while that callback still exists.
+struct RemotePickerState {
+    identity: std::sync::Arc<()>,
+    hosts: Vec<jterm_core::jsh_remote::RemoteHostConfig>,
+    selected: usize,
+}
+
+impl RemotePickerState {
+    fn new(hosts: &[jterm_core::jsh_remote::RemoteHostConfig]) -> Self {

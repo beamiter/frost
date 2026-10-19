@@ -1,0 +1,300 @@
+        std::fs::write(root.join("a.txt"), b"aaa").expect("write");
+        std::fs::write(root.join("target").join("taken.txt"), b"x").expect("write");
+        root
+    }
+
+    #[test]
+    fn plan_drop_builds_per_item_plan_with_collision_flags() {
+        let root = drop_fixture();
+        // A burst of three: a file, a directory, and a name colliding at the
+        // target — only the collision is flagged, the rest stay importable.
+        let plan = plan_drop(
+            vec![
+                root.join("a.txt"),
+                root.join("adir"),
+                root.join("target").join("taken.txt"),
+            ],
+            root.join("target"),
+            true,
+        )
+        .expect("plan");
+        assert_eq!(plan.items.len(), 3);
+        assert_eq!(plan.items[0].dst, root.join("target").join("a.txt"));
+        assert!(!plan.items[0].is_dir && plan.items[0].error.is_none());
+        assert!(plan.items[1].is_dir && plan.items[1].error.is_none());
+        assert!(plan.items[2].error.is_some(), "collision flags the item");
+        // Only importable items count: a.txt (3) + adir/sub/deep.txt (4); the
+        // colliding item is flagged and contributes nothing.
+        assert_eq!(plan.total_bytes, 7);
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn plan_drop_refuses_bad_bursts_wholesale() {
+        let root = drop_fixture();
+        // Empty, over the item cap, and relative paths are all refused before
+        // anything is planned.
+        assert!(plan_drop_with_caps(vec![], root.join("target"), true, 4, 1024).is_err());
+        let many: Vec<std::path::PathBuf> = (0..5).map(|i| root.join(format!("f{i}"))).collect();
+        let error = plan_drop_with_caps(many, root.join("target"), true, 4, 1024).expect_err("cap");
+        assert!(error.contains("limited to 4"));
+        let error = plan_drop_with_caps(
+            vec![std::path::PathBuf::from("relative/file.txt")],
+            root.join("target"),
+            true,
+            4,
+            1024,
+        )
+        .expect_err("relative");
+        assert!(error.contains("absolute"));
+        let hostile = plan_drop_with_caps(
+            vec![std::path::PathBuf::from(format!(
+                "rel/\u{1b}{}",
+                "x".repeat(400)
+            ))],
+            root.join("target"),
+            true,
+            4,
+            1024,
+        )
+        .expect_err("hostile relative");
+        assert!(!hostile.contains('\u{1b}'));
+        assert!(hostile.contains("absolute"));
+        // Total size over the byte cap refuses the whole burst.
+        let error = plan_drop_with_caps(vec![root.join("a.txt")], root.join("target"), true, 4, 2)
+            .expect_err("oversize");
+        assert!(error.contains("limit"));
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn drop_item_size_is_bounded_and_never_follows_symlinked_dirs() {
+        let root = drop_fixture();
+        // Nested dir sums file bytes without following the symlink below.
+        std::os::unix::fs::symlink(root.join("adir"), root.join("linkdir")).expect("symlink");
+        let size = drop_item_size(&root.join("adir"), 0, 1024).expect("walk");
+        assert!(size >= 4, "at least deep.txt's bytes, got {size}");
+        let link_size = drop_item_size(&root.join("linkdir"), 0, 1024).expect("link walk");
+        let link_len = std::fs::symlink_metadata(root.join("linkdir"))
+            .expect("metadata")
+            .len();
+        assert_eq!(link_size, link_len, "a symlinked dir counts as the link");
+        // Depth cap: a chain deeper than the walk allows is refused.
+        let mut deep = root.join("deep-chain");
+        std::fs::create_dir(&deep).expect("deep chain");
+        for _ in 0..70 {
+            let next = deep.join("d");
+            std::fs::create_dir(&next).expect("deep dir");
+            deep = next;
+        }
+        let error =
+            drop_item_size(&root.join("deep-chain"), 0, 1024 * 1024).expect_err("depth cap");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn import_runs_items_sequentially_and_summarizes() {
+        use remote_fs::FsLocation;
+        let root = drop_fixture();
+        let plan = plan_drop(
+            vec![
+                root.join("a.txt"),
+                root.join("adir"),
+                root.join("target").join("taken.txt"),
+            ],
+            root.join("target"),
+            true,
+        )
+        .expect("plan");
+        let op = SidebarOp::BatchTransfer {
+            src_loc: FsLocation::Local,
+            items: plan.items,
+            cut: false,
+            verb: "Imported",
+        };
+        let outcome = run_sidebar_op(&FsLocation::Local, &[], &op, None);
+        assert!(outcome.result.is_ok());
+        assert!(!outcome.cancelled);
+        assert_eq!(outcome.location, FsLocation::Local);
+        assert!(outcome.consumed_paths.is_empty());
+        // Two landed, the colliding one is counted in the summary.
+        assert!(root.join("target").join("a.txt").exists());
+        assert!(root
+            .join("target")
+            .join("adir")
+            .join("sub")
+            .join("deep.txt")
+            .exists());
+        let (text, neutral) = outcome.warning.expect("summary notice");
+        assert!(text.starts_with("1 of 3 items failed"), "{text}");
+        assert!(!neutral);
+
+        // A pre-cancelled burst imports nothing and reports cancelled.
+        let root2 = drop_fixture();
+        let plan = plan_drop(vec![root2.join("a.txt")], root2.join("target"), true).expect("plan");
+        let progress = remote_fs::TransferProgress::new();
+        progress.cancel();
+        let op = SidebarOp::BatchTransfer {
+            src_loc: FsLocation::Local,
+            items: plan.items,
+            cut: false,
+            verb: "Imported",
+        };
+        let outcome = run_sidebar_op(&FsLocation::Local, &[], &op, Some(&progress));
+        assert!(outcome.cancelled);
+        assert!(outcome.result.is_err());
+        assert!(outcome.consumed_paths.is_empty());
+        assert!(!root2.join("target").join("a.txt").exists());
+        assert!(outcome
+            .warning
+            .expect("cancel summary")
+            .0
+            .contains("Cancelled"));
+        std::fs::remove_dir_all(root2).expect("remove test tree");
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_pty_hangup_waits_for_real_exit_and_recovers_output() {
+        use iced::futures::StreamExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = format!(
+            "frost-pty-hangup-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let script_path = std::env::temp_dir().join(unique);
+        std::fs::write(
+            &script_path,
+            b"#!/bin/sh\nexec 0>&- 1>&- 2>&-\nsleep 0.25\nexec 0</dev/tty 1>/dev/tty 2>/dev/tty\nprintf recovered\nsleep 0.05\nexit 7\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script_path, permissions).unwrap();
+
+        let script = script_path.to_string_lossy().into_owned();
+        let argv = vec![script];
+        let pty = Pty::new_with_cwd(80, 24, Some("/"), None, None, Some(&argv))
+            .expect("spawn hangup test shell");
+        let (shutdown_r, shutdown_w) = Pty::make_shutdown_pipe().unwrap();
+        let _shutdown_guard = shutdown_w;
+        let (mut tx, mut rx) = iced::futures::channel::mpsc::channel(2);
+        let id = 77;
+        let fd = pty.master_fd();
+
+        // Observe the initial hangup the way the reader loop does: poll the
+        // master until the child has closed every slave fd (Linux EIO).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut probe = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(fd, probe.as_mut_ptr() as *mut libc::c_void, probe.len()) };
+            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never closed its slave fds"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // The old implementation emitted PtyExited(-1) here, causing the live
+        // child to be dropped and killed before it could reopen /dev/tty.
+        let outcome = wait_out_hangup(
+            id,
+            fd,
+            fd,
+            shutdown_r,
+            pty.get_child_pid(),
+            &mut tx,
+            &mut organism_watch::SourceAuthority::default().start(),
+        );
+        assert!(matches!(outcome, HangupOutcome::Recovered));
+        let output = match iced::futures::executor::block_on(rx.next()) {
+            Some(Message::PtyOutput(msg_id, msg_fd, bytes, _)) => {
+                assert_eq!((msg_id, msg_fd), (id, fd));
+                bytes
+            }
+            other => panic!("expected recovered PTY output, got {other:?}"),
+        };
+        assert_eq!(output, b"recovered");
+
+        // The child then exits for real. Wait for the second hangup the same
+        // way, then the probe must report the genuine status — never a
+        // fabricated exit while the child was still alive.
+        loop {
+            let n = unsafe { libc::read(fd, probe.as_mut_ptr() as *mut libc::c_void, probe.len()) };
+            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never exited after recovery"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let outcome = wait_out_hangup(
+            id,
+            fd,
+            fd,
+            shutdown_r,
+            pty.get_child_pid(),
+            &mut tx,
+            &mut organism_watch::SourceAuthority::default().start(),
+        );
+        assert!(matches!(outcome, HangupOutcome::Exited));
+        match iced::futures::executor::block_on(rx.next()) {
+            Some(Message::PtyExited(msg_id, msg_fd, code)) => {
+                assert_eq!((msg_id, msg_fd), (id, fd));
+                assert_eq!(code, 7);
+            }
+            other => panic!("expected a real PTY exit, got {other:?}"),
+        }
+
+        drop(pty);
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[test]
+    fn tab_switcher_query_drops_controls_and_truncates_on_a_char_boundary() {
+        let mut state = TabSwitcherState {
+            selected: 3,
+            ..Default::default()
+        };
+        assert!(state.push_query_text("ta\nb\u{1b}"));
+        assert_eq!(state.query, "tab");
+        assert_eq!(state.selected, 0);
+        assert!(!state.push_query_text("\n"));
+        assert_eq!(state.query, "tab");
+
+        state.set_query(format!(
+            "{}x",
+            "界".repeat(TabSwitcherState::MAX_QUERY_BYTES)
+        ));
+        assert!(state.query.len() <= TabSwitcherState::MAX_QUERY_BYTES);
+        assert!(state.query.is_char_boundary(state.query.len()));
+        assert!(!state.query.contains('x'));
+
+        state.set_query(format!(
+            "{}y",
+            "x".repeat(TabSwitcherState::MAX_QUERY_BYTES)
+        ));
+        assert_eq!(state.query.len(), TabSwitcherState::MAX_QUERY_BYTES);
+        assert!(!state.query.contains('y'));
+        let filled = state.query.clone();
+        assert!(!state.push_query_text("z"));
+        assert_eq!(state.query, filled);
+        assert!(state.backspace());
+        assert_eq!(state.query.len(), filled.len() - 1);
+        state.set_query("tab");
+        state.set_query("tab\u{202e}");
+        assert_eq!(state.query, "tab");
+        assert!(!state.query.contains('\u{202e}'));
+        assert!(!state.query.contains('\u{fffd}'));

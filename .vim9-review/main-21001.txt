@@ -1,0 +1,300 @@
+            )
+            .size(self.effective_font_size())
+            .wrapping(text::Wrapping::Word)
+            .style(text::danger),
+        );
+        body = body.push(
+            row![
+                button(self.popup_text("Cancel").size(self.effective_font_size()))
+                    .on_press(Message::SidebarDeleteCancel)
+                    .padding([4, 12])
+                    .style(self.ghost_btn_style()),
+                Space::new().width(Length::Fill),
+                button(self.popup_text("Delete").size(self.effective_font_size()))
+                    .on_press(Message::SidebarDeleteConfirm)
+                    .padding([4, 12])
+                    .style(button::danger),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        );
+        let panel = container(scrollable(body).height(Length::Shrink))
+            .width(Length::Fixed(
+                (self.win_size.width - 16.0).clamp(1.0, 380.0),
+            ))
+            .padding(14)
+            .max_height((self.win_size.height - 16.0).max(1.0))
+            .style(self.popup_style());
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::SidebarDeleteCancel);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
+    /// Centered modal: "Tab is running `<proc>`. Close anyway?". Esc / outside
+    /// click cancel; only TabCloseConfirmYes proceeds with the close.
+    fn tab_close_confirm_view(&self, id: usize, proc_name: &str) -> Element<'_, Message> {
+        let label = session_persistence::bound_tab_title_draft(
+            self.sessions
+                .iter()
+                .find(|session| session.id == id)
+                .map(|s| s.label())
+                .unwrap_or_else(|| format!("Session {}", id + 1)),
+        );
+        let proc_name = session_persistence::bound_tab_title_draft(proc_name);
+        let body = column![
+            self.popup_text(format!("Close \"{}\"?", label))
+                .size(self.effective_font_size()),
+            self.popup_text(format!("Foreground process: {}", proc_name))
+                .size(self.effective_font_size())
+                .color(self.c_text_dim()),
+            row![
+                button(self.popup_text("Cancel").size(self.effective_font_size()))
+                    .on_press(Message::TabCloseConfirmNo)
+                    .padding([4, 12])
+                    .style(self.ghost_btn_style()),
+                Space::new().width(Length::Fill),
+                button(
+                    self.popup_text("Close anyway")
+                        .size(self.effective_font_size())
+                )
+                .on_press(Message::TabCloseConfirmYes)
+                .padding([4, 12])
+                .style(button::danger),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        ]
+        .spacing(10);
+        let panel = container(scrollable(body).height(Length::Shrink))
+            .width(Length::Fixed(
+                (self.win_size.width - 16.0).clamp(1.0, 320.0),
+            ))
+            .padding(14)
+            .max_height((self.win_size.height - 16.0).max(1.0))
+            .style(self.popup_style());
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::TabCloseConfirmNo);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
+    /// Counted, stable-pane confirmation for Clear Blocks. The destructive
+    /// wording is deliberately explicit: clearing also discards bookmarks and
+    /// captured output, and there is no undo path after this modal.
+    fn block_clear_confirm_view(&self, confirm: BlockClearConfirmation) -> Element<'_, Message> {
+        let count = confirm.block_count;
+        let noun = if count == 1 { "block" } else { "blocks" };
+        let body = column![
+            self.popup_text(format!("Clear {count} command {noun}?")).size(self.effective_font_size()),
+            self.popup_text(format!(
+                "This clears {count} completed command {noun}, their bookmarks, and captured output from this pane."
+            ))
+            .size(self.effective_font_size())
+            .wrapping(text::Wrapping::Word)
+            .color(self.c_text_dim()),
+            self.popup_text("Undo Clear Blocks can restore the latest clear, within history limits. Bookmarks and selection are not restored.").size(self.effective_font_size()).wrapping(text::Wrapping::Word).style(text::warning),
+            row![
+                button(self.popup_text("Cancel").size(self.effective_font_size()))
+                    .on_press(Message::BlockClearConfirmNo)
+                    .padding([4, 12])
+                    .style(self.ghost_btn_style()),
+                Space::new().width(Length::Fill),
+                button(self.popup_text(format!("Clear {count} {noun}")).size(self.effective_font_size()))
+                    .on_press(Message::BlockClearConfirmYes)
+                    .padding([4, 12])
+                    .style(button::danger),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        ]
+        .spacing(10);
+        let panel_width = (self.win_size.width - 32.0).clamp(240.0, 380.0);
+        let panel = container(scrollable(body).height(Length::Shrink))
+            .width(Length::Fixed(panel_width))
+            .padding(14)
+            .max_height((self.win_size.height - 16.0).max(1.0))
+            .style(self.popup_style());
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::BlockClearConfirmNo);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
+    /// Bottom-right toast stack. Each toast is click-dismissable.
+    fn toast_overlay(&self) -> Element<'_, Message> {
+        let mut col = column![].spacing(6);
+        for (idx, t) in self.toasts.iter().enumerate() {
+            let accent = match t.kind {
+                ToastKind::Info => self.c_accent(),
+                ToastKind::Success => self.theme.ansi_color(2),
+                ToastKind::Warning => self.theme.ansi_color(3),
+            };
+            let style_accent = accent;
+            let style = move |_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(Color {
+                    a: 0.96,
+                    ..Color::BLACK
+                })),
+                text_color: Some(Color::WHITE),
+                border: iced::Border {
+                    color: style_accent,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            };
+            let body = container(text(t.text.clone()).size(self.effective_font_size()))
+                .padding([6, 12])
+                .style(style);
+            let clickable = mouse_area(body).on_press(Message::ToastDismiss(idx));
+            col = col.push(clickable);
+        }
+        // Sit just above the bottom bar — or the window edge when it's off.
+        let bottom = if self.config.bottom_bar {
+            self.status_bar_height() + self.organism_strip_height() + 12.0
+        } else {
+            12.0
+        };
+        container(col)
+            .align_right(Length::Fill)
+            .align_bottom(Length::Fill)
+            .padding(iced::Padding::from(0).right(16.0).bottom(bottom))
+            .into()
+    }
+
+    /// A bounded in-layout startup notice. Only its own scroll area and Dismiss
+    /// button handle pointer events; no overlay or input focus is introduced.
+    fn session_recovery_banner(&self) -> Option<Element<'_, Message>> {
+        if !self.startup_recovery.visible() {
+            return None;
+        }
+        let font_size = self.chrome_font_size();
+        let mut details = column![].spacing(2).width(Length::Fill);
+        if let Some(notice) = self.startup_recovery.preservation.notice() {
+            details = details.push(
+                text(crate::review_text::bound_diagnostic_text(notice))
+                    .size(font_size)
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::warning),
+            );
+        }
+        details = details.push(
+            text(crate::review_text::bound_diagnostic_text(format!(
+                "Recovered saved session: {}",
+                self.startup_recovery.report.summary()
+            )))
+            .size(font_size)
+            .wrapping(text::Wrapping::Word),
+        );
+        let bar = row![
+            scrollable(details).width(Length::Fill).height(Length::Fill),
+            button(text("Dismiss").size(font_size))
+                .on_press(Message::SessionRecoveryDismiss)
+                .padding([3, 9])
+                .style(self.ghost_btn_style()),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+        Some(
+            container(bar)
+                .width(Length::Fill)
+                .height(Length::Fixed(
+                    self.startup_recovery.banner_height(font_size),
+                ))
+                .padding([6, 10])
+                .style(self.chrome_bar_style())
+                .into(),
+        )
+    }
+
+    /// Persistent load diagnostics. Unlike transient toasts, these remain
+    /// visible until the user fixes the underlying file (or explicitly resets
+    /// the main config), so a fallback can never look like a successful load.
+    fn diagnostics_overlay(&self) -> Element<'_, Message> {
+        let mut content = column![text("frost needs attention").size(self.effective_font_size())]
+            .spacing(4)
+            .width(Length::Fill);
+        if let Some(error) = &self.config_diagnostic {
+            content = content.push(
+                text(crate::review_text::bound_diagnostic_text(error))
+                    .size(self.effective_font_size())
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::warning),
+            );
+            content = content.push(
+                text("Auto-save is paused to preserve the file. Fix it externally or use Reset.")
+                    .size(self.effective_font_size())
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::secondary),
+            );
+        }
+        if let Some(error) = &self.session_diagnostic {
+            content = content.push(
+                text(crate::review_text::bound_diagnostic_text(error))
+                    .size(self.effective_font_size())
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::danger),
+            );
+        }
+        for diagnostic in self.keybindings_diagnostics.iter().take(3) {
+            content = content.push(
+                text(crate::review_text::bound_diagnostic_text(diagnostic))
+                    .size(self.effective_font_size())
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::warning),
+            );
+        }
+        if self.keybindings_diagnostics.len() > 3 {
+            content = content.push(
+                text(format!(
+                    "…and {} more keybinding issue(s)",
+                    self.keybindings_diagnostics.len() - 3
+                ))
+                .size(self.effective_font_size())
+                .style(text::secondary),
+            );
+        }
+        let panel_width = (self.win_size.width - 32.0).clamp(240.0, 520.0);
+        let panel = container(content)
+            .width(Length::Fixed(panel_width))
+            .padding([8, 12])
+            .style(container::dark);
+        container(panel)
+            .align_right(Length::Fill)
+            .align_top(Length::Fill)
+            .padding([40, 8])
+            .into()
+    }
+
+    /// Ctrl+Shift+L fuzzy tab switcher overlay (palette-style).
+    fn tab_switcher_view(&self, state: &TabSwitcherState) -> Element<'_, Message> {
+        let labels = self.tab_labels();
+        let filtered = tab_switcher_filtered(&labels, &state.query);
+
+        let query: Element<'_, Message> = text_input("Jump to tab…", &state.query)
+            .style(self.popup_input_style())
+            .font(self.mono)
+            .id(TAB_SWITCHER_INPUT_ID.clone())
+            .on_input(Message::TabSwitcherInput)
+            .size(self.effective_font_size())
+            .into();
+        let query_line = row![self.popup_text("↦"), query]

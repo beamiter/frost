@@ -1,0 +1,300 @@
+                    // The remote host picker owns the keyboard the same way
+                    // (Enter connects, arrows move, Esc/Ctrl+Shift+S dismiss).
+                    if self.remote_picker.is_some() {
+                        if let Some(task) = self.handle_remote_picker_key(&key, modifiers) {
+                            return task;
+                        }
+                    }
+                    // The history picker owns the keyboard the same way (Enter
+                    // types the selection, Esc/Ctrl+Shift+H dismisses).
+                    if self.history_picker.is_some() {
+                        if let Some(task) =
+                            self.handle_history_picker_key(&key, modifiers, text.as_deref())
+                        {
+                            return task;
+                        }
+                    }
+                    // The workflow overlay owns the keyboard the same way
+                    // (picker: Enter accepts, Esc/Ctrl+Shift+M dismisses;
+                    // argument form: Tab traverses, Enter submits, Esc closes).
+                    if self.workflow_overlay.is_some() {
+                        if let Some(task) =
+                            self.handle_workflow_overlay_key(&key, modifiers, text.as_deref())
+                        {
+                            return task;
+                        }
+                    }
+                    // The inline "Ask AI" request overlay owns the keyboard the
+                    // same way (Enter drafts, Esc dismisses, typing feeds the
+                    // request when the input did not capture it).
+                    if self.ai_ask.is_some() {
+                        if let Some(task) = self.handle_ai_ask_key(&key, modifiers, text.as_deref())
+                        {
+                            return task;
+                        }
+                    }
+                    // The block search picker owns the keyboard the same way
+                    // (Enter selects and reveals the hit's zone, Esc/
+                    // Ctrl+Alt+F dismiss). It MUST consume keys before the
+                    // encode_key path below: PTY-bound input clears
+                    // the block selection, and the picker's own keystrokes must
+                    // never do that.
+                    if self.block_search.is_some() {
+                        if let Some(task) =
+                            self.handle_block_search_key(&key, modifiers, text.as_deref(), repeat)
+                        {
+                            return task;
+                        }
+                    }
+                    if self.help_open || self.debug_open {
+                        let active_overlay_toggle = (self.help_open
+                            && chrome_shortcut(&key, modifiers) == Some(ChromeShortcut::Help))
+                            || (self.debug_open
+                                && chrome_shortcut(&key, modifiers) == Some(ChromeShortcut::Debug));
+                        if active_overlay_toggle
+                            || matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                        {
+                            self.help_open = false;
+                            self.debug_open = false;
+                        }
+                        return Task::none();
+                    }
+                    // Input-owning overlays route before global keybindings so a
+                    // shortcut or printable key cannot mutate the hidden terminal.
+                    if let Some(task) = self.handle_config_panel_key(&key, modifiers) {
+                        return task;
+                    }
+                    if let Some(task) = self.handle_palette_key(&key, modifiers, text.as_deref()) {
+                        return task;
+                    }
+                    if let Some(task) = self.handle_search_replace_key(&key, modifiers) {
+                        return task;
+                    }
+                    if self.handle_search_key(&key, modifiers, text.as_deref()) {
+                        return Task::none();
+                    }
+                    let files_scope = self.files_shortcut_scope();
+                    if let Some(navigation) =
+                        sidebar_files_navigation_key(&key, modifiers, repeat, files_scope)
+                    {
+                        return match navigation {
+                            SidebarNavigationKey::Back => self.navigate_sidebar_back(),
+                            SidebarNavigationKey::Forward => self.navigate_sidebar_forward(),
+                            SidebarNavigationKey::Parent => self.navigate_sidebar_parent(),
+                            SidebarNavigationKey::Home => self.navigate_sidebar_home(),
+                        };
+                    }
+                    if sidebar_files_manual_refresh_key(&key, modifiers, repeat, files_scope) {
+                        self.invalidate_sidebar_remote_follow_intent();
+                        let request = self.sidebar.refresh();
+                        return self.queue_sidebar_load(request);
+                    }
+                    if let Some(task) = self.handle_sidebar_files_key(&key, modifiers, repeat) {
+                        return task;
+                    }
+                    // Escape dismisses a visible block selection locally. It
+                    // must not also reach the PTY: that would both clear the
+                    // UI state and send an unrelated cancel key to the child.
+                    let no_modifier = !modifiers.shift()
+                        && !modifiers.control()
+                        && !modifiers.alt()
+                        && !modifiers.logo();
+                    // Zone metadata is bounded independently of the UI state.
+                    // Reconcile a non-empty selection before deciding whether
+                    // block mode owns this key, so an asynchronously evicted
+                    // stale-only selection cannot swallow one Enter/Down.
+                    let block_key_context = self.sessions.get_mut(self.active).map(|sess| {
+                        let has_selection = if sess.block_selection.is_empty() {
+                            false
+                        } else {
+                            let ids: Vec<u64> = sess
+                                .terminal
+                                .command_zones
+                                .iter()
+                                .map(|zone| zone.id)
+                                .collect();
+                            sess.block_selection.retain(&ids)
+                        };
+                        (
+                            has_selection,
+                            sess.terminal.is_alt_buffer_active(),
+                            sess.terminal.is_command_running(),
+                        )
+                    });
+                    if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                        && block_key_context.is_some_and(
+                            |(has_selection, alt_screen, command_running)| {
+                                block_escape_owns_key(
+                                    self.config.is_block_mode(),
+                                    has_selection,
+                                    alt_screen,
+                                    command_running,
+                                    no_modifier,
+                                )
+                            },
+                        )
+                    {
+                        if let Some(sess) = self.sessions.get_mut(self.active) {
+                            sess.block_selection.clear();
+                            sess.refresh();
+                        }
+                        return Task::none();
+                    }
+                    // Warp-style block selection owns the unmodified arrows
+                    // only once a selection exists: Up/Down collapses it to
+                    // one neighboring block, Shift+Up/Down moves the active
+                    // range edge, Ctrl+Shift+Up/Down reveals that card's top /
+                    // bottom, and Enter reinputs the selected commands.
+                    // A running/full-screen program keeps every key, including
+                    // Enter, so block chrome can never steal its stdin.
+                    let shift_only = modifiers.shift()
+                        && !modifiers.control()
+                        && !modifiers.alt()
+                        && !modifiers.logo();
+                    let ctrl_shift_only = modifiers.shift()
+                        && modifiers.control()
+                        && !modifiers.alt()
+                        && !modifiers.logo();
+                    let selection_owns_keys = block_key_context.is_some_and(
+                        |(has_selection, alt_screen, command_running)| {
+                            block_selection_owns_keys(
+                                self.config.is_block_mode(),
+                                has_selection,
+                                alt_screen,
+                                command_running,
+                            )
+                        },
+                    );
+                    if selection_owns_keys {
+                        match &key {
+                            keyboard::Key::Named(keyboard::key::Named::ArrowUp) if no_modifier => {
+                                return self.block_select_step(true);
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowDown)
+                                if no_modifier =>
+                            {
+                                return self.block_select_step(false);
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowUp) if shift_only => {
+                                return self.block_extend_selection_step(true);
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowDown) if shift_only => {
+                                return self.block_extend_selection_step(false);
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowUp)
+                                if ctrl_shift_only =>
+                            {
+                                if let Some(id) = self
+                                    .sessions
+                                    .get(self.active)
+                                    .and_then(|sess| sess.block_selection.active())
+                                {
+                                    return self.block_reveal_edge(id, false);
+                                }
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowDown)
+                                if ctrl_shift_only =>
+                            {
+                                if let Some(id) = self
+                                    .sessions
+                                    .get(self.active)
+                                    .and_then(|sess| sess.block_selection.active())
+                                {
+                                    return self.block_reveal_edge(id, true);
+                                }
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::Enter) if no_modifier => {
+                                // A selection can be created after the user has
+                                // already typed at the live prompt. Only an OSC
+                                // 133-confirmed empty prompt owned by the shell
+                                // may be replaced with recalled commands.
+                                let prompt_status = self
+                                    .sessions
+                                    .get_mut(self.active)
+                                    .map(Session::agent_prompt_status);
+                                if prompt_status.is_some_and(|status| {
+                                    block_enter_reinputs_selection(selection_owns_keys, status)
+                                }) {
+                                    return self.block_reinput_selected_commands_task();
+                                }
+                                // Dirty/untrusted prompt state: exit block
+                                // selection and let Enter follow the ordinary
+                                // keybinding/PTY path, preserving visible input.
+                                if let Some(reason) = prompt_status.and_then(|status| {
+                                    block_enter_blocked_reason(selection_owns_keys, status)
+                                }) {
+                                    self.push_toast(
+                                        format!(
+                                            "Selection cleared; commands not reinput: {reason}"
+                                        ),
+                                        ToastKind::Info,
+                                    );
+                                }
+                                if let Some(sess) = self.sessions.get_mut(self.active) {
+                                    sess.block_selection.clear();
+                                    sess.refresh();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(task) = self.handle_keybinding(&key, modifiers, retreat_before_key)
+                    {
+                        return task;
+                    }
+                    if let Some(task) =
+                        self.handle_tab_shortcut(&key, modifiers, retreat_before_key)
+                    {
+                        return task;
+                    }
+                    if self.handle_scroll_shortcut(&key, modifiers) {
+                        return Task::none();
+                    }
+                    if self.sidebar_files_focused
+                        && self.dock_open()
+                        && self.sidebar_panel == SidebarPanel::Files
+                    {
+                        return Task::none();
+                    }
+                    let mut dead_input = false;
+                    let Some(sess) = self.sessions.get_mut(self.active) else {
+                        return Task::none();
+                    };
+                    let app_cursor = sess.terminal.is_application_cursor_keys();
+                    let enh = KeyboardEnhancements {
+                        kitty_flags: sess.terminal.keyboard_enhancement_flags(),
+                        modify_other_keys: sess.terminal.xterm_modify_other_keys(),
+                        format_other_keys: sess.terminal.xterm_format_other_keys(),
+                        report_all_keys: sess.terminal.is_report_all_keys_enabled(),
+                        application_keypad: sess.terminal.is_application_keypad(),
+                    };
+                    if let Some(bytes) =
+                        encode_key(&key, location, modifiers, text.as_deref(), app_cursor, enh)
+                    {
+                        if sess.transcript_read_only() {
+                            // Held-open task transcript: the PTY is gone, so
+                            // typing becomes a visible no-op instead of an EIO
+                            // in the log.
+                            dead_input = true;
+                        } else {
+                            // Typing into the shell dismisses the block selection
+                            // (any PTY-bound key, not Escape specifically).
+                            sess.block_selection.clear();
+                            sess.terminal.scroll_to_bottom();
+                            sess.projection_view_state.scroll_to_bottom();
+                            let accepted = sess.write_pty(&bytes);
+                            if accepted
+                                && self.config.is_chat_mode()
+                                && no_modifier
+                                && matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter))
+                            {
+                                sess.terminal.note_chat_submit();
+                            }
+                            if accepted
+                                && !sess.managed_remote
+                                && self.organism.is_local(sess.id)
+                                && !matches!(
+                                    sess.fg_proc_cache.as_deref(),
+                                    Some("ssh" | "mosh" | "telnet")
+                                )
+                            {

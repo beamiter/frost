@@ -1,0 +1,300 @@
+        assert!(!link_projection_matches(0, 0));
+        assert!(!link_projection_matches(0, 41));
+    }
+
+    #[test]
+    fn terminal_mouse_gestures_are_independent_per_button() {
+        let mut gestures = [None; 3];
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            gestures[button.slot()] = Some(TerminalMouseGesture {
+                session_id: 7,
+                button,
+                report_to_app: true,
+                last_app_cell: None,
+                consumed: false,
+            });
+        }
+        for button in [MouseButton::Right, MouseButton::Left, MouseButton::Middle] {
+            let gesture = gestures[button.slot()].take().expect("owned release");
+            assert_eq!(gesture.button, button);
+        }
+        assert!(gestures.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn terminal_app_mouse_release_fallback_is_paired_and_button_owned() {
+        let mut gestures = [None; 3];
+        for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+            let session_id = 40 + button.slot();
+            gestures[button.slot()] = Some(TerminalMouseGesture {
+                session_id,
+                button,
+                report_to_app: true,
+                last_app_cell: None,
+                consumed: false,
+            });
+            let pending = gestures[button.slot()].unwrap();
+            assert_eq!(pending.app_drag_cell(Some((2, 3))), None);
+            assert_eq!(pending.app_release_cell(Some((2, 3)), 24, 8), None);
+            assert_eq!(pending.app_release_cell(None, 24, 8), None);
+
+            record_terminal_app_mouse_cell(&mut gestures, 99, button, (9, 9));
+            assert_eq!(gestures[button.slot()], Some(pending));
+            record_terminal_app_mouse_cell(
+                &mut gestures,
+                session_id,
+                button,
+                (button.slot() + 1, 4),
+            );
+        }
+
+        // Releasing in reverse order cannot borrow another button's accepted
+        // coordinates or retire a sibling pane's still-pending gesture.
+        for button in [MouseButton::Right, MouseButton::Middle, MouseButton::Left] {
+            let session_id = 40 + button.slot();
+            let pending = gestures[button.slot()].unwrap();
+            assert_eq!(take_terminal_mouse_gesture(&mut gestures, 99, button), None);
+            assert_eq!(gestures[button.slot()], Some(pending));
+            let released = take_terminal_mouse_gesture(&mut gestures, session_id, button).unwrap();
+            assert_eq!(
+                released.app_release_cell(None, 24, 8),
+                Some((button.slot() + 1, 4))
+            );
+            assert_eq!(released.app_release_cell(Some((7, 6)), 24, 8), Some((7, 6)));
+            assert_eq!(
+                take_terminal_mouse_gesture(&mut gestures, session_id, button),
+                None
+            );
+        }
+        assert!(gestures.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn terminal_app_mouse_drag_preserves_the_last_accepted_raw_cell() {
+        let button = MouseButton::Left;
+        let mut gestures = [None; 3];
+        gestures[button.slot()] = Some(TerminalMouseGesture {
+            session_id: 7,
+            button,
+            report_to_app: true,
+            last_app_cell: Some((1, 2)),
+            consumed: false,
+        });
+        let dragged = gestures[button.slot()].unwrap().app_drag_cell(Some((5, 6)));
+        assert_eq!(dragged, Some((5, 6)));
+        record_terminal_app_mouse_cell(&mut gestures, 7, button, dragged.unwrap());
+        let pending = gestures[button.slot()].unwrap();
+        assert_eq!(
+            pending.app_drag_cell(None),
+            None,
+            "gap/history has no drag cell"
+        );
+        assert_eq!(pending.app_release_cell(None, 24, 8), Some((5, 6)));
+        assert_eq!(pending.app_release_cell(Some((8, 3)), 24, 8), Some((8, 3)));
+
+        for mut unowned in [
+            TerminalMouseGesture {
+                report_to_app: false,
+                ..pending
+            },
+            TerminalMouseGesture {
+                consumed: true,
+                ..pending
+            },
+        ] {
+            unowned.last_app_cell = None;
+            gestures[button.slot()] = Some(unowned);
+            record_terminal_app_mouse_cell(&mut gestures, 7, button, (9, 9));
+            assert_eq!(gestures[button.slot()], Some(unowned));
+            assert_eq!(unowned.app_drag_cell(Some((3, 4))), None);
+            assert_eq!(unowned.app_release_cell(Some((3, 4)), 24, 8), None);
+            assert_eq!(unowned.app_release_cell(None, 24, 8), None);
+        }
+
+        // A corrupted/mismatched slot is never treated as a paired button.
+        gestures[button.slot()] = Some(TerminalMouseGesture {
+            button: MouseButton::Right,
+            ..pending
+        });
+        record_terminal_app_mouse_cell(&mut gestures, 7, button, (9, 9));
+        assert_eq!(gestures[button.slot()].unwrap().last_app_cell, Some((5, 6)));
+        assert_eq!(take_terminal_mouse_gesture(&mut gestures, 7, button), None);
+    }
+
+    fn caret_test_press(row: usize, col: usize) -> MouseInput {
+        MouseInput::Press {
+            row,
+            col,
+            button: MouseButton::Left,
+            alt: false,
+            shift: false,
+            ctrl: false,
+            count: 1,
+            finalized: false,
+            link_eligible: false,
+            app_eligible: false,
+            block: None,
+            block_zone_id: None,
+            link: false,
+            link_revision: 0,
+            x: 0.0,
+            y: 0.0,
+        }
+    }
+
+    #[test]
+    fn terminal_click_projection_resize_must_not_retarget_the_prompt() {
+        let mut terminal = terminal::TerminalState::new(32, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hello");
+        let before = terminal.get_projected_viewport(true);
+        let mut tracker = TerminalClickTracker::default();
+        tracker.update(caret_test_press(0, 7), 7, before.key(), false);
+        terminal.on_resize(24, 8);
+        let after = terminal.get_projected_viewport(true);
+        assert_ne!(before.key(), after.key());
+        // The stale display cell is still a valid live prompt cell. Blindly
+        // remapping it would really emit five Left keys, not just lose a click.
+        let (col, row) = projected_live_grid_cell(&terminal, &after, 0, 7).unwrap();
+        assert_eq!(
+            terminal.click_cursor_move(row, col, true),
+            b"\x1b[D".repeat(5)
+        );
+        assert_eq!(
+            tracker.update(
+                MouseInput::Release {
+                    row: 0,
+                    col: 7,
+                    button: MouseButton::Left,
+                },
+                7,
+                after.key(),
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_click_projection_wheel_must_cancel_even_at_scroll_boundary() {
+        let mut terminal = terminal::TerminalState::new(32, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hello");
+        let view = terminal.get_projected_viewport(true);
+        for ctrl in [false, true] {
+            let mut tracker = TerminalClickTracker::default();
+            tracker.update(caret_test_press(0, 7), 7, view.key(), false);
+            tracker.update(
+                MouseInput::Wheel {
+                    row: 0,
+                    col: 7,
+                    up: true,
+                    ctrl,
+                    shift: false,
+                    lines: 1,
+                    app_eligible: false,
+                },
+                7,
+                view.key(),
+                false,
+            );
+            assert_eq!(
+                tracker.update(
+                    MouseInput::Release {
+                        row: 0,
+                        col: 7,
+                        button: MouseButton::Left,
+                    },
+                    7,
+                    view.key(),
+                    false
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_click_projection_collapse_expand_modes_and_scroll_cancel() {
+        let mut terminal = terminal::TerminalState::new(32, 8);
+        terminal.process_input(
+            concat!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07",
+                "A中e\u{301}\r\n\r\nlast\r\n\x1b]133;D;0\x07",
+                "\x1b]133;A\x07$ \x1b]133;B\x07echo hello",
+            )
+            .as_bytes(),
+        );
+        let mut policy = terminal::ProjectionPolicy::new();
+        policy.set_native_chrome(true, 0);
+        policy.set_block_spacing(false);
+        let zone = terminal.command_zones.front().unwrap().id;
+        let before = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+        policy.collapse(zone);
+        let collapsed = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+        policy.expand(zone);
+        let expanded = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+        policy.set_chat(true);
+        let chat = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+        let native = terminal.get_projected_viewport_with_policy(false, &policy, 0);
+        let scrolled = terminal.get_projected_viewport_with_policy(true, &policy, usize::MAX);
+        for (label, press, release) in [
+            ("collapse", &before, &collapsed),
+            ("expand", &collapsed, &expanded),
+            ("chat", &expanded, &chat),
+            ("native", &chat, &native),
+            ("scroll", &chat, &scrolled),
+        ] {
+            assert_ne!(press.key(), release.key(), "{label}");
+            let mut tracker = TerminalClickTracker::default();
+            tracker.update(caret_test_press(2, 7), 7, press.key(), false);
+            assert_eq!(
+                tracker.update(
+                    MouseInput::Release {
+                        row: 2,
+                        col: 7,
+                        button: MouseButton::Left,
+                    },
+                    7,
+                    release.key(),
+                    false
+                ),
+                None,
+                "{label}"
+            );
+            assert!(
+                tracker.cancelled,
+                "{label}: stale one-cell press must not copy"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_click_projection_unchanged_refresh_and_other_buttons_keep_caret() {
+        let mut terminal = terminal::TerminalState::new(32, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hello");
+        let before = terminal.get_projected_viewport(true);
+        let mut tracker = TerminalClickTracker::default();
+        tracker.update(caret_test_press(0, 7), 7, before.key(), false);
+        terminal.process_input(b"");
+        let after = terminal.get_projected_viewport(true);
+        assert_eq!(
+            before.key(),
+            after.key(),
+            "quiet refresh has the same identity"
+        );
+        for button in [MouseButton::Right, MouseButton::Middle] {
+            let mut press = caret_test_press(0, 7);
+            if let MouseInput::Press {
+                button: current, ..
+            } = &mut press
+            {
+                *current = button;
+            }
+            tracker.update(press, 99, after.key(), false);
+            tracker.update(
+                MouseInput::Release {
+                    row: 0,
+                    col: 7,
+                    button,
+                },
+                99,
+                after.key(),

@@ -1,0 +1,300 @@
+                line_text: "needle".into(),
+                is_output_line: true,
+                match_span: Some(0..6),
+                command_preview: "first".into(),
+            };
+            match invalid {
+                "command" => hit.is_output_line = false,
+                "zero line" => hit.line_no = 0,
+                "removed" => hit.zone_id = u64::MAX,
+                "evicted" => {
+                    fixture
+                        .terminal
+                        .command_zones
+                        .front_mut()
+                        .unwrap()
+                        .rows_evicted = true
+                }
+                "projection" => {
+                    fixture.policy.expand(fixture.other_zone);
+                }
+                _ => unreachable!(),
+            }
+            let revision = fixture.policy.revision();
+            assert!(
+                !expand_block_search_hit(
+                    &fixture.terminal,
+                    &fixture.projection,
+                    &mut fixture.policy,
+                    &hit,
+                ),
+                "{invalid}"
+            );
+            assert_eq!(fixture.policy.revision(), revision);
+            assert!(fixture.policy.is_collapsed(fixture.target.zone_id));
+        }
+    }
+
+    #[test]
+    fn block_search_selection_wraps_over_all_hits() {
+        // Every hit is drawn (in a scrollable) and navigable — the selection
+        // wraps across the FULL hit list, not a visible-rows prefix.
+        let mut state = BlockSearchState {
+            hits: (0..40).map(block_search_hit).collect(),
+            ..BlockSearchState::default()
+        };
+        state.select_prev();
+        assert_eq!(state.selected, 39);
+        state.select_next();
+        assert_eq!(state.selected, 0);
+        for _ in 0..39 {
+            state.select_next();
+        }
+        assert_eq!(state.selected, 39);
+        state.select_first();
+        assert_eq!(state.selected, 0);
+        state.select_page(true);
+        assert_eq!(state.selected, 10);
+        state.select_page(true);
+        assert_eq!(state.selected, 20);
+        state.select_page(false);
+        assert_eq!(state.selected, 10);
+        state.select_last();
+        assert_eq!(state.selected, 39);
+        state.select_page(true);
+        assert_eq!(state.selected, 39, "page-down clamps at the final hit");
+        state.selected = usize::MAX;
+        state.select_prev();
+        assert_eq!(
+            state.selected, 38,
+            "stale selection is clamped before moving"
+        );
+        // Empty hits pin the selection at 0 in both directions.
+        let mut empty = BlockSearchState::default();
+        empty.select_next();
+        empty.select_prev();
+        empty.select_last();
+        empty.select_page(true);
+        assert_eq!(empty.selected, 0);
+    }
+
+    #[test]
+    fn block_search_count_label_reports_all_hits_and_the_cap() {
+        let mut state = BlockSearchState {
+            query: "needle".into(),
+            hits: vec![block_search_hit(1)],
+            ..BlockSearchState::default()
+        };
+        // The label leads with the highlight's position, so stepping the
+        // arrows through a long hit list says how far through it you are.
+        assert_eq!(state.count_label(), "1 of 1 match");
+        state.hits.push(block_search_hit(2));
+        assert_eq!(state.count_label(), "1 of 2 matches");
+        state.selected = 1;
+        assert_eq!(state.count_label(), "2 of 2 matches");
+        // A selection left past the end by a shrinking hit list still reports
+        // a position inside it.
+        state.selected = 9;
+        assert_eq!(state.count_label(), "2 of 2 matches");
+        state.selected = 1;
+        // The hit cap uses ember's wording: it means older blocks went
+        // unscanned, not that more matches necessarily exist.
+        state.capped = true;
+        assert_eq!(
+            state.count_label(),
+            "2 of 2 matches · older blocks not searched"
+        );
+        state.older_not_indexed = true;
+        assert_eq!(
+            state.count_label(),
+            "2 of 2 matches · older blocks not searched · older blocks not indexed"
+        );
+        // An empty result set has no position to report.
+        state.hits.clear();
+        state.capped = false;
+        state.older_not_indexed = false;
+        assert_eq!(state.count_label(), "0 matches");
+        state.query.clear();
+        assert_eq!(state.count_label(), "0 blocks");
+        state.hits.push(block_search_hit(1));
+        assert_eq!(state.count_label(), "1 of 1 block");
+    }
+
+    fn sidebar_clipboard(
+        loc: remote_fs::FsLocation,
+        items: Vec<(&std::path::Path, bool)>,
+        cut: bool,
+    ) -> FsClipboard {
+        FsClipboard {
+            id: 1,
+            loc,
+            items: items
+                .into_iter()
+                .map(|(path, is_dir)| (path.to_path_buf(), is_dir))
+                .collect(),
+            cut,
+        }
+    }
+
+    #[test]
+    fn sidebar_paste_op_builds_one_batch_per_clipboard() {
+        use remote_fs::FsLocation;
+        let dir = std::path::Path::new("/target");
+        // Same- and cross-location both become one BatchTransfer; the same-vs-
+        // cross decision is the executor's (it compares src_loc to the tree's
+        // location at run time).
+        let clip = sidebar_clipboard(
+            FsLocation::Local,
+            vec![
+                (std::path::Path::new("/a/file.txt"), false),
+                (std::path::Path::new("/a/packed"), true),
+            ],
+            false,
+        );
+        match sidebar_paste_op(&clip, dir) {
+            Ok(SidebarOp::BatchTransfer {
+                src_loc,
+                items,
+                cut,
+                ..
+            }) => {
+                assert_eq!(src_loc, FsLocation::Local);
+                assert!(!cut);
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].dst, std::path::PathBuf::from("/target/file.txt"));
+                assert_eq!(items[1].dst, std::path::PathBuf::from("/target/packed"));
+                assert!(items[1].is_dir);
+            }
+            other => panic!("expected BatchTransfer, got {other:?}"),
+        }
+        // Cut is carried through; a nameless source refuses the whole paste.
+        let clip = sidebar_clipboard(
+            FsLocation::Remote(1),
+            vec![(std::path::Path::new("/src/packed"), true)],
+            true,
+        );
+        match sidebar_paste_op(&clip, dir) {
+            Ok(SidebarOp::BatchTransfer { src_loc, cut, .. }) => {
+                assert_eq!(src_loc, FsLocation::Remote(1));
+                assert!(cut);
+            }
+            other => panic!("expected BatchTransfer, got {other:?}"),
+        }
+        let clip = sidebar_clipboard(
+            FsLocation::Local,
+            vec![(std::path::Path::new("/"), true)],
+            false,
+        );
+        assert!(sidebar_paste_op(&clip, dir).is_err());
+    }
+
+    #[test]
+    fn batch_transfer_cut_moves_items_and_keeps_failures() {
+        use remote_fs::FsLocation;
+        let root = std::env::temp_dir().join(format!("frost-op-{}", uuid::Uuid::new_v4()));
+        let dst_dir = root.join("dst");
+        std::fs::create_dir_all(&dst_dir).expect("create test tree");
+        std::fs::write(root.join("one.txt"), b"1").expect("write");
+        std::fs::write(root.join("two.txt"), b"2").expect("write");
+        // The second item's destination is taken: it fails, the first still
+        // moves, and a cut only ever removes a source that was copied first.
+        std::fs::write(dst_dir.join("two.txt"), b"taken").expect("write taken");
+        let items = vec![
+            DropItem {
+                src: root.join("one.txt"),
+                dst: dst_dir.join("one.txt"),
+                is_dir: false,
+                error: None,
+            },
+            DropItem {
+                src: root.join("two.txt"),
+                dst: dst_dir.join("two.txt"),
+                is_dir: false,
+                error: None,
+            },
+        ];
+        let op = SidebarOp::BatchTransfer {
+            src_loc: FsLocation::Local,
+            items,
+            cut: true,
+            verb: "Moved",
+        };
+        let outcome = run_sidebar_op(&FsLocation::Local, &[], &op, None);
+        assert!(outcome.result.is_ok());
+        assert!(!outcome.cancelled);
+        assert_eq!(outcome.location, FsLocation::Local);
+        assert_eq!(outcome.consumed_paths, vec![root.join("one.txt")]);
+        assert_eq!(
+            std::fs::read(dst_dir.join("one.txt")).expect("read moved"),
+            b"1"
+        );
+        assert!(!root.join("one.txt").exists(), "moved source is deleted");
+        assert_eq!(
+            std::fs::read(root.join("two.txt")).expect("source kept"),
+            b"2",
+            "a failed item keeps its source"
+        );
+        let (text, neutral) = outcome.warning.expect("summary");
+        assert!(text.starts_with("1 of 2 items failed"), "{text}");
+        assert!(!neutral);
+
+        // Cross-location cut against an unknown host fails the item and keeps
+        // the source — the delete only runs after a landed copy.
+        let op = SidebarOp::BatchTransfer {
+            src_loc: FsLocation::Remote(9),
+            items: vec![DropItem {
+                src: std::path::PathBuf::from("/src/file.txt"),
+                dst: std::path::PathBuf::from("/dst/file.txt"),
+                is_dir: false,
+                error: None,
+            }],
+            cut: true,
+            verb: "Moved",
+        };
+        let outcome = run_sidebar_op(&FsLocation::Remote(9), &[], &op, None);
+        assert!(
+            outcome.result.is_ok(),
+            "batch errors are per-item, not fatal"
+        );
+        assert!(!outcome.cancelled);
+        assert!(outcome.consumed_paths.is_empty());
+        let (text, _) = outcome.warning.expect("summary");
+        assert!(text.starts_with("1 of 1 items failed"), "{text}");
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn batch_transfer_cancel_stops_the_remaining_items() {
+        use remote_fs::FsLocation;
+        let root = std::env::temp_dir().join(format!("frost-op-{}", uuid::Uuid::new_v4()));
+        let dst_dir = root.join("dst");
+        std::fs::create_dir_all(&dst_dir).expect("create test tree");
+        std::fs::write(root.join("one.txt"), b"1").expect("write");
+        let items = vec![DropItem {
+            src: root.join("one.txt"),
+            dst: dst_dir.join("one.txt"),
+            is_dir: false,
+            error: None,
+        }];
+        // A flag already set stops the batch before item one: cancelled, not
+        // failed, nothing copied.
+        let progress = remote_fs::TransferProgress::new();
+        progress.cancel();
+        let op = SidebarOp::BatchTransfer {
+            src_loc: FsLocation::Local,
+            items,
+            cut: false,
+            verb: "Pasted",
+        };
+        let outcome = run_sidebar_op(&FsLocation::Local, &[], &op, Some(&progress));
+        assert!(outcome.cancelled);
+        assert!(outcome.result.is_err());
+        assert!(outcome.consumed_paths.is_empty());
+        assert!(!dst_dir.join("one.txt").exists());
+        assert!(outcome
+            .warning
+            .expect("cancel summary")
+            .0
+            .contains("Cancelled"));
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }

@@ -1,0 +1,300 @@
+            let outcome = block_mode::classify(zone.command.as_deref(), zone.exit_code);
+            let status = block_mode::badge_text_with_lifecycle(
+                outcome,
+                zone.duration_ms,
+                zone.start_mark_seen,
+                zone.completion_provenance,
+            )
+            .unwrap_or_else(|| "Background output".to_string());
+            let bookmarked = sess.block_bookmarks.contains(zone.id);
+            let mut meta = status;
+            if bookmarked {
+                meta.push_str(" · ◆ bookmarked");
+            }
+            if let Some(cwd) = zone.cwd.as_deref() {
+                meta.push_str(" · ");
+                meta.push_str(&history_picker::display_cwd(&abbreviate_home(cwd)));
+            }
+            // Metadata-only: rendering an open menu must not clone/extract up
+            // to 1 MiB of output every frame. Copy/AI actions do the bounded
+            // extraction only when clicked.
+            let retention = if zone
+                .captured_output
+                .as_ref()
+                .is_some_and(|(_, truncated)| *truncated)
+            {
+                Some("Output is truncated")
+            } else if zone.captured_output_evicted {
+                Some(if zone.rows_evicted {
+                    "Output snapshot and rows were evicted"
+                } else {
+                    "Output snapshot was evicted; live rows remain available"
+                })
+            } else {
+                None
+            };
+
+            body = body
+                .push(row_btn("Open block details", BlockMenuAction::Details))
+                .push(
+                    row![
+                        self.popup_text(format!("Command Block #{}", zone.id)),
+                        Space::new().width(Length::Fill),
+                        container(row_btn("Close", BlockMenuAction::Close)).width(72),
+                    ]
+                    .align_y(iced::Alignment::Center),
+                )
+                .push(
+                    self.popup_text(preview)
+                        .wrapping(text::Wrapping::Word)
+                        .width(Length::Fill),
+                )
+                .push(
+                    self.popup_text(block_mode::display_block_search_text(&meta))
+                        .wrapping(text::Wrapping::Word)
+                        .color(self.c_text_dim()),
+                );
+            if let Some(retention) = retention {
+                body = body.push(self.popup_text(retention).style(text::warning));
+            }
+            if !matches!(outcome, block_mode::BlockOutcome::Background)
+                && block_mode::assess_lifecycle(zone.start_mark_seen, zone.completion_provenance)
+                    != block_mode::BlockLifecycleHealth::Healthy
+            {
+                body = body.push(
+                    self.popup_text(block_mode::lifecycle_detail(
+                        zone.start_mark_seen,
+                        zone.completion_provenance,
+                    ))
+                    .style(text::warning),
+                );
+            }
+            if state.chat_read_only {
+                body = body.push(
+                    self.popup_text("Read-only Chat card actions")
+                        .color(self.c_text_dim()),
+                );
+                for (label, action) in [
+                    ("Copy command", BlockMenuAction::CopyCommand),
+                    ("Copy output", BlockMenuAction::CopyOutput),
+                    ("Copy block", BlockMenuAction::CopyBlock),
+                    ("Copy block as Markdown", BlockMenuAction::CopyMarkdown),
+                ] {
+                    if actions.contains(&action) {
+                        body = body.push(row_btn(label, action));
+                    }
+                }
+            } else {
+                if sess.projection_policy.is_collapsed(zone.id) {
+                    body = body.push(row_btn("Expand output", BlockMenuAction::ExpandOutput));
+                } else if !sess.projection_policy.is_collapsed(zone.id)
+                    && sess.terminal.finished_output_range(zone.id).is_some()
+                {
+                    body = body.push(row_btn("Collapse output", BlockMenuAction::CollapseOutput));
+                }
+                let selection = block_menu_selection_summary(
+                    sess.terminal
+                        .command_zones
+                        .iter()
+                        .map(|zone| (zone.id, zone.command.as_deref())),
+                    &sess.block_selection,
+                    zone.id,
+                );
+                body = if selection.has_selected_commands {
+                    body.push(
+                        row![
+                            row_btn(
+                                if selection.selected_count > 1 {
+                                    "Copy commands"
+                                } else {
+                                    "Copy command"
+                                },
+                                BlockMenuAction::CopyCommand,
+                            ),
+                            row_btn("Ask AI about block", BlockMenuAction::AskAi),
+                        ]
+                        .spacing(6),
+                    )
+                } else {
+                    body.push(row_btn("Ask AI about block", BlockMenuAction::AskAi))
+                };
+                // Failed completed blocks expose the ember-style action chain:
+                // fresh Fix/Explain Agent tasks and a guarded semantic Retry.
+                if matches!(outcome, block_mode::BlockOutcome::Failed(_)) {
+                    body = body.push(
+                        row![
+                            row_btn("Fix with Agent", BlockMenuAction::FixWithAgent),
+                            row_btn("Explain with Agent", BlockMenuAction::ExplainWithAgent),
+                            row_btn("Retry", BlockMenuAction::Retry),
+                        ]
+                        .spacing(6),
+                    );
+                    // The experimental dashboard adds worktree task creation for
+                    // the same failed block (ember's Create task).
+                    if self.config.experimental_task_sidebar {
+                        body = body.push(row_btn("Create task", BlockMenuAction::CreateTask));
+                    }
+                }
+                body = body.push(
+                    row![
+                        row_btn(
+                            if selection.selected_count > 1 {
+                                "Copy outputs"
+                            } else if selection.clicked_has_command {
+                                "Copy output"
+                            } else {
+                                "Copy background output"
+                            },
+                            BlockMenuAction::CopyOutput,
+                        ),
+                        row_btn(
+                            if selection.selected_count > 1 {
+                                "Copy blocks"
+                            } else {
+                                "Copy block"
+                            },
+                            BlockMenuAction::CopyBlock,
+                        ),
+                    ]
+                    .spacing(6),
+                );
+                body = body.push(row_btn(
+                    if selection.selected_count > 1 {
+                        "Copy blocks as Markdown"
+                    } else {
+                        "Copy block as Markdown"
+                    },
+                    BlockMenuAction::CopyMarkdown,
+                ));
+                if selection.clicked_has_command {
+                    body = body.push(row_btn(
+                        "Recall this command",
+                        BlockMenuAction::RecallCommand,
+                    ));
+                }
+                if selection.has_selected_commands {
+                    body = body.push(row_btn(
+                        review_commands_menu_label(selection.selected_count),
+                        BlockMenuAction::ReinputSelected,
+                    ));
+                }
+                body = body
+                    .push(
+                        row![
+                            row_btn(
+                                if bookmarked {
+                                    "Remove bookmark"
+                                } else {
+                                    "Bookmark block"
+                                },
+                                BlockMenuAction::ToggleBookmark,
+                            ),
+                            row_btn("Search blocks", BlockMenuAction::Search),
+                        ]
+                        .spacing(6),
+                    )
+                    .push(
+                        row![
+                            row_btn("Jump to top", BlockMenuAction::JumpTop),
+                            row_btn("Jump to bottom", BlockMenuAction::JumpBottom),
+                        ]
+                        .spacing(6),
+                    )
+                    .push(
+                        row![
+                            row_btn(
+                                "Export this block · Markdown",
+                                BlockMenuAction::ExportMarkdown
+                            ),
+                            row_btn("Export this block · JSON", BlockMenuAction::ExportJson),
+                        ]
+                        .spacing(6),
+                    )
+                    .push(row_btn(
+                        "Clear all completed blocks…",
+                        BlockMenuAction::Clear,
+                    ))
+                    .push(row_btn("Undo clear blocks", BlockMenuAction::UndoClear));
+            }
+        } else {
+            body = body
+                .push(self.popup_text("Command block is no longer available"))
+                .push(row_btn("Close", BlockMenuAction::Close));
+        }
+
+        let panel_width = (self.win_size.width - 12.0).clamp(1.0, 360.0);
+        let panel_height = (self.win_size.height - self.tab_bar_height() - 12.0).clamp(1.0, 520.0);
+        let panel = container(
+            scrollable(body)
+                .id("block-menu-scroll")
+                .height(Length::Shrink),
+        )
+        .id("block-menu-panel")
+        .width(Length::Fixed(panel_width))
+        .max_height(panel_height)
+        .padding(12)
+        .style(self.popup_style());
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::BlockMenuClose);
+        let position = anchored_overlay_position(
+            state.anchor,
+            self.win_size,
+            iced::Size::new(panel_width, panel_height),
+            self.tab_bar_height(),
+        );
+        let placed = container(panel)
+            .align_left(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(iced::Padding::from(0).top(position.y).left(position.x));
+        stack![Element::from(dismiss), Element::from(placed)].into()
+    }
+
+    /// Family-wide bottom bar (`jterm_core::bottom_bar`): cwd and git on the
+    /// left; last-command status, grid size, and tab count on the right.
+    fn organism_layout(&self) -> OrganismLayout {
+        let width = if self.config.is_card_mode() {
+            organism_card_width(
+                &self.pane_rects(),
+                self.active,
+                self.is_split() && self.pane_zoomed,
+                self.term_width(),
+                self.metrics.padding,
+            )
+        } else {
+            self.win_size.width
+        };
+        organism_host_layout(
+            width,
+            self.config.ascii_organism_enabled,
+            self.config.ascii_organism_expanded,
+            self.config.bottom_bar,
+            self.config.is_card_mode(),
+        )
+    }
+
+    fn sync_organism_geometry(&mut self) {
+        self.organism_body_geometry = None;
+        self.organism_geometry_epoch = self.organism_geometry_epoch.saturating_add(1);
+        let layout = self.organism_layout();
+        self.organism.sync_greeting_geometry(
+            !self.config.is_card_mode() && layout.glyph,
+            layout.presentable(),
+        );
+        if !layout.presentable() {
+            self.organism_pointer_buttons.clear();
+        }
+        self.sync_organism_watch();
+    }
+
+    fn sync_organism_attention_owner(&mut self) {
+        let owner = self.sessions.get(self.active).map(|session| session.id);
+        self.organism.sync_live_attention_owner(owner);
+    }
+
+    fn organism_effective_motion(&self) -> Option<organism::Motion> {
+        Some(self.organism_motion_control.resolution().effective.into())
+    }

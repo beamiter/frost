@@ -1,0 +1,300 @@
+                text(notice)
+                    .size(self.effective_font_size())
+                    .style(text::secondary),
+            );
+        }
+        let session = self.agent.session.as_ref();
+        if let Some(session) = session {
+            for (index, turn) in session.transcript().iter().enumerate() {
+                let element: Element<'_, Message> = match turn {
+                    AgentTurn::User(message) => text(crate::agent::bound_transcript_text(format!(
+                        "You: {message}"
+                    )))
+                    .size(self.effective_font_size())
+                    .into(),
+                    AgentTurn::AssistantThought(thought) => text(
+                        crate::agent::bound_transcript_text(format!("thought: {thought}")),
+                    )
+                    .size(self.effective_font_size())
+                    .style(text::secondary)
+                    .into(),
+                    AgentTurn::AssistantSay(message) => text(crate::agent::bound_transcript_text(
+                        format!("Agent: {message}"),
+                    ))
+                    .size(self.effective_font_size())
+                    .into(),
+                    AgentTurn::ProtocolError(message) => text(crate::agent::bound_transcript_text(
+                        format!("protocol: {message}"),
+                    ))
+                    .size(self.effective_font_size())
+                    .style(text::danger)
+                    .into(),
+                    AgentTurn::Observation {
+                        exit_code,
+                        output_sample,
+                        ..
+                    } => {
+                        let head = text(format!(
+                            "Output (exit {exit_code}, {} bytes)",
+                            output_sample.len()
+                        ))
+                        .size(self.effective_font_size())
+                        .style(if *exit_code == 0 {
+                            text::secondary
+                        } else {
+                            text::danger
+                        });
+                        let body = text(crate::agent::bound_transcript_text(output_sample.clone()))
+                            .size(self.effective_font_size())
+                            .font(iced::Font::MONOSPACE);
+                        container(column![head, body].spacing(4))
+                            .padding(6)
+                            .style(container::bordered_box)
+                            .width(Length::Fill)
+                            .into()
+                    }
+                    AgentTurn::AssistantProposed {
+                        id,
+                        command,
+                        status,
+                    } => {
+                        let reference = agent::ProposalRef {
+                            epoch: session.epoch(),
+                            id: *id,
+                        };
+                        let danger = jterm_core::agent::is_dangerous(command);
+                        let is_current = matches!(
+                            session.state(),
+                            AgentState::AwaitingApproval { proposal_id }
+                                if proposal_id == *id
+                        );
+                        let mut card = column![].spacing(6);
+                        if let Some(reason) = danger {
+                            card = card.push(
+                                text(format!(
+                                    "⚠ destructive: {}",
+                                    crate::agent::bound_transcript_text(reason)
+                                ))
+                                .size(self.effective_font_size())
+                                .style(text::danger),
+                            );
+                        }
+                        if let Some((edit_reference, buffer)) = self
+                            .agent
+                            .edit
+                            .as_ref()
+                            .filter(|(edited, _)| *edited == reference)
+                        {
+                            let visible_buffer = crate::review_text::visible_bounded(
+                                buffer,
+                                crate::review_text::MAX_AGENT_COMMAND_BYTES,
+                            );
+                            card = card.push(
+                                text_input("command", &visible_buffer)
+                                    .id(AGENT_EDIT_INPUT_ID.clone())
+                                    .on_input(move |value| {
+                                        Message::AgentEditInput(reference, value)
+                                    })
+                                    .on_submit(Message::AgentEditApprove(*edit_reference))
+                                    .size(self.effective_font_size())
+                                    .font(iced::Font::MONOSPACE),
+                            );
+                            card = card.push(
+                                row![
+                                    button(text("Approve edited").size(self.effective_font_size()))
+                                        .on_press(Message::AgentEditApprove(*edit_reference)),
+                                    button(text("Cancel").size(self.effective_font_size()))
+                                        .style(button::secondary)
+                                        .on_press(Message::AgentEditCancel(*edit_reference)),
+                                ]
+                                .spacing(6),
+                            );
+                        } else {
+                            card = card.push(
+                                text(crate::review_text::visible_bounded(
+                                    command,
+                                    crate::review_text::MAX_AGENT_COMMAND_BYTES,
+                                ))
+                                .size(self.effective_font_size())
+                                .font(iced::Font::MONOSPACE),
+                            );
+                            let status_row: Element<'_, Message> = match status {
+                                ProposalStatus::Pending if is_current => {
+                                    let approve_label = if danger.is_some() {
+                                        "Approve & Run (destructive)"
+                                    } else {
+                                        "Approve & Run"
+                                    };
+                                    let approve = button(
+                                        text(approve_label).size(self.effective_font_size()),
+                                    )
+                                    .style(if danger.is_some() {
+                                        button::danger
+                                    } else {
+                                        button::primary
+                                    })
+                                    .on_press(Message::AgentApprove(reference));
+                                    row![
+                                        approve,
+                                        button(text("Edit").size(self.effective_font_size()))
+                                            .style(button::secondary)
+                                            .on_press(Message::AgentEditStart(
+                                                reference,
+                                                command.clone()
+                                            )),
+                                        button(text("Reject").size(self.effective_font_size()))
+                                            .style(button::secondary)
+                                            .on_press(Message::AgentReject(reference)),
+                                    ]
+                                    .spacing(6)
+                                    .into()
+                                }
+                                ProposalStatus::Pending => text("pending")
+                                    .size(self.effective_font_size())
+                                    .style(text::secondary)
+                                    .into(),
+                                ProposalStatus::Approved => text("✓ ran")
+                                    .size(self.effective_font_size())
+                                    .style(text::secondary)
+                                    .into(),
+                                ProposalStatus::Rejected => text("✗ rejected")
+                                    .size(self.effective_font_size())
+                                    .style(text::secondary)
+                                    .into(),
+                                ProposalStatus::ManualReview => text("moved to manual review")
+                                    .size(self.effective_font_size())
+                                    .style(text::secondary)
+                                    .into(),
+                            };
+                            card = card.push(status_row);
+                        }
+                        let _ = index;
+                        container(card)
+                            .padding(8)
+                            .style(container::bordered_box)
+                            .width(Length::Fill)
+                            .into()
+                    }
+                };
+                transcript = transcript.push(element);
+            }
+        }
+        // While a reply streams in, its readable fields grow in place of the
+        // static waiting line; the completed reply then replaces the preview
+        // with real transcript turns. After a mid-stream failure the partial
+        // text stays visible next to the recorded protocol error.
+        match self.agent.reply_preview() {
+            Some(preview) => {
+                if let Some(thought) = &preview.thought {
+                    transcript = transcript.push(
+                        text(crate::agent::bound_transcript_text(format!(
+                            "thought: {thought}"
+                        )))
+                        .size(self.effective_font_size())
+                        .style(text::secondary),
+                    );
+                }
+                if let Some(command) = &preview.command {
+                    transcript = transcript.push(
+                        text(crate::agent::bound_transcript_text(format!(
+                            "proposing: {command}"
+                        )))
+                        .size(self.effective_font_size())
+                        .font(iced::Font::MONOSPACE),
+                    );
+                }
+                if let Some(message) = &preview.message {
+                    transcript = transcript.push(
+                        text(crate::agent::bound_transcript_text(format!(
+                            "Agent: {message}"
+                        )))
+                        .size(self.effective_font_size()),
+                    );
+                }
+                if !self.agent.loading {
+                    transcript = transcript.push(
+                        text("reply interrupted")
+                            .size(self.effective_font_size())
+                            .style(text::secondary),
+                    );
+                }
+            }
+            None if self.agent.loading => {
+                transcript = transcript.push(
+                    text("waiting for the model…")
+                        .size(self.effective_font_size())
+                        .style(text::secondary),
+                );
+            }
+            None => {}
+        }
+
+        let (turns_used, max_turns, state_line, can_submit) = match session {
+            Some(session) => (
+                session.turns_used(),
+                session.max_turns(),
+                match session.state() {
+                    AgentState::Ready => "ready",
+                    AgentState::AwaitingModel => "waiting for the model",
+                    AgentState::AwaitingApproval { .. } => "a command is waiting for approval",
+                    AgentState::AwaitingObservation { .. } => {
+                        "waiting for the approved command to finish"
+                    }
+                    AgentState::Completed => "task completed",
+                    AgentState::Cancelled => "session cancelled",
+                    AgentState::TurnLimitReached => "turn limit reached",
+                },
+                session.state() == AgentState::Ready && session.turns_used() < session.max_turns(),
+            ),
+            None => (0, 0, "no session", false),
+        };
+
+        let header = row![
+            text("AI Agent").size(self.effective_font_size()),
+            text(if self.agent.provider_label.is_empty() {
+                "not configured".to_string()
+            } else {
+                self.agent.provider_label.clone()
+            })
+            .size(self.effective_font_size())
+            .style(text::secondary),
+            Space::new().width(Length::Fill),
+            text(format!("turns {turns_used}/{max_turns}"))
+                .size(self.effective_font_size())
+                .style(text::secondary),
+            button(text("✕").size(self.effective_font_size()))
+                .style(button::secondary)
+                .on_press(Message::AgentClose),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
+        let status_line: Element<'_, Message> = if self.agent.status.is_empty() {
+            text(state_line)
+                .size(self.effective_font_size())
+                .style(text::secondary)
+                .into()
+        } else {
+            text(self.agent.status.clone())
+                .size(self.effective_font_size())
+                .style(text::danger)
+                .into()
+        };
+        let context_line: Element<'_, Message> = match self.agent.last_manual_completed.as_ref() {
+            Some(context) => {
+                let status = agent_context_exit_label(context.exit_code);
+                row![
+                    text(format!(
+                        "attached context: `{}` ({status})",
+                        crate::agent::bound_attached_context_cmd(context.cmd.clone())
+                    ))
+                    .size(self.effective_font_size())
+                    .style(text::secondary),
+                    button(text("✕").size(self.effective_font_size()))
+                        .style(button::secondary)
+                        .padding(2)
+                        .on_press(Message::AgentClearContext),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+                .into()

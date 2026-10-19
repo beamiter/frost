@@ -1,0 +1,300 @@
+    let mut next_id = 0usize;
+    let mut restored_active_tab = None;
+    for (saved_index, restored) in trees.into_iter().enumerate() {
+        let RestoredTab {
+            tree,
+            focus: saved_focus,
+            title,
+            pinned,
+            marked,
+            private_title,
+        } = restored;
+        if !valid_restored_layout(&tree, session_count) {
+            report.add(crate::recovery_report::RepairKind::ReferencesAdjusted, 1);
+            continue;
+        }
+        let leaves = tree.leaves();
+        if leaves.iter().any(|leaf| claimed.contains(leaf)) {
+            // A leaf is already owned by an earlier tab; drop this whole tab
+            // and let the adoption pass place its sessions.
+            report.add(crate::recovery_report::RepairKind::ReferencesAdjusted, 1);
+            continue;
+        }
+        claimed.extend(leaves.iter().copied());
+        if report_explicit_focus
+            && saved_focus.is_some_and(|session| !tree.contains_session(session))
+        {
+            report.add(crate::recovery_report::RepairKind::ReferencesAdjusted, 1);
+        }
+        let focus = saved_focus
+            .filter(|session| tree.contains_session(*session))
+            .or_else(|| leaves.first().copied());
+        let Some(focus) = focus else {
+            report.add(crate::recovery_report::RepairKind::ReferencesAdjusted, 1);
+            continue;
+        };
+        if saved_active_tab == Some(saved_index) {
+            restored_active_tab = Some(tabs.len());
+        }
+        tabs.push(Tab {
+            id: next_id,
+            tree,
+            focus,
+            title,
+            pinned,
+            marked,
+            private_title,
+        });
+        next_id += 1;
+    }
+    for session in 0..session_count {
+        if claimed.insert(session) {
+            tabs.push(Tab::new(next_id, session));
+            next_id += 1;
+        }
+    }
+    if tabs.is_empty() {
+        // Zero tabs is not a renderable state.
+        tabs.push(Tab::new(next_id, 0));
+        next_id += 1;
+    }
+
+    let active_tab = restored_active_tab
+        // No recorded tab (or it did not survive): follow the active session.
+        .or_else(|| tabs.iter().position(|tab| tab.contains(active_session)))
+        .unwrap_or(0);
+    // A snapshot can interleave pinned and unpinned tabs (it predates pinning,
+    // or an adopted orphan landed at the end). Restore the invariant here so
+    // the strip never shows an order the app itself would not produce.
+    let active_tab = sort_pinned_first(&mut tabs, active_tab);
+    tabs[active_tab].repair_focus();
+    (tabs, active_tab, next_id)
+}
+
+/// Re-index every tab's tree after a session was inserted at `inserted`.
+///
+/// Session indices are global, so an insert in the middle shifts the panes of
+/// every tab, not just the active one.
+fn reindex_tabs_for_insert(tabs: &mut [Tab], inserted: usize) {
+    let remap = |s: usize| if s >= inserted { s + 1 } else { s };
+    for tab in tabs {
+        tab.tree.remap_sessions(&remap);
+        tab.focus = remap(tab.focus);
+    }
+}
+
+/// Re-index every tab's tree after the session at `removed` left the vector.
+///
+/// The tab owning that session drops its leaf — folding the freed share into a
+/// neighbor — and then every tab shifts the indices above the removed slot
+/// down. A tab whose only pane was the removed session keeps its (now stale)
+/// leaf: emptying a tree is not representable, so the caller removes that tab
+/// before calling here.
+fn reindex_tabs_for_removal(tabs: &mut [Tab], removed: usize) {
+    let remap = |s: usize| if s > removed { s - 1 } else { s };
+    for tab in tabs {
+        if tab.tree.contains_session(removed) && tab.tree.leaf_count() > 1 {
+            tab.tree.remove_leaf(removed);
+        }
+        tab.tree.remap_sessions(&remap);
+        tab.focus = remap(tab.focus);
+        tab.repair_focus();
+    }
+}
+
+/// Pending means save confirmation is outstanding, including durability retry.
+/// The existing ConfigTick handles retries; blocked writes require the diagnostic.
+fn config_save_feedback(dirty: bool, blocked: bool) -> &'static str {
+    if blocked {
+        "Auto-save paused · See the configuration diagnostic"
+    } else if dirty {
+        "Save pending · auto-save will retry"
+    } else {
+        "Changes auto-save"
+    }
+}
+
+/// Only losing the active tab clears its zoom. IDs are captured before reindexing.
+fn pane_zoom_after_tab_close(
+    zoomed: bool,
+    active_tab_id: Option<usize>,
+    emptied_tab_id: Option<usize>,
+) -> bool {
+    zoomed && !(emptied_tab_id.is_some() && emptied_tab_id == active_tab_id)
+}
+
+/// Validate a candidate restored layout: every leaf session must be in range and
+/// appear at most once, and the pane count must stay within `MAX_PANES`.
+///
+/// One leaf is valid — a tab with a single pane is the ordinary case now that
+/// tabs own their panes. It used to be rejected because a one-leaf tree meant
+/// "not split" back when there was a single global layout.
+fn valid_restored_layout(tree: &PaneTree, session_count: usize) -> bool {
+    let leaves = tree.leaves();
+    let n = leaves.len();
+    if !(1..=MAX_PANES).contains(&n) {
+        return false;
+    }
+    if leaves.iter().any(|&s| s >= session_count) {
+        return false;
+    }
+    let distinct = leaves
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    distinct == n
+}
+
+/// Resolve the directional split edge under `point`. The center of a pane is
+/// deliberately a dead zone: a release there cancels instead of guessing.
+fn split_drop_direction(rect: pane_layout::Rect, point: iced::Point) -> Option<PaneDirection> {
+    if !rect.x.is_finite()
+        || !rect.y.is_finite()
+        || !rect.width.is_finite()
+        || !rect.height.is_finite()
+        || !point.x.is_finite()
+        || !point.y.is_finite()
+        || rect.width <= 0.0
+        || rect.height <= 0.0
+        || point.x < rect.x
+        || point.x >= rect.x + rect.width
+        || point.y < rect.y
+        || point.y >= rect.y + rect.height
+    {
+        return None;
+    }
+
+    let distances = [
+        ((point.x - rect.x) / rect.width, PaneDirection::Left),
+        (
+            (rect.x + rect.width - point.x) / rect.width,
+            PaneDirection::Right,
+        ),
+        ((point.y - rect.y) / rect.height, PaneDirection::Up),
+        (
+            (rect.y + rect.height - point.y) / rect.height,
+            PaneDirection::Down,
+        ),
+    ];
+    distances
+        .into_iter()
+        .min_by(|(a, _), (b, _)| a.total_cmp(b))
+        .filter(|(distance, _)| *distance <= SPLIT_DROP_EDGE_FRACTION)
+        .map(|(_, direction)| direction)
+}
+
+fn tab_drag_hover_ready(
+    source_tab: Option<usize>,
+    source_is_plain: bool,
+    active_tab: Option<usize>,
+    hovered_tab: Option<usize>,
+    pending_target: usize,
+    elapsed: std::time::Duration,
+) -> bool {
+    source_is_plain
+        && source_tab.is_some_and(|source| source != pending_target)
+        && active_tab != Some(pending_target)
+        && hovered_tab == Some(pending_target)
+        && elapsed >= std::time::Duration::from_millis(TAB_DRAG_HOVER_SWITCH_MS)
+}
+
+/// Move a one-pane tab into a directional edge of another tab's pane tree.
+///
+/// All fallible checks and tree construction happen before the source tab is
+/// removed. The session itself is never cloned or reindexed: only its single
+/// layout leaf changes owner.
+fn move_plain_tab_into_split(
+    tabs: &mut Vec<Tab>,
+    source_tab_id: usize,
+    target_session: usize,
+    direction: PaneDirection,
+) -> Option<(usize, usize)> {
+    let source_index = tabs.iter().position(|tab| tab.id == source_tab_id)?;
+    let source_session = match tabs.get(source_index)?.tree {
+        PaneTree::Leaf(session) => session,
+        PaneTree::Split { .. } => return None,
+    };
+    if source_session == target_session {
+        return None;
+    }
+
+    // Reject corrupt/ambiguous ownership rather than turning one bad leaf into
+    // a duplicated live PTY in two visible locations.
+    let source_claims = tabs
+        .iter()
+        .flat_map(Tab::sessions)
+        .filter(|session| *session == source_session)
+        .count();
+    let target_claims = tabs
+        .iter()
+        .flat_map(Tab::sessions)
+        .filter(|session| *session == target_session)
+        .count();
+    if source_claims != 1 || target_claims != 1 {
+        return None;
+    }
+
+    let target_index = tabs.iter().position(|tab| tab.contains(target_session))?;
+    if source_index == target_index || tabs[target_index].tree.leaf_count() >= MAX_PANES {
+        return None;
+    }
+    let mut next_tree = tabs[target_index].tree.clone();
+    if !next_tree.split_leaf(target_session, direction.axis(), source_session) {
+        return None;
+    }
+    if !direction.forward() {
+        swap_sessions_in_tree(&mut next_tree, target_session, source_session);
+    }
+
+    // Commit. All identities used below were proven unique above.
+    tabs.remove(source_index);
+    let target_index = target_index - usize::from(source_index < target_index);
+    tabs[target_index].tree = next_tree;
+    tabs[target_index].focus = source_session;
+    Some((target_index, source_session))
+}
+
+/// Detach one leaf from a split and promote it to a new ordinary tab. The
+/// source tree is cloned and collapsed before either live collection changes,
+/// making every invalid/stale drop a true no-op.
+fn promote_split_pane_to_tab(
+    tabs: &mut Vec<Tab>,
+    next_tab_id: &mut usize,
+    source_session: usize,
+    after_tab_id: Option<usize>,
+) -> Option<(usize, usize)> {
+    if tabs
+        .iter()
+        .flat_map(Tab::sessions)
+        .filter(|session| *session == source_session)
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let owner_index = tabs.iter().position(|tab| tab.contains(source_session))?;
+    if tabs[owner_index].tree.is_leaf() {
+        return None;
+    }
+    let anchor_index = match after_tab_id {
+        Some(id) => tabs.iter().position(|tab| tab.id == id)?,
+        None => owner_index,
+    };
+    let id = *next_tab_id;
+    let next_id = id.checked_add(1)?;
+    if tabs.iter().any(|tab| tab.id == id) {
+        return None;
+    }
+
+    let mut source_tree = tabs[owner_index].tree.clone();
+    if !source_tree.remove_leaf(source_session) || source_tree.contains_session(source_session) {
+        return None;
+    }
+
+    // Commit. New tabs are unpinned, so never insert one inside the leading
+    // pinned block even if the pointer was released over a pinned tab.
+    tabs[owner_index].tree = source_tree;
+    tabs[owner_index].repair_focus();
+    let first_unpinned = tabs
+        .iter()
+        .position(|tab| !tab.pinned)

@@ -1,0 +1,300 @@
+    fn queue_accepts_entry(
+        queue: &std::collections::VecDeque<PtyWriteChunk>,
+        len: usize,
+        response: bool,
+    ) -> bool {
+        queue.len() < MAX_PTY_QUEUE_ENTRIES
+            || queue.back().is_some_and(|back| {
+                back.response == response
+                    && len <= PTY_QUEUE_COALESCE_BYTES.saturating_sub(back.data.len())
+            })
+    }
+
+    fn push_queue_owned(
+        queue: &mut std::collections::VecDeque<PtyWriteChunk>,
+        data: Vec<u8>,
+        response: bool,
+    ) {
+        let coalesce = queue.back().is_some_and(|back| {
+            back.response == response
+                && data.len() <= PTY_QUEUE_COALESCE_BYTES.saturating_sub(back.data.len())
+        });
+        if coalesce {
+            if let Some(back) = queue.back_mut() {
+                back.data.extend_from_slice(&data);
+                return;
+            }
+        }
+        queue.push_back(PtyWriteChunk { data, response });
+    }
+
+    fn push_queue_copy(
+        queue: &mut std::collections::VecDeque<PtyWriteChunk>,
+        data: &[u8],
+        response: bool,
+    ) {
+        let coalesce = queue.back().is_some_and(|back| {
+            back.response == response
+                && data.len() <= PTY_QUEUE_COALESCE_BYTES.saturating_sub(back.data.len())
+        });
+        if coalesce {
+            if let Some(back) = queue.back_mut() {
+                back.data.extend_from_slice(data);
+                return;
+            }
+        }
+        queue.push_back(PtyWriteChunk {
+            data: data.to_vec(),
+            response,
+        });
+    }
+
+    fn flush_responses(&mut self) {
+        let out = self.terminal.get_output();
+        if out.is_empty() {
+            return;
+        }
+        if !self.flush_write_queue() {
+            return;
+        }
+        if out.len() > MAX_PTY_RESPONSE_QUEUE_BYTES.saturating_sub(self.queued_response_bytes)
+            || !Self::queue_accepts_entry(&self.write_queue, out.len(), true)
+        {
+            log::warn!(
+                "[PTY] response queue limit reached for session {} ({} queued, {} incoming)",
+                self.id,
+                self.queued_response_bytes,
+                out.len()
+            );
+            return;
+        }
+        self.queued_response_bytes += out.len();
+        Self::push_queue_owned(&mut self.write_queue, out, true);
+        self.terminal.note_protocol_response();
+        let _ = self.flush_write_queue();
+    }
+
+    /// Drain prior work and report whether a user payload can be prepared while
+    /// staying inside both the byte and allocation-count limits.
+    fn can_queue_user_bytes(&mut self, len: usize) -> bool {
+        self.flush_write_queue()
+            && len <= MAX_PTY_WRITE_QUEUE_BYTES.saturating_sub(self.queued_write_bytes)
+            && Self::queue_accepts_entry(&self.write_queue, len, false)
+    }
+
+    /// True while this tab is a held-open task transcript whose child has
+    /// already exited (`hold_after_exit` is set exactly then). User bytes
+    /// have nowhere to go: every PTY-bound write path refuses them up front
+    /// and the chrome shows the transcript as read-only.
+    fn transcript_read_only(&self) -> bool {
+        user_input_blocked(self.hold_after_exit)
+    }
+
+    fn chat_backlog(&self) -> chat_mode::InputBacklog {
+        chat_mode::InputBacklog {
+            entries: self.write_queue.len(),
+            offset: self.write_queue_offset,
+            user_bytes: self.queued_write_bytes,
+            response_bytes: self.queued_response_bytes,
+        }
+    }
+
+    fn chat_control_bytes(&self, kind: chat_mode::ControlKind) -> Option<Vec<u8>> {
+        let (key, modifiers) = match kind {
+            chat_mode::ControlKind::Submit => (
+                keyboard::Key::Named(keyboard::key::Named::Enter),
+                keyboard::Modifiers::empty(),
+            ),
+            chat_mode::ControlKind::Interrupt => (
+                keyboard::Key::Character("c".into()),
+                keyboard::Modifiers::CTRL,
+            ),
+        };
+        encode_key(
+            &key,
+            keyboard::Location::Standard,
+            modifiers,
+            None,
+            self.terminal.is_application_cursor_keys(),
+            KeyboardEnhancements {
+                kitty_flags: self.terminal.keyboard_enhancement_flags(),
+                modify_other_keys: self.terminal.xterm_modify_other_keys(),
+                format_other_keys: self.terminal.xterm_format_other_keys(),
+                report_all_keys: self.terminal.is_report_all_keys_enabled(),
+                application_keypad: self.terminal.is_application_keypad(),
+            },
+        )
+    }
+
+    fn chat_control_token(&self, kind: chat_mode::ControlKind) -> Option<chat_mode::ControlToken> {
+        use chat_mode::{ChatSurface, ControlAction, ControlKind, ControlToken};
+        let action = match (kind, self.terminal.chat_surface()) {
+            (ControlKind::Submit, ChatSurface::Prompt) => {
+                ControlAction::Submit(self.projection.key())
+            }
+            (ControlKind::Interrupt, ChatSurface::Running) => {
+                ControlAction::Interrupt(self.terminal.watch_generation()?)
+            }
+            _ => return None,
+        };
+        // The displayed action owns the actual kernel foreground group, never
+        // a process-name cache. Shell builtins (e.g. read) legitimately share
+        // the shell PGID and remain interruptible.
+        let foreground = jterm_core::process::tty_foreground_pgid(self.master_fd)?;
+        if kind == ControlKind::Submit && foreground != self.pty.get_child_pid() {
+            return None;
+        }
+        Some(ControlToken {
+            session: self.id,
+            foreground,
+            action,
+        })
+    }
+
+    fn enabled_chat_control(
+        &self,
+        kind: chat_mode::ControlKind,
+        input_ready: bool,
+    ) -> Option<chat_mode::ControlToken> {
+        if !input_ready || self.transcript_read_only() || !self.terminal.preedit_text.is_empty() {
+            return None;
+        }
+        let bytes = self.chat_control_bytes(kind)?;
+        chat_mode::control_enabled(
+            &bytes,
+            self.chat_backlog(),
+            input_ready && !self.transcript_read_only() && self.terminal.preedit_text.is_empty(),
+        )
+        .then(|| self.chat_control_token(kind))
+        .flatten()
+    }
+
+    fn try_chat_control(&mut self, displayed: &chat_mode::ControlToken, input_ready: bool) -> bool {
+        let Some(bytes) = self.chat_control_bytes(displayed.kind()) else {
+            return false;
+        };
+        let backlog = self.chat_backlog();
+        let input_ready =
+            input_ready && !self.transcript_read_only() && self.terminal.preedit_text.is_empty();
+        if !chat_mode::control_enabled(&bytes, backlog, input_ready) || !self.pty.is_alive() {
+            return false;
+        }
+        // This is the final writer admission. No FIFO flush, append, scheduled
+        // retry or partial enhanced-key suffix exists on this optional path.
+        let current = self.chat_control_token(displayed.kind());
+        let accepted = chat_mode::admit_control(
+            displayed,
+            current.as_ref(),
+            &bytes,
+            backlog,
+            input_ready,
+            |byte| self.pty.write(byte),
+        );
+        if accepted {
+            self.terminal.note_user_input(&bytes);
+            if displayed.kind() == chat_mode::ControlKind::Submit {
+                self.terminal.note_chat_submit();
+            }
+        }
+        accepted
+    }
+
+    /// Queue data in-order and make one non-blocking drain attempt. Returns false
+    /// if the bounded queue rejected the write or the PTY has failed.
+    fn write_pty(&mut self, data: &[u8]) -> bool {
+        self.write_pty_with_origin(data, true)
+    }
+
+    /// Queue an already-reviewed Agent payload. The terminal was armed before
+    /// this call, so these exact bytes must not taint their own prompt; any
+    /// subsequent ordinary input still goes through `write_pty` and does.
+    fn write_agent_pty(&mut self, data: &[u8]) -> bool {
+        self.write_pty_with_origin(data, false)
+    }
+
+    fn write_pty_with_origin(&mut self, data: &[u8], taint_prompt: bool) -> bool {
+        if data.is_empty() {
+            return true;
+        }
+        // A held-open task transcript's child already exited; its bytes would
+        // only hit EIO on the dead master fd. The keyboard/paste dispatchers
+        // pre-check `transcript_read_only` to show the read-only hint; this
+        // guard catches every remaining user-write path (mouse reports,
+        // Agent payloads) silently.
+        if self.transcript_read_only() {
+            return false;
+        }
+        if !self.can_queue_user_bytes(data.len()) {
+            log::warn!(
+                "[PTY] input backpressure for session {} ({} input, {} response, {} incoming)",
+                self.id,
+                self.queued_write_bytes,
+                self.queued_response_bytes,
+                data.len()
+            );
+            return false;
+        }
+        self.queued_write_bytes += data.len();
+        Self::push_queue_copy(&mut self.write_queue, data, false);
+        // The write may complete before its echo returns through the reader.
+        // Taint the current OSC 133 prompt now so Agent approval cannot race a
+        // locally typed-but-not-yet-visible edit line.
+        if taint_prompt {
+            self.terminal.note_user_input(data);
+        }
+        self.flush_write_queue()
+    }
+
+    fn flush_write_queue(&mut self) -> bool {
+        let mut budget = PTY_WRITE_DRAIN_BUDGET;
+        while let Some(front) = self.write_queue.front() {
+            if budget == 0 {
+                return true;
+            }
+            let front_len = front.data.len();
+            let is_response = front.response;
+            let end = (self.write_queue_offset + budget).min(front_len);
+            match self.pty.write(&front.data[self.write_queue_offset..end]) {
+                Ok(0) => return true,
+                Ok(written) => {
+                    budget = budget.saturating_sub(written);
+                    self.write_queue_offset += written;
+                    if is_response {
+                        self.queued_response_bytes =
+                            self.queued_response_bytes.saturating_sub(written);
+                    } else {
+                        self.queued_write_bytes = self.queued_write_bytes.saturating_sub(written);
+                    }
+                    if self.write_queue_offset == front_len {
+                        self.write_queue.pop_front();
+                        self.write_queue_offset = 0;
+                    }
+                }
+                Err(error) => {
+                    log::warn!("[PTY] write failed for session {}: {error}", self.id);
+                    self.write_queue.clear();
+                    self.write_queue_offset = 0;
+                    self.queued_write_bytes = 0;
+                    self.queued_response_bytes = 0;
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn has_pending_write(&self) -> bool {
+        self.queued_write_bytes != 0 || self.queued_response_bytes != 0
+    }
+
+    /// Working directory of the shell child, used when spawning a sibling and
+    /// when persisting the session.
+    ///
+    /// OSC 7 first: `/proc/<pid>/cwd` is the *direct* child's directory, so it
+    /// reports where ssh was launched from rather than where the user is, and it
+    /// does not exist at all on a non-Linux kernel. The OSC 7 value has already
+    /// been rejected unless it named a local host (`TerminalState::decode_osc7_cwd`).
+    fn cwd(&self) -> Option<String> {
+        self.terminal
+            .current_working_dir()
+            .map(str::to_string)

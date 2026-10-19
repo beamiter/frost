@@ -1,0 +1,300 @@
+                Box::new(block_mode::badge_ladder(
+                    outcome,
+                    zone.duration_ms,
+                    zone.start_mark_seen,
+                    zone.completion_provenance,
+                    clock,
+                ))
+            };
+            for badge in badges {
+                let needed = badge.chars().count() + inset;
+                if block_mode::badge_fits(cells.iter().map(Self::block_badge_cell_char), needed) {
+                    row.badge = Some((badge, color));
+                    break;
+                }
+            }
+        }
+
+        // Running output and the editable prompt are one native iced active
+        // card. Match the family's six-row input minimum and grow only through
+        // the current output/cursor row, without changing Frost's PTY or cell
+        // geometry.
+        if let Some((active_start, active_end)) = Self::active_zone_span(terminal) {
+            let active_top_view = terminal
+                .raw_row_id_at_absolute(active_start)
+                .and_then(|row| sess.projection.raw_row_view_bounds(row))
+                .map(|(first, _)| first);
+            let active_bottom_view = active_end
+                .checked_sub(1)
+                .and_then(|row| terminal.raw_row_id_at_absolute(row))
+                .and_then(|row| sess.projection.raw_row_view_bounds(row))
+                .map(|(_, last)| last);
+            for (view_row, absolute_row) in view_absolute_rows.iter().copied().enumerate() {
+                if absolute_row.is_some_and(|row| row >= active_start && row < active_end) {
+                    let row = &mut paint[view_row];
+                    row.app_eligible = true;
+                    row.stripe = Some(accent);
+                    row.card_group = Some(0);
+                    row.card_kind = terminal_view::BlockCardKind::Active;
+                    row.card_top = active_top_view == Some(view_row);
+                    row.card_bottom = active_bottom_view == Some(view_row);
+                }
+            }
+            if let Some(active_top_view) = active_top_view {
+                paint[active_top_view].separator = true;
+            }
+            // Anchored independently of `active_top_view`: the chip must
+            // survive the card's own top row scrolling out of the viewport.
+            if let Some((badge_view_row, badge, _)) = self.running_badge_target(sess) {
+                if let Some(row) = paint.get_mut(badge_view_row) {
+                    row.badge = Some((badge, accent));
+                }
+            }
+        }
+        for (row, kind) in paint.iter_mut().zip(sess.projection.row_kinds()) {
+            if let terminal::ProjectedRowKind::BlockChrome { boundary, line } = kind {
+                if boundary.kind == terminal::ChromeKind::Organism {
+                    row.host_spacer = true;
+                    row.organism_status = Some((*line, boundary.rows));
+                }
+            }
+        }
+        paint
+    }
+
+    /// Scrollbar-track fractions of each FAILED zone's first row, for the red
+    /// failure markers painted along the scrollbar. Same gates as
+    /// [`Self::build_block_paint_rows`] (feature off / alt screen → empty), and the
+    /// same red as the Failed stripe. The 256-zone cap keeps this scan
+    /// trivial. Called only on a [`Self::block_chrome`] cache miss.
+    fn block_marker_fractions(&self, sess: &Session) -> Vec<f32> {
+        if !self.config.is_block_mode() || sess.terminal.is_alt_buffer_active() {
+            return Vec::new();
+        }
+        let terminal = &sess.terminal;
+        let failed: Vec<usize> = terminal
+            .command_zones
+            .iter()
+            .filter(|zone| {
+                // Rows-evicted zones have no track position to mark.
+                !zone.rows_evicted
+                    && matches!(
+                        block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                        block_mode::BlockOutcome::Failed(_)
+                    )
+            })
+            .map(|zone| zone.prompt_start)
+            .collect();
+        terminal.projected_marker_fractions(&sess.projection, &failed)
+    }
+
+    /// Bookmark-notch scrollbar fractions for bookmarked zones. Called only
+    /// on a [`Self::block_chrome`] cache miss.
+    fn block_bookmark_marker_fractions(&self, sess: &Session) -> Vec<f32> {
+        if !self.config.is_block_mode() || sess.terminal.is_alt_buffer_active() {
+            return Vec::new();
+        }
+        // Resolve through the exact plan so gaps and collapsed output cannot
+        // shift a bookmark's scrollbar position onto a neighbouring block.
+        let rows: Vec<usize> = sess
+            .terminal
+            .command_zones
+            .iter()
+            .filter(|zone| !zone.rows_evicted && sess.block_bookmarks.contains(zone.id))
+            .map(|zone| zone.prompt_start)
+            .collect();
+        sess.terminal
+            .projected_marker_fractions(&sess.projection, &rows)
+    }
+
+    /// Active Block identity comes from native OSC lifecycle/provenance only.
+    fn organism_block_key(&self) -> Option<terminal::RawRowId> {
+        let session = self.sessions.get(self.active)?;
+        let (start, _) = Self::active_zone_span(&session.terminal)?;
+        session.terminal.raw_row_id_at_absolute(start)
+    }
+
+    /// Drawing can represent Busy/watch while hover still requires shared idle
+    /// admission. There is one body owner and no body in Static/traditional UI.
+    fn organism_body_owner(&self) -> Option<usize> {
+        if !self.config.is_card_mode()
+            || self.organism_effective_motion() == Some(organism::Motion::Static)
+            || self.organism_geometry_epoch == u64::MAX
+            || !self.organism_pointer_buttons.is_empty()
+            || self.dragging_tab.is_some()
+            || self.pane_drag.is_some()
+            || self.dragging_divider.is_some()
+            || self.dragging_sidebar
+            || self.terminal_mouse_gestures.iter().any(Option::is_some)
+        {
+            return None;
+        }
+        let owner = self.organism_owner()?;
+        let session = self.sessions.get(self.active)?;
+        if session.terminal.has_text_selection()
+            || session.terminal.is_mouse_enabled()
+            || !session.terminal.preedit_text.is_empty()
+            || !session.terminal.kitty_graphics.get_placements().is_empty()
+        {
+            return None;
+        }
+        self.organism_block_key().map(|_| owner)
+    }
+
+    fn organism_body_hover_available(&self) -> bool {
+        self.organism_body_geometry
+            .as_ref()
+            .is_some_and(|(id, geometry)| {
+                self.organism_body_owner() == Some(*id)
+                    && self.organism_block_key() == Some(geometry.block)
+                    && geometry.epoch == self.organism_geometry_epoch
+                    && self
+                        .sessions
+                        .get(self.active)
+                        .is_some_and(|s| s.projection.key() == geometry.projection)
+            })
+    }
+
+    fn observe_organism_body(
+        &mut self,
+        id: usize,
+        observation: terminal_view::OrganismBodyObservation,
+    ) {
+        use organism_block::Edge;
+        if self.sessions.get(self.active).map(|s| s.id) != Some(id) {
+            return;
+        }
+        if let Some(geometry) = observation.geometry.as_ref() {
+            if self.organism_body_owner() != Some(id)
+                || self.organism_block_key() != Some(geometry.block)
+                || geometry.epoch != self.organism_geometry_epoch
+                || !self
+                    .sessions
+                    .get(self.active)
+                    .is_some_and(|s| s.projection.key() == geometry.projection)
+            {
+                return;
+            }
+        }
+        if observation.edge == Edge::Geometry {
+            // Layout, scroll, Block/pane replacement and typing restoration only
+            // reconcile geometry. None of them is a physical pointer entry.
+            let mut facts = self.organism_attention_facts();
+            facts.hover_available = false;
+            self.organism.leave_live_greeting(facts);
+            self.organism_body_geometry = observation.geometry.map(|g| (id, g));
+            return;
+        }
+        if observation.geometry.as_ref()
+            != self
+                .organism_body_geometry
+                .as_ref()
+                .filter(|(owner, _)| *owner == id)
+                .map(|(_, g)| g)
+        {
+            return;
+        }
+        let facts = self.organism_attention_facts();
+        if let Some(ticket) = observation.ticket {
+            match observation.edge {
+                Edge::Enter if self.organism_body_hover_available() => {
+                    self.organism.enter_live_greeting(id, ticket, facts);
+                }
+                Edge::Exit => self.organism.exit_live_greeting(id, ticket, facts),
+                _ => {}
+            }
+        }
+    }
+
+    /// Chat chrome follows the independent projection's actual raw/synthetic
+    /// ownership. Completed raw transcript rows expose read-only card actions.
+    fn chat_paint_rows(&self, sess: &Session) -> Vec<terminal_view::BlockPaintRow> {
+        use chat_mode::ChatRole;
+        sess.projection
+            .chat_rows()
+            .iter()
+            .enumerate()
+            .map(|(index, chat)| {
+                let raw = matches!(
+                    sess.projection.row_kinds().get(index),
+                    Some(terminal::ProjectedRowKind::Raw)
+                );
+                let zone_id = chat_completed_zone_at_row(&sess.terminal, &sess.projection, index);
+                terminal_view::BlockPaintRow {
+                    selectable: zone_id.is_some(),
+                    zone_id,
+                    card_selected: zone_id.is_some_and(|id| sess.block_selection.contains(id)),
+                    card_selection_active: zone_id == sess.block_selection.active()
+                        && zone_id.is_some(),
+                    host_spacer: !raw,
+                    app_eligible: raw && chat.app_eligible,
+                    organism_status: chat.status_line,
+                    badge: chat
+                        .status_zone
+                        .and_then(|id| sess.terminal.zone_by_id(id))
+                        .and_then(|zone| {
+                            let outcome =
+                                block_mode::classify(zone.command.as_deref(), zone.exit_code);
+                            block_mode::badge_text_with_lifecycle(
+                                outcome,
+                                zone.duration_ms,
+                                zone.start_mark_seen,
+                                zone.completion_provenance,
+                            )
+                            .map(|mut text| {
+                                let budget = sess.terminal.grid.cols().saturating_sub(3);
+                                if text.chars().count() > budget {
+                                    text = text.chars().take(budget).collect();
+                                }
+                                let color = match outcome {
+                                    block_mode::BlockOutcome::Failed(_) => self.theme.ansi_color(1),
+                                    block_mode::BlockOutcome::Success => self.theme.ansi_color(2),
+                                    _ => self.theme.ansi_color(3),
+                                };
+                                (text, color)
+                            })
+                        }),
+                    card_group: matches!(
+                        chat.role,
+                        ChatRole::Command | ChatRole::Output | ChatRole::Composer
+                    )
+                    .then_some(chat.group),
+                    card_kind: if chat.role == ChatRole::Composer {
+                        terminal_view::BlockCardKind::Active
+                    } else {
+                        terminal_view::BlockCardKind::Finished
+                    },
+                    card_top: chat.top,
+                    card_bottom: chat.bottom,
+                    ..terminal_view::BlockPaintRow::default()
+                }
+            })
+            .collect()
+    }
+
+    /// Build the terminal widget for one pane, using its exact projection for
+    /// cells, selection, search, links, image placement and pointer routing.
+    fn pane_view(&self, sess_idx: usize) -> Element<'_, Message> {
+        let sess = &self.sessions[sess_idx];
+        let session_id = sess.id;
+        let is_active = sess_idx == self.active;
+        // An open overlay input owns the keyboard and IME, so the terminal pane
+        // renders unfocused (no blinking cursor, no competing IME request).
+        let focused = self.focused && is_active && self.terminal_input_active();
+        // Only walk the grid to build per-row selection spans when a selection
+        // actually exists; otherwise hand the widget an empty Vec (no highlight).
+        let selection: Vec<Option<(usize, usize)>> = if sess.terminal.has_text_selection() {
+            (0..sess.projection.cells().len())
+                .map(|r| {
+                    sess.terminal
+                        .row_selection_cols_in_projection(&sess.projection, r)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Only paint match highlights while the search bar is open; otherwise
+        // stale matches (whose line indices drift as the grid scrolls) linger.
+        let (search_matches, current) = if is_active && self.search.is_open {
+            let visible = self
+                .search

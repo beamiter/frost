@@ -1,0 +1,300 @@
+        });
+        links.extend(
+            osc8_links
+                .into_iter()
+                .filter(|link| link::is_openable_url(&link.text)),
+        );
+        self.links = links;
+    }
+
+    // --- Theme-derived chrome colors and styles ---------------------------
+    fn popup_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+        let style = theme::popup_style(&self.theme);
+        move |_| style
+    }
+
+    fn popup_input_style(&self) -> impl Fn(&iced::Theme, text_input::Status) -> text_input::Style {
+        let active = theme::popup_input_style(&self.theme, text_input::Status::Active);
+        let hovered = theme::popup_input_style(&self.theme, text_input::Status::Hovered);
+        let focused = theme::popup_input_style(
+            &self.theme,
+            text_input::Status::Focused { is_hovered: false },
+        );
+        let disabled = theme::popup_input_style(&self.theme, text_input::Status::Disabled);
+        move |_, status| match status {
+            text_input::Status::Active => active,
+            text_input::Status::Hovered => hovered,
+            text_input::Status::Focused { .. } => focused,
+            text_input::Status::Disabled => disabled,
+        }
+    }
+
+    fn popup_text<'a>(
+        &self,
+        content: impl iced::widget::text::IntoFragment<'a>,
+    ) -> iced::widget::Text<'a> {
+        text(content)
+            .font(self.mono)
+            .size(self.effective_font_size())
+    }
+
+    fn c_panel(&self) -> Color {
+        Theme::rgb_to_color32(self.theme.ui.panel_bg)
+    }
+    fn c_text(&self) -> Color {
+        Theme::rgb_to_color32(self.theme.ui.text)
+    }
+    fn c_text_dim(&self) -> Color {
+        Theme::rgb_to_color32(self.theme.ui.text_disabled)
+    }
+    fn c_border(&self) -> Color {
+        Theme::rgb_to_color32(self.theme.ui.border)
+    }
+    fn c_accent(&self) -> Color {
+        Theme::rgb_to_color32(self.theme.tabbar.active_border)
+    }
+
+    /// Top tab bar / status bar background, matching the theme's tabbar color.
+    fn chrome_bar_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+        let bg = self.with_window_opacity(Theme::rgb_to_color32(self.theme.tabbar.bg));
+        let text = self.c_text();
+        move |_| container::Style {
+            text_color: Some(text),
+            background: Some(bg.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Sidebar dock background, matching the theme's panel color.
+    fn panel_style_with_focus(
+        &self,
+        files_focused: bool,
+    ) -> impl Fn(&iced::Theme) -> container::Style {
+        let bg = self.with_window_opacity(self.c_panel());
+        let text = self.c_text();
+        let accent = self.c_accent();
+        move |_| container::Style {
+            text_color: Some(text),
+            background: Some(bg.into()),
+            border: iced::Border {
+                color: if files_focused {
+                    accent
+                } else {
+                    Color::TRANSPARENT
+                },
+                width: if files_focused { 1.0 } else { 0.0 },
+                radius: 0.0.into(),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// `active` (hovered or mid-drag) tints the strip with the accent color so
+    /// the user can see the divider is grabbable / being dragged.
+    fn divider_style(&self, active: bool) -> impl Fn(&iced::Theme) -> container::Style {
+        let bg = if active {
+            blend(self.c_border(), self.c_accent(), 0.6)
+        } else {
+            self.c_border()
+        };
+        move |_| container::Style {
+            background: Some(bg.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Container-flavored variant of `tab_btn_style`, used when wrapping a tab
+    /// in `mouse_area` (which can't hand the hover status off to a Button).
+    /// `hovered`/`dragging` are pushed in by the caller from `self.hovered_tab`
+    /// and `self.dragging_tab`.
+    fn tab_container_style(
+        &self,
+        active: bool,
+        hovered: bool,
+        dragging: bool,
+    ) -> impl Fn(&iced::Theme) -> container::Style {
+        let base = Theme::rgb_to_color32(self.theme.tabbar.bg);
+        let accent = self.c_accent();
+        let active_text = Theme::rgb_to_color32(self.theme.tabbar.active_text);
+        let inactive_text = Theme::rgb_to_color32(self.theme.tabbar.inactive_text);
+        move |_t| {
+            let (mut bg, txt, bw) = if active {
+                (blend(base, accent, 0.22), active_text, 1.0)
+            } else if hovered {
+                (blend(base, accent, 0.10), inactive_text, 0.0)
+            } else {
+                (base, inactive_text, 0.0)
+            };
+            // Dim the source tab while it is being dragged so the user sees
+            // which one will move.
+            if dragging {
+                bg = Color { a: 0.55, ..bg };
+            }
+            container::Style {
+                text_color: Some(txt),
+                background: Some(bg.into()),
+                border: iced::Border {
+                    color: accent,
+                    width: bw,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Tab button: accent-tinted + bordered when active, flat otherwise.
+    fn tab_btn_style(
+        &self,
+        active: bool,
+    ) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+        let base = Theme::rgb_to_color32(self.theme.tabbar.bg);
+        let accent = self.c_accent();
+        let active_text = Theme::rgb_to_color32(self.theme.tabbar.active_text);
+        let inactive_text = Theme::rgb_to_color32(self.theme.tabbar.inactive_text);
+        move |_t, status| {
+            let (bg, txt, bw) = if active {
+                (blend(base, accent, 0.22), active_text, 1.0)
+            } else {
+                let bg = match status {
+                    button::Status::Hovered => blend(base, accent, 0.10),
+                    _ => base,
+                };
+                (bg, inactive_text, 0.0)
+            };
+            button::Style {
+                background: Some(bg.into()),
+                text_color: txt,
+                border: iced::Border {
+                    color: accent,
+                    width: bw,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
+        }
+    }
+
+    /// File-tree row: the ghost button look, with an accent wash for selected
+    /// rows (kept on hover, slightly deeper). A keyboard-focus row gets a left
+    /// accent bar; a drop target gets a stronger wash and outline.
+    fn sidebar_row_style(
+        &self,
+        selected: bool,
+        keyboard_focus: bool,
+        drop_target: bool,
+    ) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+        let base = self.c_panel();
+        let accent = self.c_accent();
+        let text = self.c_text();
+        move |_t, status| {
+            let mut mix: f32 = if selected {
+                if status == button::Status::Hovered {
+                    0.34
+                } else {
+                    0.24
+                }
+            } else {
+                match status {
+                    button::Status::Hovered => 0.16,
+                    _ => 0.0,
+                }
+            };
+            if drop_target {
+                mix = mix.max(0.40);
+            }
+            let bg = if mix > 0.0 {
+                Some(blend(base, accent, mix).into())
+            } else {
+                None
+            };
+            let border_w = if keyboard_focus {
+                2.0
+            } else if drop_target {
+                1.0
+            } else {
+                0.0
+            };
+            button::Style {
+                background: bg,
+                text_color: text,
+                border: iced::Border {
+                    color: if border_w > 0.0 {
+                        accent
+                    } else {
+                        Color::TRANSPARENT
+                    },
+                    width: border_w,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Flat button (toggles, file rows, "+ New"): transparent, accent on hover.
+    fn ghost_btn_style(&self) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+        let base = self.c_panel();
+        let accent = self.c_accent();
+        let text = self.c_text();
+        move |_t, status| {
+            let bg = match status {
+                button::Status::Hovered => Some(blend(base, accent, 0.16).into()),
+                _ => None,
+            };
+            button::Style {
+                background: bg,
+                text_color: text,
+                border: iced::Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Close (×) button using the theme's close-button colors.
+    fn close_btn_style(&self) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+        let normal = Theme::rgb_to_color32(self.theme.tabbar.close_btn_bg);
+        let hover = Theme::rgb_to_color32(self.theme.tabbar.close_btn_hover);
+        let text = self.c_text();
+        move |_t, status| {
+            let bg = match status {
+                button::Status::Hovered => hover,
+                _ => normal,
+            };
+            button::Style {
+                background: Some(bg.into()),
+                text_color: text,
+                border: iced::Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Close button embedded in a tab. The tab container owns the shared
+    /// background and outline; only the close button's hover affordance paints
+    /// a separate background.
+    fn tab_close_btn_style(&self) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+        let hover = Theme::rgb_to_color32(self.theme.tabbar.close_btn_hover);
+        let text = self.c_text();
+        move |_t, status| {
+            let background = match status {
+                button::Status::Hovered | button::Status::Pressed => Some(hover.into()),
+                _ => None,
+            };
+            button::Style {
+                background,
+                text_color: text,
+                border: iced::Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 3.0.into(),
+                },
+                ..Default::default()

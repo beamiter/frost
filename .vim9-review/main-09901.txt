@@ -1,0 +1,300 @@
+        // Key auto-repeat — holding a chord that refuses, like prompt
+        // navigation at the oldest prompt — would otherwise stack four copies
+        // of one message and bury the terminal. Refresh the live duplicate
+        // instead of queueing another.
+        if let Some(last) = self.toasts.last_mut() {
+            if last.kind == kind && last.text == text {
+                last.expires_at = expires_at;
+                return;
+            }
+        }
+        self.toasts.push(Toast {
+            text,
+            kind,
+            expires_at,
+        });
+        // Drop oldest if we exceed cap so the stack never grows past MAX_TOASTS.
+        if self.toasts.len() > MAX_TOASTS {
+            let drop = self.toasts.len() - MAX_TOASTS;
+            self.toasts.drain(0..drop);
+        }
+    }
+
+    /// Drop expired toasts. Cheap; called from the periodic tick.
+    fn expire_toasts(&mut self) {
+        let now = std::time::Instant::now();
+        self.toasts.retain(|t| t.expires_at > now);
+    }
+
+    /// Typing or pasting into a held-open task transcript cannot reach a
+    /// child — the PTY is gone. Show one throttled hint instead of a dead
+    /// echo; the pane header carries the persistent "exited" marker.
+    fn hint_read_only_transcript(&mut self) {
+        const HINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1600);
+        let now = std::time::Instant::now();
+        if self
+            .read_only_hint_at
+            .is_some_and(|at| now.duration_since(at) < HINT_INTERVAL)
+        {
+            return;
+        }
+        self.read_only_hint_at = Some(now);
+        self.push_toast(
+            "Task terminal exited; its transcript is read-only",
+            ToastKind::Info,
+        );
+    }
+
+    /// Apply a tab context-menu action. Close/CloseOthers/CloseToRight close
+    /// whole tabs — every pane in them, PTYs included; Duplicate opens a new
+    /// tab at the target's cwd next to it.
+    ///
+    /// The ids are tab ids, and every batch preflights each affected tab for a
+    /// running foreground process before anything is torn down.
+    fn execute_tab_menu_action(&mut self, action: TabMenuAction) -> Task<Message> {
+        match action {
+            TabMenuAction::Close(id) => {
+                let Some(tab) = self.tab_index_by_id(id) else {
+                    return Task::none();
+                };
+                self.request_close_tab(tab)
+            }
+            TabMenuAction::CloseOthers(keep_id) => {
+                let Some(keep) = self.tab_index_by_id(keep_id) else {
+                    return Task::none();
+                };
+                let targets: Vec<usize> = (0..self.tabs.len()).filter(|&i| i != keep).collect();
+                self.close_tabs("Closed other tabs", targets)
+            }
+            TabMenuAction::CloseToRight(anchor_id) => {
+                let Some(anchor) = self.tab_index_by_id(anchor_id) else {
+                    return Task::none();
+                };
+                let targets: Vec<usize> = ((anchor + 1)..self.tabs.len()).collect();
+                self.close_tabs("Closed tabs to the right", targets)
+            }
+            TabMenuAction::Duplicate(id) => {
+                let Some(tab) = self.tab_index_by_id(id) else {
+                    return Task::none();
+                };
+                // Duplicate copies the tab's selected pane, matching the label
+                // the user right-clicked.
+                let Some(source) = self.tab_focus(tab) else {
+                    return Task::none();
+                };
+                let private_title = self.tabs[tab].private_title;
+                let cwd = self
+                    .sessions
+                    .get(source)
+                    .and_then(|s| s.cwd_cache.clone().or_else(|| s.cwd()));
+                match Session::spawn(
+                    &self.config,
+                    self.next_id,
+                    self.cols,
+                    self.rows,
+                    cwd.as_deref(),
+                ) {
+                    Ok(session) => {
+                        self.session_diagnostic = None;
+                        self.next_id += 1;
+                        let insert = (source + 1).min(self.sessions.len());
+                        self.sessions.insert(insert, session);
+                        apply_theme_colors(&mut self.sessions[insert].terminal, &self.theme);
+                        self.reindex_tabs_after_insert(insert);
+                        self.active_tab = tab;
+                        self.open_tab_with(insert);
+                        self.tabs[self.active_tab].private_title = private_title;
+                        self.relayout();
+                        self.refresh_active_context();
+                        self.save_session_snapshot();
+                        self.push_toast("Duplicated tab", ToastKind::Success);
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        log::error!("[PTY] {message}");
+                        self.session_diagnostic =
+                            Some(crate::review_text::bound_diagnostic_text(message.clone()));
+                        self.push_toast(message, ToastKind::Warning);
+                    }
+                }
+                Task::none()
+            }
+            TabMenuAction::CloseMarked => {
+                let targets: Vec<usize> = (0..self.tabs.len())
+                    .filter(|&tab| self.tabs[tab].marked)
+                    .collect();
+                if targets.is_empty() {
+                    return Task::none();
+                }
+                self.close_tabs("Closed marked tabs", targets)
+            }
+            TabMenuAction::NewTab => {
+                self.new_session();
+                Task::none()
+            }
+            TabMenuAction::TogglePinned(id) => {
+                let Some(tab) = self.tab_index_by_id(id) else {
+                    return Task::none();
+                };
+                let pinned = !self.tabs[tab].pinned;
+                self.tabs[tab].pinned = pinned;
+                // Pinning reorders the strip, so the active tab has to be
+                // re-found by identity rather than kept by index.
+                self.active_tab = sort_pinned_first(&mut self.tabs, self.active_tab);
+                self.dragging_tab = None;
+                self.session_dirty = true;
+                self.push_toast(
+                    if pinned { "Pinned tab" } else { "Unpinned tab" },
+                    ToastKind::Info,
+                );
+                Task::none()
+            }
+            TabMenuAction::ToggleMarked(id) => {
+                let Some(tab) = self.tab_index_by_id(id) else {
+                    return Task::none();
+                };
+                let marked = !self.tabs[tab].marked;
+                self.tabs[tab].marked = marked;
+                self.session_dirty = true;
+                self.push_toast(
+                    if marked {
+                        "Marked tab as important"
+                    } else {
+                        "Cleared tab mark"
+                    },
+                    ToastKind::Info,
+                );
+                Task::none()
+            }
+            TabMenuAction::TogglePrivateTitle(id) => {
+                let Some(tab) = self.tab_index_by_id(id) else {
+                    return Task::none();
+                };
+                let private = !self.tabs[tab].private_title;
+                self.tabs[tab].private_title = private;
+                self.session_dirty = true;
+                self.push_toast(
+                    if private {
+                        "Tab title details hidden"
+                    } else {
+                        "Tab title details visible"
+                    },
+                    ToastKind::Info,
+                );
+                Task::none()
+            }
+            TabMenuAction::ConnectRemote(index) => {
+                self.connect_remote_host(index);
+                Task::none()
+            }
+        }
+    }
+
+    /// Apply the context menu's Rename. An empty name clears the custom title,
+    /// putting the tab back to following its focused session's label.
+    fn apply_tab_rename(&mut self, id: usize, raw: String) {
+        let Some(tab) = self.tab_index_by_id(id) else {
+            return;
+        };
+        // The title is persisted and drawn verbatim in the strip; hold it to
+        // the same contract the snapshot loader enforces on the way back in.
+        self.tabs[tab].title = session_persistence::persistable_tab_title(raw);
+        self.session_dirty = true;
+    }
+
+    /// Close a set of tabs, refusing the whole batch if any pane in any of them
+    /// still runs a foreground process — a bulk action should not be the way a
+    /// running job gets killed without a prompt.
+    ///
+    /// Tabs are resolved to stable ids up front and closed one at a time, since
+    /// each close shifts the indices of the tabs still queued.
+    fn close_tabs(&mut self, done_message: &str, targets: Vec<usize>) -> Task<Message> {
+        if let Some((index, process)) = targets
+            .iter()
+            .flat_map(|&tab| self.tabs_sessions(tab))
+            .find_map(|session| self.busy_session_name(session).map(|name| (session, name)))
+        {
+            self.focus_session(index);
+            self.relayout();
+            self.refresh_active_context();
+            self.push_toast(
+                format!("{process} is still running — close that tab explicitly"),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        let ids: Vec<usize> = targets
+            .iter()
+            .filter_map(|&tab| self.tabs.get(tab).map(|tab| tab.id))
+            .collect();
+        let mut tasks: Vec<Task<Message>> = Vec::new();
+        for id in ids {
+            if let Some(tab) = self.tab_index_by_id(id) {
+                tasks.push(self.close_tab(tab));
+            }
+        }
+        self.push_toast(done_message.to_string(), ToastKind::Info);
+        Task::batch(tasks)
+    }
+
+    fn tabs_sessions(&self, tab: usize) -> Vec<usize> {
+        self.tabs
+            .get(tab)
+            .map(|tab| tab.sessions())
+            .unwrap_or_default()
+    }
+
+    /// Move tab `from` to position `to`, shifting the tabs in between.
+    ///
+    /// Only the strip's order changes. The session vector and every tab's
+    /// panes stay put: dragging one tab must not permute the panes inside
+    /// another one, which is exactly what reordering the session vector did
+    /// back when a tab *was* a session.
+    fn reorder_tab(&mut self, from: usize, to: usize) {
+        let Some(active_tab) =
+            reorder_tabs_preserving_pinned_prefix(&mut self.tabs, self.active_tab, from, to)
+        else {
+            return;
+        };
+        self.active_tab = active_tab;
+        self.session_dirty = true;
+        self.refresh_active_context();
+        self.save_session_snapshot();
+    }
+
+    /// Commit the currently previewed ordinary-tab → split-pane drop.
+    fn finish_tab_split_drop(&mut self) {
+        // The pointer may arm an edge and then switch/zoom the visible page
+        // without moving again. Re-resolve every final topology condition here
+        // so a stale overlay cannot graft the source into a hidden old target.
+        let request =
+            self.dragging_tab
+                .zip(self.tab_split_drop)
+                .and_then(|(source_tab_id, drop)| {
+                    let source_tab = self.tab_index_by_id(source_tab_id);
+                    let source_is_plain = source_tab
+                        .and_then(|tab| self.tabs.get(tab))
+                        .is_some_and(|tab| tab.tree.is_leaf());
+                    let target_session = self.session_index_by_id(drop.target_session_id)?;
+                    let target_tab = self.tab_of_session(target_session);
+                    tab_split_commit_allowed(
+                        source_tab,
+                        source_is_plain,
+                        self.active_tab,
+                        target_tab,
+                        self.layout().leaf_count(),
+                        self.pane_zoomed,
+                    )
+                    .then_some((source_tab_id, target_session, drop.direction))
+                });
+        let result = request.and_then(|(source_tab_id, target_session, direction)| {
+            move_plain_tab_into_split(&mut self.tabs, source_tab_id, target_session, direction)
+        });
+        let origin = self.tab_drag_origin.take();
+        self.dragging_tab = None;
+        self.tab_split_drop = None;
+        self.tab_drag_moved = false;
+        self.tab_drag_hover_since = None;
+        let Some((target_tab, focused_session)) = result else {
+            self.restore_tab_drag_origin(origin);
+            return;

@@ -1,0 +1,300 @@
+    fn review_insertion_can_reuse_current_command_validation_without_weakening_snapshot_checks() {
+        let review = BlockReview {
+            session_id: 7,
+            ids: vec![1, 2],
+            title: String::new(),
+            body: String::new(),
+            commands: Some("echo one\necho two".into()),
+            command_error: None,
+            bracketed: true,
+            comparison: None,
+        };
+        for session_id in [7, 8] {
+            for ids in [&[1, 2][..], &[2, 1][..], &[1][..], &[][..]] {
+                for commands in ["echo one\necho two", "echo changed", ""] {
+                    for bracketed in [true, false] {
+                        let commands_current = review.matches_commands(session_id, ids, commands);
+                        let reused = commands_current && review.bracketed == bracketed;
+                        assert_eq!(
+                            reused,
+                            review.matches_selection(session_id, ids, commands, bracketed)
+                        );
+                    }
+                }
+            }
+        }
+        assert!(review.matches_commands(7, &[1, 2], "echo one\necho two"));
+        assert!(!review.matches_selection(7, &[1, 2], "echo one\necho two", false));
+    }
+
+    #[test]
+    fn block_review_layout_is_bounded_and_scrolls_wrapped_chrome_when_compact() {
+        for window in [
+            Size::new(280.0, 200.0),
+            Size::new(360.0, 300.0),
+            Size::new(1000.0, 680.0),
+            Size::new(20.0, 20.0),
+        ] {
+            let panel = block_review_panel_size(window);
+            assert!(panel.width > 0.0 && panel.width <= window.width);
+            assert!(panel.height > 0.0 && panel.height <= window.height);
+        }
+        assert!(block_review_scrolls_heading(block_review_panel_size(
+            Size::new(280.0, 200.0)
+        )));
+        assert!(block_review_scrolls_heading(block_review_panel_size(
+            Size::new(360.0, 300.0)
+        )));
+        assert!(!block_review_scrolls_heading(block_review_panel_size(
+            Size::new(1000.0, 680.0)
+        )));
+    }
+
+    #[test]
+    fn history_picker_panel_reserves_window_margins_and_shrinks_for_few_results() {
+        use super::history_picker_panel_size;
+        use iced::Size;
+        assert_eq!(
+            history_picker_panel_size(Size::new(1100.0, 680.0), 15),
+            Size::new(560.0, 460.0)
+        );
+        assert_eq!(
+            history_picker_panel_size(Size::new(360.0, 300.0), 15),
+            Size::new(336.0, 276.0)
+        );
+        assert_eq!(
+            history_picker_panel_size(Size::new(280.0, 200.0), 15),
+            Size::new(256.0, 176.0)
+        );
+        assert_eq!(
+            history_picker_panel_size(Size::new(1100.0, 680.0), 0),
+            Size::new(560.0, 204.0)
+        );
+        assert_eq!(
+            history_picker_panel_size(Size::new(8.0, 8.0), 1),
+            Size::new(1.0, 1.0)
+        );
+    }
+
+    use super::*;
+    use iced::keyboard::key::Named;
+
+    #[test]
+    fn block_review_identity_and_payload_fail_closed() {
+        let review = BlockReview {
+            session_id: 7,
+            ids: vec![4, 9],
+            title: String::new(),
+            body: String::new(),
+            commands: Some("echo one\necho two".into()),
+            command_error: None,
+            bracketed: true,
+            comparison: None,
+        };
+        assert!(review.matches_selection(7, &[4, 9], "echo one\necho two", true));
+        assert!(!review.matches_selection(8, &[4, 9], "echo one\necho two", true));
+        assert!(!review.matches_selection(7, &[9, 4], "echo one\necho two", true));
+        assert!(!review.matches_selection(7, &[9], "echo two", true));
+        assert!(!review.matches_selection(7, &[4, 9], "changed", true));
+        assert!(!review.matches_selection(7, &[4, 9], "echo one\necho two", false));
+        // Clipboard identity is independent of the paste mode and prompt;
+        // selection, pane and original bytes are still mandatory.
+        assert!(review.matches_commands(7, &[4, 9], "echo one\necho two"));
+        assert!(!review.matches_commands(8, &[4, 9], "echo one\necho two"));
+        assert!(!review.matches_commands(7, &[4], "echo one"));
+        assert!(!review.matches_commands(7, &[4, 9], "changed"));
+        let details = BlockReview {
+            commands: None,
+            ..review
+        };
+        assert!(!details.matches_selection(7, &[4, 9], "", true));
+    }
+
+    #[test]
+    fn desktop_notification_pair_strips_osc_payload_controls() {
+        let (title, body) = bound_desktop_notification_pair(
+            format!("bell\u{1b}[31m\u{202e}{}", "t".repeat(400)),
+            format!("from PTY\n\u{07}{}", "b".repeat(400)),
+        );
+        assert!(!title.contains('\u{1b}'));
+        assert!(!title.contains('\u{202e}'));
+        assert!(title.len() <= crate::review_text::MAX_TOAST_BYTES);
+        assert!(!body.contains('\n'));
+        assert!(!body.contains('\u{07}'));
+        assert!(body.len() <= crate::review_text::MAX_TOAST_BYTES);
+        assert!(title.starts_with("bell"));
+        assert!(body.starts_with("from PTY"));
+    }
+
+    #[test]
+    fn status_bar_segment_strips_cwd_spoofing() {
+        let shown = crate::review_text::bound_toast_text(format!(
+            "~/src/\u{1b}[31m\u{202e}{}",
+            "d".repeat(400)
+        ));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.len() <= crate::review_text::MAX_TOAST_BYTES);
+        assert!(shown.starts_with("~/src/"));
+    }
+
+    #[test]
+    fn home_display_abbreviation_respects_lexical_components() {
+        let home = Some(std::path::Path::new("/home/ann"));
+        assert_eq!(abbreviate_home_with("/home/ann", home), "~");
+        assert_eq!(abbreviate_home_with("/home/ann/", home), "~");
+        assert_eq!(abbreviate_home_with("/home/ann/src", home), "~/src");
+        assert_eq!(
+            abbreviate_home_with("/home/anna/src", home),
+            "/home/anna/src"
+        );
+        assert_eq!(abbreviate_home_with("/home/annex", home), "/home/annex");
+        assert_eq!(
+            abbreviate_home_with("/home/ann/雪", Some(std::path::Path::new("/home/ann/"))),
+            "~/雪"
+        );
+        assert_eq!(
+            abbreviate_home_with("/", Some(std::path::Path::new("/"))),
+            "~"
+        );
+        assert_eq!(
+            abbreviate_home_with("/tmp", Some(std::path::Path::new("/"))),
+            "~/tmp"
+        );
+        assert_eq!(abbreviate_home_with("/tmp", None), "/tmp");
+        assert_eq!(
+            abbreviate_home_with("/tmp", Some(std::path::Path::new(""))),
+            "/tmp"
+        );
+        assert_eq!(
+            abbreviate_home_with("/home/ann/../other", home),
+            "~/../other"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_home_keeps_original_path_display() {
+        use std::os::unix::ffi::OsStringExt;
+        let home = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/home/\xff".to_vec()));
+        assert_eq!(
+            abbreviate_home_with("/home/ann/src", Some(&home)),
+            "/home/ann/src"
+        );
+    }
+
+    #[test]
+    fn block_menu_preview_strips_command_and_cwd_spoofing() {
+        let preview =
+            history_picker::display_command(&format!("ls \u{1b}[31m\u{202e}{}", "n".repeat(400)));
+        assert!(!preview.contains('\u{1b}'));
+        assert!(!preview.contains('\u{202e}'));
+        assert!(preview.starts_with("ls "));
+        let cwd = history_picker::display_cwd(&abbreviate_home(&format!(
+            "/tmp/\u{202e}{}",
+            "p".repeat(400)
+        )));
+        assert!(!cwd.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn long_block_notification_command_strips_spoofing() {
+        let shown = history_picker::display_command(&format!(
+            "sleep 30 \u{1b}[31m\u{202e}{}",
+            "n".repeat(400)
+        ));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.starts_with("sleep 30"));
+    }
+
+    #[test]
+    fn osc5522_pending_read_counts_refusals_before_eperm() {
+        let mut terminal = TerminalState::new(80, 24);
+        let mut in_flight = false;
+        let mut pending = None;
+        let request = || terminal::ClipboardReadKind::MimeData("text/plain".to_string());
+        assert_eq!(
+            service_osc5522_read(
+                &mut terminal,
+                &mut in_flight,
+                &mut pending,
+                true,
+                false,
+                request()
+            ),
+            Some("text/plain".to_string())
+        );
+        // Permission is revoked while the host read is still outstanding.
+        assert!(service_osc5522_read(
+            &mut terminal,
+            &mut in_flight,
+            &mut pending,
+            false,
+            false,
+            request()
+        )
+        .is_none());
+        assert!(
+            terminal.output_buffer.is_empty(),
+            "EPERM must not answer a later batch while the first read is still in flight"
+        );
+        assert_eq!(pending, Some(1));
+    }
+
+    #[test]
+    fn osc5522_slow_read_precedes_later_mime_read_refusal() {
+        let mut terminal = TerminalState::new(80, 24);
+        let mut in_flight = false;
+        let mut pending = None;
+        let request = || terminal::ClipboardReadKind::MimeData("text/plain".to_string());
+        assert_eq!(
+            service_osc5522_read(
+                &mut terminal,
+                &mut in_flight,
+                &mut pending,
+                true,
+                false,
+                request()
+            ),
+            Some("text/plain".to_string())
+        );
+        // A second PTY batch arrives before iced returns the first read.
+        assert!(service_osc5522_read(
+            &mut terminal,
+            &mut in_flight,
+            &mut pending,
+            true,
+            false,
+            request()
+        )
+        .is_none());
+        assert!(
+            terminal.output_buffer.is_empty(),
+            "EBUSY must not overtake the first read"
+        );
+        complete_osc5522_read(
+            &mut terminal,
+            &mut in_flight,
+            &mut pending,
+            true,
+            "text/plain",
+            "first",
+        );
+        let mut expected = clipboard_5522_response_for_mime("text/plain", b"first");
+        expected.extend_from_slice(&osc_5522_packet("type=read:status=EBUSY", None));
+        assert_eq!(terminal.output_buffer, expected);
+        assert!(!in_flight);
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn osc5522_disabled_completion_keeps_bounded_refusals_on_its_session() {
+        let mut terminal = TerminalState::new(80, 24);
+        let mut in_flight = false;
+        let mut pending = None;
+        assert!(service_osc5522_read(
+            &mut terminal,
+            &mut in_flight,
+            &mut pending,
+            true,

@@ -1,0 +1,300 @@
+        .width(Length::Fill)
+        .into()
+}
+
+/// The same native card geometry is used by production and renderer-free tests.
+fn companion_card_content<'a, R: iced::advanced::renderer::Renderer + 'a>(
+    body: Element<'a, Message, iced::Theme, R>,
+    detail: Option<Element<'a, Message, iced::Theme, R>>,
+    toggle: Element<'a, Message, iced::Theme, R>,
+) -> iced::widget::Container<'a, Message, iced::Theme, R> {
+    let body = container(body)
+        .width(Length::Fixed(COMPANION_CARD_SPRITE_WIDTH))
+        .height(Length::Fill)
+        .align_y(iced::Alignment::Center);
+    let detail = container(detail.unwrap_or_else(|| Space::new().width(Length::Fill).into()))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_y(iced::Alignment::Center)
+        .clip(true);
+    container(
+        row![body, detail, toggle]
+            .spacing(12)
+            .align_y(iced::Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .padding([8.0, 12.0])
+}
+
+/// Retain release cleanup offscreen without admitting new hidden observations.
+fn organism_pointer_observation_needed(
+    visible: bool,
+    glyph: bool,
+    explicit: bool,
+    buttons_down: bool,
+    motion: Option<organism::Motion>,
+) -> bool {
+    buttons_down || (visible && (glyph || explicit) && motion != Some(organism::Motion::Static))
+}
+
+/// A hidden companion listens only long enough to retire its held-button ledger.
+fn organism_pointer_event(event: iced::Event, visible: bool) -> Option<Message> {
+    match event {
+        iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button)) if visible => {
+            Some(Message::OrganismPointerButton(button, true))
+        }
+        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(button)) => {
+            Some(Message::OrganismPointerButton(button, false))
+        }
+        iced::Event::Mouse(iced::mouse::Event::CursorLeft) => Some(Message::OrganismPointerLeft),
+        _ => None,
+    }
+}
+
+fn organism_settings_hint(
+    width: f32,
+    enabled: bool,
+    expanded: bool,
+    bottom_bar: bool,
+) -> &'static str {
+    if !enabled {
+        return "Enable ASCII Organism to allow the live companion.";
+    }
+    if !bottom_bar {
+        return organism::expanded_companion_hint(false);
+    }
+    let layout = organism_layout(width, enabled, expanded, bottom_bar);
+    if layout.body && !layout.glyph {
+        return "This width shows the companion card with a collapse arrow, but no live hover target or status glyph. When idle, use Greet companion in the command palette. Preview Say hello is separate.";
+    }
+    if !layout.presentable() {
+        return if organism_layout(width, enabled, true, bottom_bar).body {
+            "Use the status-bar arrow to reopen the companion card. This width has no room for the status glyph or live hover target."
+        } else if expanded {
+            "Resize the window to make room for the live body. The expanded strip keeps its reserved height."
+        } else {
+            "Resize the window to make room for the live companion; even the expanded body needs more width."
+        };
+    }
+    if expanded {
+        organism::expanded_companion_hint(true)
+    } else {
+        "Use the status-bar arrow or enable Show expanded companion to keep the full body visible."
+    }
+}
+
+/// Calendar knowledge is sampled on existing native event/tick boundaries.
+fn organism_local_day() -> Option<i64> {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    let millis = elapsed.as_millis().min(u64::MAX as u128) as u64;
+    Some(jterm_core::organism_memory::local_day_at_ms(millis))
+}
+
+/// Live eligibility never changes the reserved card height.
+fn companion_strip_height(enabled: bool, expanded: bool, bottom_bar: bool) -> f32 {
+    if enabled && expanded && bottom_bar {
+        88.0
+    } else {
+        0.0
+    }
+}
+
+fn terminal_height_after_chrome(
+    window_height: f32,
+    font_size: f32,
+    chrome_font_size: f32,
+    bottom_bar: bool,
+    reading_bar_height: f32,
+    companion_height: f32,
+) -> f32 {
+    (window_height
+        - chrome_height(font_size, chrome_font_size, bottom_bar)
+        - reading_bar_height
+        - companion_height)
+        .max(0.0)
+}
+
+/// Whether an existing block selection may consume plain navigation/Enter.
+/// Running and alternate-screen applications always retain their keyboard.
+/// The single exception to dropping keyboard events a widget captured.
+///
+/// A focused overlay text input captures Escape merely to blur itself, which
+/// left the overlay open until a second press. Re-delivering that one event
+/// fixes it; widening this predicate would hand the terminal keys the overlay
+/// already consumed, so it stays exactly "an Escape key press".
+fn captured_key_is_overlay_escape(event: &keyboard::Event) -> bool {
+    matches!(
+        event,
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            ..
+        }
+    )
+}
+
+/// Physical Enter state is tracked before a review surface opens. Ownership
+/// can then follow the same held key through a palette, picker and mouse click
+/// without letting its repeat become an implicit shell submission.
+#[derive(Debug, Default)]
+struct PromptRecallEnterLatch {
+    pressed: u8,
+    owned: u8,
+}
+
+impl PromptRecallEnterLatch {
+    fn mask(location: keyboard::Location) -> u8 {
+        match location {
+            keyboard::Location::Standard => 1,
+            keyboard::Location::Left => 2,
+            keyboard::Location::Right => 4,
+            keyboard::Location::Numpad => 8,
+        }
+    }
+
+    /// Called when an explicit recall operation begins, including mouse
+    /// acceptance. A normal click with no held Enter does not block a later
+    /// fresh Enter. Failed recalls keep the same key ownership as successful
+    /// ones, so a refusal cannot accidentally submit an existing prompt.
+    fn begin_recall(&mut self) {
+        self.owned |= self.pressed;
+    }
+
+    /// A widget already consumed this press. Observe it without redispatching
+    /// its action, even if that action closed the widget before this message.
+    fn captured_press(&mut self, location: keyboard::Location) {
+        let mask = Self::mask(location);
+        self.pressed |= mask;
+        self.owned |= mask;
+    }
+
+    fn consume(&mut self, event: &keyboard::Event, recall_surface_open: bool) -> bool {
+        use keyboard::{key::Named, Event, Key};
+        match event {
+            Event::KeyReleased {
+                key: Key::Named(Named::Enter),
+                location,
+                ..
+            } => {
+                let mask = Self::mask(*location);
+                let owned = self.owned & mask != 0;
+                self.pressed &= !mask;
+                self.owned &= !mask;
+                owned
+            }
+            Event::KeyPressed {
+                key: Key::Named(Named::Enter),
+                location,
+                repeat,
+                ..
+            } => {
+                let mask = Self::mask(*location);
+                self.pressed |= mask;
+                if self.owned != 0 {
+                    self.owned |= mask;
+                    true
+                } else if recall_surface_open {
+                    self.owned |= mask;
+                    // An already-repeating key cannot newly confirm a surface.
+                    *repeat
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+fn captured_key_is_enter_release(event: &keyboard::Event) -> bool {
+    matches!(
+        event,
+        keyboard::Event::KeyReleased {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            ..
+        }
+    )
+}
+
+/// The Block Search refresh shortcut is deliberately the unmodified F5 key.
+/// Modified or auto-repeated function-key events remain ordinary overlay-owned
+/// no-ops instead of silently forcing a potentially expensive index rebuild.
+fn block_search_manual_refresh_key(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    repeat: bool,
+) -> bool {
+    matches!(key, keyboard::Key::Named(keyboard::key::Named::F5))
+        && !repeat
+        && !modifiers.shift()
+        && !modifiers.control()
+        && !modifiers.alt()
+        && !modifiers.logo()
+}
+
+/// Files owns bare F5 while the pointer is over the Files dock **or** the
+/// panel has keyboard focus. Everywhere else the terminal keeps its ordinary
+/// F5 escape sequence.
+fn sidebar_files_manual_refresh_key(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    repeat: bool,
+    files_scope: bool,
+) -> bool {
+    files_scope && block_search_manual_refresh_key(key, modifiers, repeat)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarNavigationKey {
+    Back,
+    Forward,
+    Parent,
+    Home,
+}
+
+/// Remote/local tree navigation owns Alt+Up and Alt+Home only while Files has
+/// the same shortcut scope as F5 (pointer over the dock or keyboard focus).
+/// Everywhere else the PTY receives the original key unchanged.
+fn sidebar_files_navigation_key(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    repeat: bool,
+    files_scope: bool,
+) -> Option<SidebarNavigationKey> {
+    if !files_scope
+        || repeat
+        || !modifiers.alt()
+        || modifiers.shift()
+        || modifiers.control()
+        || modifiers.logo()
+    {
+        return None;
+    }
+    match key {
+        keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => Some(SidebarNavigationKey::Back),
+        keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
+            Some(SidebarNavigationKey::Forward)
+        }
+        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some(SidebarNavigationKey::Parent),
+        keyboard::Key::Named(keyboard::key::Named::Home) => Some(SidebarNavigationKey::Home),
+        _ => None,
+    }
+}
+
+fn files_shortcut_scope(dock_open: bool, files_panel: bool, hovered: bool, focused: bool) -> bool {
+    dock_open && files_panel && (hovered || focused)
+}
+
+const SIDEBAR_SNAPSHOT_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+fn compact_scan_duration(duration: std::time::Duration) -> String {
+    if duration < std::time::Duration::from_secs(1) {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{}s", duration.as_secs())
+    }
+}
+
+fn sidebar_breadcrumbs(

@@ -1,0 +1,300 @@
+        let alt_screen_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Alt Screen",
+            checkbox(self.config.disable_alt_screen)
+                .label("Disable")
+                .text_size(self.effective_font_size())
+                .on_toggle(Message::SetDisableAltScreen)
+                .into(),
+        );
+
+        let clipboard_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Clipboard",
+            row![
+                checkbox(self.config.allow_clipboard_read)
+                    .label("Allow PTY reads (unsafe over SSH)")
+                    .text_size(self.effective_font_size())
+                    .on_toggle(Message::SetAllowClipboardRead),
+                checkbox(self.config.allow_remote_clipboard_write)
+                    .label("Allow PTY writes (unsafe over SSH)")
+                    .text_size(self.effective_font_size())
+                    .on_toggle(Message::SetAllowRemoteClipboardWrite),
+            ]
+            .spacing(12)
+            .align_y(iced::Alignment::Center)
+            .into(),
+        );
+
+        let tab_position_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Tabs",
+            checkbox(self.config.tab_position == config::TabPosition::Side)
+                .label("In sidebar")
+                .text_size(self.effective_font_size())
+                .on_toggle(|side| {
+                    Message::SetTabPosition(if side {
+                        config::TabPosition::Side
+                    } else {
+                        config::TabPosition::Top
+                    })
+                })
+                .into(),
+        );
+
+        let notify_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Notify",
+            checkbox(self.config.notify_long_blocks)
+                .label("Toast when long commands finish unwatched")
+                .text_size(self.effective_font_size())
+                .on_toggle(Message::SetNotifyLongBlocks)
+                .into(),
+        );
+
+        let repo_strip_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Git",
+            checkbox(self.config.show_repo_strip)
+                .label("Branch/dirty in pane headers")
+                .text_size(self.effective_font_size())
+                .on_toggle(Message::SetShowRepoStrip)
+                .into(),
+        );
+
+        let bottom_bar_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Bar",
+            checkbox(self.config.bottom_bar)
+                .label("Bottom status bar (cwd, git, last command)")
+                .text_size(self.effective_font_size())
+                .on_toggle(Message::SetBottomBar)
+                .into(),
+        );
+
+        let organism_settings = self.organism_settings();
+
+        let block_mode_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Terminal",
+            pick_list(
+                [
+                    config::TerminalMode::Normal,
+                    config::TerminalMode::Block,
+                    config::TerminalMode::Chat,
+                ],
+                Some(self.config.effective_terminal_mode()),
+                Message::SetTerminalMode,
+            )
+            .text_size(self.effective_font_size())
+            .into(),
+        );
+
+        let block_compact_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Block spacing",
+            checkbox(self.config.block_compact)
+                .label("Compact Block Spacing")
+                .text_size(self.effective_font_size())
+                .on_toggle(Message::SetBlockCompact)
+                .into(),
+        );
+
+        // ── AI & Agent ────────────────────────────────────────────────────
+        let ai_header = text("AI & Agent").size(self.effective_font_size());
+        let ai_enable_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "AI",
+            checkbox(self.config.ai_enabled)
+                .label("Enable AI features")
+                .text_size(self.effective_font_size())
+                .on_toggle(Message::SetAiEnabled)
+                .into(),
+        );
+        let ai_providers = vec![
+            "anthropic".to_string(),
+            "openai-compatible".to_string(),
+            "ollama".to_string(),
+        ];
+        let ai_provider_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Provider",
+            pick_list(
+                ai_providers,
+                Some(self.config.ai_provider.clone()),
+                Message::SetAiProvider,
+            )
+            .text_size(self.effective_font_size())
+            .width(Length::Fill)
+            .into(),
+        );
+        let ai_model_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Model",
+            text_input("claude-sonnet-4-6", &self.config.ai_model)
+                .on_input(Message::SetAiModel)
+                .size(self.effective_font_size())
+                .into(),
+        );
+        let ai_base_url_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Base URL",
+            text_input("https://api.anthropic.com", &self.config.ai_base_url)
+                .on_input(Message::SetAiBaseUrl)
+                .size(self.effective_font_size())
+                .into(),
+        );
+        let ai_tokens_row = responsive_slider_row(
+            compact,
+            self.effective_font_size(),
+            "Max tokens",
+            format!("{}", self.config.ai_max_tokens),
+            slider(
+                64..=32_768u32,
+                self.config.ai_max_tokens,
+                Message::SetAiMaxTokens,
+            )
+            .into(),
+        );
+        let ai_temperature_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Temperature",
+            text_input("provider default (0.0-2.0)", &self.ai_temperature_draft)
+                .on_input(Message::SetAiTemperature)
+                .size(self.effective_font_size())
+                .into(),
+        );
+        let ai_key_file_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Key file",
+            text_input(
+                "~/.config/frost/ai.key (chmod 600)",
+                self.config.ai_api_key_file.as_deref().unwrap_or(""),
+            )
+            .on_input(Message::SetAiKeyFile)
+            .size(self.effective_font_size())
+            .into(),
+        );
+        let ai_key_store_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "API Key",
+            text_input(
+                "paste key, Enter stores it as a 600 file",
+                &self.ai_key_draft,
+            )
+            .secure(true)
+            .on_input(Message::SetAiKeyDraft)
+            .on_submit(Message::StoreAiKey)
+            .size(self.effective_font_size())
+            .into(),
+        );
+        let ai_redact_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Privacy",
+            checkbox(self.config.ai_redact_secrets)
+                .label("Redact secrets in AI-bound text")
+                .text_size(self.effective_font_size())
+                .on_toggle(Message::SetAiRedactSecrets)
+                .into(),
+        );
+        let ai_stream_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Streaming",
+            checkbox(self.config.ai_stream)
+                .label("Stream agent replies as they arrive")
+                .text_size(self.effective_font_size())
+                .on_toggle(Message::SetAiStream)
+                .into(),
+        );
+        let ai_share_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Cloud context",
+            checkbox(self.config.ai_share_command_context)
+                .label("Share command context with non-local AI")
+                .text_size(self.effective_font_size())
+                .on_toggle(Message::SetAiShareCommandContext)
+                .into(),
+        );
+        let ai_correction_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Corrections",
+            checkbox(self.config.command_correction_enabled)
+                .label("Suggest corrections for failed commands (reviewed before running)")
+                .text_size(self.effective_font_size())
+                .on_toggle(Message::SetCommandCorrectionEnabled)
+                .into(),
+        );
+        let task_sidebar_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Tasks",
+            checkbox(self.config.experimental_task_sidebar)
+                .label("Experimental Tasks dashboard (Codex/Claude/OpenCode/Kimi)")
+                .text_size(self.effective_font_size())
+                .on_toggle(Message::SetExperimentalTaskSidebar)
+                .into(),
+        );
+        let preferred_agent_choices: Vec<String> = agent_task::AgentProvider::ALL
+            .iter()
+            .map(|provider| provider.config_value().to_string())
+            .collect();
+        let preferred_agent_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Preferred Agent",
+            pick_list(
+                preferred_agent_choices,
+                Some(self.config.preferred_agent_provider.clone()),
+                Message::SetPreferredAgentProvider,
+            )
+            .text_size(self.effective_font_size())
+            .into(),
+        );
+        let agent_turns_row = responsive_slider_row(
+            compact,
+            self.effective_font_size(),
+            "Agent turns",
+            format!("{}", self.config.agent_max_turns),
+            slider(
+                1..=100u32,
+                self.config.agent_max_turns,
+                Message::SetAgentMaxTurns,
+            )
+            .into(),
+        );
+
+        // ── Remote hosts ──────────────────────────────────────────────────
+        // Edited in place; entries ride the same auto-save as every other
+        // setting. Validation is live but advisory — editing and saving are
+        // never blocked, and the Ctrl+Shift+S picker shows the same reason
+        // for an entry it refuses to open.
+        let mut remote_hosts_section =
+            column![text("Remote hosts").size(self.effective_font_size())].spacing(8);
+        if self.config.remote_hosts.is_empty() {
+            remote_hosts_section = remote_hosts_section.push(
+                text("None configured. Ctrl+Shift+S opens the picker once a host is added.")
+                    .size(self.effective_font_size())
+                    .style(text::secondary),
+            );
+        }
+        for (i, host) in self
+            .config

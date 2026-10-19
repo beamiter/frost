@@ -1,0 +1,300 @@
+            .remote_hosts
+            .iter()
+            .take(config::MAX_REMOTE_HOST_UI_ROWS)
+            .enumerate()
+        {
+            let target = self.remote_host_editor.target(i);
+            let validation = config::validate_remote_host_at(&self.config.remote_hosts, i);
+            let transport = if host.docker { "docker" } else { "ssh" };
+            let deploy = if host.deploy.is_empty() {
+                "off"
+            } else {
+                host.deploy.as_str()
+            };
+            let deploy_label = jterm_core::review_input::safe_inline_display(deploy, 64);
+            let display_name = config::remote_host_display_name(host, i);
+            let header = row![
+                text(display_name).size(self.effective_font_size()),
+                Space::new().width(Length::Fill),
+                text(format!("{transport} · deploy {deploy_label}"))
+                    .size(self.effective_font_size())
+                    .style(text::secondary),
+                button(text("Delete").size(self.effective_font_size()))
+                    .on_press(Message::RemoteHostRemove(target.clone()))
+                    .style(button::danger),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+
+            let name_target = target.clone();
+            let name_input = text_input("display name", &host.name)
+                .on_input(move |s| Message::RemoteHostName(name_target.clone(), s))
+                .size(self.effective_font_size());
+            let host_placeholder = if host.docker {
+                "container name"
+            } else {
+                "ssh host"
+            };
+            let host_target = target.clone();
+            let host_input = text_input(host_placeholder, &host.host)
+                .on_input(move |s| Message::RemoteHostHost(host_target.clone(), s))
+                .size(self.effective_font_size());
+            let user_target = target.clone();
+            let user_input = text_input("user (optional)", host.user.as_deref().unwrap_or(""))
+                .on_input(move |s| Message::RemoteHostUser(user_target.clone(), s))
+                .size(self.effective_font_size());
+            let docker_target = target.clone();
+            let docker_box = checkbox(host.docker)
+                .label("docker")
+                .text_size(self.effective_font_size())
+                .on_toggle(move |v| Message::RemoteHostDocker(docker_target.clone(), v));
+            let deploy_target = target.clone();
+            let deploy_pick = pick_list(
+                vec![
+                    "off".to_string(),
+                    "persist".to_string(),
+                    "incognito".to_string(),
+                ],
+                Some(deploy_label),
+                move |v| Message::RemoteHostDeploy(deploy_target.clone(), v),
+            )
+            .text_size(self.effective_font_size())
+            .width(Length::Fixed(110.0));
+            let toggles = row![docker_box, deploy_pick]
+                .spacing(10)
+                .align_y(iced::Alignment::Center);
+            let fields: Element<'_, Message> = if compact {
+                column![name_input, host_input, user_input, toggles]
+                    .spacing(6)
+                    .into()
+            } else {
+                column![
+                    row![name_input, host_input].spacing(8),
+                    row![user_input, toggles].spacing(10),
+                ]
+                .spacing(6)
+                .into()
+            };
+            let mut entry = column![header, fields].spacing(6);
+            if let Err(problem) = validation {
+                entry = entry.push(
+                    text(problem)
+                        .size(self.effective_font_size())
+                        .style(text::danger),
+                );
+            }
+            remote_hosts_section = remote_hosts_section.push(
+                container(entry)
+                    .width(Length::Fill)
+                    .padding([6, 8])
+                    .style(container::bordered_box),
+            );
+        }
+        if self.config.remote_hosts.len() > config::MAX_REMOTE_HOST_UI_ROWS {
+            remote_hosts_section = remote_hosts_section.push(
+                text(format!(
+                    "{} additional drafts remain in config.toml and will be saved unchanged; this panel renders only the first {}.",
+                    self.config.remote_hosts.len() - config::MAX_REMOTE_HOST_UI_ROWS,
+                    config::MAX_REMOTE_HOST_UI_ROWS
+                ))
+                .size(self.effective_font_size())
+                .style(text::danger),
+            );
+        }
+        let at_remote_host_capacity = self.config.remote_hosts.len() >= config::MAX_REMOTE_HOSTS;
+        let add_host = button(text("Add host").size(self.effective_font_size()));
+        let add_host = if at_remote_host_capacity {
+            add_host
+        } else {
+            add_host.on_press(Message::RemoteHostAdd(self.remote_host_editor.identity()))
+        };
+        remote_hosts_section = remote_hosts_section.push(add_host);
+        if at_remote_host_capacity {
+            let message = if self.config.remote_hosts.len() == config::MAX_REMOTE_HOSTS {
+                format!(
+                    "The {}-host active limit is reached; remove an entry before adding another.",
+                    config::MAX_REMOTE_HOSTS
+                )
+            } else {
+                format!(
+                    "All {} entries are retained, but only the first {} can be used; remove entries to re-enable Add.",
+                    self.config.remote_hosts.len(),
+                    config::MAX_REMOTE_HOSTS
+                )
+            };
+            remote_hosts_section = remote_hosts_section.push(
+                text(message)
+                    .size(self.effective_font_size())
+                    .style(text::danger),
+            );
+        }
+
+        let buttons = row![
+            button(text("Save").size(self.effective_font_size())).on_press(Message::ConfigSave),
+            button(text("Reset").size(self.effective_font_size()))
+                .on_press(Message::ConfigReset)
+                .style(button::danger),
+            button(text("Close").size(self.effective_font_size()))
+                .on_press(Message::ToggleConfigPanel)
+                .style(button::secondary),
+        ]
+        .spacing(8);
+
+        let buttons = buttons.wrap();
+
+        let footer = text(format!(
+            "{} · Ctrl+Shift+O toggles · Esc closes",
+            config_save_feedback(self.config_dirty, self.config_write_blocked)
+        ))
+        .size(self.effective_font_size())
+        .width(Length::Fill)
+        .wrapping(text::Wrapping::Word)
+        .style(text::secondary);
+
+        let content = column![
+            text("Settings").size(self.effective_font_size()),
+            theme_row,
+            font_family_row,
+            font_size,
+            chrome_font_size,
+            ui_scale,
+            line_spacing,
+            padding,
+            opacity,
+            scrollback,
+            scroll_speed,
+            scrollbar_row,
+            alt_screen_row,
+            clipboard_row,
+            tab_position_row,
+            notify_row,
+            repo_strip_row,
+            bottom_bar_row,
+            organism_settings,
+            block_mode_row,
+            block_compact_row,
+            ai_header,
+            ai_enable_row,
+            ai_provider_row,
+            ai_model_row,
+            ai_base_url_row,
+            ai_tokens_row,
+            ai_temperature_row,
+            ai_key_file_row,
+            ai_key_store_row,
+            ai_redact_row,
+            ai_stream_row,
+            ai_share_row,
+            ai_correction_row,
+            task_sidebar_row,
+            preferred_agent_row,
+            agent_turns_row,
+            widget_identity_scope::scope(self.remote_host_editor.identity(), remote_hosts_section),
+            buttons,
+            footer,
+        ]
+        .spacing(12)
+        // Keep controls at readable size; tiny windows can pan horizontally as
+        // well as scroll down instead of making the controls unreachable.
+        .width(Length::Fixed(
+            (panel_width - 2.0 * panel_padding).max(self.effective_font_size() * 10.0 + 32.0),
+        ));
+
+        let inner = container(
+            scrollable(content)
+                .direction(scrollable::Direction::Both {
+                    vertical: scrollable::Scrollbar::default(),
+                    horizontal: scrollable::Scrollbar::default(),
+                })
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .width(Length::Fixed(panel_width))
+        .height(Length::Fixed(panel_height))
+        .padding(panel_padding)
+        .style(container::dark);
+        container(inner)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into()
+    }
+
+    /// Custom-theme editor overlay: name field plus a hex input per terminal
+    /// palette color, with a live swatch. UI-chrome colors are inherited from the
+    /// theme the editor was opened on.
+    fn theme_editor_view(&self) -> Element<'_, Message> {
+        let Some(ed) = &self.theme_editor else {
+            return Space::new().into();
+        };
+        let labels = Theme::editable_color_labels();
+
+        let name_row = row![
+            text("Name")
+                .size(self.effective_font_size())
+                .width(Length::Fixed(150.0)),
+            text_input("theme name", &ed.name)
+                .on_input(Message::ThemeEditName)
+                .size(self.effective_font_size()),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
+        let mut list = column![].spacing(6);
+        for (i, label) in labels.iter().enumerate() {
+            let hex = ed.hexes.get(i).cloned().unwrap_or_default();
+            // Live swatch when the hex parses, else a neutral placeholder.
+            let swatch_color = Theme::hex_to_rgb(&hex)
+                .map(Theme::rgb_to_color32)
+                .unwrap_or(iced::Color::from_rgb(0.3, 0.3, 0.3));
+            let swatch = container(Space::new())
+                .width(Length::Fixed(22.0))
+                .height(Length::Fixed(22.0))
+                .style(move |_| container::Style {
+                    background: Some(swatch_color.into()),
+                    border: iced::Border {
+                        color: iced::Color::from_rgb(0.5, 0.5, 0.5),
+                        width: 1.0,
+                        radius: 3.0.into(),
+                    },
+                    ..Default::default()
+                });
+            let r = row![
+                text(*label)
+                    .size(self.effective_font_size())
+                    .width(Length::Fixed(150.0)),
+                swatch,
+                text_input("#RRGGBB", &hex)
+                    .on_input(move |s| Message::ThemeEditColor(i, s))
+                    .size(self.effective_font_size())
+                    .width(Length::Fixed(110.0)),
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center);
+            list = list.push(r);
+        }
+
+        let buttons = row![
+            button(text("Save").size(self.effective_font_size())).on_press(Message::ThemeEditSave),
+            button(text("Cancel").size(self.effective_font_size()))
+                .on_press(Message::ThemeEditClose)
+                .style(button::secondary),
+        ]
+        .spacing(8);
+
+        let mut content = column![
+            text("Theme Editor").size(self.effective_font_size()),
+            name_row,
+            scrollable(list).height(Length::Fixed(300.0)),
+        ]
+        .spacing(12);
+        if let Some(err) = &ed.error {
+            content = content.push(
+                text(crate::theme::bound_theme_editor_error(err))
+                    .size(self.effective_font_size())
+                    .style(text::danger),
+            );
+        }
+        content = content.push(buttons);
+
+        let inner = container(content)
+            .width(Length::Fixed(420.0))

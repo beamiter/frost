@@ -1,0 +1,300 @@
+            handler
+                .find("overlay.accepts_picker_close(snapshot)")
+                .unwrap()
+                < handler.find("self.workflow_overlay = None").unwrap()
+        );
+        let view = production
+            .split_once("    fn workflow_picker_view(")
+            .unwrap()
+            .1
+            .split_once("    fn workflow_args_view(")
+            .unwrap()
+            .0;
+        assert!(view.contains("Message::WorkflowPickerClose(state.snapshot_identity())"));
+        assert!(!production.contains("WorkflowOverlayClose"));
+    }
+
+    #[test]
+    fn workflow_args_callbacks_and_widget_tree_share_opening_identity() {
+        let source = include_str!("main.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests {").unwrap().0;
+        let handlers = production
+            .split_once("            Message::WorkflowArgInput(identity, index, value) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::TabCloseConfirmNo => {")
+            .unwrap()
+            .0;
+        assert_eq!(handlers.matches("form.accepts(&identity)").count(), 4);
+        assert!(
+            handlers.find("form.accepts(&identity)").unwrap()
+                < handlers.find("form.set_value(index, value)").unwrap()
+        );
+        let view = production
+            .split_once("    fn workflow_args_view(")
+            .unwrap()
+            .1
+            .split_once("    /// Ctrl+Shift+H")
+            .unwrap()
+            .0;
+        assert!(!view.contains("Message::WorkflowOverlayClose"));
+        assert_eq!(
+            view.matches("Message::WorkflowArgClose(form.identity())")
+                .count(),
+            3
+        );
+        assert!(view.contains("Message::WorkflowArgSubmit(form.identity())"));
+        assert!(view.contains("Message::WorkflowArgReset(form.identity(), index)"));
+        assert!(view.contains("workflow_argument_input(form.identity(), index"));
+        assert!(view.contains(
+            "widget_identity_scope::scope(\n            form.identity().widget_identity(),"
+        ));
+    }
+
+    #[test]
+    fn palette_widgets_bind_row_state_to_items_and_outer_state_to_opening() {
+        let source = include_str!("main.rs");
+        let palette = source
+            .split_once("    fn command_palette(&self)")
+            .unwrap()
+            .1
+            .split_once("    fn organism_preview_visible(")
+            .unwrap()
+            .0;
+        assert!(palette.contains("let epoch = self.palette.epoch()"));
+        assert!(palette.contains("self.palette.row_identity(*idx)"));
+        assert!(palette.contains("widget_identity_scope::scope(identity, row_btn)"));
+        assert!(palette.contains("widget_identity_scope::scope(\n            epoch,"));
+        assert!(!palette.contains("Arc::new"));
+        assert_eq!(palette.matches("widget_identity_scope::scope(").count(), 2);
+    }
+
+    #[test]
+    fn only_remote_settings_widgets_share_the_editor_retirement_identity() {
+        let source = include_str!("main.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests {").unwrap().0;
+        assert_eq!(
+            production.matches("widget_identity_scope::scope(").count(),
+            8
+        );
+        assert!(production.contains(
+            "widget_identity_scope::scope(self.remote_host_editor.identity(), remote_hosts_section)"
+        ));
+        // Add and every row live inside the same subtree reset boundary.
+        let settings = production
+            .split_once("let target = self.remote_host_editor.target(i);")
+            .unwrap()
+            .1;
+        assert!(
+            settings
+                .find("Message::RemoteHostAdd(self.remote_host_editor.identity())")
+                .unwrap()
+                < settings.find("widget_identity_scope::scope(").unwrap()
+        );
+    }
+
+    #[test]
+    fn remote_editor_callbacks_validate_retained_identity_before_index_access() {
+        let source = include_str!("main.rs");
+        let handlers = source
+            .split_once("            Message::RemoteHostName(target, name) => {")
+            .unwrap()
+            .1;
+        let handlers = handlers
+            .split_once("            Message::JshNoticeDismiss")
+            .unwrap()
+            .0;
+        assert_eq!(
+            handlers
+                .matches("let Some(index) = self.remote_host_row(&target)")
+                .count(),
+            6
+        );
+        assert!(!handlers.contains("Message::RemoteHostRemove(index)"));
+        let add = handlers
+            .split_once("            Message::RemoteHostAdd(identity) => {")
+            .unwrap()
+            .1;
+        let add = add
+            .split_once("            Message::RemoteHostRemove(target)")
+            .unwrap()
+            .0;
+        assert!(add.contains(".accepts(&identity, self.remote_host_editor_visible())"));
+        assert!(
+            add.find("config::MAX_REMOTE_HOSTS").unwrap()
+                < add.find("self.remote_host_editor.retire();").unwrap()
+        );
+        assert!(
+            add.find("self.remote_host_editor.retire();").unwrap()
+                < add.find("self.reconcile_sidebar_remote_hosts()").unwrap()
+        );
+        let remove = handlers
+            .split_once("            Message::RemoteHostRemove(target)")
+            .unwrap()
+            .1;
+        assert!(
+            remove.find("self.remote_host_editor.retire();").unwrap()
+                < remove
+                    .find("self.reconcile_sidebar_remote_hosts()")
+                    .unwrap()
+        );
+        let fields = handlers
+            .split_once("            Message::RemoteHostAdd(identity)")
+            .unwrap()
+            .0;
+        assert!(!fields.contains("self.remote_host_editor.retire()"));
+        for field in ["Name", "Host", "User", "Docker", "Deploy"] {
+            assert!(source.contains(&format!("RemoteHost{field}(remote_host_editor::RowTarget,")));
+        }
+        assert!(source.contains("Message::RemoteHostRemove(target.clone())"));
+        assert!(source.contains("Message::RemoteHostAdd(self.remote_host_editor.identity())"));
+    }
+
+    #[test]
+    fn remote_editor_opening_replacement_and_hidden_boundaries_retire_callbacks() {
+        let source = include_str!("main.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests {").unwrap().0;
+        assert_eq!(production.matches("self.config_panel_open =").count(), 1);
+        let open = production
+            .split_once("    fn set_config_panel_open(")
+            .unwrap()
+            .1;
+        let open = open.split_once("    fn apply_config(").unwrap().0;
+        assert!(open.contains("if self.config_panel_open != open"));
+        assert!(open.contains("self.remote_host_editor.retire();"));
+        assert!(
+            open.contains("self.focused && self.config_panel_open && self.theme_editor.is_none()")
+        );
+        let reload = production
+            .split_once("    fn reload_config_if_changed(")
+            .unwrap()
+            .1;
+        let reload = reload.split_once("self.config = config;").unwrap().0;
+        assert!(reload.contains("self.remote_host_editor.retire();"));
+        let reset = production
+            .split_once("            Message::ConfigReset => {")
+            .unwrap()
+            .1;
+        let reset = reset
+            .split_once("            Message::ConfigTick")
+            .unwrap()
+            .0;
+        assert_eq!(
+            reset.matches("self.remote_host_editor.retire();").count(),
+            2
+        );
+        let blur = production
+            .split_once("            Message::Focus(f) => {")
+            .unwrap()
+            .1;
+        let blur = blur
+            .split_once("            Message::NewSession")
+            .unwrap()
+            .0;
+        assert!(blur.contains("self.remote_host_editor.retire();"));
+        let theme = production
+            .split_once("            Message::ThemeEditOpen => {")
+            .unwrap()
+            .1;
+        assert!(theme
+            .split_once("            Message::ThemeEditClose")
+            .unwrap()
+            .0
+            .contains("self.remote_host_editor.retire();"));
+    }
+
+    #[test]
+    fn config_save_feedback_prioritizes_blocked_over_pending_confirmation() {
+        assert_eq!(config_save_feedback(false, false), "Changes auto-save");
+        assert_eq!(
+            config_save_feedback(true, false),
+            "Save pending · auto-save will retry"
+        );
+        for dirty in [false, true] {
+            assert_eq!(
+                config_save_feedback(dirty, true),
+                "Auto-save paused · See the configuration diagnostic"
+            );
+        }
+        // Dirty also covers normal debounce and a visible but not durable write.
+        // It must not categorically claim failure, absence, or successful saving.
+        let pending = config_save_feedback(true, false);
+        assert!(!pending.contains("failed"));
+        assert!(!pending.contains("not written"));
+        assert!(!pending.contains("saved"));
+    }
+
+    #[test]
+    fn settings_save_feedback_uses_existing_dirty_state_and_retry_tick() {
+        let source = include_str!("main.rs");
+        let settings = source
+            .split_once("        let footer = text(format!(")
+            .unwrap()
+            .1;
+        assert!(settings
+            .split_once("        let content = column![")
+            .unwrap()
+            .0
+            .contains("config_save_feedback(self.config_dirty, self.config_write_blocked)"));
+        let subscription = source.split_once("    fn subscription(&self)").unwrap().1;
+        assert!(subscription.contains("iced::time::every(std::time::Duration::from_millis(1500)).map(|_| Message::ConfigTick)"));
+        let tick = source
+            .split_once("            Message::ConfigTick => {")
+            .unwrap()
+            .1;
+        let tick = tick
+            .split_once("            Message::TabMenuOpen")
+            .unwrap()
+            .0;
+        assert!(
+            tick.find("self.reload_config_if_changed()").unwrap()
+                < tick.find("self.persist_live_config();").unwrap()
+        );
+        let save = source
+            .split_once("    fn persist_live_config(&mut self)")
+            .unwrap()
+            .1;
+        let save = save.split_once("    /// Observe external edits").unwrap().0;
+        assert!(save.contains("if !self.config_dirty || self.config_write_blocked"));
+        assert!(save.contains("self.save_config_checked()"));
+    }
+
+    #[test]
+    fn config_retry_keeps_live_changes_cas_and_manual_recovery_paths() {
+        let source = include_str!("main.rs");
+        let auto = source
+            .split_once("    fn persist_live_config(&mut self)")
+            .unwrap()
+            .1
+            .split_once("    /// Observe external edits")
+            .unwrap()
+            .0;
+        assert!(
+            auto.find("self.config_write_blocked").unwrap()
+                < auto.find("self.config_save_retry.ready").unwrap()
+        );
+        assert!(
+            auto.find("self.config_save_retry.ready").unwrap()
+                < auto.find("self.save_config_checked()").unwrap()
+        );
+        let checked = source
+            .split_once("    fn save_config_checked(")
+            .unwrap()
+            .1
+            .split_once("    fn block_config_writes(")
+            .unwrap()
+            .0;
+        assert!(checked.contains("self.config.clone().normalized()"));
+        assert!(checked.contains("candidate.save_if_unchanged(self.config_revision.as_ref())"));
+        assert!(checked.contains("self.config_save_retry.reset();"));
+        let uncertain = checked
+            .split_once("if let Some(revision) = error.committed_revision().cloned()")
+            .unwrap()
+            .1;
+        assert!(uncertain.contains("self.config_revision = Some(revision);"));
+        assert!(uncertain.contains("self.config_dirty = true;"));
+        let manual = source
+            .split_once("            Message::ConfigSave => {")
+            .unwrap()
+            .1
+            .split_once("            Message::ConfigReset => {")

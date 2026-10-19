@@ -1,0 +1,300 @@
+        };
+
+        if focused_session != self.active {
+            self.close_block_search_on_session_change();
+            self.active_session_changed_for_remote_follow();
+        }
+        self.active_tab = target_tab;
+        self.active = focused_session;
+        self.pane_zoomed = false;
+        self.hovered_divider = None;
+        self.dragging_divider = None;
+        self.session_dirty = true;
+        self.relayout();
+        self.refresh_active_context();
+        self.save_session_snapshot();
+        self.push_toast("Tab moved into split".to_string(), ToastKind::Success);
+    }
+
+    fn restore_tab_drag_origin(&mut self, origin: Option<usize>) {
+        let Some(tab) = origin.and_then(|id| self.tab_index_by_id(id)) else {
+            return;
+        };
+        if tab != self.active_tab {
+            self.activate_tab(tab);
+        }
+    }
+
+    fn cancel_tab_drag(&mut self) {
+        let origin = self.tab_drag_origin.take();
+        self.dragging_tab = None;
+        self.tab_split_drop = None;
+        self.tab_drag_moved = false;
+        self.tab_drag_hover_since = None;
+        self.restore_tab_drag_origin(origin);
+    }
+
+    fn cancel_layout_drags(&mut self) {
+        self.cancel_tab_drag();
+        self.pane_drag = None;
+        self.dragging_divider = None;
+        self.hovered_divider = None;
+        self.dragging_sidebar = false;
+    }
+
+    /// Commit the current split-pane → ordinary-tab drop. `after_tab_id` is
+    /// stable across tab reordering; `None` means immediately after its owner.
+    fn finish_pane_promotion(&mut self, after_tab_id: Option<usize>) {
+        let Some(drag) = self.pane_drag.take() else {
+            return;
+        };
+        let Some(source_session) = self.session_index_by_id(drag.session_id) else {
+            return;
+        };
+        let Some((new_tab, focused_session)) = promote_split_pane_to_tab(
+            &mut self.tabs,
+            &mut self.next_tab_id,
+            source_session,
+            after_tab_id,
+        ) else {
+            return;
+        };
+
+        if focused_session != self.active {
+            self.close_block_search_on_session_change();
+            self.active_session_changed_for_remote_follow();
+        }
+        self.active_tab = new_tab;
+        self.active = focused_session;
+        self.pane_zoomed = false;
+        self.hovered_divider = None;
+        self.dragging_divider = None;
+        self.session_dirty = true;
+        self.relayout();
+        self.refresh_active_context();
+        self.save_session_snapshot();
+        self.push_toast("Pane moved to a new tab".to_string(), ToastKind::Success);
+    }
+
+    /// The active tab's pane tree. Every split/focus/divider operation goes
+    /// through here, so it cannot reach into another tab.
+    fn layout(&self) -> &PaneTree {
+        &self.tabs[self.active_tab.min(self.tabs.len() - 1)].tree
+    }
+
+    fn layout_mut(&mut self) -> &mut PaneTree {
+        let idx = self.active_tab.min(self.tabs.len() - 1);
+        &mut self.tabs[idx].tree
+    }
+
+    /// Move keyboard focus to a pane of the *active* tab. Also records the
+    /// choice on the tab, so returning to it restores the same pane.
+    fn set_focus(&mut self, session: usize) {
+        if session != self.active {
+            // Every pane/tab focus switch funnels through here (pane clicks,
+            // Alt+arrows, `focus_session`, the tab switcher): the block
+            // search picker must not survive the active session changing.
+            self.close_block_search_on_session_change();
+            self.active_session_changed_for_remote_follow();
+        }
+        let idx = self.active_tab.min(self.tabs.len() - 1);
+        if self.active != session || self.tabs[idx].focus != session {
+            self.session_dirty = true;
+        }
+        self.active = session;
+        self.tabs[idx].focus = session;
+    }
+
+    /// The tab owning `session`. Each session lives in exactly one pane of one
+    /// tab, so there is at most one answer.
+    fn tab_of_session(&self, session: usize) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.contains(session))
+    }
+
+    /// The session a tab displays: its selected pane. Tab labels, the tab
+    /// switcher and the window title all read this.
+    fn tab_focus(&self, tab: usize) -> Option<usize> {
+        self.tabs.get(tab).map(|tab| tab.focus)
+    }
+
+    /// One label per tab, in strip order — what the switcher matches against.
+    fn tab_labels(&self) -> Vec<String> {
+        (0..self.tabs.len()).map(|i| self.tab_label(i)).collect()
+    }
+
+    /// A tab's strip label. A title set through the context menu's Rename wins;
+    /// otherwise the tab keeps following its focused session's own label.
+    fn tab_label(&self, tab: usize) -> String {
+        if self.tabs.get(tab).is_some_and(|tab| tab.private_title) {
+            return "Private".to_string();
+        }
+        self.tab_real_label(tab)
+    }
+
+    /// The title retained behind the privacy mask. Shell title updates and
+    /// rename keep changing this value so revealing it restores immediately.
+    fn tab_real_label(&self, tab: usize) -> String {
+        if let Some(title) = self.tabs.get(tab).and_then(|tab| tab.title.clone()) {
+            return title;
+        }
+        self.tab_focus(tab)
+            .and_then(|index| self.sessions.get(index))
+            .map(|session| session.label())
+            .unwrap_or_default()
+    }
+
+    /// Pin / mark indicators prefixed to a tab's label. They are the only
+    /// on-strip evidence of state the context menu can set, so both placements
+    /// (top strip and sidebar dock) render them.
+    fn tab_state_prefix(&self, tab: usize) -> String {
+        let Some(tab) = self.tabs.get(tab) else {
+            return String::new();
+        };
+        let mut prefix = String::new();
+        if tab.pinned {
+            prefix.push('◆');
+        }
+        if tab.marked {
+            prefix.push('★');
+        }
+        if !prefix.is_empty() {
+            prefix.push(' ');
+        }
+        prefix
+    }
+
+    /// Switch to `tab` and hand keyboard focus to the pane it had selected.
+    fn activate_tab(&mut self, tab: usize) {
+        if tab >= self.tabs.len() {
+            return;
+        }
+        if self.active_tab != tab || self.tabs[tab].focus != self.active {
+            self.active_session_changed_for_remote_follow();
+        }
+        self.active_tab = tab;
+        self.tabs[tab].repair_focus();
+        if self.tabs[tab].focus != self.active {
+            // Tab activation bypasses `set_focus`; same rule — the block
+            // search picker must not survive the active session changing.
+            self.close_block_search_on_session_change();
+        }
+        self.active = self.tabs[tab].focus;
+        self.pane_zoomed = false;
+        self.hovered_divider = None;
+        self.dragging_divider = None;
+        self.session_dirty = true;
+        self.relayout();
+        self.refresh_active_context();
+    }
+
+    /// Focus `session` wherever it lives, switching tabs if it belongs to
+    /// another one. Unlike the old `focus_or_replace_session`, a session is
+    /// never moved into a different pane: pane ownership is fixed.
+    fn focus_session(&mut self, session: usize) -> bool {
+        let Some(tab) = self.tab_of_session(session) else {
+            return false;
+        };
+        if tab != self.active_tab {
+            self.active_tab = tab;
+            self.pane_zoomed = false;
+            self.hovered_divider = None;
+            self.dragging_divider = None;
+        }
+        self.set_focus(session);
+        true
+    }
+
+    /// Rebuild the tab list from a snapshot, after the sessions have spawned.
+    ///
+    /// The snapshot is external input, so every index is validated: a tab keeps
+    /// only leaves that name a session that exists and that no earlier tab
+    /// already claimed — two tabs sharing a pane would fight over one PTY.
+    ///
+    /// The closing step adopts orphans. Validation can empty a tab, a shell can
+    /// fail to restore, and a v1 snapshot's sessions may not appear in its
+    /// single tree at all; every session no tab claims gets a one-pane tab,
+    /// because an unclaimed session is a live PTY nothing can switch to.
+    fn restore_tabs(
+        &mut self,
+        saved_tabs: Vec<session_persistence::TabSnapshot>,
+        saved_active_tab: Option<usize>,
+        legacy_tree: Option<session_persistence::PaneTreeSnapshot>,
+        legacy_split: Option<session_persistence::SplitSnapshot>,
+    ) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        let migrated = restored_tab_candidates(
+            &saved_tabs,
+            legacy_tree.as_ref(),
+            legacy_split.as_ref(),
+            self.active,
+            &mut session_persistence::RecoveryReport::default(),
+        );
+
+        let (tabs, active_tab, next_tab_id) =
+            build_restored_tabs(migrated, self.sessions.len(), self.active, saved_active_tab);
+        self.tabs = tabs;
+        self.active_tab = active_tab;
+        self.next_tab_id = next_tab_id;
+        self.active = self.tabs[active_tab].focus;
+    }
+
+    /// Current index of the tab with this stable id, if it is still open.
+    /// Anything held across UI events must go through here: tab indices shift
+    /// when a tab is closed or the strip is reordered.
+    fn tab_index_by_id(&self, id: usize) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == id)
+    }
+
+    /// Open `session` in a brand new unpinned tab after the active one without
+    /// ever splitting the leading pinned partition.
+    fn open_tab_with(&mut self, session: usize) {
+        if session != self.active {
+            // New-tab activation bypasses `set_focus`; the block search
+            // picker must not survive the active session changing.
+            self.close_block_search_on_session_change();
+            self.active_session_changed_for_remote_follow();
+        }
+        let at = new_unpinned_tab_index(&self.tabs, self.active_tab);
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.insert(at, Tab::new(id, session));
+        self.active_tab = at;
+        self.active = session;
+        self.pane_zoomed = false;
+        self.hovered_divider = None;
+        self.dragging_divider = None;
+    }
+
+    /// Re-index every tab's tree after a session was inserted at `inserted`.
+    /// Session indices are global, so an insert in the middle shifts the panes
+    /// of every tab, not just the active one.
+    fn reindex_tabs_after_insert(&mut self, inserted: usize) {
+        reindex_tabs_for_insert(&mut self.tabs, inserted);
+        self.active = if self.active >= inserted {
+            self.active + 1
+        } else {
+            self.active
+        };
+    }
+
+    /// Re-index every tab's tree after `removed` left the session vector.
+    /// The owning tab drops its leaf first; a tab left with no pane is gone
+    /// (its caller removed it), and the rest only shift indices down.
+    fn reindex_tabs_after_removal(&mut self, removed: usize) {
+        reindex_tabs_for_removal(&mut self.tabs, removed);
+    }
+
+    /// Whether the active tab is currently split (more than one pane).
+    fn is_split(&self) -> bool {
+        !self.layout().is_leaf()
+    }
+
+    fn tab_split_drag_eligible(&self) -> bool {
+        self.dragging_tab.and_then(|source_id| {
+            let source = self.tab_index_by_id(source_id)?;
+            matches!(self.tabs[source].tree, PaneTree::Leaf(_)).then_some(source != self.active_tab)
+        }) == Some(true)
+            && !self.pane_zoomed
+            && self.layout().leaf_count() < MAX_PANES

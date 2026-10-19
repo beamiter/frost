@@ -1,0 +1,300 @@
+                // That follow is a local-filesystem notion only: with a remote
+                // location active, keep its root and just reload it.
+                if panel == SidebarPanel::Files {
+                    if self.sidebar.location == remote_fs::FsLocation::Local {
+                        if let Some(cwd) = self
+                            .sessions
+                            .get(self.active)
+                            .and_then(|s| s.cwd_cache.clone().or_else(|| s.cwd()))
+                        {
+                            let request =
+                                self.sidebar.set_current_dir(std::path::PathBuf::from(cwd));
+                            return self.queue_sidebar_load(request);
+                        }
+                    }
+                    let request = self.sidebar.refresh();
+                    return self.queue_sidebar_load(request);
+                }
+            }
+            Message::SetTabPosition(pos) => {
+                if self.config.tab_position != pos {
+                    self.config.tab_position = pos;
+                    self.config_dirty = true;
+                    self.sync_tab_position_ui();
+                    // Layout chrome changed (top bar shown/hidden, dock width):
+                    // recompute the grid.
+                    self.apply_config();
+                }
+            }
+            Message::SidebarInsertPath(path) => {
+                self.invalidate_sidebar_remote_follow_intent();
+                // Type the (shell-quoted) path into the active terminal so the
+                // sidebar doubles as a path picker.
+                // Trailing space so the picked path is ready to extend.
+                let mut quoted = jterm_core::process::shell_quote_path(&path.to_string_lossy());
+                quoted.push(' ');
+                // Through the paste choke point, not a raw write: quoting
+                // protects the *shell parser*, but at the input layer a
+                // filename carrying a raw CR would still submit the pending
+                // line and an embedded `ESC[201~` would still close a paste
+                // frame. (An insert, not a recall: the picked path is appended
+                // to whatever command the user is composing.)
+                return self.type_into_active_pane(quoted);
+            }
+            Message::SidebarOpenTerminal(generation) => {
+                if self.sidebar.accepts_generation(generation) {
+                    self.invalidate_sidebar_remote_follow_intent();
+                    self.open_sidebar_terminal();
+                }
+            }
+            Message::SidebarGoBack => return self.navigate_sidebar_back(),
+            Message::SidebarGoForward => return self.navigate_sidebar_forward(),
+            Message::SidebarGoParent => {
+                return self.navigate_sidebar_parent();
+            }
+            Message::SidebarGoHome => return self.navigate_sidebar_home(),
+            Message::SidebarNavigatePath(path) => return self.navigate_sidebar_to(path),
+            Message::SidebarPathEdit => return self.begin_sidebar_path_edit(),
+            Message::SidebarPathInput(input) => {
+                if let Some(input) = crate::sidebar::accepted_sidebar_path_input(input) {
+                    self.sidebar_path_input = Some(input);
+                }
+            }
+            Message::SidebarPathSubmit => return self.submit_sidebar_path(),
+            Message::SidebarPathCancel => self.sidebar_path_input = None,
+            Message::SidebarRefresh => {
+                self.invalidate_sidebar_remote_follow_intent();
+                let request = self.sidebar.refresh();
+                return self.queue_sidebar_load(request);
+            }
+            Message::SidebarScanTick => return self.dispatch_sidebar_scans(),
+            Message::SidebarSnapshotTick => {
+                let requests = self.sidebar.refresh_stale_visible(
+                    std::time::Instant::now(),
+                    SIDEBAR_SNAPSHOT_STALE_AFTER,
+                    2,
+                );
+                if !requests.is_empty() {
+                    return Task::batch(
+                        requests
+                            .into_iter()
+                            .map(|request| self.queue_sidebar_load(request)),
+                    );
+                }
+            }
+            Message::SidebarRetry(generation, path) => {
+                if !self.sidebar.accepts_generation(generation) {
+                    return Task::none();
+                }
+                self.invalidate_sidebar_remote_follow_intent();
+                if let Some(request) = self.sidebar.retry_node(&path) {
+                    return self.queue_sidebar_load(request);
+                }
+            }
+            Message::SidebarShowHidden(show_hidden) => {
+                self.invalidate_sidebar_remote_follow_intent();
+                self.clear_sidebar_tree_intent();
+                self.sidebar_selection.clear();
+                self.sidebar_selection_anchor = None;
+                if let Some(request) = self.sidebar.set_show_hidden(show_hidden) {
+                    return self.queue_sidebar_load(request);
+                }
+            }
+            Message::SidebarLoaded(result) => {
+                self.sidebar_scans.finish_result(&result);
+                let reconciled_dir = result.path.clone();
+                let previous_location = self.sidebar.location.clone();
+                let outcome = apply_sidebar_load_result(
+                    &mut self.sidebar,
+                    &mut self.sidebar_hovered_row,
+                    result,
+                );
+                if outcome == SidebarLoadApply::Reconciled {
+                    prune_sidebar_context_after_reconcile(
+                        &self.sidebar,
+                        &reconciled_dir,
+                        &mut self.sidebar_selection,
+                        &mut self.sidebar_selection_anchor,
+                        &mut self.sidebar_hovered_row,
+                        &mut self.sidebar_menu,
+                        &mut self.sidebar_dialog,
+                        &mut self.sidebar_delete_confirm,
+                        &mut self.sidebar_drop_burst,
+                        &mut self.sidebar_drop_debounce_generation,
+                        &mut self.sidebar_drop_hint,
+                    );
+                    if self.sidebar_drop_debounce_generation.is_none() {
+                        self.sidebar_drop_intents.collecting = None;
+                    }
+                } else if outcome == SidebarLoadApply::NavigationCommitted {
+                    if self.sidebar.location != previous_location {
+                        self.invalidate_sidebar_pending_work();
+                    } else {
+                        self.clear_sidebar_tree_intent();
+                    }
+                    self.sidebar_selection.clear();
+                    self.sidebar_selection_anchor = None;
+                    self.sidebar_filter = None;
+                    self.sidebar_path_input = None;
+                    self.sidebar_notice = None;
+                } else if outcome == SidebarLoadApply::NavigationFailed {
+                    if let Some(failure) = self.sidebar.navigation_failure() {
+                        self.set_sidebar_notice(
+                            format!(
+                                "Could not open folder: {}. Current files were kept.",
+                                failure.error
+                            ),
+                            false,
+                        );
+                    }
+                }
+                return self.dispatch_sidebar_scans();
+            }
+            Message::SidebarSetLocation(hosts_epoch, location) => {
+                if hosts_epoch != self.sidebar_hosts_epoch {
+                    self.set_sidebar_notice(
+                        "Remote profiles changed; choose the destination again".to_string(),
+                        false,
+                    );
+                    return Task::none();
+                }
+                if location != self.sidebar.location {
+                    self.invalidate_sidebar_remote_follow_intent();
+                    let generation = self.sidebar.begin_location_change(location.clone());
+                    let hosts_epoch = self.sidebar_hosts_epoch;
+                    let hosts = self.sidebar.hosts_snapshot().to_vec();
+                    return Task::perform(
+                        async move {
+                            remote_fs::start_dir(&location, &hosts)
+                                .map_err(sidebar::DirectoryError::from_io)
+                        },
+                        move |result| {
+                            Message::SidebarLocationResolved(generation, hosts_epoch, result)
+                        },
+                    );
+                }
+            }
+            Message::SidebarLocationResolved(generation, hosts_epoch, start) => {
+                if hosts_epoch != self.sidebar_hosts_epoch
+                    || !self.sidebar.accepts_generation(generation)
+                {
+                    return Task::none();
+                }
+                if let Some(request) = self.sidebar.resolve_location(generation, start) {
+                    return self.queue_sidebar_load(request);
+                }
+                if let Some(failure) = self.sidebar.navigation_failure() {
+                    self.set_sidebar_notice(
+                        format!(
+                            "Could not open location: {}. Current files were kept.",
+                            failure.error
+                        ),
+                        false,
+                    );
+                }
+            }
+            Message::SidebarRemoteFollowResolved(token, start) => {
+                return self.resolve_sidebar_remote_follow(token, start);
+            }
+            Message::SidebarRemoteFollowRetry => {
+                let Some(retry) = self.sidebar_follow_retry_available.take() else {
+                    return Task::none();
+                };
+                self.invalidate_sidebar_remote_follow_intent();
+                self.sidebar_follow_retry_once = Some(retry);
+                self.sidebar_follow_observed = None;
+                return self.poll_sidebar_remote_follow();
+            }
+            Message::SidebarHover(hovered) => self.sidebar_hovered = hovered,
+            Message::SidebarFilesFocus => {
+                if self.dock_open() && self.sidebar_panel == SidebarPanel::Files {
+                    self.sidebar_files_focused = true;
+                }
+            }
+            Message::SidebarTreeScrolled(offset_y, viewport_h) => {
+                self.sidebar_tree_offset_y = offset_y.max(0.0);
+                if viewport_h > 1.0 {
+                    self.sidebar_tree_viewport_h = viewport_h;
+                }
+            }
+            Message::SidebarPointerMoved(position) => self.sidebar_pointer = position,
+            Message::SidebarRowClick(generation, path, is_dir) => {
+                if !self.sidebar.accepts_generation(generation) {
+                    self.set_sidebar_notice(
+                        "Files changed; select the item again".to_string(),
+                        false,
+                    );
+                    return Task::none();
+                }
+                return self.sidebar_row_click(path, is_dir);
+            }
+            Message::SidebarMenuOpen(generation, path, is_dir) => {
+                if !self.sidebar.accepts_generation(generation) {
+                    return Task::none();
+                }
+                self.invalidate_sidebar_remote_follow_intent();
+                // A right-click inside the selection targets the selection
+                // (in visible order); anywhere else the selection collapses
+                // to the clicked row.
+                let targets = match menu_targets(
+                    &self.sidebar_selection,
+                    &self.sidebar_visible_rows(),
+                    &path,
+                ) {
+                    Some(targets) => targets,
+                    None => {
+                        self.sidebar_selection = vec![path.clone()];
+                        self.sidebar_selection_anchor = Some(path.clone());
+                        vec![(path.clone(), is_dir)]
+                    }
+                };
+                self.sidebar_menu =
+                    Some(self.sidebar_menu_state(path, is_dir, targets, generation));
+            }
+            Message::SidebarMenuOpenRoot(generation) => {
+                if !self.sidebar.accepts_generation(generation) {
+                    return Task::none();
+                }
+                self.invalidate_sidebar_remote_follow_intent();
+                self.sidebar_menu = Some(self.sidebar_menu_state(
+                    self.sidebar.current_dir.clone(),
+                    true,
+                    vec![(self.sidebar.current_dir.clone(), true)],
+                    generation,
+                ));
+            }
+            Message::SidebarMenuClose => self.sidebar_menu = None,
+            Message::SidebarMenuAction(action) => {
+                if let Some(menu) = self.sidebar_menu.take() {
+                    return self.execute_sidebar_menu_action(menu, action);
+                }
+            }
+            Message::SidebarDialogInput(value) => {
+                if let Some(dialog) = self.sidebar_dialog.as_mut() {
+                    dialog.input = crate::remote_fs::bound_new_name(value);
+                    dialog.error = None;
+                }
+            }
+            Message::SidebarDialogSubmit => return self.submit_sidebar_dialog(),
+            Message::SidebarDialogCancel => self.sidebar_dialog = None,
+            Message::SidebarDeleteConfirm => return self.confirm_sidebar_delete(),
+            Message::SidebarDeleteCancel => self.sidebar_delete_confirm = None,
+            Message::SidebarOpFinished(report) => {
+                let report = *report;
+                // Completion releases only its own handle, even if navigation
+                // makes the report's UI feedback stale.
+                retire_sidebar_transfer_owner(
+                    &mut self.sidebar_transfer,
+                    report.transfer_owner.as_ref(),
+                );
+                // Clipboard settlement is backend state, not UI feedback. Do
+                // it first so a safe profile reorder/location switch cannot
+                // resurrect already-moved cut sources. Exact-token matching
+                // still protects every newer Copy/Cut intent.
+                settle_sidebar_clipboard_sources(
+                    &mut self.sidebar_clipboard,
+                    report.consumed_clipboard_id,
+                    &report.consumed_paths,
+                );
+                if !sidebar_op_report_matches_context(
+                    report.context_epoch,

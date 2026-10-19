@@ -1,0 +1,1178 @@
+93: fn history_picker_panel_size(window: Size, visible_results: usize) -> Size {
+102: fn workflow_panel_size(window: Size, requested_height: f32) -> Size {
+112: fn workflow_argument_input<'a, Renderer>(
+136: fn block_review_panel_size(window: Size) -> Size {
+143: fn block_review_scrolls_heading(panel: Size) -> bool {
+177: fn chrome_height(font_size: f32, chrome_font_size: f32, bottom_bar: bool) -> f32 {
+193: struct OrganismLayout {
+199: impl OrganismLayout {
+200:     fn presentable(self) -> bool {
+204:     fn maintenance_eligible(self, focused: bool) -> bool {
+212: fn native_status_rows(enabled: bool, expanded: bool, cell_height: f32) -> usize {
+225: fn organism_card_width(
+245: fn organism_host_layout(
+264: fn organism_layout(width: f32, enabled: bool, expanded: bool, bottom_bar: bool) -> OrganismLayout {
+278: fn companion_narrow_reopen(width: f32, enabled: bool, expanded: bool, bottom_bar: bool) -> bool {
+284: fn companion_compact_slot<'a, R: iced::advanced::renderer::Renderer + 'a>(
+293: fn companion_status_with_slot<'a, R: iced::advanced::renderer::Renderer + 'a>(
+306: fn companion_card_content<'a, R: iced::advanced::renderer::Renderer + 'a>(
+331: fn organism_pointer_observation_needed(
+342: fn organism_pointer_event(event: iced::Event, visible: bool) -> Option<Message> {
+355: fn organism_settings_hint(
+388: fn organism_local_day() -> Option<i64> {
+397: fn companion_strip_height(enabled: bool, expanded: bool, bottom_bar: bool) -> f32 {
+405: fn terminal_height_after_chrome(
+428: fn captured_key_is_overlay_escape(event: &keyboard::Event) -> bool {
+442: struct PromptRecallEnterLatch {
+447: impl PromptRecallEnterLatch {
+448:     fn mask(location: keyboard::Location) -> u8 {
+461:     fn begin_recall(&mut self) {
+467:     fn captured_press(&mut self, location: keyboard::Location) {
+473:     fn consume(&mut self, event: &keyboard::Event, recall_surface_open: bool) -> bool {
+511: fn captured_key_is_enter_release(event: &keyboard::Event) -> bool {
+524: fn block_search_manual_refresh_key(
+540: fn sidebar_files_manual_refresh_key(
+550: enum SidebarNavigationKey {
+560: fn sidebar_files_navigation_key(
+586: fn files_shortcut_scope(dock_open: bool, files_panel: bool, hovered: bool, focused: bool) -> bool {
+592: fn compact_scan_duration(duration: std::time::Duration) -> String {
+600: fn sidebar_breadcrumbs(
+642: fn sidebar_snapshot_age_copy(age: std::time::Duration) -> (String, bool) {
+662: enum BlockSearchToggleKeyRoute {
+669: enum BlockSearchBookmarkKeyRoute {
+675: fn block_search_is_bookmark_key(key: &keyboard::Key) -> bool {
+685: fn block_search_bookmark_key_route(
+717: fn block_search_bookmark_key_release(
+733: fn block_search_toggle_key_route(
+751: fn block_selection_owns_keys(
+763: fn ctrl_scroll_block_navigation(
+778: fn block_escape_owns_key(
+788: fn block_enter_reinputs_selection(
+801: fn block_enter_blocked_reason(
+813: fn active_bookmark_target(ids: &[u64], active: Option<u64>) -> Option<u64> {
+820: fn app_owns_terminal_mouse(
+829: fn app_owns_terminal_wheel(mouse_enabled: bool, shift: bool, app_eligible: bool) -> bool {
+833: fn app_mouse_uses_full_grid(block_mode: bool, alt_screen: bool, usable_partitions: bool) -> bool {
+837: fn prompt_jump_target(
+855: fn finalized_block_at_viewport_row(
+912: fn chat_completed_zone_at_row(
+951: fn project_search_match(
+977: fn projected_kitty_anchor(
+1009: fn projected_live_grid_cell(
+1027: struct TerminalClickTracker {
+1034: impl TerminalClickTracker {
+1035:     fn cancel(&mut self) {
+1040:     fn invalidate_caret(&mut self) {
+1046:     fn geometry_changed(&mut self, before: Metrics, after: Metrics) {
+1060:     fn update(
+1131: struct ProjectedZoneMemberships {
+1139: fn projected_zone_memberships(
+1174: fn projected_card_real_top(
+1192: fn validated_claimed_block_target(
+1205: fn link_projection_matches(rendered_revision: u64, current_revision: u64) -> bool {
+1209: fn validated_summary_target(
+1227: fn agent_context_exit_label(exit_code: i32) -> String {
+1244: fn ad_hoc_block_semantic_context(
+1282: struct SearchRevealTarget {
+1293: fn search_reveal_target(
+1323: fn apply_search_reveal(
+1349: fn clear_stale_hidden_match_diagnostic(error: &mut Option<String>) {
+1362: fn command_requires_block_context(command: &keybindings::Command) -> bool {
+1403: fn block_prompt_replace_blocker(
+1421: fn block_reinput_policy() -> PastePolicy {
+1428: fn block_retry_policy() -> PastePolicy {
+1439: fn correction_run_policy() -> PastePolicy {
+1481: fn logical_viewport_after_scale(size: Size, old_scale: f32, new_scale: f32) -> Size {
+1544: enum ToastKind {
+1552: struct Toast {
+1567: struct PaneDrag {
+1577: struct TabSplitDrop {
+1583: enum TabDragReleaseAction {
+1589: fn tab_drag_release_action(
+1601: fn tab_drag_hover_left_source(source: Option<usize>, hovered: Option<usize>) -> bool {
+1605: fn tab_split_commit_allowed(
+1628: struct Tab {
+1651: impl Tab {
+1652:     fn new(id: usize, session: usize) -> Self {
+1664:     fn sessions(&self) -> Vec<usize> {
+1668:     fn contains(&self, session: usize) -> bool {
+1673:     fn repair_focus(&mut self) {
+1685: struct RestoredTab {
+1694: impl RestoredTab {
+1697:     fn plain(tree: PaneTree, focus: Option<usize>) -> Self {
+1713: fn sort_pinned_first(tabs: &mut [Tab], active: usize) -> usize {
+1725: fn reorder_tabs_preserving_pinned_prefix(
+1753: fn new_unpinned_tab_index(tabs: &[Tab], active: usize) -> usize {
+1765: enum PendingClose {
+1776: struct StartupRecovery {
+1782: impl StartupRecovery {
+1783:     fn new(
+1794:     fn visible(&self) -> bool {
+1798:     fn dismiss(&mut self) {
+1804:     fn banner_height(&self, font_size: f32) -> f32 {
+1816: struct RestoredState<S = Session> {
+1835:     fn default() -> Self {
+1854:     fn from_spawn_result<E: std::fmt::Display>(result: Result<S, E>, id_start: usize) -> Self {
+1869:     fn with_recovery(mut self, startup_recovery: StartupRecovery) -> Self {
+1878: struct TabSwitcherState {
+1884: impl TabSwitcherState {
+1888:     fn set_query(&mut self, query: impl Into<String>) {
+1917:     fn push_query_text(&mut self, text: &str) -> bool {
+1925:     fn backspace(&mut self) -> bool {
+1944: enum BlockSearchFilter {
+1958: enum BlockSearchFilterContext {
+1964: impl BlockSearchFilter {
+1976:     fn label(self) -> &'static str {
+1988:     fn context(
+2000:     fn matches(
+2031:     fn cycled(self, forward: bool) -> Self {
+2045: struct BlockSearchBuildIdentity {
+2053: struct BlockSearchJob {
+2059: impl BlockSearchJob {
+2060:     fn cancel(&self) {
+2066: fn finish_block_search_job(
+2082: struct BlockSearchMatchBuild {
+2092: struct BlockSearchZoneVersion {
+2098: impl BlockSearchZoneVersion {
+2099:     fn from_terminal(terminal: &terminal::TerminalState) -> Self {
+2108: fn next_block_search_epoch(epoch: &mut u64) -> Option<u64> {
+2115: enum BlockSearchActivation {
+2121: fn block_search_activation(target_is_live: bool, continuous_review: bool) -> BlockSearchActivation {
+2135: struct BlockSearchMemory {
+2145: struct BlockSearchIntent {
+2155: struct BlockSearchSelectionAnchor {
+2161: enum BlockSearchBookmarkPlan {
+2169: enum BlockSearchBookmarkNotice {
+2177: impl BlockSearchBookmarkNotice {
+2178:     fn label(self) -> &'static str {
+2193: fn block_search_bookmark_button_text(bookmarked: bool) -> &'static str {
+2201: fn block_search_bookmark_button_help(bookmarked: bool, stale: bool) -> &'static str {
+2215: fn block_search_bookmarks_have_indexed_text(
+2229: fn block_search_empty_message(
+2262: fn block_search_refresh_selection_index(
+2275: impl BlockSearchMemory {
+2276:     fn capture(&mut self, state: &BlockSearchState) {
+2292:     fn state_for(&self, session_id: usize) -> BlockSearchState {
+2307: struct BlockSearchState {
+2368: impl BlockSearchState {
+2369:     fn busy(&self) -> bool {
+2373:     fn selected_anchor(&self) -> Option<BlockSearchSelectionAnchor> {
+2386:     fn observe_filter_context(&mut self, context: BlockSearchFilterContext) {
+2404:     fn install_cache(&mut self, build: block_mode::BlockSearchCacheBuild) -> bool {
+2418:     fn install_match(
+2474:     fn intent(&self) -> BlockSearchIntent {
+2485:     fn take_refresh_selection_anchor(&mut self) -> Option<BlockSearchSelectionAnchor> {
+2500:     fn request_manual_refresh(&mut self) -> bool {
+2520:     fn take_manual_refresh_followup(&mut self) -> bool {
+2530:     fn reset_intent(&mut self) {
+2542:     fn apply_query_input(&mut self, query: String) -> bool {
+2563:     fn accepts_build(&self, identity: BlockSearchBuildIdentity) -> bool {
+2567:     fn accepts_hit(
+2580:     fn bookmark_plan(
+2598:     fn release_index_for_rebuild(&mut self) {
+2617:     fn select_next(&mut self) {
+2626:     fn select_prev(&mut self) {
+2636:     fn select_first(&mut self) {
+2640:     fn select_last(&mut self) {
+2644:     fn select_page(&mut self, forward: bool) {
+2662:     fn count_label(&self) -> String {
+2693: fn block_search_reveal_row(
+2710: fn expand_block_search_hit(
+2733: fn set_completed_output_collapsed(
+2759: fn anchored_overlay_position(
+2788: struct BlockMenuState {
+2799: struct BlockReview {
+2810: impl BlockReview {
+2811:     fn matches_selection(
+2821:     fn matches_commands(&self, session_id: usize, ids: &[u64], commands: &str) -> bool {
+2829: struct BlockMenuSelectionSummary {
+2835: fn block_menu_selection_summary<'a, I>(
+2858: enum BlockMenuAction {
+2884: fn chat_read_only_menu_actions(has_command: bool) -> Vec<BlockMenuAction> {
+2894: fn chat_menu_target_is_current(
+2905: fn block_menu_actions(
+2951: fn block_menu_keyboard_target(
+2964: fn block_menu_navigation(
+2990: fn review_commands_menu_label(selected_count: usize) -> &'static str {
+2998: fn block_menu_command_hint(action: BlockMenuAction) -> Option<&'static str> {
+3007: fn block_menu_shortcut_command(action: BlockMenuAction) -> Option<&'static str> {
+3024: enum FailedBlockAgentIntent {
+3034: struct BlockClearConfirmation {
+3041: enum BlockClearResolution {
+3048: impl BlockClearConfirmation {
+3049:     fn new(session_id: usize, block_count: usize, latest_zone_id: Option<u64>) -> Option<Self> {
+3061:     fn resolve(self, active: Option<(usize, usize, Option<u64>)>) -> BlockClearResolution {
+3086: enum SidebarPanel {
+3099: enum SidebarMenuAction {
+3112: fn sidebar_menu_action_label(action: SidebarMenuAction, multi: usize) -> String {
+3140: struct SidebarMenuState {
+3157: enum SidebarDialogKind {
+3167: struct SidebarDialogState {
+3176: struct SidebarDeleteConfirmation {
+3185: struct FsClipboard {
+3192: fn next_sidebar_clipboard_id(current: u64) -> Option<u64> {
+3196: fn next_sidebar_context_epoch(current: Option<u64>) -> Option<u64> {
+3205: fn settle_sidebar_clipboard_sources(
+3229: fn sidebar_menu_clipboard_is_current(
+3236: fn sidebar_clipboard_id_at_location(
+3249: fn unique_active_remote_profile_index(
+3266: fn same_ssh_files_transport(
+3273: fn unique_active_ssh_transport_index(
+3290: fn interactive_ssh_argv(profile: &jterm_core::jsh_remote::RemoteHostConfig) -> Vec<String> {
+3301: fn remap_sidebar_location(
+3319: fn sidebar_terminal_entry_copy(location: &remote_fs::FsLocation) -> (String, String) {
+3348: struct SidebarTransferUi {
+3358: fn retire_sidebar_transfer_owner(
+3371: impl SidebarTransferUi {
+3373:     fn status_text(&self) -> String {
+3399: struct DropItem {
+3408: struct DropPlan {
+3416: struct SidebarDropIntent {
+3427: struct SidebarDropIntents {
+3433: impl SidebarDropIntents {
+3434:     fn clear(&mut self) {
+3441:     fn can_plan(&self) -> bool {
+3445:     fn collecting_is(&self, intent: &std::sync::Arc<SidebarDropIntent>) -> bool {
+3451:     fn start_planning(&mut self, intent: &std::sync::Arc<SidebarDropIntent>) -> bool {
+3460:     fn finish_planning(&mut self, intent: &std::sync::Arc<SidebarDropIntent>) -> bool {
+3472: impl SidebarDropIntent {
+3473:     fn capture(
+3489:     fn matches_context(
+3505: fn drop_item_size(path: &std::path::Path, depth: usize, max_bytes: u64) -> std::io::Result<u64> {
+3541: fn plan_drop(
+3556: fn plan_drop_with_caps(
+3641: enum SidebarOp {
+3671: struct SidebarOpReport {
+3695: struct SidebarPathRemap {
+3700: struct SidebarWorkerOutcome {
+3710: fn sidebar_op_report_matches_context(
+3740: struct SidebarLocationChoice {
+3746: struct SidebarRemoteFollow {
+3768: struct SidebarRemoteFollowResult {
+3773: fn probe_sidebar_remote_follow(
+3808: fn sidebar_remote_follow_tree_is_current(
+3821: fn sidebar_remote_follow_context_is_current(
+3837: fn suppress_armed_sidebar_retry(
+3846: impl std::fmt::Display for SidebarLocationChoice {
+3847:     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+3853: enum ChromeShortcut {
+3863: fn chrome_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Option<ChromeShortcut> {
+3893: struct RemotePickerState {
+3899: impl RemotePickerState {
+3900:     fn new(hosts: &[jterm_core::jsh_remote::RemoteHostConfig]) -> Self {
+3912: fn remote_picker_target_index(
+3926: fn first_runnable_remote_index(
+3940: fn next_runnable_remote_index(
+3962: fn last_session_index(session_count: usize) -> Option<usize> {
+3966: fn axis_from_str(s: &str) -> Option<Axis> {
+3974: fn axis_to_str(axis: Axis) -> &'static str {
+3986: fn swap_sessions_in_tree(tree: &mut PaneTree, a: usize, b: usize) {
+4000: fn pane_tree_to_snapshot(tree: &PaneTree) -> session_persistence::PaneTreeSnapshot {
+4020: fn equalize_pane_tree(node: &mut PaneTree) -> bool {
+4045: fn pane_tree_from_snapshot(snap: &session_persistence::PaneTreeSnapshot) -> Option<PaneTree> {
+4073: fn pane_tree_from_legacy(split: &session_persistence::SplitSnapshot) -> Option<PaneTree> {
+4090: fn restored_tab_candidates(
+4142: fn inspect_restored_snapshot(
+4175: fn build_restored_tabs(
+4191: fn build_restored_tabs_with_report(
+4278: fn reindex_tabs_for_insert(tabs: &mut [Tab], inserted: usize) {
+4293: fn reindex_tabs_for_removal(tabs: &mut [Tab], removed: usize) {
+4307: fn config_save_feedback(dirty: bool, blocked: bool) -> &'static str {
+4318: fn pane_zoom_after_tab_close(
+4332: fn valid_restored_layout(tree: &PaneTree, session_count: usize) -> bool {
+4350: fn split_drop_direction(rect: pane_layout::Rect, point: iced::Point) -> Option<PaneDirection> {
+4386: fn tab_drag_hover_ready(
+4406: fn move_plain_tab_into_split(
+4460: fn promote_split_pane_to_tab(
+4509: fn blend(a: Color, b: Color, t: f32) -> Color {
+4518: fn resolve_mono_font(family: &str) -> iced::Font {
+4538: fn resolve_optional_font(family: Option<&str>) -> Option<iced::Font> {
+4542: fn main() -> iced::Result {
+4628: enum Message {
+5119: enum TabMenuAction {
+5138: struct PtySubscriptionKey {
+5150: struct PtyWriteChunk {
+5155: impl PartialEq for PtySubscriptionKey {
+5156:     fn eq(&self, other: &Self) -> bool {
+5161: impl Eq for PtySubscriptionKey {}
+5163: impl Hash for PtySubscriptionKey {
+5164:     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+5172: struct ThemeEditState {
+5181: struct Session {
+5260: enum HostClipboardReply {
+5265: fn release_host_clipboard_state(
+5281: fn refuse_host_clipboard_reply(
+5300: fn host_clipboard_completion_matches(
+5313: fn defer_osc52_refusal(
+5326: fn complete_osc52_read(
+5347: fn admit_osc52_clipboard_write(
+5367: fn service_osc5522_read(
+5408: fn complete_osc5522_read(
+5435: struct BlockChromeCache {
+5446: struct BlockChromeKey {
+5461: fn agent_prompt_status_with_foreground(
+5485: fn user_input_blocked(hold_after_exit: bool) -> bool {
+5491: fn session_label(base: String, transcript_read_only: bool) -> String {
+5521: fn jsh_session_id(id: usize, command_argv: Option<&[String]>) -> Option<String> {
+5537: fn journal_lifecycle(
+5554: fn apply_theme_colors(terminal: &mut TerminalState, theme: &Theme) {
+5565: impl Session {
+5566:     fn spawn(
+5578:     fn spawn_argv(
+5591:     fn spawn_argv_env(
+5684:     fn label(&self) -> String {
+5688:     fn label_base(&self) -> String {
+5705:     fn pane_title(&self) -> String {
+5720:     fn cwd_display(&self) -> Option<String> {
+5746:     fn git_meta(&self) -> Option<jterm_core::git_meta::RepoMeta> {
+5753:     fn cwd_basename(cwd: &str) -> Option<String> {
+5769:     fn fg_proc(&self) -> Option<String> {
+5785:     fn observed_ssh_command(&self) -> Option<jterm_core::process::ObservedSshCommand> {
+5793:     fn agent_prompt_status(&mut self) -> terminal::AgentPromptStatus {
+5808:     fn refresh(&mut self) {
+5871:     fn scroll(&mut self, lines: isize) {
+5881:     fn set_scroll_offset(&mut self, offset: usize) {
+5892:     fn scroll_to_bottom(&mut self) {
+5902:     fn jump_prompt(&mut self, older: bool) -> bool {
+5975:     fn reveal_absolute_cell(&mut self, absolute_row: usize, col: usize) -> bool {
+6001:     fn queue_accepts_entry(
+6013:     fn push_queue_owned(
+6031:     fn push_queue_copy(
+6052:     fn flush_responses(&mut self) {
+6079:     fn can_queue_user_bytes(&mut self, len: usize) -> bool {
+6089:     fn transcript_read_only(&self) -> bool {
+6093:     fn chat_backlog(&self) -> chat_mode::InputBacklog {
+6102:     fn chat_control_bytes(&self, kind: chat_mode::ControlKind) -> Option<Vec<u8>> {
+6129:     fn chat_control_token(&self, kind: chat_mode::ControlKind) -> Option<chat_mode::ControlToken> {
+6154:     fn enabled_chat_control(
+6172:     fn try_chat_control(&mut self, displayed: &chat_mode::ControlToken, input_ready: bool) -> bool {
+6204:     fn write_pty(&mut self, data: &[u8]) -> bool {
+6211:     fn write_agent_pty(&mut self, data: &[u8]) -> bool {
+6215:     fn write_pty_with_origin(&mut self, data: &[u8], taint_prompt: bool) -> bool {
+6248:     fn flush_write_queue(&mut self) -> bool {
+6286:     fn has_pending_write(&self) -> bool {
+6297:     fn cwd(&self) -> Option<String> {
+6313: struct TerminalMouseGesture {
+6330: fn reject_chat_press(
+6361: impl TerminalMouseGesture {
+6364:     fn app_drag_cell(self, current: Option<(usize, usize)>) -> Option<(usize, usize)> {
+6374:     fn app_release_cell(
+6396: fn cancelled_terminal_mouse_report(
+6411: fn retire_terminal_mouse_gestures(
+6419: fn change_terminal_interaction_mode(
+6437: enum TerminalPaneOwner {
+6442: impl TerminalPaneOwner {
+6443:     fn matches(&self, tree: &PaneTree, session_id: &impl Fn(usize) -> Option<usize>) -> bool {
+6458:     fn capture(tree: &PaneTree, session_id: &impl Fn(usize) -> Option<usize>) -> Self {
+6473: struct TerminalPaneOwners {
+6478: impl TerminalPaneOwners {
+6479:     fn matches(
+6495:     fn capture(
+6513: fn change_terminal_pane_owners(
+6534: fn retire_closing_terminal_mouse_gestures(
+6552: fn terminal_panes_body<'a, Message: 'a, Renderer: iced::advanced::Renderer + 'a>(
+6565: fn record_terminal_app_mouse_cell(
+6585: fn take_terminal_mouse_gesture(
+6599: enum OverlayReleaseDisposition {
+6605: fn overlay_release_disposition(
+6623: struct Frost {
+6949: impl Frost {
+6950:     fn new(
+7191:     fn title(&self) -> String {
+7200:     fn iced_theme(&self) -> iced::Theme {
+7219:     fn app_style(&self, theme: &iced::Theme) -> iced::theme::Style {
+7229:     fn with_window_opacity(&self, color: Color) -> Color {
+7236:     fn scale_factor(&self) -> f32 {
+7242:     fn sync_theme_colors(&mut self) {
+7250:     fn effective_font_size(&self) -> f32 {
+7254:     fn chrome_font_size(&self) -> f32 {
+7258:     fn font_zoom_enabled(&self) -> bool {
+7269:     fn font_zoom_region<'a>(
+7283:     fn tab_bar_height(&self) -> f32 {
+7287:     fn status_bar_height(&self) -> f32 {
+7291:     fn pane_header_height(&self) -> f32 {
+7295:     fn sidebar_row_height(&self) -> f32 {
+7303:     fn set_config_panel_open(&mut self, open: bool) {
+7312:     fn remote_host_editor_visible(&self) -> bool {
+7316:     fn remote_host_row(&self, target: &remote_host_editor::RowTarget) -> Option<usize> {
+7326:     fn apply_config(&mut self) {
+7410:     fn sync_tab_position_ui(&mut self) {
+7433:     fn adjust_font_size(&mut self, delta: f32) {
+7445:     fn set_chrome_font_size(&mut self, size: f32) {
+7459:     fn reset_font_size(&mut self) {
+7473:     fn adjust_opacity(&mut self, delta: f32) {
+7486:     fn save_config_checked(&mut self) -> Result<(), persistence::AtomicWriteError> {
+7513:     fn block_config_writes(&mut self, diagnostic: String) {
+7525:     fn note_config_save_error(&mut self, error: &persistence::AtomicWriteError) {
+7544:     fn persist_live_config(&mut self) {
+7560:     fn reload_config_if_changed(&mut self) -> Option<sidebar::DirectoryRequest> {
+7634:     fn dock_open(&self) -> bool {
+7640:     fn sync_terminal_ime_owner(&mut self) {
+7659:     fn terminal_input_active(&self) -> bool {
+7684:     fn chat_input_ready(&self, session_id: usize) -> bool {
+7700:     fn terminal_mouse_active(&self) -> bool {
+7723:     fn local_sidebar_fallback_root(&self) -> std::path::PathBuf {
+7732:     fn clear_sidebar_tree_intent(&mut self) {
+7747:     fn invalidate_sidebar_pending_work(&mut self) {
+7759:     fn clear_sidebar_remote_context(&mut self) {
+7772:     fn reset_sidebar_to_local_with_hosts(
+7785:     fn cancel_sidebar_remote_follow(&mut self) {
+7791:     fn invalidate_sidebar_remote_follow_intent(&mut self) {
+7805:     fn active_session_changed_for_remote_follow(&mut self) {
+7819:     fn poll_sidebar_remote_follow(&mut self) -> Task<Message> {
+8004:     fn resolve_sidebar_remote_follow(
+8116:     fn reconcile_sidebar_remote_hosts(&mut self) -> Option<sidebar::DirectoryRequest> {
+8173:     fn open_sidebar_terminal(&mut self) {
+8192:     fn navigate_sidebar_to(&mut self, path: std::path::PathBuf) -> Task<Message> {
+8199:     fn navigate_sidebar_back(&mut self) -> Task<Message> {
+8206:     fn navigate_sidebar_forward(&mut self) -> Task<Message> {
+8213:     fn navigate_sidebar_parent(&mut self) -> Task<Message> {
+8221:     fn navigate_sidebar_home(&mut self) -> Task<Message> {
+8228:     fn begin_sidebar_path_edit(&mut self) -> Task<Message> {
+8247:     fn submit_sidebar_path(&mut self) -> Task<Message> {
+8262:     fn queue_sidebar_load(&mut self, request: sidebar::DirectoryRequest) -> Task<Message> {
+8285:     fn dispatch_sidebar_scans(&mut self) -> Task<Message> {
+8306:     fn refresh_sidebar_directories(&mut self, directories: &[std::path::PathBuf]) -> Task<Message> {
+8325:     fn toggle_sidebar(&mut self) -> Task<Message> {
+8356:     fn execute_sidebar_menu_action(
+8553:     fn submit_sidebar_dialog(&mut self) -> Task<Message> {
+8623:     fn sidebar_drop_target(&self) -> Option<std::path::PathBuf> {
+8640:     fn sidebar_visible_rows(&self) -> Vec<(std::path::PathBuf, bool)> {
+8655:     fn sidebar_row_click(&mut self, path: std::path::PathBuf, is_dir: bool) -> Task<Message> {
+8687:     fn files_shortcut_scope(&self) -> bool {
+8696:     fn sidebar_menu_action_list(
+8727:     fn sidebar_menu_state(
+8750:     fn reveal_sidebar_tree_focus(&mut self) -> Task<Message> {
+8775:     fn sidebar_render_items(&self) -> Vec<sidebar::SidebarRenderItem> {
+8783:     fn handle_sidebar_menu_key(
+8824:     fn handle_sidebar_files_key(
+8968:     fn confirm_sidebar_delete(&mut self) -> Task<Message> {
+9013:     fn block_reading_bar_height(&self) -> f32 {
+9029:     fn organism_strip_height(&self) -> f32 {
+9045:     fn term_height(&self) -> f32 {
+9058:     fn term_width(&self) -> f32 {
+9063:     fn sidebar_width(&self) -> f32 {
+9071:     fn host_clipboard_read_blocked_for(&self, id: usize, fd: RawFd) -> bool {
+9076:     fn try_begin_host_clipboard_read(&mut self, id: usize, fd: RawFd) -> bool {
+9088:     fn finish_host_clipboard_read(&mut self, id: usize, fd: RawFd, generation: u64) -> bool {
+9104:     fn release_host_clipboard_read(&mut self, id: usize, fd: RawFd) {
+9114:     fn before_clipboard_permission_change(&mut self, allow: bool) {
+9120:     fn revoke_host_clipboard_read(&mut self) {
+9139:     fn session_by_identity(&mut self, id: usize, fd: RawFd) -> Option<&mut Session> {
+9147:     fn sync_terminal_pane_owners(&mut self) {
+9171:     fn refresh_active_context(&mut self) {
+9180:     fn refresh_active_context_caches(&mut self) {
+9202:     fn restore_or_spawn(
+9360:     fn save_session_snapshot(&mut self) {
+9450:     fn new_session(&mut self) {
+9458:     fn new_session_at(&mut self, cwd: Option<&str>) {
+9487:     fn install_or_update_jsh(&mut self) {
+9533:     fn jsh_update_check_task(policy: &str) -> Task<Message> {
+9559:     fn close_tab(&mut self, tab: usize) -> Task<Message> {
+9574:     fn request_close_tab(&mut self, tab: usize) -> Task<Message> {
+9597:     fn execute_pending_close(&mut self, index: usize, pending: PendingClose) -> Task<Message> {
+9609:     fn close_session(&mut self, index: usize) -> Task<Message> {
+9704:     fn prune_closed_pane(&mut self, index: usize, old_active: usize) {
+9759:     fn busy_session_name(&self, index: usize) -> Option<String> {
+9769:     fn request_close_session(&mut self, index: usize) -> Task<Message> {
+9773:     fn request_close_session_then(
+9789:     fn close_session_then(&mut self, index: usize, activate_after: Option<usize>) -> Task<Message> {
+9807:     fn request_window_close(&mut self) -> Task<Message> {
+9838:     fn exit_flushing_durable_state(&mut self) -> Task<Message> {
+9860:     fn flush_config_on_exit(&mut self) {
+9874:     fn next_session(&mut self) {
+9880:     fn prev_session(&mut self) {
+9887:     fn jump_session(&mut self, index: usize) {
+9891:     fn set_sidebar_notice(&mut self, text: impl Into<String>, neutral: bool) {
+9896:     fn push_toast(&mut self, text: impl Into<String>, kind: ToastKind) {
+9924:     fn expire_toasts(&mut self) {
+9932:     fn hint_read_only_transcript(&mut self) {
+9954:     fn execute_tab_menu_action(&mut self, action: TabMenuAction) -> Task<Message> {
+10095:     fn apply_tab_rename(&mut self, id: usize, raw: String) {
+10111:     fn close_tabs(&mut self, done_message: &str, targets: Vec<usize>) -> Task<Message> {
+10140:     fn tabs_sessions(&self, tab: usize) -> Vec<usize> {
+10153:     fn reorder_tab(&mut self, from: usize, to: usize) {
+10166:     fn finish_tab_split_drop(&mut self) {
+10219:     fn restore_tab_drag_origin(&mut self, origin: Option<usize>) {
+10228:     fn cancel_tab_drag(&mut self) {
+10237:     fn cancel_layout_drags(&mut self) {
+10247:     fn finish_pane_promotion(&mut self, after_tab_id: Option<usize>) {
+10281:     fn layout(&self) -> &PaneTree {
+10285:     fn layout_mut(&mut self) -> &mut PaneTree {
+10292:     fn set_focus(&mut self, session: usize) {
+10310:     fn tab_of_session(&self, session: usize) -> Option<usize> {
+10316:     fn tab_focus(&self, tab: usize) -> Option<usize> {
+10321:     fn tab_labels(&self) -> Vec<String> {
+10327:     fn tab_label(&self, tab: usize) -> String {
+10336:     fn tab_real_label(&self, tab: usize) -> String {
+10349:     fn tab_state_prefix(&self, tab: usize) -> String {
+10367:     fn activate_tab(&mut self, tab: usize) {
+10393:     fn focus_session(&mut self, session: usize) -> bool {
+10417:     fn restore_tabs(
+10446:     fn tab_index_by_id(&self, id: usize) -> Option<usize> {
+10452:     fn open_tab_with(&mut self, session: usize) {
+10473:     fn reindex_tabs_after_insert(&mut self, inserted: usize) {
+10485:     fn reindex_tabs_after_removal(&mut self, removed: usize) {
+10490:     fn is_split(&self) -> bool {
+10494:     fn tab_split_drag_eligible(&self) -> bool {
+10504:     fn layout_area(&self) -> pane_layout::Rect {
+10514:     fn pane_rects(&self) -> Vec<PaneRect> {
+10521:     fn focused_pane_pos(&self) -> usize {
+10529:     fn grid_pixel_size(&self, cols: usize, rows: usize) -> (u32, u32) {
+10536:     fn resize_session(&mut self, index: usize, cols: usize, rows: usize) -> Option<usize> {
+10555:     fn relayout(&mut self) {
+10588:     fn split(&mut self, axis: Axis) {
+10634:     fn focus_next_pane(&mut self) {
+10645:     fn focus_prev_pane(&mut self) {
+10658:     fn session_index_by_id(&self, id: usize) -> Option<usize> {
+10665:     fn swap_pane_sessions(&mut self, dragged: usize, target: usize) {
+10683:     fn focus_pane_direction(&mut self, direction: PaneDirection) {
+10694:     fn resize_pane_direction(&mut self, direction: PaneDirection) {
+10741:     fn toggle_pane_zoom(&mut self) {
+10752:     fn swap_panes(&mut self) {
+10766:     fn equalize_panes(&mut self) {
+10785:     fn close_focused_pane(&mut self) -> Task<Message> {
+10806:     fn handle_keybinding(
+10827:     fn dispatch_command(&mut self, cmd: keybindings::Command) -> Option<Task<Message>> {
+11198:     fn handle_tab_shortcut(
+11263:     fn handle_remote_picker_key(
+11315:     fn connect_remote_host(&mut self, index: usize) {
+11333:     fn connect_remote_profile(
+11394:     fn handle_tab_switcher_key(
+11459:     fn open_history_picker(&mut self) -> Task<Message> {
+11485:     fn overlay_owns_escape(&self) -> bool {
+11522:     fn ai_suggestion_bound_session(&self) -> Option<&ai_command::CommandSuggestion> {
+11529:     fn ai_suggestion_visible(&self) -> bool {
+11533:     fn active_pane_has_prompt_marks(&self) -> bool {
+11547:     fn block_absent_toast(&self, subject: &str) -> String {
+11561:     fn block_action_available(&self) -> bool {
+11572:     fn block_binding_available(&self) -> bool {
+11580:     fn ensure_block_action_available(&mut self, action: &str) -> bool {
+11606:     fn jump_prompt_with_feedback(&mut self, older: bool) -> Task<Message> {
+11633:     fn block_reveal_edge(&mut self, zone_id: u64, bottom: bool) -> Task<Message> {
+11693:     fn block_toggle_bookmark(&mut self, zone_id: u64) -> Task<Message> {
+11730:     fn block_toggle_selected_collapse(&mut self) -> Task<Message> {
+11773:     fn block_toggle_target_bookmark(&mut self) -> Task<Message> {
+11797:     fn block_jump_bookmark(&mut self, older: bool) -> Task<Message> {
+11824:     fn execute_block_menu_action(&mut self, action: BlockMenuAction) -> Task<Message> {
+11938:     fn chat_card_copy_text(
+11986:     fn execute_chat_read_only_menu_action(
+12045:     fn block_ask_ai_task(&mut self, id: u64) -> Task<Message> {
+12075:     fn failed_block_agent_task(
+12179:     fn failed_block_retry_task(&mut self, session_id: usize, zone_id: u64) -> Task<Message> {
+12262:     fn palette_failed_block_target(&mut self) -> Option<(usize, u64)> {
+12297:     fn palette_failed_block_agent_task(&mut self, intent: FailedBlockAgentIntent) -> Task<Message> {
+12313:     fn palette_failed_block_retry_task(&mut self) -> Task<Message> {
+12332:     fn toggle_block_search(&mut self) -> Task<Message> {
+12354:     fn block_search_source_snapshot(sess: &Session) -> block_mode::BlockSearchSourceSnapshot {
+12371:     fn begin_block_search_rebuild(&mut self) -> Task<Message> {
+12450:     fn force_block_search_rebuild(&mut self) -> Task<Message> {
+12470:     fn close_block_search_on_session_change(&mut self) {
+12476:     fn close_block_search(&mut self) {
+12487:     fn block_search_recompute(&mut self) {
+12494:     fn block_search_recompute_with_anchor(
+12512:     fn block_search_eligible(&self, filter: BlockSearchFilter) -> std::collections::HashSet<u64> {
+12535:     fn dispatch_block_search_work(&mut self) -> Task<Message> {
+12632:     fn block_search_refocus_task(&self) -> Task<Message> {
+12643:     fn block_search_snap_task(&self) -> Task<Message> {
+12668:     fn block_search_target_is_live(&self, session_id: usize, zone_id: u64) -> bool {
+12677:     fn toggle_block_search_hit_bookmark(
+12783:     fn handle_block_search_key(
+12984:     fn type_into_active_pane(&mut self, text: String) -> Task<Message> {
+12993:     fn recall_into_active_pane(&mut self, command: String) -> Task<Message> {
+13008:     fn session_prompt_replace_ready(&mut self, id: usize) -> Result<(), &'static str> {
+13035:     fn write_paste_to_session(
+13114:     fn handle_history_picker_key(
+13181:     fn history_picker_snap_task(&self) -> Task<Message> {
+13202:     fn open_workflow_picker(&mut self) -> Task<Message> {
+13214:     fn accept_workflow_choice(&mut self, choice: workflow_picker::WorkflowChoice) -> Task<Message> {
+13229:     fn accept_workflow(
+13265:     fn submit_workflow_args(&mut self) -> Task<Message> {
+13298:     fn workflow_recall_preflight(&mut self, id: usize, command: &str) -> Result<String, String> {
+13331:     fn deliver_workflow_args(
+13378:     fn handle_workflow_overlay_key(
+13447:     fn block_at_viewport_row(&self, session_id: usize, row: usize) -> Option<u64> {
+13460:     fn handle_summary_activation(
+13495:     fn finish_cancelled_terminal_mouse_gesture(&mut self, gesture: TerminalMouseGesture) {
+13504:     fn handle_mouse(&mut self, source_session_id: usize, input: MouseInput) -> Task<Message> {
+13982:     fn handle_scroll_shortcut(&mut self, key: &keyboard::Key, mods: keyboard::Modifiers) -> bool {
+14017:     fn recompute_search(&mut self) {
+14030:     fn navigate_search(&mut self, previous: bool) {
+14048:     fn reveal_current_search_match(&mut self) {
+14087:     fn reveal_hidden_search_match(&mut self, target: &SearchRevealTarget) -> Task<Message> {
+14123:     fn handle_search_key(
+14207:     fn handle_search_replace_key(
+14232:     fn apply_search_replace(
+14261:     fn handle_config_panel_key(
+14291:     fn palette_snap_task(&self) -> Task<Message> {
+14303:     fn palette_page_selection(&mut self, delta: isize) {
+14318:     fn handle_palette_key(
+14396:     fn edit_copy_task(&mut self, output_only: bool) -> Task<Message> {
+14428:     fn execute_palette_action(
+14686:     fn copy_last_output_task(&mut self) -> Task<Message> {
+14730:     fn select_and_reveal_block(&mut self, id: u64) {
+14764:     fn reveal_block_search_hit(&mut self, hit: &block_mode::BlockSearchHit) {
+14794:     fn block_jump_first_failed(&mut self) -> Task<Message> {
+14818:     fn block_jump_failed_step(&mut self, older: bool) -> Task<Message> {
+14856:     fn clear_stale_block_selection(&mut self) {
+14866:     fn block_copy_selected_task(
+14983:     fn block_action_command(&mut self, verb: &str) -> Option<(String, bool)> {
+15016:     fn block_copy_command_task(&mut self) -> Task<Message> {
+15047:     fn block_copy_output_task(&mut self) -> Task<Message> {
+15121:     fn block_recall_command_task(&mut self) -> Task<Message> {
+15164:     fn block_select_all(&mut self) -> Task<Message> {
+15191:     fn request_block_clear(&mut self) -> Task<Message> {
+15216:     fn confirm_block_clear(&mut self) -> Task<Message> {
+15258:     fn execute_block_clear(&mut self, session_id: usize) -> Task<Message> {
+15306:     fn undo_block_clear(&mut self) -> Task<Message> {
+15338:     fn block_extend_selection_step(&mut self, older: bool) -> Task<Message> {
+15371:     fn insert_reviewed_block_commands(&mut self) -> Task<Message> {
+15489:     fn block_select_step(&mut self, older: bool) -> Task<Message> {
+15549:     fn block_target_zone_id(&mut self, verb: &str) -> Option<u64> {
+15577:     fn block_copy_block_task(&mut self) -> Task<Message> {
+15629:     fn block_markdown(terminal: &terminal::TerminalState, zone: &terminal::CommandZone) -> String {
+15670:     fn block_copy_selected_markdown_task(&mut self) -> Option<Task<Message>> {
+15740:     fn block_copy_markdown_task(&mut self) -> Task<Message> {
+15769:     fn start_block_export(
+15795:     fn block_export_zone_task(
+15830:     fn block_export_session_task(
+15865:     fn update(&mut self, message: Message) -> Task<Message> {
+15885:     fn update_message(&mut self, message: Message) -> Task<Message> {
+19996:     fn refresh_kitty_handles(&mut self) {
+20035:     fn kitty_images(&self, sess: &Session) -> Vec<KittyRender> {
+20071:     fn recompute_links(&mut self) {
+20111:     fn popup_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+20116:     fn popup_input_style(&self) -> impl Fn(&iced::Theme, text_input::Status) -> text_input::Style {
+20132:     fn popup_text<'a>(
+20141:     fn c_panel(&self) -> Color {
+20144:     fn c_text(&self) -> Color {
+20147:     fn c_text_dim(&self) -> Color {
+20150:     fn c_border(&self) -> Color {
+20153:     fn c_accent(&self) -> Color {
+20158:     fn chrome_bar_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+20169:     fn panel_style_with_focus(
+20194:     fn divider_style(&self, active: bool) -> impl Fn(&iced::Theme) -> container::Style {
+20210:     fn tab_container_style(
+20247:     fn tab_btn_style(
+20281:     fn sidebar_row_style(
+20336:     fn ghost_btn_style(&self) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+20359:     fn close_btn_style(&self) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+20384:     fn tab_close_btn_style(&self) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+20405:     fn tab_bar(&self) -> Element<'_, Message> {
+20513:     fn chat_running_status(&self) -> Option<(usize, u64, u64)> {
+20536:     fn top_bar_with_close<'a>(&'a self, content: Element<'a, Message>) -> Element<'a, Message> {
+20615:     fn tab_context_menu(&self, id: usize) -> Element<'_, Message> {
+20753:     fn float_tab_menu<'a>(
+20803:     fn sidebar_menu_view(&self, state: &SidebarMenuState) -> Element<'_, Message> {
+20909:     fn sidebar_dialog_view(&self, state: &SidebarDialogState) -> Element<'_, Message> {
+20975:     fn sidebar_delete_confirm_view(&self, paths: &[std::path::PathBuf]) -> Element<'_, Message> {
+21042:     fn tab_close_confirm_view(&self, id: usize, proc_name: &str) -> Element<'_, Message> {
+21097:     fn block_clear_confirm_view(&self, confirm: BlockClearConfirmation) -> Element<'_, Message> {
+21143:     fn toast_overlay(&self) -> Element<'_, Message> {
+21186:     fn session_recovery_banner(&self) -> Option<Element<'_, Message>> {
+21232:     fn diagnostics_overlay(&self) -> Element<'_, Message> {
+21289:     fn tab_switcher_view(&self, state: &TabSwitcherState) -> Element<'_, Message> {
+21365:     fn remote_picker_view(&self, state: &RemotePickerState) -> Element<'_, Message> {
+21478:     fn workflow_overlay_view(
+21491:     fn workflow_picker_view(
+21611:     fn workflow_args_view(
+21745:     fn history_picker_view(
+21954:     fn block_search_view(&self, state: &BlockSearchState) -> Element<'_, Message> {
+22421:     fn block_reading_bar(&self) -> Element<'_, Message> {
+22499:     fn block_details_snapshot(
+22551:     fn open_block_review(&mut self, target: Option<u64>) -> Task<Message> {
+22579:     fn block_reinput_selected_commands_task(&mut self) -> Task<Message> {
+22690:     fn block_review_is_current(&self, review: &BlockReview, insertion: bool) -> bool {
+22729:     fn copy_block_review(&mut self) -> Task<Message> {
+22748:     fn confirm_block_review(&mut self) -> Task<Message> {
+22764:     fn block_review_view<'a>(&'a self, review: &'a BlockReview) -> Element<'a, Message> {
+22908:     fn open_selected_block_menu(&mut self) -> Option<Task<Message>> {
+22940:     fn available_block_menu_actions(&self, state: BlockMenuState) -> Vec<BlockMenuAction> {
+22989:     fn handle_block_menu_key(
+23032:     fn block_menu_view(&self, state: BlockMenuState) -> Element<'_, Message> {
+23358:     fn organism_layout(&self) -> OrganismLayout {
+23379:     fn sync_organism_geometry(&mut self) {
+23393:     fn sync_organism_attention_owner(&mut self) {
+23398:     fn organism_effective_motion(&self) -> Option<organism::Motion> {
+23402:     fn apply_organism_motion_transition(
+23412:     fn prepare_organism_motion_config(&mut self, configured: Option<organism::Motion>) {
+23420:     fn sync_organism_motion(&mut self, foreground_resume: bool) {
+23430:     fn organism_motion_description(&self) -> &'static str {
+23449:     fn organism_owner(&self) -> Option<usize> {
+23454:     fn organism_observation_owner(&self) -> Option<usize> {
+23475:     fn organism_watch_owner(&self) -> Option<usize> {
+23480:     fn organism_watch_source(&self) -> Option<(usize, i32, u64)> {
+23486:     fn sync_organism_watch(&mut self) {
+23500:     fn greet_companion(&mut self, target: Option<usize>) {
+23530:     fn organism_attention_facts(&self) -> organism::AttentionFacts {
+23555:     fn organism_hover_eligible(&self) -> bool {
+23563:     fn organism_interaction_eligible(&self) -> bool {
+23579:     fn status_bar(&self) -> Element<'_, Message> {
+23844:     fn companion_toggle(&self, expanded: bool) -> Element<'_, Message> {
+23872:     fn jsh_notice(&self) -> Option<Element<'_, Message>> {
+23906:     fn block_badge_cell_char(cell: &terminal::TerminalCell) -> char {
+23918:     fn block_badge_inset(&self) -> usize {
+23926:     fn active_zone_span(terminal: &terminal::TerminalState) -> Option<(usize, usize)> {
+23955:     fn running_badge_target(&self, sess: &Session) -> Option<(usize, String, u64)> {
+23989:     fn block_chrome(
+24053:     fn build_block_paint_rows(&self, sess: &Session) -> Vec<terminal_view::BlockPaintRow> {
+24370:     fn block_marker_fractions(&self, sess: &Session) -> Vec<f32> {
+24393:     fn block_bookmark_marker_fractions(&self, sess: &Session) -> Vec<f32> {
+24411:     fn organism_block_key(&self) -> Option<terminal::RawRowId> {
+24419:     fn organism_body_owner(&self) -> Option<usize> {
+24444:     fn organism_body_hover_available(&self) -> bool {
+24458:     fn observe_organism_body(
+24511:     fn chat_paint_rows(&self, sess: &Session) -> Vec<terminal_view::BlockPaintRow> {
+24577:     fn pane_view(&self, sess_idx: usize) -> Element<'_, Message> {
+24772:     fn sidebar_view(&self) -> Element<'_, Message> {
+24826:     fn window_resize_edges(&self) -> Element<'_, Message> {
+24920:     fn sidebar_divider(&self) -> Element<'_, Message> {
+24935:     fn sidebar_files_view(&self) -> Element<'_, Message> {
+25450:     fn sidebar_tabs_view(&self) -> Element<'_, Message> {
+25528:     fn pane_to_tab_drop_hint(&self, compact: bool) -> Element<'_, Message> {
+25545:     fn sidebar_render_item(
+25701:     fn divider(&self, axis: Axis, id: DividerId) -> Element<'_, Message> {
+25730:     fn render_tree(&self, node: &PaneTree, path: &[usize]) -> Element<'_, Message> {
+25824:     fn pane_header(&self, session: usize) -> Element<'_, Message> {
+25923:     fn pane_header_style(
+25964:     fn pane_frame_style(&self, focused: bool) -> impl Fn(&iced::Theme) -> container::Style {
+25978:     fn split_drop_overlay(&self, direction: PaneDirection) -> Element<'_, Message> {
+26024:     fn split_drop_zone_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+26042:     fn tab_to_split_instruction(&self) -> Element<'_, Message> {
+26073:     fn view(&self) -> Element<'_, Message> {
+26354:     fn search_bar(&self) -> Element<'_, Message> {
+26455:     fn search_replace_panel(&self) -> Element<'_, Message> {
+26557:     fn command_palette(&self) -> Element<'_, Message> {
+26639:     fn organism_preview_visible(&self) -> bool {
+26649:     fn organism_settings(&self) -> Element<'_, Message> {
+26767:     fn config_panel(&self) -> Element<'_, Message> {
+27525:     fn theme_editor_view(&self) -> Element<'_, Message> {
+27612:     fn help_panel(&self) -> Element<'_, Message> {
+27841:     fn debug_panel(&self) -> Element<'_, Message> {
+27939:     fn agent_drive_task(&mut self) -> Option<Task<Message>> {
+28003:     fn agent_run_approved(
+28080:     fn maybe_start_command_correction(
+28176:     fn correction_card_visible(&self) -> bool {
+28183:     fn dismiss_active_correction(&mut self) {
+28196:     fn accept_command_correction(
+28266:     fn toggle_ai_chats(&mut self) -> Task<Message> {
+28282:     fn ai_chats_request_task(&mut self, request: ai_chats::ChatRequest) -> Task<Message> {
+28329:     fn open_ai_ask(&mut self) -> Task<Message> {
+28347:     fn handle_ai_ask_key(
+28386:     fn submit_ai_ask(&mut self) -> Task<Message> {
+28450:     fn selected_block_context_for_ai(
+28462:     fn ai_suggestion_worker_task(&self, generation: u64) -> Task<Message> {
+28509:     fn next_ai_suggestion_generation(&mut self) -> Option<u64> {
+28514:     fn regenerate_ai_suggestion(&mut self, expected_generation: u64) -> Task<Message> {
+28538:     fn ai_suggestion_focusable(&mut self) -> bool {
+28552:     fn insert_ai_suggestion(&mut self, generation: u64) -> Task<Message> {
+28601:     fn task_follow_up_is_current(&self, reference: &agent_task_ui::TaskFollowUpRef) -> bool {
+28625:     fn set_task_panel_open(&mut self, open: bool) {
+28640:     fn toggle_task_panel(&mut self) {
+28655:     fn task_create_from_block(&mut self, session_id: usize, zone_id: u64) {
+28757:     fn task_create_with_provider(
+28805:     fn task_start_native(&mut self, task_id: agent_task::TaskId) {
+28866:     fn agent_launch_in_tab(&mut self, provider: agent_task::AgentProvider) {
+28924:     fn tasks_tick(&mut self) {
+29029:     fn task_terminal_index(
+29046:     fn task_focus_terminal(
+29082:     fn task_open_terminal(&mut self, task_id: agent_task::TaskId) {
+29222:     fn task_start_validation(&mut self, task_id: agent_task::TaskId) {
+29300:     fn sidebar_tasks_view(&self) -> Element<'_, Message> {
+29570:     fn task_card(&self, task: &agent_task::AgentTask) -> Element<'_, Message> {
+29995:     fn agent_panel(&self) -> Element<'_, Message> {
+30379:     fn correction_card(&self) -> Option<Element<'_, Message>> {
+30498:     fn ai_chats_panel(&self) -> Element<'_, Message> {
+30546:     fn ai_chats_chat_page(&self) -> Element<'_, Message> {
+30722:     fn ai_chats_library_page(&self) -> Element<'_, Message> {
+30800:     fn ai_suggestion_card(&self) -> Option<Element<'_, Message>> {
+30938:     fn ai_ask_overlay(&self) -> Element<'_, Message> {
+30975:     fn subscription(&self) -> Subscription<Message> {
+31362: fn slider_row<'a>(
+31380: fn sidebar_scan_task(request: sidebar::DirectoryRequest) -> Task<Message> {
+31402: enum SidebarLoadApply {
+31415: fn apply_sidebar_load_result(
+31453: fn prune_sidebar_context_after_reconcile(
+31524: fn remap_sidebar_path(path: &std::path::Path, remaps: &[SidebarPathRemap]) -> std::path::PathBuf {
+31540: fn remap_sidebar_selection(
+31565: fn filter_match_set(
+31576:     fn walk(
+31604: fn visible_row_list(
+31623: fn selection_toggle(selection: &mut Vec<std::path::PathBuf>, path: &std::path::Path) {
+31633: fn selection_range(
+31652: fn transfer_verb(
+31683: fn sidebar_paste_op(
+31710: fn menu_targets(
+31731: fn copy_path_payload(path: &std::path::Path) -> Option<String> {
+31744: fn sidebar_op_task(
+31792: fn run_sidebar_op(
+31798:     fn push_parent(parents: &mut Vec<std::path::PathBuf>, path: &std::path::Path) {
+32042: fn tab_switcher_target_id(
+32051: fn tab_switcher_filtered(labels: &[String], query: &str) -> Vec<(usize, usize)> {
+32075: fn read_rss_mb() -> Option<f64> {
+32087: fn btn_code(button: MouseButton) -> u8 {
+32097: fn abbreviate_home(path: &str) -> String {
+32103: fn abbreviate_home_with(path: &str, home: Option<&std::path::Path>) -> String {
+32121: fn bound_desktop_notification_pair(title: String, body: String) -> (String, String) {
+32128: fn enqueue_desktop_notification(title: String, body: String) {
+32158: fn agent_command_payload(
+32179: fn osc_5522_packet(metadata: &str, payload: Option<&str>) -> Vec<u8> {
+32192: fn clipboard_5522_response_for_mime(mime_type: &str, data: &[u8]) -> Vec<u8> {
+32207: fn organism_deadline_subscription(
+32219: fn pty_subscription(key: PtySubscriptionKey) -> Subscription<Message> {
+32226: fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Message> {
+32380: enum HangupOutcome {
+32397: fn wait_out_hangup(
+32495: fn organism_modifier_only_key(key: &keyboard::Key) -> bool {
+32517: fn key_to_binding_string(key: &keyboard::Key, mods: keyboard::Modifiers) -> Option<String> {
+32585: fn resolve_keybinding_command(
+32609: struct KeyboardEnhancements {
+32618: fn encode_key(
+32735: fn legacy_function_key_sequence(
+32802: fn kitty_text_key_code(key: &keyboard::Key) -> Option<u32> {
+32822: fn text_key_code(
+32844: fn first_committed_key_char(text: Option<&str>) -> Option<char> {
+32854: fn keyboard_modifier_value(mods: keyboard::Modifiers) -> u8 {
+32874: fn kitty_encode_key(
+32946: fn xterm_modify_other_keys_encode(
+32987:     fn ime_owner_sync_brackets_every_reducer_and_admission_precedes_pty_write() {
+33049:     fn chat_card_fixture(output: &str) -> terminal::TerminalState {
+33058:     fn chat_completed_projection_hits_copy_only_the_proven_card() {
+33119:     fn chat_card_actions_reject_stale_sessions_eviction_and_alt_screen() {
+33154:     fn chat_empty_output_does_not_copy_live_draft_or_execute() {
+33168:     fn chat_read_only_dispatch_and_details_never_insert_into_prompt() {
+33214:     fn chat_running_controls_share_visible_timer_and_validate_generation() {
+33305:     fn chat_exact_cell_gate_rejects_capsule_padding_all_buttons_and_latches_release() {
+33430:     fn chat_rejected_press_returns_before_clipboard_selection_and_app_input() {
+33456:     fn workflow_target_is_captured_at_opening_and_carried_through_both_accept_routes() {
+33492:     fn workflow_args_delivery_keeps_deferred_identity_and_retires_after_attempt() {
+33537:     fn workflow_preflight_uses_recall_sanitizer_and_exact_encoded_admission_size() {
+33562:     fn workflow_picker_opening_scopes_query_state_and_queued_input() {
+33590:     fn picker_backdrop_callback_validates_snapshot_before_dismissing() {
+33618:     fn workflow_args_callbacks_and_widget_tree_share_opening_identity() {
+33655:     fn palette_widgets_bind_row_state_to_items_and_outer_state_to_opening() {
+33673:     fn only_remote_settings_widgets_share_the_editor_retirement_identity() {
+33697:     fn remote_editor_callbacks_validate_retained_identity_before_index_access() {
+33754:     fn remote_editor_opening_replacement_and_hidden_boundaries_retire_callbacks() {
+33807:     fn config_save_feedback_prioritizes_blocked_over_pending_confirmation() {
+33828:     fn settings_save_feedback_uses_existing_dirty_state_and_retry_tick() {
+33863:     fn config_retry_keeps_live_changes_cas_and_manual_recovery_paths() {
+33952:     fn exit_attempts_pending_config_once_after_existing_flushes_without_reload() {
+33987:     fn delayed_history_reflow_refreshes_search_without_revealing_an_old_match() {
+34004:     fn session_close_uses_stable_organism_owner_and_keeps_all_context_caches() {
+34051:     fn organism_motion_reload_and_reset_share_the_settings_boundary() {
+34088:     fn companion_strip_and_tooltip_clip_to_their_allocated_bounds() {
+34108:     fn live_rhythm_explanation_is_shared_by_body_and_tooltip() {
+34119:     fn demo_and_hello_requests_share_the_preview_visibility_guard() {
+34167:     fn paused_demo_stops_only_preview_animation_and_scopes_all_preview_actions() {
+34198:     fn organism_settings_hint_prioritizes_enabled_and_bottom_bar_before_geometry() {
+34216:     fn organism_settings_hint_tracks_shared_width_capabilities_and_preview_distinction() {
+34235:     fn organism_settings_guidance_reads_current_config_without_transient_owner_or_wakes() {
+34273:     fn native_body_uses_shared_context_and_current_owner_without_new_timers() {
+34318:     fn native_body_withdrawals_and_entries_validate_exact_native_snapshot() {
+34370:     fn narrow_reopen_is_configuration_only_and_preserves_live_thresholds() {
+34405:     fn companion_card_header_and_narrow_reopen_do_not_add_live_inputs() {
+34452:     fn inline_organism_mode_expanded_footer_motion_matrix() {
+34484:     fn organism_layout_uses_existing_body_width_and_preserves_compact_threshold() {
+34519:     fn companion_card_admission_tracks_zoom_and_unzoom_in_both_card_modes() {
+34575:     fn companion_card_zoom_admission_uses_rendered_width_and_existing_ownership() {
+34612:     fn narrow_companion_preserves_height_and_stops_maintenance_without_presentable_geometry() {
+34635:     fn shrinking_away_the_glyph_cancels_visit_without_rearming_on_width_restore() {
+34700:     fn narrow_companion_owner_view_and_subscription_share_geometry_without_second_target() {
+34770:     fn expanded_companion_reserves_height_only_for_explicit_config() {
+34789:     fn companion_height_is_stable_and_tiny_terminal_viewports_are_nonnegative() {
+34820:     fn expanded_companion_reuses_one_snapshot_and_shared_geometry() {
+34861:     fn passive_companion_does_not_expand_live_admission_or_add_wakes() {
+34903:     fn companion_chrome_click_is_not_redispatched_as_terminal_mouse_input() {
+34951:     fn companion_toggle_is_separate_config_chrome_without_terminal_or_greeting_actions() {
+34993:     fn live_sprite_detail_keeps_passive_presence_separate_from_live_owner_gate() {
+35015:     fn watch_source_callback_defers_all_watch_mutation_and_restores_scope() {
+35049:     fn watch_source_stamp_is_created_in_both_native_handoff_paths() {
+35067:     fn watch_rhythm_uses_only_visible_running_nonempty_admitted_batches() {
+35101:     fn review_insertion_can_reuse_current_command_validation_without_weakening_snapshot_checks() {
+35131:     fn block_review_layout_is_bounded_and_scrolls_wrapped_chrome_when_compact() {
+35154:     fn history_picker_panel_reserves_window_margins_and_shrinks_for_few_results() {
+35183:     fn block_review_identity_and_payload_fail_closed() {
+35214:     fn desktop_notification_pair_strips_osc_payload_controls() {
+35230:     fn status_bar_segment_strips_cwd_spoofing() {
+35242:     fn home_display_abbreviation_respects_lexical_components() {
+35277:     fn non_utf8_home_keeps_original_path_display() {
+35287:     fn block_menu_preview_strips_command_and_cwd_spoofing() {
+35301:     fn long_block_notification_command_strips_spoofing() {
+35312:     fn osc5522_pending_read_counts_refusals_before_eperm() {
+35346:     fn osc5522_slow_read_precedes_later_mime_read_refusal() {
+35392:     fn osc5522_disabled_completion_keeps_bounded_refusals_on_its_session() {
+35471:     fn osc5522_host_read_is_globally_single_flight() {
+35509:     fn osc52_async_callback_ownership_regressions() {
+35521:     fn osc52_response_byte_cap_is_checked_before_real_base64_encoding() {
+35542:     fn osc52_real_parser_and_encoder_bound_query_bursts_without_private_text() {
+35564:     fn osc52_slow_read_keeps_cross_batch_refusals_in_request_order() {
+35583:     fn osc52_disabled_completion_remains_ordered_and_refusals_are_bounded() {
+35613:     fn the_process_has_exactly_one_exit_and_it_flushes_first() {
+35659:     fn the_last_session_close_flushes_before_it_signals_the_child() {
+35684:     fn a_complete_osc_133_start_mints_the_capability_frost_journals_with() {
+35747:     fn durable_journal_writes_are_gated_on_capture_and_a_start_lifecycle() {
+35797:     fn an_osc_52_clipboard_get_is_started_only_behind_the_read_permission() {
+35814:     fn an_osc_52_read_completion_honors_the_read_permission() {
+35832:     fn osc52_clipboard_writes_are_rate_limited_within_a_window() {
+35858:     fn an_osc_5522_read_completion_honors_the_read_permission() {
+35876:     fn an_osc_5522_clipboard_read_is_started_only_behind_the_read_permission() {
+35909:     fn an_osc_52_clipboard_set_is_applied_only_behind_the_write_permission() {
+35941:     fn every_interactive_shell_is_launched_with_a_valid_jsh_session_identity() {
+36002:     fn frost_source() -> String {
+36011:     fn paren_arguments(source: &str) -> &str {
+36032:     fn braced_block_after(source: &str, opener: &str) -> String {
+36058:     fn sidebar_remote_profile(name: &str, host: &str) -> jterm_core::jsh_remote::RemoteHostConfig {
+36066:     fn stale_sidebar_load_does_not_clear_the_live_hover_target() {
+36107:     fn transactional_navigation_failure_keeps_hover_and_success_commits_once() {
+36162:     fn retired_same_path_load_does_not_clear_the_live_hover_target() {
+36205:     fn root_reconcile_prunes_removed_path_and_delayed_contexts() {
+36274:     fn directory_reconcile_prunes_only_its_own_subtree() {
+36332:     fn sidebar_remote_location_rebinds_only_one_complete_profile_identity() {
+36414:     fn observed_ssh_prefers_one_saved_transport_but_not_an_ambiguous_pair() {
+36443:     fn long_dsw_ssh_and_jsh_wrapper_keep_one_files_target() {
+36482:     fn live_control_path_is_execution_metadata_and_plain_login_stays_plain() {
+36505:     fn stale_sidebar_op_report_cannot_mutate_a_new_transfer_context() {
+36594:     fn combined_ssh_listing_has_no_second_navigation_completion() {
+36621:     fn cancelled_ssh_follow_never_starts_home_or_listing() {
+36635:     fn staged_ssh_follow_never_overrides_newer_file_tree_or_chrome_intent() {
+36737:     fn cut_settlement_is_exact_partial_and_aba_safe() {
+36797:     fn sidebar_menu_paste_rejects_a_new_same_payload_clipboard_intent() {
+36821:     fn sidebar_menu_opened_without_a_clipboard_cannot_adopt_one_later() {
+36834:     fn files_terminal_entry_states_its_real_start_directory() {
+36857:     fn remote_picker_navigation_skips_invalid_and_inactive_drafts() {
+36879:     fn block_badge_treats_wide_continuations_as_occupied() {
+36894:     fn held_transcript_blocks_user_input_and_marks_the_label() {
+36909:     fn block_key_ownership_preserves_running_program_input() {
+36925:     fn terminal_mouse_routing_prefers_finished_history_over_live_app_mode() {
+36948:     fn projected_prompt_navigation_chooses_the_nearest_strict_boundary() {
+36970:     fn search_reveal_fixture() -> SearchRevealFixture {
+37002:     fn search_reveal_expands_only_the_matching_block_and_locates_real_output() {
+37040:     fn search_reveal_declines_stale_query_owner_match_and_projection() {
+37099:     fn search_reveal_control_only_exists_for_a_current_hidden_match() {
+37150:     fn search_reveal_control_is_absent_when_chat_keeps_the_output_visible() {
+37179:     fn search_matches_use_exact_projected_origins_and_fail_closed() {
+37223:     fn moving_from_hidden_search_match_clears_only_location_diagnostic() {
+37235:     fn collapsed_summary_target_is_stable_and_kitty_is_all_or_nothing() {
+37334:     fn projected_zone_sweep_is_linear_and_keeps_padding_unowned() {
+37347:     fn collapsed_summary_is_real_top_only_for_headerless_background() {
+37366:     fn empty_history_row_retains_finished_block_target_without_cell_origin() {
+37429:     fn claimed_block_press_does_not_retarget_after_pty_viewport_shift() {
+37498:     fn stale_or_exhausted_link_projection_revision_fails_closed() {
+37506:     fn terminal_mouse_gestures_are_independent_per_button() {
+37525:     fn terminal_app_mouse_release_fallback_is_paired_and_button_owned() {
+37573:     fn terminal_app_mouse_drag_preserves_the_last_accepted_raw_cell() {
+37624:     fn caret_test_press(row: usize, col: usize) -> MouseInput {
+37646:     fn terminal_click_projection_resize_must_not_retarget_the_prompt() {
+37678:     fn terminal_click_projection_wheel_must_cancel_even_at_scroll_boundary() {
+37716:     fn terminal_click_projection_collapse_expand_modes_and_scroll_cancel() {
+37771:     fn terminal_click_projection_unchanged_refresh_and_other_buttons_keep_caret() {
+37821:     fn terminal_click_projection_real_drag_preserves_wide_combining_and_blank_copy() {
+37889:     fn terminal_click_projection_release_in_another_cell_is_not_a_caret_click() {
+37911:     fn terminal_click_projection_geometry_changes_only_cancel_actual_caret_gestures() {
+37948:     fn terminal_click_projection_change_before_first_drag_preserves_actual_selection_copy() {
+38013:     fn terminal_click_projection_app_owned_gesture_keeps_paired_release() {
+38054:     fn terminal_click_projection_current_prompt_roundtrips_native_and_chat_resizes() {
+38103:     fn block_spacer_projection_keeps_helpers_and_app_release_on_raw_cells() {
+38246:     fn terminal_app_mouse_release_over_history_uses_the_paired_raw_cell() {
+38278:     fn overlay_only_dispatches_origin_app_release() {
+38322:     fn ctrl_link_requires_an_unshifted_single_left_press() {
+38390:     fn unknown_ai_block_status_is_not_presented_as_success() {
+38397:     fn bookmark_toggle_has_no_implicit_latest_target() {
+38411:     fn ai_block_output_goes_through_the_shared_ad_hoc_adapter() {
+38470:     fn pointer_anchored_block_menu_flips_and_clamps_inside_window() {
+38496:     fn block_menu_batch_commands_do_not_depend_on_clicked_background() {
+38507:     fn unavailable_block_bindings_are_classified_for_pty_passthrough() {
+38529:     fn block_clear_confirmation_is_counted_and_fails_closed() {
+38550:     fn block_clear_confirmation_rearms_when_the_live_history_changes() {
+38573:     fn enter_reinput_requires_a_trusted_empty_prompt() {
+38625:     fn ctrl_arrows_preserve_scroll_and_own_selection_edges() {
+38671:     fn selected_command_reinput_never_executes_unbracketed_later_lines() {
+38695:     fn block_prompt_replacement_requires_a_trusted_empty_shell_prompt() {
+38714:     fn agent_prompt_requires_the_shell_to_own_the_foreground_pty() {
+38737:     fn ui_scale_change_resizes_logical_viewport_and_terminal_grid() {
+38778:     fn disabling_the_bottom_bar_returns_its_rows_to_the_grid() {
+38797:     fn app_chrome_shortcuts_keep_palette_help_switcher_and_f12_contract() {
+38835:     fn physical_key_events_match_sidebar_focus_and_resize_binding_names() {
+38871:     fn runtime_and_config_paths_agree_on_non_ascii_case_folding() {
+38907:     fn alt_derives_output_copy_from_a_remapped_copy_unless_explicitly_overridden() {
+38933:     fn pane_tree_snapshot_round_trips() {
+38958:     fn equalize_pane_tree_resets_every_nested_divider() {
+39006:     fn split_tab(id: usize, sessions: &[usize]) -> Tab {
+39023:     fn tab_split_drop_zones_choose_the_nearest_edge_and_keep_a_dead_center() {
+39061:     fn tab_split_commit_revalidates_visible_target_zoom_and_capacity() {
+39105:     fn drag_hover_switch_requires_the_same_target_for_the_full_delay() {
+39169:     fn a_drag_returning_to_its_source_restores_origin_but_a_click_activates() {
+39192:     fn ordinary_tab_moves_to_each_direction_without_duplicating_its_session() {
+39217:     fn invalid_tab_to_split_drops_are_transactional_no_ops() {
+39262:     fn nested_split_pane_promotes_to_one_new_tab_and_collapses_its_source() {
+39302:     fn invalid_pane_promotions_leave_layout_and_id_counter_untouched() {
+39329:     fn background_empty_tab_close_preserves_zoom_and_stable_foreground_owner() {
+39362:     fn zoom_close_policy_preserves_existing_active_pane_and_final_tab_semantics() {
+39381:     fn close_zoom_policy_uses_pre_removal_tab_ids_and_retains_divider_cleanup() {
+39410:     fn closing_a_tab_takes_all_its_sessions_without_disturbing_neighbours() {
+39431:     fn closing_one_pane_leaves_its_tab_and_reindexes_the_rest() {
+39444:     fn inserting_a_session_shifts_every_tab_not_just_the_active_one() {
+39455:     fn a_v1_layout_becomes_one_tab_and_loose_sessions_are_adopted() {
+39478:     fn a_session_claimed_twice_lands_in_exactly_one_tab() {
+39497:     fn discarded_restored_tabs_preserve_the_selected_tab_identity() {
+39512:     fn a_discarded_active_tab_cannot_activate_an_adopted_orphan_by_index() {
+39528:     fn an_out_of_range_active_tab_falls_back_to_the_active_session() {
+39548:     fn restored_tabs_keep_their_menu_state_and_pinned_ones_lead() {
+39588:     fn sorting_pinned_first_is_stable_and_follows_the_active_tab() {
+39618:     fn drag_reorder_clamps_both_sides_of_the_pinned_boundary() {
+39652:     fn a_new_unpinned_tab_never_splits_the_pinned_prefix() {
+39669:     fn a_restored_tab_may_hold_a_single_pane() {
+39677:     fn swapping_two_panes_exchanges_only_them_and_keeps_the_shape() {
+39721:     fn session_last_targets_the_final_index_without_underflow() {
+39731:     fn paste_framing_cannot_be_closed_by_its_own_payload() {
+39760:     fn unbracketed_multiline_paste_stays_verbatim() {
+39775:     fn untrusted_prompt_payloads_strip_control_bytes() {
+39804:     fn an_approved_agent_command_replaces_the_line_and_submits_outside_the_frame() {
+39826:     fn history_recall_replaces_the_pending_line_and_inserts_append() {
+39842:     fn a_sidebar_path_pick_cannot_close_a_frame_or_submit_the_line() {
+39884:     fn tiny_pty_writes_are_coalesced_and_entry_bounded() {
+39908:     fn modified_function_keys_keep_their_xterm_modifier_parameters() {
+39969:     fn legacy_control_keys_preserve_ctrl_and_alt_semantics() {
+40002:     fn kitty_report_all_and_disambiguation_do_not_fall_back_to_plain_text() {
+40064:     fn modify_other_keys_handles_shifted_text_and_level_three() {
+40145:     fn theme_notification_mode_leaves_capital_letters_as_text() {
+40185:     fn kitty_reports_the_shifted_character_when_the_app_asks_for_it() {
+40265:     fn enter_honors_key_location_in_application_keypad_mode() {
+40303:     fn block_search_hit(zone_id: u64) -> block_mode::BlockSearchHit {
+40315:     fn block_search_build_identity_rejects_old_epochs_even_in_the_same_session() {
+40346:     fn block_search_memory_restores_only_bounded_matching_intent() {
+40388:     fn block_search_query_input_refuses_spoofing() {
+40404:     fn block_search_reset_returns_every_intent_control_to_default() {
+40428:     fn block_search_refresh_preserves_identity_then_nearest_rank() {
+40482:     fn block_search_bookmarked_self_removal_keeps_the_closest_original_rank() {
+40520:     fn block_search_manual_refresh_fails_fast_on_errors_and_coalesces_while_busy() {
+40546:     fn block_search_busy_followup_skips_invalid_queries_but_refreshes_all_browsing() {
+40586:     fn block_search_manual_refresh_key_accepts_only_bare_f5() {
+40618:     fn files_f5_refresh_is_scoped_and_never_steals_terminal_input() {
+40651:     fn files_alt_navigation_is_scoped_and_exact() {
+40695:     fn files_shortcut_scope_is_hover_or_keyboard_focus() {
+40704:     fn sidebar_breadcrumbs_are_exact_safe_and_bounded() {
+40716:     fn sidebar_snapshot_age_copy_marks_the_five_minute_boundary() {
+40736:     fn block_search_toggle_repeat_is_consumed_without_closing_the_picker() {
+40776:     fn block_search_bookmark_chord_is_exact_and_latched_until_b_release() {
+40919:     fn block_search_bookmark_plan_rejects_busy_stale_and_unlisted_hits() {
+40973:     fn block_search_bookmark_copy_distinguishes_row_actions_from_selected_shortcut() {
+40996:     fn block_search_bookmarked_empty_state_gives_reachable_next_steps() {
+41073:     fn block_search_continuous_review_advances_only_after_a_live_reveal() {
+41092:     fn history_enter_event(
+41122:     fn history_enter_confirmation_owns_repeats_until_release() {
+41153:     fn workflow_argument_widget_cannot_bypass_owned_enter() {
+41207:     fn workflow_argument_ime_edit_precedes_routed_confirmation() {
+41259:     fn history_ime_commit_updates_the_real_input_before_enter_confirmation() {
+41319:     fn recall_adopts_enter_pressed_before_picker_or_mouse_acceptance() {
+41343:     fn fresh_enter_after_mouse_recall_is_not_swallowed() {
+41357:     fn captured_widget_enter_and_multiple_preheld_locations_stay_owned() {
+41373:     fn inherited_history_enter_repeat_cannot_confirm_a_picker() {
+41390:     fn history_enter_locations_release_independently() {
+41404:     fn only_an_escape_press_survives_the_captured_key_drop() {
+41446:     fn block_search_filter_cycles_through_every_chip_in_both_directions() {
+41471:     fn block_search_rebuild_release_drops_capacity_and_keeps_query_controls() {
+41506:     fn block_search_accept_rejects_loading_stale_or_unlisted_clicks() {
+41538:     fn block_search_zone_version_changes_only_when_finalized_zones_change() {
+41581:     fn block_search_reveal_targets_soft_wrap_and_falls_back_safely() {
+41629:     fn accepted_block_search_output_unfolds_only_its_owner_without_editing_prompt() {
+41695:     fn block_search_unfold_rejects_non_output_removed_evicted_and_stale_projection() {
+41739:     fn block_search_selection_wraps_over_all_hits() {
+41782:     fn block_search_count_label_reports_all_hits_and_the_cap() {
+41823:     fn sidebar_clipboard(
+41840:     fn sidebar_paste_op_builds_one_batch_per_clipboard() {
+41892:     fn batch_transfer_cut_moves_items_and_keeps_failures() {
+41967:     fn batch_transfer_cancel_stops_the_remaining_items() {
+42003:     fn batch_delete_continues_past_errors_and_summarizes() {
+42032:     fn rename_reports_source_only_after_backend_success() {
+42074:     fn confirmed_directory_move_remaps_selection_and_anchor_by_path_component() {
+42098:     fn selection_toggle_and_range_follow_the_visible_order() {
+42123:     fn menu_targets_the_selection_when_clicked_inside_it() {
+42142:     fn loaded_sidebar_tree(collapse_a: bool) -> (sidebar::Sidebar, std::path::PathBuf) {
+42168:     fn filter_match_set_keeps_matches_and_ancestors() {
+42188:     fn visible_row_list_filters_and_force_expands_ancestors() {
+42217:     fn copy_path_payload_is_the_plain_full_path() {
+42238:     fn transfer_verb_names_the_transport() {
+42296:     fn drop_fixture() -> std::path::PathBuf {
+42307:     fn plan_drop_builds_per_item_plan_with_collision_flags() {
+42333:     fn plan_drop_refuses_bad_bursts_wholesale() {
+42371:     fn drop_item_size_is_bounded_and_never_follows_symlinked_dirs() {
+42397:     fn import_runs_items_sequentially_and_summarizes() {
+42460:     fn transient_pty_hangup_waits_for_real_exit_and_recovers_output() {
+42566:     fn tab_switcher_query_drops_controls_and_truncates_on_a_char_boundary() {
+42608:     fn ctrl_non_ascii_keys_never_alias_ascii_control_bytes() {
+42645:     fn ctrl_ascii_keys_keep_their_legacy_control_mapping() {
+42698:     fn activity_facts_reconcile_only_fresh_active_output_after_context_updates() {
+42767:     fn shared_attention_coordinates_identity_without_accepting_before_input() {
+42814:     fn organism_pointer_offscreen_release_retires_held_buttons() {
+42876:     fn paste_feedback_uses_writer_outcome_and_does_not_double_report_reinput() {
+42899:     fn organism_paste_attempt_is_target_gated_before_queue_admission() {
+42923:     fn narrow_explicit_pointer_observation_keeps_release_cleanup_after_cancellation() {
+43024:     fn palette_greeting_uses_opening_target_after_close_and_presentable_admission() {
+43074:     fn standalone_modifiers_never_encode_payload_across_keyboard_protocols() {
+43125:     fn greeting_binding_classifies_before_restoring_retreat_and_uses_shared_admission() {
+43188:     fn palette_navigation_restores_only_its_own_retreat_after_custom_binding_precedence() {
+43243:     fn hover_candidate_cue_stays_inside_glyph_slot_and_uses_existing_admission() {
+43270:     fn live_hover_is_passive_owner_bound_and_deadline_driven() {
+43319:     fn organism_preview_retreat_and_completion_use_one_shot_deadlines() {
+43355:     fn completion_expiry_wake_uses_the_current_eligible_observation_owner() {
+43402:     fn organism_observation_reuses_terminal_input_ownership() {
+43432:     fn modal_ai_surfaces_gate_terminal_input_and_mouse_ownership() {
+43484:     fn direct_session_save_failure_remains_eligible_for_periodic_retry() {
+43557:     fn pane_focus_and_ratio_changes_dirty_periodic_session_snapshots() {
+43599:     fn all_tasks_dock_entry_points_relayout_and_release_files_focus() {
+43639:     fn terminal_mouse_release_retires_only_the_matching_owner() {
+43681:     fn tab_switcher_targets_tab_ids_when_split_and_strip_order_diverge() {
+43699:     fn tab_switcher_render_and_close_actions_keep_tab_semantics() {
+43751:     fn audit_transfer_ui(
+43763:     fn sidebar_old_completion_preserves_new_cancel_owner() {
+43774:     fn sidebar_owner_completion_does_not_depend_on_navigation_context() {
+43785:     fn sidebar_no_owner_completion_preserves_live_transfer() {
+43793:     fn sidebar_normal_owner_completion_retires_once() {
+43802:     fn sidebar_transfer_completion_and_drop_planner_keep_owner_wiring() {
+43880:     fn test_drop_intent(target: &str) -> std::sync::Arc<SidebarDropIntent> {
+43885:     fn drop_keeps_first_destination_when_pointer_moves_during_debounce() {
+43900:     fn cancelled_drop_callbacks_cannot_consume_a_new_same_context_burst() {
+43918:     fn consecutive_drop_bursts_keep_independent_planning_and_destinations() {
+43936:     fn canceled_size_walks_keep_admission_slots_until_their_results_arrive() {
+43961:     fn drop_requires_initial_target_and_current_tree_host_and_session() {
+43974:     fn remote_drop_does_not_probe_the_local_destination_namespace() {
+44004:     fn remote_picker_snapshot_rebinds_only_a_unique_unchanged_profile() {
+44032:     fn remote_picker_dismissal_and_reopening_retire_callback_identity() {
+44054:     fn remote_picker_snapshot_and_current_active_limits_both_apply() {
+44086:     fn remote_picker_keyboard_rows_and_dispatch_share_snapshot_identity() {
+44124:     fn block_menu_shortcut_commands_match_equivalent_actions_only() {
+44155:     fn block_menu_shortcut_labels_use_live_bindings_without_default_fallback() {
+44173:     fn block_menu_keyboard_traverses_only_renderable_actions_in_order() {
+44238:     fn block_menu_focus_never_retargets_a_removed_action() {
+44264:     fn block_menu_enter_cannot_repeat_into_the_shell_or_a_confirmation() {
+44277:     fn block_menu_keyboard_dispatch_and_render_share_availability_and_modal_ownership() {
+44320:     fn review_and_recall_menu_labels_distinguish_confirmation_from_direct_fill() {
+44346:     fn keyboard_menu_requires_a_retained_selection_and_never_claims_composition() {
+44366:     fn keyboard_menu_open_preserves_selection_prompt_and_normal_key_fallback() {
+44409:     fn keyboard_menu_mode_matrix_keeps_chat_and_normal_on_the_terminal_path() {
+44458:     fn revoke_aborts_task_clears_owner_and_preserves_ordered_refusals() {
+44502:     fn every_config_replacement_revokes_before_permission_change() {
+44528:     fn revoke_regrant_rejects_already_queued_old_generation() {
+44554:     fn close_replacement_and_reused_fd_never_match_another_session() {
+44573:     fn source_keeps_ownership_check_before_both_completion_side_effects() {
+44594:     fn repaired(preservation: PreservationOutcome) -> StartupRecovery {
+44602:     fn clean_startup_has_no_banner_or_write_block() {
+44612:     fn fallback_success_and_failure_keep_the_recovery_report() {
+44630:     fn dismiss_retains_facts_and_never_unblocks_saving() {
+44651:     fn attaching_recovery_cannot_clear_an_existing_write_block() {
+44661:     fn banner_height_is_bounded_and_independent_of_repair_count() {
+44672:     fn source_preserves_loaded_bytes_before_either_fallback() {
+44704:     fn source_banner_is_in_layout_and_dismiss_preserves_permissions() {
+44759:     fn leaf(session: usize) -> PaneTreeSnapshot {
+44763:     fn split(sessions: &[usize]) -> PaneTreeSnapshot {
+44771:     fn tab(tree: PaneTreeSnapshot, focus: Option<usize>) -> TabSnapshot {
+44782:     fn snapshot(tabs: Vec<TabSnapshot>) -> SessionsSnapshot {
+44792:     fn original_invalid_and_duplicate_references_are_not_hidden_by_pruning() {
+44805:     fn cross_tab_ownership_reports_once_and_keeps_existing_restore_behavior() {
+44836:     fn explicit_invalid_focus_reports_but_absent_focus_is_normal() {
+44847:     fn legacy_migration_orphan_adoption_and_spawn_remapping_are_silent() {
+44862:     fn rejected_conversion_reports_and_still_uses_legacy_fallback() {
+44890:     fn reference_only_repair_preserves_exact_loaded_bytes_before_any_save() {
+44933:     fn source_preflight_precedes_preservation_and_spawn_result_pruning() {

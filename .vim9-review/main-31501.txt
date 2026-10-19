@@ -1,0 +1,300 @@
+                }
+            }
+    }) {
+        *dialog = None;
+    }
+    if delete_confirm.as_ref().is_some_and(|state| {
+        state.generation != generation
+            || state
+                .paths
+                .iter()
+                .any(|path| is_in_reconciled_tree(path) && !sidebar.contains_path(path))
+    }) {
+        *delete_confirm = None;
+    }
+    if hover_removed || *drop_debounce_generation != Some(generation) {
+        drop_burst.clear();
+        *drop_debounce_generation = None;
+        *drop_hint = false;
+    }
+}
+
+/// Rewrite a path through the most specific backend-confirmed move. Component
+/// prefix matching avoids textual collisions such as `/tmp/a` and `/tmp/ab`.
+fn remap_sidebar_path(path: &std::path::Path, remaps: &[SidebarPathRemap]) -> std::path::PathBuf {
+    remaps
+        .iter()
+        .filter_map(|remap| {
+            path.strip_prefix(&remap.from)
+                .ok()
+                .map(|suffix| (remap.from.components().count(), remap.to.join(suffix)))
+        })
+        .max_by_key(|(components, _)| *components)
+        .map(|(_, path)| path)
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// Keep selection identity stable across successful rename/move operations.
+/// Duplicates can arise when a batch contains overlapping sources, so retain
+/// the first occurrence just like ordinary insertion-ordered selection.
+fn remap_sidebar_selection(
+    selection: &mut Vec<std::path::PathBuf>,
+    selection_anchor: &mut Option<std::path::PathBuf>,
+    remaps: &[SidebarPathRemap],
+) {
+    if remaps.is_empty() {
+        return;
+    }
+    let mut rewritten = Vec::with_capacity(selection.len());
+    for path in selection.iter() {
+        let path = remap_sidebar_path(path, remaps);
+        if !rewritten.contains(&path) {
+            rewritten.push(path);
+        }
+    }
+    *selection = rewritten;
+    if let Some(anchor) = selection_anchor.as_mut() {
+        *anchor = remap_sidebar_path(anchor, remaps);
+    }
+}
+
+/// The set of paths a filter query shows: rows whose name contains the query
+/// (case-insensitive), plus every ancestor of a match (ancestors are
+/// force-expanded while filtering). `None` for an empty query — identity, no
+/// filtering. Pure over the loaded tree; never scans the filesystem.
+fn filter_match_set(
+    root: &sidebar::FileTreeNode,
+    query: &str,
+) -> Option<std::collections::BTreeSet<std::path::PathBuf>> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return None;
+    }
+    if query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(&query) {
+        return Some(std::collections::BTreeSet::new());
+    }
+    fn walk(
+        node: &sidebar::FileTreeNode,
+        query: &str,
+        ancestors: &mut Vec<std::path::PathBuf>,
+        set: &mut std::collections::BTreeSet<std::path::PathBuf>,
+    ) {
+        for child in &node.children {
+            let hits = child.name.to_lowercase().contains(query);
+            if hits {
+                set.extend(ancestors.iter().cloned());
+                set.insert(child.path.clone());
+            }
+            if child.is_dir && !child.children.is_empty() {
+                ancestors.push(child.path.clone());
+                walk(child, query, ancestors, set);
+                ancestors.pop();
+            }
+        }
+    }
+    let mut set = std::collections::BTreeSet::new();
+    walk(root, &query, &mut Vec::new(), &mut set);
+    Some(set)
+}
+
+/// The rows the files panel shows under `node`, in display order: expanded
+/// directories recursed; while a filter is active, only the match set and
+/// force-expanded ancestors appear. Shared by rendering, range selection, and
+/// the menu's target list so all three agree on "visible order".
+fn visible_row_list(
+    node: &sidebar::FileTreeNode,
+    filter: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
+    out: &mut Vec<(std::path::PathBuf, bool)>,
+) {
+    for child in &node.children {
+        if let Some(set) = filter {
+            if !set.contains(&child.path) {
+                continue;
+            }
+        }
+        out.push((child.path.clone(), child.is_dir));
+        if child.is_dir && (child.expanded || filter.is_some()) {
+            visible_row_list(child, filter, out);
+        }
+    }
+}
+
+/// Toggle one path in the (insertion-ordered) selection.
+fn selection_toggle(selection: &mut Vec<std::path::PathBuf>, path: &std::path::Path) {
+    if let Some(index) = selection.iter().position(|entry| entry == path) {
+        selection.remove(index);
+    } else {
+        selection.push(path.to_path_buf());
+    }
+}
+
+/// The inclusive range between `anchor` and `target` within the visible row
+/// order — shift-click semantics. Empty when either endpoint is off-list.
+fn selection_range(
+    rows: &[(std::path::PathBuf, bool)],
+    anchor: &std::path::Path,
+    target: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let anchor_index = rows.iter().position(|(path, _)| path == anchor);
+    let target_index = rows.iter().position(|(path, _)| path == target);
+    let (Some(from), Some(to)) = (anchor_index, target_index) else {
+        return Vec::new();
+    };
+    let (from, to) = if from <= to { (from, to) } else { (to, from) };
+    rows[from..=to]
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// The menu/notice verb for a paste: copy/move within one location,
+/// download/upload (or a relay) across locations.
+fn transfer_verb(
+    src_loc: &remote_fs::FsLocation,
+    dst_loc: &remote_fs::FsLocation,
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    cut: bool,
+) -> String {
+    let same_remote = src_loc.is_remote()
+        && dst_loc.is_remote()
+        && remote_fs::same_files_location(src_loc, dst_loc, hosts);
+    let transport = match (src_loc.is_remote(), dst_loc.is_remote()) {
+        (false, true) => "upload",
+        (true, false) => "download",
+        (true, true) if !same_remote => "relay",
+        _ => return if cut { "move" } else { "copy" }.to_string(),
+    };
+    if cut {
+        format!("{transport} + delete")
+    } else {
+        transport.to_string()
+    }
+}
+
+/// Turn the clipboard into the op a paste should run. Same-location keeps the
+/// copy/move semantics; cross-location becomes a download, an upload, or a
+/// remote→remote relay, with a cut meaning transfer-then-delete-source.
+/// Turn the clipboard into the op a paste should run: one batch job over the
+/// clipboard's items, dst = target_dir.join(name) per item. Same-location
+/// copies/renames and cross-location transfers share the sequential
+/// per-item machinery (per-item AlreadyExists refusal, continue past
+/// failures, summary at the end); a cut deletes a source only after its own
+/// copy landed.
+fn sidebar_paste_op(
+    clipboard: &FsClipboard,
+    target_dir: &std::path::Path,
+) -> Result<SidebarOp, String> {
+    let mut items = Vec::with_capacity(clipboard.items.len());
+    for (src, is_dir) in &clipboard.items {
+        let Some(dst) = remote_fs::paste_destination(target_dir, src) else {
+            return Err("A clipboard source has no file name to paste".to_string());
+        };
+        items.push(DropItem {
+            src: src.clone(),
+            dst,
+            is_dir: *is_dir,
+            error: None,
+        });
+    }
+    Ok(SidebarOp::BatchTransfer {
+        src_loc: clipboard.loc.clone(),
+        items,
+        cut: clipboard.cut,
+        verb: if clipboard.cut { "Moved" } else { "Pasted" },
+    })
+}
+
+/// The rows a row-opened menu applies to: the selection (in visible order)
+/// when the click landed inside a multi-row selection, otherwise `None` and
+/// the caller collapses the selection to the clicked row.
+fn menu_targets(
+    selection: &[std::path::PathBuf],
+    visible: &[(std::path::PathBuf, bool)],
+    clicked: &std::path::Path,
+) -> Option<Vec<(std::path::PathBuf, bool)>> {
+    if selection.len() <= 1 || !selection.iter().any(|entry| entry == clicked) {
+        return None;
+    }
+    Some(
+        visible
+            .iter()
+            .filter(|(path, _)| selection.contains(path))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// The text "Copy Path" puts on the host clipboard: the row's full path,
+/// lossy-decoded, exactly as the tree shows it (remote rows carry no prefix).
+/// `None` when the path still contains replacement, control, or visual-spoofing
+/// characters after decode.
+fn copy_path_payload(path: &std::path::Path) -> Option<String> {
+    let text = path.to_string_lossy();
+    if crate::block_mode::clipboard_multiline_is_unsafe(&text) {
+        None
+    } else {
+        Some(text.into_owned())
+    }
+}
+
+/// Run one sidebar file operation off the UI thread. The location and hosts
+/// snapshot travel with the op, so a config edit or location switch made
+/// while it runs cannot redirect it to another machine. Transfers also carry
+/// their progress handle (byte counter + cancellation flag).
+fn sidebar_op_task(
+    context_epoch: u64,
+    location: remote_fs::FsLocation,
+    hosts: Vec<jterm_core::jsh_remote::RemoteHostConfig>,
+    op: SidebarOp,
+    progress: Option<std::sync::Arc<remote_fs::TransferProgress>>,
+    consumed_clipboard_id: Option<u64>,
+) -> Task<Message> {
+    let location_profile = match &location {
+        remote_fs::FsLocation::Local => None,
+        remote_fs::FsLocation::Remote(index) => config::validate_remote_host_at(&hosts, *index)
+            .ok()
+            .cloned(),
+        remote_fs::FsLocation::Transient(profile) => Some(profile.clone()),
+    };
+    Task::perform(
+        async move {
+            let outcome = run_sidebar_op(&location, &hosts, &op, progress.as_ref());
+            SidebarOpReport {
+                context_epoch,
+                transfer_owner: progress,
+                location: outcome.location,
+                location_profile,
+                consumed_clipboard_id,
+                consumed_paths: outcome.consumed_paths,
+                affected_parents: outcome.affected_parents,
+                path_remaps: outcome.path_remaps,
+                warning: outcome.warning.map(|(warning, neutral)| {
+                    (
+                        jterm_core::review_input::safe_inline_display(&warning, 512),
+                        neutral,
+                    )
+                }),
+                cancelled: outcome.cancelled,
+                result: outcome.result.map_err(|error| {
+                    jterm_core::review_input::safe_inline_display(&error.to_string(), 256)
+                }),
+            }
+        },
+        |report| Message::SidebarOpFinished(Box::new(report)),
+    )
+}
+
+/// Execute one op and report
+/// `(changed_location, warning, cancelled, result, invalidated_sources)`.
+/// Factored out of the task so the ordering (transfer first, delete source
+/// after; cancel is neutral and only counts when the transfer failed) is
+/// testable headlessly.
+fn run_sidebar_op(
+    location: &remote_fs::FsLocation,
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    op: &SidebarOp,
+    progress: Option<&std::sync::Arc<remote_fs::TransferProgress>>,
+) -> SidebarWorkerOutcome {
+    fn push_parent(parents: &mut Vec<std::path::PathBuf>, path: &std::path::Path) {
+        if let Some(parent) = path.parent().map(std::path::Path::to_path_buf) {
+            if !parents.contains(&parent) {

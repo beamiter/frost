@@ -1,0 +1,300 @@
+        assert!(
+            !tab_switcher_filtered(&["build".into(), "tab two".into()], &state.query).is_empty()
+        );
+        state.set_query("tab\u{fffd}");
+        assert_eq!(state.query, "tab");
+    }
+    #[test]
+    fn ctrl_non_ascii_keys_never_alias_ascii_control_bytes() {
+        for character in ['ţ', 'Ť', 'š', '☃', '中', 'é'] {
+            let text = character.to_string();
+            let key = keyboard::Key::Character(text.clone().into());
+            for modifiers in [
+                keyboard::Modifiers::CTRL,
+                keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+            ] {
+                assert_eq!(
+                    encode_key(
+                        &key,
+                        keyboard::Location::Standard,
+                        modifiers,
+                        Some(&text),
+                        false,
+                        KeyboardEnhancements::default()
+                    ),
+                    Some(text.as_bytes().to_vec()),
+                    "Ctrl Unicode key {character:?} must not become an ASCII control"
+                );
+                assert_eq!(
+                    encode_key(
+                        &key,
+                        keyboard::Location::Standard,
+                        modifiers,
+                        None,
+                        false,
+                        KeyboardEnhancements::default()
+                    ),
+                    None,
+                    "A non-ASCII key without committed text must not invent a control byte"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_ascii_keys_keep_their_legacy_control_mapping() {
+        for character in 'a'..='z' {
+            for case in [character, character.to_ascii_uppercase()] {
+                let key = keyboard::Key::Character(case.to_string().into());
+                let control = (character as u8) & 0x1f;
+                assert_eq!(
+                    encode_key(
+                        &key,
+                        keyboard::Location::Standard,
+                        keyboard::Modifiers::CTRL,
+                        None,
+                        false,
+                        KeyboardEnhancements::default()
+                    ),
+                    Some(vec![control])
+                );
+                assert_eq!(
+                    encode_key(
+                        &key,
+                        keyboard::Location::Standard,
+                        keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+                        None,
+                        false,
+                        KeyboardEnhancements::default()
+                    ),
+                    Some(vec![0x1b, control])
+                );
+            }
+        }
+        for (character, control) in [
+            ('@', 0),
+            ('[', 27),
+            ('\\', 28),
+            (']', 29),
+            ('^', 30),
+            ('_', 31),
+            (' ', 0),
+        ] {
+            assert_eq!(
+                encode_key(
+                    &keyboard::Key::Character(character.to_string().into()),
+                    keyboard::Location::Standard,
+                    keyboard::Modifiers::CTRL,
+                    None,
+                    false,
+                    KeyboardEnhancements::default()
+                ),
+                Some(vec![control])
+            );
+        }
+    }
+
+    #[test]
+    fn activity_facts_reconcile_only_fresh_active_output_after_context_updates() {
+        let source = include_str!("main.rs");
+        let output = source
+            .split_once("            Message::PtyOutput(id, fd, data, watch_stamp) => {")
+            .unwrap()
+            .1
+            .split_once("                self.last_ingest_us =")
+            .unwrap()
+            .0;
+        assert!(output.contains("session.id == id && session.master_fd == fd"));
+        assert!(output.contains("if is_active_output {"));
+        assert!(
+            output.find("sess.terminal.process_batch(&data)").unwrap()
+                < output
+                    .find("self.organism.poll_live_greeting(Some(id), facts)")
+                    .unwrap()
+        );
+        assert!(
+            output.find("self.organism.completed_event(").unwrap()
+                < output
+                    .find("self.organism.poll_live_greeting(Some(id), facts)")
+                    .unwrap()
+        );
+        assert!(
+            output
+                .find(".batch_finished(id, sess.terminal.is_command_running())")
+                .unwrap()
+                < output
+                    .find("self.organism.poll_live_greeting(Some(id), facts)")
+                    .unwrap()
+        );
+        let facts = source
+            .split_once("    fn organism_attention_facts(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_hover_eligible(")
+            .unwrap()
+            .0;
+        assert!(facts.contains("self.organism_interaction_eligible()"));
+        assert!(
+            facts.find("session.terminal.is_command_running()").unwrap()
+                < facts
+                    .find("session.terminal.live_activity_facts().knowledge()")
+                    .unwrap()
+        );
+        assert!(facts.contains("else if eligible"));
+        let terminal = include_str!("terminal.rs");
+        let getter = terminal
+            .split_once("    pub(crate) fn live_activity_facts(")
+            .unwrap()
+            .1
+            .split_once("    pub fn agent_prompt_status(")
+            .unwrap()
+            .0;
+        for field in [
+            "agent_prompt_input_tainted",
+            "idle_prompt_input_dirty",
+            "prompt_submission_pending",
+            "prompt_cancel_pending",
+            "pending_prompt_typeahead",
+            "armed_agent_execution",
+            "active_agent_execution",
+        ] {
+            assert!(getter.contains(field));
+        }
+        assert!(getter.contains(".with_prompt_ready(|| self.agent_prompt_status().is_ready())"));
+    }
+
+    #[test]
+    fn shared_attention_coordinates_identity_without_accepting_before_input() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let entry = source
+            .split_once("    fn update(&mut self, message: Message)")
+            .unwrap()
+            .1
+            .split_once("        match message {")
+            .unwrap()
+            .0;
+        assert!(entry.contains("self.sync_organism_attention_owner();"));
+        assert!(!entry.contains("poll_live_greeting"));
+        let tick = source
+            .split_once("            Message::OrganismTick(cause) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SetBottomBar")
+            .unwrap()
+            .0;
+        assert!(tick.contains("self.sessions.get(self.active).map(|session| session.id)"));
+        assert!(tick.contains(".poll_live_greeting("));
+        let edges = source
+            .split_once("            Message::OrganismHoverEnter(id, epoch) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::OrganismPointerButton")
+            .unwrap()
+            .0;
+        assert!(edges.contains("self.organism.enter_live_greeting("));
+        assert!(edges.contains(".exit_live_greeting(id, epoch, facts)"));
+        let view = source
+            .split_once("// One core offer binds both edges before the next view rebuild.")
+            .unwrap()
+            .1
+            .split_once("                area.into()")
+            .unwrap()
+            .0;
+        assert!(view.contains("live_greeting_offer(id)"));
+        assert!(view.contains("on_enter(Message::OrganismHoverEnter(id, ticket))"));
+        assert!(view.contains("live_greeting_exit_reference(id)"));
+        assert!(view.contains("on_exit(Message::OrganismHoverExit(id, ticket))"));
+        let adapter = include_str!("organism_hover.rs");
+        assert!(!adapter.contains("GentleInteraction"));
+        assert!(!adapter.contains("struct LiveGreeting"));
+        assert!(adapter.contains("update_pressed_button"));
+    }
+
+    #[test]
+    fn organism_pointer_offscreen_release_retires_held_buttons() {
+        use iced::mouse::{Button, Event};
+        for cleanup in [Event::ButtonReleased(Button::Left), Event::CursorLeft] {
+            let mut buttons = Vec::new();
+            assert!(organism_pointer_observation_needed(
+                true, true, false, false, None
+            ));
+            let Some(Message::OrganismPointerButton(button, pressed)) = organism_pointer_event(
+                iced::Event::Mouse(Event::ButtonPressed(Button::Left)),
+                true,
+            ) else {
+                panic!("visible press must be observed")
+            };
+            organism_hover::update_pressed_button(&mut buttons, button, pressed);
+            // Scrolling both status and body offscreen must retain cleanup.
+            assert!(organism_pointer_observation_needed(
+                false,
+                true,
+                false,
+                !buttons.is_empty(),
+                None
+            ));
+            assert!(organism_pointer_event(
+                iced::Event::Mouse(Event::ButtonPressed(Button::Right)),
+                false
+            )
+            .is_none());
+            match organism_pointer_event(iced::Event::Mouse(cleanup), false) {
+                Some(Message::OrganismPointerButton(button, pressed)) => {
+                    organism_hover::update_pressed_button(&mut buttons, button, pressed)
+                }
+                Some(Message::OrganismPointerLeft) => buttons.clear(),
+                _ => panic!("offscreen cleanup must be observed"),
+            }
+            assert!(
+                buttons.is_empty(),
+                "returning body must not be blocked by a stale press"
+            );
+            assert!(!organism_pointer_observation_needed(
+                false,
+                true,
+                true,
+                !buttons.is_empty(),
+                None
+            ));
+            assert!(organism_pointer_observation_needed(
+                true,
+                true,
+                false,
+                !buttons.is_empty(),
+                None
+            ));
+        }
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let subs = source.split_once("    fn subscription(&self)").unwrap().1;
+        assert!(subs.contains("if organism_pointer_observation_needed(\n            live_visible,"));
+    }
+
+    #[test]
+    fn paste_feedback_uses_writer_outcome_and_does_not_double_report_reinput() {
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let writer = source
+            .split_once("    fn write_paste_to_session(")
+            .unwrap()
+            .1
+            .split_once("    /// History picker key handling.")
+            .unwrap()
+            .0;
+        assert!(writer.contains("paste_feedback::encode_and_write("));
+        assert!(writer.contains("sess.can_queue_user_bytes(bytes.len())"));
+        assert!(writer.contains("sess.write_pty(bytes)"));
+        assert!(writer.contains("if let Some(message) = outcome.feedback()"));
+        assert!(source.contains(
+            "if self.write_paste_to_session(session_id, &commands, block_reinput_policy(), true)\n            == paste_feedback::PasteOutcome::Written"
+        ));
+        assert!(!source.contains("let multiline_fallback ="));
+    }
+
+    #[test]
+    fn organism_paste_attempt_is_target_gated_before_queue_admission() {
+        let source = include_str!("main.rs")

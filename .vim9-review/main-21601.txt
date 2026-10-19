@@ -1,0 +1,300 @@
+            .center_y(Length::Fill);
+        widget_identity_scope::scope(
+            state.widget_identity(),
+            stack![Element::from(dismiss), Element::from(centered)],
+        )
+    }
+
+    /// One workflow's argument form (anvil's parameter dialog): description,
+    /// the command template for review, one input per declared argument
+    /// prefilled with its default, and explicit Insert/Cancel actions.
+    fn workflow_args_view(
+        &self,
+        form: &workflow_picker::WorkflowArgsState,
+    ) -> Element<'_, Message> {
+        let header = row![
+            self.popup_text(format!(
+                "Workflow: {}",
+                crate::workflow_picker::bound_workflow_feedback(&form.workflow().name)
+            ))
+            .size(self.effective_font_size()),
+            Space::new().width(Length::Fill),
+            button(self.popup_text("✕").size(self.effective_font_size()))
+                .style(button::secondary)
+                .on_press(Message::WorkflowArgClose(form.identity())),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
+        let mut card = column![header].spacing(8);
+        if !form.workflow().description.is_empty() {
+            card = card.push(
+                self.popup_text(crate::workflow_picker::bound_workflow_feedback(
+                    form.workflow().description.clone(),
+                ))
+                .size(self.effective_font_size())
+                .wrapping(text::Wrapping::Word)
+                .color(self.c_text_dim()),
+            );
+        }
+        card = card.push(
+            self.popup_text(crate::review_text::visible_bounded(
+                &form.workflow().command,
+                4 * 1024,
+            ))
+            .size(self.effective_font_size())
+            .font(iced::Font::MONOSPACE)
+            .wrapping(text::Wrapping::Word),
+        );
+
+        let missing = form.missing();
+        for (index, arg) in form.workflow().args.iter().enumerate() {
+            let name = crate::workflow_picker::bound_workflow_feedback(&arg.name);
+            // The first field has a stable focus id; Tab traverses the rest.
+            let input = workflow_argument_input(form.identity(), index, &name, form.value(index))
+                .size(self.effective_font_size());
+            let label = crate::workflow_picker::bound_workflow_arg_label(
+                &arg.name,
+                &arg.description,
+                missing.contains(&arg.name.as_str()),
+            );
+            let field = row![
+                input,
+                button(self.popup_text("Reset").size(self.effective_font_size()))
+                    .style(button::secondary)
+                    .on_press(Message::WorkflowArgReset(form.identity(), index)),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            card = card.push(
+                container(
+                    column![
+                        self.popup_text(label)
+                            .size(self.effective_font_size())
+                            .color(self.c_text_dim()),
+                        field
+                    ]
+                    .spacing(2),
+                )
+                .id(workflow_focus::row_id(index)),
+            );
+        }
+
+        if let Some(feedback) = form.feedback.as_deref() {
+            card = card.push(
+                container(
+                    self.popup_text(crate::workflow_picker::bound_workflow_feedback(feedback))
+                        .size(self.effective_font_size())
+                        .style(text::danger),
+                )
+                .id(workflow_focus::ERROR_ID),
+            );
+        }
+
+        let actions = row![
+            button(
+                self.popup_text("Insert command")
+                    .size(self.effective_font_size())
+            )
+            .style(button::primary)
+            .on_press_maybe(
+                (!form.is_pending()).then(|| Message::WorkflowArgSubmit(form.identity()))
+            ),
+            button(self.popup_text("Cancel").size(self.effective_font_size()))
+                .style(button::secondary)
+                .on_press(Message::WorkflowArgClose(form.identity())),
+        ]
+        .spacing(6);
+        let panel_size = workflow_panel_size(
+            self.win_size,
+            160.0 + form.workflow().args.len() as f32 * 64.0,
+        );
+        // The legal 64-argument form must never squeeze its fields and actions
+        // into zero-height rows. Reading content scrolls; actions stay visible.
+        let body = column![
+            scrollable(card)
+                .id(workflow_focus::SCROLL_ID)
+                .spacing(6)
+                .height(Length::Fill),
+            actions
+        ]
+        .spacing(8);
+        let panel = container(body)
+            .id(workflow_focus::FORM_ID)
+            .width(Length::Fixed(panel_size.width))
+            .height(Length::Fixed(panel_size.height))
+            .padding(12)
+            .style(self.popup_style());
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::WorkflowArgClose(form.identity()));
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        widget_identity_scope::scope(
+            form.identity().widget_identity(),
+            stack![Element::from(dismiss), Element::from(centered)],
+        )
+    }
+
+    /// Ctrl+Shift+H persisted-command history picker overlay (palette-style).
+    /// Enter/click types the command into the active pane; nothing executes.
+    fn history_picker_view(
+        &self,
+        state: &history_picker::HistoryPickerState,
+    ) -> Element<'_, Message> {
+        let filtered = state.shared_filtered();
+        let panel_size = history_picker_panel_size(self.win_size, filtered.len());
+        let panel_width = panel_size.width;
+        let panel_height = panel_size.height;
+        let compact = panel_width < 440.0;
+        let scroll_panel = self.win_size.height < 244.0;
+
+        let query: Element<'_, Message> = text_input("Recall a command…", state.query())
+            .style(self.popup_input_style())
+            .font(self.mono)
+            .id(HISTORY_PICKER_INPUT_ID.clone())
+            .on_input(Message::HistoryPickerInput)
+            .size(self.effective_font_size())
+            .into();
+        let query_line = row![self.popup_text("↺"), query]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+
+        use history_picker::{HistoryFilterAction as Filter, HistoryStatus};
+        let directory = tooltip(
+            button(self.popup_text(if compact {
+                "Directory"
+            } else {
+                "This directory"
+            }))
+            .on_press_maybe(
+                state
+                    .current_directory()
+                    .map(|_| Message::HistoryPickerFilter(Filter::ToggleDirectory)),
+            )
+            .padding([3, 7])
+            .style(if state.directory_only() {
+                button::primary
+            } else {
+                button::secondary
+            }),
+            container(self.popup_text(match state.current_directory() {
+                Some(cwd) => format!(
+                    "{} (Ctrl+D)",
+                    history_picker::display_cwd(&abbreviate_home(cwd))
+                ),
+                None => "Current directory unavailable".to_string(),
+            }))
+            .padding(6)
+            .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        let status_button = |label: &str, status: HistoryStatus| {
+            button(self.popup_text(label.to_string()))
+                .on_press(Message::HistoryPickerFilter(Filter::SetStatus(status)))
+                .padding([3, 7])
+                .style(if state.status() == status {
+                    button::primary
+                } else {
+                    button::secondary
+                })
+        };
+        let unique = button(self.popup_text("Unique"))
+            .on_press(Message::HistoryPickerFilter(Filter::ToggleUnique))
+            .padding([3, 7])
+            .style(if state.unique() {
+                button::primary
+            } else {
+                button::secondary
+            });
+        let reset = button(self.popup_text("Reset"))
+            .on_press(Message::HistoryPickerFilter(Filter::Reset))
+            .padding([3, 7])
+            .style(button::secondary);
+        let filters = row![
+            directory,
+            status_button("All", HistoryStatus::All),
+            status_button("Success", HistoryStatus::Success),
+            status_button("Failed", HistoryStatus::Failed),
+            unique,
+            reset
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center)
+        .wrap();
+        let summary = self
+            .popup_text(format!(
+                "{} of {} matches · {} recent entries{}",
+                filtered.len(),
+                state.match_count(),
+                state.entry_count(),
+                if state.older_not_loaded() {
+                    " · older entries not loaded"
+                } else {
+                    ""
+                }
+            ))
+            .size(self.effective_font_size())
+            .color(self.c_text_dim());
+
+        let mut list = column![].spacing(2);
+        if filtered.is_empty() {
+            let hint = if state.entry_count() == 0 {
+                "No persisted commands yet (recorded via OSC 133 shell integration)"
+            } else {
+                "No commands match — adjust the query or reset the filters"
+            };
+            list = list.push(self.popup_text(hint).color(self.c_text_dim()));
+        } else {
+            for (pos, record) in filtered.iter().enumerate() {
+                let selected = pos == state.selected;
+                let mut info = row![self
+                    .popup_text(history_picker::display_command(&record.command))
+                    .size(self.effective_font_size())
+                    .wrapping(text::Wrapping::WordOrGlyph)
+                    .width(Length::Fill)]
+                .spacing(10)
+                .align_y(iced::Alignment::Center);
+                if record.exit_code != 0 {
+                    info = info.push(
+                        self.popup_text(format!("✗ {}", record.exit_code))
+                            .style(text::danger),
+                    );
+                }
+                let content: Element<'_, Message> = if let Some(cwd) = record.cwd.as_deref() {
+                    column![
+                        info,
+                        self.popup_text(history_picker::display_cwd(&abbreviate_home(cwd)))
+                            .width(Length::Fill)
+                            .shaping(text::Shaping::Advanced)
+                            .wrapping(text::Wrapping::WordOrGlyph)
+                            .color(self.c_text_dim()),
+                    ]
+                    .spacing(1)
+                    .into()
+                } else {
+                    info.into()
+                };
+                let accent = self.c_accent();
+                let body = container(content)
+                    .width(Length::Fill)
+                    .padding([3, 8])
+                    .style(move |_t: &iced::Theme| container::Style {
+                        background: if selected {
+                            Some(iced::Background::Color(Color { a: 0.28, ..accent }))
+                        } else {
+                            None
+                        },
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    });
+                let row_btn =
+                    mouse_area(body).on_press(Message::HistoryPickerAccept(Arc::clone(record)));
+                list = list.push(row_btn);

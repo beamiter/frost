@@ -1,0 +1,300 @@
+                    restored[snapshot_index] = true;
+                    next_id += 1;
+                }
+                Err(error) if snap.cwd.is_some() => {
+                    let cwd = snap.cwd.as_deref().unwrap_or_default();
+                    log::warn!(
+                        "[SessionPersistence] Cannot restore cwd {cwd:?}: {error}; using default cwd"
+                    );
+                    match Session::spawn(config, next_id, cols, rows, None) {
+                        Ok(session) => {
+                            restore_warnings.push(format!(
+                                "Restored missing cwd {cwd:?} in the default folder"
+                            ));
+                            sessions.push(session);
+                            restored[snapshot_index] = true;
+                            next_id += 1;
+                        }
+                        Err(fallback_error) => restore_warnings
+                            .push(format!("Cannot restore terminal session: {fallback_error}")),
+                    }
+                }
+                Err(error) => {
+                    restore_warnings.push(format!("Cannot restore terminal session: {error}"));
+                }
+            }
+        }
+        if sessions.is_empty() {
+            let mut state = default(0).with_recovery(startup_recovery);
+            if let Some(error) = state.diagnostic.take() {
+                restore_warnings.push(error);
+            }
+            state.diagnostic = (!restore_warnings.is_empty())
+                .then(|| crate::review_text::bound_diagnostic_text(restore_warnings.join("\n")));
+            return state;
+        }
+        snapshot.retain_restored_sessions(&restored);
+        let active = snapshot.active_index.unwrap_or(0).min(sessions.len() - 1);
+        eprintln!(
+            "[SessionPersistence] Restored {} session(s) from {}",
+            sessions.len(),
+            path.display()
+        );
+        RestoredState {
+            sessions,
+            active,
+            next_id,
+            tabs: snapshot.tabs,
+            active_tab: snapshot.active_tab,
+            legacy_tree: snapshot.tree,
+            legacy_split: snapshot.split,
+            diagnostic: (!restore_warnings.is_empty())
+                .then(|| crate::review_text::bound_diagnostic_text(restore_warnings.join("\n"))),
+            startup_recovery,
+            session_writes_blocked: startup_recovery.preservation.writes_blocked(),
+        }
+    }
+
+    /// Persist the current tabs (live cwd of each + active index) when enabled.
+    /// De-duplicated against the last write to avoid redundant disk churn.
+    fn save_session_snapshot(&mut self) {
+        if self.sessions.is_empty() || !self.config.restore_session || !self.is_first_instance {
+            self.session_dirty = false;
+            return;
+        }
+        if self.session_writes_blocked {
+            return;
+        }
+        // Direct save callers (including new/closed tabs) need not have set
+        // dirty first. Any serialization, path or write failure must retain
+        // this generation for the periodic retry, even after a clean save.
+        self.session_dirty = true;
+        let snaps: Vec<session_persistence::SessionSnapshot> = self
+            .sessions
+            .iter()
+            .map(|s| session_persistence::SessionSnapshot { cwd: s.cwd() })
+            .collect();
+        // Task-bound terminals (Agent CLI fallback, validation runs) and any
+        // held-open exited transcript stay out of the snapshot: their task
+        // metadata is runtime-only, so restoring one would produce a plain
+        // shell that happens to sit in a task worktree. `prune_sessions`
+        // rewrites every pane-tree leaf, focus, and active index against the
+        // post-filter session indices.
+        let keep: Vec<bool> = self
+            .sessions
+            .iter()
+            .map(|s| {
+                !s.hold_after_exit
+                    && self
+                        .task_manager
+                        .task_for_terminal_session(&agent_task_ui::terminal_session_id(s.id))
+                        .is_none()
+            })
+            .collect();
+        let pruned = session_persistence::prune_sessions(
+            snaps,
+            // Persist every tab's pane tree so a restart restores the same
+            // tabs with the same panes in each.
+            self.tabs
+                .iter()
+                .map(|tab| session_persistence::TabSnapshot {
+                    tree: pane_tree_to_snapshot(&tab.tree),
+                    focus: Some(tab.focus),
+                    title: tab.title.clone(),
+                    pinned: tab.pinned,
+                    marked: tab.marked,
+                    private_title: tab.private_title,
+                })
+                .collect(),
+            Some(self.active),
+            Some(self.active_tab),
+            &keep,
+        );
+        let snapshot = session_persistence::SessionsSnapshot::new(
+            pruned.sessions,
+            pruned.active_index,
+            pruned.tabs,
+            pruned.active_tab,
+        );
+        let Some(json) = snapshot.to_json() else {
+            log::warn!("[SessionPersistence] Cannot serialize the current session snapshot");
+            return;
+        };
+        if self.last_session_save.as_deref() == Some(json.as_str()) {
+            self.session_dirty = false;
+            return;
+        }
+        let path = match self.config.session_history_path() {
+            Ok(path) => path,
+            Err(error) => {
+                log::warn!("[SessionPersistence] Cannot resolve snapshot path: {error}");
+                return;
+            }
+        };
+        match snapshot.save(&path) {
+            Ok(()) => {
+                self.last_session_save = Some(json);
+                self.session_dirty = false;
+            }
+            Err(error) => {
+                // Keep dirty so the periodic tick retries transient I/O
+                // failures instead of silently abandoning this generation.
+                log::warn!(
+                    "[SessionPersistence] Cannot save {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    fn new_session(&mut self) {
+        let cwd = self.sessions.get(self.active).and_then(|s| s.cwd());
+        self.new_session_at(cwd.as_deref());
+    }
+
+    /// Open an ordinary local shell at an explicit directory. Keeping this
+    /// shared with `new_session` makes the Files-header action differ only in
+    /// its cwd source, not tab placement, diagnostics, or persistence.
+    fn new_session_at(&mut self, cwd: Option<&str>) {
+        match Session::spawn(&self.config, self.next_id, self.cols, self.rows, cwd) {
+            Ok(session) => {
+                self.session_diagnostic = None;
+                self.next_id += 1;
+                let insert = (self.active + 1).min(self.sessions.len());
+                self.sessions.insert(insert, session);
+                apply_theme_colors(&mut self.sessions[insert].terminal, &self.theme);
+                self.reindex_tabs_after_insert(insert);
+                // A new session opens its own tab; it is never grafted into
+                // the current tab's split.
+                self.open_tab_with(insert);
+                self.relayout();
+                self.refresh_active_context();
+                self.save_session_snapshot();
+            }
+            Err(error) => {
+                let message = error.to_string();
+                log::error!("[PTY] {message}");
+                self.session_diagnostic =
+                    Some(crate::review_text::bound_diagnostic_text(message.clone()));
+                self.push_toast(message, ToastKind::Warning);
+            }
+        }
+    }
+
+    /// Run the jsh installer in its own session. The script narrates what it
+    /// does, so the session is the progress UI — the user can read a failure or
+    /// interrupt it with Ctrl+C like any other command.
+    fn install_or_update_jsh(&mut self) {
+        self.jsh_notice_dismissed = true;
+        let argv = match jterm_core::jsh_install::install_argv() {
+            Ok(argv) => argv,
+            Err(error) => {
+                log::warn!("cannot stage the jsh installer: {error}");
+                self.push_toast(
+                    format!("Could not write the installer script: {error}"),
+                    ToastKind::Warning,
+                );
+                return;
+            }
+        };
+        match Session::spawn_argv(
+            &self.config,
+            self.next_id,
+            self.cols,
+            self.rows,
+            None,
+            Some(&argv),
+        ) {
+            Ok(session) => {
+                self.session_diagnostic = None;
+                self.next_id += 1;
+                let insert = (self.active + 1).min(self.sessions.len());
+                self.sessions.insert(insert, session);
+                apply_theme_colors(&mut self.sessions[insert].terminal, &self.theme);
+                self.reindex_tabs_after_insert(insert);
+                // A new session opens its own tab; it is never grafted into
+                // the current tab's split.
+                self.open_tab_with(insert);
+                self.relayout();
+                self.refresh_active_context();
+                self.save_session_snapshot();
+            }
+            Err(error) => {
+                let message = error.to_string();
+                log::error!("[PTY] {message}");
+                self.push_toast(message, ToastKind::Warning);
+            }
+        }
+    }
+
+    /// Ask the installer what is published, off the UI thread. A check that
+    /// fails, or finds nothing to do, stays silent: an offline laptop must not
+    /// be nagged about a button that cannot work.
+    fn jsh_update_check_task(policy: &str) -> Task<Message> {
+        // "startup" asks the network every launch; "daily" reuses the
+        // installer's cache, which every jterm on this machine shares.
+        let Some(max_age) = jterm_core::jsh_install::UpdateCheck::parse(policy).max_age() else {
+            return Task::none();
+        };
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    jterm_core::jsh_install::check_blocking(max_age)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    log::warn!("jsh update check did not finish: {error}");
+                    jterm_core::jsh_install::Status::default()
+                })
+            },
+            |status| Message::JshChecked(Box::new(status)),
+        )
+    }
+
+    /// Close every session in `tab`. This is what the tab bar's × does: panes
+    /// belong to their tab, so none of them outlive it as a hidden PTY.
+    ///
+    /// Sessions are closed highest-index-first so the indices still queued are
+    /// never shifted by an earlier removal.
+    fn close_tab(&mut self, tab: usize) -> Task<Message> {
+        let Some(state) = self.tabs.get(tab) else {
+            return Task::none();
+        };
+        let mut owned = state.sessions();
+        owned.sort_unstable_by(|a, b| b.cmp(a));
+        let mut tasks = Vec::new();
+        for index in owned {
+            tasks.push(self.close_session(index));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Ask to close every session in `tab`, confirming first if any of them is
+    /// running a foreground process.
+    fn request_close_tab(&mut self, tab: usize) -> Task<Message> {
+        let owned = self
+            .tabs
+            .get(tab)
+            .map(|state| state.sessions())
+            .unwrap_or_default();
+        if let Some((index, process)) = owned
+            .iter()
+            .find_map(|&index| self.busy_session_name(index).map(|name| (index, name)))
+        {
+            // Show the user which pane is holding the tab open before it is
+            // torn down together with its siblings.
+            self.focus_session(index);
+            self.refresh_active_context();
+            if let Some(session) = self.sessions.get(index) {
+                self.tab_close_confirm = Some((session.id, process, PendingClose::Tab));
+            }
+            return Task::none();
+        }
+        self.close_tab(tab)
+    }
+
+    /// Carry out a close the user just confirmed.
+    fn execute_pending_close(&mut self, index: usize, pending: PendingClose) -> Task<Message> {
+        match pending {
+            PendingClose::Session { activate_after } => {
+                self.close_session_then(index, activate_after)

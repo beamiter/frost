@@ -1,0 +1,300 @@
+            self.sidebar.location.clone(),
+            self.sidebar.hosts_snapshot().to_vec(),
+            SidebarOp::DeleteBatch(paths),
+            None,
+            consumed_clipboard_id,
+        )
+    }
+
+    /// Terminal area height: window minus the tab bar and (when enabled) the
+    /// status bar. The top bar is always reserved (even in side-tab mode, where
+    /// it hosts the dock toggle) so floating chrome never overlaps terminal
+    /// content.
+    fn block_reading_bar_height(&self) -> f32 {
+        if !self.config.is_block_mode() {
+            return 0.0;
+        }
+        let scale = (self.effective_font_size() / 11.0).max(1.0);
+        let logical_width = self.term_width() / scale;
+        let height = if logical_width < 220.0 {
+            116.0
+        } else if logical_width < 430.0 {
+            90.0
+        } else {
+            64.0
+        };
+        height * scale
+    }
+
+    fn organism_strip_height(&self) -> f32 {
+        if self.config.is_card_mode() {
+            return 0.0;
+        }
+        let base = companion_strip_height(
+            self.config.ascii_organism_enabled,
+            self.config.ascii_organism_expanded,
+            self.config.bottom_bar,
+        );
+        if base > 0.0 {
+            base.max(self.effective_font_size() * 4.0 + 16.0)
+        } else {
+            0.0
+        }
+    }
+
+    fn term_height(&self) -> f32 {
+        terminal_height_after_chrome(
+            (self.win_size.height - self.startup_recovery.banner_height(self.chrome_font_size()))
+                .max(0.0),
+            self.effective_font_size(),
+            self.chrome_font_size(),
+            self.config.bottom_bar,
+            self.block_reading_bar_height(),
+            self.organism_strip_height(),
+        )
+    }
+
+    /// Terminal area width: window minus the sidebar (when shown).
+    fn term_width(&self) -> f32 {
+        (self.win_size.width - self.sidebar_width()).max(0.0)
+    }
+
+    /// Current sidebar width (0 when hidden), including the resize divider.
+    fn sidebar_width(&self) -> f32 {
+        if self.dock_open() {
+            self.dock_width + DIVIDER
+        } else {
+            0.0
+        }
+    }
+
+    fn host_clipboard_read_blocked_for(&self, id: usize, fd: RawFd) -> bool {
+        self.host_clipboard_read_owner
+            .is_some_and(|(owner_id, owner_fd)| owner_id != id || owner_fd != fd)
+    }
+
+    fn try_begin_host_clipboard_read(&mut self, id: usize, fd: RawFd) -> bool {
+        if self.host_clipboard_read_owner.is_some() {
+            return false;
+        }
+        let Some(generation) = self.host_clipboard_read_generation.checked_add(1) else {
+            return false;
+        };
+        self.host_clipboard_read_generation = generation;
+        self.host_clipboard_read_owner = Some((id, fd));
+        true
+    }
+
+    fn finish_host_clipboard_read(&mut self, id: usize, fd: RawFd, generation: u64) -> bool {
+        if !host_clipboard_completion_matches(
+            self.host_clipboard_read_owner,
+            self.host_clipboard_read_generation,
+            id,
+            fd,
+            generation,
+        ) {
+            return false;
+        }
+        self.host_clipboard_read_owner = None;
+        self.host_clipboard_read_task = None;
+        self.host_clipboard_read_reply = None;
+        true
+    }
+
+    fn release_host_clipboard_read(&mut self, id: usize, fd: RawFd) {
+        release_host_clipboard_state(
+            &mut self.host_clipboard_read_owner,
+            &mut self.host_clipboard_read_task,
+            &mut self.host_clipboard_read_reply,
+            id,
+            fd,
+        );
+    }
+
+    fn before_clipboard_permission_change(&mut self, allow: bool) {
+        if !allow {
+            self.revoke_host_clipboard_read();
+        }
+    }
+
+    fn revoke_host_clipboard_read(&mut self) {
+        let Some((id, fd)) = self.host_clipboard_read_owner else {
+            return;
+        };
+        let reply = self.host_clipboard_read_reply.take();
+        self.release_host_clipboard_read(id, fd);
+        if let Some(session) = self.session_by_identity(id, fd) {
+            refuse_host_clipboard_reply(
+                reply,
+                &mut session.terminal,
+                &mut session.clipboard_read_in_flight,
+                &mut session.osc52_pending_refusals,
+                &mut session.osc5522_pending_refusals,
+            );
+            session.flush_responses();
+            session.refresh();
+        }
+    }
+
+    fn session_by_identity(&mut self, id: usize, fd: RawFd) -> Option<&mut Session> {
+        self.sessions
+            .iter_mut()
+            .find(|session| session.id == id && session.master_fd == fd)
+    }
+
+    /// Compare only the bounded visible tree (at most MAX_PANES leaves), using
+    /// stable identities so background closes/reindexing are harmless.
+    fn sync_terminal_pane_owners(&mut self) {
+        let session_id = |index| self.sessions.get(index).map(|session: &Session| session.id);
+        let tab = self.tabs.get(self.active_tab);
+        // PTY output visits this boundary frequently. Walk the borrowed tree
+        // without allocating when ownership is unchanged; only changes capture.
+        if self.terminal_pane_owners.as_ref().is_some_and(|previous| {
+            previous.matches(tab, self.pane_zoomed, self.active, &session_id)
+        }) {
+            return;
+        }
+        let next = TerminalPaneOwners::capture(tab, self.pane_zoomed, self.active, &session_id);
+        for gesture in change_terminal_pane_owners(
+            &mut self.terminal_pane_owners,
+            next,
+            &mut self.terminal_interaction_epoch,
+            &mut self.terminal_mouse_gestures,
+            &mut self.click_tracker,
+        ) {
+            self.finish_cancelled_terminal_mouse_gesture(gesture);
+        }
+    }
+
+    /// Refresh every cache/state object whose coordinates belong to the active
+    /// session. All tab/pane activation paths call this before accepting input.
+    fn refresh_active_context(&mut self) {
+        self.sync_terminal_pane_owners();
+        self.sync_organism_attention_owner();
+        self.organism.reset_watch();
+        self.organism.cancel_live_greeting();
+        self.refresh_active_context_caches();
+    }
+
+    /// Refresh index-dependent caches without treating reindexing as a new owner.
+    fn refresh_active_context_caches(&mut self) {
+        self.links_cache_key = None;
+        if self.search.is_open {
+            let reflow_pending = self
+                .sessions
+                .get(self.active)
+                .is_some_and(|session| self.history_reflow_sessions.contains(&session.id));
+            if reflow_pending {
+                self.search_dirty = true;
+            } else {
+                self.recompute_search();
+                self.reveal_current_search_match();
+            }
+        }
+        self.recompute_links();
+        self.refresh_kitty_handles();
+    }
+
+    /// Startup session setup: when `restore_session` is enabled and a snapshot
+    /// exists, respawn each saved terminal at its recorded cwd; otherwise fall
+    /// back to a single default session. Keep startup repair facts and write
+    /// protection even when the saved session list is empty or every spawn fails.
+    fn restore_or_spawn(
+        config: &Config,
+        cols: usize,
+        rows: usize,
+        is_first_instance: bool,
+    ) -> RestoredState {
+        let default = |id_start: usize| {
+            RestoredState::from_spawn_result(
+                Session::spawn(config, id_start, cols, rows, None),
+                id_start,
+            )
+        };
+        if !config.restore_session || !is_first_instance {
+            return default(0);
+        }
+        let Ok(path) = config.session_history_path() else {
+            return default(0);
+        };
+        let (mut snapshot, startup_recovery) = match session_persistence::SessionsSnapshot::load(
+            &path,
+        ) {
+            session_persistence::SnapshotLoad::Loaded {
+                snapshot,
+                mut report,
+                original,
+            } => {
+                report.merge(inspect_restored_snapshot(&snapshot));
+                // Preserve the exact bytes captured by load before any fallback
+                // can return a state eligible for automatic session saving.
+                let preservation = session_persistence::prepare_repaired_snapshot(
+                    &path,
+                    &report,
+                    original.as_deref(),
+                );
+                (snapshot, StartupRecovery::new(report, preservation))
+            }
+            session_persistence::SnapshotLoad::Missing => return default(0),
+            // Quarantine before returning, because returning is what lets the
+            // app start — and `save_session_snapshot` then writes a fresh
+            // snapshot over this same path on the first periodic tick. Retaining
+            // the unreadable file and overwriting it seconds later destroys the
+            // only copy of the user's tabs.
+            session_persistence::SnapshotLoad::Unreadable(reason) => {
+                let mut state = default(0);
+                let note = match jterm_core::snapshot_file::quarantine_corrupt(&path) {
+                    Ok(backup) => {
+                        log::warn!(
+                            "[SessionPersistence] Cannot read {} ({reason}); moved it to {}",
+                            path.display(),
+                            backup.display()
+                        );
+                        format!(
+                            "Could not read the saved session ({reason}).\nThe old file was kept as {}",
+                            backup.display()
+                        )
+                    }
+                    Err(move_error) => {
+                        state.session_writes_blocked = true;
+                        log::warn!(
+                            "[SessionPersistence] Cannot read {} ({reason}) and cannot move it aside ({move_error})",
+                            path.display()
+                        );
+                        format!(
+                            "Could not read the saved session ({reason}), and it could not be moved aside ({move_error}). Automatic session saving is disabled for this run so the original is not overwritten; repair or move it, then restart"
+                        )
+                    }
+                };
+                state.diagnostic = Some(crate::review_text::bound_diagnostic_text(
+                    match state.diagnostic.take() {
+                        Some(existing) => format!("{note}\n{existing}"),
+                        None => note,
+                    },
+                ));
+                return state;
+            }
+        };
+        if snapshot.sessions.is_empty() {
+            return default(0).with_recovery(startup_recovery);
+        }
+        let mut sessions = Vec::new();
+        let mut next_id = 0usize;
+        let mut restore_warnings = Vec::new();
+        if snapshot.sessions.len() > session_persistence::MAX_RESTORED_SESSIONS {
+            log::warn!(
+                "[SessionPersistence] Snapshot has {} sessions; restoring only the first {}",
+                snapshot.sessions.len(),
+                session_persistence::MAX_RESTORED_SESSIONS
+            );
+        }
+        let mut restored = vec![false; snapshot.sessions.len()];
+        for (snapshot_index, snap) in snapshot
+            .sessions
+            .iter()
+            .take(session_persistence::MAX_RESTORED_SESSIONS)
+            .enumerate()
+        {
+            match Session::spawn(config, next_id, cols, rows, snap.cwd.as_deref()) {
+                Ok(session) => {
+                    sessions.push(session);

@@ -1,0 +1,300 @@
+    }
+
+    #[test]
+    fn only_an_escape_press_survives_the_captured_key_drop() {
+        let pressed = |key: keyboard::Key| keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key.clone(),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::default(),
+            text: None,
+            repeat: false,
+        };
+
+        assert!(captured_key_is_overlay_escape(&pressed(
+            keyboard::Key::Named(Named::Escape)
+        )));
+        // Everything the overlay's own input consumed stays consumed: letting
+        // any of these through would double-input into the terminal.
+        assert!(!captured_key_is_overlay_escape(&pressed(
+            keyboard::Key::Character("a".into())
+        )));
+        assert!(!captured_key_is_overlay_escape(&pressed(
+            keyboard::Key::Named(Named::Enter)
+        )));
+        assert!(!captured_key_is_overlay_escape(&pressed(
+            keyboard::Key::Named(Named::Backspace)
+        )));
+        // The release half of the same key must not fire a second dismissal.
+        assert!(!captured_key_is_overlay_escape(
+            &keyboard::Event::KeyReleased {
+                key: keyboard::Key::Named(Named::Escape),
+                modified_key: keyboard::Key::Named(Named::Escape),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::default(),
+            }
+        ));
+    }
+
+    #[test]
+    fn block_search_filter_cycles_through_every_chip_in_both_directions() {
+        // Tab must reach every chip: while the picker is open it owns the
+        // keyboard, so a chip the cycle skips is mouse-only.
+        let mut seen = Vec::new();
+        let mut filter = BlockSearchFilter::default();
+        for _ in 0..BlockSearchFilter::ORDER.len() {
+            seen.push(filter);
+            filter = filter.cycled(true);
+        }
+        assert_eq!(seen, BlockSearchFilter::ORDER.to_vec());
+        // Wraps rather than sticking at the last chip.
+        assert_eq!(filter, BlockSearchFilter::default());
+
+        // Shift+Tab is the exact inverse from every chip.
+        for &start in &BlockSearchFilter::ORDER {
+            assert_eq!(start.cycled(true).cycled(false), start);
+            assert_eq!(start.cycled(false).cycled(true), start);
+        }
+        assert_eq!(
+            BlockSearchFilter::All.cycled(false),
+            BlockSearchFilter::Background
+        );
+    }
+
+    #[test]
+    fn block_search_rebuild_release_drops_capacity_and_keeps_query_controls() {
+        let mut state = BlockSearchState {
+            query: "needle".to_string(),
+            case_sensitive: true,
+            regex: true,
+            whole_word: true,
+            scope: block_mode::BlockSearchScope::Output,
+            filter: BlockSearchFilter::Failed,
+            query_error: Some("old".to_string()),
+            ..BlockSearchState::default()
+        };
+        state.cache.reserve(2048);
+        state.hits.push(block_search_hit(7));
+        state.selected = 0;
+        assert!(state.cache.capacity() > 0);
+
+        state.release_index_for_rebuild();
+
+        // The multi-MiB index is what the memory-peak invariant is about, and
+        // it is released.
+        assert_eq!(state.cache.capacity(), 0);
+        assert_eq!(state.query, "needle");
+        assert!(state.case_sensitive && state.regex && state.whole_word);
+        assert_eq!(state.scope, block_mode::BlockSearchScope::Output);
+        assert_eq!(state.filter, BlockSearchFilter::Failed);
+        assert_eq!(state.query_error.as_deref(), Some("old"));
+        // The previous hits stay so an open picker is not blanked by a block
+        // finishing behind it. They are shown as stale, and every path that
+        // acts on one refuses while `loading` is set.
+        assert_eq!(state.hits.len(), 1);
+        state.loading = true;
+        assert!(!state.accepts_hit(&block_search_hit(7), state.session_id, state.zone_version));
+    }
+
+    #[test]
+    fn block_search_accept_rejects_loading_stale_or_unlisted_clicks() {
+        let version = BlockSearchZoneVersion {
+            len: 1,
+            oldest: Some(7),
+            newest: Some(7),
+        };
+        let hit = block_search_hit(7);
+        let mut state = BlockSearchState {
+            session_id: 3,
+            zone_version: version,
+            hits: vec![hit.clone()],
+            ..BlockSearchState::default()
+        };
+        assert!(state.accepts_hit(&hit, 3, version));
+        assert!(!state.accepts_hit(&block_search_hit(8), 3, version));
+        assert!(!state.accepts_hit(&hit, 4, version));
+        assert!(!state.accepts_hit(
+            &hit,
+            3,
+            BlockSearchZoneVersion {
+                newest: Some(8),
+                ..version
+            }
+        ));
+        state.loading = true;
+        assert!(!state.accepts_hit(&hit, 3, version));
+        state.loading = false;
+        state.query_error = Some("invalid".to_string());
+        assert!(!state.accepts_hit(&hit, 3, version));
+    }
+
+    #[test]
+    fn block_search_zone_version_changes_only_when_finalized_zones_change() {
+        let before_rotation = BlockSearchZoneVersion {
+            len: 3,
+            oldest: Some(7),
+            newest: Some(9),
+        };
+        let after_rotation = BlockSearchZoneVersion {
+            len: 3,
+            oldest: Some(8),
+            newest: Some(10),
+        };
+        assert_eq!(before_rotation.len, after_rotation.len);
+        assert_ne!(before_rotation, after_rotation);
+
+        let mut completed = terminal::TerminalState::new(40, 8);
+        let empty = BlockSearchZoneVersion::from_terminal(&completed);
+        completed.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07ok\r\n\x1b]133;C\x07done\r\n\x1b]133;D;0\x07",
+        );
+        let one = BlockSearchZoneVersion::from_terminal(&completed);
+        assert_ne!(one, empty);
+        assert_eq!(one.len, 1);
+        completed.process_input(b"ordinary idle paint");
+        assert_eq!(BlockSearchZoneVersion::from_terminal(&completed), one);
+
+        // A missing D is not represented until the following A seals the
+        // stale lifecycle, even though it never enters CompletedCommand.
+        let mut stale = terminal::TerminalState::new(40, 8);
+        stale.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07lost-d\r\n\x1b]133;C\x07output\r\n");
+        assert_eq!(BlockSearchZoneVersion::from_terminal(&stale), empty);
+        stale.process_input(b"\x1b]133;A\x07");
+        assert_ne!(BlockSearchZoneVersion::from_terminal(&stale), empty);
+
+        // Commandless idle output is finalized by the next prompt marker and
+        // must refresh the Background filter as well.
+        let mut background = terminal::TerminalState::new(40, 8);
+        background.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07daemon ready\r\n");
+        assert_eq!(BlockSearchZoneVersion::from_terminal(&background), empty);
+        background.process_input(b"\x1b]133;A\x07");
+        assert_ne!(BlockSearchZoneVersion::from_terminal(&background), empty);
+    }
+
+    #[test]
+    fn block_search_reveal_targets_soft_wrap_and_falls_back_safely() {
+        let mut terminal = terminal::TerminalState::new(5, 8);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07x\r\n\x1b]133;C\x07abcdef\r\ngh\r\n\x1b]133;D;0\x07",
+        );
+        let zone = terminal
+            .command_zones
+            .back()
+            .expect("completed command block");
+        let zone_id = zone.id;
+        let output_start = zone.output_start.expect("retained output rows");
+        let cache = [block_mode::CachedBlockSearchZone::new(
+            zone_id,
+            zone.command.as_deref(),
+            terminal.zone_output_text(zone_id),
+        )];
+        let hit = block_mode::search_blocks(&cache, "f")
+            .hits
+            .into_iter()
+            .find(|hit| hit.is_output_line)
+            .expect("match in second physical row");
+        assert_eq!(hit.match_span, Some(5..6));
+        assert_eq!(
+            block_search_reveal_row(&terminal, &hit),
+            Some(output_start + 1)
+        );
+
+        // Filter-only browsing has no match span and intentionally lands at
+        // the logical line start. A stale snapshot span does the same rather
+        // than guessing a physical row from unrelated live content.
+        let mut browse = hit.clone();
+        browse.match_span = None;
+        assert_eq!(
+            block_search_reveal_row(&terminal, &browse),
+            Some(output_start)
+        );
+        let mut stale = hit;
+        stale.match_span = Some(999..1_000);
+        assert_eq!(
+            block_search_reveal_row(&terminal, &stale),
+            Some(output_start)
+        );
+
+        terminal.command_zones.back_mut().unwrap().rows_evicted = true;
+        assert_eq!(block_search_reveal_row(&terminal, &stale), None);
+    }
+
+    #[test]
+    fn accepted_block_search_output_unfolds_only_its_owner_without_editing_prompt() {
+        let mut fixture = search_reveal_fixture();
+        fixture
+            .terminal
+            .process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07draft untouched\x1b[3D");
+        fixture.projection = fixture.terminal.get_projected_viewport_with_state(
+            true,
+            &fixture.policy,
+            &mut fixture.view_state,
+        );
+        let zone = fixture.terminal.zone_by_id(fixture.target.zone_id).unwrap();
+        let cache = [block_mode::CachedBlockSearchZone::new(
+            zone.id,
+            zone.command.as_deref(),
+            fixture.terminal.zone_output_text(zone.id),
+        )];
+        let hit = block_mode::search_blocks(&cache, "needle")
+            .hits
+            .into_iter()
+            .find(|hit| hit.is_output_line)
+            .unwrap();
+        let row = block_search_reveal_row(&fixture.terminal, &hit).unwrap();
+        let origin = fixture
+            .terminal
+            .raw_cell_origin_at_absolute(row, 0)
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .terminal
+                .locate_raw_cell_in_projection(&fixture.projection, origin,),
+            terminal::ProjectedRawCellLocation::Hidden { .. }
+        ));
+        let grid = fixture.terminal.grid.to_vec();
+        let cursor = fixture.terminal.get_cursor_pos();
+        assert!(expand_block_search_hit(
+            &fixture.terminal,
+            &fixture.projection,
+            &mut fixture.policy,
+            &hit,
+        ));
+        assert!(!fixture.policy.is_collapsed(hit.zone_id));
+        assert!(fixture.policy.is_collapsed(fixture.other_zone));
+        fixture.projection = fixture.terminal.get_projected_viewport_with_state(
+            true,
+            &fixture.policy,
+            &mut fixture.view_state,
+        );
+        assert!(fixture.terminal.reveal_raw_cell_in_projection(
+            &fixture.policy,
+            &mut fixture.view_state,
+            origin,
+        ));
+        assert_eq!(fixture.terminal.grid.to_vec(), grid);
+        assert_eq!(fixture.terminal.get_cursor_pos(), cursor);
+        assert!(
+            !expand_block_search_hit(
+                &fixture.terminal,
+                &fixture.projection,
+                &mut fixture.policy,
+                &hit,
+            ),
+            "repeated acceptance does not change the fold policy again"
+        );
+    }
+
+    #[test]
+    fn block_search_unfold_rejects_non_output_removed_evicted_and_stale_projection() {
+        for invalid in ["command", "zero line", "removed", "evicted", "projection"] {
+            let mut fixture = search_reveal_fixture();
+            let mut hit = block_mode::BlockSearchHit {
+                zone_id: fixture.target.zone_id,
+                line_no: 1,

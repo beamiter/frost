@@ -1,0 +1,300 @@
+        self.sidebar_follow_intent_epoch =
+            next_sidebar_context_epoch(self.sidebar_follow_intent_epoch);
+    }
+
+    fn active_session_changed_for_remote_follow(&mut self) {
+        self.sidebar_drop_intents.clear();
+        self.sidebar_drop_burst.clear();
+        self.sidebar_drop_debounce_generation = None;
+        self.invalidate_sidebar_remote_follow_intent();
+        // Returning A→B→A is a new active-session intent. The old A probe may
+        // not commit (epoch above), but the real still-running A command should
+        // be eligible for a fresh staged follow instead of being deduped away.
+        self.sidebar_follow_observed = None;
+    }
+
+    /// Poll the active pane's real foreground argv. OSC 133 command text is
+    /// deliberately ignored: a remote program can print terminal escapes, but
+    /// it cannot forge `/proc/<pid>/cmdline` for a local foreground process.
+    fn poll_sidebar_remote_follow(&mut self) -> Task<Message> {
+        let observed = self.sessions.get(self.active).and_then(|session| {
+            (!session.managed_remote && !session.transcript_read_only())
+                .then(|| {
+                    session
+                        .observed_ssh_command()
+                        .map(|command| (session.id, command))
+                })
+                .flatten()
+        });
+        let Some((session_id, command)) = observed else {
+            self.sidebar_follow_observed = None;
+            self.sidebar_follow_retry_once = None;
+            self.sidebar_follow_retry_available = None;
+            self.cancel_sidebar_remote_follow();
+            return Task::none();
+        };
+
+        let argv = command.argv;
+        let parsed = command.target;
+        let control_path = command.reusable_control_path;
+        if matches!(parsed, jterm_core::jsh_remote::ObservedSshTarget::NotSsh) {
+            self.sidebar_follow_observed = None;
+            self.sidebar_follow_retry_once = None;
+            self.sidebar_follow_retry_available = None;
+            self.cancel_sidebar_remote_follow();
+            return Task::none();
+        }
+        let retry_attempt = self
+            .sidebar_follow_retry_once
+            .as_ref()
+            .is_some_and(|retry| retry.0 == session_id && retry.1 == argv);
+        if !retry_attempt
+            && self
+                .sidebar_follow_observed
+                .as_ref()
+                .is_some_and(|observed| observed.0 == session_id && observed.1 == argv)
+        {
+            return Task::none();
+        }
+        let attempt = if retry_attempt {
+            self.sidebar_follow_retry_once = None;
+            1
+        } else {
+            self.sidebar_follow_retry_once = None;
+            self.sidebar_follow_retry_available = None;
+            0
+        };
+        self.sidebar_follow_observed = Some((session_id, argv));
+        self.cancel_sidebar_remote_follow();
+
+        let profile = match parsed {
+            jterm_core::jsh_remote::ObservedSshTarget::Target(profile) => profile,
+            jterm_core::jsh_remote::ObservedSshTarget::Unsupported(reason) => {
+                self.push_toast(
+                    format!(
+                        "Files did not follow SSH: {reason}. Add a saved remote profile to connect manually."
+                    ),
+                    ToastKind::Warning,
+                );
+                return Task::none();
+            }
+            jterm_core::jsh_remote::ObservedSshTarget::NotSsh => return Task::none(),
+        };
+
+        let target_location =
+            unique_active_ssh_transport_index(self.sidebar.hosts_snapshot(), &profile)
+                .map(remote_fs::FsLocation::Remote)
+                .unwrap_or_else(|| remote_fs::FsLocation::Transient(profile.clone()));
+
+        // A ControlPath belongs to this live connection, not the saved target
+        // identity. Preserve an explicit `-S`/`-o ControlPath` from a direct
+        // command, or overlay the provenance-checked path derived for jsh's
+        // launcher, while keeping ordinary saved profiles stable.
+        let observed_has_control_path = remote_fs::has_control_path_argument(&profile.ssh_args);
+        let execution_profile = if observed_has_control_path {
+            profile.clone()
+        } else {
+            match &target_location {
+                remote_fs::FsLocation::Remote(index) => self
+                    .sidebar
+                    .hosts_snapshot()
+                    .get(*index)
+                    .cloned()
+                    .unwrap_or_else(|| profile.clone()),
+                remote_fs::FsLocation::Transient(profile) => profile.clone(),
+                remote_fs::FsLocation::Local => profile.clone(),
+            }
+        };
+        let execution_profile =
+            remote_fs::with_reusable_control_path(&execution_profile, control_path.as_deref());
+        let target_location = if control_path.is_some() || observed_has_control_path {
+            remote_fs::FsLocation::Transient(execution_profile)
+        } else {
+            target_location
+        };
+
+        let current_profile =
+            remote_fs::remote_host(&self.sidebar.location, self.sidebar.hosts_snapshot()).ok();
+        let same_target =
+            current_profile.is_some_and(|current| same_ssh_files_transport(current, &profile));
+        let live_execution_requested = observed_has_control_path || control_path.is_some();
+        let same_execution = current_profile.is_some_and(|current| {
+            remote_fs::remote_host(&target_location, self.sidebar.hosts_snapshot())
+                .is_ok_and(|target| remote_fs::same_files_execution(current, target))
+        });
+        // If the new command offers a live socket, keep an existing tree
+        // only when it already uses that exact route. Otherwise stage a probe
+        // and upgrade future operations without throwing away loaded rows.
+        // The sidebar is never forced open: the tree follows in the
+        // background and is visible the next time the user opens it.
+        let already_following = same_target && (!live_execution_requested || same_execution);
+        let preserve_loaded_tree =
+            same_target && !already_following && self.sidebar.has_loaded_snapshot();
+        if already_following {
+            self.set_sidebar_notice(
+                format!(
+                    "Following {}",
+                    crate::sidebar::bound_sidebar_path_label(std::path::Path::new(
+                        &self.sidebar.location.label(self.sidebar.hosts_snapshot())
+                    ))
+                ),
+                true,
+            );
+            self.apply_config();
+            return Task::none();
+        }
+
+        let Some(intent_epoch) = self.sidebar_follow_intent_epoch else {
+            self.push_toast(
+                "Automatic SSH Files follow is unavailable until Frost restarts",
+                ToastKind::Warning,
+            );
+            return Task::none();
+        };
+
+        let Some(token) = self.sidebar_follow_next_token.checked_add(1) else {
+            self.push_toast(
+                "Automatic SSH Files follow is unavailable until Frost restarts",
+                ToastKind::Warning,
+            );
+            return Task::none();
+        };
+        self.sidebar_follow_next_token = token;
+        let cancellation = remote_fs::CancellationToken::new();
+        self.sidebar_follow_pending = Some(SidebarRemoteFollow {
+            cancellation: cancellation.clone(),
+            token,
+            intent_epoch,
+            session_id,
+            source_argv: self
+                .sidebar_follow_observed
+                .as_ref()
+                .map(|observed| observed.1.clone())
+                .unwrap_or_default(),
+            source_profile: profile,
+            source_control_path: control_path,
+            attempt,
+            target_location: target_location.clone(),
+            preserve_loaded_tree,
+            hosts_epoch: self.sidebar_hosts_epoch,
+            tree_generation: self.sidebar.generation(),
+            tree_location: self.sidebar.location.clone(),
+            tree_root: self.sidebar.current_dir.clone(),
+            sidebar_open: self.sidebar_open,
+            sidebar_panel: self.sidebar_panel,
+        });
+
+        let hosts = self.sidebar.hosts_snapshot().to_vec();
+        let show_hidden = self.sidebar.show_hidden();
+        Task::perform(
+            async move {
+                probe_sidebar_remote_follow(
+                    &target_location,
+                    &hosts,
+                    show_hidden,
+                    preserve_loaded_tree,
+                    &cancellation,
+                )
+                .map_err(|error| error.to_string())
+            },
+            move |result| Message::SidebarRemoteFollowResolved(token, result),
+        )
+    }
+
+    fn resolve_sidebar_remote_follow(
+        &mut self,
+        token: u64,
+        start: Result<SidebarRemoteFollowResult, String>,
+    ) -> Task<Message> {
+        if self
+            .sidebar_follow_pending
+            .as_ref()
+            .is_none_or(|pending| pending.token != token)
+        {
+            return Task::none();
+        }
+        let pending = self
+            .sidebar_follow_pending
+            .take()
+            .expect("matching pending SSH follow");
+
+        let source_still_matches = self
+            .sessions
+            .get(self.active)
+            .filter(|session| session.id == pending.session_id && !session.managed_remote)
+            .and_then(Session::observed_ssh_command)
+            .is_some_and(|command| {
+                command.argv == pending.source_argv
+                    && command.reusable_control_path == pending.source_control_path
+                    && matches!(
+                        command.target,
+                        jterm_core::jsh_remote::ObservedSshTarget::Target(profile)
+                            if profile == pending.source_profile
+                    )
+            });
+        let files_busy = self.sidebar_transfer.is_some()
+            || self.sidebar_menu.is_some()
+            || self.sidebar_dialog.is_some()
+            || self.sidebar_delete_confirm.is_some()
+            || !self.sidebar_drop_burst.is_empty();
+        let tree_still_matches = sidebar_remote_follow_context_is_current(
+            &pending,
+            &self.sidebar,
+            self.sidebar_open,
+            self.sidebar_panel,
+            self.sidebar_hosts_epoch,
+            self.sidebar_follow_intent_epoch,
+            files_busy,
+        );
+        if !source_still_matches || !tree_still_matches {
+            return Task::none();
+        }
+
+        let start = match start {
+            Ok(start) => start,
+            Err(error) => {
+                let detail = jterm_core::review_input::safe_inline_display(&error, 160);
+                let retrying = pending.attempt == 0;
+                let suffix = if retrying {
+                    " Frost will retry once while the SSH control socket settles."
+                } else {
+                    " Fix authentication if needed, then select Retry without leaving SSH."
+                };
+                let message = format!(
+                    "Files could not join {}: {detail}. Non-interactive SSH needs a key, agent, or reusable control socket; the current tree was kept.{suffix}",
+                    pending.source_profile.display_name()
+                );
+                self.set_sidebar_notice(message.clone(), false);
+                self.push_toast(message, ToastKind::Warning);
+                if retrying {
+                    self.sidebar_follow_retry_once =
+                        Some((pending.session_id, pending.source_argv));
+                    self.sidebar_follow_observed = None;
+                } else {
+                    self.sidebar_follow_retry_available =
+                        Some((pending.session_id, pending.source_argv));
+                }
+                return Task::none();
+            }
+        };
+
+        let label = pending.target_location.label(self.sidebar.hosts_snapshot());
+        self.invalidate_sidebar_remote_follow_intent();
+        if pending.preserve_loaded_tree
+            && self
+                .sidebar
+                .rebind_same_namespace_preserving_tree(pending.target_location.clone())
+        {
+            self.invalidate_sidebar_pending_work();
+            self.set_sidebar_notice(format!("Following {label}"), true);
+            self.apply_config();
+            return Task::none();
+        }
+
+        let Some(listing) = start.listing else {
+            return Task::none();
+        };
+        if self
+            .sidebar
+            .commit_probed_location_listing(pending.target_location, start.root, listing)
+        {

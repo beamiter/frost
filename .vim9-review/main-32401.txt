@@ -1,0 +1,300 @@
+    shutdown_raw: RawFd,
+    child_pid: i32,
+    tx: &mut iced::futures::channel::mpsc::Sender<Message>,
+    watch_source: &mut organism_watch::SourceWriter,
+) -> HangupOutcome {
+    use iced::futures::SinkExt;
+
+    const PROBE_DELAY_MAX: std::time::Duration = std::time::Duration::from_millis(250);
+    let mut probe_delay = std::time::Duration::from_millis(50);
+    let mut buf = vec![0u8; 65536];
+    loop {
+        // Recovery probe: a live child may have reopened /dev/tty since the
+        // hangup. Data or WouldBlock both mean the slave side lives again.
+        let n = loop {
+            let n =
+                unsafe { libc::read(reader_raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break n;
+        };
+        if n > 0 {
+            let stamp = watch_source.stamp(std::time::Instant::now());
+            let data = buf[..n as usize].to_vec();
+            if iced::futures::executor::block_on(tx.send(Message::PtyOutput(id, fd, data, stamp)))
+                .is_err()
+            {
+                return HangupOutcome::Shutdown;
+            }
+            return HangupOutcome::Recovered;
+        }
+        if n < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return HangupOutcome::Recovered;
+            }
+            if error.raw_os_error() != Some(libc::EIO) {
+                // A genuine read error keeps the pre-hangup behavior.
+                let _ = iced::futures::executor::block_on(tx.send(Message::PtyExited(id, fd, -1)));
+                return HangupOutcome::Exited;
+            }
+        }
+        // Still hung up (read(2) == 0 or EIO). Declare exit only when the
+        // child is actually gone; WNOWAIT leaves the real status for the
+        // session's Pty to reap, so task terminals keep their true code.
+        match Pty::observe_child_exit(child_pid) {
+            Ok(Some(code)) => {
+                let _ =
+                    iced::futures::executor::block_on(tx.send(Message::PtyExited(id, fd, code)));
+                return HangupOutcome::Exited;
+            }
+            Ok(None) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                // Reaped elsewhere (session teardown won the race): gone.
+                let _ = iced::futures::executor::block_on(tx.send(Message::PtyExited(id, fd, -1)));
+                return HangupOutcome::Exited;
+            }
+            Err(error) => {
+                // Unknown is not evidence of exit; keep probing.
+                log::warn!("[PTY] waitid(WNOWAIT) failed while probing PTY child: {error}");
+            }
+        }
+        // Pace the next probe through the shutdown pipe alone.
+        let mut shutdown_poll = libc::pollfd {
+            fd: shutdown_raw,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = loop {
+            // SAFETY: shutdown_poll is a valid stack pollfd and shutdown_raw
+            // is owned by the caller for the duration of this wait.
+            let ready =
+                unsafe { libc::poll(&mut shutdown_poll, 1, probe_delay.as_millis() as i32) };
+            if ready >= 0 {
+                break ready;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                return HangupOutcome::Shutdown;
+            }
+        };
+        if ready > 0
+            && shutdown_poll.revents
+                & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+                != 0
+        {
+            return HangupOutcome::Shutdown;
+        }
+        probe_delay = PROBE_DELAY_MAX.min(probe_delay.saturating_mul(2));
+    }
+}
+
+/// These standalone modifier keys encode no payload in Frost's supported
+/// legacy/Kitty/xterm paths. Unknown keys keep ordinary retreat semantics.
+fn organism_modifier_only_key(key: &keyboard::Key) -> bool {
+    matches!(
+        key,
+        keyboard::Key::Named(
+            keyboard::key::Named::Control
+                | keyboard::key::Named::Shift
+                | keyboard::key::Named::Alt
+                | keyboard::key::Named::Super
+        )
+    )
+}
+
+/// Build the canonical binding string (e.g. `"ctrl+shift+t"`) for a key event
+/// by constructing a `jterm_core::keybindings::Chord` from the iced key data
+/// and rendering `Chord::canonical()` — the exact form `KeyBinding::canonical`
+/// produces for keybindings.toml strings, so the runtime and config sides can
+/// never disagree on folding. (The previous hand-rolled version lowercased
+/// with `to_ascii_lowercase`, so a non-ASCII binding like `ctrl+ю` was never
+/// stored in the same case the keyboard delivered.)
+/// Returns `None` for keys that should never be treated as shortcuts — plain
+/// character input (no Ctrl/Alt/Super) and unmappable named keys — so ordinary
+/// typing is never swallowed by the keybinding layer.
+fn key_to_binding_string(key: &keyboard::Key, mods: keyboard::Modifiers) -> Option<String> {
+    use jterm_core::keybindings::{Chord, KeySym, Mods, NamedKey};
+    use keyboard::key::Named;
+    use keyboard::Key;
+    let sym = match key {
+        Key::Character(s) => {
+            // Shift alone just changes case; require a "real" modifier so typing
+            // an uppercase letter can't trigger a command.
+            if !(mods.control() || mods.alt() || mods.logo()) {
+                return None;
+            }
+            // Unicode-lowercase, matching the chord core's storage invariant.
+            // A char whose lowercase expands to several chars ('İ') has no
+            // storable chord form; core's parser rejects it too.
+            let mut lower = s.chars().next()?.to_lowercase();
+            match (lower.next(), lower.next()) {
+                (Some(c), None) => KeySym::Char(c),
+                _ => return None,
+            }
+        }
+        Key::Named(named) => match named {
+            Named::Tab => KeySym::Named(NamedKey::Tab),
+            Named::Enter => KeySym::Named(NamedKey::Return),
+            Named::Escape => KeySym::Named(NamedKey::Escape),
+            Named::Backspace => KeySym::Named(NamedKey::Backspace),
+            Named::Delete => KeySym::Named(NamedKey::Delete),
+            Named::Insert => KeySym::Named(NamedKey::Insert),
+            Named::Home => KeySym::Named(NamedKey::Home),
+            Named::End => KeySym::Named(NamedKey::End),
+            Named::PageUp => KeySym::Named(NamedKey::PageUp),
+            Named::PageDown => KeySym::Named(NamedKey::PageDown),
+            Named::ArrowUp => KeySym::Named(NamedKey::Up),
+            Named::ArrowDown => KeySym::Named(NamedKey::Down),
+            Named::ArrowLeft => KeySym::Named(NamedKey::Left),
+            Named::ArrowRight => KeySym::Named(NamedKey::Right),
+            Named::Space => KeySym::Named(NamedKey::Space),
+            Named::F1 => KeySym::Function(1),
+            Named::F2 => KeySym::Function(2),
+            Named::F3 => KeySym::Function(3),
+            Named::F4 => KeySym::Function(4),
+            Named::F5 => KeySym::Function(5),
+            Named::F6 => KeySym::Function(6),
+            Named::F7 => KeySym::Function(7),
+            Named::F8 => KeySym::Function(8),
+            Named::F9 => KeySym::Function(9),
+            Named::F10 => KeySym::Function(10),
+            Named::F11 => KeySym::Function(11),
+            Named::F12 => KeySym::Function(12),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let chord = Chord {
+        mods: Mods {
+            ctrl: mods.control(),
+            shift: mods.shift(),
+            alt: mods.alt(),
+            sup: mods.logo(),
+        },
+        key: sym,
+    };
+    Some(chord.canonical())
+}
+
+/// Resolve a configured chord, then apply Anvil's output-only copy modifier:
+/// when an Alt chord has no explicit binding but the same chord without Alt is
+/// the configured Copy action, treat it as Copy Block Output. Exact bindings
+/// always win, so users can deliberately override Alt+their-copy shortcut.
+fn resolve_keybinding_command(
+    bindings: &keybindings::KeyBindings,
+    key: &keyboard::Key,
+    mods: keyboard::Modifiers,
+) -> Option<keybindings::Command> {
+    let binding = key_to_binding_string(key, mods)?;
+    if let Some(command) = bindings.get_command(&binding) {
+        return Some(command);
+    }
+    if !mods.alt() {
+        return None;
+    }
+    let without_alt = mods & !keyboard::Modifiers::ALT;
+    let base = key_to_binding_string(key, without_alt)?;
+    matches!(
+        bindings.get_command(&base),
+        Some(keybindings::Command::EditCopy)
+    )
+    .then_some(keybindings::Command::EditCopyBlockOutput)
+}
+
+/// Flags describing which enhanced-keyboard protocols an application has
+/// enabled, sampled from the focused terminal before encoding a key press.
+#[derive(Clone, Copy, Default)]
+struct KeyboardEnhancements {
+    kitty_flags: u16,
+    modify_other_keys: u16,
+    format_other_keys: u16,
+    report_all_keys: bool,
+    application_keypad: bool,
+}
+
+/// Translate an iced key press into the bytes to send to the PTY.
+fn encode_key(
+    key: &keyboard::Key,
+    location: keyboard::Location,
+    mods: keyboard::Modifiers,
+    text: Option<&str>,
+    app_cursor: bool,
+    enh: KeyboardEnhancements,
+) -> Option<Vec<u8>> {
+    use keyboard::key::Named;
+    use keyboard::Key;
+
+    let ctrl = mods.control();
+    let alt = mods.alt();
+
+    // Enhanced keyboard protocols (Kitty / xterm modifyOtherKeys) take
+    // precedence when an app has enabled them. Unlike ember/egui, iced puts
+    // committed text on this same key event; there is no second text event to
+    // suppress. Skipping an alphanumeric key here would therefore violate
+    // Kitty's report-all-keys mode and send plain text instead.
+    if let Some(enc) = kitty_encode_key(key, mods, text, enh.kitty_flags) {
+        return Some(enc);
+    }
+    if let Some(enc) = xterm_modify_other_keys_encode(
+        key,
+        mods,
+        text,
+        enh.modify_other_keys,
+        enh.format_other_keys,
+        enh.report_all_keys,
+    ) {
+        return Some(enc);
+    }
+
+    let csi = |c: &str| -> Vec<u8> { format!("\x1b[{c}").into_bytes() };
+    let ss3 = |c: &str| -> Vec<u8> { format!("\x1bO{c}").into_bytes() };
+
+    match key {
+        Key::Named(named) => {
+            let mut bytes = match named {
+                Named::Enter => {
+                    if enh.application_keypad && location == keyboard::Location::Numpad {
+                        ss3("M")
+                    } else {
+                        vec![b'\r']
+                    }
+                }
+                Named::Backspace => vec![if ctrl { 0x08 } else { 0x7f }],
+                Named::Tab => {
+                    if mods.shift() {
+                        csi("Z")
+                    } else {
+                        vec![b'\t']
+                    }
+                }
+                Named::Escape => vec![0x1b],
+                Named::Space => vec![if ctrl { 0x00 } else { b' ' }],
+                _ => {
+                    return legacy_function_key_sequence(
+                        named,
+                        mods,
+                        app_cursor,
+                        enh.report_all_keys,
+                    )
+                }
+            };
+            if alt {
+                bytes.insert(0, 0x1b);
+            }
+            Some(bytes)
+        }
+        Key::Character(s) => {
+            let c = s.chars().next()?;
+            if ctrl {
+                // Map Ctrl+key to the corresponding control byte.
+                // Match Unicode scalars before narrowing: casting a non-ASCII
+                // key to u8 can alias an ASCII control (for example ţ → Ctrl+C).
+                let b = c.to_ascii_lowercase();
+                let ctrl_byte = match b {
+                    'a'..='z' => (b as u8) & 0x1f,
+                    '@' => 0,
+                    '[' => 0x1b,
+                    '\\' => 0x1c,
+                    ']' => 0x1d,

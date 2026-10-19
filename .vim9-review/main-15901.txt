@@ -1,0 +1,300 @@
+        self.organism.freeze_watch(is_pty_output);
+        // Coordinate identity only: due attention is not accepted ahead of input.
+        self.sync_organism_attention_owner();
+        self.organism
+            .set_enabled(self.config.ascii_organism_enabled);
+        if self.organism_observation_owner().is_none() {
+            self.organism.pause_clock();
+            self.organism_pointer_buttons.clear();
+        }
+        self.organism
+            .sync_preview_visibility(self.organism_preview_visible());
+        if !is_pty_output {
+            self.sync_organism_watch();
+        }
+        match message {
+            Message::PtyOutput(id, fd, data, watch_stamp) => {
+                let t0 = std::time::Instant::now();
+                let is_active_output = self
+                    .sessions
+                    .get(self.active)
+                    .is_some_and(|session| session.id == id && session.master_fd == fd);
+                let mut clip_set: Option<String> = None;
+                let mut clip_queries = Vec::new();
+                let mut clip_requests: Vec<terminal::ClipboardReadKind> = Vec::new();
+                let mut notifications: Vec<(String, String)> = Vec::new();
+                let mut completed_commands: Vec<terminal::CompletedCommand> = Vec::new();
+                // Observe only live session identities, before processing this
+                // batch so enabling during C..D cannot replay that command.
+                if self.config.ascii_organism_enabled {
+                    self.organism.observe_work_day(organism_local_day());
+                    if let Some(sess) = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == id && s.master_fd == fd)
+                    {
+                        if !sess.managed_remote && !sess.transcript_read_only() {
+                            self.organism
+                                .prime_session(id, sess.terminal.is_command_running());
+                            if self.organism.remote_probe_due(id) {
+                                self.organism
+                                    .set_remote(id, sess.observed_ssh_command().is_some());
+                            }
+                        } else {
+                            self.organism.forget_session(id);
+                        }
+                    }
+                }
+                // Snapshot admission before the batch lifts enable-time quarantine.
+                let watch_batch_admitted = self.organism.watch_batch_admitted(id);
+                if let Some(sess) = self.session_by_identity(id, fd) {
+                    sess.terminal.process_batch(&data);
+                    let retained_block_ids: Vec<u64> = sess
+                        .terminal
+                        .command_zones
+                        .iter()
+                        .map(|zone| zone.id)
+                        .collect();
+                    sess.block_selection.retain(&retained_block_ids);
+                    sess.block_bookmarks.retain(&retained_block_ids);
+                    sess.flush_responses();
+                    sess.refresh();
+                    clip_set = sess.terminal.take_osc52_clipboard_set();
+                    clip_queries =
+                        std::iter::from_fn(|| sess.terminal.take_osc52_clipboard_query()).collect();
+                    clip_requests = sess
+                        .terminal
+                        .take_clipboard_read_requests()
+                        .into_iter()
+                        .map(|r| r.kind)
+                        .collect();
+                    notifications = std::mem::take(&mut sess.terminal.pending_notifications);
+                    completed_commands = sess.terminal.take_completed_commands();
+                    // Retain the newest completion for the bottom bar; the
+                    // drain above is the only place finished commands surface.
+                    if let Some(last) = completed_commands.last() {
+                        sess.last_exit = last.exit_code;
+                        sess.last_duration_ms = last.duration_ms;
+                    }
+                }
+                // Borrow the existing one-shot drain. Do not drain again or
+                // infer successful exits for boundary-inferred completions.
+                if self.config.ascii_organism_enabled {
+                    if let Some(sess) = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == id && s.master_fd == fd)
+                    {
+                        if !sess.managed_remote
+                            && !sess.terminal.is_alt_buffer_active()
+                            && !matches!(
+                                sess.fg_proc_cache.as_deref(),
+                                Some("ssh" | "mosh" | "telnet")
+                            )
+                        {
+                            for completed in &completed_commands {
+                                let exit = (completed.completion_provenance
+                                    == block_mode::CompletionProvenance::ShellReported)
+                                    .then_some(completed.exit_code)
+                                    .flatten();
+                                self.organism.completed_event(
+                                    id,
+                                    organism::CommandCompletion {
+                                        command: &completed.command,
+                                        exit,
+                                        duration: completed.duration_ms,
+                                        cwd: completed.command_cwd.as_deref(),
+                                        agent_driven: completed.agent_generation.is_some(),
+                                    },
+                                );
+                            }
+                            self.organism
+                                .batch_finished(id, sess.terminal.is_command_running());
+                            self.organism.observe_work_context(
+                                id,
+                                sess.terminal.organism_idle_working_dir(),
+                            );
+                        } else {
+                            self.organism.observe_work_context(id, None);
+                        }
+                    }
+                }
+                if !data.is_empty()
+                    && self.organism.is_local(id)
+                    && self.sessions.iter().any(|s| {
+                        s.id == id
+                            && s.master_fd == fd
+                            && !s.managed_remote
+                            && !matches!(
+                                s.fg_proc_cache.as_deref(),
+                                Some("ssh" | "mosh" | "telnet")
+                            )
+                    })
+                {
+                    self.organism.note_output(id);
+                }
+                if watch_source_valid {
+                    if let Some(stamp) = watch_stamp {
+                        // Linearize Watch admission against the same native source.
+                        // No generic sync in this message can attach to a newer one.
+                        let source = self
+                            .sessions
+                            .iter()
+                            .find(|s| {
+                                s.id == id
+                                    && s.master_fd == fd
+                                    && s.watch_source.epoch() == Some(stamp.epoch)
+                            })
+                            .map(|s| s.watch_source.clone());
+                        if let Some(source) = source {
+                            let eligible = self.organism_watch_source();
+                            if eligible.is_none()
+                                || eligible
+                                    .is_some_and(|e| e.0 == id && e.1 == fd && e.2 == stamp.epoch)
+                            {
+                                if let Some(sess) = self
+                                    .sessions
+                                    .iter()
+                                    .find(|s| s.id == id && s.master_fd == fd)
+                                {
+                                    self.organism.freeze_watch(false);
+                                    self.organism.bind_watch_source(Some(source));
+                                    self.organism.watch_output(
+                                        eligible,
+                                        sess.terminal.watch_generation(),
+                                        sess.terminal.watch_batch(),
+                                        stamp,
+                                        !data.is_empty(),
+                                        watch_batch_admitted,
+                                    );
+                                    self.organism.freeze_watch(true);
+                                }
+                            }
+                        }
+                    }
+                }
+                if is_active_output {
+                    let facts = self.organism_attention_facts();
+                    self.organism.poll_live_greeting(Some(id), facts);
+                }
+                self.last_ingest_us = t0.elapsed().as_micros();
+                self.last_ingest_bytes = data.len();
+                if is_active_output
+                    && self
+                        .sessions
+                        .get(self.active)
+                        .is_some_and(|session| session.terminal.is_alt_buffer_active())
+                {
+                    self.close_block_search();
+                    self.block_menu = None;
+                    self.block_clear_confirm = None;
+                }
+                let refresh_block_search = is_active_output
+                    && self.block_search.as_ref().is_some_and(|state| {
+                        state.session_id == id
+                            && self.sessions.get(self.active).is_some_and(|sess| {
+                                sess.id == id
+                                    && BlockSearchZoneVersion::from_terminal(&sess.terminal)
+                                        != state.zone_version
+                            })
+                    });
+                // Output may have moved the shell's cwd; let the next periodic
+                // tick reconcile the session snapshot.
+                self.session_dirty = true;
+                if is_active_output && self.search.is_open {
+                    self.search_dirty = true;
+                }
+
+                // Desktop notifications requested via OSC 9 / OSC 777.
+                if let Some((title, body)) = notifications.into_iter().next() {
+                    let now = std::time::Instant::now();
+                    let allowed = self.last_notification_at.is_none_or(|last| {
+                        now.duration_since(last) >= std::time::Duration::from_secs(2)
+                    });
+                    if allowed {
+                        self.last_notification_at = Some(now);
+                        enqueue_desktop_notification(title, body);
+                    }
+                }
+
+                // Desktop notification when a long-running command finishes
+                // (duration measured by the OSC 133 bookkeeping). Mirrors the
+                // block-view gating in anvil: an opt-out config flag plus a
+                // duration threshold, with iced window focus standing in for
+                // its background-block check — a command the user is actively
+                // watching (focused window, active pane) never toasts.
+                if self.config.notify_long_blocks && !(self.focused && is_active_output) {
+                    for completed in &completed_commands {
+                        if completed.completion_provenance
+                            != block_mode::CompletionProvenance::ShellReported
+                        {
+                            continue;
+                        }
+                        let (Some(ms), Some(exit_code)) =
+                            (completed.duration_ms, completed.exit_code)
+                        else {
+                            continue;
+                        };
+                        if ms >= self.config.notify_long_block_threshold_ms {
+                            jterm_core::notify::long_block_finished(
+                                &history_picker::display_command(&completed.command),
+                                exit_code,
+                                ms,
+                            );
+                        }
+                    }
+                }
+
+                // A finished command may have changed branch/dirty state;
+                // re-probe the pane's git meta now instead of waiting for the
+                // next periodic tick (same immediate refresh anvil does).
+                // Both the pane-header strip and the bottom bar read the cache.
+                if !completed_commands.is_empty()
+                    && (self.config.show_repo_strip || self.config.bottom_bar)
+                {
+                    if let Some(sess) = self.session_by_identity(id, fd) {
+                        sess.git_meta_cache = sess.git_meta();
+                    }
+                }
+
+                // Clipboard set/query via OSC 52. The query path reads the
+                // system clipboard asynchronously and writes the base64
+                // response back to the originating session's PTY.
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                let session_index = self
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == id && session.master_fd == fd);
+                if refresh_block_search {
+                    tasks.push(self.begin_block_search_rebuild());
+                }
+                // An OSC 52 SET is PTY output asking to replace the host
+                // clipboard, so it crosses the same trust boundary a read
+                // does, in the other direction: a program on the far side of
+                // an ssh connection choosing what the user's next paste
+                // produces. frost applied it unconditionally while gating
+                // reads; both siblings gate both. The decode still happened
+                // above, so the pending slot is cleared either way and a
+                // refused write cannot be replayed by a later allowed one.
+                if let Some(text) = clip_set {
+                    if self.config.allow_remote_clipboard_write
+                        && admit_osc52_clipboard_write(
+                            &mut self.osc52_write_window_started,
+                            &mut self.osc52_writes_in_window,
+                        )
+                    {
+                        tasks.push(iced::clipboard::write(text));
+                    }
+                }
+                for terminator in clip_queries {
+                    if let Some(sess) = self.session_by_identity(id, fd) {
+                        if defer_osc52_refusal(&mut sess.osc52_pending_refusals, terminator) {
+                            continue;
+                        }
+                    }
+                    if self.config.allow_clipboard_read {
+                        let host_blocked = self.host_clipboard_read_blocked_for(id, fd);
+                        let session_busy = session_index
+                            .and_then(|index| self.sessions.get(index))
+                            .is_some_and(|session| session.clipboard_read_in_flight);
+                        let start_read = !session_busy

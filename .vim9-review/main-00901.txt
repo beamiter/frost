@@ -1,0 +1,300 @@
+        .collect();
+    let starts: Vec<usize> = zones.iter().map(|zone| zone.prompt_start).collect();
+    zones
+        .iter()
+        .zip(block_mode::spans(&starts, live_boundary))
+        .find(|(_, (span_start, span_end))| abs_row >= *span_start && abs_row < *span_end)
+        .map(|(zone, _)| zone.id)
+}
+
+/// Only proven completed transcript cells can expose Chat card actions.
+/// Live/composer and host-owned rows never acquire a synthetic zone identity.
+fn chat_completed_zone_at_row(
+    terminal: &terminal::TerminalState,
+    projection: &ProjectedViewport,
+    row: usize,
+) -> Option<u64> {
+    let chat = projection.chat_rows().get(row)?;
+    if !matches!(
+        chat.role,
+        chat_mode::ChatRole::Command | chat_mode::ChatRole::Output
+    ) || !matches!(
+        projection.row_kinds().get(row),
+        Some(terminal::ProjectedRowKind::Raw)
+    ) {
+        return None;
+    }
+    if terminal.is_alt_buffer_active() {
+        return None;
+    }
+    let absolute = projection.view_row_absolute(row)?;
+    let live_boundary = terminal
+        .running_zone_start()
+        .or(terminal.live_prompt_row())?;
+    if absolute >= live_boundary {
+        return None;
+    }
+    // Walk newest-first without allocating a second zone/span list per painted
+    // row. An evicted zone remains a boundary; never borrow its predecessor.
+    terminal
+        .command_zones
+        .iter()
+        .rev()
+        .find(|zone| zone.prompt_start <= absolute)
+        .filter(|zone| !zone.rows_evicted)
+        .map(|zone| zone.id)
+}
+
+/// Map one raw-buffer search match through the exact immutable projection.
+/// A match split across display rows, trimmed origin, or structural padding is
+/// not guessed onto a nearby cell.
+fn project_search_match(
+    terminal: &terminal::TerminalState,
+    projection: &ProjectedViewport,
+    matched: &search::SearchMatch,
+) -> Option<search::SearchMatch> {
+    let end_col = matched.col_end.checked_sub(1)?;
+    let start_origin = terminal.raw_cell_origin_at_absolute(matched.line, matched.col_start)?;
+    let end_origin = terminal.raw_cell_origin_at_absolute(matched.line, end_col)?;
+    let start = projection.raw_to_view(start_origin)?;
+    let end = projection.raw_to_view(end_origin)?;
+    if projection.view_to_raw(start) != Some(start_origin)
+        || projection.view_to_raw(end) != Some(end_origin)
+    {
+        return None;
+    }
+    (start.row == end.row).then_some(search::SearchMatch {
+        line: start.row,
+        col_start: start.col,
+        col_end: end.col.saturating_add(1),
+    })
+}
+
+/// Project a Kitty placement as one indivisible rectangle. Reflow or collapse
+/// may split its backing raw rows; rendering only a surviving fragment would
+/// visually bridge hidden output, so every occupied row must map to a
+/// consecutive display row at the same column.
+fn projected_kitty_anchor(
+    terminal: &terminal::TerminalState,
+    projection: &ProjectedViewport,
+    buffer_row: usize,
+    col: usize,
+    cols: usize,
+    rows: usize,
+) -> Option<terminal::ViewportCell> {
+    let rows = rows.max(1);
+    let cols = cols.max(1);
+    if rows > projection.cells().len() || cols > projection.cells().first().map_or(0, Vec::len) {
+        return None;
+    }
+    let mut first = None;
+    for row_delta in 0..rows {
+        let absolute_row = buffer_row.checked_add(row_delta)?;
+        let origin = terminal.raw_cell_origin_at_absolute(absolute_row, col)?;
+        let mapped = projection.raw_range_to_view(origin, cols)?;
+        match first {
+            None => first = Some(mapped),
+            Some(anchor)
+                if mapped.row == anchor.row.checked_add(row_delta)? && mapped.col == anchor.col => {
+            }
+            Some(_) => return None,
+        }
+    }
+    first
+}
+
+/// Translate a visible projected cell back onto the live PTY grid. History,
+/// padding and synthetic rows fail closed; only this mapping may feed app
+/// mouse reports or click-to-cursor movement while collapse shifts rows.
+fn projected_live_grid_cell(
+    terminal: &terminal::TerminalState,
+    projection: &ProjectedViewport,
+    row: usize,
+    col: usize,
+) -> Option<(usize, usize)> {
+    let origin = projection.view_to_raw(terminal::ViewportCell { row, col })?;
+    let absolute = projection.view_row_absolute(row)?;
+    let history = terminal.scrollback_len();
+    if absolute < history || terminal.raw_row_id_at_absolute(absolute)? != origin.row {
+        return None;
+    }
+    Some((origin.col, absolute - history))
+}
+
+/// A local caret gesture owns the exact displayed terminal snapshot at press.
+/// Selection and application-mouse ownership remain separate.
+#[derive(Default)]
+struct TerminalClickTracker {
+    tracker: click_cursor::ClickTracker,
+    pending: Option<(usize, terminal::ProjectionKey)>,
+    selection_press: Option<click_cursor::Cell>,
+    cancelled: bool,
+}
+
+impl TerminalClickTracker {
+    fn cancel(&mut self) {
+        self.invalidate_caret();
+        self.selection_press = None;
+    }
+
+    fn invalidate_caret(&mut self) {
+        self.tracker.cancel();
+        self.pending = None;
+        self.cancelled = true;
+    }
+
+    fn geometry_changed(&mut self, before: Metrics, after: Metrics) {
+        let geometry = |metrics: Metrics| {
+            (
+                metrics.cell_w,
+                metrics.cell_h,
+                metrics.padding,
+                metrics.block_gutter,
+            )
+        };
+        if geometry(before) != geometry(after) && self.pending.is_some() {
+            self.invalidate_caret();
+        }
+    }
+
+    fn update(
+        &mut self,
+        input: MouseInput,
+        session_id: usize,
+        projection: terminal::ProjectionKey,
+        report_to_app: bool,
+    ) -> Option<click_cursor::Cell> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(owner, key)| *owner == session_id && *key != projection)
+        {
+            // The same display coordinate may now belong to a different raw
+            // row. Invalidate the caret gesture before re-mapping its release.
+            self.invalidate_caret();
+        }
+        match input {
+            MouseInput::Press {
+                col,
+                row,
+                button: MouseButton::Left,
+                alt,
+                shift,
+                ctrl,
+                count,
+                ..
+            } => {
+                let plain = count == 1 && !alt && !shift && !ctrl && !report_to_app;
+                let cell = click_cursor::Cell::new(row as i64, col as i64);
+                self.tracker.press(cell, plain);
+                self.pending = plain.then_some((session_id, projection));
+                self.selection_press = plain.then_some(cell);
+                self.cancelled = false;
+                None
+            }
+            MouseInput::Drag { col, row, .. } => {
+                let cell = click_cursor::Cell::new(row as i64, col as i64);
+                self.tracker.pointer_at(cell);
+                if self.selection_press.is_some_and(|press| press != cell) {
+                    // A genuine drag owns selection/copy even if the viewport
+                    // changed before its first motion event. Only the caret
+                    // click is invalidated by that change.
+                    self.pending = None;
+                    self.selection_press = None;
+                    self.cancelled = false;
+                }
+                None
+            }
+            MouseInput::Release {
+                button: MouseButton::Left,
+                row,
+                col,
+            } => {
+                // A release can arrive without an intervening move event.
+                self.tracker
+                    .pointer_at(click_cursor::Cell::new(row as i64, col as i64));
+                self.pending = None;
+                self.selection_press = None;
+                self.tracker.release()
+            }
+            MouseInput::Wheel { .. } | MouseInput::ScrollTo { .. } => {
+                if self.pending.is_some() {
+                    self.invalidate_caret();
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+struct ProjectedZoneMemberships {
+    rows: Vec<Option<(usize, usize)>>,
+    #[cfg(test)]
+    scan_steps: usize,
+}
+
+/// Assign sorted projected raw rows to sorted zone spans in one forward pass.
+/// `None` rows are structural viewport padding and remain unowned.
+fn projected_zone_memberships(
+    view_absolute_rows: &[Option<usize>],
+    zone_spans: &[(usize, usize)],
+) -> ProjectedZoneMemberships {
+    let mut zone_index = 0;
+    #[cfg(test)]
+    let mut scan_steps = 0;
+    let rows = view_absolute_rows
+        .iter()
+        .map(|absolute_row| {
+            #[cfg(test)]
+            {
+                scan_steps += 1;
+            }
+            let absolute_row = (*absolute_row)?;
+            while zone_index < zone_spans.len() && absolute_row >= zone_spans[zone_index].1 {
+                zone_index += 1;
+                #[cfg(test)]
+                {
+                    scan_steps += 1;
+                }
+            }
+            zone_spans
+                .get(zone_index)
+                .filter(|(start, end)| absolute_row >= *start && absolute_row < *end)
+                .map(|_| (zone_index, absolute_row))
+        })
+        .collect();
+    ProjectedZoneMemberships {
+        rows,
+        #[cfg(test)]
+        scan_steps,
+    }
+}
+
+fn projected_card_real_top(
+    visible_raw_top: Option<usize>,
+    summary_top: Option<usize>,
+    outcome: block_mode::BlockOutcome,
+) -> Option<usize> {
+    visible_raw_top.or_else(|| {
+        // Collapse hides output only. A command card whose header is merely
+        // above the viewport must stay top-clipped; only Background has no
+        // surviving header and may promote its summary to the semantic top.
+        matches!(outcome, block_mode::BlockOutcome::Background)
+            .then_some(summary_top)
+            .flatten()
+    })
+}
+
+/// A claimed card gesture may use only the stable id painted under the press.
+/// A later viewport mapping is evidence for validation, never a replacement
+/// target: moving onto a neighbour fails closed.
+fn validated_claimed_block_target(
+    rendered_zone_id: Option<u64>,
+    current_row_zone_id: Option<u64>,
+    retained_finalized: bool,
+) -> Option<u64> {
+    let rendered_zone_id = rendered_zone_id?;
+    (retained_finalized && current_row_zone_id == Some(rendered_zone_id))
+        .then_some(rendered_zone_id)
+}

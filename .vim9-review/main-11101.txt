@@ -1,0 +1,300 @@
+                self.resize_pane_direction(PaneDirection::Left);
+                Task::none()
+            }
+            C::PaneResizeRight => {
+                self.resize_pane_direction(PaneDirection::Right);
+                Task::none()
+            }
+            C::PaneResizeUp => {
+                self.resize_pane_direction(PaneDirection::Up);
+                Task::none()
+            }
+            C::PaneResizeDown => {
+                self.resize_pane_direction(PaneDirection::Down);
+                Task::none()
+            }
+            C::PaneZoomToggle => {
+                self.toggle_pane_zoom();
+                Task::none()
+            }
+            C::PaneSwap => {
+                self.swap_panes();
+                Task::none()
+            }
+            C::PaneEqualize => {
+                self.equalize_panes();
+                Task::none()
+            }
+            C::OrganismHello => {
+                let target = self.sessions.get(self.active).map(|session| session.id);
+                self.greet_companion(target);
+                Task::none()
+            }
+            C::ConfigOpen => {
+                self.set_config_panel_open(true);
+                Task::none()
+            }
+            C::ConfigClose => {
+                self.set_config_panel_open(false);
+                Task::none()
+            }
+            C::ConfigToggle => {
+                self.set_config_panel_open(!self.config_panel_open);
+                Task::none()
+            }
+            C::SidebarToggle => self.toggle_sidebar(),
+            C::AgentToggle => {
+                if self.agent.is_open {
+                    self.agent.close();
+                    Task::none()
+                } else {
+                    let session_id = self.sessions.get(self.active).map(|s| s.id).unwrap_or(0);
+                    self.agent.open(&self.config, session_id);
+                    let focus = iced::widget::operation::focus(AGENT_INPUT_ID.clone());
+                    match self.agent_drive_task() {
+                        Some(task) => Task::batch([focus, task]),
+                        None => focus,
+                    }
+                }
+            }
+            C::AiChatToggle => self.toggle_ai_chats(),
+            C::AgentLaunchCodex => {
+                Task::done(Message::AgentLaunch(agent_task::AgentProvider::Codex))
+            }
+            C::AgentLaunchClaude => {
+                Task::done(Message::AgentLaunch(agent_task::AgentProvider::Claude))
+            }
+            C::AgentLaunchOpenCode => {
+                Task::done(Message::AgentLaunch(agent_task::AgentProvider::OpenCode))
+            }
+            C::AgentLaunchKimi => Task::done(Message::AgentLaunch(agent_task::AgentProvider::Kimi)),
+            C::FontZoomIn => {
+                self.adjust_font_size(1.0);
+                Task::none()
+            }
+            C::FontZoomOut => {
+                self.adjust_font_size(-1.0);
+                Task::none()
+            }
+            C::FontZoomReset => {
+                self.reset_font_size();
+                Task::none()
+            }
+            C::OpacityIncrease => {
+                self.adjust_opacity(0.025);
+                Task::none()
+            }
+            C::OpacityDecrease => {
+                self.adjust_opacity(-0.025);
+                Task::none()
+            }
+        };
+        Some(task)
+    }
+
+    /// Non-configurable app-chrome shortcuts that have no [`keybindings::Command`]
+    /// (command palette, diagnostics, and help overlays). Returns `Some` when the
+    /// keypress was consumed.
+    fn handle_tab_shortcut(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+        retreat_before_key: Option<std::time::Instant>,
+    ) -> Option<Task<Message>> {
+        match chrome_shortcut(key, mods)? {
+            ChromeShortcut::CommandPalette => {
+                self.palette.toggle();
+                Some(if self.palette.is_open {
+                    self.organism
+                        .restore_retreat_after_app_action(retreat_before_key);
+                    self.palette.bind_greeting_target(
+                        self.sessions.get(self.active).map(|session| session.id),
+                    );
+                    iced::widget::operation::focus(PALETTE_INPUT_ID.clone())
+                } else {
+                    Task::none()
+                })
+            }
+            ChromeShortcut::Help => {
+                self.help_open = !self.help_open;
+                Some(Task::none())
+            }
+            ChromeShortcut::TabSwitcher => {
+                if self.tab_switcher.is_some() {
+                    self.tab_switcher = None;
+                    return Some(Task::none());
+                }
+                self.tab_switcher = Some(TabSwitcherState::default());
+                Some(iced::widget::operation::focus(
+                    TAB_SWITCHER_INPUT_ID.clone(),
+                ))
+            }
+            ChromeShortcut::HistoryPicker => {
+                if self.history_picker.is_some() {
+                    self.history_picker = None;
+                    return Some(Task::none());
+                }
+                Some(self.open_history_picker())
+            }
+            ChromeShortcut::RemoteHosts => {
+                if self.remote_picker.is_some() {
+                    self.remote_picker = None;
+                } else {
+                    self.remote_picker = Some(RemotePickerState::new(&self.config.remote_hosts));
+                }
+                Some(Task::none())
+            }
+            ChromeShortcut::Workflows => {
+                if self.workflow_overlay.is_some() {
+                    self.workflow_overlay = None;
+                    return Some(Task::none());
+                }
+                Some(self.open_workflow_picker())
+            }
+            ChromeShortcut::Debug => {
+                self.debug_open = !self.debug_open;
+                Some(Task::none())
+            }
+        }
+    }
+
+    /// Remote picker key handling. Mirrors `handle_tab_switcher_key`: arrows
+    /// move, Enter connects, Esc or the toggle chord dismisses.
+    fn handle_remote_picker_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+    ) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        if chrome_shortcut(key, mods) == Some(ChromeShortcut::RemoteHosts) {
+            self.remote_picker = None;
+            return Some(Task::none());
+        }
+        let state = self.remote_picker.as_mut()?;
+        let count = state.hosts.len().min(config::MAX_REMOTE_HOST_UI_ROWS);
+        match key {
+            Key::Named(Named::Escape) => {
+                self.remote_picker = None;
+                Some(Task::none())
+            }
+            Key::Named(Named::Enter) => {
+                let profile = state.hosts.get(state.selected).cloned();
+                let identity = state.identity.clone();
+                Some(match profile {
+                    Some(profile) => {
+                        self.update(Message::RemotePickerConnect(identity, Box::new(profile)))
+                    }
+                    None => {
+                        self.remote_picker = None;
+                        Task::none()
+                    }
+                })
+            }
+            Key::Named(Named::ArrowDown) if count > 0 => {
+                if let Some(next) = next_runnable_remote_index(&state.hosts, state.selected, true) {
+                    state.selected = next;
+                }
+                Some(Task::none())
+            }
+            Key::Named(Named::ArrowUp) if count > 0 => {
+                if let Some(next) = next_runnable_remote_index(&state.hosts, state.selected, false)
+                {
+                    state.selected = next;
+                }
+                Some(Task::none())
+            }
+            _ => Some(Task::none()),
+        }
+    }
+
+    /// Open a `[[remote_hosts]]` destination in its own session. The argv is
+    /// the family-shared builder's: the deploy launcher when the entry asks
+    /// for it — lending the local jsh when that one is static — and a plain
+    /// ssh / `docker exec` otherwise.
+    fn connect_remote_host(&mut self, index: usize) {
+        let host = match config::validate_remote_host_at(&self.config.remote_hosts, index) {
+            Ok(host) => host.clone(),
+            Err(problem) => {
+                let name = self
+                    .config
+                    .remote_hosts
+                    .get(index)
+                    .map(|host| config::remote_host_display_name(host, index))
+                    .unwrap_or_else(|| format!("remote host #{}", index + 1));
+                self.push_toast(format!("Remote host {name}: {problem}"), ToastKind::Warning);
+                return;
+            }
+        };
+        let display_name = config::remote_host_display_name(&host, index);
+        self.connect_remote_profile(host, display_name, false);
+    }
+
+    fn connect_remote_profile(
+        &mut self,
+        host: jterm_core::jsh_remote::RemoteHostConfig,
+        display_name: String,
+        plain_interactive: bool,
+    ) {
+        if let Err(problem) = config::validate_remote_host(&host) {
+            self.push_toast(
+                format!("Remote host {display_name}: {problem}"),
+                ToastKind::Warning,
+            );
+            return;
+        }
+        let (argv, degraded) = if plain_interactive && !host.docker {
+            (interactive_ssh_argv(&host), None)
+        } else {
+            host.tab_argv()
+        };
+        if let Some(error) = degraded {
+            // The tab still opens — a plain connection beats no connection —
+            // but quietly pretending jsh was deployed would be worse than
+            // either.
+            log::warn!("cannot publish jsh-remote.sh: {error}; connecting without deployment");
+            self.push_toast(
+                format!("Deploy unavailable; connecting to {} plainly", display_name),
+                ToastKind::Warning,
+            );
+        }
+        match Session::spawn_argv(
+            &self.config,
+            self.next_id,
+            self.cols,
+            self.rows,
+            None,
+            Some(&argv),
+        ) {
+            Ok(mut session) => {
+                session.managed_remote = true;
+                self.session_diagnostic = None;
+                self.next_id += 1;
+                let insert = (self.active + 1).min(self.sessions.len());
+                self.sessions.insert(insert, session);
+                apply_theme_colors(&mut self.sessions[insert].terminal, &self.theme);
+                self.reindex_tabs_after_insert(insert);
+                // A remote session opens its own tab; it is never grafted into
+                // the current tab's split.
+                self.open_tab_with(insert);
+                self.relayout();
+                self.refresh_active_context();
+                self.save_session_snapshot();
+            }
+            Err(error) => {
+                let message = error.to_string();
+                log::error!("[PTY] {message}");
+                self.push_toast(message, ToastKind::Warning);
+            }
+        }
+    }
+
+    /// Tab switcher key handling. Mirrors `handle_palette_key`: filters by
+    /// typed text, arrows move selection, Enter jumps, Esc closes.
+    fn handle_tab_switcher_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+        text: Option<&str>,
+    ) -> Option<Task<Message>> {
+        use keyboard::key::Named;

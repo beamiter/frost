@@ -1,0 +1,300 @@
+        assert!(inactive.contains("self.session_dirty = false;"));
+        assert!(!inactive.contains("snapshot.save("));
+        for (start, end) in [
+            ("    fn new_session_at(", "    /// Run the jsh installer"),
+            ("    fn close_session(", "    /// Reconcile every tab"),
+        ] {
+            let caller = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
+            assert!(caller.contains("self.save_session_snapshot();"));
+        }
+        let tick = source
+            .split_once("            Message::ConfigTick => {")
+            .unwrap()
+            .1
+            .split_once("            Message::TabMenuOpen(")
+            .unwrap()
+            .0;
+        assert!(tick.contains("if self.session_dirty {"));
+        assert!(tick.contains("self.save_session_snapshot();"));
+        let eligible = save
+            .split_once("        if self.session_writes_blocked {")
+            .unwrap()
+            .1;
+        let pending = eligible.find("self.session_dirty = true;").unwrap();
+        for failure_boundary in [
+            "snapshot.to_json()",
+            "self.config.session_history_path()",
+            "snapshot.save(&path)",
+        ] {
+            assert!(pending < eligible.find(failure_boundary).unwrap());
+        }
+        // After admission only a cached exact match or a successful save may
+        // clear pending work; all error returns retain it for ConfigTick.
+        assert_eq!(eligible.matches("self.session_dirty = false;").count(), 2);
+        let write = eligible
+            .split_once("match snapshot.save(&path) {")
+            .unwrap()
+            .1;
+        assert!(write
+            .split_once("            Err(error) => {")
+            .unwrap()
+            .0
+            .contains("self.session_dirty = false;"));
+        assert!(!write
+            .split_once("            Err(error) => {")
+            .unwrap()
+            .1
+            .contains("self.session_dirty = false;"));
+    }
+
+    #[test]
+    fn pane_focus_and_ratio_changes_dirty_periodic_session_snapshots() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        for (start, end) in [
+            ("    fn set_focus(", "    /// The tab owning"),
+            (
+                "    fn resize_pane_direction(",
+                "    /// Toggle tmux-style zoom",
+            ),
+            ("    fn equalize_panes(", "    /// Close the focused pane"),
+            (
+                "            Message::DividerDragStart(",
+                "            Message::DividerDragEnd",
+            ),
+            (
+                "            Message::DividerDragMove(",
+                "            Message::PaneDragStart(",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
+            assert!(
+                body.contains("self.session_dirty = true;"),
+                "snapshot mutation was not marked dirty: {start}"
+            );
+        }
+        let tick = source
+            .split_once("            Message::ConfigTick => {")
+            .unwrap()
+            .1
+            .split_once("            Message::TabMenuOpen(")
+            .unwrap()
+            .0;
+        assert!(tick.contains("if self.session_dirty {"));
+        assert!(tick.contains("self.save_session_snapshot();"));
+    }
+
+    #[test]
+    fn all_tasks_dock_entry_points_relayout_and_release_files_focus() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let setter = source
+            .split_once("    fn set_task_panel_open(")
+            .unwrap()
+            .1
+            .split_once("    /// Show or hide the Tasks dock panel")
+            .unwrap()
+            .0;
+        assert!(setter.contains("self.sidebar_files_focused = false;"));
+        assert!(setter.contains("self.apply_config();"));
+        for (start, end) in [
+            (
+                "    fn toggle_task_panel(",
+                "    /// Create an isolated-worktree task",
+            ),
+            (
+                "    fn task_create_from_block(",
+                "    /// Finish Create task",
+            ),
+            (
+                "    fn task_create_with_provider(",
+                "    /// Enter the bounded, cancellable",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
+            assert!(
+                body.contains("self.set_task_panel_open("),
+                "Tasks entry point bypassed layout ownership: {start}"
+            );
+            assert!(!body.contains("self.sidebar_open ="));
+        }
+    }
+    #[test]
+    fn terminal_mouse_release_retires_only_the_matching_owner() {
+        for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+            let gesture = TerminalMouseGesture {
+                session_id: 42,
+                button,
+                report_to_app: true,
+                last_app_cell: None,
+                consumed: false,
+            };
+            let mut slots = [None; 3];
+            slots[button.slot()] = Some(gesture);
+            assert_eq!(take_terminal_mouse_gesture(&mut slots, 7, button), None);
+            assert_eq!(slots[button.slot()], Some(gesture));
+            assert_eq!(
+                take_terminal_mouse_gesture(&mut slots, 42, button),
+                Some(gesture)
+            );
+            assert_eq!(take_terminal_mouse_gesture(&mut slots, 42, button), None);
+        }
+        let consumed = TerminalMouseGesture {
+            session_id: 42,
+            button: MouseButton::Left,
+            report_to_app: false,
+            last_app_cell: None,
+            consumed: true,
+        };
+        let mut slots = [Some(consumed), None, None];
+        assert_eq!(
+            take_terminal_mouse_gesture(&mut slots, 42, MouseButton::Right),
+            None
+        );
+        assert_eq!(
+            take_terminal_mouse_gesture(&mut slots, 7, MouseButton::Left),
+            None
+        );
+        assert_eq!(
+            take_terminal_mouse_gesture(&mut slots, 42, MouseButton::Left),
+            Some(consumed)
+        );
+    }
+
+    #[test]
+    fn tab_switcher_targets_tab_ids_when_split_and_strip_order_diverge() {
+        let mut split = Tab::new(8, 3);
+        split.tree = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![PaneTree::Leaf(2), PaneTree::Leaf(3)],
+            ratios: vec![0.5, 0.5],
+        };
+        split.pinned = true;
+        split.title = Some("work".to_string());
+        let mut tabs = vec![split, Tab::new(4, 0)];
+        assert_eq!(tab_switcher_target_id(&tabs, &[(0, 0), (1, 1)], 0), Some(8));
+        tabs.reverse();
+        assert_eq!(tab_switcher_target_id(&tabs, &[(0, 1)], 0), Some(8));
+        assert_eq!(tab_switcher_target_id(&tabs, &[(0, 9)], 0), None);
+        assert_eq!(tab_switcher_target_id(&tabs, &[(0, 1)], 2), None);
+    }
+
+    #[test]
+    fn tab_switcher_render_and_close_actions_keep_tab_semantics() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let view = source
+            .split_once("    fn tab_switcher_view(")
+            .unwrap()
+            .1
+            .split_once("    fn remote_picker_view(")
+            .unwrap()
+            .0;
+        assert!(view.contains("self.tabs.get(idx)"));
+        assert!(view.contains("let label = self.tab_label(idx);"));
+        assert!(view.contains("let id = tab.id;"));
+        assert!(!view.contains("self.sessions.get(idx)"));
+        let handler = source
+            .split_once("    fn handle_tab_switcher_key(")
+            .unwrap()
+            .1
+            .split_once("    fn open_history_picker(")
+            .unwrap()
+            .0;
+        assert!(handler.contains("tab_switcher_target_id(&self.tabs, &filtered, state.selected)"));
+        let jump = source
+            .split_once("            Message::TabSwitcherJump(id) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::HistoryPickerClose")
+            .unwrap()
+            .0;
+        assert!(jump.contains("self.tab_index_by_id(id)"));
+        assert!(!jump.contains("self.sessions.iter()"));
+        let palette = source
+            .split_once("    fn execute_palette_action(")
+            .unwrap()
+            .1
+            .split_once("    fn copy_last_output_task(")
+            .unwrap()
+            .0;
+        assert!(
+            palette.contains("PaletteAction::CloseTab => self.request_close_tab(self.active_tab)")
+        );
+        assert!(palette.contains("PaletteAction::ClosePane => self.close_focused_pane()"));
+        let mouse = source
+            .split_once("    fn handle_mouse(")
+            .unwrap()
+            .1
+            .split_once("    fn handle_scroll_shortcut(")
+            .unwrap()
+            .0;
+        assert!(mouse.contains("let Some(gesture) = take_terminal_mouse_gesture("));
+        assert!(!mouse.contains("self.terminal_mouse_gestures[button.slot()].take()"));
+    }
+
+    fn audit_transfer_ui(
+        progress: std::sync::Arc<remote_fs::TransferProgress>,
+    ) -> Option<SidebarTransferUi> {
+        Some(SidebarTransferUi {
+            progress,
+            verb: "copy".into(),
+            name: "fixture".into(),
+            total: None,
+        })
+    }
+
+    #[test]
+    fn sidebar_old_completion_preserves_new_cancel_owner() {
+        let old = remote_fs::TransferProgress::new();
+        let new = remote_fs::TransferProgress::new();
+        let mut transfer = audit_transfer_ui(new.clone());
+        assert!(!retire_sidebar_transfer_owner(&mut transfer, Some(&old)));
+        transfer.as_ref().unwrap().progress.cancel();
+        assert!(new.is_cancelled());
+        assert!(!old.is_cancelled());
+    }
+
+    #[test]
+    fn sidebar_owner_completion_does_not_depend_on_navigation_context() {
+        let own = remote_fs::TransferProgress::new();
+        let mut transfer = audit_transfer_ui(own.clone());
+        // The pure ownership check has no location/epoch dependency. Reducer
+        // wiring below verifies it runs even when UI feedback will be stale.
+        assert!(retire_sidebar_transfer_owner(&mut transfer, Some(&own)));
+        assert!(transfer.is_none());
+        assert!(!own.is_cancelled());
+    }
+
+    #[test]
+    fn sidebar_no_owner_completion_preserves_live_transfer() {
+        let own = remote_fs::TransferProgress::new();
+        let mut transfer = audit_transfer_ui(own.clone());
+        assert!(!retire_sidebar_transfer_owner(&mut transfer, None));
+        assert!(std::sync::Arc::ptr_eq(&transfer.unwrap().progress, &own));
+    }
+
+    #[test]
+    fn sidebar_normal_owner_completion_retires_once() {
+        let own = remote_fs::TransferProgress::new();
+        let mut transfer = audit_transfer_ui(own.clone());
+        assert!(retire_sidebar_transfer_owner(&mut transfer, Some(&own)));
+        assert!(!retire_sidebar_transfer_owner(&mut transfer, Some(&own)));
+        assert!(transfer.is_none());
+    }
+

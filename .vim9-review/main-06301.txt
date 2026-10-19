@@ -1,0 +1,300 @@
+            .or_else(|| jterm_core::process::process_cwd(self.pty.get_child_pid()))
+    }
+}
+
+/// Texture-cache key for one Kitty placement: stable session id, image id and
+/// the clamped source-crop rectangle the placement shows.
+type KittyHandleKey = (usize, u32, kitty_graphics::Crop);
+
+/// Route every event in one terminal mouse gesture to the owner chosen at
+/// press time. Mouse-reporting mode and Shift may change before release; that
+/// must never synthesize a half gesture for either the app or local selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalMouseGesture {
+    session_id: usize,
+    button: MouseButton,
+    report_to_app: bool,
+    /// Last raw live-grid cell whose press/drag report the PTY accepted. `None`
+    /// means no press was sent, so a trailing event must not manufacture one.
+    last_app_cell: Option<(usize, usize)>,
+    /// The app layer claimed this sequence after the widget had already
+    /// published an ordinary press (for example an inactive pane whose link
+    /// cache was refreshed only after focus moved). Subsequent drag/release
+    /// messages close the slot without touching selection or the PTY.
+    consumed: bool,
+}
+
+/// Shared press-origin gate for the app handler and CPU interaction tests.
+/// Returning a button means no terminal/clipboard action may run for this
+/// press; its later drag/release remains owned by this consumed gesture.
+fn reject_chat_press(
+    projection: Option<&ProjectedViewport>,
+    session_id: usize,
+    input: MouseInput,
+    gestures: &mut [Option<TerminalMouseGesture>; 3],
+) -> Option<MouseButton> {
+    let MouseInput::Press {
+        button,
+        link_revision,
+        row,
+        col,
+        ..
+    } = input
+    else {
+        return None;
+    };
+    if projection.is_some_and(|projection| {
+        chat_mode::terminal_press_allowed(projection, link_revision, row, col)
+    }) {
+        return None;
+    }
+    gestures[button.slot()] = Some(TerminalMouseGesture {
+        session_id,
+        button,
+        report_to_app: false,
+        last_app_cell: None,
+        consumed: true,
+    });
+    Some(button)
+}
+
+impl TerminalMouseGesture {
+    /// Drag reports require a paired app press and a current raw cell. A
+    /// synthetic spacer/history row never inherits an earlier drag position.
+    fn app_drag_cell(self, current: Option<(usize, usize)>) -> Option<(usize, usize)> {
+        if !self.report_to_app || self.consumed || self.last_app_cell.is_none() {
+            return None;
+        }
+        current
+    }
+
+    /// A matched release must close its accepted press even when the pointer
+    /// moved into a spacer/history row. Prefer the current live mapping; only
+    /// the paired release may fall back to the last accepted raw coordinates.
+    fn app_release_cell(
+        self,
+        current: Option<(usize, usize)>,
+        grid_cols: usize,
+        grid_rows: usize,
+    ) -> Option<(usize, usize)> {
+        if !self.report_to_app || self.consumed {
+            return None;
+        }
+        let last = self.last_app_cell?;
+        current.or_else(|| {
+            // The pane may have shrunk since the accepted press/drag. Only
+            // the saved fallback needs clamping; a current mapping is exact.
+            Some((
+                last.0.min(grid_cols.checked_sub(1)?),
+                last.1.min(grid_rows.checked_sub(1)?),
+            ))
+        })
+    }
+}
+
+/// A mode boundary never remaps an old press onto the new presentation.
+fn cancelled_terminal_mouse_report(
+    gesture: TerminalMouseGesture,
+    terminal: &terminal::TerminalState,
+) -> Option<Vec<u8>> {
+    let (col, row) =
+        gesture.app_release_cell(None, terminal.grid.row_len(), terminal.grid.rows())?;
+    let code = match gesture.button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    };
+    terminal.get_mouse_release_report(code, col, row)
+}
+
+/// App ownership must retire before a mode change can replace the widget tree.
+fn retire_terminal_mouse_gestures(
+    gestures: &mut [Option<TerminalMouseGesture>; 3],
+    clicks: &mut TerminalClickTracker,
+) -> Vec<TerminalMouseGesture> {
+    clicks.cancel();
+    std::mem::take(gestures).into_iter().flatten().collect()
+}
+
+fn change_terminal_interaction_mode(
+    previous: &mut config::TerminalMode,
+    next: config::TerminalMode,
+    epoch: &mut u64,
+    gestures: &mut [Option<TerminalMouseGesture>; 3],
+    clicks: &mut TerminalClickTracker,
+) -> Vec<TerminalMouseGesture> {
+    if *previous == next {
+        return Vec::new();
+    }
+    *previous = next;
+    *epoch = epoch.wrapping_add(1);
+    retire_terminal_mouse_gestures(gestures, clicks)
+}
+
+/// Identity of the visible widget composition, deliberately excluding pane
+/// ratios, pixel sizes and keyboard focus within an unchanged split.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TerminalPaneOwner {
+    Leaf(Option<usize>),
+    Split(bool, Vec<TerminalPaneOwner>),
+}
+
+impl TerminalPaneOwner {
+    fn matches(&self, tree: &PaneTree, session_id: &impl Fn(usize) -> Option<usize>) -> bool {
+        match (self, tree) {
+            (Self::Leaf(saved), PaneTree::Leaf(index)) => *saved == session_id(*index),
+            (Self::Split(horizontal, saved), PaneTree::Split { axis, children, .. }) => {
+                *horizontal == (*axis == Axis::Horizontal)
+                    && saved.len() == children.len()
+                    && saved
+                        .iter()
+                        .zip(children)
+                        .all(|(saved, child)| saved.matches(child, session_id))
+            }
+            _ => false,
+        }
+    }
+
+    fn capture(tree: &PaneTree, session_id: &impl Fn(usize) -> Option<usize>) -> Self {
+        match tree {
+            PaneTree::Leaf(index) => Self::Leaf(session_id(*index)),
+            PaneTree::Split { axis, children, .. } => Self::Split(
+                *axis == Axis::Horizontal,
+                children
+                    .iter()
+                    .map(|child| Self::capture(child, session_id))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalPaneOwners {
+    tab_id: Option<usize>,
+    tree: TerminalPaneOwner,
+}
+
+impl TerminalPaneOwners {
+    fn matches(
+        &self,
+        tab: Option<&Tab>,
+        zoomed: bool,
+        active: usize,
+        session_id: &impl Fn(usize) -> Option<usize>,
+    ) -> bool {
+        self.tab_id == tab.map(|tab| tab.id)
+            && if zoomed {
+                self.tree == TerminalPaneOwner::Leaf(session_id(active))
+            } else {
+                tab.map(|tab| self.tree.matches(&tab.tree, session_id))
+                    .unwrap_or(self.tree == TerminalPaneOwner::Leaf(None))
+            }
+    }
+
+    fn capture(
+        tab: Option<&Tab>,
+        zoomed: bool,
+        active: usize,
+        session_id: &impl Fn(usize) -> Option<usize>,
+    ) -> Self {
+        Self {
+            tab_id: tab.map(|tab| tab.id),
+            tree: if zoomed {
+                TerminalPaneOwner::Leaf(session_id(active))
+            } else {
+                tab.map(|tab| TerminalPaneOwner::capture(&tab.tree, session_id))
+                    .unwrap_or(TerminalPaneOwner::Leaf(None))
+            },
+        }
+    }
+}
+
+fn change_terminal_pane_owners(
+    previous: &mut Option<TerminalPaneOwners>,
+    next: TerminalPaneOwners,
+    epoch: &mut u64,
+    gestures: &mut [Option<TerminalMouseGesture>; 3],
+    clicks: &mut TerminalClickTracker,
+) -> Vec<TerminalMouseGesture> {
+    if previous.as_ref() == Some(&next) {
+        return Vec::new();
+    }
+    let initialized = previous.is_some();
+    *previous = Some(next);
+    if !initialized {
+        return Vec::new();
+    }
+    *epoch = epoch.wrapping_add(1);
+    retire_terminal_mouse_gestures(gestures, clicks)
+}
+
+/// Closing a background session must not cancel an unrelated visible gesture.
+/// Take the closing owner's slots while its PTY still exists.
+fn retire_closing_terminal_mouse_gestures(
+    session_id: usize,
+    gestures: &mut [Option<TerminalMouseGesture>; 3],
+    clicks: &mut TerminalClickTracker,
+) -> Vec<TerminalMouseGesture> {
+    let mut retired = Vec::new();
+    for slot in gestures {
+        if slot.is_some_and(|gesture| gesture.session_id == session_id) {
+            let gesture = slot.take().expect("matched owner");
+            if gesture.button == MouseButton::Left {
+                clicks.cancel();
+            }
+            retired.push(gesture);
+        }
+    }
+    retired
+}
+
+fn terminal_panes_body<'a, Message: 'a, Renderer: iced::advanced::Renderer + 'a>(
+    reading_bar: Option<Element<'a, Message, iced::Theme, Renderer>>,
+    panes: Element<'a, Message, iced::Theme, Renderer>,
+) -> Element<'a, Message, iced::Theme, Renderer> {
+    if let Some(bar) = reading_bar {
+        column![bar, panes].height(Length::Fill).into()
+    } else {
+        panes
+    }
+}
+
+/// Remember only reports accepted by the gesture's own PTY. Button slots and
+/// stable pane ownership prevent another pane or button from moving this cell.
+fn record_terminal_app_mouse_cell(
+    gestures: &mut [Option<TerminalMouseGesture>; 3],
+    source_session_id: usize,
+    button: MouseButton,
+    cell: (usize, usize),
+) {
+    let Some(Some(gesture)) = gestures.get_mut(button.slot()) else {
+        return;
+    };
+    if gesture.session_id == source_session_id
+        && gesture.button == button
+        && gesture.report_to_app
+        && !gesture.consumed
+    {
+        gesture.last_app_cell = Some(cell);
+    }
+}
+
+/// Only the pane that started a gesture may retire it. Every visible widget
+/// can report the same global release, so a sibling's event must be a no-op.
+fn take_terminal_mouse_gesture(
+    gestures: &mut [Option<TerminalMouseGesture>; 3],
+    source_session_id: usize,
+    button: MouseButton,
+) -> Option<TerminalMouseGesture> {
+    let slot = gestures.get_mut(button.slot())?;
+    let gesture = (*slot)?;
+    if gesture.button != button || gesture.session_id != source_session_id {
+        return None;
+    }
+    slot.take()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverlayReleaseDisposition {
+    Reject,

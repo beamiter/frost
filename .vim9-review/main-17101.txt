@@ -1,0 +1,300 @@
+                            .push_toast(format!("API key not saved: {error}"), ToastKind::Warning),
+                    }
+                }
+            }
+            Message::SetAgentMaxTurns(turns) => {
+                self.config.agent_max_turns = turns.clamp(1, 100);
+                self.config_dirty = true;
+            }
+            Message::Osc52Query(id, fd, generation, terminator, content) => {
+                let allow_clipboard_read = self.config.allow_clipboard_read;
+                if !self.finish_host_clipboard_read(id, fd, generation) {
+                    return Task::none();
+                }
+                if let Some(sess) = self.session_by_identity(id, fd) {
+                    sess.clipboard_read_in_flight = false;
+                    let content = content.as_deref().unwrap_or("");
+                    complete_osc52_read(
+                        &mut sess.terminal,
+                        &mut sess.osc52_pending_refusals,
+                        allow_clipboard_read,
+                        content,
+                        terminator,
+                    );
+                    sess.flush_responses();
+                    sess.refresh();
+                }
+            }
+            Message::Osc5522Data(id, fd, generation, mime, content) => {
+                let allow_clipboard_read = self.config.allow_clipboard_read;
+                if !self.finish_host_clipboard_read(id, fd, generation) {
+                    return Task::none();
+                }
+                if let Some(sess) = self.session_by_identity(id, fd) {
+                    complete_osc5522_read(
+                        &mut sess.terminal,
+                        &mut sess.clipboard_read_in_flight,
+                        &mut sess.osc5522_pending_refusals,
+                        allow_clipboard_read,
+                        &mime,
+                        content.as_deref().unwrap_or_default(),
+                    );
+                    sess.flush_responses();
+                    sess.refresh();
+                }
+            }
+            Message::PtyExited(id, fd, _code) => {
+                if let Some(index) = self
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == id && session.master_fd == fd)
+                {
+                    // A task-bound terminal (Agent or validation) reports its
+                    // real child exit status to the reducer and stays open so
+                    // its transcript remains reviewable; the task card drives
+                    // the lifecycle from here. Ordinary sessions still close.
+                    let session_key = agent_task_ui::terminal_session_id(id);
+                    let task_bound = self
+                        .task_manager
+                        .task_for_terminal_session(&session_key)
+                        .is_some();
+                    let exit_code = self.sessions[index].pty.exited_code();
+                    let feedback = agent_task_ui::task_terminal_exit_feedback(
+                        &mut self.task_manager,
+                        &session_key,
+                        exit_code,
+                    );
+                    if task_bound {
+                        self.organism.forget_session(id);
+                        self.sessions[index].hold_after_exit = true;
+                        if let Some(message) = feedback {
+                            self.push_toast(message, ToastKind::Info);
+                        }
+                        return Task::none();
+                    }
+                    return self.close_session(index);
+                }
+            }
+            Message::OverlayEscape(event) => {
+                // Re-deliver only while something on screen owns Escape; with
+                // no overlay open this must stay a no-op rather than falling
+                // through to `encode_key` and reaching the child process.
+                //
+                // Dispatched synchronously rather than through `Task::done`:
+                // a deferred re-delivery would re-enter the key chain a cycle
+                // after this gate ran, so an overlay closing in between could
+                // let the Escape fall through to the PTY after all. Recursion
+                // is one level deep — the key chain never emits OverlayEscape.
+                if self.overlay_owns_escape() {
+                    return self.update(Message::Key(event));
+                }
+            }
+            Message::CapturedEnterPress(id, event) => {
+                let mut native = self.native_enter_ownership.lock();
+                if native.acknowledge_captured(id, &event) {
+                    return Task::none();
+                }
+                if let keyboard::Event::KeyPressed { location, .. } = event {
+                    self.prompt_recall_enter_latch.captured_press(location);
+                }
+            }
+            Message::WindowKey(id, event) => {
+                let ime_owned = self.terminal_ime.claim_enter(&event);
+                let mut native = self.native_enter_ownership.lock();
+                let native_owned = native.acknowledge(id, &event);
+                if ime_owned && !native_owned {
+                    // Match captured-input ordering: acknowledge an older
+                    // already-owned delivery before claiming any newer hold.
+                    native.claim_pressed();
+                }
+                drop(native);
+                if native_owned || ime_owned {
+                    return Task::none();
+                }
+                return self.update(Message::Key(event));
+            }
+            Message::Key(event) => {
+                if self.terminal_ime.claim_enter(&event) {
+                    self.native_enter_ownership.lock().claim_pressed();
+                    return Task::none();
+                }
+                let retreat_before_key = self.organism.retreat_deadline();
+                if self.terminal_input_active() {
+                    if let keyboard::Event::KeyPressed { key, .. } = &event {
+                        if organism_modifier_only_key(key) {
+                            self.organism.modifier_pressed();
+                        } else {
+                            self.organism.retreat();
+                        }
+                    }
+                }
+                // These surfaces confirm/open reviewed commands. Search-only
+                // Enter navigation remains unchanged; all physical presses are
+                // still tracked for a later explicit recall transaction.
+                let recall_surface_open = self.history_picker.is_some()
+                    || self.palette.is_open
+                    || self.workflow_overlay.is_some()
+                    || self.block_review.is_some()
+                    || self.block_menu.is_some();
+                if recall_surface_open {
+                    self.native_enter_ownership.lock().claim_held();
+                }
+                if self
+                    .prompt_recall_enter_latch
+                    .consume(&event, recall_surface_open)
+                {
+                    return Task::none();
+                }
+                if let keyboard::Event::KeyReleased { key, .. } = &event {
+                    if self.block_search.as_mut().is_some_and(|state| {
+                        block_search_bookmark_key_release(
+                            key,
+                            &mut state.bookmark_key_held,
+                            &mut state.bookmark_key_claimed,
+                        )
+                    }) {
+                        return Task::none();
+                    }
+                }
+                if let keyboard::Event::KeyPressed {
+                    key,
+                    location,
+                    modifiers,
+                    text,
+                    repeat,
+                    ..
+                } = event
+                {
+                    // The destructive block confirmation is the top-most modal.
+                    // Enter confirms, Esc cancels, and every other key is swallowed.
+                    if self.block_clear_confirm.is_some() {
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter)) {
+                            return self.confirm_block_clear();
+                        }
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                            self.block_clear_confirm = None;
+                        }
+                        return Task::none();
+                    }
+                    if self.tab_close_confirm.is_some() {
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter)) {
+                            if let Some((id, _, pending)) = self.tab_close_confirm.take() {
+                                if let Some(index) = self.session_index_by_id(id) {
+                                    return self.execute_pending_close(index, pending);
+                                }
+                            }
+                        } else if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                        {
+                            self.tab_close_confirm = None;
+                        }
+                        return Task::none();
+                    }
+                    if self.block_review.is_some() {
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                            self.block_review = None;
+                        }
+                        return Task::none();
+                    }
+                    if self.block_menu.is_some() {
+                        return self.handle_block_menu_key(&key, modifiers);
+                    }
+                    // The sidebar's file dialogs are modal over the terminal:
+                    // Enter submits (the focused input also reports it via
+                    // on_submit), Esc backs out, and no other key reaches the
+                    // PTY while one is up.
+                    if self.sidebar_dialog.is_some() {
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter)) {
+                            return self.submit_sidebar_dialog();
+                        }
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                            self.sidebar_dialog = None;
+                        }
+                        return Task::none();
+                    }
+                    if self.sidebar_delete_confirm.is_some() {
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter)) {
+                            return self.confirm_sidebar_delete();
+                        }
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                            self.sidebar_delete_confirm = None;
+                        }
+                        return Task::none();
+                    }
+                    // The sidebar file menu is pointer-driven; keep every
+                    // keypress out of the PTY while it is visible.
+                    if self.sidebar_menu.is_some() {
+                        return self.handle_sidebar_menu_key(&key, modifiers);
+                    }
+                    // The tree filter is non-modal: while its input is
+                    // focused the input captures typing; only Esc belongs to
+                    // the filter itself (close + clear) wherever focus sits.
+                    if self.sidebar_filter.is_some()
+                        && matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                    {
+                        self.sidebar_filter = None;
+                        return Task::none();
+                    }
+                    // A visible correction card is likewise non-modal: Escape
+                    // dismisses it (the GTK siblings scope this to the card's
+                    // focus; here the visible card owns the one Escape), and
+                    // every other key reaches the terminal or the focused draft.
+                    if self.correction_card_visible()
+                        && matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                    {
+                        self.dismiss_active_correction();
+                        return Task::none();
+                    }
+                    // The AI suggestion card shares the correction card's
+                    // non-modal Escape discipline (dismiss only), and its
+                    // pane scoping too: a card drafting for a background pane
+                    // must not swallow the Escape of the program on screen.
+                    if self.ai_suggestion_visible()
+                        && matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                    {
+                        self.ai_suggestion = None;
+                        return Task::none();
+                    }
+                    // The AI chats panel is an input-owning overlay, like the
+                    // help and debug panels below: while it is up no key
+                    // reaches the terminal behind it. Escape and its own
+                    // toggle chord close it; everything else is swallowed.
+                    // Only keys the panel's focused text inputs did not
+                    // capture reach this far — browsing the library or
+                    // clicking a chat row leaves focus outside every input,
+                    // and before this arm existed that Escape went to the
+                    // foreground program and printable keys were typed into
+                    // the hidden shell.
+                    if self.ai_chats.is_open {
+                        let own_toggle =
+                            resolve_keybinding_command(&self.keybindings, &key, modifiers)
+                                == Some(keybindings::Command::AiChatToggle);
+                        if own_toggle
+                            || matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                        {
+                            self.ai_chats.close(self.config.ai_redact_secrets);
+                        }
+                        return Task::none();
+                    }
+                    // Apart from the rename editor (whose keys the focused text
+                    // input captures before this point), the tab menu is
+                    // pointer-driven; keep every other keypress out of the PTY
+                    // while it is visible.
+                    if self.tab_menu.is_some() {
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                            // Esc backs out of the rename first, then the menu.
+                            if self.tab_rename.take().is_none() {
+                                self.tab_menu = None;
+                            }
+                        }
+                        return Task::none();
+                    }
+                    // Tab switcher swallows keys while open (Enter to jump,
+                    // arrows to move, Esc/Ctrl+Shift+L to dismiss). Handle before
+                    // generic keybindings so its toggle shortcut wins.
+                    if self.tab_switcher.is_some() {
+                        if let Some(task) =
+                            self.handle_tab_switcher_key(&key, modifiers, text.as_deref())
+                        {
+                            return task;
+                        }
+                    }

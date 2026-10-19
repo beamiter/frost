@@ -1,0 +1,300 @@
+    /// Installing index text cannot acknowledge an input error: only a new
+    /// accepted edit or an explicit control change can do that. The caller
+    /// has already checked this build's owner, epoch and source version.
+    fn install_cache(&mut self, build: block_mode::BlockSearchCacheBuild) -> bool {
+        self.cache = build.zones;
+        self.older_not_indexed = build.older_not_indexed;
+        self.loading = false;
+        if self.query_error.is_some() {
+            self.match_pending = false;
+            self.refresh_intent = None;
+            return false;
+        }
+        true
+    }
+
+    /// Restore cache ownership first, then admit only the latest intent and
+    /// membership. Superseded results keep the previous visible hits inert.
+    fn install_match(
+        &mut self,
+        identity: BlockSearchBuildIdentity,
+        build: BlockSearchMatchBuild,
+        current_version: BlockSearchZoneVersion,
+        eligible: &std::collections::HashSet<u64>,
+    ) -> bool {
+        if !self.matching || !self.accepts_build(identity) {
+            return false;
+        }
+        self.matching = false;
+        self.cache = build.cache;
+        if current_version != self.zone_version || self.rebuild_pending {
+            self.rebuild_pending = true;
+            return false;
+        }
+        if self.take_manual_refresh_followup() {
+            self.rebuild_pending = true;
+            return false;
+        }
+        if self.query_error.is_some() {
+            // A rejected unsafe paste must retain its diagnostic even when
+            // the earlier, valid request has completed in the meantime.
+            self.match_pending = false;
+            return false;
+        }
+        if build.intent != self.intent() || build.eligible != *eligible || build.result.is_none() {
+            self.match_pending = true;
+            return false;
+        }
+        self.match_pending = false;
+        match build.result.expect("checked completed match") {
+            Ok(results) => {
+                // A selection-preserving refresh must follow navigation that
+                // occurred during matching. Real query/control edits clear
+                // match_anchor, so their result sets still start at the top.
+                let anchor = self
+                    .match_anchor
+                    .take()
+                    .map(|original| self.selected_anchor().unwrap_or(original));
+                self.selected =
+                    block_search_refresh_selection_index(&results.hits, anchor.as_ref());
+                self.hits = results.hits;
+                self.capped = results.capped;
+                self.matched_intent = Some(build.intent);
+                self.matched_eligible = build.eligible;
+            }
+            Err(error) => {
+                self.query_error = Some(crate::review_text::bound_query_error(error));
+                self.matched_intent = None;
+                self.match_anchor = None;
+            }
+        }
+        true
+    }
+
+    fn intent(&self) -> BlockSearchIntent {
+        BlockSearchIntent {
+            query: self.query.clone(),
+            case_sensitive: self.case_sensitive,
+            regex: self.regex,
+            whole_word: self.whole_word,
+            scope: self.scope,
+            filter: self.filter,
+        }
+    }
+
+    fn take_refresh_selection_anchor(&mut self) -> Option<BlockSearchSelectionAnchor> {
+        let current_intent = self.intent();
+        (self.refresh_intent.take().as_ref() == Some(&current_intent))
+            .then(|| {
+                self.hits
+                    .get(self.selected)
+                    .cloned()
+                    .map(|hit| BlockSearchSelectionAnchor {
+                        hit,
+                        index: self.selected,
+                    })
+            })
+            .flatten()
+    }
+
+    fn request_manual_refresh(&mut self) -> bool {
+        // Preserve the visible diagnostic and the last valid result set. The
+        // same invalid expression would only fail again after rebuilding the
+        // multi-megabyte cache, so an explicit refresh is a bounded no-op.
+        if self.query_error.is_some() {
+            return false;
+        }
+        if self.loading || self.matching || self.rebuild_pending {
+            self.manual_refresh_pending = true;
+            false
+        } else {
+            self.manual_refresh_pending = false;
+            true
+        }
+    }
+
+    /// Consume one coalesced request after the current worker has produced a
+    /// version-current cache. A changed finalized-zone version is handled
+    /// before this decision and always rebuilds; here a second manual snapshot
+    /// is useful only when the current intent can actually inspect an index.
+    fn take_manual_refresh_followup(&mut self) -> bool {
+        if !std::mem::take(&mut self.manual_refresh_pending) {
+            return false;
+        }
+        // Keep regex compilation on the matcher, including F5 coalescing.
+        // An already diagnosed expression cannot request another rebuild;
+        // a newly edited one is validated by the next bounded worker pass.
+        self.query_error.is_none() && block_mode::validated_block_search_query(&self.query).is_ok()
+    }
+
+    fn reset_intent(&mut self) {
+        self.query.clear();
+        self.case_sensitive = false;
+        self.regex = false;
+        self.whole_word = false;
+        self.scope = block_mode::BlockSearchScope::default();
+        self.filter = BlockSearchFilter::default();
+        self.query_error = None;
+        self.selected = 0;
+        self.refresh_intent = None;
+    }
+
+    fn apply_query_input(&mut self, query: String) -> bool {
+        if self.bookmark_key_claimed {
+            return false;
+        }
+        let query = block_mode::bounded_block_search_query(query);
+        if matches!(
+            block_mode::validated_block_search_query(&query),
+            Err(block_mode::BlockSearchQueryError::Unsafe)
+        ) {
+            self.query_error = Some(crate::review_text::bound_query_error(
+                "Query contains control or visual-spoofing characters and was not saved",
+            ));
+            return false;
+        }
+        if query == self.query && self.query_error.is_none() {
+            return false;
+        }
+        self.query = query;
+        true
+    }
+
+    fn accepts_build(&self, identity: BlockSearchBuildIdentity) -> bool {
+        self.session_id == identity.session_id && self.epoch == identity.epoch
+    }
+
+    fn accepts_hit(
+        &self,
+        hit: &block_mode::BlockSearchHit,
+        session_id: usize,
+        zone_version: BlockSearchZoneVersion,
+    ) -> bool {
+        !self.busy()
+            && self.query_error.is_none()
+            && self.session_id == session_id
+            && self.zone_version == zone_version
+            && self.hits.iter().any(|current| current == hit)
+    }
+
+    fn bookmark_plan(
+        &self,
+        requested: Option<&block_mode::BlockSearchHit>,
+        session_id: usize,
+        zone_version: BlockSearchZoneVersion,
+    ) -> BlockSearchBookmarkPlan {
+        if self.busy() {
+            return BlockSearchBookmarkPlan::Busy;
+        }
+        let Some(hit) = requested else {
+            return BlockSearchBookmarkPlan::NoSelection;
+        };
+        if !self.accepts_hit(hit, session_id, zone_version) {
+            return BlockSearchBookmarkPlan::RejectStale;
+        }
+        BlockSearchBookmarkPlan::Toggle(hit.zone_id)
+    }
+
+    fn release_index_for_rebuild(&mut self) {
+        // Assignment drops Vec allocations as well as their elements. Query,
+        // filter and matching controls intentionally survive the rebuild.
+        //
+        // The previous HITS survive too, so a background block closing (or the
+        // shell re-emitting its prompt cycle) no longer blanks an open picker
+        // to "Indexing blocks…" and throws the highlight back to the top. They
+        // are bounded by the 500-hit cap at
+        // [`block_mode::BLOCK_SEARCH_LINE_CHARS`] + `BLOCK_SEARCH_COMMAND_CHARS`
+        // per row — well under a megabyte — so retaining them does not disturb
+        // the cache/source memory-peak invariant, which is about the multi-MiB
+        // index. They are rendered as stale until the rebuild lands, and every
+        // path that ACTS on a hit is gated on `loading`.
+        self.cache = Vec::new();
+        self.older_not_indexed = false;
+        self.matched_intent = None;
+        self.matched_eligible.clear();
+    }
+
+    fn select_next(&mut self) {
+        let len = self.hits.len();
+        self.selected = if len == 0 {
+            0
+        } else {
+            (self.selected.min(len - 1) + 1) % len
+        };
+    }
+
+    fn select_prev(&mut self) {
+        let len = self.hits.len();
+        if len == 0 {
+            self.selected = 0;
+            return;
+        }
+        let current = self.selected.min(len - 1);
+        self.selected = if current == 0 { len - 1 } else { current - 1 };
+    }
+
+    fn select_first(&mut self) {
+        self.selected = 0;
+    }
+
+    fn select_last(&mut self) {
+        self.selected = self.hits.len().saturating_sub(1);
+    }
+
+    fn select_page(&mut self, forward: bool) {
+        let len = self.hits.len();
+        if len == 0 {
+            self.selected = 0;
+            return;
+        }
+        let current = self.selected.min(len - 1);
+        self.selected = if forward {
+            current.saturating_add(BLOCK_SEARCH_PAGE_STEP).min(len - 1)
+        } else {
+            current.saturating_sub(BLOCK_SEARCH_PAGE_STEP)
+        };
+    }
+
+    /// Result-count line: `"N matches"` (`"1 match"`), plus ember's
+    /// `" · older blocks not searched"` when the run stopped at the hit cap
+    /// — which is what `capped` actually means, not that more matches
+    /// necessarily exist.
+    fn count_label(&self) -> String {
+        let count = self.hits.len();
+        let noun = match (self.query.trim().is_empty(), count == 1) {
+            (true, true) => "block",
+            (true, false) => "blocks",
+            (false, true) => "match",
+            (false, false) => "matches",
+        };
+        // Position, not just a total: walking a query's hits with the arrows
+        // otherwise gives no sense of how far through the list you are.
+        let mut label = if count == 0 {
+            format!("{count} {noun}")
+        } else {
+            format!(
+                "{} of {count} {noun}",
+                self.selected.saturating_add(1).min(count)
+            )
+        };
+        if self.capped {
+            label.push_str(" · older blocks not searched");
+        }
+        if self.older_not_indexed {
+            label.push_str(" · older blocks not indexed");
+        }
+        label
+    }
+}
+
+/// Resolve the best live buffer row for one cached block-search hit. Exact
+/// match positioning is attempted first; a captured snapshot whose span no
+/// longer agrees with live rows safely degrades to the logical-line start.
+fn block_search_reveal_row(
+    terminal: &terminal::TerminalState,
+    hit: &block_mode::BlockSearchHit,
+) -> Option<usize> {
+    if !hit.is_output_line || hit.line_no == 0 {
+        return None;
+    }
+    hit.match_span

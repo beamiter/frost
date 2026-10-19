@@ -1,0 +1,300 @@
+        .unwrap_or(tabs.len());
+    let insert_at = (anchor_index + 1).max(first_unpinned).min(tabs.len());
+    tabs.insert(insert_at, Tab::new(id, source_session));
+    *next_tab_id = next_id;
+    Some((insert_at, source_session))
+}
+
+/// Linear blend between two colors (t=0 → a, t=1 → b); result is fully opaque.
+fn blend(a: Color, b: Color, t: f32) -> Color {
+    Color {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: 1.0,
+    }
+}
+
+fn resolve_mono_font(family: &str) -> iced::Font {
+    let f = family.trim();
+    if f.is_empty() {
+        iced::Font::MONOSPACE
+    } else {
+        // iced stores family names as `&'static str`. Intern each distinct name
+        // once so repeatedly applying settings does not leak another allocation.
+        static INTERNED_FONTS: once_cell::sync::Lazy<
+            Mutex<std::collections::HashMap<String, &'static str>>,
+        > = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+        let mut names = INTERNED_FONTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let name = *names
+            .entry(f.to_string())
+            .or_insert_with(|| Box::leak(f.to_string().into_boxed_str()));
+        iced::Font::with_name(name)
+    }
+}
+
+fn resolve_optional_font(family: Option<&str>) -> Option<iced::Font> {
+    family.map(resolve_mono_font)
+}
+
+fn main() -> iced::Result {
+    // Shared jterm_core modules brand themselves per app (env prefixes,
+    // prompt strings) from this identity.
+    jterm_core::identity::init(jterm_core::identity::AppIdentity {
+        app_name: "frost",
+        app_id: "io.github.beamiter.frost",
+        // From the app crate, not jterm_core's: a shell that pairs
+        // TERM_PROGRAM with TERM_PROGRAM_VERSION must read this binary's
+        // version, not the shared library's.
+        app_version: env!("CARGO_PKG_VERSION"),
+    });
+    env_logger::init();
+    let config::ConfigLoad {
+        config,
+        diagnostic: config_diagnostic,
+        revision: config_revision,
+    } = Config::load_with_diagnostics();
+    let win = iced::window::Settings {
+        size: Size::new(config.initial_width, config.initial_height),
+        // Without this the window ships an empty WM_CLASS/app_id, so neither
+        // X11 nor Wayland can tie it to the installed .desktop entry: the shell
+        // shows an unbranded window that cannot be pinned. iced feeds this to
+        // winit as both the X11 WM_CLASS pair and the Wayland app_id.
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: WINDOW_APP_ID.to_string(),
+            ..Default::default()
+        },
+        // The .desktop entry only covers windows the shell can match to it.
+        // Without an icon of its own the window has no _NET_WM_ICON at all, so
+        // anything else — a bare `cargo run`, a session where the entry is not
+        // installed — falls back to a blank placeholder in the dock and the
+        // window switcher.
+        icon: match iced::window::icon::from_file_data(
+            WINDOW_ICON_PNG,
+            Some(image::ImageFormat::Png),
+        ) {
+            Ok(icon) => Some(icon),
+            Err(err) => {
+                log::warn!("Failed to decode the embedded window icon: {err}");
+                None
+            }
+        },
+        // Route window-manager close requests through our foreground-job guard.
+        exit_on_close_request: false,
+        // Ask for an alpha-capable surface so the configured background opacity
+        // (config `opacity`, Ctrl+Alt+=/-) can actually show the desktop
+        // through the window, matching the rest of the jterm family.
+        transparent: true,
+        // Draw our own title bar. GNOME and other wlroots-style compositors
+        // offer no server-side decorations, so winit falls back to drawing one
+        // with `sctk-adwaita`, whose renderer maps the whole title through a
+        // single system font with no fallback chain — every CJK codepoint came
+        // out as .notdef. frost's own chrome uses the configured CJK fallback
+        // font, so the title renders like the rest of the UI. See
+        // `Frost::top_bar_with_close` and `Frost::window_resize_edges`.
+        decorations: false,
+        ..Default::default()
+    };
+    let native_enter_ownership = native_enter::install();
+    iced::application(
+        move || {
+            Frost::new(
+                config.clone(),
+                config_diagnostic.clone(),
+                config_revision.clone(),
+                Arc::clone(&native_enter_ownership),
+            )
+        },
+        Frost::update,
+        Frost::view,
+    )
+    .title(Frost::title)
+    .subscription(Frost::subscription)
+    .theme(Frost::iced_theme)
+    .style(Frost::app_style)
+    .scale_factor(Frost::scale_factor)
+    // MSAA forces wgpu down the multisample path; on Intel/Mesa that triggers
+    // the "manual shader clears for srgb textures" path, which flashes the whole
+    // surface on heavy redraws (e.g. multi-line `ls` output). Glyph and quad
+    // rendering don't benefit from geometry MSAA, so disabling it is free here.
+    .antialiasing(false)
+    .window(win)
+    .run()
+}
+
+#[derive(Debug, Clone)]
+enum Message {
+    /// Observe an Enter already consumed by a widget, without repeating its action.
+    CapturedEnterPress(iced::window::Id, keyboard::Event),
+    WindowKey(iced::window::Id, keyboard::Event),
+    // AI agent panel (per-command approval agent over jterm_core).
+    AgentInput(String),
+    AgentSubmit,
+    AgentApprove(agent::ProposalRef),
+    AgentEditStart(agent::ProposalRef, String),
+    AgentEditInput(agent::ProposalRef, String),
+    AgentEditApprove(agent::ProposalRef),
+    AgentEditCancel(agent::ProposalRef),
+    AgentReject(agent::ProposalRef),
+    /// One streamed fragment of the in-flight model reply for the given
+    /// request task epoch/generation (stale ones dropped).
+    AgentModelDelta(agent::ModelRequestIdentity, String),
+    /// One model reply for the given request identity (stale ones dropped).
+    AgentModelReply(agent::ModelRequestIdentity, Result<String, String>),
+    AgentContinueTask,
+    AgentNewTask,
+    AgentClearContext,
+    AgentClose,
+    // Review-first command correction for failed Block-mode commands.
+    /// A pane's correction worker resolved (stale generations dropped).
+    CommandCorrectionResolved(
+        usize,
+        u64,
+        Result<Option<command_correction::CorrectionCandidate>, String>,
+    ),
+    /// Edit of the correction card's command draft.
+    CommandCorrectionInput(command_correction::CorrectionRef, String),
+    /// The card's primary action: run when verified and unchanged, else insert.
+    CommandCorrectionAccept(command_correction::CorrectionRef),
+    CommandCorrectionDismiss(command_correction::CorrectionRef),
+    /// Settings toggle for review-first command correction.
+    SetCommandCorrectionEnabled(bool),
+    // Persistent AI chats library (ported from anvil's AI panel) and inline
+    // AI command generation (ported from anvil's `?` palette flow).
+    /// Composer edit of the viewed chat's draft.
+    AiChatsInput(String),
+    AiChatsSubmit,
+    AiChatsStop,
+    AiChatsRetry,
+    /// One streamed fragment for the in-flight chat turn (stale tokens dropped).
+    AiChatsDelta(ai_chat_store::RequestToken, String),
+    /// One finished chat request (stale tokens dropped).
+    AiChatsResult(ai_chat_store::RequestToken, Result<String, String>),
+    AiChatsNewChat,
+    AiChatsSelect(u64),
+    AiChatsSearchInput(String),
+    AiChatsShowLibrary,
+    AiChatsShowChat,
+    /// Rename-editor edit of the viewed chat's title.
+    AiChatsTitleInput(String),
+    AiChatsToggleArchive,
+    /// Two-step delete: the first press arms, the second confirms.
+    AiChatsDelete,
+    AiChatsIncludeRecent(bool),
+    AiChatsClose,
+    /// Edit of the inline AI command-generation request overlay.
+    AiAskInput(String),
+    AiAskSubmit,
+    AiAskClose,
+    /// The suggestion worker resolved (stale generations dropped).
+    AiSuggestionResolved(u64, Result<String, String>),
+    /// Edit of the suggestion card's command draft.
+    AiSuggestionInput(u64, String),
+    /// The card's primary action: insert the validated draft at the prompt
+    /// for review. Never submits.
+    AiSuggestionInsert(u64),
+    AiSuggestionRegenerate(u64),
+    AiSuggestionDismiss(u64),
+    // Experimental Tasks dashboard (native Codex/Claude runtime + isolated worktrees).
+    TaskPanelToggle,
+    TaskDashboardQuery(String),
+    TaskDashboardView(agent_task::DashboardView),
+    TaskDashboardClear,
+    TaskDashboardOpenResult,
+    TaskSelect(agent_task::TaskId),
+    TaskHide(agent_task::TaskId),
+    TaskCreateWithProvider(std::sync::Arc<()>, agent_task::AgentProvider),
+    TaskCreateProviderCancel(std::sync::Arc<()>),
+    TaskStartNative(agent_task::TaskId),
+    TaskCancelNative(agent_task::TaskId),
+    TaskFinishNative(agent_task::TaskId),
+    TaskFollowUpInput(agent_task_ui::TaskFollowUpRef, String),
+    TaskFollowUpSend(agent_task_ui::TaskFollowUpRef),
+    TaskRequestDiscardSavedDrafts(std::sync::Arc<()>),
+    TaskCancelDiscardSavedDrafts(std::sync::Arc<()>),
+    TaskDiscardSavedDrafts(std::sync::Arc<()>),
+    TaskApprovalDeny(agent_task::TaskId, agent_task::ApprovalId),
+    TaskDiffOpen(agent_task::TaskId),
+    TaskDiffClose(std::sync::Arc<()>),
+    TaskValidationStart(agent_task::TaskId),
+    TaskMarkComplete(agent_task::TaskId),
+    TaskTerminalOpen(agent_task::TaskId),
+    TaskFocusTerminal(agent_task::TaskId),
+    TaskFocusValidation(agent_task::TaskId),
+    /// Open a coding-agent CLI in a new tab at the active pane cwd.
+    AgentLaunch(agent_task::AgentProvider),
+    /// Periodic reducer/driver poll while the dashboard is open or a provider
+    /// session is active.
+    TaskTick,
+    /// Result of the background jsh update check (boxed: one rare message must
+    /// not widen every other variant).
+    JshChecked(Box<jterm_core::jsh_install::Status>),
+    /// Install jsh, or update the installed one, in a dedicated session.
+    JshInstall,
+    /// Close the remote host picker overlay.
+    RemotePickerClose,
+    /// Open the picked `[[remote_hosts]]` entry in a new session.
+    RemotePickerConnect(
+        std::sync::Arc<()>,
+        Box<jterm_core::jsh_remote::RemoteHostConfig>,
+    ),
+    /// Per-field edits of the indexed `[[remote_hosts]]` entry from Settings.
+    RemoteHostName(remote_host_editor::RowTarget, String),
+    RemoteHostHost(remote_host_editor::RowTarget, String),
+    RemoteHostUser(remote_host_editor::RowTarget, String),
+    RemoteHostDocker(remote_host_editor::RowTarget, bool),
+    RemoteHostDeploy(remote_host_editor::RowTarget, String),
+    /// Append a template `[[remote_hosts]]` entry for in-place editing.
+    RemoteHostAdd(Arc<()>),
+    RemoteHostRemove(remote_host_editor::RowTarget),
+    /// Hide the jsh notice until the next launch.
+    JshNoticeDismiss,
+    /// Hide only the recovery banner; retain the report and write protection.
+    SessionRecoveryDismiss,
+    SetAiEnabled(bool),
+    SetAiProvider(String),
+    SetAiModel(String),
+    SetAiBaseUrl(String),
+    SetAiMaxTokens(u32),
+    SetAiTemperature(String),
+    SetAiRedactSecrets(bool),
+    SetAiShareCommandContext(bool),
+    SetExperimentalTaskSidebar(bool),
+    SetPreferredAgentProvider(String),
+    SetAiStream(bool),
+    SetAiKeyFile(String),
+    SetAiKeyDraft(String),
+    StoreAiKey,
+    SetAgentMaxTurns(u32),
+    PtyOutput(usize, RawFd, Vec<u8>, Option<organism_watch::SourceStamp>),
+    PtyExited(usize, RawFd, i32),
+    Key(keyboard::Event),
+    /// An input-method (IME) composition event: open/close, pre-edit updates,
+    /// and committed text.
+    Ime(iced::advanced::input_method::Event),
+    ImeCancelledCommit,
+    ModifiersChanged(keyboard::Modifiers),
+    /// A mouse interaction within the pane showing the stable session id.
+    MousePane(usize, MouseInput),
+    /// Stable release of a host-owned collapsed-output summary row.
+    SummaryActivate(usize, SummaryActivation),
+    /// Clipboard result scoped to the stable session that requested the paste.
+    Pasted(usize, Option<String>),
+    /// One decoded local path delivered by the window system's file-drop event.
+    ImageDropped(std::path::PathBuf),
+    /// Text appended by search-replace or a sidebar path pick. Both sources
+    /// can contain terminal/file-system controlled bytes, so this is an
+    /// untrusted paste and never receives the control-preserving policy.
+    PromptInsert(usize, String),
+    /// A command recalled from history onto the prompt. Unlike `PromptInsert`
+    /// it kills the pending line first: a recall that merely appends is glued
+    /// to whatever the user had half-typed (the failure mode forge shipped),
+    /// and the mangled line is one Enter away from running.
+    PromptRecall(usize, String),
+    /// System clipboard contents read in response to an OSC 52 query from the
+    /// app running in the session identified by the file descriptor.
+    Osc52Query(usize, RawFd, u64, &'static [u8], Option<String>),
+    /// System clipboard contents read in response to an OSC 5522 MIME-data read
+    /// request. Carries the requesting fd and the MIME type that was requested.

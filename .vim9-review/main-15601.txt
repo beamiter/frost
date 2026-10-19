@@ -1,0 +1,300 @@
+                );
+                return Task::none();
+            }
+            None => return Task::none(),
+        };
+        let Some(text) = block_mode::block_copy_text(zone.command.as_deref(), output.as_deref())
+        else {
+            self.push_toast("Block is empty".to_string(), ToastKind::Info);
+            return Task::none();
+        };
+        if zone
+            .command
+            .as_deref()
+            .is_some_and(crate::block_mode::command_text_is_unsafe)
+            || output
+                .as_deref()
+                .is_some_and(crate::block_mode::clipboard_multiline_is_unsafe)
+        {
+            self.push_toast(
+                "Block not copied: it contains control or visual-spoofing characters".to_string(),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        self.push_toast("Copied block", ToastKind::Success);
+        iced::clipboard::write(text)
+    }
+
+    fn block_markdown(terminal: &terminal::TerminalState, zone: &terminal::CommandZone) -> String {
+        let (output, output_truncated, output_unavailable) = match terminal
+            .zone_output_export_capped(zone.id)
+        {
+            Some(terminal::ZoneOutputExport::Available { text, truncated }) => {
+                (text, truncated, false)
+            }
+            Some(terminal::ZoneOutputExport::Empty) => (String::new(), false, false),
+            Some(terminal::ZoneOutputExport::Unavailable) | None => (String::new(), false, true),
+        };
+        // Resolve the offset at the finish instant, not at copy time, so a
+        // block that crossed a DST change keeps the correct local timestamp.
+        let tz_offset_secs = block_mode::local_offset_secs(zone.finished_at_ms.map_or_else(
+            || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_secs() as i64)
+            },
+            |ms| (ms / 1000) as i64,
+        ));
+        block_mode::markdown_export_with_lifecycle(
+            &block_mode::MarkdownBlock {
+                command: zone.command.as_deref(),
+                output: &output,
+                output_truncated,
+                exit_code: zone.exit_code,
+                duration_ms: zone.duration_ms,
+                finished_at_ms: zone.finished_at_ms,
+                tz_offset_secs,
+                cwd: zone.cwd.as_deref(),
+            },
+            zone.command_truncated,
+            output_unavailable,
+            zone.start_mark_seen,
+            zone.completion_provenance,
+        )
+    }
+
+    /// Copy every selected block as Markdown in terminal order. Rendering is
+    /// lazy and aggregation is bounded, so an oversized selection fails
+    /// atomically instead of placing a partial history on the clipboard.
+    fn block_copy_selected_markdown_task(&mut self) -> Option<Task<Message>> {
+        let result = {
+            let sess = self.sessions.get_mut(self.active)?;
+            if !self.config.is_block_mode() || sess.terminal.is_alt_buffer_active() {
+                return None;
+            }
+            if sess.block_selection.is_empty() {
+                return None;
+            }
+            let ids: Vec<u64> = sess
+                .terminal
+                .command_zones
+                .iter()
+                .map(|zone| zone.id)
+                .collect();
+            if !sess.block_selection.retain(&ids) {
+                Err(block_mode::SelectedClipboardError::Empty)
+            } else {
+                block_mode::selected_markdown_text(
+                    sess.terminal
+                        .command_zones
+                        .iter()
+                        .filter(|zone| sess.block_selection.contains(zone.id))
+                        .map(|zone| (zone.id, Self::block_markdown(&sess.terminal, zone))),
+                    &sess.block_selection,
+                    block_mode::SELECTED_CLIPBOARD_MAX_BYTES,
+                )
+            }
+        };
+
+        match result {
+            Ok(copied) => {
+                self.push_toast(
+                    format!(
+                        "Copied {} selected block{} as Markdown",
+                        copied.block_count,
+                        if copied.block_count == 1 { "" } else { "s" }
+                    ),
+                    ToastKind::Success,
+                );
+                Some(iced::clipboard::write(copied.text))
+            }
+            Err(block_mode::SelectedClipboardError::Empty) => {
+                self.push_toast("Selected blocks are no longer available", ToastKind::Info);
+                Some(Task::none())
+            }
+            Err(block_mode::SelectedClipboardError::Unsafe) => {
+                self.push_toast(
+                    "Selected block Markdown contains control or visual-spoofing characters; nothing was copied"
+                        .to_string(),
+                    ToastKind::Warning,
+                );
+                Some(Task::none())
+            }
+            Err(
+                block_mode::SelectedClipboardError::TooLarge
+                | block_mode::SelectedClipboardError::OutputUnavailable,
+            ) => {
+                self.push_toast(
+                    "Selected block Markdown is too large to copy",
+                    ToastKind::Warning,
+                );
+                Some(Task::none())
+            }
+        }
+    }
+
+    /// Copy the selected block(s), or newest block when nothing is selected,
+    /// as the family's shared Markdown snippet, including retained
+    /// lifecycle/capture notes when the available data is incomplete.
+    fn block_copy_markdown_task(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Block Markdown copy") {
+            return Task::none();
+        }
+        if let Some(task) = self.block_copy_selected_markdown_task() {
+            return task;
+        }
+        let Some(id) = self.block_target_zone_id("copy") else {
+            return Task::none();
+        };
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let Some(zone) = sess.terminal.zone_by_id(id) else {
+            return Task::none();
+        };
+        let markdown = Self::block_markdown(&sess.terminal, zone);
+        if crate::block_mode::clipboard_multiline_is_unsafe(&markdown) {
+            self.push_toast(
+                "Block Markdown not copied: it contains control or visual-spoofing characters"
+                    .to_string(),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        self.push_toast("Copied block as Markdown", ToastKind::Success);
+        iced::clipboard::write(markdown)
+    }
+
+    fn start_block_export(
+        &mut self,
+        snapshot: block_export::SessionExportSnapshot,
+        format: block_export::SessionExportFormat,
+        description: &str,
+    ) -> Task<Message> {
+        self.block_export_in_flight = true;
+        self.push_toast(
+            format!("Exporting {} {description}…", format.label()),
+            ToastKind::Info,
+        );
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    block_export::export_session_to_file(&snapshot, format)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("export worker failed: {error}")))
+            },
+            move |result| Message::BlockExportFinished(format, result),
+        )
+    }
+
+    /// Export exactly the stable card captured by a right click. The snapshot
+    /// intentionally never clones unrelated blocks from the same pane.
+    fn block_export_zone_task(
+        &mut self,
+        zone_id: u64,
+        format: block_export::SessionExportFormat,
+    ) -> Task<Message> {
+        if !self.ensure_block_action_available("Block export") {
+            return Task::none();
+        }
+        if self.block_export_in_flight {
+            self.push_toast(
+                "A block export is already in progress".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let snapshot = match block_export::snapshot_block(&sess.terminal, sess.id, zone_id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.push_toast(
+                    format!("Could not prepare block export: {error}"),
+                    ToastKind::Warning,
+                );
+                return Task::none();
+            }
+        };
+        self.start_block_export(snapshot, format, "block")
+    }
+
+    /// Snapshot every retained finalized block in the active pane, then serialize and
+    /// durably write it off the UI thread. The snapshot is bounded before the
+    /// task starts, and the worker owns it, so later output/session churn cannot
+    /// change the document halfway through an export.
+    fn block_export_session_task(
+        &mut self,
+        format: block_export::SessionExportFormat,
+    ) -> Task<Message> {
+        if !self.ensure_block_action_available("Block session export") {
+            return Task::none();
+        }
+        if self.block_export_in_flight {
+            self.push_toast(
+                "A session export is already in progress".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        if sess.terminal.command_zones.is_empty() {
+            let message = self.block_absent_toast("retained command blocks to export");
+            self.push_toast(message, ToastKind::Info);
+            return Task::none();
+        }
+        let snapshot = match block_export::snapshot_session(&sess.terminal, sess.id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.push_toast(
+                    format!("Could not prepare session export: {error}"),
+                    ToastKind::Warning,
+                );
+                return Task::none();
+            }
+        };
+        self.start_block_export(snapshot, format, "session blocks")
+    }
+
+    fn update(&mut self, message: Message) -> Task<Message> {
+        self.sync_terminal_ime_owner();
+        self.sync_terminal_pane_owners();
+        let task = self.update_message(message);
+        self.sync_organism_motion(false);
+        self.organism.observe_agent(
+            self.agent
+                .session
+                .as_ref()
+                .filter(|_| self.agent.is_open)
+                .map(|session| session.state()),
+            self.agent.loading,
+        );
+        // Also cover early-return reducers. This runs before the next queued
+        // message, not after an Iced message batch or a widget tree redraw.
+        self.sync_terminal_pane_owners();
+        self.sync_terminal_ime_owner();
+        Task::batch([task, self.dispatch_block_search_work()])
+    }
+
+    fn update_message(&mut self, message: Message) -> Task<Message> {
+        // Defer focus operations until normal viewport/cache bookkeeping finishes.
+        let mut post_update_task = Task::none();
+        // Reject output provenance before generic synchronization can touch Watch.
+        // Invalid/old source metadata never prevents valid native bytes from being
+        // parsed and displayed by the original id/fd route below.
+        let watch_source_valid = match &message {
+            Message::PtyOutput(id, fd, _, stamp) => self
+                .session_by_identity(*id, *fd)
+                .is_some_and(|s| s.watch_receiver.accept(&s.watch_source, *stamp)),
+            _ => true,
+        };
+        let is_pty_output = matches!(&message, Message::PtyOutput(..));
+        // During native parsing all Watch changes are deferred. In particular,
+        // an old completion cannot retire a newly published reader incarnation.
+        // This scope is restored before every PtyOutput return below.

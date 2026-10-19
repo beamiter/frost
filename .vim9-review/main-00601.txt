@@ -1,0 +1,300 @@
+    path: &std::path::Path,
+    max_items: usize,
+) -> Vec<(String, std::path::PathBuf)> {
+    if max_items == 0 || !path.is_absolute() {
+        return Vec::new();
+    }
+    let mut crumbs = vec![("/".to_string(), std::path::PathBuf::from("/"))];
+    let mut cursor = std::path::PathBuf::from("/");
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        cursor.push(name);
+        let label = jterm_core::review_input::safe_inline_display(&name.to_string_lossy(), 48);
+        crumbs.push((
+            if label.is_empty() {
+                "?".to_string()
+            } else {
+                label
+            },
+            cursor.clone(),
+        ));
+    }
+    if crumbs.len() <= max_items {
+        return crumbs;
+    }
+    if max_items == 1 {
+        return crumbs.into_iter().rev().take(1).collect();
+    }
+    if max_items == 2 {
+        return vec![crumbs[0].clone(), crumbs.last().expect("non-empty").clone()];
+    }
+    let tail_len = max_items - 2;
+    let tail_start = crumbs.len() - tail_len;
+    let mut bounded = Vec::with_capacity(max_items);
+    bounded.push(crumbs[0].clone());
+    bounded.push(("…".to_string(), crumbs[tail_start - 1].1.clone()));
+    bounded.extend(crumbs.into_iter().skip(tail_start));
+    bounded
+}
+
+fn sidebar_snapshot_age_copy(age: std::time::Duration) -> (String, bool) {
+    let stale = age >= SIDEBAR_SNAPSHOT_STALE_AFTER;
+    let age_copy = if age < std::time::Duration::from_secs(60) {
+        "just now".to_string()
+    } else if age < std::time::Duration::from_secs(60 * 60) {
+        format!("{}m ago", age.as_secs() / 60)
+    } else {
+        format!("{}h ago", age.as_secs() / (60 * 60))
+    };
+    (
+        if stale {
+            format!("Updated {age_copy} · stale")
+        } else {
+            format!("Updated {age_copy}")
+        },
+        stale,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockSearchToggleKeyRoute {
+    NotToggle,
+    Close,
+    SuppressRepeat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockSearchBookmarkKeyRoute {
+    NotBookmark,
+    Toggle,
+    SuppressRepeat,
+}
+
+fn block_search_is_bookmark_key(key: &keyboard::Key) -> bool {
+    matches!(
+        key,
+        keyboard::Key::Character(character) if character.eq_ignore_ascii_case("b")
+    )
+}
+
+/// The in-picker bookmark shortcut is deliberately exact. The configurable
+/// picker-toggle chord is routed first, so a user mapping that collides with
+/// Ctrl+Shift+B still closes the picker instead of mutating a bookmark.
+fn block_search_bookmark_key_route(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    repeat: bool,
+    held: &mut bool,
+    claimed: &mut bool,
+) -> BlockSearchBookmarkKeyRoute {
+    if !block_search_is_bookmark_key(key) {
+        return BlockSearchBookmarkKeyRoute::NotBookmark;
+    }
+    // Freeze the first physical press's route. An exact action stays consumed
+    // through modifier release; an ineligible/plain B stays ordinary input
+    // even if its modifiers later become the exact chord.
+    if *held {
+        return if *claimed {
+            BlockSearchBookmarkKeyRoute::SuppressRepeat
+        } else {
+            BlockSearchBookmarkKeyRoute::NotBookmark
+        };
+    }
+    let exact_modifiers = modifiers == (keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT);
+    *held = true;
+    *claimed = exact_modifiers;
+    if exact_modifiers && !repeat {
+        BlockSearchBookmarkKeyRoute::Toggle
+    } else if exact_modifiers {
+        BlockSearchBookmarkKeyRoute::SuppressRepeat
+    } else {
+        BlockSearchBookmarkKeyRoute::NotBookmark
+    }
+}
+
+fn block_search_bookmark_key_release(
+    key: &keyboard::Key,
+    held: &mut bool,
+    claimed: &mut bool,
+) -> bool {
+    if !block_search_is_bookmark_key(key) {
+        return false;
+    }
+    *held = false;
+    *claimed = false;
+    true
+}
+
+/// Route the configurable picker toggle while the picker already owns input.
+/// The non-repeated press is an intentional close; an auto-repeat from the
+/// physical press that opened the picker is consumed without flashing it shut.
+fn block_search_toggle_key_route(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    repeat: bool,
+    bindings: &keybindings::KeyBindings,
+) -> BlockSearchToggleKeyRoute {
+    let is_toggle = key_to_binding_string(key, modifiers)
+        .and_then(|binding| bindings.get_command(&binding))
+        == Some(keybindings::Command::BlockSearch);
+    if !is_toggle {
+        BlockSearchToggleKeyRoute::NotToggle
+    } else if repeat {
+        BlockSearchToggleKeyRoute::SuppressRepeat
+    } else {
+        BlockSearchToggleKeyRoute::Close
+    }
+}
+
+fn block_selection_owns_keys(
+    block_mode: bool,
+    has_selection: bool,
+    alt_screen: bool,
+    command_running: bool,
+) -> bool {
+    block_mode && has_selection && !alt_screen && !command_running
+}
+
+/// Resolve contextual Ctrl+Up/Down block navigation. `Passthrough` means the
+/// caller must retain ordinary scrolling; `Select`/`Clear` own the key even at
+/// the selection boundary.
+fn ctrl_scroll_block_navigation(
+    block_mode: bool,
+    older: bool,
+    alt_screen: bool,
+    command_running: bool,
+    ids: &[u64],
+    current: Option<u64>,
+    selected_count: usize,
+) -> block_mode::SelectionNavigation {
+    if !block_mode || alt_screen || command_running || (!older && current.is_none()) {
+        return block_mode::SelectionNavigation::Passthrough;
+    }
+    block_mode::selection_navigation_with_count(ids, current, selected_count, older)
+}
+
+fn block_escape_owns_key(
+    block_mode: bool,
+    has_selection: bool,
+    alt_screen: bool,
+    command_running: bool,
+    no_modifier: bool,
+) -> bool {
+    no_modifier && block_selection_owns_keys(block_mode, has_selection, alt_screen, command_running)
+}
+
+fn block_enter_reinputs_selection(
+    selection_owns_keys: bool,
+    prompt_status: terminal::AgentPromptStatus,
+) -> bool {
+    selection_owns_keys && prompt_status.is_ready()
+}
+
+/// Why an Enter carrying a live block selection could not reinput it.
+///
+/// `Ctrl+Shift+I` explains the same refusal with a toast, while Enter used to
+/// drop the selection and submit the typed line in silence — one chord
+/// explaining and its twin acting. Enter keeps submitting (that is what the
+/// user typed), but now says why the selection went unused.
+fn block_enter_blocked_reason(
+    selection_owns_keys: bool,
+    prompt_status: terminal::AgentPromptStatus,
+) -> Option<&'static str> {
+    selection_owns_keys
+        .then(|| block_prompt_replace_blocker(prompt_status))
+        .flatten()
+}
+
+/// Keyboard bookmark toggling is deliberately selection-only. Falling back to
+/// the newest block would steal Ctrl+Shift+B from the shell with no visible
+/// target and differs from the Block family contract.
+fn active_bookmark_target(ids: &[u64], active: Option<u64>) -> Option<u64> {
+    active.filter(|id| ids.contains(id))
+}
+
+/// Finished history rows are local static cards. Application mouse reporting
+/// owns only active/live rows (or every row in alternate screen, where there
+/// are no finalized cards); Shift and link activation remain local overrides.
+fn app_owns_terminal_mouse(
+    mouse_enabled: bool,
+    shift: bool,
+    app_eligible: bool,
+    link_override: bool,
+) -> bool {
+    mouse_enabled && !shift && app_eligible && !link_override
+}
+
+fn app_owns_terminal_wheel(mouse_enabled: bool, shift: bool, app_eligible: bool) -> bool {
+    mouse_enabled && !shift && app_eligible
+}
+
+fn app_mouse_uses_full_grid(block_mode: bool, alt_screen: bool, usable_partitions: bool) -> bool {
+    !block_mode || alt_screen || !usable_partitions
+}
+
+fn prompt_jump_target(
+    rows: impl Iterator<Item = usize>,
+    viewport_top: usize,
+    older: bool,
+) -> Option<usize> {
+    rows.filter(|row| {
+        if older {
+            *row < viewport_top
+        } else {
+            *row > viewport_top
+        }
+    })
+    .reduce(|best, row| if older { best.max(row) } else { best.min(row) })
+}
+
+/// Resolve the finalized card currently covering one viewport row. This is
+/// kept independent of `Frost` so stale-render tests can drive a real PTY
+/// lifecycle and change only the viewport between render and dispatch.
+fn finalized_block_at_viewport_row(
+    block_mode_enabled: bool,
+    terminal: &terminal::TerminalState,
+    projection: &ProjectedViewport,
+    row: usize,
+) -> Option<u64> {
+    if !block_mode_enabled || terminal.is_alt_buffer_active() {
+        return None;
+    }
+    match projection.row_kinds().get(row)? {
+        terminal::ProjectedRowKind::CollapsedSummary { key, .. } => {
+            return (key.policy_revision == projection.policy_revision()
+                && projection.effective_collapsed().contains(&key.zone_id)
+                && terminal
+                    .zone_by_id(key.zone_id)
+                    .is_some_and(|zone| !zone.rows_evicted))
+            .then_some(key.zone_id);
+        }
+        terminal::ProjectedRowKind::BlockChrome { boundary, .. } => {
+            return match boundary.kind {
+                terminal::ChromeKind::Header { zone_id } => terminal
+                    .zone_by_id(zone_id)
+                    .filter(|zone| {
+                        !zone.rows_evicted
+                            && terminal.raw_row_id_at_absolute(zone.prompt_start)
+                                == Some(boundary.next)
+                    })
+                    .map(|zone| zone.id),
+                terminal::ChromeKind::Organism => None,
+            };
+        }
+        terminal::ProjectedRowKind::Padding | terminal::ProjectedRowKind::BlockSpacer { .. } => {
+            return None
+        }
+        terminal::ProjectedRowKind::Raw => {}
+    }
+    let abs_row = projection.view_row_absolute(row)?;
+    let total = terminal.scrollback_len() + terminal.grid.rows();
+    let live_boundary = terminal
+        .running_zone_start()
+        .or(terminal.live_prompt_row())
+        .unwrap_or(total);
+    let zones: Vec<&terminal::CommandZone> = terminal
+        .command_zones
+        .iter()
+        .filter(|zone| !zone.rows_evicted)

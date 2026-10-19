@@ -1,0 +1,300 @@
+            .filter(|text| !text.is_empty());
+        if let Some(text) = text {
+            if crate::block_mode::clipboard_multiline_is_unsafe(&text) {
+                self.push_toast(
+                    "Selection not copied: it contains control or visual-spoofing characters"
+                        .to_string(),
+                    ToastKind::Warning,
+                );
+                return Task::none();
+            }
+            let count = text.chars().count();
+            self.push_toast(
+                format!("Copied {} char{}", count, if count == 1 { "" } else { "s" }),
+                ToastKind::Success,
+            );
+            return iced::clipboard::write(text);
+        }
+        let mode = if output_only {
+            block_mode::SelectedClipboardMode::Outputs
+        } else {
+            block_mode::SelectedClipboardMode::Blocks
+        };
+        self.block_copy_selected_task(mode)
+            .unwrap_or_else(Task::none)
+    }
+
+    /// Dispatch a palette action to the matching existing operation.
+    fn execute_palette_action(
+        &mut self,
+        action: command_palette::PaletteAction,
+        greeting_target: Option<usize>,
+    ) -> Task<Message> {
+        use command_palette::PaletteAction;
+        if matches!(
+            action,
+            PaletteAction::BlockCompareSelected
+                | PaletteAction::BlockExportSelectedMarkdown
+                | PaletteAction::BlockExportSelectedJson
+        ) && greeting_target.is_none_or(|target| {
+            self.sessions
+                .get(self.active)
+                .is_none_or(|session| session.id != target)
+        }) {
+            self.push_toast(
+                "The source pane changed. Reopen the command palette in the pane to review.",
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        self.palette.record_use(action);
+        match action {
+            PaletteAction::GreetCompanion => {
+                self.greet_companion(greeting_target);
+                Task::none()
+            }
+            PaletteAction::NewTab => {
+                self.new_session();
+                Task::none()
+            }
+            PaletteAction::InstallJsh => {
+                self.install_or_update_jsh();
+                Task::none()
+            }
+            PaletteAction::LaunchCodex => {
+                Task::done(Message::AgentLaunch(agent_task::AgentProvider::Codex))
+            }
+            PaletteAction::LaunchClaude => {
+                Task::done(Message::AgentLaunch(agent_task::AgentProvider::Claude))
+            }
+            PaletteAction::LaunchOpenCode => {
+                Task::done(Message::AgentLaunch(agent_task::AgentProvider::OpenCode))
+            }
+            PaletteAction::LaunchKimi => {
+                Task::done(Message::AgentLaunch(agent_task::AgentProvider::Kimi))
+            }
+            PaletteAction::CloseTab => self.request_close_tab(self.active_tab),
+            PaletteAction::NextTab => {
+                self.next_session();
+                Task::none()
+            }
+            PaletteAction::PrevTab => {
+                self.prev_session();
+                Task::none()
+            }
+            PaletteAction::Copy => self.edit_copy_task(false),
+            PaletteAction::Paste => {
+                let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
+                    return Task::none();
+                };
+                iced::clipboard::read().map(move |text| Message::Pasted(id, text))
+            }
+            PaletteAction::OpenSearch => {
+                self.search.toggle();
+                self.recompute_search();
+                if self.search.is_open {
+                    iced::widget::operation::focus(SEARCH_INPUT_ID.clone())
+                } else {
+                    Task::none()
+                }
+            }
+            PaletteAction::OpenSearchReplace => {
+                self.search_replace.toggle();
+                if self.search_replace.is_open {
+                    iced::widget::operation::focus(SEARCH_REPLACE_FIND_ID.clone())
+                } else {
+                    Task::none()
+                }
+            }
+            PaletteAction::SplitVertical => {
+                self.split(Axis::Vertical);
+                Task::none()
+            }
+            PaletteAction::SplitHorizontal => {
+                self.split(Axis::Horizontal);
+                Task::none()
+            }
+            PaletteAction::FocusPaneLeft => {
+                self.focus_pane_direction(PaneDirection::Left);
+                Task::none()
+            }
+            PaletteAction::FocusPaneRight => {
+                self.focus_pane_direction(PaneDirection::Right);
+                Task::none()
+            }
+            PaletteAction::FocusPaneUp => {
+                self.focus_pane_direction(PaneDirection::Up);
+                Task::none()
+            }
+            PaletteAction::FocusPaneDown => {
+                self.focus_pane_direction(PaneDirection::Down);
+                Task::none()
+            }
+            PaletteAction::ResizePaneLeft => {
+                self.resize_pane_direction(PaneDirection::Left);
+                Task::none()
+            }
+            PaletteAction::ResizePaneRight => {
+                self.resize_pane_direction(PaneDirection::Right);
+                Task::none()
+            }
+            PaletteAction::ResizePaneUp => {
+                self.resize_pane_direction(PaneDirection::Up);
+                Task::none()
+            }
+            PaletteAction::ResizePaneDown => {
+                self.resize_pane_direction(PaneDirection::Down);
+                Task::none()
+            }
+            PaletteAction::ZoomPane => {
+                self.toggle_pane_zoom();
+                Task::none()
+            }
+            PaletteAction::SwapPanes => {
+                self.swap_panes();
+                Task::none()
+            }
+            PaletteAction::EqualizePanes => {
+                self.equalize_panes();
+                Task::none()
+            }
+            PaletteAction::ClosePane => self.close_focused_pane(),
+            PaletteAction::ToggleSidebar => self.toggle_sidebar(),
+            PaletteAction::ToggleAgent => {
+                if self.agent.is_open {
+                    self.agent.close();
+                    Task::none()
+                } else {
+                    let session_id = self.sessions.get(self.active).map(|s| s.id).unwrap_or(0);
+                    self.agent.open(&self.config, session_id);
+                    let focus = iced::widget::operation::focus(AGENT_INPUT_ID.clone());
+                    match self.agent_drive_task() {
+                        Some(task) => Task::batch([focus, task]),
+                        None => focus,
+                    }
+                }
+            }
+            PaletteAction::ToggleTasks => Task::done(Message::TaskPanelToggle),
+            PaletteAction::ToggleAiChats => self.toggle_ai_chats(),
+            PaletteAction::AskAiGenerate => self.open_ai_ask(),
+            PaletteAction::OpenSettings => {
+                self.set_config_panel_open(true);
+                Task::none()
+            }
+            PaletteAction::QuickTabSwitch => {
+                self.tab_switcher = Some(TabSwitcherState::default());
+                iced::widget::operation::focus(TAB_SWITCHER_INPUT_ID.clone())
+            }
+            PaletteAction::OpenHelp => {
+                self.help_open = true;
+                Task::none()
+            }
+            PaletteAction::ZoomIn => {
+                self.adjust_font_size(1.0);
+                Task::none()
+            }
+            PaletteAction::ZoomOut => {
+                self.adjust_font_size(-1.0);
+                Task::none()
+            }
+            PaletteAction::ZoomReset => {
+                self.reset_font_size();
+                Task::none()
+            }
+            PaletteAction::OpacityIncrease => {
+                self.adjust_opacity(0.025);
+                Task::none()
+            }
+            PaletteAction::OpacityDecrease => {
+                self.adjust_opacity(-0.025);
+                Task::none()
+            }
+            PaletteAction::ScrollToTop => {
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    let len = sess.projection.max_scroll_offset();
+                    sess.set_scroll_offset(len);
+                }
+                Task::none()
+            }
+            PaletteAction::ScrollToBottom => {
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    sess.scroll_to_bottom();
+                }
+                Task::none()
+            }
+            PaletteAction::CopyLastOutput => self.copy_last_output_task(),
+            PaletteAction::BlockJumpFirstFailed => self.block_jump_first_failed(),
+            PaletteAction::BlockJumpPrevFailed => self.block_jump_failed_step(true),
+            PaletteAction::BlockJumpNextFailed => self.block_jump_failed_step(false),
+            PaletteAction::BlockCopyCommand => self.block_copy_command_task(),
+            PaletteAction::BlockCopyOutput => self.block_copy_output_task(),
+            PaletteAction::BlockRecallCommand => self.block_recall_command_task(),
+            PaletteAction::BlockSelectAll => self.block_select_all(),
+            PaletteAction::BlockClear => self.request_block_clear(),
+            PaletteAction::BlockUndoClear => self.undo_block_clear(),
+            PaletteAction::BlockSelectPrev => self.block_select_step(true),
+            PaletteAction::BlockSelectNext => self.block_select_step(false),
+            PaletteAction::BlockReinputSelectedCommands => {
+                self.block_reinput_selected_commands_task()
+            }
+            PaletteAction::BlockCopyBlock => self.block_copy_block_task(),
+            PaletteAction::BlockCopyMarkdown => self.block_copy_markdown_task(),
+            PaletteAction::BlockExportSessionMarkdown => {
+                self.block_export_session_task(block_export::SessionExportFormat::Markdown)
+            }
+            PaletteAction::BlockExportSessionJson => {
+                self.block_export_session_task(block_export::SessionExportFormat::Json)
+            }
+            PaletteAction::BlockCompareSelected => self.block_compare_selected_task(false),
+            PaletteAction::BlockExportSelectedMarkdown => {
+                self.block_export_selected_task(block_export::SessionExportFormat::Markdown, false)
+            }
+            PaletteAction::BlockExportSelectedJson => {
+                self.block_export_selected_task(block_export::SessionExportFormat::Json, false)
+            }
+            PaletteAction::BlockSearch => self.toggle_block_search(),
+            PaletteAction::BlockToggleBookmark => self.block_toggle_target_bookmark(),
+            PaletteAction::BlockJumpPrevBookmark => self.block_jump_bookmark(true),
+            PaletteAction::BlockJumpNextBookmark => self.block_jump_bookmark(false),
+            PaletteAction::BlockFixWithAgent => {
+                self.palette_failed_block_agent_task(FailedBlockAgentIntent::Fix)
+            }
+            PaletteAction::BlockExplainWithAgent => {
+                self.palette_failed_block_agent_task(FailedBlockAgentIntent::Explain)
+            }
+            PaletteAction::BlockRetryFailed => self.palette_failed_block_retry_task(),
+            PaletteAction::BlockToggleCollapse => self.block_toggle_selected_collapse(),
+            PaletteAction::CommandHistory => self.open_history_picker(),
+            PaletteAction::OpenWorkflows => self.open_workflow_picker(),
+            PaletteAction::PromptJumpPrev | PaletteAction::PromptJumpNext => {
+                self.jump_prompt_with_feedback(matches!(action, PaletteAction::PromptJumpPrev))
+            }
+            PaletteAction::ClearScreen => {
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    // Clear screen + scrollback and home the cursor via the
+                    // terminal's own parser (shell-agnostic).
+                    sess.terminal.process_batch(b"\x1b[3J\x1b[2J\x1b[H");
+                    sess.refresh();
+                }
+                Task::none()
+            }
+        }
+    }
+
+    /// Copy the previous command's output (OSC 133 zones) to the clipboard,
+    /// shared by the Ctrl+Shift+G binding and the command palette.
+    fn copy_last_output_task(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Last block output copy") {
+            return Task::none();
+        }
+        let text = self
+            .sessions
+            .get(self.active)
+            .and_then(|s| s.terminal.last_command_output_text());
+        match text {
+            Some(text) if crate::block_mode::clipboard_multiline_is_unsafe(&text) => {
+                self.push_toast(
+                    "Last output not copied: it contains control or visual-spoofing characters"
+                        .to_string(),
+                    ToastKind::Warning,
+                );

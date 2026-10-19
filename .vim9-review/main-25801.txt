@@ -1,0 +1,300 @@
+                    items.push(el);
+                }
+                if horizontal {
+                    iced::widget::Column::with_children(items)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                } else {
+                    iced::widget::Row::with_children(items)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                }
+            }
+        }
+    }
+
+    /// Status strip above a split pane: its position in the layout, its title,
+    /// its working directory, and the command it is currently running.
+    ///
+    /// The strip doubles as the rearrange handle. Pressing it focuses the pane
+    /// (as clicking the terminal would); releasing over a different pane swaps
+    /// the two sessions without disturbing the split geometry.
+    fn pane_header(&self, session: usize) -> Element<'_, Message> {
+        let Some(sess) = self.sessions.get(session) else {
+            return Space::new()
+                .height(Length::Fixed(self.pane_header_height()))
+                .into();
+        };
+        let position = self
+            .layout()
+            .leaves()
+            .iter()
+            .position(|&leaf| leaf == session)
+            .unwrap_or(0);
+        let focused = session == self.active;
+        let drag_source = self
+            .pane_drag
+            .as_ref()
+            .is_some_and(|drag| drag.session_id == sess.id);
+        let drop_target = self
+            .pane_drag
+            .as_ref()
+            .is_some_and(|drag| drag.target == Some(sess.id));
+
+        let mut line = row![
+            text(format!("{}", position + 1))
+                .size(self.effective_font_size())
+                .color(self.c_accent()),
+            text(sess.pane_title()).size(self.effective_font_size()),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+
+        // The title is usually the directory's leaf; the full path only earns
+        // its space when it says something the title does not.
+        if let Some(cwd) = sess.cwd_display() {
+            if cwd != sess.pane_title() {
+                line = line.push(
+                    text(cwd)
+                        .size(self.effective_font_size())
+                        .color(self.c_text_dim()),
+                );
+            }
+        }
+        // Branch/dirty strip for the pane's repo, straight from the session
+        // cache (refreshed on the periodic tick and after command completion).
+        if self.config.show_repo_strip {
+            if let Some(meta) = sess.git_meta_cache.as_ref() {
+                let git =
+                    crate::review_text::bound_toast_text(jterm_core::git_meta::format_strip(meta));
+                line = line.push(text(git).size(self.effective_font_size()).color(blend(
+                    self.c_text_dim(),
+                    self.c_accent(),
+                    0.35,
+                )));
+            }
+        }
+        if let Some(command) = sess.fg_proc_cache.as_deref() {
+            line = line.push(
+                text(format!(
+                    "▶ {}",
+                    session_persistence::bound_tab_title_draft(command)
+                ))
+                .size(self.effective_font_size())
+                .color(blend(self.c_text_dim(), self.c_accent(), 0.6)),
+            );
+        }
+        // Held-open task transcript: the child exited, so the pane is
+        // read-only. The chip mirrors the hint toast's wording.
+        if sess.transcript_read_only() {
+            line = line.push(
+                text("■ exited")
+                    .size(self.effective_font_size())
+                    .color(self.c_text_dim()),
+            );
+        }
+        line = line.push(Space::new().width(Length::Fill));
+        if drop_target {
+            line = line.push(
+                text("⇄")
+                    .size(self.effective_font_size())
+                    .color(self.c_accent()),
+            );
+        }
+
+        let strip = container(line)
+            .width(Length::Fill)
+            .height(Length::Fixed(self.pane_header_height()))
+            .padding([0, 6])
+            .clip(true)
+            .style(self.pane_header_style(focused, drag_source, drop_target));
+
+        mouse_area(strip)
+            .on_press(Message::PaneDragStart(sess.id))
+            .interaction(iced::mouse::Interaction::Grab)
+            .into()
+    }
+
+    /// Pane header background: accent-tinted when focused, strongly tinted
+    /// when it is the pending drop target, and faded while it is the pane
+    /// being dragged away.
+    fn pane_header_style(
+        &self,
+        focused: bool,
+        drag_source: bool,
+        drop_target: bool,
+    ) -> impl Fn(&iced::Theme) -> container::Style {
+        let base = Theme::rgb_to_color32(self.theme.tabbar.bg);
+        let accent = self.c_accent();
+        let border = self.c_border();
+        let active_text = Theme::rgb_to_color32(self.theme.tabbar.active_text);
+        let inactive_text = Theme::rgb_to_color32(self.theme.tabbar.inactive_text);
+        move |_| {
+            let mut bg = if drop_target {
+                blend(base, accent, 0.45)
+            } else if focused {
+                blend(base, accent, 0.18)
+            } else {
+                base
+            };
+            if drag_source {
+                bg = Color { a: 0.55, ..bg };
+            }
+            container::Style {
+                text_color: Some(if focused || drop_target {
+                    active_text
+                } else {
+                    inactive_text
+                }),
+                background: Some(bg.into()),
+                border: iced::Border {
+                    color: if drop_target { accent } else { border },
+                    width: if drop_target { 1.0 } else { 0.0 },
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Thin frame around a split pane: the focused pane gets an accent outline
+    /// so keyboard focus is visible at a glance; the other pane stays plain.
+    fn pane_frame_style(&self, focused: bool) -> impl Fn(&iced::Theme) -> container::Style {
+        let accent = self.c_accent();
+        move |_| container::Style {
+            border: iced::Border {
+                color: if focused { accent } else { Color::TRANSPARENT },
+                width: if focused { 1.0 } else { 0.0 },
+                radius: 0.0.into(),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Directional overlay shown only after the pointer enters a pane edge's
+    /// armed zone. The untouched center remains visible as a safe cancel area.
+    fn split_drop_overlay(&self, direction: PaneDirection) -> Element<'_, Message> {
+        let label = match direction {
+            PaneDirection::Left => "← Split left",
+            PaneDirection::Right => "Split right →",
+            PaneDirection::Up => "↑ Split above",
+            PaneDirection::Down => "Split below ↓",
+        };
+        let zone = container(
+            text(label)
+                .size(self.effective_font_size())
+                .color(self.c_text()),
+        )
+        .center(Length::Fill)
+        .style(self.split_drop_zone_style());
+        let overlay: Element<'_, Message> = match direction {
+            PaneDirection::Left => row![
+                container(zone).width(Length::FillPortion(28)),
+                Space::new().width(Length::FillPortion(72)),
+            ]
+            .height(Length::Fill)
+            .into(),
+            PaneDirection::Right => row![
+                Space::new().width(Length::FillPortion(72)),
+                container(zone).width(Length::FillPortion(28)),
+            ]
+            .height(Length::Fill)
+            .into(),
+            PaneDirection::Up => column![
+                container(zone).height(Length::FillPortion(28)),
+                Space::new().height(Length::FillPortion(72)),
+            ]
+            .width(Length::Fill)
+            .into(),
+            PaneDirection::Down => column![
+                Space::new().height(Length::FillPortion(72)),
+                container(zone).height(Length::FillPortion(28)),
+            ]
+            .width(Length::Fill)
+            .into(),
+        };
+        container(overlay)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn split_drop_zone_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+        let base = Theme::rgb_to_color32(self.theme.tabbar.bg);
+        let accent = self.c_accent();
+        move |_| {
+            let mut background = blend(base, accent, 0.48);
+            background.a = 0.88;
+            container::Style {
+                background: Some(background.into()),
+                border: iced::Border {
+                    color: accent,
+                    width: 2.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            }
+        }
+    }
+
+    fn tab_to_split_instruction(&self) -> Element<'_, Message> {
+        let mut background = blend(
+            Theme::rgb_to_color32(self.theme.tabbar.bg),
+            self.c_accent(),
+            0.28,
+        );
+        background.a = 0.92;
+        let accent = self.c_accent();
+        let foreground = self.c_text();
+        let chip = container(
+            text("Drop near a pane edge to split · center cancels")
+                .size(self.effective_font_size()),
+        )
+        .padding([5, 10])
+        .style(move |_| container::Style {
+            text_color: Some(foreground),
+            background: Some(background.into()),
+            border: iced::Border {
+                color: accent,
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            ..Default::default()
+        });
+        container(chip)
+            .center_x(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(8)
+            .into()
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        if self.sessions.is_empty() {
+            let message = self
+                .session_diagnostic
+                .as_deref()
+                .unwrap_or("No terminal session is available");
+            let panel_width = (self.win_size.width - 48.0).clamp(240.0, 520.0);
+            let empty: Element<'_, Message> = container(
+                column![
+                    text("Terminal could not start").size(self.effective_font_size()),
+                    text(crate::review_text::bound_diagnostic_text(message))
+                        .size(self.effective_font_size())
+                        .wrapping(text::Wrapping::Word)
+                        .style(text::danger),
+                    button(text("Retry").size(self.effective_font_size()))
+                        .on_press(Message::NewSession),
+                ]
+                .spacing(12)
+                .width(Length::Fixed(panel_width)),
+            )
+            .center(Length::Fill)
+            .padding(24)
+            .into();
+            let empty: Element<'_, Message> = if let Some(banner) = self.session_recovery_banner() {
+                column![banner, empty]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()

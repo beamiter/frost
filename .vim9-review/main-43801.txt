@@ -1,0 +1,300 @@
+    #[test]
+    fn sidebar_transfer_completion_and_drop_planner_keep_owner_wiring() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let completion = source
+            .split_once("            Message::SidebarOpFinished(report) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SidebarTransferTick => {")
+            .unwrap()
+            .0;
+        assert!(
+            completion.find("retire_sidebar_transfer_owner(").unwrap()
+                < completion
+                    .find("if !sidebar_op_report_matches_context(")
+                    .unwrap()
+        );
+        assert!(completion.contains("report.transfer_owner.as_ref()"));
+        assert!(!completion.contains("self.sidebar_transfer = None"));
+        let worker = source
+            .split_once("fn sidebar_op_task(")
+            .unwrap()
+            .1
+            .split_once("fn run_sidebar_op(")
+            .unwrap()
+            .0;
+        assert!(worker.contains("run_sidebar_op(&location, &hosts, &op, progress.as_ref())"));
+        assert!(worker.contains("transfer_owner: progress,"));
+        let drop = source
+            .split_once("            Message::SidebarDropFlush(intent) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SidebarDropPlanned(")
+            .unwrap()
+            .0;
+        assert!(drop.contains("let target_is_local = intent.target_is_local;"));
+        assert!(drop.contains("plan_drop(paths, target_dir, target_is_local)"));
+        assert!(drop.contains("tokio::task::spawn_blocking("));
+        assert!(drop.contains("Drop planner failed:"));
+        assert!(drop.contains("let target_dir = intent.target_dir.clone();"));
+        assert!(!drop.contains("self.sidebar_drop_target()"));
+        let cancel = source
+            .split_once("            Message::SidebarTransferCancel => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SidebarRowHover(")
+            .unwrap()
+            .0;
+        assert!(cancel.contains("self.sidebar_drop_intents.clear()"));
+        assert!(cancel.contains("self.sidebar_drop_burst.clear()"));
+        assert!(cancel.contains("transfer.progress.cancel()"));
+        let admission = source
+            .split_once("            Message::FileDropped(path) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SidebarDropFlush(")
+            .unwrap()
+            .0;
+        assert!(
+            admission
+                .find("!self.sidebar_drop_intents.can_plan()")
+                .unwrap()
+                < admission.find("return Task::perform(").unwrap()
+        );
+        assert!(admission.contains("Drop planning is busy; wait and drop these files again"));
+        let completion = source
+            .split_once("            Message::SidebarDropPlanned(intent, plan) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SidebarDropHover(")
+            .unwrap()
+            .0;
+        assert!(
+            completion
+                .find("!self.sidebar_drop_intents.finish_planning(&intent)")
+                .unwrap()
+                < completion.find("self.sidebar_transfer = Some(ui)").unwrap()
+        );
+    }
+
+    fn test_drop_intent(target: &str) -> std::sync::Arc<SidebarDropIntent> {
+        SidebarDropIntent::capture(7, Some(3), Some(11), Some(target.into()), true).unwrap()
+    }
+
+    #[test]
+    fn drop_keeps_first_destination_when_pointer_moves_during_debounce() {
+        let first = test_drop_intent("/first");
+        let mut state = SidebarDropIntents {
+            collecting: Some(first.clone()),
+            ..SidebarDropIntents::default()
+        };
+        let later_hover = test_drop_intent("/other");
+        assert!(!state.start_planning(&later_hover));
+        assert!(state.start_planning(&first));
+        assert_eq!(first.target_dir, std::path::PathBuf::from("/first"));
+        assert!(state.finish_planning(&first));
+        assert!(!state.finish_planning(&first));
+    }
+
+    #[test]
+    fn cancelled_drop_callbacks_cannot_consume_a_new_same_context_burst() {
+        let old = test_drop_intent("/first");
+        let mut state = SidebarDropIntents {
+            collecting: Some(old.clone()),
+            ..SidebarDropIntents::default()
+        };
+        assert!(state.start_planning(&old));
+        state.clear();
+        let new = test_drop_intent("/first");
+        state.collecting = Some(new.clone());
+        assert!(!state.start_planning(&old));
+        assert!(!state.finish_planning(&old));
+        assert!(state.collecting_is(&new));
+        assert!(state.start_planning(&new));
+        assert!(state.finish_planning(&new));
+    }
+
+    #[test]
+    fn consecutive_drop_bursts_keep_independent_planning_and_destinations() {
+        let a = test_drop_intent("/a");
+        let b = test_drop_intent("/b");
+        let mut state = SidebarDropIntents {
+            collecting: Some(a.clone()),
+            ..SidebarDropIntents::default()
+        };
+        assert!(state.start_planning(&a));
+        state.collecting = Some(b.clone());
+        assert!(!state.start_planning(&a));
+        assert!(state.finish_planning(&a));
+        assert!(state.collecting_is(&b));
+        assert_eq!(b.target_dir, std::path::PathBuf::from("/b"));
+        assert!(state.start_planning(&b));
+        assert!(state.finish_planning(&b));
+    }
+
+    #[test]
+    fn canceled_size_walks_keep_admission_slots_until_their_results_arrive() {
+        let mut state = SidebarDropIntents::default();
+        let mut plans = Vec::new();
+        for _ in 0..MAX_PENDING_DROP_PLANS {
+            let intent = test_drop_intent("/a");
+            state.collecting = Some(intent.clone());
+            assert!(state.start_planning(&intent));
+            plans.push(intent);
+        }
+        assert!(!state.can_plan());
+        state.clear();
+        assert!(!state.can_plan());
+        let blocked = test_drop_intent("/b");
+        state.collecting = Some(blocked.clone());
+        assert!(!state.start_planning(&blocked));
+        assert!(!state.finish_planning(&plans[0]));
+        assert!(state.can_plan());
+        assert!(state.start_planning(&blocked));
+        assert!(!state.can_plan());
+        assert!(!state.finish_planning(&plans[0]));
+        assert!(!state.can_plan());
+        assert!(state.finish_planning(&blocked));
+    }
+
+    #[test]
+    fn drop_requires_initial_target_and_current_tree_host_and_session() {
+        assert!(SidebarDropIntent::capture(7, Some(3), Some(11), None, true).is_none());
+        assert!(SidebarDropIntent::capture(7, None, Some(11), Some("/a".into()), true).is_none());
+        assert!(SidebarDropIntent::capture(7, Some(3), None, Some("/a".into()), true).is_none());
+        let intent = test_drop_intent("/a");
+        assert!(intent.matches_context(7, Some(3), Some(11)));
+        assert!(!intent.matches_context(8, Some(3), Some(11)));
+        assert!(!intent.matches_context(7, Some(4), Some(11)));
+        assert!(!intent.matches_context(7, Some(3), Some(12)));
+        assert!(!intent.matches_context(7, None, Some(11)));
+    }
+
+    #[test]
+    fn remote_drop_does_not_probe_the_local_destination_namespace() {
+        let root =
+            std::env::temp_dir().join(format!("frost-drop-namespace-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("source")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let source = root.join("source/item.txt");
+        let destination = root.join("target/item.txt");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&destination, b"unrelated local file").unwrap();
+        let local = plan_drop(vec![source.clone()], root.join("target"), true).unwrap();
+        assert!(local.items[0].error.is_some());
+        let remote = plan_drop(vec![source.clone()], root.join("target"), false).unwrap();
+        assert!(remote.items[0].error.is_none());
+        assert_eq!(remote.total_bytes, 6);
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"unrelated local file"
+        );
+        let missing = plan_drop(vec![root.join("missing")], root.join("target"), false).unwrap();
+        assert!(missing.items[0].error.is_some());
+        assert!(plan_drop_with_caps(vec![source], root.join("target"), false, 1, 2).is_err());
+    }
+    #[test]
+    fn remote_picker_snapshot_rebinds_only_a_unique_unchanged_profile() {
+        let a = sidebar_remote_profile("A", "a.example.test");
+        let b = sidebar_remote_profile("B", "b.example.test");
+        let picker = RemotePickerState::new(&[a.clone(), b.clone()]);
+        let reordered = vec![b.clone(), a.clone()];
+        assert_eq!(
+            remote_picker_target_index(Some(&picker), &picker.identity, &a, &reordered),
+            Some(1)
+        );
+        assert_eq!(
+            picker.hosts[picker.selected], a,
+            "the displayed selection stays on A"
+        );
+        let mut changed = a.clone();
+        changed.host = "changed.example.test".into();
+        for current in [
+            vec![changed, b.clone()],
+            vec![b.clone()],
+            vec![a.clone(), b, a.clone()],
+        ] {
+            assert_eq!(
+                remote_picker_target_index(Some(&picker), &picker.identity, &a, &current),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn remote_picker_dismissal_and_reopening_retire_callback_identity() {
+        let a = sidebar_remote_profile("A", "a.example.test");
+        let hosts = vec![a.clone()];
+        let old = RemotePickerState::new(&hosts);
+        let identity = old.identity.clone();
+        drop(old);
+        assert_eq!(
+            remote_picker_target_index(None, &identity, &a, &hosts),
+            None
+        );
+        let new = RemotePickerState::new(&hosts);
+        assert_eq!(
+            remote_picker_target_index(Some(&new), &identity, &a, &hosts),
+            None
+        );
+        assert_eq!(
+            remote_picker_target_index(Some(&new), &new.identity, &a, &hosts),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn remote_picker_snapshot_and_current_active_limits_both_apply() {
+        let a = sidebar_remote_profile("A", "a.example.test");
+        let b = sidebar_remote_profile("B", "b.example.test");
+        let picker = RemotePickerState::new(std::slice::from_ref(&a));
+        let mut inactive = vec![b.clone(); config::MAX_REMOTE_HOSTS];
+        inactive.push(a.clone());
+        assert_eq!(
+            remote_picker_target_index(Some(&picker), &picker.identity, &a, &inactive),
+            None
+        );
+        assert_eq!(
+            remote_picker_target_index(
+                Some(&picker),
+                &picker.identity,
+                &b,
+                std::slice::from_ref(&b)
+            ),
+            None
+        );
+        let duplicate = RemotePickerState::new(&[a.clone(), a.clone()]);
+        assert_eq!(
+            remote_picker_target_index(
+                Some(&duplicate),
+                &duplicate.identity,
+                &a,
+                std::slice::from_ref(&a)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn remote_picker_keyboard_rows_and_dispatch_share_snapshot_identity() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let key = source
+            .split_once("    fn handle_remote_picker_key(")
+            .unwrap()
+            .1
+            .split_once("    /// Open a `[[remote_hosts]]` destination")
+            .unwrap()
+            .0;
+        assert!(key.contains("state.hosts.get(state.selected).cloned()"));
+        assert!(key.contains("let identity = state.identity.clone();"));
+        assert!(key.contains("self.update(Message::RemotePickerConnect("));
+        assert!(!key.contains("self.config.remote_hosts"));
+        let view = source
+            .split_once("    fn remote_picker_view(")

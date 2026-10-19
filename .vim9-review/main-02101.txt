@@ -1,0 +1,300 @@
+            len: terminal.command_zones.len(),
+            oldest: terminal.command_zones.front().map(|zone| zone.id),
+            newest: terminal.command_zones.back().map(|zone| zone.id),
+        }
+    }
+}
+
+fn next_block_search_epoch(epoch: &mut u64) -> Option<u64> {
+    let next = epoch.checked_add(1)?;
+    *epoch = next;
+    Some(next)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockSearchActivation {
+    RejectStale,
+    Close,
+    Advance,
+}
+
+fn block_search_activation(target_is_live: bool, continuous_review: bool) -> BlockSearchActivation {
+    if !target_is_live {
+        BlockSearchActivation::RejectStale
+    } else if continuous_review {
+        BlockSearchActivation::Advance
+    } else {
+        BlockSearchActivation::Close
+    }
+}
+
+/// Window-lifetime search intent. This deliberately excludes pane identity,
+/// cache generations, hits and selection, and is never part of session/config
+/// persistence.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BlockSearchMemory {
+    query: String,
+    case_sensitive: bool,
+    regex: bool,
+    whole_word: bool,
+    scope: block_mode::BlockSearchScope,
+    filter: BlockSearchFilter,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlockSearchIntent {
+    query: String,
+    case_sensitive: bool,
+    regex: bool,
+    whole_word: bool,
+    scope: block_mode::BlockSearchScope,
+    filter: BlockSearchFilter,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlockSearchSelectionAnchor {
+    hit: block_mode::BlockSearchHit,
+    index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockSearchBookmarkPlan {
+    Toggle(u64),
+    Busy,
+    NoSelection,
+    RejectStale,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockSearchBookmarkNotice {
+    Bookmarked,
+    Removed,
+    Busy,
+    NoSelection,
+    Stale,
+}
+
+impl BlockSearchBookmarkNotice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bookmarked => "Bookmarked block ★",
+            Self::Removed => "Removed block bookmark ☆",
+            Self::Busy => "Bookmarks are available when results finish updating",
+            Self::NoSelection => "No search result selected",
+            Self::Stale => "Search result is no longer available",
+        }
+    }
+}
+
+/// Visible and hover text for a result-local bookmark action. The keyboard
+/// chord deliberately does not appear here: Ctrl+Shift+B acts on the
+/// highlighted result, which may differ from the row whose pointer button is
+/// focused or hovered.
+fn block_search_bookmark_button_text(bookmarked: bool) -> &'static str {
+    if bookmarked {
+        "★ Remove"
+    } else {
+        "☆ Bookmark"
+    }
+}
+
+fn block_search_bookmark_button_help(bookmarked: bool, stale: bool) -> &'static str {
+    if stale {
+        "Bookmarks are available when results finish updating"
+    } else if bookmarked {
+        "Remove the bookmark from this block"
+    } else {
+        "Bookmark this block"
+    }
+}
+
+const BLOCK_SEARCH_KEYBOARD_HELP: &str =
+    "Ctrl+Shift+B toggle bookmark on selected result · F5 refresh · Tab filter · Ctrl+I case · Ctrl+R regex · Ctrl+W whole word · \
+     ↑↓ select · Enter reveal · Shift+Enter step · Ctrl+U clear · Ctrl+Shift+U reset · Esc close";
+
+fn block_search_bookmarks_have_indexed_text(
+    cache: &[block_mode::CachedBlockSearchZone],
+    bookmarked_zone_ids: &std::collections::HashSet<u64>,
+    scope: block_mode::BlockSearchScope,
+) -> bool {
+    cache.iter().any(|zone| {
+        bookmarked_zone_ids.contains(&zone.zone_id)
+            && block_mode::metadata_block_search_hit(zone, scope).is_some()
+    })
+}
+
+/// Explain a valid search/browse intent that produced no hits. In particular,
+/// an empty Bookmarked view must not tell the user to press Ctrl+Shift+B while
+/// there is no selected row for that shortcut to act on.
+fn block_search_empty_message(
+    query: &str,
+    filter: BlockSearchFilter,
+    scope: block_mode::BlockSearchScope,
+    has_live_bookmarks: bool,
+    has_bookmarked_indexed_text: bool,
+    older_not_indexed: bool,
+) -> String {
+    let surface = match scope {
+        block_mode::BlockSearchScope::All => "command or output",
+        block_mode::BlockSearchScope::Command => "command",
+        block_mode::BlockSearchScope::Output => "output",
+    };
+    let query_is_empty = query.trim().is_empty();
+    let message = if filter == BlockSearchFilter::Bookmarked && !has_live_bookmarks {
+        "No bookmarked blocks — choose the All filter and search for a block, then use ☆ or Ctrl+Shift+B on the selected result"
+            .to_string()
+    } else if filter == BlockSearchFilter::Bookmarked && !has_bookmarked_indexed_text {
+        format!("Bookmarked blocks have no indexed {surface} text")
+    } else if filter == BlockSearchFilter::Bookmarked {
+        "No matches in bookmarked blocks".to_string()
+    } else if query_is_empty {
+        format!("Matching blocks have no indexed {surface} text")
+    } else {
+        "No matching blocks".to_string()
+    };
+    if older_not_indexed {
+        format!("{message} · older blocks not indexed")
+    } else {
+        message
+    }
+}
+
+fn block_search_refresh_selection_index(
+    hits: &[block_mode::BlockSearchHit],
+    anchor: Option<&BlockSearchSelectionAnchor>,
+) -> usize {
+    if hits.is_empty() {
+        return 0;
+    }
+    anchor
+        .and_then(|anchor| hits.iter().position(|hit| hit == &anchor.hit))
+        .or_else(|| anchor.map(|anchor| anchor.index.min(hits.len() - 1)))
+        .unwrap_or(0)
+}
+
+impl BlockSearchMemory {
+    fn capture(&mut self, state: &BlockSearchState) {
+        self.query = if state.query.len() <= block_mode::BLOCK_SEARCH_QUERY_MAX_BYTES {
+            state.query.clone()
+        } else {
+            // The one-scalar sentinel exists only to show TooLong and support
+            // Backspace recovery while open; it must not become remembered
+            // state that immediately reopens on an error.
+            String::new()
+        };
+        self.case_sensitive = state.case_sensitive;
+        self.regex = state.regex;
+        self.whole_word = state.whole_word;
+        self.scope = state.scope;
+        self.filter = state.filter;
+    }
+
+    fn state_for(&self, session_id: usize) -> BlockSearchState {
+        BlockSearchState {
+            session_id,
+            query: self.query.clone(),
+            case_sensitive: self.case_sensitive,
+            regex: self.regex,
+            whole_word: self.whole_word,
+            scope: self.scope,
+            filter: self.filter,
+            ..BlockSearchState::default()
+        }
+    }
+}
+
+#[derive(Default)]
+struct BlockSearchState {
+    /// Pane identity owning the cache. Zone ids are only pane-local.
+    session_id: usize,
+    /// Monotonic window-wide generation of the background operation owned by
+    /// this picker. Session id alone cannot distinguish close/reopen races.
+    epoch: u64,
+    /// True while source text is being lowercased on the worker.
+    loading: bool,
+    /// Matching owns the cache on a worker; pending edits overwrite only the
+    /// bounded intent fields and never queue another cache or task.
+    matching: bool,
+    match_pending: bool,
+    rebuild_pending: bool,
+    match_anchor: Option<BlockSearchSelectionAnchor>,
+    /// Repeated UI messages for the same intent/filter membership are free.
+    matched_intent: Option<BlockSearchIntent>,
+    matched_eligible: std::collections::HashSet<u64>,
+    filter_context: Option<BlockSearchFilterContext>,
+    /// The source or resident budget omitted at least one older zone.
+    older_not_indexed: bool,
+    /// Finalized-zone set represented by the current/in-flight cache.
+    zone_version: BlockSearchZoneVersion,
+    query: String,
+    /// Matching controls are pane-picker state, not global terminal search
+    /// settings. They survive index refreshes while the picker stays open.
+    case_sensitive: bool,
+    regex: bool,
+    whole_word: bool,
+    /// Command/output surface restriction. Applied before the 500-hit cap.
+    scope: block_mode::BlockSearchScope,
+    /// Invalid/oversized queries leave the last valid hits and bounded index
+    /// intact, but disable activation until the query compiles again.
+    query_error: Option<String>,
+    filter: BlockSearchFilter,
+    /// Highlighted row among `hits`; rendering windows the list while every
+    /// retained result remains reachable by keyboard.
+    selected: usize,
+    hits: Vec<block_mode::BlockSearchHit>,
+    /// The 500-hit matching cap stopped the scan early (older zones were
+    /// left unscanned).
+    capped: bool,
+    /// Bounded cache the hits are computed from, oldest zone first (the zone
+    /// deque's order). Rebuilt only when the finalized-zone version changes.
+    cache: Vec<block_mode::CachedBlockSearchZone>,
+    /// Matching intent at the start of a version rebuild. It gates selection
+    /// restoration when the asynchronous cache result lands: edits made while
+    /// loading are a new intent and must start at the first result.
+    refresh_intent: Option<BlockSearchIntent>,
+    /// One coalesced F5 request made while the cache worker was already busy.
+    manual_refresh_pending: bool,
+    /// Short picker-local feedback for star clicks and Ctrl+Shift+B. Toasts
+    /// can sit behind the modal, so the result is also reported in its footer.
+    bookmark_notice: Option<BlockSearchBookmarkNotice>,
+    /// Physical-B latch. The first edge freezes whether this press belongs to
+    /// Ctrl+Shift+B until B itself is released.
+    bookmark_key_held: bool,
+    /// Whether the first press in the current physical-B lifetime was the
+    /// exact picker bookmark chord. Later modifier changes cannot alter it.
+    bookmark_key_claimed: bool,
+}
+
+impl BlockSearchState {
+    fn busy(&self) -> bool {
+        self.loading || self.matching || self.match_pending || self.rebuild_pending
+    }
+
+    fn selected_anchor(&self) -> Option<BlockSearchSelectionAnchor> {
+        self.hits
+            .get(self.selected)
+            .cloned()
+            .map(|hit| BlockSearchSelectionAnchor {
+                hit,
+                index: self.selected,
+            })
+    }
+
+    /// Hot reload and returning to live can change filter membership while
+    /// finalized-zone identity remains stable. Keep input errors authoritative
+    /// and coalesce metadata updates just like pending text edits.
+    fn observe_filter_context(&mut self, context: BlockSearchFilterContext) {
+        if self.filter_context == Some(context) {
+            return;
+        }
+        self.filter_context = Some(context);
+        if self.query_error.is_some() {
+            self.match_pending = false;
+            return;
+        }
+        if !self.match_pending {
+            self.match_anchor = self.selected_anchor();
+            self.match_pending = true;
+        }
+    }
+

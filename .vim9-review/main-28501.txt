@@ -1,0 +1,300 @@
+        )
+    }
+
+    /// Allocate the next request id. Window-wide and strictly increasing, so
+    /// a reply can only ever publish onto the request that asked for it — a
+    /// per-card counter let request A's answer land on card B, which is one
+    /// Enter away from typing an unrelated (possibly destructive) command at
+    /// the prompt. Exhaustion refuses the request instead of wrapping.
+    fn next_ai_suggestion_generation(&mut self) -> Option<u64> {
+        ai_command::next_generation(&mut self.ai_suggestion_generation)
+    }
+
+    /// Re-draft after a failure with the same request and captured context.
+    fn regenerate_ai_suggestion(&mut self, expected_generation: u64) -> Task<Message> {
+        if !self
+            .ai_suggestion
+            .as_ref()
+            .is_some_and(|session| session.is_generation(expected_generation))
+        {
+            return Task::none();
+        }
+        let Some(generation) = self.next_ai_suggestion_generation() else {
+            return Task::none();
+        };
+        let re_armed = self
+            .ai_suggestion
+            .as_mut()
+            .is_some_and(|session| session.regenerate(generation));
+        if !re_armed {
+            return Task::none();
+        }
+        self.ai_suggestion_worker_task(generation)
+    }
+
+    /// Take keyboard focus only for a card bound to the active pane whose
+    /// prompt is clean and idle — the correction card's rule, so a prompt the
+    /// user is already typing into keeps its keystrokes.
+    fn ai_suggestion_focusable(&mut self) -> bool {
+        let Some(session) = self.ai_suggestion.as_ref() else {
+            return false;
+        };
+        self.sessions.get_mut(self.active).is_some_and(|sess| {
+            sess.id == session.session_id && sess.agent_prompt_status().is_ready()
+        })
+    }
+
+    /// The card's primary action: validate the draft with the sources'
+    /// `jterm_core::review_input` gate, re-check prompt ownership at the write
+    /// boundary, and type the command into the prompt through the
+    /// non-submitting insert policy. Generated commands never run
+    /// automatically — the user reviews and presses Enter.
+    fn insert_ai_suggestion(&mut self, generation: u64) -> Task<Message> {
+        if !self
+            .ai_suggestion
+            .as_ref()
+            .is_some_and(|session| session.is_generation(generation))
+        {
+            return Task::none();
+        }
+        // The insert types into the *bound* pane. If the user has moved on to
+        // another pane, refuse rather than clearing and rewriting a prompt
+        // that is off screen (ember refuses the same way).
+        if !self.ai_suggestion_visible() {
+            if let Some(session) = self.ai_suggestion.as_mut() {
+                session.reject_insert("its pane is not on screen — switch back to it first");
+            }
+            return Task::none();
+        }
+        let Some(session) = self.ai_suggestion.as_mut() else {
+            return Task::none();
+        };
+        let session_id = session.session_id;
+        let command = match session.validated_insert_command() {
+            Ok(command) => command.to_string(),
+            Err(error) => {
+                session.reject_insert(error);
+                return Task::none();
+            }
+        };
+        if let Err(reason) = self.session_prompt_replace_ready(session_id) {
+            if let Some(session) = self.ai_suggestion.as_mut() {
+                session.reject_insert(reason);
+            }
+            return Task::none();
+        }
+        if self
+            .write_paste_to_session(session_id, &command, block_reinput_policy(), true)
+            .written()
+        {
+            self.ai_suggestion = None;
+        } else if let Some(session) = self.ai_suggestion.as_mut() {
+            session.reject_insert("the target prompt changed before the command could be queued");
+        }
+        Task::none()
+    }
+
+    // ===== Experimental Tasks dashboard (agent_task) =====
+
+    /// Re-check the same live task/turn conditions that render the composer.
+    /// A retained UI callback must never send another selected task's draft.
+    fn task_follow_up_is_current(&self, reference: &agent_task_ui::TaskFollowUpRef) -> bool {
+        if !self.config.experimental_task_sidebar
+            || !self.dock_open()
+            || self.sidebar_panel != SidebarPanel::Tasks
+        {
+            return false;
+        }
+        let Some(task) = self.task_manager.get(reference.task_id) else {
+            return false;
+        };
+        let Some(snapshot) = self.agent_runtime.snapshot(reference.task_id) else {
+            return false;
+        };
+        self.task_panel
+            .accepts_follow_up(reference, snapshot.completed_turns)
+            && self.agent_runtime.has_running(task.id)
+            && self.task_manager.has_active_agent_event_stream(task.id)
+            && task.status == agent_task::TaskStatus::ReadyForReview
+            && task.runtime_kind == agent_task::TaskRuntimeKind::Native
+            && matches!(task.provider, agent_task::AgentProvider::Codex)
+    }
+
+    /// Keep Tasks dock geometry and keyboard ownership in sync for every
+    /// entry point, including opening it while the ordinary sidebar is hidden.
+    fn set_task_panel_open(&mut self, open: bool) {
+        if self.sidebar_open != open || self.sidebar_panel != SidebarPanel::Tasks {
+            self.task_panel.retire_panel_callbacks();
+        }
+        self.invalidate_sidebar_remote_follow_intent();
+        self.sidebar_open = open;
+        if open {
+            self.sidebar_panel = SidebarPanel::Tasks;
+        }
+        self.sidebar_files_focused = false;
+        self.apply_config();
+    }
+
+    /// Show or hide the Tasks dock panel. With the feature flag off the
+    /// toggle only explains how to enable it.
+    fn toggle_task_panel(&mut self) {
+        if !self.config.experimental_task_sidebar {
+            self.push_toast(
+                "Enable the experimental Tasks dashboard in Settings first",
+                ToastKind::Info,
+            );
+            return;
+        }
+        let showing = self.sidebar_open && self.sidebar_panel == SidebarPanel::Tasks;
+        self.set_task_panel_open(!showing);
+    }
+
+    /// Create an isolated-worktree task from one failed command block. The
+    /// eligibility gates mirror the Fix/Explain Agent path; the actual Git
+    /// work is prepared on a background worker and registered on TaskTick.
+    fn task_create_from_block(&mut self, session_id: usize, zone_id: u64) {
+        if !self.config.experimental_task_sidebar {
+            return;
+        }
+        if self.task_panel.pending_creation.is_some() {
+            self.push_toast(
+                "Another task worktree is still being created",
+                ToastKind::Info,
+            );
+            return;
+        }
+        let prepared = self
+            .sessions
+            .iter()
+            .find(|sess| sess.id == session_id)
+            .map(|sess| {
+                let Some(zone) = sess.terminal.zone_by_id(zone_id) else {
+                    return Err("Block menu target is no longer available".to_string());
+                };
+                if !matches!(
+                    block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                    block_mode::BlockOutcome::Failed(_)
+                ) {
+                    return Err("Tasks can be created for failed command blocks".to_string());
+                }
+                if let Some(reason) = block_mode::failed_block_agent_disabled_reason(
+                    zone.command.as_deref(),
+                    zone.command_truncated,
+                    zone.cwd.as_deref(),
+                ) {
+                    return Err(format!("Cannot create a task: {reason}"));
+                }
+                let recorded = zone.cwd.clone().expect("eligibility guarantees a cwd");
+                let reported = sess.terminal.current_working_dir().map(str::to_string);
+                let process = jterm_core::process::process_cwd(sess.pty.get_child_pid());
+                if !block_mode::verified_local_command_cwd(
+                    &recorded,
+                    reported.as_deref(),
+                    process.as_deref(),
+                ) {
+                    return Err(
+                        "Cannot create a task: the recorded cwd is not independently verified; return a local shell to the command's directory first"
+                            .to_string(),
+                    );
+                }
+                let (output_text, output_truncated, output_available) =
+                    match sess.terminal.zone_output_export_capped(zone_id) {
+                        Some(terminal::ZoneOutputExport::Available { text, truncated }) => {
+                            (text, truncated, true)
+                        }
+                        Some(terminal::ZoneOutputExport::Empty) => (String::new(), false, true),
+                        Some(terminal::ZoneOutputExport::Unavailable) => {
+                            (String::new(), false, false)
+                        }
+                        None => {
+                            return Err("Block menu target is no longer available".to_string())
+                        }
+                    };
+                let command = zone.command.clone().expect("eligibility guarantees a command");
+                Ok(agent_task::SemanticCommandContext {
+                    source_session_id: agent_task_ui::terminal_session_id(session_id),
+                    source_execution_id: format!("zone-{zone_id}"),
+                    source_sequence: zone_id,
+                    source_shell: pty::resolved_shell_identity(
+                        self.config.shell.as_deref(),
+                        Some(&recorded),
+                    ),
+                    command: Some(command),
+                    command_exact: zone.command_exact,
+                    command_truncated: zone.command_truncated,
+                    cwd: Some(recorded),
+                    cwd_after: None,
+                    exit_code: zone.exit_code,
+                    duration_ms: zone.duration_ms,
+                    output_text,
+                    output_available,
+                    output_truncated,
+                    output_total_bytes: 0,
+                    started_at: None,
+                    finished_at: None,
+                })
+            });
+        let context = match prepared {
+            Some(Ok(context)) => context,
+            Some(Err(message)) => {
+                self.push_toast(message, ToastKind::Warning);
+                return;
+            }
+            None => {
+                self.push_toast("Block menu target is no longer available", ToastKind::Info);
+                return;
+            }
+        };
+        self.task_panel.provider_picker = Some(agent_task_ui::TaskProviderPicker::new(context));
+        self.set_task_panel_open(true);
+        self.push_toast(
+            "Choose Codex, Claude, OpenCode, or Kimi for the new task",
+            ToastKind::Info,
+        );
+    }
+
+    /// Finish Create task after the user picks a provider in the Tasks panel.
+    fn task_create_with_provider(
+        &mut self,
+        reference: std::sync::Arc<()>,
+        provider: agent_task::AgentProvider,
+    ) {
+        if !self.config.experimental_task_sidebar
+            || !self.dock_open()
+            || self.sidebar_panel != SidebarPanel::Tasks
+        {
+            return;
+        }
+        if self.task_panel.pending_creation.is_some() {
+            self.push_toast(
+                "Another task worktree is still being created",
+                ToastKind::Info,
+            );
+            return;
+        }
+        let Some(context) = agent_task_ui::TaskProviderPicker::take_current(
+            &mut self.task_panel.provider_picker,
+            &reference,
+        ) else {
+            return;
+        };
+        let provider_name = crate::review_text::bound_provider_label(provider.display_name());
+        if let Err(error) = provider.ensure_executable_available() {
+            self.task_panel.provider_picker = Some(agent_task_ui::TaskProviderPicker::new(context));
+            self.push_toast(error.to_string(), ToastKind::Warning);
+            return;
+        }
+        self.config.preferred_agent_provider = provider.config_value().to_string();
+        self.config_dirty = true;
+        match agent_task_ui::begin_worktree_creation(context, provider) {
+            Ok(pending) => {
+                self.task_panel.pending_creation = Some(pending);
+                self.set_task_panel_open(true);
+                self.push_toast(
+                    format!("Creating an isolated Git worktree for {provider_name}…"),
+                    ToastKind::Info,
+                );
+            }
+            Err(error) => self.push_toast(error, ToastKind::Warning),
+        }
+    }

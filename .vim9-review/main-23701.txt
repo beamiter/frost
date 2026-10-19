@@ -1,0 +1,300 @@
+            let border = blend(self.c_border(), accent, 0.35);
+            let background = self.with_window_opacity(blend(self.c_panel(), accent, 0.035));
+            companion_card_content(body, detail, self.companion_toggle(true))
+                .style(move |_| container::Style {
+                    background: Some(background.into()),
+                    border: iced::Border {
+                        color: border,
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .into()
+        };
+        let companion = container(companion)
+            .width(Length::Fill)
+            .height(Length::Fixed(companion_height))
+            // The reserved strip is separate from the terminal, even when tiny.
+            .clip(true)
+            .padding([3.0, 8.0])
+            .style(self.chrome_bar_style());
+        let mut compact_slot: Option<Element<'_, Message>> = None;
+        if layout.glyph {
+            // Keep a still presence in the same slot while live reactions pause.
+            // Typing, focus and pane changes cannot move the status segments.
+            let organism::LivePresentation {
+                glyph,
+                sprite,
+                explanation,
+                status,
+                life,
+                ..
+            } = presentation;
+            let candidate_visible = self.organism_hover_eligible()
+                && self.organism_owner().is_some_and(|id| {
+                    self.organism
+                        .live_greeting_candidate_visible(id, attention_facts)
+                });
+            // Always reserve this tiny mark inside the existing slot. It is
+            // a passive dwell cue, not a focus ring or a behavior change.
+            let cue_color = self.c_text_dim();
+            let cue = container(Space::new())
+                .width(Length::Fixed(2.0))
+                .height(Length::Fixed(2.0))
+                .style(move |_| container::Style {
+                    background: candidate_visible.then_some(cue_color.into()),
+                    ..Default::default()
+                });
+            let slot = container(
+                row![
+                    text(glyph)
+                        .font(iced::Font::MONOSPACE)
+                        .size(11)
+                        .color(companion_color),
+                    Space::new().width(Length::Fill),
+                    cue,
+                ]
+                .align_y(iced::Alignment::Center),
+            )
+            .width(Length::Fixed(64.0))
+            .clip(true);
+            let slot: Element<'_, Message> =
+                if explanation.is_empty() || !self.terminal_input_active() {
+                    slot.into()
+                } else {
+                    let detail = container(
+                        column![
+                            container(text(sprite).font(iced::Font::MONOSPACE).size(13))
+                                .width(Length::Fixed(200.0))
+                                .height(Length::Fixed(72.0)),
+                            text(status.into_owned())
+                                .size(self.effective_font_size())
+                                .color(companion_color),
+                            text(explanation.into_owned()).size(self.effective_font_size()),
+                            text(life)
+                                .size(self.effective_font_size())
+                                .color(self.c_text_dim()),
+                        ]
+                        .spacing(8),
+                    )
+                    .padding(8)
+                    .width(Length::Fixed(220.0))
+                    .max_height(220.0)
+                    // Tooltip overlays otherwise pass an unbounded draw viewport.
+                    .clip(true);
+                    tooltip(slot, detail, tooltip::Position::Top).into()
+                };
+            let slot: Element<'_, Message> = if let Some(id) = self.organism_owner() {
+                // One core offer binds both edges before the next view rebuild.
+                let mut area = mouse_area(slot);
+                if !self.config.is_card_mode() {
+                    if let Some(ticket) = self.organism.live_greeting_offer(id) {
+                        area = area.on_enter(Message::OrganismHoverEnter(id, ticket));
+                    }
+                    if let Some(ticket) = self.organism.live_greeting_exit_reference(id) {
+                        area = area.on_exit(Message::OrganismHoverExit(id, ticket));
+                    }
+                }
+                area.into()
+            } else {
+                slot
+            };
+            // Separate sibling of the greeting target; never an implicit hello.
+            compact_slot = Some(
+                companion_compact_slot(
+                    slot,
+                    self.companion_toggle(self.config.ascii_organism_expanded),
+                )
+                .into(),
+            );
+        }
+        let bar = row![left, Space::new().width(Length::Fill), right]
+            .spacing(12)
+            .align_y(iced::Alignment::Center);
+        let bar: Element<'_, Message> = if let Some(slot) = compact_slot {
+            companion_status_with_slot(bar.into(), slot, 12)
+        } else if !self.config.is_card_mode()
+            && companion_narrow_reopen(
+                self.win_size.width,
+                self.config.ascii_organism_enabled,
+                self.config.ascii_organism_expanded,
+                self.config.bottom_bar,
+            )
+        {
+            companion_status_with_slot(bar.into(), self.companion_toggle(false), 8)
+        } else {
+            bar.into()
+        };
+        let bar: Element<'_, Message> = container(bar)
+            .width(Length::Fill)
+            .height(Length::Fixed(self.status_bar_height()))
+            .padding([0, 10])
+            .align_y(iced::Alignment::Center)
+            .style(self.chrome_bar_style())
+            .into();
+        if companion_height > 0.0 {
+            column![companion, bar].into()
+        } else {
+            bar
+        }
+    }
+
+    /// A native chrome action, not part of the live greeting hit area.
+    fn companion_toggle(&self, expanded: bool) -> Element<'_, Message> {
+        let available = self.focused && self.terminal_input_active();
+        let toggle = button(text(if expanded { "v" } else { "^" }).size(11))
+            .width(Length::Fixed(20.0))
+            .height(Length::Fixed(self.status_bar_height()))
+            .padding(0)
+            .on_press_maybe(available.then_some(Message::SetOrganismExpanded(!expanded)))
+            .style(self.ghost_btn_style());
+        if available {
+            tooltip(
+                toggle,
+                text(if expanded {
+                    "Collapse companion"
+                } else {
+                    "Keep companion expanded"
+                })
+                .size(self.effective_font_size()),
+                tooltip::Position::Top,
+            )
+            .into()
+        } else {
+            toggle.into()
+        }
+    }
+
+    /// One-line offer to install or update jsh, shown under the tab bar only
+    /// while the background check has something actionable and the user has not
+    /// waved it away.
+    fn jsh_notice(&self) -> Option<Element<'_, Message>> {
+        if self.jsh_notice_dismissed {
+            return None;
+        }
+        let prompt = self.jsh_prompt.as_ref()?;
+        let dim = self.c_text_dim();
+        let bar = row![
+            text(prompt.banner_title())
+                .size(self.effective_font_size())
+                .style(move |_t: &iced::Theme| text::Style { color: Some(dim) }),
+            Space::new().width(Length::Fill),
+            button(text(prompt.button_label()).size(self.effective_font_size()))
+                .on_press(Message::JshInstall)
+                .padding([3, 9])
+                .style(self.ghost_btn_style()),
+            button(text("×").size(self.effective_font_size()))
+                .on_press(Message::JshNoticeDismiss)
+                .padding([3, 9])
+                .style(self.ghost_btn_style()),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+        Some(
+            container(bar)
+                .width(Length::Fill)
+                .padding([2, 10])
+                .style(self.chrome_bar_style())
+                .into(),
+        )
+    }
+
+    /// The live block badge when it fits over blank cells on `viewport_row`,
+    /// paired with the elapsed time that produced it. Paint and subscription
+    /// gating share this check so a hidden badge never owns a redraw timer.
+    fn block_badge_cell_char(cell: &terminal::TerminalCell) -> char {
+        if cell.flags.wide_continuation() {
+            // A continuation cell carries no standalone character, but it is
+            // still occupied by the wide glyph immediately to its left.
+            '\u{fffd}'
+        } else {
+            cell.character
+        }
+    }
+
+    /// Cells a right-aligned badge must keep clear of the scrollbar and the
+    /// card's right inset.
+    fn block_badge_inset(&self) -> usize {
+        ((terminal_view::SCROLLBAR_WIDTH + 16.0) / self.metrics.cell_w.max(1.0)).ceil() as usize
+    }
+
+    /// Absolute row span `[start, end)` of the live card — the running
+    /// command's rows, or the idle prompt's input area. Factored out of
+    /// [`Self::build_block_paint_rows`] so card painting and the badge anchor can
+    /// never disagree about where the live card is.
+    fn active_zone_span(terminal: &terminal::TerminalState) -> Option<(usize, usize)> {
+        let total = terminal.scrollback_len() + terminal.grid.rows();
+        let active_start = terminal
+            .running_zone_start()
+            .or_else(|| terminal.live_prompt_row())?;
+        let active_extent_row = terminal.active_app_extent_row().unwrap_or_else(|| {
+            terminal
+                .scrollback_len()
+                .saturating_add(terminal.get_cursor_pos().0)
+        });
+        let active_end = active_extent_row
+            .saturating_add(1)
+            .max(active_start.saturating_add(block_mode::MIN_INPUT_ROWS))
+            .min(total);
+        Some((active_start, active_end))
+    }
+
+    /// Viewport row that carries the live `▶ elapsed` chip, with the chip text
+    /// and the elapsed time that produced it.
+    ///
+    /// The chip used to be pinned to the running card's prompt row, so it
+    /// disappeared as soon as one screenful of output pushed that row above the
+    /// viewport — that is, on exactly the long commands whose elapsed time is
+    /// worth watching — and the redraw tick, sharing the same gate, went stale
+    /// with it. Anchor it instead to the topmost *visible* row of the running
+    /// card whose tail is blank, bounded by
+    /// [`block_mode::BADGE_ANCHOR_WINDOW`] so the chip stays on the card's top
+    /// edge rather than wandering down the screen as output streams. The fit
+    /// test stays per-frame: the chip must never be painted over real text.
+    fn running_badge_target(&self, sess: &Session) -> Option<(usize, String, u64)> {
+        if !self.config.is_block_mode() || sess.terminal.is_alt_buffer_active() {
+            return None;
+        }
+        let terminal = &sess.terminal;
+        // Idle prompts share the Active card kind but carry no elapsed time.
+        terminal.running_zone_start()?;
+        let (active_start, active_end) = Self::active_zone_span(terminal)?;
+        let elapsed_ms = terminal.running_duration_ms()?;
+        let badge = block_mode::running_badge_text(elapsed_ms);
+        let needed = badge.chars().count() + self.block_badge_inset();
+        let cells = sess.projection.cells();
+        let candidates = (0..cells.len()).filter(|&view_row| {
+            sess.projection
+                .view_row_absolute(view_row)
+                .is_some_and(|row| row >= active_start && row < active_end)
+        });
+        let view_row = block_mode::first_fitting_badge_row(candidates, |view_row| {
+            block_mode::badge_fits(
+                cells[view_row].iter().map(Self::block_badge_cell_char),
+                needed,
+            )
+        })?;
+        Some((view_row, badge, elapsed_ms))
+    }
+
+    /// Block chrome for `sess`'s visible rows, cached per session: the
+    /// builders below rebuild ~8 collections on every `pane_view` pass —
+    /// every PTY batch during streaming plus every blink/mouse/elapsed
+    /// tick — while their inputs change far less often. The key covers
+    /// every input, so a cache hit is identical to a fresh build. One
+    /// approximation: the finished-clock badge's local timezone offset is
+    /// treated as run-constant, so a mid-session tz change shows up only
+    /// with the next key change.
+    fn block_chrome(
+        &self,
+        sess: &Session,
+    ) -> (Vec<terminal_view::BlockPaintRow>, Vec<f32>, Vec<f32>) {
+        if !self.config.is_block_mode() || sess.terminal.is_alt_buffer_active() {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+        let projection_key = sess.projection.key();
+        let theme_rgbs = [
+            self.theme.terminal.ansi_colors[1],
+            self.theme.terminal.ansi_colors[2],
+            self.theme.terminal.ansi_colors[3],

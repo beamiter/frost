@@ -1,0 +1,300 @@
+    /// and synchronous, the same seam as `open_history_picker`.
+    fn open_workflow_picker(&mut self) -> Task<Message> {
+        let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
+            return Task::none();
+        };
+        self.workflow_overlay = Some(workflow_picker::WorkflowOverlay::Picker(Box::new(
+            workflow_picker::WorkflowPickerState::load(id),
+        )));
+        iced::widget::operation::focus(WORKFLOW_PICKER_INPUT_ID.clone())
+    }
+
+    /// Resolve a click against the picker snapshot that rendered its row.
+    /// Keyboard confirmation still uses the latest filtered selection.
+    fn accept_workflow_choice(&mut self, choice: workflow_picker::WorkflowChoice) -> Task<Message> {
+        let selection = match self.workflow_overlay.as_ref() {
+            Some(workflow_picker::WorkflowOverlay::Picker(state)) => state
+                .resolve_choice(choice)
+                .cloned()
+                .map(|workflow| (state.target_session_id(), workflow)),
+            _ => None,
+        };
+        let Some((target_session_id, workflow)) = selection else {
+            return Task::none();
+        };
+        self.accept_workflow(target_session_id, workflow)
+    }
+
+    /// Render-and-insert or open the argument form for one chosen workflow.
+    fn accept_workflow(
+        &mut self,
+        target_session_id: usize,
+        workflow: workflows::Workflow,
+    ) -> Task<Message> {
+        if workflow.args.is_empty() {
+            self.workflow_overlay = None;
+            return match workflows::render(&workflow, &std::collections::HashMap::new())
+                .and_then(crate::workflow_picker::insertable_rendered_command)
+            {
+                Ok(command) => {
+                    self.native_enter_ownership.lock().claim_pressed();
+                    self.prompt_recall_enter_latch.begin_recall();
+                    Task::done(Message::PromptRecall(target_session_id, command))
+                }
+                Err(error) => {
+                    log::warn!("workflow render failed: {error}");
+                    self.push_toast(
+                        format!("Workflow could not be rendered: {error}"),
+                        ToastKind::Warning,
+                    );
+                    Task::none()
+                }
+            };
+        }
+        self.workflow_overlay = Some(workflow_picker::WorkflowOverlay::Args(Box::new(
+            workflow_picker::WorkflowArgsState::new(target_session_id, workflow),
+        )));
+        iced::widget::operation::focus(WORKFLOW_ARG_INPUT_ID.clone())
+            .chain(workflow_focus::reveal())
+    }
+
+    /// The argument form's primary action ("Insert command" / Enter in any
+    /// field). The rendered command is typed at the prompt for review through
+    /// the shared recall boundary; it never submits. A render error stays
+    /// inline on the form, like anvil's dialog error label.
+    fn submit_workflow_args(&mut self) -> Task<Message> {
+        let rendered = match self.workflow_overlay.as_mut() {
+            Some(workflow_picker::WorkflowOverlay::Args(form)) => {
+                if form.is_pending() {
+                    return Task::none();
+                }
+                match form.render() {
+                    Ok(command) => command,
+                    Err(error) => {
+                        log::warn!("workflow render failed: {error}");
+                        form.set_feedback(format!("Workflow could not be rendered: {error}"));
+                        return workflow_focus::reveal_error();
+                    }
+                }
+            }
+            _ => return Task::none(),
+        };
+        // Preserve the ordinary recall's Enter ownership before deferred checks.
+        self.native_enter_ownership.lock().claim_pressed();
+        self.prompt_recall_enter_latch.begin_recall();
+        let Some(workflow_picker::WorkflowOverlay::Args(form)) = self.workflow_overlay.as_mut()
+        else {
+            return Task::none();
+        };
+        let id = form.target_session_id();
+        let Some(attempt) = form.begin_delivery() else {
+            return Task::none();
+        };
+        Task::done(Message::WorkflowArgDeliver(attempt, id, rendered))
+    }
+
+    /// Preflight may drain older queued work, but never admits this workflow
+    /// payload. The actual write keeps using the existing shared paste boundary.
+    fn workflow_recall_preflight(&mut self, id: usize, command: &str) -> Result<String, String> {
+        let command = crate::review_text::sanitize_untrusted_single_line(
+            command,
+            crate::history_picker::MAX_SHARED_HISTORY_COMMAND_BYTES,
+        )
+        .map_err(|error| error.to_string())?;
+        self.session_prompt_replace_ready(id)
+            .map_err(str::to_owned)?;
+        let sess = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == id)
+            .ok_or_else(|| "the terminal session is no longer available".to_string())?;
+        if sess.transcript_read_only() {
+            return Err("the terminal transcript is read-only".into());
+        }
+        let paste = pty_input::encode_prompt_insert(
+            &command,
+            PasteModes {
+                bracketed: sess.terminal.is_bracketed_paste_enabled(),
+            },
+            PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+            true,
+        );
+        if paste.is_empty() {
+            return Err("the command has no insertable text".into());
+        }
+        if !sess.can_queue_user_bytes(paste.bytes.len()) {
+            return Err("the terminal cannot accept this input payload".into());
+        }
+        Ok(command)
+    }
+
+    fn deliver_workflow_args(
+        &mut self,
+        attempt: workflow_picker::WorkflowArgsAttempt,
+        id: usize,
+        command: String,
+    ) -> Task<Message> {
+        if !matches!(self.workflow_overlay.as_ref(), Some(workflow_picker::WorkflowOverlay::Args(form)) if form.accepts_delivery(&attempt))
+        {
+            return Task::none();
+        }
+        let command = match self.workflow_recall_preflight(id, &command) {
+            Ok(command) => command,
+            Err(reason) => {
+                if let Some(workflow_picker::WorkflowOverlay::Args(form)) =
+                    self.workflow_overlay.as_mut()
+                {
+                    form.reject_delivery(
+                        &attempt,
+                        format!("Workflow not inserted: {reason}. Your arguments are preserved."),
+                    );
+                }
+                return workflow_focus::reveal_error();
+            }
+        };
+        let accepted = self.write_paste_to_session(
+            id,
+            &command,
+            PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+            true,
+        );
+        // A false result after attempting the shared writer can include partial
+        // PTY delivery. Retire on either result; never expose one-click retry.
+        self.workflow_overlay = None;
+        if !accepted.written() {
+            self.push_toast(
+                "Workflow insertion may be incomplete. Some text may have reached the terminal; inspect the prompt before retrying.",
+                ToastKind::Warning,
+            );
+        }
+        Task::none()
+    }
+
+    /// Workflow overlay key handling. The picker stage mirrors
+    /// `handle_history_picker_key` (typed text filters, arrows move, Enter
+    /// accepts, Esc/Ctrl+Shift+M dismisses). The argument stage is driven by
+    /// real text inputs: they capture edits while Enter stays on the shared
+    /// physical-key ownership path. Tab/Shift+Tab move focus and Escape closes.
+    fn handle_workflow_overlay_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+        text: Option<&str>,
+    ) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        if chrome_shortcut(key, mods) == Some(ChromeShortcut::Workflows) {
+            self.workflow_overlay = None;
+            return Some(Task::none());
+        }
+        match self.workflow_overlay.as_mut()? {
+            workflow_picker::WorkflowOverlay::Args(_) => match key {
+                Key::Named(Named::Escape) => {
+                    self.workflow_overlay = None;
+                    Some(Task::none())
+                }
+                Key::Named(Named::Tab) if mods.shift() => Some(workflow_focus::navigate(true)),
+                Key::Named(Named::Tab) => Some(workflow_focus::navigate(false)),
+                Key::Named(Named::Enter) => Some(self.submit_workflow_args()),
+                // Everything else belongs to the focused argument input (or is
+                // a harmless no-op); none of it may reach the terminal.
+                _ => Some(Task::none()),
+            },
+            workflow_picker::WorkflowOverlay::Picker(state) => {
+                match key {
+                    Key::Named(Named::Escape) => {
+                        self.workflow_overlay = None;
+                        return Some(Task::none());
+                    }
+                    Key::Named(Named::Enter) => {
+                        let workflow = state.selected_workflow().cloned();
+                        let target_session_id = state.target_session_id();
+                        return Some(match workflow {
+                            Some(workflow) => self.accept_workflow(target_session_id, workflow),
+                            None => Task::none(),
+                        });
+                    }
+                    Key::Named(Named::ArrowDown) => {
+                        state.select_next();
+                        return Some(workflow_focus::reveal_picker());
+                    }
+                    Key::Named(Named::ArrowUp) => {
+                        state.select_prev();
+                        return Some(workflow_focus::reveal_picker());
+                    }
+                    Key::Named(Named::Backspace) => {
+                        state.backspace();
+                        return Some(workflow_focus::reveal_picker());
+                    }
+                    _ => {}
+                }
+                if !mods.control() && !mods.alt() {
+                    if let Some(t) = text {
+                        if state.push_query_text(t) {
+                            return Some(workflow_focus::reveal_picker());
+                        }
+                    }
+                }
+                // Swallow all other keys while the overlay owns the keyboard.
+                Some(Task::none())
+            }
+        }
+    }
+
+    /// Stable id of the finalized block covering viewport `row` in the pane
+    /// identified by `session_id`. Running/live-prompt rows deliberately have
+    /// no target. Mouse events retain this stable identity across focus moves.
+    fn block_at_viewport_row(&self, session_id: usize, row: usize) -> Option<u64> {
+        let sess = self.sessions.iter().find(|sess| sess.id == session_id)?;
+        if self.config.is_chat_mode() {
+            return chat_completed_zone_at_row(&sess.terminal, &sess.projection, row);
+        }
+        finalized_block_at_viewport_row(
+            self.config.is_block_mode(),
+            &sess.terminal,
+            &sess.projection,
+            row,
+        )
+    }
+
+    fn handle_summary_activation(
+        &mut self,
+        source_session_id: usize,
+        activation: SummaryActivation,
+    ) -> Task<Message> {
+        let Some(source) = self.session_index_by_id(source_session_id) else {
+            return Task::none();
+        };
+        // A release from a pane that left the visible layout must not mutate a
+        // parked tab/session. Stable identity prevents retargeting; visibility
+        // is the final ownership check.
+        if !self.layout().contains_session(source) {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(source) else {
+            return Task::none();
+        };
+        let Some(zone_id) = validated_summary_target(&sess.projection, &activation) else {
+            return Task::none();
+        };
+        if sess.projection_policy.expand(zone_id) {
+            sess.refresh();
+            self.block_menu = None;
+            if self.layout().contains_session(source) {
+                self.set_focus(source);
+                self.session_dirty = true;
+            }
+            self.refresh_active_context();
+        }
+        Task::none()
+    }
+
+    /// Route a grid mouse interaction either to the running application (when it
+    /// has enabled mouse reporting and Shift is not held) or to local selection
+    /// and scrollback handling.
+    fn finish_cancelled_terminal_mouse_gesture(&mut self, gesture: TerminalMouseGesture) {
+        if let Some(index) = self.session_index_by_id(gesture.session_id) {
+            let session = &mut self.sessions[index];
+            if let Some(report) = cancelled_terminal_mouse_report(gesture, &session.terminal) {
+                session.write_pty(&report);
+            }

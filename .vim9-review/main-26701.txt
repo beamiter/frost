@@ -1,0 +1,300 @@
+                self.organism.preview_request(PreviewAction::Hello),
+            ));
+        }
+        let hello_button = widget_identity_scope::scope(
+            self.organism.preview_action_identity(PreviewAction::Hello),
+            hello_button,
+        );
+        let mut hello_controls = column![hello_button].spacing(4);
+        match availability {
+            organism::HelloAvailability::Demonstrating => {
+                hello_controls = hello_controls
+                    .push(text("Unavailable during demo").size(self.effective_font_size()));
+            }
+            organism::HelloAvailability::Busy => {
+                hello_controls = hello_controls
+                    .push(text("Unavailable for this pose").size(self.effective_font_size()));
+            }
+            organism::HelloAvailability::CoolingDown => {
+                hello_controls = hello_controls
+                    .push(text("Wait for the greeting cooldown").size(self.effective_font_size()));
+            }
+            organism::HelloAvailability::Available => {}
+        }
+        let preview_controls = widget_identity_scope::scope(
+            self.organism.preview_control_epoch(),
+            column![
+                demo_controls,
+                text(demo_caption).size(self.effective_font_size()),
+                hello_controls
+            ]
+            .spacing(8),
+        );
+        column![
+            checkbox(self.config.ascii_organism_enabled).text_size(self.effective_font_size()).label("ASCII Organism")
+                .on_toggle(Message::SetAsciiOrganism),
+            text("Local companion. Memory is volatile; it resets when disabled or closed.").size(self.effective_font_size()),
+            checkbox(self.config.ascii_organism_expanded).text_size(self.effective_font_size()).label("Show expanded companion")
+                .on_toggle(Message::SetOrganismExpanded),
+            text(if self.config.is_block_mode() && self.config.ascii_organism_enabled {
+                "Block mode keeps the status card between history and current input. Its arrow switches between a full card and one line, independently of the bottom bar. Full wanders in safe blank space; Calm rests; Static shows only this status card."
+            } else { organism_settings_hint(
+                self.win_size.width,
+                self.config.ascii_organism_enabled,
+                self.config.ascii_organism_expanded,
+                self.config.bottom_bar,
+            ) }).size(self.effective_font_size()),
+            text("Organism Motion").size(self.effective_font_size()),
+            pick_list(organism::MotionChoice::ALL,
+                Some(organism::MotionChoice::from_config(self.config.ascii_organism_motion)),
+                Message::SetOrganismMotion).text_size(self.effective_font_size()),
+            text(self.organism_motion_description()).size(self.effective_font_size()),
+            text(motion.description()).size(self.effective_font_size()),
+            text(motion.interaction_hint()).size(self.effective_font_size()),
+            text("Output rhythm reflects observed activity, not command progress.").size(self.effective_font_size()),
+            text("Organism Preview").size(self.effective_font_size()),
+            text("Pose").size(self.effective_font_size()),
+            pick_list(poses, Some(self.organism.pose), Message::SetOrganismPose).text_size(self.effective_font_size()),
+            container(text(preview.sprite)
+                .font(self.mono).size(13))
+                .width(Length::Fixed(200.0)).height(Length::Fixed(72.0)),
+            text(preview.pose.explanation()).size(self.effective_font_size()),
+            preview_controls,
+            text("Preview is isolated: no command, terminal input, life change, or saved memory.").size(self.effective_font_size()),
+        ].spacing(8).into()
+    }
+
+    fn config_panel(&self) -> Element<'_, Message> {
+        let mut themes: Vec<String> = Theme::available_themes()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        themes.extend(
+            Theme::custom_theme_names()
+                .into_iter()
+                .map(crate::theme::bound_custom_theme_name)
+                .filter(|name| !name.is_empty()),
+        );
+        let current_theme = Some(crate::theme::bound_custom_theme_name(
+            self.config.theme.clone(),
+        ));
+        let is_custom = !Theme::is_builtin(&self.config.theme);
+
+        // Keep the modal inside the current window and switch to a stacked form
+        // before horizontal controls become cramped. The content itself scrolls
+        // below, so every setting remains reachable in short windows.
+        let panel_width = (self.win_size.width - 24.0).clamp(1.0, 520.0);
+        let panel_height = (self.win_size.height - 24.0).clamp(1.0, 560.0);
+        let compact = panel_width < 430.0 * (self.effective_font_size() / 13.0).max(1.0);
+        let panel_padding = if compact || panel_height < 360.0 {
+            10.0
+        } else {
+            16.0
+        };
+
+        let theme_picker = pick_list(themes, current_theme, Message::SetTheme)
+            .text_size(self.effective_font_size())
+            .width(Length::Fill);
+        let mut theme_actions =
+            row![button(text("Edit…").size(self.effective_font_size()))
+                .on_press(Message::ThemeEditOpen),]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+        if is_custom {
+            theme_actions = theme_actions.push(
+                button(text("Delete").size(self.effective_font_size()))
+                    .on_press(Message::ThemeDelete(self.config.theme.clone()))
+                    .style(button::danger),
+            );
+        }
+        let theme_row: Element<'_, Message> = if compact {
+            column![
+                text("Theme").size(self.effective_font_size()),
+                theme_picker,
+                theme_actions
+            ]
+            .spacing(6)
+            .into()
+        } else {
+            row![
+                text("Theme")
+                    .size(self.effective_font_size())
+                    .width(Length::Fixed(120.0)),
+                theme_picker,
+                theme_actions,
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center)
+            .into()
+        };
+
+        // Monospace families detected via fc-list (cached, scanned on first open).
+        // Ensure the configured family is present so the pick_list shows it.
+        let mut fonts: Vec<String> = Config::get_monospace_fonts().clone();
+        if !self.config.font_family.trim().is_empty()
+            && !fonts.iter().any(|f| f == &self.config.font_family)
+        {
+            fonts.insert(0, self.config.font_family.clone());
+        }
+        let font_picker = pick_list(
+            fonts,
+            Some(self.config.font_family.clone()),
+            Message::SetFontFamily,
+        )
+        .text_size(self.effective_font_size())
+        .width(Length::Fill);
+        let font_family_row: Element<'_, Message> = if compact {
+            column![text("Font").size(self.effective_font_size()), font_picker]
+                .spacing(6)
+                .into()
+        } else {
+            row![
+                text("Font")
+                    .size(self.effective_font_size())
+                    .width(Length::Fixed(120.0)),
+                font_picker,
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center)
+            .into()
+        };
+
+        fn responsive_slider_row<'a>(
+            compact: bool,
+            font_size: f32,
+            label: &'static str,
+            value: String,
+            control: Element<'a, Message>,
+        ) -> Element<'a, Message> {
+            if compact {
+                column![
+                    row![
+                        text(label).size(font_size).width(Length::Fill),
+                        text(value).size(font_size),
+                    ]
+                    .align_y(iced::Alignment::Center),
+                    control,
+                ]
+                .spacing(6)
+                .into()
+            } else {
+                slider_row(label, value, control, font_size)
+            }
+        }
+
+        let font_size = responsive_slider_row(
+            compact,
+            self.effective_font_size(),
+            "Content font size",
+            format!("{:.0}", self.config.font_size),
+            slider(8.0..=72.0, self.config.font_size, Message::SetFontSize)
+                .step(1.0_f32)
+                .into(),
+        );
+        let chrome_font_size = responsive_slider_row(
+            compact,
+            self.effective_font_size(),
+            "Top bar / sidebar font size",
+            format!("{:.0}", self.chrome_font_size()),
+            slider(
+                8.0..=72.0,
+                self.chrome_font_size(),
+                Message::SetChromeFontSize,
+            )
+            .step(1.0_f32)
+            .into(),
+        );
+        let ui_scale_value = self.config.ui_scale.unwrap_or(1.0);
+        let ui_scale = responsive_slider_row(
+            compact,
+            self.effective_font_size(),
+            "UI Scale",
+            format!("{:.0}%", ui_scale_value * 100.0),
+            slider(0.5..=4.0, ui_scale_value, Message::SetUiScale)
+                .step(0.05_f32)
+                .into(),
+        );
+        let line_spacing = responsive_slider_row(
+            compact,
+            self.effective_font_size(),
+            "Line Spacing",
+            format!("{:.2}", self.config.line_spacing),
+            slider(0.8..=3.0, self.config.line_spacing, Message::SetLineSpacing)
+                .step(0.05_f32)
+                .into(),
+        );
+        let padding = responsive_slider_row(
+            compact,
+            self.effective_font_size(),
+            "Padding",
+            format!("{:.0}", self.config.padding),
+            slider(0.0..=20.0, self.config.padding, Message::SetPadding)
+                .step(1.0_f32)
+                .into(),
+        );
+        let opacity = responsive_slider_row(
+            compact,
+            self.effective_font_size(),
+            "Opacity",
+            format!("{:.0}%", self.config.opacity * 100.0),
+            slider(0.05..=1.0, self.config.opacity, Message::SetOpacity)
+                .step(0.025_f32)
+                .into(),
+        );
+        let scrollback = responsive_slider_row(
+            compact,
+            self.effective_font_size(),
+            "Scrollback",
+            format!("{}", self.config.scrollback_lines),
+            slider(
+                100..=100_000u32,
+                self.config.scrollback_lines as u32,
+                Message::SetScrollback,
+            )
+            .step(100u32)
+            .into(),
+        );
+        let scroll_speed = responsive_slider_row(
+            compact,
+            self.effective_font_size(),
+            "Scroll Speed",
+            format!("{}", self.config.scroll_speed),
+            slider(1..=10u32, self.config.scroll_speed, Message::SetScrollSpeed)
+                .step(1u32)
+                .into(),
+        );
+        fn responsive_control_row<'a>(
+            compact: bool,
+            font_size: f32,
+            label: &'static str,
+            control: Element<'a, Message>,
+        ) -> Element<'a, Message> {
+            if compact {
+                column![text(label).size(font_size), control]
+                    .spacing(6)
+                    .into()
+            } else {
+                row![
+                    text(label).size(font_size).width(Length::Fixed(120.0)),
+                    control,
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center)
+                .into()
+            }
+        }
+
+        let scrollbar_row = responsive_control_row(
+            compact,
+            self.effective_font_size(),
+            "Scrollbar",
+            checkbox(matches!(
+                self.config.scrollbar_visibility,
+                config::ScrollbarVisibility::Always
+            ))
+            .label("Always show")
+            .text_size(self.effective_font_size())
+            .on_toggle(Message::SetScrollbarAlways)
+            .into(),
+        );
+

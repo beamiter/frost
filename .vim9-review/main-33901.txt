@@ -1,0 +1,300 @@
+            .unwrap()
+            .0;
+        assert!(
+            manual.find("if self.config_write_blocked").unwrap()
+                < manual.find("self.config_save_retry.reset();").unwrap()
+        );
+        assert!(
+            manual.find("self.config_save_retry.reset();").unwrap()
+                < manual.find("self.save_config_checked()").unwrap()
+        );
+        assert!(!manual.contains(".ready("));
+        let reset = source
+            .split_once("            Message::ConfigReset => {")
+            .unwrap()
+            .1
+            .split_once("            Message::ConfigTick => {")
+            .unwrap()
+            .0;
+        assert_eq!(reset.matches("self.config_save_retry.reset();").count(), 2);
+        let partial_reset = reset
+            .split_once("if let Some(revision) = error.committed_revision().cloned()")
+            .unwrap()
+            .1;
+        assert!(
+            partial_reset
+                .find("self.config_revision = Some(revision);")
+                .unwrap()
+                < partial_reset
+                    .find("self.note_config_save_error(&error);")
+                    .unwrap()
+        );
+        let reload = source
+            .split_once("    fn reload_config_if_changed(")
+            .unwrap()
+            .1
+            .split_once("    /// Whether the left dock")
+            .unwrap()
+            .0;
+        assert!(reload.contains("self.config_save_retry.reset();"));
+        let direct = source
+            .split_once("                            if needs_config_save {")
+            .unwrap()
+            .1
+            .split_once("                            } else {")
+            .unwrap()
+            .0;
+        assert!(direct.contains("self.config_save_retry.reset();"));
+        assert!(direct.contains("candidate.save_if_unchanged(self.config_revision.as_ref())"));
+    }
+
+    #[test]
+    fn exit_attempts_pending_config_once_after_existing_flushes_without_reload() {
+        let source = include_str!("main.rs");
+        let exit = source
+            .split_once("    fn exit_flushing_durable_state(")
+            .unwrap()
+            .1
+            .split_once("    /// Backoff must not strand")
+            .unwrap()
+            .0;
+        assert_eq!(exit.matches("self.flush_config_on_exit();").count(), 1);
+        assert!(
+            exit.find("command_history::flush_pending").unwrap()
+                < exit.find("self.flush_config_on_exit();").unwrap()
+        );
+        let exit_call = format!("iced::{}()", "exit");
+        assert!(
+            exit.find("self.flush_config_on_exit();").unwrap() < exit.find(&exit_call).unwrap()
+        );
+        let last_save = source
+            .split_once("    fn flush_config_on_exit(")
+            .unwrap()
+            .1
+            .split_once("    /// Next/Prev")
+            .unwrap()
+            .0;
+        assert!(last_save.contains("if !self.config_dirty || self.config_write_blocked"));
+        assert_eq!(last_save.matches("self.save_config_checked()").count(), 1);
+        assert!(!last_save.contains(".ready("));
+        assert!(!last_save.contains("reload_config_if_changed"));
+        assert!(!last_save.contains("save_force"));
+        assert!(!last_save.contains("loop"));
+        assert!(last_save.contains("not confirmed before exit"));
+    }
+
+    #[test]
+    fn delayed_history_reflow_refreshes_search_without_revealing_an_old_match() {
+        let source = include_str!("main.rs");
+        let reflow = source
+            .split_once("            Message::HistoryReflowTick => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SetTheme")
+            .unwrap()
+            .0;
+        assert!(reflow.contains("session.terminal.normalize_scrollback_width()"));
+        assert!(reflow.contains("session.refresh();"));
+        assert!(reflow.contains("self.recompute_search();"));
+        assert!(!reflow.contains("self.reveal_current_search_match()"));
+        assert!(!reflow.contains("scroll_to_bottom()"));
+    }
+
+    #[test]
+    fn session_close_uses_stable_organism_owner_and_keeps_all_context_caches() {
+        let source = include_str!("main.rs");
+        let close = source.split_once("    fn close_session(").unwrap().1;
+        let close = close.split_once("    /// Reconcile every tab").unwrap().0;
+        let before = close
+            .find("let previous_owner = self.sessions.get(self.active).map(|session| session.id);")
+            .unwrap();
+        let remove = close.find("self.sessions.remove(index)").unwrap();
+        let prune = close
+            .find("self.prune_closed_pane(index, old_active);")
+            .unwrap();
+        let after = close
+            .find("let next_owner = self.sessions.get(self.active).map(|session| session.id);")
+            .unwrap();
+        assert!(before < remove && remove < prune && prune < after);
+        assert!(close.contains("self.organism.forget_session(closed_id);"));
+        assert!(close.contains("self.organism.owner_changed(previous_owner, next_owner);"));
+        assert!(close.contains("self.refresh_active_context_caches();"));
+        assert!(!close.contains("self.refresh_active_context();"));
+        assert!(close.contains("let exit = self.exit_flushing_durable_state();"));
+        let full = source
+            .split_once("    fn refresh_active_context(&mut self)")
+            .unwrap()
+            .1;
+        let full = full.split_once("    /// Startup session setup").unwrap().0;
+        assert!(full.contains("self.organism.reset_watch();"));
+        assert!(full.contains("self.organism.cancel_live_greeting();"));
+        assert!(full.contains("self.refresh_active_context_caches();"));
+        for cache in [
+            "self.links_cache_key = None;",
+            "self.recompute_search();",
+            "self.reveal_current_search_match();",
+            "self.recompute_links();",
+            "self.refresh_kitty_handles();",
+        ] {
+            assert!(full.contains(cache));
+        }
+        let exit = source
+            .split_once("    fn exit_flushing_durable_state(")
+            .unwrap()
+            .1;
+        let exit = exit.split_once("const EXIT_FLUSH_TIMEOUT").unwrap().0;
+        assert!(exit.contains("self.organism.set_enabled(false);"));
+        assert!(exit.contains("self.organism.close_preview();"));
+    }
+
+    #[test]
+    fn organism_motion_reload_and_reset_share_the_settings_boundary() {
+        let source = include_str!("main.rs");
+        let reload = source
+            .split_once("    fn reload_config_if_changed(")
+            .unwrap()
+            .1;
+        let reload = reload.split_once("self.config = config;").unwrap().0;
+        assert!(reload.contains("self.prepare_organism_motion_config("));
+        assert!(reload.contains("config.ascii_organism_motion"));
+        let reset = source
+            .split_once("            Message::ConfigReset => {")
+            .unwrap()
+            .1;
+        let reset = reset
+            .split_once("            Message::ConfigTick => {")
+            .unwrap()
+            .0;
+        assert_eq!(
+            reset
+                .matches("self.prepare_organism_motion_config(")
+                .count(),
+            2
+        );
+        assert_eq!(reset.matches("reset.ascii_organism_motion").count(), 2);
+        let control = source
+            .split_once("            Message::SetOrganismMotion(choice) => {")
+            .unwrap()
+            .1;
+        let control = control
+            .split_once("            Message::SetOrganismPose")
+            .unwrap()
+            .0;
+        assert!(control.contains("self.prepare_organism_motion_config(next)"));
+        assert!(control.contains("self.config.ascii_organism_motion = next;"));
+    }
+
+    #[test]
+    fn companion_strip_and_tooltip_clip_to_their_allocated_bounds() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let bar = source.split_once("    fn status_bar(&self)").unwrap().1;
+        let bar = bar.split_once("    fn ").unwrap().0;
+        let companion = bar
+            .split_once("let companion = container(companion)")
+            .unwrap()
+            .1;
+        let companion = companion.split_once("if layout.glyph").unwrap().0;
+        assert!(companion.contains(".height(Length::Fixed(companion_height))"));
+        assert!(companion.contains(".clip(true)"));
+        let tooltip = bar.split_once("let detail = container(").unwrap().1;
+        let tooltip = tooltip.split_once("tooltip(slot, detail").unwrap().0;
+        assert!(tooltip.contains(".width(Length::Fixed(220.0))"));
+        assert!(tooltip.contains(".max_height(220.0)"));
+        assert!(tooltip.contains(".clip(true)"));
+        assert_eq!(bar.matches(".clip(true)").count(), 4);
+    }
+
+    #[test]
+    fn live_rhythm_explanation_is_shared_by_body_and_tooltip() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let bar = source.split_once("    fn status_bar(&self)").unwrap().1;
+        let bar = bar.split_once("    fn ").unwrap().0;
+        assert_eq!(bar.matches(".presentation_with_attention(").count(), 1);
+        assert!(bar.contains("text(presentation.explanation.clone().into_owned())"));
+        assert!(bar.contains("text(explanation.into_owned())"));
+        assert!(!bar.contains("behavior_explanation("));
+    }
+
+    #[test]
+    fn demo_and_hello_requests_share_the_preview_visibility_guard() {
+        let source = include_str!("main.rs");
+        let gate = source
+            .split_once("    fn organism_preview_visible(&self)")
+            .unwrap()
+            .1
+            .split_once("    fn organism_settings(")
+            .unwrap()
+            .0;
+        assert!(gate.contains("self.focused"));
+        assert!(gate.contains("self.config_panel_open"));
+        assert!(gate.contains("self.theme_editor.is_some()"));
+        let handler = source
+            .split_once("            Message::OrganismPreviewAction(request) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::OrganismHoverEnter")
+            .unwrap()
+            .0;
+        assert!(handler.contains("if self.organism_preview_visible()"));
+        assert!(handler.contains("self.organism.apply_preview_request(&request)"));
+        let update = source
+            .split_once("    fn update(&mut self, message: Message)")
+            .unwrap()
+            .1
+            .split_once("        match message {")
+            .unwrap()
+            .0;
+        assert!(update.contains("sync_preview_visibility(self.organism_preview_visible())"));
+        let setter = source
+            .split_once("    fn set_config_panel_open(")
+            .unwrap()
+            .1
+            .split_once("    fn apply_config(")
+            .unwrap()
+            .0;
+        assert!(setter.contains("sync_preview_visibility(self.organism_preview_visible())"));
+        let blur = source
+            .split_once("Message::Focus(f) => {")
+            .unwrap()
+            .1
+            .split_once("Message::NewSession =>")
+            .unwrap()
+            .0;
+        assert!(blur.contains("self.organism.close_preview()"));
+    }
+
+    #[test]
+    fn paused_demo_stops_only_preview_animation_and_scopes_all_preview_actions() {
+        let source = include_str!("main.rs");
+        let subs = source
+            .split_once("        let preview_visible =")
+            .unwrap()
+            .1
+            .split_once("        // A right-press on a tab")
+            .unwrap()
+            .0;
+        assert!(subs.contains("self.organism.preview_animation_enabled()"));
+        assert!(subs.contains("if preview_visible && !preview_full"));
+        assert!(subs.contains("self.organism.preview_deadline()"));
+        assert_eq!(subs.matches("iced::time::every(").count(), 1);
+        let settings = source
+            .split_once("    fn organism_settings(")
+            .unwrap()
+            .1
+            .split_once("    fn config_panel(")
+            .unwrap()
+            .0;
+        assert!(settings.contains("self.organism.preview_control_epoch()"));
+        assert!(settings.contains("self.organism.preview_action_identity(action)"));
+        assert!(settings.contains("self.organism.preview_action_identity(PreviewAction::Hello)"));
+        assert!(settings.contains("PreviewAction::Pause"));
+        assert!(settings.contains("PreviewAction::Resume"));
+        assert!(settings.contains("Some(self.organism.pose)"));
+        assert!(settings.contains("preview.pose.explanation()"));
+        assert!(settings.contains("No command runs."));
+    }
+
+    #[test]
+    fn organism_settings_hint_prioritizes_enabled_and_bottom_bar_before_geometry() {
+        for width in [0.0, 220.0, 640.0, f32::NAN] {
+            for expanded in [false, true] {

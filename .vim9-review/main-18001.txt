@@ -1,0 +1,300 @@
+                        state.bookmark_key_claimed = false;
+                    }
+                }
+                let resumed = f && !self.focused;
+                self.focused = f;
+                if resumed {
+                    // Event-driven reattach after a missing/disconnected bus.
+                    self.sync_organism_motion(true);
+                }
+                if !f {
+                    self.organism.close_preview();
+                    self.organism.retreat();
+                }
+                // The blink tick stops while unfocused; leave the cursor solid so
+                // it can't get stuck in the "off" half of a blink.
+                if !f {
+                    self.blink_on = true;
+                }
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    if sess.terminal.is_focus_event_mode() {
+                        if f {
+                            sess.terminal.emit_focus_in();
+                        } else {
+                            sess.terminal.emit_focus_out();
+                        }
+                        sess.flush_responses();
+                    }
+                }
+            }
+            Message::NewSession => self.new_session(),
+            Message::CloseTab(id) => {
+                // Closing a tab closes every pane in it.
+                if let Some(tab) = self.tab_index_by_id(id) {
+                    return self.request_close_tab(tab);
+                }
+            }
+            Message::WindowClose => return self.request_window_close(),
+            // Window moves and resizes are compositor operations: we only get
+            // to ask, and only while the button that started them is held.
+            // `latest()` resolves the single application window.
+            Message::WindowDrag => {
+                return iced::window::latest().and_then(iced::window::drag);
+            }
+            Message::WindowResizeDrag(direction) => {
+                return iced::window::latest()
+                    .and_then(move |id| iced::window::drag_resize(id, direction));
+            }
+            Message::WindowMinimize => {
+                return iced::window::latest().and_then(|id| iced::window::minimize(id, true));
+            }
+            Message::WindowToggleMaximize => {
+                return iced::window::latest().and_then(iced::window::toggle_maximize);
+            }
+            Message::TabHover(id) => {
+                self.hovered_tab = id;
+                if tab_drag_hover_left_source(self.dragging_tab, id) {
+                    self.tab_drag_moved = true;
+                }
+                let active_id = self.tabs.get(self.active_tab).map(|tab| tab.id);
+                self.tab_drag_hover_since = match (self.dragging_tab, id) {
+                    (Some(source), Some(target))
+                        if source != target && active_id != Some(target) =>
+                    {
+                        Some((target, std::time::Instant::now()))
+                    }
+                    _ => None,
+                };
+            }
+            Message::TabDragStart(id) => {
+                if self.tab_index_by_id(id).is_some() {
+                    self.pane_drag = None;
+                    self.tab_split_drop = None;
+                    self.tab_drag_origin = self.tabs.get(self.active_tab).map(|tab| tab.id);
+                    self.tab_drag_moved = false;
+                    self.tab_drag_hover_since = None;
+                    self.dragging_tab = Some(id);
+                }
+            }
+            Message::TabDragEnd(target_id) => {
+                if self.pane_drag.is_some() {
+                    self.finish_pane_promotion(Some(target_id));
+                } else if let Some(source_id) = self.dragging_tab.take() {
+                    let origin = self.tab_drag_origin.take();
+                    let moved = std::mem::take(&mut self.tab_drag_moved);
+                    self.tab_drag_hover_since = None;
+                    let source = self.tab_index_by_id(source_id);
+                    let target = self.tab_index_by_id(target_id);
+                    match tab_drag_release_action(source, target, moved) {
+                        TabDragReleaseAction::Activate(tab) => self.activate_tab(tab),
+                        TabDragReleaseAction::Reorder { from, to } => {
+                            // Reordering moves tabs only; the session vector
+                            // and every tab's panes stay as they are.
+                            self.reorder_tab(from, to);
+                            self.restore_tab_drag_origin(origin);
+                            // `reorder_tab` saved before the hover-preview
+                            // origin was restored; persist the final focus too.
+                            self.save_session_snapshot();
+                        }
+                        TabDragReleaseAction::RestoreOrigin => {
+                            self.restore_tab_drag_origin(origin);
+                        }
+                    }
+                }
+                self.tab_drag_origin = None;
+                self.tab_drag_moved = false;
+                self.tab_drag_hover_since = None;
+                self.tab_split_drop = None;
+            }
+            Message::TabDragMove(point) => {
+                self.tab_drag_moved = true;
+                self.tab_split_drop = self
+                    .tab_split_drag_eligible()
+                    .then(|| {
+                        self.pane_rects().into_iter().find_map(|pane| {
+                            let direction = split_drop_direction(pane.rect, point)?;
+                            let target_session_id = self.sessions.get(pane.session)?.id;
+                            Some(TabSplitDrop {
+                                target_session_id,
+                                direction,
+                            })
+                        })
+                    })
+                    .flatten();
+            }
+            Message::TabDragLeavePaneArea => self.tab_split_drop = None,
+            Message::TabDragHoverTick => {
+                let source_is_plain = self
+                    .dragging_tab
+                    .and_then(|id| self.tab_index_by_id(id))
+                    .is_some_and(|tab| self.tabs[tab].tree.is_leaf());
+                let active_id = self.tabs.get(self.active_tab).map(|tab| tab.id);
+                let ready = self.tab_drag_hover_since.is_some_and(|(target, since)| {
+                    tab_drag_hover_ready(
+                        self.dragging_tab,
+                        source_is_plain,
+                        active_id,
+                        self.hovered_tab,
+                        target,
+                        since.elapsed(),
+                    )
+                });
+                if !source_is_plain
+                    || self
+                        .tab_drag_hover_since
+                        .is_some_and(|(target, _)| active_id == Some(target))
+                {
+                    self.tab_drag_hover_since = None;
+                }
+                if ready {
+                    let target = self
+                        .tab_drag_hover_since
+                        .take()
+                        .and_then(|(id, _)| self.tab_index_by_id(id));
+                    if let Some(target) = target {
+                        self.activate_tab(target);
+                    }
+                }
+            }
+            Message::TabSplitDrop => {
+                self.finish_tab_split_drop();
+            }
+            Message::TabDragCancel => {
+                self.cancel_layout_drags();
+            }
+            Message::DividerDragStart(divider) => {
+                let now = std::time::Instant::now();
+                // Double-click on a divider equalizes the panes of its node.
+                let double = self.last_divider_press.as_ref().is_some_and(|(prev, d)| {
+                    *d == divider
+                        && now.duration_since(*prev)
+                            < std::time::Duration::from_millis(DIVIDER_DOUBLE_CLICK_MS)
+                });
+                self.last_divider_press = Some((now, divider.clone()));
+                if double {
+                    if let Some(PaneTree::Split { ratios, .. }) =
+                        self.layout_mut().node_at_path_mut(&divider.path)
+                    {
+                        let previous = ratios.clone();
+                        equalize_shares(ratios);
+                        if *ratios != previous {
+                            self.session_dirty = true;
+                        }
+                        self.relayout();
+                        self.refresh_active_context();
+                    }
+                }
+                self.dragging_divider = Some(divider);
+            }
+            Message::DividerDragEnd => self.dragging_divider = None,
+            Message::DividerHover(divider) => self.hovered_divider = divider,
+            Message::DividerDragMove(pt) => {
+                if let Some(divider) = self.dragging_divider.clone() {
+                    // Locate the dragged divider's owning split node rectangle so
+                    // the pointer maps to a fraction of that node's own extent.
+                    let Some((axis, node_rect)) =
+                        split_node_rect(self.layout(), &divider.path, self.layout_area(), DIVIDER)
+                    else {
+                        return Task::none();
+                    };
+                    let local = match axis {
+                        Axis::Vertical => (pt.x - node_rect.x) / node_rect.width.max(1.0),
+                        Axis::Horizontal => (pt.y - node_rect.y) / node_rect.height.max(1.0),
+                    };
+                    if let Some(PaneTree::Split { ratios, .. }) =
+                        self.layout_mut().node_at_path_mut(&divider.path)
+                    {
+                        if divider.gap + 1 < ratios.len() {
+                            // Pointer fraction minus the children before this gap
+                            // gives the dragged child's new share of its pair.
+                            let before: f32 = ratios[..divider.gap].iter().sum();
+                            let first = local - before;
+                            if set_divider_share(ratios, divider.gap, first, true) {
+                                self.session_dirty = true;
+                                self.relayout();
+                                self.refresh_active_context();
+                            }
+                        }
+                    }
+                }
+            }
+            Message::PaneDragStart(session_id) => {
+                // A press on the header focuses its pane, exactly like a click
+                // in the terminal below it. The swap only happens if the
+                // pointer is released somewhere else.
+                if let Some(session) = self.session_index_by_id(session_id) {
+                    if !self.layout().contains_session(session) {
+                        return Task::none();
+                    }
+                    self.set_focus(session);
+                    self.session_dirty = true;
+                    self.refresh_active_context();
+                    self.cancel_tab_drag();
+                    self.pane_drag = Some(PaneDrag {
+                        session_id,
+                        target: None,
+                    });
+                }
+            }
+            Message::PaneDragMove(pt) => {
+                let source = self
+                    .pane_drag
+                    .as_ref()
+                    .and_then(|drag| self.session_index_by_id(drag.session_id));
+                let target = source.and_then(|source| {
+                    self.pane_rects()
+                        .into_iter()
+                        .find(|pane| {
+                            pt.x >= pane.rect.x
+                                && pt.x < pane.rect.x + pane.rect.width
+                                && pt.y >= pane.rect.y
+                                && pt.y < pane.rect.y + pane.rect.height
+                        })
+                        .map(|pane| pane.session)
+                        .filter(|hit| *hit != source)
+                        .and_then(|hit| self.sessions.get(hit).map(|session| session.id))
+                });
+                if let Some(drag) = self.pane_drag.as_mut() {
+                    drag.target = target;
+                }
+            }
+            Message::PaneDragLeavePaneArea => {
+                if let Some(drag) = self.pane_drag.as_mut() {
+                    drag.target = None;
+                }
+            }
+            Message::PaneDragEnd => {
+                if let Some(drag) = self.pane_drag.take() {
+                    if let (Some(source), Some(target)) = (
+                        self.session_index_by_id(drag.session_id),
+                        drag.target.and_then(|id| self.session_index_by_id(id)),
+                    ) {
+                        self.swap_pane_sessions(source, target);
+                    }
+                }
+            }
+            Message::PanePromoteToTab(after_tab_id) => {
+                self.finish_pane_promotion(after_tab_id);
+            }
+            Message::SidebarDragStart => self.dragging_sidebar = true,
+            Message::SidebarDragEnd => self.dragging_sidebar = false,
+            Message::SidebarDragMove(pt) => {
+                if self.dragging_sidebar {
+                    // pt.x is relative to the dock+body row, which starts at the
+                    // window's left edge, so it is the desired dock width directly.
+                    let w = pt.x.clamp(SIDEBAR_W_MIN, SIDEBAR_W_MAX);
+                    if (w - self.dock_width).abs() > f32::EPSILON {
+                        self.dock_width = w;
+                        self.apply_config();
+                    }
+                }
+            }
+            Message::ToggleSidebar => return self.toggle_sidebar(),
+            Message::SetSidebarPanel(panel) => {
+                if self.sidebar_panel != panel {
+                    self.task_panel.retire_panel_callbacks();
+                    self.invalidate_sidebar_remote_follow_intent();
+                }
+                self.sidebar_panel = panel;
+                self.sidebar_files_focused = panel == SidebarPanel::Files && self.sidebar_open;
+                // Opening the file tree should reflect the active tab's cwd.

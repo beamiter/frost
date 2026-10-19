@@ -1,0 +1,300 @@
+                .matches
+                .iter()
+                .filter_map(|matched| {
+                    project_search_match(&sess.terminal, &sess.projection, matched)
+                })
+                .collect();
+            let current = self
+                .search
+                .current_match()
+                .and_then(|matched| {
+                    project_search_match(&sess.terminal, &sess.projection, &matched)
+                })
+                .map(|m| (m.line, m.col_start));
+            (visible, current)
+        } else {
+            (Vec::new(), None)
+        };
+        let links: &[link::Link] = if is_active { &self.links } else { &[] };
+        let images = if is_active {
+            self.kitty_images(sess)
+        } else {
+            Vec::new()
+        };
+        let (blocks, block_markers, block_bookmark_markers) = if self.config.is_chat_mode() {
+            (self.chat_paint_rows(sess), Vec::new(), Vec::new())
+        } else {
+            self.block_chrome(sess)
+        };
+        let app_mouse_full_grid = app_mouse_uses_full_grid(
+            self.config.is_block_mode() || !sess.projection.chat_rows().is_empty(),
+            sess.terminal.is_alt_buffer_active(),
+            sess.terminal.has_usable_block_partitions(),
+        );
+        let organism_projection = sess.projection.key();
+        let organism_block = self.organism_block_key();
+        let organism_epoch = self.organism_geometry_epoch;
+        let organism_body = (self.organism_body_owner() == Some(session_id))
+            .then(|| self.organism_block_key())
+            .flatten()
+            .map(|block| {
+                let presentation = self.organism.presentation_with_attention(
+                    session_id,
+                    sess.terminal.is_command_running(),
+                    sess.terminal
+                        .running_duration_ms()
+                        .is_some_and(|ms| ms >= 60_000),
+                    self.organism_effective_motion(),
+                    self.organism_attention_facts(),
+                );
+                terminal_view::OrganismBody {
+                    block,
+                    epoch: self.organism_geometry_epoch,
+                    sprite: presentation.sprite,
+                    walking_sprite: presentation.walking_sprite,
+                    tone: presentation.tone,
+                    frame: self.organism.paint_frame(self.organism_effective_motion()),
+                    wander: presentation.wander,
+                    bottom: presentation.bottom,
+                }
+            });
+        let status_presentation =
+            (self.config.is_card_mode() && self.config.ascii_organism_enabled).then(|| {
+                if is_active {
+                    self.organism_owner()
+                        .map(|id| {
+                            self.organism.presentation_with_attention(
+                                id,
+                                sess.terminal.is_command_running(),
+                                false,
+                                self.organism_effective_motion(),
+                                self.organism_attention_facts(),
+                            )
+                        })
+                        .unwrap_or_else(organism::LivePresentation::passive_presence)
+                } else {
+                    organism::LivePresentation::passive_presence()
+                }
+            });
+        let submit_token = sess.enabled_chat_control(
+            chat_mode::ControlKind::Submit,
+            self.chat_input_ready(session_id),
+        );
+        TermWidget::new(
+            sess.projection.cells(),
+            sess.cursor,
+            sess.cursor_visible,
+            sess.terminal.cursor_shape,
+            focused,
+            &self.theme,
+            self.metrics,
+            self.mono,
+            self.cjk_mono,
+            self.symbol_mono,
+            self.math_symbol,
+            self.nerd_symbol,
+            selection,
+            sess.projection.scroll_offset(),
+            sess.projection.max_scroll_offset(),
+        )
+        .interaction_mode(
+            self.config.effective_terminal_mode(),
+            self.terminal_interaction_epoch,
+        )
+        .modifiers(
+            self.modifiers.shift(),
+            self.modifiers.alt(),
+            self.modifiers.control(),
+        )
+        .scrollbar_always(matches!(
+            self.config.scrollbar_visibility,
+            config::ScrollbarVisibility::Always
+        ))
+        .search(search_matches, current)
+        .blocks(blocks)
+        .chat_rows(
+            sess.projection.chat_rows(),
+            self.config
+                .is_chat_mode()
+                .then_some(sess.projection.as_ref()),
+            submit_token.map(Message::ChatSubmit),
+        )
+        .organism_status(
+            status_presentation,
+            self.config.ascii_organism_expanded,
+            Message::SetOrganismExpanded,
+        )
+        .organism_body(
+            organism_body,
+            self.organism.live_greeting_offer(session_id),
+            self.organism.live_greeting_exit_reference(session_id),
+            move |observation| {
+                Message::OrganismBodyObserved(
+                    session_id,
+                    organism_epoch,
+                    organism_projection.clone(),
+                    organism_block,
+                    observation,
+                )
+            },
+        )
+        .app_mouse_full_grid(app_mouse_full_grid)
+        .block_compact(self.config.block_compact)
+        .block_markers(block_markers)
+        .block_bookmark_markers(block_bookmark_markers)
+        .links(links, sess.projection.view_revision())
+        .dynamic_palette(&sess.terminal.dynamic_palette)
+        .dynamic_defaults(
+            sess.terminal.dynamic_fg,
+            sess.terminal.dynamic_bg,
+            sess.terminal.dynamic_cursor_color,
+        )
+        .images(images)
+        .preedit(if focused && !sess.terminal.preedit_text.is_empty() {
+            Some((
+                sess.terminal.preedit_text.clone(),
+                sess.terminal.preedit_selection.clone(),
+            ))
+        } else {
+            None
+        })
+        .blink_on(self.blink_on)
+        .opacity(self.config.opacity)
+        .on_mouse(move |inp| Message::MousePane(session_id, inp))
+        .on_summary(sess.projection.key(), move |activation| {
+            Message::SummaryActivate(session_id, activation)
+        })
+        .into()
+    }
+
+    /// Left dock. A header lets the user switch between the file tree and the
+    /// vertical tab list and dock the tab strip back to the top.
+    fn sidebar_view(&self) -> Element<'_, Message> {
+        // Panel switcher: highlight the active panel.
+        let panel_btn = |label: &str, panel: SidebarPanel| {
+            let active = self.sidebar_panel == panel;
+            button(text(label.to_string()).size(self.chrome_font_size()))
+                .on_press(Message::SetSidebarPanel(panel))
+                .padding([2, 8])
+                .style(self.tab_btn_style(active))
+        };
+        let header = row![
+            panel_btn("Tabs", SidebarPanel::Tabs),
+            panel_btn("Files", SidebarPanel::Files),
+            Space::new().width(Length::Fill),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center);
+        // The experimental Tasks dashboard joins the switcher only when the
+        // feature flag is on; with the flag off no task UI is reachable.
+        let header = if self.config.experimental_task_sidebar {
+            row![
+                panel_btn("Tabs", SidebarPanel::Tabs),
+                panel_btn("Files", SidebarPanel::Files),
+                panel_btn("Tasks", SidebarPanel::Tasks),
+                Space::new().width(Length::Fill),
+            ]
+            .spacing(4)
+            .align_y(iced::Alignment::Center)
+        } else {
+            header
+        };
+        let header = container(header.wrap()).padding([4, 6]);
+
+        let panel: Element<'_, Message> = match self.sidebar_panel {
+            SidebarPanel::Tabs => self.sidebar_tabs_view(),
+            SidebarPanel::Files => self.sidebar_files_view(),
+            SidebarPanel::Tasks => self.sidebar_tasks_view(),
+        };
+
+        container(column![header, panel].spacing(2))
+            .width(Length::Fixed(self.dock_width))
+            .height(Length::Fill)
+            .style(self.panel_style_with_focus(
+                self.sidebar_files_focused && self.sidebar_panel == SidebarPanel::Files,
+            ))
+            .into()
+    }
+
+    /// Invisible resize grips hugging the window border, stacked over the rest
+    /// of the UI. An undecorated window has no frame to grab, so without these
+    /// the window could not be resized at all.
+    ///
+    /// Only the strips themselves react: the middle of the overlay is bare
+    /// [`Space`], which captures nothing, so `stack` passes those events down
+    /// to the terminal underneath.
+    fn window_resize_edges(&self) -> Element<'_, Message> {
+        use iced::mouse::Interaction;
+        use iced::window::Direction;
+
+        fn grip<'a>(
+            width: Length,
+            height: Length,
+            direction: Direction,
+            cursor: Interaction,
+        ) -> Element<'a, Message> {
+            mouse_area(container(Space::new()).width(width).height(height))
+                .on_press(Message::WindowResizeDrag(direction))
+                .interaction(cursor)
+                .into()
+        }
+        let corner = Length::Fixed(RESIZE_CORNER);
+        let edge = Length::Fixed(RESIZE_EDGE);
+
+        // Corners come first in each row so a diagonal drag wins over the
+        // edge it overlaps.
+        let top: Element<'_, Message> = row![
+            grip(
+                corner,
+                edge,
+                Direction::NorthWest,
+                Interaction::ResizingDiagonallyDown
+            ),
+            grip(
+                Length::Fill,
+                edge,
+                Direction::North,
+                Interaction::ResizingVertically
+            ),
+            grip(
+                corner,
+                edge,
+                Direction::NorthEast,
+                Interaction::ResizingDiagonallyUp
+            ),
+        ]
+        .width(Length::Fill)
+        .into();
+        let middle: Element<'_, Message> = row![
+            grip(
+                edge,
+                Length::Fill,
+                Direction::West,
+                Interaction::ResizingHorizontally
+            ),
+            Space::new().width(Length::Fill).height(Length::Fill),
+            grip(
+                edge,
+                Length::Fill,
+                Direction::East,
+                Interaction::ResizingHorizontally
+            ),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
+        let bottom: Element<'_, Message> = row![
+            grip(
+                corner,
+                edge,
+                Direction::SouthWest,
+                Interaction::ResizingDiagonallyUp
+            ),
+            grip(
+                Length::Fill,
+                edge,
+                Direction::South,
+                Interaction::ResizingVertically
+            ),
+            grip(
+                corner,

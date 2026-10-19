@@ -1,0 +1,300 @@
+
+    #[test]
+    fn batch_delete_continues_past_errors_and_summarizes() {
+        use remote_fs::FsLocation;
+        let root = std::env::temp_dir().join(format!("frost-op-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create test tree");
+        std::fs::write(root.join("one.txt"), b"1").expect("write");
+        let op = SidebarOp::DeleteBatch(vec![
+            root.join("one.txt"),
+            root.join("gone.txt"),
+            root.join("two.txt"),
+        ]);
+        std::fs::write(root.join("two.txt"), b"2").expect("write");
+        let outcome = run_sidebar_op(&FsLocation::Local, &[], &op, None);
+        assert!(outcome.result.is_ok());
+        assert!(!outcome.cancelled);
+        assert_eq!(outcome.location, FsLocation::Local);
+        assert_eq!(
+            outcome.consumed_paths,
+            vec![root.join("one.txt"), root.join("two.txt")],
+            "only successfully deleted sources invalidate clipboard entries"
+        );
+        assert!(!root.join("one.txt").exists());
+        assert!(!root.join("two.txt").exists());
+        let (text, neutral) = outcome.warning.expect("summary");
+        assert!(text.starts_with("1 of 3 items failed"), "{text}");
+        assert!(!neutral);
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn rename_reports_source_only_after_backend_success() {
+        use remote_fs::FsLocation;
+        let root = std::env::temp_dir().join(format!("frost-op-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create test tree");
+        let src = root.join("before.txt");
+        let dst = root.join("after.txt");
+        std::fs::write(&src, b"data").expect("write source");
+
+        let op = SidebarOp::Rename {
+            src: src.clone(),
+            dst: dst.clone(),
+        };
+        let outcome = run_sidebar_op(&FsLocation::Local, &[], &op, None);
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.consumed_paths, vec![src.clone()]);
+        assert_eq!(outcome.affected_parents, vec![root.clone()]);
+        assert_eq!(
+            outcome.path_remaps,
+            vec![SidebarPathRemap {
+                from: src.clone(),
+                to: dst.clone(),
+            }]
+        );
+
+        let failed = SidebarOp::Rename {
+            src: src.clone(),
+            dst: root.join("never.txt"),
+        };
+        let outcome = run_sidebar_op(&FsLocation::Local, &[], &failed, None);
+        assert!(outcome.result.is_err());
+        assert!(outcome.consumed_paths.is_empty());
+        assert_eq!(
+            outcome.affected_parents,
+            vec![root.clone()],
+            "an ambiguous backend failure still invalidates its exact parent"
+        );
+        assert!(outcome.path_remaps.is_empty());
+        assert!(dst.exists());
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn confirmed_directory_move_remaps_selection_and_anchor_by_path_component() {
+        let remaps = vec![SidebarPathRemap {
+            from: std::path::PathBuf::from("/root/old"),
+            to: std::path::PathBuf::from("/root/new"),
+        }];
+        let mut selection = vec![
+            std::path::PathBuf::from("/root/old"),
+            std::path::PathBuf::from("/root/old/nested/file"),
+            std::path::PathBuf::from("/root/old-suffix"),
+        ];
+        let mut anchor = Some(std::path::PathBuf::from("/root/old/nested"));
+        remap_sidebar_selection(&mut selection, &mut anchor, &remaps);
+        assert_eq!(
+            selection,
+            vec![
+                std::path::PathBuf::from("/root/new"),
+                std::path::PathBuf::from("/root/new/nested/file"),
+                std::path::PathBuf::from("/root/old-suffix"),
+            ]
+        );
+        assert_eq!(anchor, Some(std::path::PathBuf::from("/root/new/nested")));
+    }
+
+    #[test]
+    fn selection_toggle_and_range_follow_the_visible_order() {
+        let path = |name: &str| std::path::PathBuf::from(format!("/r/{name}"));
+        let mut selection = vec![path("a")];
+        selection_toggle(&mut selection, &path("c"));
+        assert_eq!(selection, vec![path("a"), path("c")]);
+        selection_toggle(&mut selection, &path("a"));
+        assert_eq!(selection, vec![path("c")]);
+
+        let rows: Vec<(std::path::PathBuf, bool)> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|name| (path(name), false))
+            .collect();
+        assert_eq!(
+            selection_range(&rows, &path("b"), &path("d")),
+            vec![path("b"), path("c"), path("d")]
+        );
+        // Backwards ranges normalize; an off-list endpoint yields nothing.
+        assert_eq!(
+            selection_range(&rows, &path("d"), &path("b")),
+            vec![path("b"), path("c"), path("d")]
+        );
+        assert!(selection_range(&rows, &path("x"), &path("b")).is_empty());
+    }
+
+    #[test]
+    fn menu_targets_the_selection_when_clicked_inside_it() {
+        let path = |name: &str| std::path::PathBuf::from(format!("/r/{name}"));
+        let selection = vec![path("b"), path("c")];
+        let visible: Vec<(std::path::PathBuf, bool)> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| (path(n), false))
+            .collect();
+        // Inside: the selection, in visible (not insertion) order.
+        let targets = menu_targets(&selection, &visible, &path("c")).expect("inside the selection");
+        assert_eq!(targets, vec![(path("b"), false), (path("c"), false)]);
+        // Outside: just the clicked row.
+        assert_eq!(menu_targets(&selection, &visible, &path("a")), None);
+        // A one-row selection never counts as "the selection".
+        assert_eq!(menu_targets(&[path("b")], &visible, &path("b")), None);
+    }
+
+    /// A loaded tree: top.txt + b_dir/b.txt + a_dir/{sub.txt,deep/deep.txt}.
+    /// a_dir and deep start expanded; `collapse_a` re-collapses a_dir while
+    /// keeping its loaded children — the filter's force-expand case.
+    fn loaded_sidebar_tree(collapse_a: bool) -> (sidebar::Sidebar, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("frost-sel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("a_dir").join("deep")).expect("tree");
+        std::fs::create_dir_all(root.join("b_dir")).expect("tree");
+        std::fs::write(root.join("top.txt"), b"t").expect("write");
+        std::fs::write(root.join("a_dir").join("sub.txt"), b"s").expect("write");
+        std::fs::write(root.join("a_dir").join("deep").join("deep.txt"), b"d").expect("write");
+        std::fs::write(root.join("b_dir").join("b.txt"), b"b").expect("write");
+        let mut sidebar = sidebar::Sidebar::new();
+        let request = sidebar.set_current_dir(root.clone());
+        assert!(sidebar.apply_load(sidebar::load_directory(request)));
+        let request = sidebar
+            .toggle_node(&root.join("a_dir"))
+            .expect("expand a_dir");
+        assert!(sidebar.apply_load(sidebar::load_directory(request)));
+        let request = sidebar
+            .toggle_node(&root.join("a_dir").join("deep"))
+            .expect("expand deep");
+        assert!(sidebar.apply_load(sidebar::load_directory(request)));
+        if collapse_a {
+            assert!(sidebar.toggle_node(&root.join("a_dir")).is_none());
+        }
+        (sidebar, root)
+    }
+
+    #[test]
+    fn filter_match_set_keeps_matches_and_ancestors() {
+        let (sidebar, root) = loaded_sidebar_tree(false);
+        // Case-insensitive substring; a deep match pulls its ancestors in.
+        let set = filter_match_set(&sidebar.root, "DEEP").expect("filtering");
+        assert!(set.contains(&root.join("a_dir")));
+        assert!(set.contains(&root.join("a_dir").join("deep")));
+        assert!(set.contains(&root.join("a_dir").join("deep").join("deep.txt")));
+        assert!(!set.contains(&root.join("a_dir").join("sub.txt")));
+        assert!(!set.contains(&root.join("b_dir")));
+        // Empty query is identity: no filtering at all.
+        assert!(filter_match_set(&sidebar.root, "").is_none());
+        assert!(filter_match_set(&sidebar.root, "  ").is_none());
+        let spoofed = filter_match_set(&sidebar.root, "deep\u{202e}").expect("unsafe query");
+        assert!(spoofed.is_empty());
+        let replacement = filter_match_set(&sidebar.root, "deep\u{fffd}").expect("fffd query");
+        assert!(replacement.is_empty());
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn visible_row_list_filters_and_force_expands_ancestors() {
+        let (sidebar, root) = loaded_sidebar_tree(false);
+        let mut rows = Vec::new();
+        visible_row_list(&sidebar.root, None, &mut rows);
+        let names: Vec<String> = rows
+            .iter()
+            .map(|(path, _)| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a_dir", "deep", "deep.txt", "sub.txt", "b_dir", "top.txt"]
+        );
+        std::fs::remove_dir_all(root).expect("remove test tree");
+
+        // Filtered: only the match chain — a_dir is collapsed but loaded, and
+        // the filter force-expands it to surface the deep match.
+        let (sidebar, root) = loaded_sidebar_tree(true);
+        let set = filter_match_set(&sidebar.root, "deep");
+        let mut rows = Vec::new();
+        visible_row_list(&sidebar.root, set.as_ref(), &mut rows);
+        let names: Vec<String> = rows
+            .iter()
+            .map(|(path, _)| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a_dir", "deep", "deep.txt"]);
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn copy_path_payload_is_the_plain_full_path() {
+        assert_eq!(
+            copy_path_payload(std::path::Path::new("/var/log/syslog")).as_deref(),
+            Some("/var/log/syslog")
+        );
+        // Remote rows copy the bare remote path — no ssh:/docker: prefix.
+        assert_eq!(
+            copy_path_payload(std::path::Path::new("/home/yj/some file.txt")).as_deref(),
+            Some("/home/yj/some file.txt")
+        );
+        assert_eq!(
+            copy_path_payload(std::path::Path::new("/tmp/notes\u{202e}file.txt")),
+            None
+        );
+        assert_eq!(
+            copy_path_payload(std::path::Path::new("/tmp/notes\u{fffd}file.txt")),
+            None
+        );
+    }
+
+    #[test]
+    fn transfer_verb_names_the_transport() {
+        use remote_fs::FsLocation;
+        let hosts = vec![
+            sidebar_remote_profile("one", "one.example"),
+            sidebar_remote_profile("two", "two.example"),
+        ];
+        assert_eq!(
+            transfer_verb(&FsLocation::Local, &FsLocation::Local, &hosts, false),
+            "copy"
+        );
+        assert_eq!(
+            transfer_verb(&FsLocation::Local, &FsLocation::Local, &hosts, true),
+            "move"
+        );
+        assert_eq!(
+            transfer_verb(
+                &FsLocation::Remote(0),
+                &FsLocation::Remote(0),
+                &hosts,
+                false,
+            ),
+            "copy"
+        );
+        assert_eq!(
+            transfer_verb(&FsLocation::Local, &FsLocation::Remote(0), &hosts, false,),
+            "upload"
+        );
+        assert_eq!(
+            transfer_verb(&FsLocation::Remote(0), &FsLocation::Local, &hosts, false,),
+            "download"
+        );
+        assert_eq!(
+            transfer_verb(
+                &FsLocation::Remote(0),
+                &FsLocation::Remote(1),
+                &hosts,
+                false,
+            ),
+            "relay"
+        );
+        assert_eq!(
+            transfer_verb(&FsLocation::Remote(0), &FsLocation::Local, &hosts, true,),
+            "download + delete"
+        );
+        let overlaid =
+            remote_fs::with_reusable_control_path(&hosts[0], Some("/run/user/1000/cm-%C"));
+        assert_eq!(
+            transfer_verb(
+                &FsLocation::Remote(0),
+                &FsLocation::Transient(overlaid),
+                &hosts,
+                false,
+            ),
+            "copy",
+            "a live ControlPath overlay does not turn one host into a relay"
+        );
+    }
+
+    fn drop_fixture() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("frost-drop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("target")).expect("target dir");
+        std::fs::create_dir_all(root.join("adir").join("sub")).expect("drop dir");
+        std::fs::write(root.join("adir").join("sub").join("deep.txt"), b"deep").expect("write");

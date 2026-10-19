@@ -1,0 +1,300 @@
+                    container(
+                        text(crate::ai_chats::display_chat_turn(partial))
+                            .size(self.effective_font_size())
+                            .wrapping(text::Wrapping::Word),
+                    )
+                    .padding(6)
+                    .style(container::bordered_box)
+                    .width(Length::Fill),
+                ]
+                .spacing(2),
+            );
+        }
+        // After a mid-stream failure the already-shown partial text stays
+        // visible next to the recorded error (the Agent panel's discipline).
+        if let Some(partial) = chats.interrupted_partial() {
+            transcript = transcript.push(
+                column![
+                    text("Assistant (reply interrupted)")
+                        .size(self.effective_font_size())
+                        .style(text::secondary),
+                    container(
+                        text(crate::ai_chats::display_chat_turn(partial))
+                            .size(self.effective_font_size())
+                            .wrapping(text::Wrapping::Word),
+                    )
+                    .padding(6)
+                    .style(container::bordered_box)
+                    .width(Length::Fill),
+                ]
+                .spacing(2),
+            );
+        }
+        if store.active_history().is_empty() && partial.is_empty() {
+            transcript = transcript.push(
+                text("Ask anything about the shell; every conversation is saved.")
+                    .size(self.effective_font_size())
+                    .style(text::secondary),
+            );
+        }
+
+        let status_line: Element<'_, Message> = if chats.status_line().is_empty() {
+            Space::new().into()
+        } else {
+            text(chats.status_line())
+                .size(self.effective_font_size())
+                .wrapping(text::Wrapping::Word)
+                .style(if chats.status_is_error() {
+                    text::danger
+                } else {
+                    text::secondary
+                })
+                .into()
+        };
+
+        let include_recent = checkbox(chats.include_recent(store.active_id()))
+            .label("Include recent shell context")
+            .text_size(self.effective_font_size())
+            .on_toggle(Message::AiChatsIncludeRecent);
+
+        let mut composer = text_input("Ask a question…", store.active_draft())
+            .id(AI_CHATS_INPUT_ID.clone())
+            .size(self.effective_font_size());
+        if !busy && !archived {
+            composer = composer
+                .on_input(Message::AiChatsInput)
+                .on_submit(Message::AiChatsSubmit);
+        }
+        let action: Element<'_, Message> = if busy {
+            button(text("Stop").size(self.effective_font_size()))
+                .style(button::danger)
+                .on_press(Message::AiChatsStop)
+                .into()
+        } else {
+            let mut row = row![].spacing(6);
+            if chats.has_retry() {
+                row = row.push(
+                    button(text("Retry").size(self.effective_font_size()))
+                        .style(button::secondary)
+                        .on_press(Message::AiChatsRetry),
+                );
+            }
+            let mut send =
+                button(text("Send").size(self.effective_font_size())).style(button::primary);
+            if !archived {
+                send = send.on_press(Message::AiChatsSubmit);
+            }
+            row.push(send).into()
+        };
+
+        let archive_label = if archived { "Unarchive" } else { "Archive" };
+        let manage = row![
+            button(text(archive_label).size(self.effective_font_size()))
+                .style(button::secondary)
+                .on_press(Message::AiChatsToggleArchive),
+            button(
+                text(if chats.delete_armed() {
+                    "Confirm delete"
+                } else {
+                    "Delete"
+                })
+                .size(self.effective_font_size())
+            )
+            .style(button::danger)
+            .on_press(Message::AiChatsDelete),
+        ]
+        .spacing(6);
+
+        column![
+            title,
+            scrollable(transcript).height(Length::Fill).anchor_bottom(),
+            status_line,
+            include_recent,
+            row![composer, action].spacing(6),
+            manage,
+        ]
+        .spacing(8)
+        .into()
+    }
+
+    /// The searchable library page: every saved chat, newest first, with the
+    /// sources' status markers (Archived · Thinking… · Error · New reply).
+    fn ai_chats_library_page(&self) -> Element<'_, Message> {
+        let chats = &self.ai_chats;
+        let back_and_search = row![
+            button(text("←").size(self.effective_font_size()))
+                .style(button::secondary)
+                .on_press(Message::AiChatsShowChat),
+            text_input("Search chats", &chats.search)
+                .id(AI_CHATS_SEARCH_ID.clone())
+                .on_input(Message::AiChatsSearchInput)
+                .size(self.effective_font_size()),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+        let summaries = chats.library_summaries();
+        let mut list = column![].spacing(2);
+        if summaries.is_empty() {
+            list = list.push(
+                text(if chats.search.is_empty() {
+                    "No saved chats yet"
+                } else {
+                    "No chats match"
+                })
+                .size(self.effective_font_size())
+                .style(text::secondary),
+            );
+        }
+        // `summaries` is owned, so each row moves its strings instead of
+        // cloning them on every redraw.
+        for summary in summaries {
+            let mut meta = summary.preview;
+            if summary.archived {
+                meta.push_str(" · Archived");
+            }
+            if summary.busy {
+                meta.push_str(" · Thinking…");
+            } else if summary.error {
+                meta.push_str(" · Error");
+            } else if summary.unread {
+                meta.push_str(" · New reply");
+            } else if summary.history_truncated {
+                // The shared store compacts live history and persistence
+                // compacts again to the file budget; the row admits it rather
+                // than letting a conversation quietly shrink.
+                meta.push_str(" · Some local content omitted");
+            }
+            let title_style: fn(&iced::Theme) -> text::Style = if summary.active {
+                text::default
+            } else {
+                text::secondary
+            };
+            let row_body = container(
+                column![
+                    text(crate::ai_chats::bound_title_draft(summary.title))
+                        .size(self.effective_font_size())
+                        .style(title_style),
+                    text(crate::review_text::bound_toast_text(meta))
+                        .size(self.effective_font_size())
+                        .style(text::secondary),
+                ]
+                .spacing(2),
+            )
+            .width(Length::Fill)
+            .padding([4, 8])
+            .style(container::bordered_box);
+            list = list.push(mouse_area(row_body).on_press(Message::AiChatsSelect(summary.id)));
+        }
+
+        column![back_and_search, scrollable(list).height(Length::Fill),]
+            .spacing(8)
+            .into()
+    }
+
+    /// The review-only AI command-suggestion card (ported from anvil's
+    /// `?`-palette flow), using the correction card's idiom: provider badge,
+    /// the request line, an editable command draft, and explicit
+    /// insert/regenerate/dismiss actions. The generated command is only ever
+    /// typed at the prompt for review — never run automatically.
+    fn ai_suggestion_card(&self) -> Option<Element<'_, Message>> {
+        // Scoped to the bound pane, like the correction card above: the card
+        // describes work for one pane's prompt and inserts into it.
+        let session = self.ai_suggestion_bound_session()?;
+        let generation = session.generation();
+
+        let header = row![
+            text("AI command suggestion").size(self.effective_font_size()),
+            Space::new().width(Length::Fill),
+            text(format!(
+                "{} · review only",
+                crate::review_text::bound_provider_label(&session.provider)
+            ))
+            .size(self.effective_font_size())
+            .style(text::secondary),
+            button(text("✕").size(self.effective_font_size()))
+                .style(button::secondary)
+                .on_press(Message::AiSuggestionDismiss(generation)),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
+        let request = text(format!(
+            "Request: {}",
+            crate::review_text::bound_toast_text(command_correction::compact_one_line(
+                &session.request,
+                180
+            ))
+        ))
+        .size(self.effective_font_size())
+        .wrapping(text::Wrapping::Word)
+        .style(text::secondary);
+
+        let mut card = column![header, request].spacing(8);
+        if let Some(context) = session.block_context.as_ref() {
+            card = card.push(
+                text(format!(
+                    "Selected block context · exit {}{} · {}",
+                    context.exit_code,
+                    if context.truncated {
+                        " · output truncated"
+                    } else {
+                        ""
+                    },
+                    command_correction::compact_one_line(&context.cmd, 72)
+                ))
+                .size(self.effective_font_size())
+                .wrapping(text::Wrapping::Word)
+                .style(text::secondary),
+            );
+        }
+        card = card.push(
+            text(session.status())
+                .size(self.effective_font_size())
+                .wrapping(text::Wrapping::Word)
+                .style(text::secondary),
+        );
+
+        match session.phase() {
+            ai_command::SuggestionPhase::Drafting => {
+                card = card.push(
+                    row![button(text("Stop").size(self.effective_font_size()))
+                        .style(button::danger)
+                        .on_press(Message::AiSuggestionDismiss(generation))]
+                    .spacing(6),
+                );
+            }
+            ai_command::SuggestionPhase::Review => {
+                card = card.push(
+                    text_input("generated command", &session.draft)
+                        .id(AI_SUGGESTION_INPUT_ID.clone())
+                        .on_input(move |draft| Message::AiSuggestionInput(generation, draft))
+                        .on_submit(Message::AiSuggestionInsert(generation))
+                        .size(self.effective_font_size())
+                        .font(iced::Font::MONOSPACE),
+                );
+                card = card.push(
+                    row![
+                        button(text("Insert for review").size(self.effective_font_size()))
+                            .style(button::primary)
+                            .on_press(Message::AiSuggestionInsert(generation)),
+                        button(text("Regenerate").size(self.effective_font_size()))
+                            .style(button::secondary)
+                            .on_press(Message::AiSuggestionRegenerate(generation)),
+                        button(text("Dismiss").size(self.effective_font_size()))
+                            .style(button::secondary)
+                            .on_press(Message::AiSuggestionDismiss(generation)),
+                    ]
+                    .spacing(6),
+                );
+            }
+            ai_command::SuggestionPhase::Failed => {
+                card = card.push(
+                    row![
+                        button(text("Retry").size(self.effective_font_size()))
+                            .style(button::secondary)
+                            .on_press(Message::AiSuggestionRegenerate(generation)),
+                        button(text("Dismiss").size(self.effective_font_size()))
+                            .style(button::secondary)
+                            .on_press(Message::AiSuggestionDismiss(generation)),
+                    ]

@@ -1,0 +1,300 @@
+            response: false,
+        });
+        queue.back_mut().expect("queue is populated").data = vec![0; PTY_QUEUE_COALESCE_BYTES];
+        assert!(!Session::queue_accepts_entry(&queue, 1, false));
+    }
+
+    #[test]
+    fn modified_function_keys_keep_their_xterm_modifier_parameters() {
+        let cases = [
+            (
+                Named::ArrowLeft,
+                keyboard::Modifiers::CTRL,
+                false,
+                b"\x1b[1;5D".as_slice(),
+            ),
+            (
+                Named::F5,
+                keyboard::Modifiers::SHIFT,
+                false,
+                b"\x1b[15;2~".as_slice(),
+            ),
+            (
+                Named::PageDown,
+                keyboard::Modifiers::ALT,
+                false,
+                b"\x1b[6;3~".as_slice(),
+            ),
+            (
+                Named::F1,
+                keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                false,
+                b"\x1b[1;6P".as_slice(),
+            ),
+            (
+                Named::ArrowUp,
+                keyboard::Modifiers::NONE,
+                true,
+                b"\x1bOA".as_slice(),
+            ),
+        ];
+
+        for (named, modifiers, app_cursor, expected) in cases {
+            let encoded = encode_key(
+                &keyboard::Key::Named(named),
+                keyboard::Location::Standard,
+                modifiers,
+                None,
+                app_cursor,
+                KeyboardEnhancements::default(),
+            );
+            assert_eq!(encoded.as_deref(), Some(expected), "{named:?}");
+        }
+
+        let report_all_arrow = encode_key(
+            &keyboard::Key::Named(Named::ArrowUp),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::NONE,
+            None,
+            true,
+            KeyboardEnhancements {
+                report_all_keys: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(report_all_arrow.as_deref(), Some(&b"\x1b[1;1A"[..]));
+    }
+
+    #[test]
+    fn legacy_control_keys_preserve_ctrl_and_alt_semantics() {
+        let ctrl_backspace = encode_key(
+            &keyboard::Key::Named(Named::Backspace),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::CTRL,
+            None,
+            false,
+            KeyboardEnhancements::default(),
+        );
+        assert_eq!(ctrl_backspace.as_deref(), Some(&b"\x08"[..]));
+
+        let ctrl_alt_backspace = encode_key(
+            &keyboard::Key::Named(Named::Backspace),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+            None,
+            false,
+            KeyboardEnhancements::default(),
+        );
+        assert_eq!(ctrl_alt_backspace.as_deref(), Some(&b"\x1b\x08"[..]));
+
+        let ctrl_space = encode_key(
+            &keyboard::Key::Named(Named::Space),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::CTRL,
+            Some(" "),
+            false,
+            KeyboardEnhancements::default(),
+        );
+        assert_eq!(ctrl_space.as_deref(), Some(&b"\0"[..]));
+    }
+
+    #[test]
+    fn kitty_report_all_and_disambiguation_do_not_fall_back_to_plain_text() {
+        let report_all = KeyboardEnhancements {
+            kitty_flags: 0b1000,
+            report_all_keys: true,
+            ..Default::default()
+        };
+        let letter = encode_key(
+            &keyboard::Key::Character("a".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::NONE,
+            Some("a"),
+            false,
+            report_all,
+        );
+        assert_eq!(letter.as_deref(), Some(&b"\x1b[97;1u"[..]));
+
+        let enter = encode_key(
+            &keyboard::Key::Named(Named::Enter),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::NONE,
+            None,
+            false,
+            report_all,
+        );
+        assert_eq!(enter.as_deref(), Some(&b"\x1b[13;1u"[..]));
+
+        let disambiguate = KeyboardEnhancements {
+            kitty_flags: 0b1,
+            ..Default::default()
+        };
+        let escape = encode_key(
+            &keyboard::Key::Named(Named::Escape),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::NONE,
+            None,
+            false,
+            disambiguate,
+        );
+        assert_eq!(escape.as_deref(), Some(&b"\x1b[27;1u"[..]));
+
+        let legacy_enter = encode_key(
+            &keyboard::Key::Named(Named::Enter),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::NONE,
+            None,
+            false,
+            disambiguate,
+        );
+        assert_eq!(legacy_enter.as_deref(), Some(&b"\r"[..]));
+
+        let ctrl_super = encode_key(
+            &keyboard::Key::Character("a".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::LOGO,
+            None,
+            false,
+            disambiguate,
+        );
+        assert_eq!(ctrl_super.as_deref(), Some(&b"\x1b[97;13u"[..]));
+    }
+
+    #[test]
+    fn modify_other_keys_handles_shifted_text_and_level_three() {
+        // Shift alone already produced the character, so xterm leaves it as
+        // text at level 2 — only Ctrl/Alt/Meta build a report.
+        let shifted_symbol = encode_key(
+            &keyboard::Key::Character("1".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::SHIFT,
+            Some("!"),
+            false,
+            KeyboardEnhancements {
+                modify_other_keys: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(shifted_symbol.as_deref(), Some(&b"!"[..]));
+
+        let ctrl_shifted_symbol = encode_key(
+            &keyboard::Key::Character("1".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            Some("!"),
+            false,
+            KeyboardEnhancements {
+                modify_other_keys: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctrl_shifted_symbol.as_deref(), Some(&b"\x1b[27;6;33~"[..]));
+
+        let shifted_tab = encode_key(
+            &keyboard::Key::Named(Named::Tab),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::SHIFT,
+            None,
+            false,
+            KeyboardEnhancements {
+                modify_other_keys: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(shifted_tab.as_deref(), Some(&b"\x1b[Z"[..]));
+
+        let unmodified_level_three = encode_key(
+            &keyboard::Key::Character("x".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::NONE,
+            Some("x"),
+            false,
+            KeyboardEnhancements {
+                modify_other_keys: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            unmodified_level_three.as_deref(),
+            Some(&b"\x1b[27;1;120~"[..])
+        );
+
+        let spoofed_level_three = encode_key(
+            &keyboard::Key::Character("x".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::NONE,
+            Some("\u{202e}x"),
+            false,
+            KeyboardEnhancements {
+                modify_other_keys: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            spoofed_level_three.as_deref(),
+            Some(&b"\x1b[27;1;120~"[..]),
+            "bidi must not become the xterm key codepoint"
+        );
+    }
+
+    /// The Claude CLI enables private mode 2031 (in-band theme-change
+    /// notification) on startup. It must not put the keyboard into any enhanced
+    /// mode: every capital letter reached the app as a CSI report carrying the
+    /// unshifted codepoint, so typing "This" produced "this".
+    #[test]
+    fn theme_notification_mode_leaves_capital_letters_as_text() {
+        let mut terminal = terminal::TerminalState::new(8, 2);
+        terminal.process_input(b"\x1b[?2031h");
+        assert!(!terminal.is_report_all_keys_enabled());
+
+        let enh = KeyboardEnhancements {
+            kitty_flags: terminal.keyboard_enhancement_flags(),
+            modify_other_keys: terminal.xterm_modify_other_keys(),
+            format_other_keys: terminal.xterm_format_other_keys(),
+            report_all_keys: terminal.is_report_all_keys_enabled(),
+            application_keypad: terminal.is_application_keypad(),
+        };
+
+        let shifted = encode_key(
+            &keyboard::Key::Character("t".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::SHIFT,
+            Some("T"),
+            false,
+            enh,
+        );
+        assert_eq!(shifted.as_deref(), Some(&b"T"[..]));
+
+        // Caps Lock reports no modifier at all; only the committed text says
+        // the key produced an upper case character.
+        let caps_lock = encode_key(
+            &keyboard::Key::Character("t".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::NONE,
+            Some("T"),
+            false,
+            enh,
+        );
+        assert_eq!(caps_lock.as_deref(), Some(&b"T"[..]));
+    }
+
+    /// Under Kitty's report-all-keys mode the key code is the *unshifted* key,
+    /// so the shifted character only survives in the alternate-key (flag 4) and
+    /// associated-text (flag 16) fields the app opted into.
+    #[test]
+    fn kitty_reports_the_shifted_character_when_the_app_asks_for_it() {
+        let base = encode_key(
+            &keyboard::Key::Character("t".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::SHIFT,
+            Some("T"),
+            false,
+            KeyboardEnhancements {
+                kitty_flags: 0b1000,
+                report_all_keys: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(base.as_deref(), Some(&b"\x1b[116;2u"[..]));
+
+        let alternate_and_text = encode_key(

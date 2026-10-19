@@ -1,0 +1,300 @@
+        Self {
+            identity: std::sync::Arc::new(()),
+            hosts: hosts.to_vec(),
+            selected: first_runnable_remote_index(hosts).unwrap_or(0),
+        }
+    }
+}
+
+/// A selection must still belong to this opening and identify one validated
+/// profile in both the displayed snapshot and current config. Reordering is
+/// safe; removal, edits, duplicates, and inactive entries fail closed.
+fn remote_picker_target_index(
+    picker: Option<&RemotePickerState>,
+    identity: &std::sync::Arc<()>,
+    profile: &jterm_core::jsh_remote::RemoteHostConfig,
+    current_hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+) -> Option<usize> {
+    let picker = picker?;
+    if !std::sync::Arc::ptr_eq(&picker.identity, identity) {
+        return None;
+    }
+    unique_active_remote_profile_index(&picker.hosts, profile)?;
+    unique_active_remote_profile_index(current_hosts, profile)
+}
+
+fn first_runnable_remote_index(
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+) -> Option<usize> {
+    hosts
+        .iter()
+        .take(config::MAX_REMOTE_HOST_UI_ROWS)
+        .enumerate()
+        .find_map(|(index, _)| {
+            config::validate_remote_host_at(hosts, index)
+                .is_ok()
+                .then_some(index)
+        })
+}
+
+fn next_runnable_remote_index(
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    current: usize,
+    forward: bool,
+) -> Option<usize> {
+    let count = hosts.len().min(config::MAX_REMOTE_HOST_UI_ROWS);
+    if count == 0 {
+        return None;
+    }
+    for distance in 1..=count {
+        let index = if forward {
+            (current + distance) % count
+        } else {
+            (current + count - (distance % count)) % count
+        };
+        if config::validate_remote_host_at(hosts, index).is_ok() {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn last_session_index(session_count: usize) -> Option<usize> {
+    session_count.checked_sub(1)
+}
+
+fn axis_from_str(s: &str) -> Option<Axis> {
+    match s {
+        "vertical" => Some(Axis::Vertical),
+        "horizontal" => Some(Axis::Horizontal),
+        _ => None,
+    }
+}
+
+fn axis_to_str(axis: Axis) -> &'static str {
+    match axis {
+        Axis::Vertical => "vertical",
+        Axis::Horizontal => "horizontal",
+    }
+}
+
+/// Serialize a live layout tree for session persistence.
+/// Exchange two session indices wherever they appear in a pane tree.
+///
+/// One pass, not two: remapping `a`→`b` and then `b`→`a` would send both
+/// leaves to the same session and lose one of them.
+fn swap_sessions_in_tree(tree: &mut PaneTree, a: usize, b: usize) {
+    let remap = |session: usize| {
+        if session == a {
+            b
+        } else if session == b {
+            a
+        } else {
+            session
+        }
+    };
+    let remap_ref: &dyn Fn(usize) -> usize = &remap;
+    tree.remap_sessions(remap_ref);
+}
+
+fn pane_tree_to_snapshot(tree: &PaneTree) -> session_persistence::PaneTreeSnapshot {
+    match tree {
+        PaneTree::Leaf(session) => {
+            session_persistence::PaneTreeSnapshot::Leaf { session: *session }
+        }
+        PaneTree::Split {
+            axis,
+            children,
+            ratios,
+        } => session_persistence::PaneTreeSnapshot::Split {
+            axis: axis_to_str(*axis).to_string(),
+            ratios: ratios.clone(),
+            children: children.iter().map(pane_tree_to_snapshot).collect(),
+        },
+    }
+}
+
+/// Reset every divider in the tree so each split's children share evenly,
+/// recursing into nested splits (ember's `equalize_splits`: the whole tab's
+/// tree, not just the focused subtree). Returns whether any ratio moved.
+fn equalize_pane_tree(node: &mut PaneTree) -> bool {
+    match node {
+        PaneTree::Leaf(_) => false,
+        PaneTree::Split {
+            children, ratios, ..
+        } => {
+            let even = 1.0 / children.len().max(1) as f32;
+            let mut changed = ratios
+                .iter()
+                .any(|ratio| (*ratio - even).abs() > f32::EPSILON);
+            for ratio in ratios.iter_mut() {
+                *ratio = even;
+            }
+            for child in children.iter_mut() {
+                changed |= equalize_pane_tree(child);
+            }
+            changed
+        }
+    }
+}
+
+/// Rebuild a layout tree from an (untrusted) snapshot. Ratios are normalized,
+/// falling back to an even split when unusable; unknown axes or splits with
+/// fewer than two children are rejected. Session indices are validated by the
+/// caller against the restored session count.
+fn pane_tree_from_snapshot(snap: &session_persistence::PaneTreeSnapshot) -> Option<PaneTree> {
+    match snap {
+        session_persistence::PaneTreeSnapshot::Leaf { session } => Some(PaneTree::Leaf(*session)),
+        session_persistence::PaneTreeSnapshot::Split {
+            axis,
+            ratios,
+            children,
+        } => {
+            let axis = axis_from_str(axis)?;
+            if children.len() < 2 {
+                return None;
+            }
+            let kids = children
+                .iter()
+                .map(pane_tree_from_snapshot)
+                .collect::<Option<Vec<_>>>()?;
+            let r = normalized_shares(kids.len(), ratios);
+            Some(PaneTree::Split {
+                axis,
+                children: kids,
+                ratios: r,
+            })
+        }
+    }
+}
+
+/// Convert a legacy single-axis split snapshot into a depth-1 tree so older
+/// session files keep restoring their layout.
+fn pane_tree_from_legacy(split: &session_persistence::SplitSnapshot) -> Option<PaneTree> {
+    let axis = axis_from_str(&split.mode)?;
+    let n = split.panes.len();
+    if n < 2 {
+        return None;
+    }
+    let ratios = normalized_shares(n, &split.ratios);
+    Some(PaneTree::Split {
+        axis,
+        children: split.panes.iter().map(|&s| PaneTree::Leaf(s)).collect(),
+        ratios,
+    })
+}
+
+/// Shared conversion for the original-file validation pass and actual restore.
+/// Legacy migration/default focus are intentional; only rejected content reports
+/// damage here. All input is already bounded by the snapshot decoder.
+fn restored_tab_candidates(
+    saved_tabs: &[session_persistence::TabSnapshot],
+    legacy_tree: Option<&session_persistence::PaneTreeSnapshot>,
+    legacy_split: Option<&session_persistence::SplitSnapshot>,
+    active_session: usize,
+    report: &mut session_persistence::RecoveryReport,
+) -> Vec<RestoredTab> {
+    if saved_tabs.is_empty() {
+        let tree = legacy_tree.and_then(|snapshot| {
+            let tree = pane_tree_from_snapshot(snapshot);
+            if tree.is_none() {
+                report.add(crate::recovery_report::RepairKind::ReferencesAdjusted, 1);
+            }
+            tree
+        });
+        tree.or_else(|| {
+            legacy_split.and_then(|snapshot| {
+                let tree = pane_tree_from_legacy(snapshot);
+                if tree.is_none() {
+                    report.add(crate::recovery_report::RepairKind::ReferencesAdjusted, 1);
+                }
+                tree
+            })
+        })
+        // Preserve v1 focus behavior without calling this synthesized default a repair.
+        .map(|tree| vec![RestoredTab::plain(tree, Some(active_session))])
+        .unwrap_or_default()
+    } else {
+        saved_tabs
+            .iter()
+            .filter_map(|snapshot| {
+                let Some(tree) = pane_tree_from_snapshot(&snapshot.tree) else {
+                    report.add(crate::recovery_report::RepairKind::ReferencesAdjusted, 1);
+                    return None;
+                };
+                Some(RestoredTab {
+                    tree,
+                    focus: snapshot.focus,
+                    title: snapshot.title.clone(),
+                    pinned: snapshot.pinned,
+                    marked: snapshot.marked,
+                    private_title: snapshot.private_title,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Exercise the real restore conversion/ownership validator before spawn-result
+/// pruning can hide malformed original references. This bounded pass changes no
+/// snapshot state; later shell failures/remapping and ordinary v1 migration are
+/// not file repairs. Its report is merged before preserving the exact raw bytes.
+fn inspect_restored_snapshot(
+    snapshot: &session_persistence::SessionsSnapshot,
+) -> session_persistence::RecoveryReport {
+    let mut report = session_persistence::RecoveryReport::default();
+    let active = snapshot.active_index.unwrap_or(0);
+    let candidates = restored_tab_candidates(
+        &snapshot.tabs,
+        snapshot.tree.as_ref(),
+        snapshot.split.as_ref(),
+        active,
+        &mut report,
+    );
+    let _ = build_restored_tabs_with_report(
+        candidates,
+        snapshot.sessions.len(),
+        active,
+        snapshot.active_tab,
+        !snapshot.tabs.is_empty(),
+        &mut report,
+    );
+    report
+}
+
+/// Turn validated pane trees into the tab list, and say which tab is active.
+///
+/// Every index came from a snapshot, so it is checked here: a tab keeps only
+/// leaves naming a session that exists and that no earlier tab already claimed
+/// — two tabs sharing a pane would fight over one PTY.
+///
+/// The closing pass adopts orphans. Validation can reject a tab, a shell can
+/// fail to restore, and a v1 snapshot's sessions may not appear in its single
+/// tree at all; every session no tab claims gets a one-pane tab of its own,
+/// because an unclaimed session is a live PTY nothing can switch to.
+fn build_restored_tabs(
+    trees: Vec<RestoredTab>,
+    session_count: usize,
+    active_session: usize,
+    saved_active_tab: Option<usize>,
+) -> (Vec<Tab>, usize, usize) {
+    build_restored_tabs_with_report(
+        trees,
+        session_count,
+        active_session,
+        saved_active_tab,
+        false,
+        &mut session_persistence::RecoveryReport::default(),
+    )
+}
+
+fn build_restored_tabs_with_report(
+    trees: Vec<RestoredTab>,
+    session_count: usize,
+    active_session: usize,
+    saved_active_tab: Option<usize>,
+    report_explicit_focus: bool,
+    report: &mut session_persistence::RecoveryReport,
+) -> (Vec<Tab>, usize, usize) {
+    let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut tabs: Vec<Tab> = Vec::new();

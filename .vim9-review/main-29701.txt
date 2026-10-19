@@ -1,0 +1,300 @@
+            if !snapshot.turn_history.is_empty() {
+                card = card.push(
+                    text(format!(
+                        "Completed turns: {} ({} in history)",
+                        snapshot.completed_turns,
+                        snapshot.turn_history.len()
+                    ))
+                    .size(self.chrome_font_size())
+                    .style(text::secondary),
+                );
+            }
+        }
+
+        let live_terminals: std::collections::HashSet<_> = self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.tree.leaves())
+            .filter_map(|index| self.sessions.get(index))
+            .map(|session| agent_task_ui::terminal_session_id(session.id))
+            .collect();
+        let mut agent_terminal =
+            button(text("Agent terminal").size(self.chrome_font_size())).style(button::secondary);
+        if task
+            .terminal_session_id
+            .as_ref()
+            .is_some_and(|id| live_terminals.contains(id))
+        {
+            agent_terminal = agent_terminal.on_press(Message::TaskFocusTerminal(task.id));
+        }
+        let mut validation_output = button(text("Validation output").size(self.chrome_font_size()))
+            .style(button::secondary);
+        if task
+            .validation
+            .terminal_session_id
+            .as_ref()
+            .is_some_and(|id| live_terminals.contains(id))
+        {
+            validation_output = validation_output.on_press(Message::TaskFocusValidation(task.id));
+        }
+        card = card.push(row![agent_terminal, validation_output].spacing(6).wrap());
+
+        // Action rows.
+        let provider_name = crate::review_text::bound_provider_label(task.provider.display_name());
+        if let Some(notice) = agent_task_ui::native_start_notice(task.provider) {
+            card = card.push(
+                text(notice)
+                    .size(self.chrome_font_size())
+                    .style(text::danger),
+            );
+        }
+        let share_context = agent_task_ui::prompt_policy(&self.config).share_command_context;
+        let mut actions = row![].spacing(6);
+        if preparing {
+            actions = actions.push(
+                text("Preparing…")
+                    .size(self.chrome_font_size())
+                    .style(text::secondary),
+            );
+            actions = actions.push(
+                button(text("Cancel").size(self.chrome_font_size()))
+                    .style(button::secondary)
+                    .on_press(Message::TaskCancelNative(task.id)),
+            );
+        } else if task.status == TaskStatus::Created
+            && task.runtime_kind == TaskRuntimeKind::Unassigned
+        {
+            let start_label = format!("Start {provider_name}");
+            let mut start =
+                button(text(start_label).size(self.chrome_font_size())).style(button::primary);
+            if task.provider.supports_native_driver() {
+                if share_context {
+                    start = start.on_press(Message::TaskStartNative(task.id));
+                }
+            } else {
+                start = start.on_press(Message::TaskTerminalOpen(task.id));
+            }
+            actions = actions.push(start);
+            actions = actions.push(
+                button(text(format!("Open {provider_name}")).size(self.chrome_font_size()))
+                    .style(button::secondary)
+                    .on_press(Message::TaskTerminalOpen(task.id)),
+            );
+        }
+        if running && stream_active {
+            actions = actions.push(
+                button(text(format!("Cancel {provider_name}")).size(self.chrome_font_size()))
+                    .style(button::danger)
+                    .on_press(Message::TaskCancelNative(task.id)),
+            );
+            if task.status == TaskStatus::ReadyForReview
+                && matches!(task.provider, agent_task::AgentProvider::Codex)
+            {
+                actions = actions.push(
+                    button(text(format!("Finish {provider_name}")).size(self.chrome_font_size()))
+                        .style(button::primary)
+                        .on_press(Message::TaskFinishNative(task.id)),
+                );
+            }
+        }
+        card = card.push(actions);
+        if task.status == TaskStatus::Created
+            && task.runtime_kind == TaskRuntimeKind::Unassigned
+            && task.provider.supports_native_driver()
+            && !share_context
+        {
+            card = card.push(
+                text(format!(
+                    "Start {provider_name} needs AI enabled and command-context sharing in Settings. Open {provider_name} still works in a terminal."
+                ))
+                .size(self.chrome_font_size())
+                .style(text::secondary),
+            );
+        }
+
+        // Review feedback starts another sequential turn on the live native
+        // Codex session (Claude/Kimi MVP is one-shot print mode).
+        if running
+            && stream_active
+            && task.status == TaskStatus::ReadyForReview
+            && task.runtime_kind == TaskRuntimeKind::Native
+            && matches!(task.provider, agent_task::AgentProvider::Codex)
+        {
+            let completed_turns = self
+                .agent_runtime
+                .snapshot(task.id)
+                .map(|snapshot| snapshot.completed_turns)
+                .unwrap_or(0);
+            let reference = self
+                .task_panel
+                .follow_up_reference(task.id, completed_turns);
+            let input_reference = reference.clone();
+            let input = text_input(
+                "Review feedback for the next turn…",
+                &self.task_panel.follow_up,
+            )
+            .on_input(move |value| Message::TaskFollowUpInput(input_reference.clone(), value))
+            .size(self.chrome_font_size());
+            let mut send = button(text("Send turn").size(self.chrome_font_size()));
+            if agent_task_ui::native_follow_up_can_send(&self.task_panel.follow_up, completed_turns)
+            {
+                send = send.on_press(Message::TaskFollowUpSend(reference));
+            }
+            card = card.push(row![input, send].spacing(6));
+            card = card.push(
+                text(self.task_panel.follow_up_feedback(completed_turns))
+                    .size(self.chrome_font_size())
+                    .style(text::secondary),
+            );
+        }
+
+        // Review / validation / completion actions once the provider has
+        // fully stopped.
+        if task.status == TaskStatus::ReadyForReview && !stream_active {
+            let mut review = row![].spacing(6);
+            review = review.push(
+                button(text("Review diff").size(self.chrome_font_size()))
+                    .style(button::secondary)
+                    .on_press(Message::TaskDiffOpen(task.id)),
+            );
+            if task.validation.status != TaskValidationStatus::Running {
+                review = review.push(
+                    button(text("Run validation").size(self.chrome_font_size()))
+                        .style(button::secondary)
+                        .on_press(Message::TaskValidationStart(task.id)),
+                );
+            }
+            let mut complete =
+                button(text("Mark complete").size(self.chrome_font_size())).style(button::primary);
+            if task.validation.status == TaskValidationStatus::Passed {
+                complete = complete.on_press(Message::TaskMarkComplete(task.id));
+            }
+            review = review.push(complete);
+            card = card.push(review);
+            card = card.push(
+                text(format!(
+                    "Validation: {}{}",
+                    task.validation.status.label(),
+                    task.validation
+                        .status_detail
+                        .as_deref()
+                        .map(|detail| format!(
+                            " — {}",
+                            crate::review_text::visible_bounded(
+                                detail,
+                                agent_task_ui::MAX_TASK_DETAIL_DISPLAY_BYTES
+                            )
+                        ))
+                        .unwrap_or_default()
+                ))
+                .size(self.chrome_font_size())
+                .style(text::secondary),
+            );
+        }
+
+        // Explicit terminal fallback after an unsuccessful native session, or
+        // retry of an exited task terminal.
+        let terminal_retry = self.task_manager.terminal_retry_session_id(task.id).is_ok();
+        let native_fallback = self.agent_runtime.can_continue_in_terminal(task.id)
+            && self
+                .task_manager
+                .native_terminal_fallback_eligible(task.id)
+                .is_ok();
+        if task.status == TaskStatus::Failed && (terminal_retry || native_fallback) {
+            card = card.push(
+                button(
+                    text(if native_fallback {
+                        "Continue in terminal"
+                    } else {
+                        "Retry terminal Agent"
+                    })
+                    .size(self.chrome_font_size()),
+                )
+                .style(button::secondary)
+                .on_press(Message::TaskTerminalOpen(task.id)),
+            );
+        }
+
+        if !task.status.is_running() && task.validation.status != TaskValidationStatus::Running {
+            card = card.push(
+                button(text("Hide task").size(self.chrome_font_size()))
+                    .style(button::secondary)
+                    .on_press(Message::TaskHide(task.id)),
+            );
+        }
+
+        // Bounded worktree diff surface (status + tracked diff against the
+        // task's immutable base commit).
+        if self.task_panel.owns_visible_diff(task.id) {
+            let state = self.task_panel.diff.state();
+            let mut diff_card = column![].spacing(4);
+            diff_card = diff_card.push(
+                row![
+                    text(self.task_panel.diff.display_requested_base())
+                        .size(self.chrome_font_size())
+                        .style(text::secondary),
+                    Space::new().width(Length::Fill),
+                    button(text("✕").size(self.chrome_font_size()))
+                        .style(button::secondary)
+                        .padding(2)
+                        .on_press(Message::TaskDiffClose(self.task_panel.diff_reference())),
+                ]
+                .align_y(iced::Alignment::Center),
+            );
+            if state.loading {
+                diff_card = diff_card.push(
+                    text("Loading tracked changes…")
+                        .size(self.chrome_font_size())
+                        .style(text::secondary),
+                );
+            }
+            if let Some(error) = &state.error {
+                diff_card = diff_card.push(
+                    text(crate::review_text::visible_bounded(error, 1024))
+                        .size(self.chrome_font_size())
+                        .style(text::danger),
+                );
+            }
+            if state.truncated {
+                diff_card = diff_card.push(
+                    text("Diff exceeded the retained display limits")
+                        .size(self.chrome_font_size())
+                        .style(text::danger),
+                );
+            }
+            if !state.loading && state.error.is_none() {
+                let body_text = if state.text.is_empty() {
+                    "No tracked changes relative to the task baseline.".to_string()
+                } else {
+                    state.text.clone()
+                };
+                diff_card = diff_card.push(
+                    container(
+                        scrollable(
+                            text(body_text)
+                                .size(self.chrome_font_size())
+                                .font(iced::Font::MONOSPACE),
+                        )
+                        .height(Length::Fixed(240.0)),
+                    )
+                    .padding(6)
+                    .style(container::bordered_box),
+                );
+            }
+            card = card.push(diff_card);
+        }
+
+        container(card)
+            .padding(8)
+            .style(container::bordered_box)
+            .into()
+    }
+
+    /// Overlay panel for Agent mode: transcript, per-command approval cards,
+    /// and the composer. All state lives in `agent::AgentUi`.
+    fn agent_panel(&self) -> Element<'_, Message> {
+        use jterm_core::agent::{AgentState, ProposalStatus, Turn as AgentTurn};
+
+        let mut transcript = column![].spacing(8);
+        if let Some(notice) = self.agent.restored_history_notice {
+            transcript = transcript.push(

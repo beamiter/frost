@@ -1,0 +1,300 @@
+            block_search_bookmark_key_route(
+                &upper,
+                keyboard::Modifiers::NONE,
+                false,
+                &mut held,
+                &mut claimed,
+            ),
+            BlockSearchBookmarkKeyRoute::SuppressRepeat
+        );
+
+        let mut state = BlockSearchState {
+            query: "needle".to_string(),
+            bookmark_key_held: held,
+            bookmark_key_claimed: claimed,
+            ..BlockSearchState::default()
+        };
+        assert!(!state.apply_query_input("needleb".to_string()));
+        assert_eq!(
+            state.query, "needle",
+            "captured text-input repeat is dropped"
+        );
+        assert!(block_search_bookmark_key_release(
+            &lower,
+            &mut state.bookmark_key_held,
+            &mut state.bookmark_key_claimed,
+        ));
+        assert!(!state.bookmark_key_held && !state.bookmark_key_claimed);
+        assert!(state.apply_query_input("needleb".to_string()));
+        assert_eq!(state.query, "needleb");
+
+        for modifiers in [
+            keyboard::Modifiers::NONE,
+            keyboard::Modifiers::CTRL,
+            keyboard::Modifiers::SHIFT,
+            chord | keyboard::Modifiers::ALT,
+            chord | keyboard::Modifiers::LOGO,
+        ] {
+            let mut held = false;
+            let mut claimed = false;
+            assert_eq!(
+                block_search_bookmark_key_route(&lower, modifiers, false, &mut held, &mut claimed,),
+                BlockSearchBookmarkKeyRoute::NotBookmark,
+                "non-exact modifiers {modifiers:?} must not toggle"
+            );
+            assert!(held, "every first physical B press is latched");
+            assert!(!claimed);
+        }
+
+        // An ineligible first edge freezes this whole physical press as
+        // pass-through: releasing Alt or later adding Ctrl+Shift cannot turn
+        // its repeats into a newly eligible action.
+        let mut held = false;
+        let mut claimed = false;
+        assert_eq!(
+            block_search_bookmark_key_route(
+                &lower,
+                chord | keyboard::Modifiers::ALT,
+                false,
+                &mut held,
+                &mut claimed,
+            ),
+            BlockSearchBookmarkKeyRoute::NotBookmark
+        );
+        assert!(held && !claimed);
+        assert_eq!(
+            block_search_bookmark_key_route(&lower, chord, true, &mut held, &mut claimed,),
+            BlockSearchBookmarkKeyRoute::NotBookmark,
+            "dropping Alt mid-press must not create a toggle"
+        );
+        assert_eq!(
+            block_search_bookmark_key_route(&lower, chord, false, &mut held, &mut claimed,),
+            BlockSearchBookmarkKeyRoute::NotBookmark,
+            "eligibility stays frozen even if a repeat flag is missing"
+        );
+        let mut ordinary = BlockSearchState {
+            query: "a".to_string(),
+            bookmark_key_held: held,
+            bookmark_key_claimed: claimed,
+            ..BlockSearchState::default()
+        };
+        assert!(ordinary.apply_query_input("ab".to_string()));
+        assert_eq!(ordinary.query, "ab", "unclaimed B remains ordinary input");
+        assert!(block_search_bookmark_key_release(
+            &lower,
+            &mut ordinary.bookmark_key_held,
+            &mut ordinary.bookmark_key_claimed,
+        ));
+        assert_eq!(
+            block_search_bookmark_key_route(
+                &upper,
+                chord,
+                false,
+                &mut ordinary.bookmark_key_held,
+                &mut ordinary.bookmark_key_claimed,
+            ),
+            BlockSearchBookmarkKeyRoute::Toggle,
+            "only a new B press may re-evaluate chord eligibility"
+        );
+
+        let mut held = false;
+        let mut claimed = false;
+        assert_eq!(
+            block_search_bookmark_key_route(&upper, chord, true, &mut held, &mut claimed,),
+            BlockSearchBookmarkKeyRoute::SuppressRepeat
+        );
+        assert!(
+            held && claimed,
+            "even a first observed repeat owns B until release"
+        );
+        assert!(!block_search_bookmark_key_release(
+            &keyboard::Key::Character("x".into()),
+            &mut held,
+            &mut claimed,
+        ));
+        assert!(held && claimed);
+    }
+
+    #[test]
+    fn block_search_bookmark_plan_rejects_busy_stale_and_unlisted_hits() {
+        let version = BlockSearchZoneVersion {
+            len: 1,
+            oldest: Some(7),
+            newest: Some(7),
+        };
+        let hit = block_search_hit(7);
+        let mut state = BlockSearchState {
+            session_id: 3,
+            zone_version: version,
+            hits: vec![hit.clone()],
+            ..BlockSearchState::default()
+        };
+        assert_eq!(
+            state.bookmark_plan(Some(&hit), 3, version),
+            BlockSearchBookmarkPlan::Toggle(7)
+        );
+        assert_eq!(
+            state.bookmark_plan(None, 3, version),
+            BlockSearchBookmarkPlan::NoSelection
+        );
+        assert_eq!(
+            state.bookmark_plan(Some(&block_search_hit(8)), 3, version),
+            BlockSearchBookmarkPlan::RejectStale
+        );
+        assert_eq!(
+            state.bookmark_plan(Some(&hit), 4, version),
+            BlockSearchBookmarkPlan::RejectStale
+        );
+        assert_eq!(
+            state.bookmark_plan(
+                Some(&hit),
+                3,
+                BlockSearchZoneVersion {
+                    newest: Some(8),
+                    ..version
+                },
+            ),
+            BlockSearchBookmarkPlan::RejectStale
+        );
+        state.query_error = Some("invalid".to_string());
+        assert_eq!(
+            state.bookmark_plan(Some(&hit), 3, version),
+            BlockSearchBookmarkPlan::RejectStale
+        );
+        state.loading = true;
+        assert_eq!(
+            state.bookmark_plan(None, 3, version),
+            BlockSearchBookmarkPlan::Busy,
+            "loading owns even an empty/stale retained selection"
+        );
+    }
+
+    #[test]
+    fn block_search_bookmark_copy_distinguishes_row_actions_from_selected_shortcut() {
+        assert_eq!(block_search_bookmark_button_text(false), "☆ Bookmark");
+        assert_eq!(block_search_bookmark_button_text(true), "★ Remove");
+        assert_eq!(
+            block_search_bookmark_button_help(false, false),
+            "Bookmark this block"
+        );
+        assert_eq!(
+            block_search_bookmark_button_help(true, false),
+            "Remove the bookmark from this block"
+        );
+        assert_eq!(
+            block_search_bookmark_button_help(false, true),
+            "Bookmarks are available when results finish updating"
+        );
+        assert!(BLOCK_SEARCH_KEYBOARD_HELP.contains("toggle bookmark on selected result"));
+        assert!(
+            !block_search_bookmark_button_help(false, false).contains("Ctrl+Shift+B"),
+            "a row-local pointer action must not claim the selected-row shortcut"
+        );
+    }
+
+    #[test]
+    fn block_search_bookmarked_empty_state_gives_reachable_next_steps() {
+        let no_bookmarks = block_search_empty_message(
+            "needle",
+            BlockSearchFilter::Bookmarked,
+            block_mode::BlockSearchScope::All,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            no_bookmarks,
+            "No bookmarked blocks — choose the All filter and search for a block, then use ☆ or Ctrl+Shift+B on the selected result"
+        );
+        assert!(no_bookmarks.contains("choose the All filter and search for a block"));
+
+        assert_eq!(
+            block_search_empty_message(
+                "needle",
+                BlockSearchFilter::Bookmarked,
+                block_mode::BlockSearchScope::Output,
+                true,
+                false,
+                false,
+            ),
+            "Bookmarked blocks have no indexed output text"
+        );
+        assert_eq!(
+            block_search_empty_message(
+                "needle",
+                BlockSearchFilter::Bookmarked,
+                block_mode::BlockSearchScope::Command,
+                true,
+                true,
+                true,
+            ),
+            "No matches in bookmarked blocks · older blocks not indexed"
+        );
+        assert_eq!(
+            block_search_empty_message(
+                "",
+                BlockSearchFilter::Failed,
+                block_mode::BlockSearchScope::Command,
+                false,
+                false,
+                false,
+            ),
+            "Matching blocks have no indexed command text"
+        );
+
+        let cache = vec![
+            block_mode::CachedBlockSearchZone::new(1, Some("build"), Some("\n\n".to_string())),
+            block_mode::CachedBlockSearchZone::new(
+                2,
+                Some("test"),
+                Some("\nmeaningful output".to_string()),
+            ),
+        ];
+        let command_only = std::collections::HashSet::from([1]);
+        assert!(block_search_bookmarks_have_indexed_text(
+            &cache,
+            &command_only,
+            block_mode::BlockSearchScope::Command,
+        ));
+        assert!(!block_search_bookmarks_have_indexed_text(
+            &cache,
+            &command_only,
+            block_mode::BlockSearchScope::Output,
+        ));
+        let output_bookmark = std::collections::HashSet::from([2]);
+        assert!(block_search_bookmarks_have_indexed_text(
+            &cache,
+            &output_bookmark,
+            block_mode::BlockSearchScope::Output,
+        ));
+    }
+
+    #[test]
+    fn block_search_continuous_review_advances_only_after_a_live_reveal() {
+        assert_eq!(
+            block_search_activation(true, false),
+            BlockSearchActivation::Close
+        );
+        assert_eq!(
+            block_search_activation(true, true),
+            BlockSearchActivation::Advance
+        );
+        assert_eq!(
+            block_search_activation(false, false),
+            BlockSearchActivation::RejectStale
+        );
+        assert_eq!(
+            block_search_activation(false, true),
+            BlockSearchActivation::RejectStale
+        );
+    }
+
+    fn history_enter_event(
+        pressed: bool,
+        repeat: bool,
+        location: keyboard::Location,
+    ) -> keyboard::Event {
+        let key = keyboard::Key::Named(Named::Enter);
+        let physical_key =
+            keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified);
+        if pressed {

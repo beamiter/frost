@@ -1,0 +1,300 @@
+                edge,
+                Direction::SouthEast,
+                Interaction::ResizingDiagonallyDown
+            ),
+        ]
+        .width(Length::Fill)
+        .into();
+
+        // Every row has to fill the width explicitly: a `Row` defaults to
+        // `Shrink`, which would collapse the fill between the grips and bunch
+        // them all against the left border instead of hugging it.
+        column![top, middle, bottom]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// Draggable vertical strip between the dock and the terminal body. Pressing
+    /// it starts a width-resize drag (continued via the row's `on_move`).
+    fn sidebar_divider(&self) -> Element<'_, Message> {
+        let strip = container(Space::new())
+            .width(Length::Fixed(DIVIDER))
+            .height(Length::Fill);
+        mouse_area(strip.style(self.divider_style(self.dragging_sidebar)))
+            .on_press(Message::SidebarDragStart)
+            .interaction(iced::mouse::Interaction::ResizingHorizontally)
+            .into()
+    }
+
+    /// File-tree panel body. Directories toggle expand/collapse on click; files
+    /// type their (quoted) path into the active terminal. A location picker
+    /// switches the tree between this machine and the configured remote hosts;
+    /// right-clicking a row (or the empty area below it) opens the file-ops
+    /// menu.
+    fn sidebar_files_view(&self) -> Element<'_, Message> {
+        let title = crate::sidebar::bound_sidebar_filename(
+            self.sidebar
+                .current_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("/"),
+        );
+        let mut back_button = button(text("←").size(self.chrome_font_size()))
+            .padding([2, 6])
+            .style(self.ghost_btn_style());
+        if self.sidebar.can_navigate_back() {
+            back_button = back_button.on_press(Message::SidebarGoBack);
+        }
+        let back = tooltip(
+            back_button,
+            container(
+                text("Back (Alt+Left over Files or while Files focused)")
+                    .size(self.chrome_font_size()),
+            )
+            .padding(6)
+            .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        let mut forward_button = button(text("→").size(self.chrome_font_size()))
+            .padding([2, 6])
+            .style(self.ghost_btn_style());
+        if self.sidebar.can_navigate_forward() {
+            forward_button = forward_button.on_press(Message::SidebarGoForward);
+        }
+        let forward = tooltip(
+            forward_button,
+            container(
+                text("Forward (Alt+Right over Files or while Files focused)")
+                    .size(self.chrome_font_size()),
+            )
+            .padding(6)
+            .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        let mut up_button = button(text("↑").size(self.chrome_font_size()))
+            .padding([2, 6])
+            .style(self.ghost_btn_style());
+        if self.sidebar.current_dir.parent().is_some() {
+            up_button = up_button.on_press(Message::SidebarGoParent);
+        }
+        let up = tooltip(
+            up_button,
+            container(
+                text("Parent directory (Alt+Up over Files or while Files focused)")
+                    .size(self.chrome_font_size()),
+            )
+            .padding(6)
+            .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        let mut home_button = button(text("⌂").size(self.chrome_font_size()))
+            .padding([2, 6])
+            .style(self.ghost_btn_style());
+        if self
+            .sidebar
+            .home_dir()
+            .is_some_and(|home| home != self.sidebar.current_dir.as_path())
+        {
+            home_button = home_button.on_press(Message::SidebarGoHome);
+        }
+        let home = tooltip(
+            home_button,
+            container(
+                text("Location home (Alt+Home over Files or while Files focused)")
+                    .size(self.chrome_font_size()),
+            )
+            .padding(6)
+            .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        let filter_active = self.sidebar_filter.is_some();
+        let filter_btn = button(text("⌕").size(self.chrome_font_size()))
+            .on_press(Message::SidebarFilterToggle)
+            .padding([2, 6])
+            .style(self.tab_btn_style(filter_active));
+        let hidden_active = self.sidebar.show_hidden();
+        let hidden_btn = tooltip(
+            button(text("Hidden").size(self.chrome_font_size()))
+                .on_press(Message::SidebarShowHidden(!hidden_active))
+                .padding([2, 6])
+                .style(self.tab_btn_style(hidden_active)),
+            container(text("Show or hide dot-prefixed files").size(self.chrome_font_size()))
+                .padding(6)
+                .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        let refresh_help = {
+            let mut lines =
+                vec!["Refresh files (F5 while over Files or while Files focused)".to_string()];
+            if let Some(timing) = self.sidebar_scans.last_timing() {
+                lines.push(format!(
+                    "Last scan: queued {} · ran {}",
+                    compact_scan_duration(timing.queued_for),
+                    compact_scan_duration(timing.ran_for)
+                ));
+            }
+            lines.join("\n")
+        };
+        let refresh_btn = tooltip(
+            button(text("↻").size(self.chrome_font_size()))
+                .on_press(Message::SidebarRefresh)
+                .padding([2, 6])
+                .style(self.ghost_btn_style()),
+            container(
+                text(refresh_help)
+                    .size(self.chrome_font_size())
+                    .wrapping(text::Wrapping::Word),
+            )
+            .padding(6)
+            .max_width(360)
+            .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        let nav_row = row![
+            back,
+            forward,
+            up,
+            home,
+            button(text(title).size(self.chrome_font_size()).font(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..iced::Font::DEFAULT
+            }))
+            .on_press(Message::SidebarPathEdit)
+            .padding([2, 4])
+            .width(Length::Fill)
+            .style(self.ghost_btn_style()),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center);
+        let action_row = row![filter_btn, hidden_btn, refresh_btn]
+            .spacing(4)
+            .align_y(iced::Alignment::Center);
+        let header = column![nav_row.wrap(), action_row.wrap()].spacing(2);
+        let (terminal_label, terminal_help) = sidebar_terminal_entry_copy(&self.sidebar.location);
+        let terminal_entry = tooltip(
+            button(text(terminal_label).size(self.chrome_font_size()))
+                .on_press(Message::SidebarOpenTerminal(self.sidebar.generation()))
+                .padding([3, 7])
+                .width(Length::Fill)
+                .style(self.ghost_btn_style()),
+            container(
+                text(terminal_help)
+                    .size(self.chrome_font_size())
+                    .wrapping(text::Wrapping::Word),
+            )
+            .padding(6)
+            .max_width(360)
+            .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        let mut rows: Vec<Element<'_, Message>> = vec![
+            container(header).padding([4, 6]).into(),
+            container(terminal_entry)
+                .padding([2, 6])
+                .width(Length::Fill)
+                .into(),
+        ];
+        if let Some(path) = &self.sidebar_path_input {
+            rows.insert(
+                1,
+                container(
+                    row![
+                        text_input("Absolute path…", path)
+                            .id(SIDEBAR_PATH_INPUT_ID.clone())
+                            .on_input(Message::SidebarPathInput)
+                            .on_submit(Message::SidebarPathSubmit)
+                            .size(self.chrome_font_size()),
+                        button(text("Go").size(self.chrome_font_size()))
+                            .on_press(Message::SidebarPathSubmit)
+                            .padding([2, 6])
+                            .style(self.ghost_btn_style()),
+                        button(text("×").size(self.chrome_font_size()))
+                            .on_press(Message::SidebarPathCancel)
+                            .padding([2, 5])
+                            .style(self.ghost_btn_style()),
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding([2, 6])
+                .into(),
+            );
+        } else {
+            let mut crumbs: Vec<Element<'_, Message>> = Vec::new();
+            for (index, (label, path)) in sidebar_breadcrumbs(&self.sidebar.current_dir, 4)
+                .into_iter()
+                .enumerate()
+            {
+                if index > 0 {
+                    crumbs.push(
+                        text("›")
+                            .size(self.chrome_font_size())
+                            .style(text::secondary)
+                            .into(),
+                    );
+                }
+                let mut crumb = button(text(label).size(self.chrome_font_size()))
+                    .padding([1, 4])
+                    .style(self.ghost_btn_style());
+                if path != self.sidebar.current_dir {
+                    crumb = crumb.on_press(Message::SidebarNavigatePath(path));
+                }
+                crumbs.push(crumb.into());
+            }
+            rows.insert(
+                1,
+                container(iced::widget::Row::with_children(crumbs).spacing(2))
+                    .padding([1, 6])
+                    .into(),
+            );
+        }
+        if self.sidebar.navigation_pending_target().is_some()
+            || self.sidebar.location_change_pending()
+        {
+            rows.push(
+                container(
+                    text("Opening folder… current files stay available until it succeeds")
+                        .size(self.chrome_font_size())
+                        .style(text::secondary),
+                )
+                .padding([1, 8])
+                .into(),
+            );
+        }
+        let queued_scans = self.sidebar_scans.queued_len();
+        let running_scans = self.sidebar_scans.running_len();
+        // The inline filter row: substring match over the loaded tree,
+        // local and remote alike; Esc or the toggle closes and clears it.
+        if let Some(query) = &self.sidebar_filter {
+            rows.push(
+                container(
+                    text_input("Filter names…", query)
+                        .id(SIDEBAR_FILTER_INPUT_ID.clone())
+                        .on_input(Message::SidebarFilterInput)
+                        .size(self.chrome_font_size()),
+                )
+                .padding([2, 6])
+                .into(),
+            );
+        }
+        // The location picker only exists once at least one remote host is
+        // configured; with none, "Local" would be the only entry.
+        if !self.config.remote_hosts.is_empty()
+            || matches!(self.sidebar.location, remote_fs::FsLocation::Transient(_))
+        {
+            let mut choices = vec![SidebarLocationChoice {
+                location: remote_fs::FsLocation::Local,
+                label: remote_fs::FsLocation::Local.label(&self.config.remote_hosts),
+            }];
+            for index in 0..self.config.remote_hosts.len().min(config::MAX_REMOTE_HOSTS) {
+                let location = remote_fs::FsLocation::Remote(index);
+                choices.push(SidebarLocationChoice {
+                    label: location.label(&self.config.remote_hosts),
+                    location,
+                });
+            }
+            if let remote_fs::FsLocation::Transient(profile) = &self.sidebar.location {
+                let location = remote_fs::FsLocation::Transient(profile.clone());
+                choices.push(SidebarLocationChoice {
+                    label: location.label(&self.config.remote_hosts),

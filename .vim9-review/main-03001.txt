@@ -1,0 +1,300 @@
+        BlockMenuAction::ReinputSelected => Some("Review first; insert only after confirmation"),
+        _ => None,
+    }
+}
+
+/// Menu labels teach only the real equivalent keyboard action, never a default.
+fn block_menu_shortcut_command(action: BlockMenuAction) -> Option<&'static str> {
+    Some(match action {
+        BlockMenuAction::CopyCommand => "block:copy_command",
+        BlockMenuAction::CopyOutput => "block:copy_output",
+        BlockMenuAction::CopyBlock => "block:copy_block",
+        BlockMenuAction::CopyMarkdown => "block:copy_markdown",
+        BlockMenuAction::RecallCommand => "block:recall_command",
+        BlockMenuAction::ReinputSelected => "block:reinput_selected_commands",
+        BlockMenuAction::ToggleBookmark => "block:toggle_bookmark",
+        BlockMenuAction::Search => "block:search",
+        BlockMenuAction::CollapseOutput | BlockMenuAction::ExpandOutput => "block:toggle_collapse",
+        _ => return None,
+    })
+}
+
+/// Which fresh Agent task a failed block starts (ember's Fix/Explain).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailedBlockAgentIntent {
+    Fix,
+    Explain,
+}
+
+/// Stable, counted target for the destructive Clear Blocks confirmation.
+/// The count is part of the confirmation contract: if PTY output completes or
+/// evicts a block while the modal is open, confirmation is re-armed with the
+/// new count instead of deleting a different set than the user reviewed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockClearConfirmation {
+    session_id: usize,
+    block_count: usize,
+    latest_zone_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockClearResolution {
+    Clear,
+    Refresh(BlockClearConfirmation),
+    Empty,
+    Stale,
+}
+
+impl BlockClearConfirmation {
+    fn new(session_id: usize, block_count: usize, latest_zone_id: Option<u64>) -> Option<Self> {
+        let latest_zone_id = latest_zone_id.filter(|_| block_count > 0)?;
+        Some(Self {
+            session_id,
+            block_count,
+            latest_zone_id,
+        })
+    }
+
+    /// Revalidate immediately before deletion against the active pane and its
+    /// current finalized-zone count/newest id. A focus or history change fails
+    /// closed or requires a second, freshly counted confirmation.
+    fn resolve(self, active: Option<(usize, usize, Option<u64>)>) -> BlockClearResolution {
+        let Some((session_id, block_count, latest_zone_id)) = active else {
+            return BlockClearResolution::Stale;
+        };
+        if session_id != self.session_id {
+            return BlockClearResolution::Stale;
+        }
+        if block_count == 0 {
+            return BlockClearResolution::Empty;
+        }
+        let Some(latest_zone_id) = latest_zone_id else {
+            return BlockClearResolution::Empty;
+        };
+        if block_count != self.block_count || latest_zone_id != self.latest_zone_id {
+            return BlockClearResolution::Refresh(
+                Self::new(session_id, block_count, Some(latest_zone_id))
+                    .expect("a positive live block count has a newest zone"),
+            );
+        }
+        BlockClearResolution::Clear
+    }
+}
+
+/// Which content the left sidebar dock currently shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarPanel {
+    /// File-tree browser (doubles as a path picker).
+    Files,
+    /// Vertical session tab list.
+    Tabs,
+    /// Experimental agent Tasks dashboard (config-gated).
+    Tasks,
+}
+
+/// Actions of the file tree's right-click menu. New File/New Folder/Paste act
+/// inside the clicked directory (or the clicked file's parent); Rename/
+/// Delete/Copy/Cut act on the clicked node itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarMenuAction {
+    OpenDirectory,
+    NewFile,
+    NewFolder,
+    Rename,
+    Delete,
+    Copy,
+    Cut,
+    CopyPath,
+    Paste,
+    Refresh,
+}
+
+fn sidebar_menu_action_label(action: SidebarMenuAction, multi: usize) -> String {
+    match action {
+        SidebarMenuAction::OpenDirectory => "Open Folder".to_string(),
+        SidebarMenuAction::NewFile => "New File".to_string(),
+        SidebarMenuAction::NewFolder => "New Folder".to_string(),
+        SidebarMenuAction::Rename => "Rename".to_string(),
+        SidebarMenuAction::Delete => format!(
+            "Delete {multi} {}",
+            if multi == 1 { "item" } else { "items" }
+        ),
+        SidebarMenuAction::Copy => "Copy".to_string(),
+        SidebarMenuAction::Cut => "Cut".to_string(),
+        SidebarMenuAction::CopyPath => {
+            if multi > 1 {
+                "Copy Paths".to_string()
+            } else {
+                "Copy Path".to_string()
+            }
+        }
+        SidebarMenuAction::Paste => "Paste".to_string(),
+        SidebarMenuAction::Refresh => "Refresh".to_string(),
+    }
+}
+
+/// Open file-tree context menu: the right-clicked node, the pointer position
+/// frozen at press time, and the rows the actions apply to — the selection
+/// when the click landed inside it, otherwise just the clicked row.
+#[derive(Clone, Debug)]
+struct SidebarMenuState {
+    path: std::path::PathBuf,
+    is_dir: bool,
+    at: iced::Point,
+    targets: Vec<(std::path::PathBuf, bool)>,
+    /// File-tree identity at the right press. Root/location changes make this
+    /// menu and every dialog derived from it inert.
+    generation: u64,
+    /// Exact Copy/Cut intent visible when the menu opened. Paste must not
+    /// silently substitute a newer clipboard, even when its payload is equal.
+    clipboard_id: Option<u64>,
+    /// Keyboard cursor into the enabled-skipping action list.
+    cursor: usize,
+}
+
+/// What the sidebar's modal text input is collecting a name for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarDialogKind {
+    NewFile,
+    NewFolder,
+    Rename,
+}
+
+/// Modal New File / New Folder / Rename input. `path` is the target directory
+/// for creates and the node being renamed for Rename; `error` shows the last
+/// failed validation inline.
+#[derive(Clone, Debug)]
+struct SidebarDialogState {
+    kind: SidebarDialogKind,
+    path: std::path::PathBuf,
+    input: String,
+    error: Option<String>,
+    generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct SidebarDeleteConfirmation {
+    paths: Vec<std::path::PathBuf>,
+    generation: u64,
+}
+
+/// Location-scoped sidebar clipboard: one or more items (path, is_dir).
+/// Paste within the same location copies or moves each item; paste across
+/// locations downloads, uploads, or relays them one by one.
+#[derive(Clone, Debug)]
+struct FsClipboard {
+    id: u64,
+    loc: remote_fs::FsLocation,
+    items: Vec<(std::path::PathBuf, bool)>,
+    cut: bool,
+}
+
+fn next_sidebar_clipboard_id(current: u64) -> Option<u64> {
+    current.checked_add(1)
+}
+
+fn next_sidebar_context_epoch(current: Option<u64>) -> Option<u64> {
+    current.and_then(|epoch| epoch.checked_add(1))
+}
+
+/// Retire only sources that the backend proved were moved, renamed, or
+/// deleted, and only from the exact Copy/Cut intent the worker observed when
+/// dispatching. A later intent survives even if it has an identical payload.
+/// Invalidating a directory also invalidates any explicitly selected
+/// descendants.
+fn settle_sidebar_clipboard_sources(
+    clipboard: &mut Option<FsClipboard>,
+    consumed_id: Option<u64>,
+    consumed_paths: &[std::path::PathBuf],
+) {
+    let Some(consumed_id) = consumed_id else {
+        return;
+    };
+    let Some(active) = clipboard.as_mut() else {
+        return;
+    };
+    if active.id != consumed_id || consumed_paths.is_empty() {
+        return;
+    }
+    active.items.retain(|(path, _)| {
+        !consumed_paths
+            .iter()
+            .any(|consumed| path == consumed || path.starts_with(consumed))
+    });
+    if active.items.is_empty() {
+        *clipboard = None;
+    }
+}
+
+fn sidebar_menu_clipboard_is_current(
+    opened_clipboard_id: Option<u64>,
+    live_clipboard_id: Option<u64>,
+) -> bool {
+    opened_clipboard_id == live_clipboard_id
+}
+
+fn sidebar_clipboard_id_at_location(
+    clipboard: Option<&FsClipboard>,
+    location: &remote_fs::FsLocation,
+) -> Option<u64> {
+    clipboard
+        .filter(|clipboard| &clipboard.loc == location)
+        .map(|clipboard| clipboard.id)
+}
+
+/// Rebind one location across a remote-host config replacement by the complete
+/// old profile identity, never by its numeric slot. Exactly one active match is
+/// required: removal, any profile edit, an out-of-range old slot, or duplicate
+/// identities all fail closed.
+fn unique_active_remote_profile_index(
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    expected: &jterm_core::jsh_remote::RemoteHostConfig,
+) -> Option<usize> {
+    config::validate_remote_host(expected).ok()?;
+    let mut matches = hosts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, profile)| (profile == expected).then_some(index));
+    let only = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    config::validate_remote_host_at(hosts, only).ok()?;
+    Some(only)
+}
+
+fn same_ssh_files_transport(
+    configured: &jterm_core::jsh_remote::RemoteHostConfig,
+    observed: &jterm_core::jsh_remote::RemoteHostConfig,
+) -> bool {
+    !configured.docker && !observed.docker && remote_fs::same_files_transport(configured, observed)
+}
+
+fn unique_active_ssh_transport_index(
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    observed: &jterm_core::jsh_remote::RemoteHostConfig,
+) -> Option<usize> {
+    let mut matches = hosts
+        .iter()
+        .take(config::MAX_REMOTE_HOSTS)
+        .enumerate()
+        .filter_map(|(index, configured)| {
+            (config::validate_remote_host_at(hosts, index).is_ok()
+                && same_ssh_files_transport(configured, observed))
+            .then_some(index)
+        });
+    let only = matches.next()?;
+    matches.next().is_none().then_some(only)
+}
+
+fn interactive_ssh_argv(profile: &jterm_core::jsh_remote::RemoteHostConfig) -> Vec<String> {
+    let mut argv = vec!["ssh".to_string()];
+    argv.extend(profile.ssh_args.iter().cloned());
+    argv.push("--".to_string());
+    argv.push(match &profile.user {
+        Some(user) => format!("{user}@{}", profile.host),
+        None => profile.host.clone(),
+    });
+    argv
+}
+

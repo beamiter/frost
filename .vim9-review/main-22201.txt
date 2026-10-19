@@ -1,0 +1,300 @@
+            body = body.push(
+                container(
+                    text(
+                        "This pane has no command blocks yet — block capture needs a shell that \
+                     reports commands (OSC 133); run \"Install or update jsh\" from the \
+                     command palette",
+                    )
+                    .size(self.effective_font_size())
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::secondary),
+                )
+                .id(block_search_layout::FEEDBACK_ID),
+            );
+        } else if state.hits.is_empty() {
+            let has_bookmarked_indexed_text = block_search_bookmarks_have_indexed_text(
+                &state.cache,
+                &bookmarked_zone_ids,
+                state.scope,
+            );
+            let empty = if state.filter == BlockSearchFilter::Unread && filter_counts[5] == 0 {
+                "No unread blocks. New completions appear here while you read older output; Go live marks them seen.".to_string()
+            } else {
+                block_search_empty_message(
+                    &state.query,
+                    state.filter,
+                    state.scope,
+                    !bookmarked_zone_ids.is_empty(),
+                    has_bookmarked_indexed_text,
+                    state.older_not_indexed,
+                )
+            };
+            body = body.push(
+                container(
+                    text(empty)
+                        .size(self.effective_font_size())
+                        .style(text::secondary),
+                )
+                .id(block_search_layout::FEEDBACK_ID),
+            );
+        } else {
+            // A rebuild in flight leaves the previous hits on screen so the
+            // picker does not blank out, but they must be unmistakably stale:
+            // every path that acts on one is refused until the rebuild lands.
+            body = body.push(
+                text(if state.busy() {
+                    format!("{} · updating…", state.count_label())
+                } else {
+                    state.count_label()
+                })
+                .size(self.effective_font_size())
+                .style(if state.busy() {
+                    text::warning
+                } else {
+                    text::secondary
+                }),
+            );
+            let stale = state.busy();
+            let window = block_mode::block_search_view_window(
+                state.hits.len(),
+                state.selected,
+                BLOCK_SEARCH_VISIBLE_ROWS,
+            );
+            let mut list = column![].spacing(2);
+            for (offset, hit) in state.hits[window.clone()].iter().enumerate() {
+                let pos = window.start + offset;
+                let selected = pos == state.selected;
+                // On a command hit `line_text` already IS the command line,
+                // so repeating the preview here spent the only secondary line
+                // restating what is directly above it. Spend it on the
+                // block's outcome instead.
+                let mut context = if hit.is_output_line {
+                    let command = if hit.command_preview.is_empty() {
+                        "(no command)".to_string()
+                    } else {
+                        block_mode::display_block_search_text(&hit.command_preview)
+                    };
+                    format!("{command} · L{}", hit.line_no)
+                } else {
+                    "command".to_string()
+                };
+                if let Some(badge) = zone_badges
+                    .get(&hit.zone_id)
+                    .filter(|badge| !badge.is_empty())
+                {
+                    context.push_str(" · ");
+                    context.push_str(badge);
+                }
+                let info = column![
+                    text(block_mode::display_block_search_text(&hit.line_text))
+                        .size(self.effective_font_size())
+                        .wrapping(text::Wrapping::None)
+                        .style(if stale {
+                            text::secondary
+                        } else {
+                            text::default
+                        }),
+                    text(block_mode::display_block_search_text(&context))
+                        .size(self.effective_font_size())
+                        .wrapping(text::Wrapping::None)
+                        .style(text::secondary),
+                ]
+                .spacing(1)
+                .width(Length::Fill);
+                let bookmarked = bookmarked_zone_ids.contains(&hit.zone_id);
+                let bookmark_help = block_search_bookmark_button_help(bookmarked, stale);
+                let bookmark_button = button(
+                    text(block_search_bookmark_button_text(bookmarked))
+                        .size(self.effective_font_size()),
+                )
+                .padding([5, 8])
+                .style(button::text);
+                let bookmark_button = if stale {
+                    bookmark_button
+                } else {
+                    bookmark_button.on_press(Message::BlockSearchToggleBookmark(hit.clone()))
+                };
+                let bookmark_button = tooltip(
+                    bookmark_button,
+                    container(text(bookmark_help).size(self.effective_font_size()))
+                        .padding(6)
+                        .style(container::rounded_box),
+                    tooltip::Position::Left,
+                );
+                let accent = self.c_accent();
+                let jump_target = mouse_area(
+                    container(info)
+                        .width(Length::Fill)
+                        .padding([3, 8])
+                        .clip(true),
+                );
+                let jump_target = if stale {
+                    jump_target
+                } else {
+                    jump_target.on_press(Message::BlockSearchAccept(hit.clone()))
+                };
+                let row_body = container(
+                    row![jump_target, bookmark_button]
+                        .width(Length::Fill)
+                        .align_y(iced::Alignment::Center),
+                )
+                .width(Length::Fill)
+                .style(move |_t: &iced::Theme| container::Style {
+                    background: if selected {
+                        Some(iced::Background::Color(Color { a: 0.28, ..accent }))
+                    } else {
+                        None
+                    },
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+                list = list.push(if selected {
+                    row_body.id(block_search_layout::SELECTED_ID)
+                } else {
+                    row_body
+                });
+            }
+            body = if compact {
+                body.push(list)
+            } else {
+                body.push(
+                    scrollable(list)
+                        .id(BLOCK_SEARCH_LIST_ID.clone())
+                        .height(Length::Fill),
+                )
+            };
+        }
+        // The overlay owns every key while it is open, so the chips and
+        // toggles above are otherwise reachable only with the mouse.
+        if let Some(notice) = state.bookmark_notice {
+            body = body.push(text(notice.label()).size(self.effective_font_size()).style(
+                match notice {
+                    BlockSearchBookmarkNotice::Busy | BlockSearchBookmarkNotice::Stale => {
+                        text::warning
+                    }
+                    _ => text::secondary,
+                },
+            ));
+        }
+        body = body.push(
+            text(BLOCK_SEARCH_KEYBOARD_HELP)
+                .size(self.effective_font_size())
+                .wrapping(text::Wrapping::Word)
+                .style(text::secondary),
+        );
+
+        let body = if compact {
+            column![
+                query_line(),
+                scrollable(body)
+                    .id(block_search_layout::SCROLL_ID)
+                    .spacing(4)
+                    .height(Length::Fill)
+            ]
+            .spacing(8)
+        } else {
+            body
+        };
+        let panel = container(body)
+            .id(block_search_layout::PANEL_ID)
+            .width(Length::Fixed(panel_size.width))
+            .max_height(panel_size.height)
+            .height(Length::Fixed(panel_size.height))
+            .padding(12)
+            .style(container::dark);
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::BlockSearchClose);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
+    /// Persistent navigation for the active pane, outside the projected grid.
+    fn block_reading_bar(&self) -> Element<'_, Message> {
+        let sess = &self.sessions[self.active];
+        let reading = sess.projection.scroll_offset() > 0 || !sess.block_selection.is_empty();
+        let unseen = sess
+            .block_reading
+            .unseen(sess.terminal.command_zones.iter().map(|z| z.id));
+        let status = if reading {
+            format!(
+                "Reading · {} selected · {unseen} new",
+                sess.block_selection.len()
+            )
+        } else {
+            format!("Live · {} blocks", sess.terminal.command_zones.len())
+        };
+        let control = |label: &'static str, message, enabled: bool| {
+            let ghost = self.ghost_btn_style();
+            button(text(label).size(self.effective_font_size()))
+                .on_press_maybe(enabled.then_some(message))
+                .padding([4, 7])
+                .style(move |theme, status| {
+                    let mut style = ghost(theme, status);
+                    if status == button::Status::Disabled {
+                        style.text_color.a *= 0.4;
+                    }
+                    style
+                })
+        };
+        let live_ids: Vec<_> = sess.terminal.command_zones.iter().map(|z| z.id).collect();
+        let navigation = row![
+            control(
+                "Back",
+                Message::BlockReadingNavigate(true),
+                sess.block_reading.can_navigate(&live_ids, true)
+            ),
+            control(
+                "Forward",
+                Message::BlockReadingNavigate(false),
+                sess.block_reading.can_navigate(&live_ids, false)
+            ),
+            control("Browse", Message::BlockBrowse, !live_ids.is_empty()),
+            control("Details", Message::BlockReviewOpen, !live_ids.is_empty()),
+            control(
+                "Review selection",
+                Message::BlockReviewSelected,
+                !sess.block_selection.is_empty()
+            ),
+        ]
+        .spacing(3)
+        .wrap();
+        let content: Element<'_, Message> = if sess.terminal.is_alt_buffer_active() {
+            column![
+                text("Block review paused · alternate screen").size(self.effective_font_size()),
+                text("Return to the shell to review retained blocks.")
+                    .size(self.effective_font_size())
+            ]
+            .spacing(4)
+            .into()
+        } else {
+            column![
+                row![
+                    text(status).size(self.effective_font_size()),
+                    Space::new().width(Length::Fill),
+                    control("Go live", Message::BlockGoLive, reading)
+                ]
+                .align_y(iced::Alignment::Center),
+                navigation
+            ]
+            .spacing(3)
+            .into()
+        };
+        container(content)
+            .padding([4, 10])
+            .width(Length::Fill)
+            .height(Length::Fixed(self.block_reading_bar_height()))
+            .style(container::dark)
+            .into()
+    }
+
+    fn block_details_snapshot(
+        terminal: &terminal::TerminalState,

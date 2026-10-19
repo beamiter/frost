@@ -1,0 +1,300 @@
+            .terminal
+            .command_zones
+            .iter()
+            .map(|zone| zone.id)
+            .collect();
+        sess.block_bookmarks.retain(&ids);
+        if !ids.contains(&zone_id) {
+            self.push_toast("Block is no longer retained".to_string(), ToastKind::Info);
+            return Task::none();
+        }
+        let bookmarked = sess.block_bookmarks.toggle(zone_id);
+        sess.refresh();
+        self.push_toast(
+            if bookmarked {
+                "Bookmarked block"
+            } else {
+                "Removed block bookmark"
+            },
+            ToastKind::Success,
+        );
+        Task::none()
+    }
+
+    /// Fold or unfold the selected block's output.
+    ///
+    /// The context menu folds the block under the pointer; a chord and the
+    /// palette have no pointer, so this targets the *selection* only. Reusing
+    /// the copy verbs' "newest block" fallback would let one keypress fold
+    /// output the user is reading, in a pane they may not even be looking at.
+    fn block_toggle_selected_collapse(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Collapse output") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+        // Reconcile first: a selection the retention policy has since evicted
+        // is not a live target.
+        let selected = sess
+            .block_selection
+            .active()
+            .filter(|&id| sess.terminal.zone_by_id(id).is_some());
+        let decision = block_mode::collapse_toggle(
+            selected,
+            selected.is_some_and(|id| sess.projection_policy.is_collapsed(id)),
+            selected.is_some_and(|id| sess.terminal.finished_output_range(id).is_some()),
+        );
+        let changed = match (decision, selected) {
+            (block_mode::CollapseToggle::Collapse, Some(id)) => sess.projection_policy.collapse(id),
+            (block_mode::CollapseToggle::Expand, Some(id)) => sess.projection_policy.expand(id),
+            _ => false,
+        };
+        if changed {
+            sess.refresh();
+            self.refresh_active_context();
+            return Task::none();
+        }
+        match decision {
+            block_mode::CollapseToggle::NoSelection => self.push_toast(
+                "Select a block first (Ctrl+↑, or click its command line)",
+                ToastKind::Info,
+            ),
+            block_mode::CollapseToggle::NoRetainedOutput => self.push_toast(
+                "Nothing to collapse: this block has no retained output",
+                ToastKind::Info,
+            ),
+            // The policy already held the requested state.
+            block_mode::CollapseToggle::Collapse | block_mode::CollapseToggle::Expand => {}
+        }
+        Task::none()
+    }
+
+    fn block_toggle_target_bookmark(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Block bookmark") {
+            return Task::none();
+        }
+        let target = self.sessions.get_mut(self.active).and_then(|sess| {
+            let ids: Vec<u64> = sess
+                .terminal
+                .command_zones
+                .iter()
+                .map(|zone| zone.id)
+                .collect();
+            sess.block_selection.retain(&ids);
+            active_bookmark_target(&ids, sess.block_selection.active())
+        });
+        let Some(id) = target else {
+            self.push_toast(
+                "Select a block to toggle its bookmark".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        };
+        self.block_toggle_bookmark(id)
+    }
+
+    fn block_jump_bookmark(&mut self, older: bool) -> Task<Message> {
+        if !self.ensure_block_action_available("Block bookmark navigation") {
+            return Task::none();
+        }
+        let target = {
+            let Some(sess) = self.sessions.get_mut(self.active) else {
+                return Task::none();
+            };
+            let ids: Vec<u64> = sess
+                .terminal
+                .command_zones
+                .iter()
+                .map(|zone| zone.id)
+                .collect();
+            let current = sess.block_selection.active();
+            sess.block_bookmarks.neighbor(&ids, current, older)
+        };
+        match target {
+            Some(id) => self.select_and_reveal_block(id),
+            None => self.push_toast("No bookmarked command blocks".to_string(), ToastKind::Info),
+        }
+        Task::none()
+    }
+
+    /// Dispatch a context-menu action against the stable pane/zone captured by
+    /// the right-click. Focus changes and bounded-history eviction fail closed
+    /// instead of silently applying the action to another pane's same id.
+    fn execute_block_menu_action(&mut self, action: BlockMenuAction) -> Task<Message> {
+        let Some(menu) = self.block_menu.take() else {
+            return Task::none();
+        };
+        if action == BlockMenuAction::Close {
+            return Task::none();
+        }
+        if menu.chat_read_only {
+            return self.execute_chat_read_only_menu_action(menu, action);
+        }
+        // Fix/Explain/Retry look the source session up by its stable id rather
+        // than through the focused pane: the Agent task or replay stays bound
+        // to the terminal that produced the block even when focus moved after
+        // the menu opened.
+        match action {
+            BlockMenuAction::FixWithAgent => {
+                return self.failed_block_agent_task(
+                    menu.session_id,
+                    menu.zone_id,
+                    FailedBlockAgentIntent::Fix,
+                );
+            }
+            BlockMenuAction::ExplainWithAgent => {
+                return self.failed_block_agent_task(
+                    menu.session_id,
+                    menu.zone_id,
+                    FailedBlockAgentIntent::Explain,
+                );
+            }
+            BlockMenuAction::Retry => {
+                return self.failed_block_retry_task(menu.session_id, menu.zone_id);
+            }
+            BlockMenuAction::CreateTask => {
+                self.task_create_from_block(menu.session_id, menu.zone_id);
+                return Task::none();
+            }
+            _ => {}
+        }
+        let target_is_live = self.sessions.get(self.active).is_some_and(|sess| {
+            sess.id == menu.session_id && sess.terminal.zone_by_id(menu.zone_id).is_some()
+        });
+        if !target_is_live {
+            self.push_toast(
+                "Block menu target is no longer available".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
+        match action {
+            BlockMenuAction::Details => self.open_block_review(Some(menu.zone_id)),
+            BlockMenuAction::CopyCommand => self.block_copy_command_task(),
+            BlockMenuAction::AskAi => self.block_ask_ai_task(menu.zone_id),
+            BlockMenuAction::CopyOutput => self.block_copy_output_task(),
+            BlockMenuAction::CopyBlock => self.block_copy_block_task(),
+            BlockMenuAction::CopyMarkdown => self.block_copy_markdown_task(),
+            BlockMenuAction::RecallCommand => {
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    sess.block_selection.replace(Some(menu.zone_id));
+                }
+                self.block_recall_command_task()
+            }
+            BlockMenuAction::ReinputSelected => self.block_reinput_selected_commands_task(),
+            BlockMenuAction::ToggleBookmark => self.block_toggle_bookmark(menu.zone_id),
+            BlockMenuAction::JumpTop => self.block_reveal_edge(menu.zone_id, false),
+            BlockMenuAction::JumpBottom => self.block_reveal_edge(menu.zone_id, true),
+            BlockMenuAction::Search => self.toggle_block_search(),
+            BlockMenuAction::ExportMarkdown => self
+                .block_export_zone_task(menu.zone_id, block_export::SessionExportFormat::Markdown),
+            BlockMenuAction::ExportJson => {
+                self.block_export_zone_task(menu.zone_id, block_export::SessionExportFormat::Json)
+            }
+            BlockMenuAction::CollapseOutput => {
+                let changed = self.sessions.get_mut(self.active).is_some_and(|sess| {
+                    sess.id == menu.session_id
+                        && !sess.projection_policy.is_collapsed(menu.zone_id)
+                        && sess.terminal.finished_output_range(menu.zone_id).is_some()
+                        && sess.projection_policy.collapse(menu.zone_id)
+                });
+                if changed {
+                    if let Some(sess) = self.sessions.get_mut(self.active) {
+                        sess.refresh();
+                    }
+                    self.refresh_active_context();
+                }
+                Task::none()
+            }
+            BlockMenuAction::ExpandOutput => {
+                let changed = self.sessions.get_mut(self.active).is_some_and(|sess| {
+                    sess.id == menu.session_id
+                        // Requested state remains user-recoverable even when
+                        // stale/overlapping provenance made it ineffective.
+                        && sess.projection_policy.is_collapsed(menu.zone_id)
+                        && sess.projection_policy.expand(menu.zone_id)
+                });
+                if changed {
+                    if let Some(sess) = self.sessions.get_mut(self.active) {
+                        sess.refresh();
+                    }
+                    self.refresh_active_context();
+                }
+                Task::none()
+            }
+            BlockMenuAction::Clear => self.request_block_clear(),
+            BlockMenuAction::UndoClear => self.undo_block_clear(),
+            // Returned by the stable-id dispatch above, before the focus-bound
+            // liveness check these remaining actions require.
+            BlockMenuAction::Close
+            | BlockMenuAction::FixWithAgent
+            | BlockMenuAction::ExplainWithAgent
+            | BlockMenuAction::CreateTask
+            | BlockMenuAction::Retry => Task::none(),
+        }
+    }
+
+    fn chat_card_copy_text(
+        terminal: &terminal::TerminalState,
+        id: u64,
+        action: BlockMenuAction,
+    ) -> Result<String, block_mode::SelectedClipboardError> {
+        use block_mode::{
+            ClipboardOutput, SelectedClipboardError as Error, SelectedClipboardMode as Mode,
+        };
+        let zone = terminal
+            .zone_by_id(id)
+            .filter(|zone| !zone.rows_evicted)
+            .ok_or(Error::Empty)?;
+        let mut selection = block_mode::BlockSelection::default();
+        selection.replace(Some(id));
+        if action == BlockMenuAction::CopyMarkdown {
+            return block_mode::selected_markdown_text(
+                [(id, Self::block_markdown(terminal, zone))],
+                &selection,
+                block_mode::SELECTED_CLIPBOARD_MAX_BYTES,
+            )
+            .map(|copied| copied.text);
+        }
+        let mode = match action {
+            BlockMenuAction::CopyCommand => Mode::Commands,
+            BlockMenuAction::CopyOutput => Mode::Outputs,
+            BlockMenuAction::CopyBlock => Mode::Blocks,
+            _ => return Err(Error::Empty),
+        };
+        let output = if mode == Mode::Commands {
+            ClipboardOutput::Empty
+        } else {
+            match terminal.zone_output_export_capped(id) {
+                Some(terminal::ZoneOutputExport::Available { text, .. }) => {
+                    ClipboardOutput::Available(text)
+                }
+                Some(terminal::ZoneOutputExport::Empty) => ClipboardOutput::Empty,
+                _ => ClipboardOutput::Unavailable,
+            }
+        };
+        block_mode::selected_clipboard_text(
+            [(id, zone.command.as_deref(), output)],
+            &selection,
+            mode,
+            block_mode::SELECTED_CLIPBOARD_MAX_BYTES,
+        )
+        .map(|copied| copied.text)
+    }
+
+    fn execute_chat_read_only_menu_action(
+        &mut self,
+        menu: BlockMenuState,
+        action: BlockMenuAction,
+    ) -> Task<Message> {
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let zone = sess
+            .terminal
+            .zone_by_id(menu.zone_id)
+            .filter(|zone| !zone.rows_evicted);
+        if !chat_menu_target_is_current(
+            menu,
+            sess.id,

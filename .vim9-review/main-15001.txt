@@ -1,0 +1,300 @@
+            return None;
+        };
+        let command = zone
+            .command
+            .clone()
+            .map(|command| (command, zone.command_truncated));
+        if command.is_none() {
+            self.push_toast("Selected block has no command".to_string(), ToastKind::Info);
+        }
+        command
+    }
+
+    /// Copy the selected block's command line to the clipboard (the newest
+    /// block's only when nothing is selected). A truncated command may still
+    /// be copied — only re-running it is unsafe.
+    fn block_copy_command_task(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Block command copy") {
+            return Task::none();
+        }
+        if let Some(task) =
+            self.block_copy_selected_task(block_mode::SelectedClipboardMode::Commands)
+        {
+            return task;
+        }
+        match self.block_action_command("copy") {
+            Some((text, _)) => {
+                if crate::block_mode::command_text_is_unsafe(&text) {
+                    self.push_toast(
+                        "Command not copied: it contains control or visual-spoofing characters"
+                            .to_string(),
+                        ToastKind::Warning,
+                    );
+                    Task::none()
+                } else {
+                    self.push_toast("Copied block command", ToastKind::Success);
+                    iced::clipboard::write(text)
+                }
+            }
+            None => Task::none(),
+        }
+    }
+
+    /// Copy the selected block's output to the clipboard. Falling back to the
+    /// newest completed block with output is only allowed when no block is
+    /// selected; a selected block with no output (or a vanished zone) toasts
+    /// instead of substituting another block's output.
+    fn block_copy_output_task(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Block output copy") {
+            return Task::none();
+        }
+        if let Some(task) =
+            self.block_copy_selected_task(block_mode::SelectedClipboardMode::Outputs)
+        {
+            return task;
+        }
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let text = match sess.block_selection.active() {
+            None => {
+                let fallback = sess.terminal.last_command_output_text();
+                if fallback.is_none() {
+                    self.push_toast(
+                        self.block_absent_toast("block output to copy"),
+                        ToastKind::Info,
+                    );
+                }
+                fallback
+            }
+            Some(id) => {
+                if sess.terminal.zone_by_id(id).is_none() {
+                    self.clear_stale_block_selection();
+                    return Task::none();
+                }
+                match sess.terminal.zone_output_export_capped(id) {
+                    Some(terminal::ZoneOutputExport::Available { text, .. }) => Some(text),
+                    Some(terminal::ZoneOutputExport::Empty) => {
+                        self.push_toast(
+                            "Selected block has no output".to_string(),
+                            ToastKind::Info,
+                        );
+                        None
+                    }
+                    Some(terminal::ZoneOutputExport::Unavailable) => {
+                        self.push_toast(
+                            "Selected block output is no longer retained".to_string(),
+                            ToastKind::Warning,
+                        );
+                        None
+                    }
+                    None => None,
+                }
+            }
+        };
+        match text {
+            Some(text) if crate::block_mode::clipboard_multiline_is_unsafe(&text) => {
+                self.push_toast(
+                    "Output not copied: it contains control or visual-spoofing characters"
+                        .to_string(),
+                    ToastKind::Warning,
+                );
+                Task::none()
+            }
+            Some(text) => {
+                let n = text.chars().count();
+                self.push_toast(
+                    format!("Copied block output ({} chars)", n),
+                    ToastKind::Success,
+                );
+                iced::clipboard::write(text)
+            }
+            None => Task::none(),
+        }
+    }
+
+    /// Type (never execute) the selected block's command into the prompt
+    /// (the newest block's only when nothing is selected), through the same
+    /// sanitized recall path as the history picker. Refused unless OSC 133
+    /// reports a trusted empty prompt owned by the foreground shell — merely
+    /// observing that no command is running would still overwrite typed input.
+    fn block_recall_command_task(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Block command recall") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+        let prompt_status = sess.agent_prompt_status();
+        if let Some(reason) = block_prompt_replace_blocker(prompt_status) {
+            self.push_toast(
+                format!("Command not recalled: {reason}"),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        match self.block_action_command("recall") {
+            // An incomplete capture is not the command that ran; typing it
+            // back could execute something else.
+            Some((_, true)) => {
+                self.push_toast(
+                    "Command not recalled: capture is truncated or unavailable".to_string(),
+                    ToastKind::Warning,
+                );
+                Task::none()
+            }
+            Some((command, false)) => {
+                if crate::block_mode::command_text_is_unsafe(&command) {
+                    self.push_toast(
+                        "Command not recalled: it contains control or visual-spoofing characters"
+                            .to_string(),
+                        ToastKind::Warning,
+                    );
+                    Task::none()
+                } else {
+                    self.recall_into_active_pane(command)
+                }
+            }
+            None => Task::none(),
+        }
+    }
+
+    /// Select every retained finalized block in the active pane. The oldest
+    /// block becomes the fixed range anchor and the newest the active edge.
+    fn block_select_all(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Block selection") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+        let ids: Vec<u64> = sess
+            .terminal
+            .command_zones
+            .iter()
+            .map(|zone| zone.id)
+            .collect();
+        if ids.is_empty() {
+            self.push_toast(
+                self.block_absent_toast("command blocks to select"),
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
+        sess.block_selection.select_all(&ids);
+        sess.refresh();
+        Task::none()
+    }
+
+    /// Open the one counted confirmation path shared by keybindings, the
+    /// command palette, and the block context menu. Nothing is removed here.
+    fn request_block_clear(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Clear Blocks") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let Some(confirm) = BlockClearConfirmation::new(
+            sess.id,
+            sess.terminal.command_zones.len(),
+            sess.terminal.command_zones.back().map(|zone| zone.id),
+        ) else {
+            self.push_toast(
+                "No completed command blocks to clear".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        };
+        self.block_clear_confirm = Some(confirm);
+        Task::none()
+    }
+
+    /// Revalidate the stable pane and exact displayed count, then either
+    /// execute, fail closed, or update the modal for a deliberate second
+    /// confirmation when asynchronous terminal output changed the block set.
+    fn confirm_block_clear(&mut self) -> Task<Message> {
+        let Some(confirm) = self.block_clear_confirm.take() else {
+            return Task::none();
+        };
+        let active = self.sessions.get(self.active).map(|sess| {
+            (
+                sess.id,
+                sess.terminal.command_zones.len(),
+                sess.terminal.command_zones.back().map(|zone| zone.id),
+            )
+        });
+        match confirm.resolve(active) {
+            BlockClearResolution::Clear => self.execute_block_clear(confirm.session_id),
+            BlockClearResolution::Refresh(updated) => {
+                self.block_clear_confirm = Some(updated);
+                self.push_toast(
+                    "Block history changed — review the current total and confirm again"
+                        .to_string(),
+                    ToastKind::Warning,
+                );
+                Task::none()
+            }
+            BlockClearResolution::Empty => {
+                self.push_toast(
+                    "No completed command blocks remain to clear".to_string(),
+                    ToastKind::Info,
+                );
+                Task::none()
+            }
+            BlockClearResolution::Stale => {
+                self.push_toast(
+                    "Clear Blocks target is no longer active".to_string(),
+                    ToastKind::Info,
+                );
+                Task::none()
+            }
+        }
+    }
+
+    /// The sole destructive implementation behind the confirmation. The
+    /// terminal keeps the current prompt or running command, while app-owned
+    /// selection/search state is discarded atomically with the zone history.
+    fn execute_block_clear(&mut self, session_id: usize) -> Task<Message> {
+        if !self.ensure_block_action_available("Clear Blocks") {
+            return Task::none();
+        }
+        let Some(sess) = self
+            .sessions
+            .get_mut(self.active)
+            .filter(|sess| sess.id == session_id)
+        else {
+            self.push_toast(
+                "Clear Blocks target is no longer active".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        };
+
+        let cleared = sess.terminal.clear_completed_blocks();
+        sess.block_selection.clear();
+        sess.block_bookmarks.clear();
+        sess.terminal.clear_text_selection();
+        sess.refresh();
+
+        self.close_block_search();
+        self.search.close();
+        self.search.matches.clear();
+        self.search.current_match_index = 0;
+        self.search.error_message = None;
+        self.search_dirty = false;
+        self.links_cache_key = None;
+        self.links.clear();
+        self.refresh_kitty_handles();
+        if cleared == 0 {
+            return Task::none();
+        }
+        self.push_toast(
+            format!(
+                "Cleared {cleared} command block{}",
+                if cleared == 1 { "" } else { "s" }
+            ),
+            ToastKind::Success,
+        );
+        Task::none()
+    }

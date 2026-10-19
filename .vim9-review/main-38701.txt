@@ -1,0 +1,300 @@
+            Some("the terminal is busy")
+        );
+        assert_eq!(
+            block_prompt_replace_blocker(AgentPromptStatus::InputNotEmpty),
+            Some("the prompt already contains input")
+        );
+        assert_eq!(
+            block_prompt_replace_blocker(AgentPromptStatus::ShellIntegrationUnavailable),
+            Some("waiting for an empty OSC 133 shell prompt")
+        );
+    }
+
+    #[test]
+    fn agent_prompt_requires_the_shell_to_own_the_foreground_pty() {
+        use terminal::AgentPromptStatus;
+
+        assert_eq!(
+            agent_prompt_status_with_foreground(AgentPromptStatus::Ready, 100, Some(100)),
+            AgentPromptStatus::Ready
+        );
+        assert_eq!(
+            agent_prompt_status_with_foreground(AgentPromptStatus::Ready, 100, Some(200)),
+            AgentPromptStatus::Busy
+        );
+        assert_eq!(
+            agent_prompt_status_with_foreground(AgentPromptStatus::Ready, 100, None),
+            AgentPromptStatus::ShellIntegrationUnavailable
+        );
+        // Terminal-level blockers always win, even if the shell is foreground.
+        assert_eq!(
+            agent_prompt_status_with_foreground(AgentPromptStatus::InputNotEmpty, 100, Some(100)),
+            AgentPromptStatus::InputNotEmpty
+        );
+    }
+
+    #[test]
+    fn ui_scale_change_resizes_logical_viewport_and_terminal_grid() {
+        let old_viewport = Size::new(1200.0, 800.0);
+        let old_scale = 1.0;
+        let new_scale = 2.0;
+        let new_viewport = logical_viewport_after_scale(old_viewport, old_scale, new_scale);
+
+        assert_eq!(new_viewport, Size::new(600.0, 400.0));
+        assert_eq!(
+            new_viewport.width * new_scale,
+            old_viewport.width * old_scale
+        );
+        assert_eq!(
+            new_viewport.height * new_scale,
+            old_viewport.height * old_scale
+        );
+
+        // The terminal and chrome use one configured size in production.
+        // Keep exact grid expectations at small, default and enlarged fonts so
+        // a stale fixed-height reservation cannot silently return extra rows.
+        for (font_size, expected_grid) in [
+            (10.0, (98, 29)),
+            (14.0, (70, 20)),
+            (24.0, (40, 11)),
+            (72.0, (13, 2)),
+        ] {
+            let metrics = Metrics::new(font_size, 1.0, 0.0, false);
+            let old_grid = metrics.grid_size(
+                old_viewport.width - terminal_view::SCROLLBAR_WIDTH,
+                old_viewport.height - chrome_height(metrics.font_size, metrics.font_size, true),
+            );
+            let new_grid = metrics.grid_size(
+                new_viewport.width - terminal_view::SCROLLBAR_WIDTH,
+                new_viewport.height - chrome_height(metrics.font_size, metrics.font_size, true),
+            );
+            assert!(new_grid.0 < old_grid.0);
+            assert!(new_grid.1 < old_grid.1);
+            assert_eq!(new_grid, expected_grid, "font size {font_size}");
+        }
+    }
+
+    #[test]
+    fn disabling_the_bottom_bar_returns_its_rows_to_the_grid() {
+        let viewport = Size::new(1200.0, 800.0);
+        let width = viewport.width - terminal_view::SCROLLBAR_WIDTH;
+        for font_size in [10.0, 14.0, 24.0, 72.0] {
+            let metrics = Metrics::new(font_size, 1.0, 0.0, false);
+            let with_bar = metrics.grid_size(
+                width,
+                viewport.height - chrome_height(metrics.font_size, metrics.font_size, true),
+            );
+            let without_bar = metrics.grid_size(
+                width,
+                viewport.height - chrome_height(metrics.font_size, metrics.font_size, false),
+            );
+            assert_eq!(with_bar.0, without_bar.0);
+            assert!(without_bar.1 > with_bar.1);
+        }
+    }
+
+    #[test]
+    fn app_chrome_shortcuts_keep_palette_help_switcher_and_f12_contract() {
+        let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        let character = |s: &str| keyboard::Key::Character(s.into());
+
+        assert_eq!(
+            chrome_shortcut(&character("p"), ctrl_shift),
+            Some(ChromeShortcut::CommandPalette)
+        );
+        assert_eq!(
+            chrome_shortcut(&character("/"), ctrl_shift),
+            Some(ChromeShortcut::Help)
+        );
+        assert_eq!(
+            chrome_shortcut(&character("l"), ctrl_shift),
+            Some(ChromeShortcut::TabSwitcher)
+        );
+        assert_eq!(
+            chrome_shortcut(&character("h"), ctrl_shift),
+            Some(ChromeShortcut::HistoryPicker)
+        );
+        assert_eq!(
+            chrome_shortcut(&character("m"), ctrl_shift),
+            Some(ChromeShortcut::Workflows)
+        );
+        assert_eq!(
+            chrome_shortcut(&keyboard::Key::Named(Named::F12), keyboard::Modifiers::NONE),
+            Some(ChromeShortcut::Debug)
+        );
+
+        assert_eq!(chrome_shortcut(&character("g"), ctrl_shift), None);
+        assert_eq!(chrome_shortcut(&character("k"), ctrl_shift), None);
+        assert_eq!(
+            chrome_shortcut(&character("p"), keyboard::Modifiers::CTRL),
+            None
+        );
+    }
+
+    #[test]
+    fn physical_key_events_match_sidebar_focus_and_resize_binding_names() {
+        assert_eq!(
+            key_to_binding_string(
+                &keyboard::Key::Character("\\".into()),
+                keyboard::Modifiers::CTRL
+            )
+            .as_deref(),
+            Some("ctrl+backslash")
+        );
+
+        let focus_mods = keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT;
+        let resize_mods = focus_mods | keyboard::Modifiers::SHIFT;
+        let cases = [
+            (Named::ArrowLeft, focus_mods, "ctrl+alt+left"),
+            (Named::ArrowRight, focus_mods, "ctrl+alt+right"),
+            (Named::ArrowUp, focus_mods, "ctrl+alt+up"),
+            (Named::ArrowDown, focus_mods, "ctrl+alt+down"),
+            (Named::ArrowLeft, resize_mods, "ctrl+shift+alt+left"),
+            (Named::ArrowRight, resize_mods, "ctrl+shift+alt+right"),
+            (Named::ArrowUp, resize_mods, "ctrl+shift+alt+up"),
+            (Named::ArrowDown, resize_mods, "ctrl+shift+alt+down"),
+        ];
+        for (named, modifiers, expected) in cases {
+            assert_eq!(
+                key_to_binding_string(&keyboard::Key::Named(named), modifiers).as_deref(),
+                Some(expected),
+                "{named:?}"
+            );
+        }
+    }
+
+    /// Regression: the runtime mapper used `to_ascii_lowercase` while the
+    /// config side folded with Unicode `to_lowercase`, so a non-ASCII chord
+    /// canonicalized differently depending on which side produced it. Both
+    /// paths now go through `jterm_core::keybindings`, and must agree.
+    #[test]
+    fn runtime_and_config_paths_agree_on_non_ascii_case_folding() {
+        // The keyboard delivers the shifted/uppercase 'Ю'; the config file
+        // says "ctrl+ю". Identical canonical form or the binding never fires.
+        let runtime = key_to_binding_string(
+            &keyboard::Key::Character("Ю".into()),
+            keyboard::Modifiers::CTRL,
+        );
+        assert_eq!(runtime.as_deref(), Some("ctrl+ю"));
+        assert_eq!(runtime, keybindings::KeyBinding::canonical("ctrl+ю"));
+        assert_eq!(runtime, keybindings::KeyBinding::canonical("Ctrl+Ю"));
+
+        // 'ß' has no single-char uppercase; both sides store it verbatim.
+        let runtime = key_to_binding_string(
+            &keyboard::Key::Character("ß".into()),
+            keyboard::Modifiers::CTRL,
+        );
+        assert_eq!(runtime.as_deref(), Some("ctrl+ß"));
+        assert_eq!(runtime, keybindings::KeyBinding::canonical("ctrl+ß"));
+
+        // End to end: a non-ASCII user binding is found from the key event.
+        let loaded =
+            keybindings::KeyBindings::from_toml_with_diagnostics("\"ctrl+ю\" = \"session:new\"\n")
+                .expect("valid TOML");
+        assert!(loaded.diagnostics.is_empty());
+        let binding = key_to_binding_string(
+            &keyboard::Key::Character("Ю".into()),
+            keyboard::Modifiers::CTRL,
+        )
+        .expect("chord expected");
+        assert_eq!(
+            loaded.bindings.get_command(&binding),
+            Some(keybindings::Command::SessionNew)
+        );
+    }
+
+    #[test]
+    fn alt_derives_output_copy_from_a_remapped_copy_unless_explicitly_overridden() {
+        let key = keyboard::Key::Character("x".into());
+        let alt_copy_mods =
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT | keyboard::Modifiers::ALT;
+        let remapped = keybindings::KeyBindings::from_toml_with_diagnostics(
+            "\"ctrl+shift+x\" = \"edit:copy\"\n",
+        )
+        .expect("valid remap")
+        .bindings;
+        assert_eq!(
+            resolve_keybinding_command(&remapped, &key, alt_copy_mods),
+            Some(keybindings::Command::EditCopyBlockOutput)
+        );
+
+        let overridden = keybindings::KeyBindings::from_toml_with_diagnostics(
+            "\"ctrl+shift+x\" = \"edit:copy\"\n\"ctrl+alt+shift+x\" = \"terminal:send_eof\"\n",
+        )
+        .expect("valid explicit override")
+        .bindings;
+        assert_eq!(
+            resolve_keybinding_command(&overridden, &key, alt_copy_mods),
+            Some(keybindings::Command::TerminalSendEof)
+        );
+    }
+
+    #[test]
+    fn pane_tree_snapshot_round_trips() {
+        let tree = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![
+                PaneTree::Leaf(0),
+                PaneTree::Split {
+                    axis: Axis::Horizontal,
+                    children: vec![PaneTree::Leaf(1), PaneTree::Leaf(2)],
+                    ratios: vec![0.5, 0.5],
+                },
+            ],
+            ratios: vec![0.6, 0.4],
+        };
+        let snap = pane_tree_to_snapshot(&tree);
+        let back = pane_tree_from_snapshot(&snap).unwrap();
+        assert_eq!(back, tree);
+        assert!(valid_restored_layout(&back, 3));
+        // Out-of-range session indices are rejected.
+        assert!(!valid_restored_layout(&back, 2));
+    }
+
+    /// ember's `equalize_resets_every_nested_divider` seam: every split in the
+    /// tab's tree goes even, including nested ones, and a second pass is a
+    /// no-op.
+    #[test]
+    fn equalize_pane_tree_resets_every_nested_divider() {
+        let mut tree = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![
+                PaneTree::Leaf(0),
+                PaneTree::Split {
+                    axis: Axis::Horizontal,
+                    children: vec![PaneTree::Leaf(1), PaneTree::Leaf(2)],
+                    ratios: vec![0.7, 0.3],
+                },
+            ],
+            ratios: vec![0.8, 0.2],
+        };
+
+        assert!(equalize_pane_tree(&mut tree));
+        let PaneTree::Split {
+            children, ratios, ..
+        } = &tree
+        else {
+            panic!("expected a split root");
+        };
+        assert!(ratios.iter().all(|r| (*r - 0.5).abs() <= f32::EPSILON));
+        let PaneTree::Split { ratios: nested, .. } = &children[1] else {
+            panic!("expected the nested split to survive");
+        };
+        assert!(nested.iter().all(|r| (*r - 0.5).abs() <= f32::EPSILON));
+
+        // Equalized geometry really splits the area evenly along both axes.
+        let area = pane_layout::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 212.0,
+            height: 120.0,
+        };
+        let mut rects = Vec::new();
+        collect_pane_rects(&tree, area, DIVIDER, &mut rects);
+        assert_eq!(rects.len(), 3);
+        let left = rects.iter().find(|p| p.session == 0).unwrap();
+        let right_top = rects.iter().find(|p| p.session == 1).unwrap();
+        let right_bottom = rects.iter().find(|p| p.session == 2).unwrap();
+        assert!((left.rect.width - right_top.rect.width).abs() < 1e-3);
+        assert!((right_top.rect.height - right_bottom.rect.height).abs() < 1e-3);
+

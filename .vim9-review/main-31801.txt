@@ -1,0 +1,300 @@
+                parents.push(parent);
+            }
+        }
+    }
+
+    match op {
+        SidebarOp::CreateFile(path) => {
+            let mut affected_parents = Vec::new();
+            push_parent(&mut affected_parents, path);
+            SidebarWorkerOutcome {
+                location: location.clone(),
+                warning: None,
+                cancelled: false,
+                result: remote_fs::create_file(location, hosts, path),
+                consumed_paths: Vec::new(),
+                affected_parents,
+                path_remaps: Vec::new(),
+            }
+        }
+        SidebarOp::CreateDir(path) => {
+            let mut affected_parents = Vec::new();
+            push_parent(&mut affected_parents, path);
+            SidebarWorkerOutcome {
+                location: location.clone(),
+                warning: None,
+                cancelled: false,
+                result: remote_fs::create_dir(location, hosts, path),
+                consumed_paths: Vec::new(),
+                affected_parents,
+                path_remaps: Vec::new(),
+            }
+        }
+        SidebarOp::Rename { src, dst } => {
+            let result = remote_fs::rename(location, hosts, src, dst);
+            let consumed_paths = result
+                .as_ref()
+                .ok()
+                .map(|()| vec![src.clone()])
+                .unwrap_or_default();
+            let path_remaps = result
+                .as_ref()
+                .ok()
+                .map(|()| {
+                    vec![SidebarPathRemap {
+                        from: src.clone(),
+                        to: dst.clone(),
+                    }]
+                })
+                .unwrap_or_default();
+            let mut affected_parents = Vec::new();
+            push_parent(&mut affected_parents, src);
+            push_parent(&mut affected_parents, dst);
+            SidebarWorkerOutcome {
+                location: location.clone(),
+                warning: None,
+                cancelled: false,
+                result,
+                consumed_paths,
+                affected_parents,
+                path_remaps,
+            }
+        }
+        SidebarOp::DeleteBatch(paths) => {
+            // Continue past per-item errors; the summary names the first.
+            let total = paths.len();
+            let mut done = 0usize;
+            let mut failures: Vec<String> = Vec::new();
+            let mut consumed_paths = Vec::new();
+            let mut affected_parents = Vec::new();
+            for path in paths {
+                push_parent(&mut affected_parents, path);
+                match remote_fs::delete(location, hosts, path) {
+                    Ok(()) => {
+                        done += 1;
+                        consumed_paths.push(path.clone());
+                    }
+                    Err(error) => failures.push(format!("{}: {error}", path.display())),
+                }
+            }
+            let notice = if failures.is_empty() {
+                (format!("Deleted {done} items"), true)
+            } else {
+                (
+                    format!(
+                        "{} of {total} items failed: {}",
+                        failures.len(),
+                        failures[0]
+                    ),
+                    false,
+                )
+            };
+            SidebarWorkerOutcome {
+                location: location.clone(),
+                warning: Some(notice),
+                cancelled: false,
+                result: Ok(()),
+                consumed_paths,
+                affected_parents,
+                path_remaps: Vec::new(),
+            }
+        }
+        SidebarOp::BatchTransfer {
+            src_loc,
+            items,
+            cut,
+            verb,
+        } => {
+            // Sequential per item: same-location copies (renames for a cut),
+            // cross-location transfers through the streaming machinery. A cut
+            // deletes a source only after its own copy landed; a cancel stops
+            // the remaining items and tidies the in-flight one.
+            let same_location = remote_fs::same_files_location(src_loc, location, hosts);
+            let same_location_execution = same_location.then(|| {
+                remote_fs::preferred_same_files_execution_location(src_loc, location, hosts)
+                    .expect("same namespace has an execution route")
+            });
+            let total = items.len();
+            let mut done = 0usize;
+            let mut failures: Vec<String> = Vec::new();
+            let mut consumed_paths = Vec::new();
+            let mut affected_parents = Vec::new();
+            let mut path_remaps = Vec::new();
+            for item in items {
+                if progress.is_some_and(|progress| progress.is_cancelled()) {
+                    return SidebarWorkerOutcome {
+                        location: location.clone(),
+                        warning: Some((format!("Cancelled after {done} of {total} items"), true)),
+                        cancelled: true,
+                        result: Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "transfer cancelled",
+                        )),
+                        consumed_paths,
+                        affected_parents,
+                        path_remaps,
+                    };
+                }
+                if let Some(error) = &item.error {
+                    failures.push(error.clone());
+                    continue;
+                }
+                push_parent(&mut affected_parents, &item.dst);
+                if *cut && same_location {
+                    push_parent(&mut affected_parents, &item.src);
+                }
+                let result = if same_location {
+                    let execution =
+                        same_location_execution.expect("same namespace has an execution route");
+                    if *cut {
+                        remote_fs::rename(execution, hosts, &item.src, &item.dst)
+                    } else {
+                        remote_fs::copy(execution, hosts, &item.src, &item.dst)
+                    }
+                } else {
+                    remote_fs::transfer(
+                        src_loc,
+                        location,
+                        hosts,
+                        &item.src,
+                        &item.dst,
+                        item.is_dir,
+                        progress,
+                    )
+                };
+                match result {
+                    Ok(()) => {
+                        done += 1;
+                        // Cross-location cut: delete the source only now that
+                        // its copy is complete.
+                        if *cut && !same_location {
+                            if let Err(error) = remote_fs::delete(src_loc, hosts, &item.src) {
+                                failures.push(format!(
+                                    "{}: copied, but deleting the source failed: {error}",
+                                    item.src.display()
+                                ));
+                            } else {
+                                consumed_paths.push(item.src.clone());
+                            }
+                        } else if *cut {
+                            consumed_paths.push(item.src.clone());
+                            path_remaps.push(SidebarPathRemap {
+                                from: item.src.clone(),
+                                to: item.dst.clone(),
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        if progress.is_some_and(|progress| progress.is_cancelled()) {
+                            // The transport owns only its private staging.
+                            // A raced destination may belong to another actor;
+                            // cancellation never authorizes deleting that path.
+                            return SidebarWorkerOutcome {
+                                location: location.clone(),
+                                warning: Some((
+                                    format!("Cancelled after {done} of {total} items"),
+                                    true,
+                                )),
+                                cancelled: true,
+                                result: Err(error),
+                                consumed_paths,
+                                affected_parents,
+                                path_remaps,
+                            };
+                        }
+                        failures.push(format!("{}: {error}", item.src.display()));
+                    }
+                }
+            }
+            let notice = if failures.is_empty() {
+                (format!("{verb} {done} items"), true)
+            } else {
+                (
+                    format!(
+                        "{} of {total} items failed: {}",
+                        failures.len(),
+                        failures[0]
+                    ),
+                    false,
+                )
+            };
+            SidebarWorkerOutcome {
+                location: location.clone(),
+                warning: Some(notice),
+                cancelled: false,
+                result: Ok(()),
+                consumed_paths,
+                affected_parents,
+                path_remaps,
+            }
+        }
+    }
+}
+
+/// Score and sort tabs against the switcher query. Empty query returns all in
+/// strip order; otherwise returns matches highest score first as
+/// `(filtered_position, tab_index)` tuples. Used by both the renderer and the
+/// key handler so navigation matches the visible list.
+///
+/// `labels` holds one entry per tab, taken from that tab's selected pane.
+/// Picker positions belong to the filtered tab order, never the sessions
+/// vector: split panes and pinned/reordered tabs make those indices diverge.
+fn tab_switcher_target_id(
+    tabs: &[Tab],
+    filtered: &[(usize, usize)],
+    selected: usize,
+) -> Option<usize> {
+    let (_, tab_index) = filtered.get(selected)?;
+    tabs.get(*tab_index).map(|tab| tab.id)
+}
+
+fn tab_switcher_filtered(labels: &[String], query: &str) -> Vec<(usize, usize)> {
+    use fuzzy_matcher::skim::SkimMatcherV2;
+    use fuzzy_matcher::FuzzyMatcher;
+    if query.is_empty() {
+        return labels.iter().enumerate().map(|(i, _)| (i, i)).collect();
+    }
+    if query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(query) {
+        return Vec::new();
+    }
+    let matcher = SkimMatcherV2::default();
+    let mut scored: Vec<(i64, usize)> = labels
+        .iter()
+        .enumerate()
+        .filter_map(|(i, label)| matcher.fuzzy_match(label, query).map(|sc| (sc, i)))
+        .collect();
+    scored.sort_by_key(|item| std::cmp::Reverse(item.0));
+    scored
+        .into_iter()
+        .enumerate()
+        .map(|(pos, (_, idx))| (pos, idx))
+        .collect()
+}
+
+/// Resident set size of this process in MB (Linux /proc), for the debug panel.
+fn read_rss_mb() -> Option<f64> {
+    let content = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb as f64 / 1024.0);
+        }
+    }
+    None
+}
+
+/// xterm button code for press/motion reports.
+fn btn_code(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+/// Abbreviate the home directory to `~` for compact path display (status bar,
+/// history picker rows).
+fn abbreviate_home(path: &str) -> String {
+    abbreviate_home_with(path, dirs::home_dir().as_deref())
+}
+

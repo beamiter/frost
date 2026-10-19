@@ -1,0 +1,300 @@
+                for bottom_bar in [false, true] {
+                    assert_eq!(
+                        organism_settings_hint(width, false, expanded, bottom_bar),
+                        "Enable ASCII Organism to allow the live companion."
+                    );
+                }
+                assert_eq!(
+                    organism_settings_hint(width, true, expanded, false),
+                    organism::expanded_companion_hint(false)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn organism_settings_hint_tracks_shared_width_capabilities_and_preview_distinction() {
+        for width in [0.0, 219.99, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(organism_settings_hint(width, true, true, true).contains("Resize the window"));
+            assert!(!organism_settings_hint(width, true, false, true).contains("status-bar arrow"));
+        }
+        for width in [220.0, 639.99] {
+            assert!(organism_settings_hint(width, true, false, true).contains("status-bar arrow"));
+            let body_only = organism_settings_hint(width, true, true, true);
+            assert!(body_only.contains("no live hover target"));
+            assert!(body_only.contains("Preview Say hello is separate"));
+        }
+        assert!(organism_settings_hint(640.0, true, false, true).contains("status-bar arrow"));
+        assert_eq!(
+            organism_settings_hint(640.0, true, true, true),
+            organism::expanded_companion_hint(true)
+        );
+    }
+
+    #[test]
+    fn organism_settings_guidance_reads_current_config_without_transient_owner_or_wakes() {
+        let source = include_str!("main.rs");
+        let helper = source
+            .split_once("fn organism_settings_hint(")
+            .unwrap()
+            .1
+            .split_once("fn companion_strip_height(")
+            .unwrap()
+            .0;
+        assert!(helper.contains("organism_layout(width, enabled, expanded, bottom_bar)"));
+        for forbidden in [
+            "organism_owner",
+            "focused",
+            "remote",
+            "Subscription",
+            "Instant",
+            "Task",
+        ] {
+            assert!(!helper.contains(forbidden));
+        }
+        let settings = source
+            .split_once("            text(if self.config.is_block_mode()")
+            .unwrap()
+            .1
+            .split_once("            text(\"Organism Motion\")")
+            .unwrap()
+            .0;
+        for current in [
+            "self.win_size.width",
+            "self.config.ascii_organism_enabled",
+            "self.config.ascii_organism_expanded",
+            "self.config.bottom_bar",
+        ] {
+            assert!(settings.contains(current));
+        }
+    }
+
+    #[test]
+    fn native_body_uses_shared_context_and_current_owner_without_new_timers() {
+        let source = include_str!("main.rs");
+        let pane = source
+            .split_once("    fn pane_view(")
+            .unwrap()
+            .1
+            .split_once("    fn sidebar_view(")
+            .unwrap()
+            .0;
+        assert!(pane.contains("self.organism_body_owner() == Some(session_id)"));
+        assert!(pane.contains("self.organism.presentation_with_attention("));
+        assert!(pane.contains("sess.terminal.is_command_running()"));
+        assert!(pane.contains("self.organism_attention_facts()"));
+        assert!(!pane.contains("sprite_frame"));
+        let owner = source
+            .split_once("    fn organism_body_owner(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_body_hover_available(")
+            .unwrap()
+            .0;
+        for gate in [
+            "Some(organism::Motion::Static)",
+            "self.organism_owner()?",
+            "has_text_selection()",
+            "is_mouse_enabled()",
+            "preedit_text",
+            "get_placements()",
+            "terminal_mouse_gestures",
+            "dragging_sidebar",
+        ] {
+            assert!(owner.contains(gate), "missing native gate: {gate}");
+        }
+        assert!(!owner.contains("!session.terminal.is_command_running()"));
+        let body = include_str!("organism_block.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(!body.contains("Duration"));
+        assert!(!body.contains("LiveAttention"));
+        assert!(!body.contains("std::thread"));
+        assert!(!body.contains("Behavior::"));
+    }
+
+    #[test]
+    fn native_body_withdrawals_and_entries_validate_exact_native_snapshot() {
+        let source = include_str!("main.rs");
+        let dispatch = source
+            .split_once("            Message::OrganismBodyObserved(id,")
+            .unwrap()
+            .1
+            .split_once("            Message::OrganismHoverEnter")
+            .unwrap()
+            .0;
+        for check in [
+            "epoch == self.organism_geometry_epoch",
+            "block == self.organism_block_key()",
+            "s.id == id && s.projection.key() == projection",
+        ] {
+            assert!(dispatch.contains(check));
+        }
+        let observer = source
+            .split_once("    fn observe_organism_body(")
+            .unwrap()
+            .1
+            .split_once("    /// Build the terminal widget")
+            .unwrap()
+            .0;
+        assert!(observer.contains("facts.hover_available = false"));
+        assert!(observer.contains("self.organism.leave_live_greeting(facts)"));
+        assert!(observer.contains("Edge::Enter if self.organism_body_hover_available()"));
+        assert!(observer.contains("self.organism.enter_live_greeting(id, ticket, facts)"));
+        assert!(!observer.contains("write_pty"));
+        assert!(!observer.contains("resize"));
+        let status = source
+            .split_once("// One core offer binds both edges")
+            .unwrap()
+            .1
+            .split_once("                area.into()")
+            .unwrap()
+            .0;
+        assert!(status.contains("if !self.config.is_card_mode()"));
+        let widget = include_str!("terminal_view.rs");
+        let passive = widget
+            .split_once("// Observe the exact geometry used by draw")
+            .unwrap()
+            .1
+            .split_once("// Keep the input method")
+            .unwrap()
+            .0;
+        assert!(passive.contains("self.painted_organism_geometry("));
+        assert!(passive.contains("CursorMoved"));
+        assert!(!passive.contains("capture_event"));
+        assert!(passive.contains("shell.request_redraw()"));
+    }
+
+    #[test]
+    fn narrow_reopen_is_configuration_only_and_preserves_live_thresholds() {
+        for width in [
+            0.0,
+            219.99,
+            220.0,
+            359.99,
+            360.0,
+            639.99,
+            640.0,
+            1024.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            for enabled in [false, true] {
+                for expanded in [false, true] {
+                    for bottom_bar in [false, true] {
+                        let reopen = companion_narrow_reopen(width, enabled, expanded, bottom_bar);
+                        assert_eq!(
+                            reopen,
+                            enabled && bottom_bar && !expanded && (220.0..640.0).contains(&width)
+                        );
+                        if reopen {
+                            let layout = organism_layout(width, enabled, expanded, bottom_bar);
+                            assert!(!layout.presentable());
+                            assert!(!layout.maintenance_eligible(true));
+                            assert_eq!(companion_strip_height(enabled, expanded, bottom_bar), 0.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn companion_card_header_and_narrow_reopen_do_not_add_live_inputs() {
+        let source = include_str!("main.rs");
+        let bar = source
+            .split_once("    fn status_bar(&self)")
+            .unwrap()
+            .1
+            .split_once("    fn companion_toggle(")
+            .unwrap()
+            .0;
+        assert!(bar.contains("text(presentation.life)"));
+        assert!(bar.contains("text(presentation.status.clone().into_owned())"));
+        assert!(bar.contains("terminal_view::organism_tone_color(presentation.tone, &self.theme)"));
+        assert!(bar.contains(".size(self.effective_font_size())"));
+        assert!(bar.contains("weight: iced::font::Weight::Bold"));
+        assert!(bar.contains(".height(Length::Fixed(self.effective_font_size() * 2.6))"));
+        assert!(
+            bar.contains("companion_status_with_slot(bar.into(), self.companion_toggle(false), 8)")
+        );
+        assert!(bar.contains("let mut compact_slot: Option<Element<'_, Message>> = None;"));
+        assert!(bar.contains("companion_status_with_slot(bar.into(), slot, 12)"));
+        assert!(!bar.contains("right = right.push(companion_compact_slot"));
+        assert_eq!(
+            bar.matches(".on_enter(Message::OrganismHoverEnter(")
+                .count(),
+            1
+        );
+        let narrow = source
+            .split_once("fn companion_status_with_slot<")
+            .unwrap()
+            .1
+            .split_once("/// The same native card geometry")
+            .unwrap()
+            .0;
+        assert!(narrow.contains("container(status).width(Length::Fill).clip(true), slot"));
+        for forbidden in [
+            "OrganismHello",
+            "OrganismHover",
+            "KnownIdle",
+            "write_pty",
+            "focus(",
+            "time::every",
+        ] {
+            assert!(!narrow.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn inline_organism_mode_expanded_footer_motion_matrix() {
+        for block in [false, true] {
+            for expanded in [false, true] {
+                for bottom in [false, true] {
+                    for motion in [
+                        organism::Motion::Full,
+                        organism::Motion::Calm,
+                        organism::Motion::Static,
+                    ] {
+                        let layout = organism_host_layout(900.0, true, expanded, bottom, block);
+                        assert_eq!(layout.presentable(), block || bottom);
+                        if block {
+                            assert!(!layout.glyph, "Block mode never duplicates the footer slot");
+                            assert_eq!(
+                                native_status_rows(true, expanded, 18.0),
+                                if expanded { 5 } else { 1 }
+                            );
+                            let moving = motion == organism::Motion::Full;
+                            let body = motion != organism::Motion::Static;
+                            assert!(!moving || body);
+                        } else {
+                            assert_eq!(layout.body, bottom && expanded);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(native_status_rows(false, true, 18.0), 0);
+        assert!(!organism_host_layout(120.0, true, true, false, true).presentable());
+    }
+
+    #[test]
+    fn organism_layout_uses_existing_body_width_and_preserves_compact_threshold() {
+        let minimum = COMPANION_BODY_WIDTH + 2.0 * COMPANION_HORIZONTAL_PADDING;
+        assert_eq!(minimum, 220.0);
+        for width in [0.0, 219.99, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(!organism_layout(width, true, true, true).presentable());
+        }
+        for width in [minimum, 400.0, 639.99] {
+            let expanded = organism_layout(width, true, true, true);
+            assert!(expanded.body);
+            assert!(!expanded.glyph);
+            assert_eq!(
+                expanded.explanation,
+                width >= COMPANION_CARD_DETAILS_MIN_WIDTH
+            );
+            assert!(!organism_layout(width, true, false, true).presentable());
+        }
+        assert_eq!(

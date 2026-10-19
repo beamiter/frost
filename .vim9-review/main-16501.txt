@@ -1,0 +1,300 @@
+                }
+            }
+            Message::RemoteHostAdd(identity) => {
+                if !self
+                    .remote_host_editor
+                    .accepts(&identity, self.remote_host_editor_visible())
+                {
+                    return Task::none();
+                }
+                if self.config.remote_hosts.len() >= config::MAX_REMOTE_HOSTS {
+                    self.push_toast(
+                        format!(
+                            "Remote host not added: the {}-host active limit is reached; existing entries were retained",
+                            config::MAX_REMOTE_HOSTS
+                        ),
+                        ToastKind::Warning,
+                    );
+                    return Task::none();
+                }
+                // Template the inline editor fills in. deploy "persist" so a
+                // fresh host brings jsh along by default; validation stays
+                // advisory until the host field is typed.
+                self.config
+                    .remote_hosts
+                    .push(jterm_core::jsh_remote::RemoteHostConfig {
+                        name: String::new(),
+                        host: String::new(),
+                        user: None,
+                        docker: false,
+                        remote_shell: "jsh".to_string(),
+                        session: None,
+                        ssh_args: Vec::new(),
+                        deploy: "persist".to_string(),
+                        deploy_artifact: None,
+                    });
+                self.remote_host_editor.retire();
+                self.config_dirty = true;
+                if let Some(request) = self.reconcile_sidebar_remote_hosts() {
+                    return self.queue_sidebar_load(request);
+                }
+            }
+            Message::RemoteHostRemove(target) => {
+                let Some(index) = self.remote_host_row(&target) else {
+                    return Task::none();
+                };
+                if index < self.config.remote_hosts.len() {
+                    self.config.remote_hosts.remove(index);
+                    self.remote_host_editor.retire();
+                    self.config_dirty = true;
+                    if let Some(request) = self.reconcile_sidebar_remote_hosts() {
+                        return self.queue_sidebar_load(request);
+                    }
+                }
+            }
+            Message::JshNoticeDismiss => self.jsh_notice_dismissed = true,
+            Message::SessionRecoveryDismiss => {
+                self.startup_recovery.dismiss();
+                let term_w = (self.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
+                (self.cols, self.rows) = self.metrics.grid_size(term_w, self.term_height());
+                self.relayout();
+                self.refresh_active_context();
+            }
+            Message::AgentClose => self.agent.close(),
+            Message::CommandCorrectionResolved(session_id, generation, result) => {
+                // The toggle or an Agent session may have changed mid-flight;
+                // re-check the gate before presenting anything.
+                if !command_correction::correction_monitor_enabled(
+                    self.config.ai_enabled,
+                    self.config.command_correction_enabled,
+                    self.agent.is_open,
+                ) {
+                    self.command_corrections.dismiss(session_id, generation);
+                    return Task::none();
+                }
+                match result {
+                    Ok(Some(candidate)) => {
+                        if self
+                            .command_corrections
+                            .present(session_id, generation, candidate)
+                        {
+                            // Take keyboard focus only for the active pane with a
+                            // clean, idle prompt; a prompt the user is already
+                            // typing into must keep its keystrokes.
+                            let focusable =
+                                self.sessions.get_mut(self.active).is_some_and(|sess| {
+                                    sess.id == session_id && sess.agent_prompt_status().is_ready()
+                                });
+                            if focusable {
+                                return iced::widget::operation::focus(CORRECTION_INPUT_ID.clone());
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        self.command_corrections.dismiss(session_id, generation);
+                    }
+                    Err(error) => {
+                        log::warn!("command correction failed: {error}");
+                        self.command_corrections.dismiss(session_id, generation);
+                    }
+                }
+            }
+            Message::CommandCorrectionInput(reference, draft) => {
+                if let Some(session) = self.command_corrections.get_current_mut(reference) {
+                    session.set_draft(draft);
+                }
+            }
+            Message::CommandCorrectionAccept(reference) => {
+                return self.accept_command_correction(reference);
+            }
+            Message::CommandCorrectionDismiss(reference) => {
+                self.command_corrections
+                    .dismiss(reference.session_id, reference.generation);
+            }
+            Message::SetCommandCorrectionEnabled(enabled) => {
+                self.config.command_correction_enabled = enabled;
+                self.config_dirty = true;
+            }
+            // ===== AI chats library + inline AI command generation =====
+            Message::AiChatsInput(draft) => self.ai_chats.set_draft(draft),
+            Message::AiChatsSubmit => {
+                if let Some(request) = self.ai_chats.submit(&self.config) {
+                    return self.ai_chats_request_task(request);
+                }
+            }
+            Message::AiChatsStop => self.ai_chats.stop(self.config.ai_redact_secrets),
+            Message::AiChatsRetry => {
+                if let Some(request) = self.ai_chats.retry(&self.config) {
+                    return self.ai_chats_request_task(request);
+                }
+            }
+            Message::AiChatsDelta(token, text) => {
+                self.ai_chats.push_delta(token, &text);
+            }
+            Message::AiChatsResult(token, result) => {
+                self.ai_chats.complete(token, result);
+                // A finished turn changes durable state immediately (history
+                // or restored draft), not just at the debounce tick.
+                self.ai_chats.persist(self.config.ai_redact_secrets);
+            }
+            Message::AiChatsNewChat => {
+                self.ai_chats.new_chat(self.config.ai_redact_secrets);
+                return iced::widget::operation::focus(AI_CHATS_INPUT_ID.clone());
+            }
+            Message::AiChatsSelect(id) => {
+                self.ai_chats.select_chat(id, self.config.ai_redact_secrets);
+                return iced::widget::operation::focus(AI_CHATS_INPUT_ID.clone());
+            }
+            Message::AiChatsSearchInput(query) => self.ai_chats.set_search(query),
+            Message::AiChatsShowLibrary => {
+                self.ai_chats.page = ai_chats::ChatsPage::Library;
+                return iced::widget::operation::focus(AI_CHATS_SEARCH_ID.clone());
+            }
+            Message::AiChatsShowChat => {
+                self.ai_chats.page = ai_chats::ChatsPage::Chat;
+                return iced::widget::operation::focus(AI_CHATS_INPUT_ID.clone());
+            }
+            Message::AiChatsTitleInput(title) => self.ai_chats.rename(title),
+            Message::AiChatsToggleArchive => {
+                self.ai_chats.toggle_archive(self.config.ai_redact_secrets);
+            }
+            Message::AiChatsDelete => self.ai_chats.delete(self.config.ai_redact_secrets),
+            Message::AiChatsIncludeRecent(enabled) => self.ai_chats.set_include_recent(enabled),
+            Message::AiChatsClose => {
+                self.ai_chats.close(self.config.ai_redact_secrets);
+            }
+            Message::AiAskInput(text) => {
+                if let Some(query) = self.ai_ask.as_mut() {
+                    if let Some(next) = ai_command::accepted_suggestion_request(text) {
+                        *query = next;
+                    }
+                }
+            }
+            Message::AiAskSubmit => return self.submit_ai_ask(),
+            Message::AiAskClose => self.ai_ask = None,
+            Message::AiSuggestionResolved(generation, result) => {
+                let applied = self
+                    .ai_suggestion
+                    .as_mut()
+                    .is_some_and(|session| session.apply_reply(generation, result));
+                if applied {
+                    let focusable = self.ai_suggestion.as_ref().is_some_and(|session| {
+                        session.phase() == ai_command::SuggestionPhase::Review
+                    }) && self.ai_suggestion_focusable();
+                    if focusable {
+                        return iced::widget::operation::focus(AI_SUGGESTION_INPUT_ID.clone());
+                    }
+                }
+            }
+            Message::AiSuggestionInput(generation, draft) => {
+                if let Some(session) = self
+                    .ai_suggestion
+                    .as_mut()
+                    .filter(|session| session.is_generation(generation))
+                {
+                    session.set_review_draft(draft);
+                }
+            }
+            Message::AiSuggestionInsert(generation) => {
+                return self.insert_ai_suggestion(generation)
+            }
+            Message::AiSuggestionRegenerate(generation) => {
+                return self.regenerate_ai_suggestion(generation)
+            }
+            Message::AiSuggestionDismiss(generation) => {
+                if self
+                    .ai_suggestion
+                    .as_ref()
+                    .is_some_and(|session| session.is_generation(generation))
+                {
+                    self.ai_suggestion = None;
+                }
+            }
+            Message::TaskPanelToggle => {
+                self.toggle_task_panel();
+            }
+            Message::TaskDashboardOpenResult => {
+                let dashboard = agent_task::DashboardSnapshot::project(
+                    self.task_manager
+                        .tasks()
+                        .iter()
+                        .filter(|task| task.status != agent_task::TaskStatus::Archived),
+                    |id| agent_task::DashboardActivity {
+                        has_active_agent_stream: self
+                            .task_manager
+                            .has_active_agent_event_stream(id),
+                        native_preparing: self.agent_runtime.has_preparing(id),
+                        ..Default::default()
+                    },
+                    agent_task::DashboardFilter {
+                        text: &self.task_panel.dashboard_query,
+                        view: self.task_panel.dashboard_view,
+                        ..Default::default()
+                    },
+                );
+                self.task_panel.open_dashboard_result(&dashboard);
+            }
+            Message::TaskDashboardClear => {
+                self.task_panel.retire_panel_callbacks();
+                self.task_panel.dashboard_query.clear();
+                self.task_panel.dashboard_view = agent_task::DashboardView::All;
+            }
+            Message::TaskDashboardQuery(query) => {
+                self.task_panel.retire_panel_callbacks();
+                self.task_panel.dashboard_query = query.chars().take(256).collect();
+            }
+            Message::TaskDashboardView(view) => {
+                self.task_panel.retire_panel_callbacks();
+                self.task_panel.dashboard_view = view;
+            }
+            Message::TaskSelect(task_id) => {
+                self.task_panel.select(Some(task_id));
+            }
+            Message::TaskHide(task_id) => {
+                if let Err(error) = self.task_manager.archive(task_id) {
+                    self.push_toast(error.to_string(), ToastKind::Warning);
+                } else if self.task_panel.selected == Some(task_id) {
+                    self.task_panel.select(None);
+                }
+            }
+            Message::TaskCreateWithProvider(reference, provider) => {
+                self.task_create_with_provider(reference, provider);
+            }
+            Message::TaskCreateProviderCancel(reference) => {
+                agent_task_ui::TaskProviderPicker::take_current(
+                    &mut self.task_panel.provider_picker,
+                    &reference,
+                );
+            }
+            Message::TaskStartNative(task_id) => self.task_start_native(task_id),
+            Message::TaskCancelNative(task_id) => {
+                if self.task_panel.selected == Some(task_id) {
+                    self.task_panel.retire_follow_up();
+                }
+                if let Err(error) = self.agent_runtime.cancel(task_id) {
+                    self.push_toast(
+                        format!(
+                            "Could not cancel native session: {error}. You can still Open the provider CLI in a terminal."
+                        ),
+                        ToastKind::Warning,
+                    );
+                } else {
+                    self.push_toast("Cancelling native Agent session…", ToastKind::Info);
+                }
+            }
+            Message::TaskFinishNative(task_id) => {
+                if self.task_panel.selected == Some(task_id) {
+                    self.task_panel.retire_follow_up();
+                }
+                if let Err(error) = self.agent_runtime.finish_codex(&self.task_manager, task_id) {
+                    self.push_toast(
+                        format!(
+                            "Could not finish native session: {error}. Deny any pending approval or Open the provider CLI."
+                        ),
+                        ToastKind::Warning,
+                    );
+                }
+            }
+            Message::AgentLaunch(provider) => self.agent_launch_in_tab(provider),
+            Message::TaskRequestDiscardSavedDrafts(reference) => {
+                self.task_panel.request_discard_saved_drafts(&reference);

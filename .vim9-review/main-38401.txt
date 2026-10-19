@@ -1,0 +1,300 @@
+        assert_eq!(active_bookmark_target(&ids, Some(99)), None);
+    }
+
+    /// The three surfaces that attach a block as untrusted AI evidence used to
+    /// hand-roll a `BlockContext` each, with an unknown-status note none of
+    /// the other three apps used and a second local bounding helper. They now
+    /// share the family adapter, so this pins the properties that used to be
+    /// frost-local: the shared note, the shared head/tail bound, and the
+    /// sentinel the UI's own status label is written against.
+    #[test]
+    fn ai_block_output_goes_through_the_shared_ad_hoc_adapter() {
+        use agent_task::context::{
+            ad_hoc_block_context, unknown_exit_status_note, UNKNOWN_EXIT_STATUS_SENTINEL,
+        };
+
+        let semantic = |output: &str, exit_code: Option<i32>| agent_task::SemanticCommandContext {
+            source_session_id: "frost-1-0".to_string(),
+            source_execution_id: "zone-1".to_string(),
+            source_sequence: 1,
+            source_shell: None,
+            command: Some("cargo test".to_string()),
+            command_exact: true,
+            command_truncated: false,
+            cwd: Some("/workspace/frost".to_string()),
+            cwd_after: None,
+            exit_code,
+            duration_ms: None,
+            output_text: output.to_string(),
+            output_available: true,
+            output_truncated: false,
+            output_total_bytes: output.len(),
+            started_at: None,
+            finished_at: None,
+        };
+
+        let short = "one\ntwo";
+        let reported = ad_hoc_block_context(&semantic(short, Some(0)));
+        assert_eq!(reported.output, short);
+        assert!(!reported.truncated);
+
+        let unknown = ad_hoc_block_context(&semantic(short, None));
+        assert_eq!(unknown.exit_code, UNKNOWN_EXIT_STATUS_SENTINEL);
+        assert_eq!(
+            unknown.output,
+            format!("{}{short}", unknown_exit_status_note())
+        );
+        assert!(!unknown.truncated);
+
+        let long = (0..200)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bounded = ad_hoc_block_context(&semantic(&long, None));
+        assert!(bounded.truncated);
+        assert_ne!(bounded.output, long);
+        assert!(bounded.output.starts_with(&unknown_exit_status_note()));
+        assert!(bounded.output.contains("line 0"));
+        assert!(bounded.output.contains("line 199"));
+
+        // The status line the panel renders is written against the same
+        // sentinel the adapter emits, so an unknown lifecycle never reads as
+        // "exit -1" and never reads as a success.
+        assert_eq!(
+            agent_context_exit_label(UNKNOWN_EXIT_STATUS_SENTINEL),
+            "no reported exit status"
+        );
+    }
+
+    #[test]
+    fn pointer_anchored_block_menu_flips_and_clamps_inside_window() {
+        let window = iced::Size::new(1000.0, 700.0);
+        let panel = iced::Size::new(360.0, 500.0);
+        assert_eq!(
+            anchored_overlay_position(iced::Point::new(100.0, 80.0), window, panel, TAB_BAR_H),
+            iced::Point::new(106.0, 86.0)
+        );
+        // Bottom-right summons above the pointer and clamps away from the edge.
+        assert_eq!(
+            anchored_overlay_position(iced::Point::new(990.0, 690.0), window, panel, TAB_BAR_H),
+            iced::Point::new(634.0, 184.0)
+        );
+        // Corrupt/non-finite pointer state stays reachable instead of
+        // propagating NaNs into iced layout.
+        assert_eq!(
+            anchored_overlay_position(
+                iced::Point::new(f32::NAN, f32::NAN),
+                window,
+                panel,
+                TAB_BAR_H,
+            ),
+            iced::Point::new(6.0, 36.0)
+        );
+    }
+
+    #[test]
+    fn block_menu_batch_commands_do_not_depend_on_clicked_background() {
+        let mut selection = block_mode::BlockSelection::default();
+        selection.select_all(&[10, 20]);
+        let summary =
+            block_menu_selection_summary([(10, Some("printf ok")), (20, None)], &selection, 20);
+        assert_eq!(summary.selected_count, 2);
+        assert!(summary.has_selected_commands);
+        assert!(!summary.clicked_has_command);
+    }
+
+    #[test]
+    fn unavailable_block_bindings_are_classified_for_pty_passthrough() {
+        use keybindings::Command as C;
+
+        for command in [
+            C::BlockSearch,
+            C::BlockToggleBookmark,
+            C::BlockJumpPrevBookmark,
+            C::BlockCopyOutput,
+            C::BlockClear,
+            C::BlockUndoClear,
+            C::BlockReinputSelectedCommands,
+            C::TerminalPromptPrev,
+            C::TerminalCopyLastOutput,
+        ] {
+            assert!(command_requires_block_context(&command), "{command}");
+        }
+        for command in [C::EditCopy, C::TerminalClear, C::PaneFocusLeft] {
+            assert!(!command_requires_block_context(&command), "{command}");
+        }
+    }
+
+    #[test]
+    fn block_clear_confirmation_is_counted_and_fails_closed() {
+        assert_eq!(BlockClearConfirmation::new(7, 0, None), None);
+        assert_eq!(BlockClearConfirmation::new(7, 3, None), None);
+        let confirm = BlockClearConfirmation::new(7, 3, Some(30)).expect("non-empty confirmation");
+        assert_eq!(confirm.block_count, 3);
+        assert_eq!(
+            confirm.resolve(Some((7, 3, Some(30)))),
+            BlockClearResolution::Clear
+        );
+        assert_eq!(confirm.resolve(None), BlockClearResolution::Stale);
+        assert_eq!(
+            confirm.resolve(Some((8, 3, Some(30)))),
+            BlockClearResolution::Stale
+        );
+        assert_eq!(
+            confirm.resolve(Some((7, 0, None))),
+            BlockClearResolution::Empty
+        );
+    }
+
+    #[test]
+    fn block_clear_confirmation_rearms_when_the_live_history_changes() {
+        let confirm = BlockClearConfirmation::new(11, 2, Some(20)).expect("non-empty confirmation");
+        let updated = BlockClearConfirmation::new(11, 4, Some(40)).expect("updated confirmation");
+        assert_eq!(
+            confirm.resolve(Some((11, 4, Some(40)))),
+            BlockClearResolution::Refresh(updated)
+        );
+        assert_eq!(
+            updated.resolve(Some((11, 4, Some(40)))),
+            BlockClearResolution::Clear
+        );
+
+        // A full bounded history may replace its oldest block without changing
+        // the count; the monotonic newest id still forces a fresh review.
+        let same_count_new_block =
+            BlockClearConfirmation::new(11, 2, Some(30)).expect("replacement confirmation");
+        assert_eq!(
+            confirm.resolve(Some((11, 2, Some(30)))),
+            BlockClearResolution::Refresh(same_count_new_block)
+        );
+    }
+
+    #[test]
+    fn enter_reinput_requires_a_trusted_empty_prompt() {
+        use terminal::AgentPromptStatus;
+
+        assert!(block_enter_reinputs_selection(
+            true,
+            AgentPromptStatus::Ready
+        ));
+        for status in [
+            AgentPromptStatus::Busy,
+            AgentPromptStatus::InputNotEmpty,
+            AgentPromptStatus::UnsafeCommand,
+            AgentPromptStatus::ShellIntegrationUnavailable,
+        ] {
+            assert!(!block_enter_reinputs_selection(true, status));
+        }
+        assert!(!block_enter_reinputs_selection(
+            false,
+            AgentPromptStatus::Ready
+        ));
+
+        // Every status that refuses the reinput now carries a reason, so Enter
+        // can explain itself the way Ctrl+Shift+I already does instead of
+        // dropping the selection in silence.
+        assert_eq!(
+            block_enter_blocked_reason(true, AgentPromptStatus::Ready),
+            None
+        );
+        for status in [
+            AgentPromptStatus::Busy,
+            AgentPromptStatus::InputNotEmpty,
+            AgentPromptStatus::UnsafeCommand,
+            AgentPromptStatus::ShellIntegrationUnavailable,
+        ] {
+            assert!(
+                block_enter_reinputs_selection(true, status)
+                    != block_enter_blocked_reason(true, status).is_some(),
+                "{status:?} must either reinput or explain, never both or neither"
+            );
+            // Same wording the explicit reinput chord already uses.
+            assert_eq!(
+                block_enter_blocked_reason(true, status),
+                block_prompt_replace_blocker(status)
+            );
+        }
+        // With no selection the key was never block mode's to explain.
+        assert_eq!(
+            block_enter_blocked_reason(false, AgentPromptStatus::InputNotEmpty),
+            None
+        );
+    }
+
+    #[test]
+    fn ctrl_arrows_preserve_scroll_and_own_selection_edges() {
+        use block_mode::SelectionNavigation::{Clear, Passthrough, Select};
+
+        let ids = [10, 20, 30];
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, true, false, false, &ids, None, 0),
+            Select(30)
+        );
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, false, false, false, &ids, None, 0),
+            Passthrough
+        );
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, false, false, false, &ids, Some(20), 1),
+            Select(30)
+        );
+        // Selection edges are owned: Up clamps, Down exits selection mode.
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, true, false, false, &ids, Some(10), 1),
+            Select(10)
+        );
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, false, false, false, &ids, Some(30), 1),
+            Clear
+        );
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, true, false, false, &[], None, 0),
+            Passthrough
+        );
+        // Running/full-screen programs retain Ctrl+Up too.
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, true, false, true, &ids, None, 0),
+            Passthrough
+        );
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, true, true, false, &ids, None, 0),
+            Passthrough
+        );
+        // A range at the newest edge contracts before a second step exits.
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, false, false, false, &ids, Some(30), 3),
+            Select(30)
+        );
+    }
+
+    #[test]
+    fn selected_command_reinput_never_executes_unbracketed_later_lines() {
+        let bracketed = pty_input::encode_prompt_insert(
+            "first\nsecond",
+            PasteModes { bracketed: true },
+            block_reinput_policy(),
+            true,
+        );
+        assert_eq!(bracketed.bytes, b"\x15\x1b[200~first\nsecond\x1b[201~");
+        assert!(!bracketed.bytes.ends_with(b"\r"));
+
+        let plain = pty_input::encode_prompt_insert(
+            "first\nsecond",
+            PasteModes { bracketed: false },
+            block_reinput_policy(),
+            true,
+        );
+        assert_eq!(plain.bytes, b"\x15first");
+        assert_eq!(plain.echo_text, "first");
+        assert!(plain.risk.truncated_to_first_line);
+        assert!(!plain.bytes.contains(&b'\n'));
+        assert!(!plain.bytes.contains(&b'\r'));
+    }
+
+    #[test]
+    fn block_prompt_replacement_requires_a_trusted_empty_shell_prompt() {
+        use terminal::AgentPromptStatus;
+
+        assert_eq!(block_prompt_replace_blocker(AgentPromptStatus::Ready), None);
+        assert_eq!(
+            block_prompt_replace_blocker(AgentPromptStatus::Busy),

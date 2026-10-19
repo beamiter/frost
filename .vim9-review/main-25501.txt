@@ -1,0 +1,300 @@
+        }
+        // A compact, flat "+ New" sits apart from the filled tab rows so it does
+        // not read as just another tab.
+        let new_tab = container(
+            button(text("+ New").size(self.chrome_font_size()))
+                .on_press(Message::NewSession)
+                .padding([2, 10])
+                .style(self.ghost_btn_style()),
+        )
+        .width(Length::Fill)
+        .center_x(Length::Fill)
+        .padding([4, 0]);
+        list = list.push(new_tab);
+        if self.pane_drag.is_some() {
+            list = list.push(self.pane_to_tab_drop_hint(true));
+        }
+        let list: Element<'_, Message> = scrollable(list).height(Length::Fill).into();
+        if self.pane_drag.is_some() {
+            mouse_area(list)
+                .on_release(Message::PanePromoteToTab(None))
+                .interaction(iced::mouse::Interaction::Grabbing)
+                .into()
+        } else {
+            list
+        }
+    }
+
+    fn pane_to_tab_drop_hint(&self, compact: bool) -> Element<'_, Message> {
+        let label = if compact {
+            "↓ Drop pane as tab"
+        } else {
+            "Drop pane here → new tab"
+        };
+        container(
+            text(label)
+                .size(self.chrome_font_size())
+                .color(self.c_text()),
+        )
+        .padding(if compact { [5, 8] } else { [3, 9] })
+        .style(self.split_drop_zone_style())
+        .into()
+    }
+
+    /// Paint one virtualized Files-tree slot (file row, inline error, or cap).
+    fn sidebar_render_item(
+        &self,
+        item: &sidebar::SidebarRenderItem,
+        drop_target: Option<&std::path::Path>,
+    ) -> Element<'_, Message> {
+        let generation = self.sidebar.generation();
+        match item {
+            sidebar::SidebarRenderItem::Node {
+                name,
+                path,
+                is_dir,
+                depth,
+                expanded,
+                state,
+                ..
+            } => {
+                let indent = 6.0 + *depth as f32 * 12.0;
+                let filtering = self.sidebar_filter.is_some();
+                let icon = if !is_dir {
+                    "·"
+                } else {
+                    match state {
+                        sidebar::DirectoryState::Loading | sidebar::DirectoryState::Refreshing => {
+                            "◌"
+                        }
+                        sidebar::DirectoryState::Error(_)
+                        | sidebar::DirectoryState::RefreshError(_) => "!",
+                        sidebar::DirectoryState::Unloaded | sidebar::DirectoryState::Loaded => {
+                            if *expanded || filtering {
+                                "▾"
+                            } else {
+                                "▸"
+                            }
+                        }
+                    }
+                };
+                let mut label = row![
+                    Space::new().width(Length::Fixed(indent)),
+                    text(icon)
+                        .size(self.chrome_font_size())
+                        .width(Length::Fixed(self.chrome_font_size() + 2.0)),
+                    text(crate::sidebar::bound_sidebar_filename(name.clone()))
+                        .size(self.chrome_font_size()),
+                ]
+                .spacing(2)
+                .align_y(iced::Alignment::Center);
+                match state {
+                    sidebar::DirectoryState::Loading => {
+                        let copy = if self.sidebar.request_phase(path)
+                            == Some(sidebar::DirectoryRequestPhase::Queued)
+                        {
+                            "Queued…"
+                        } else {
+                            "Loading…"
+                        };
+                        label = label.push(
+                            text(copy)
+                                .size(self.chrome_font_size())
+                                .style(text::secondary),
+                        );
+                    }
+                    sidebar::DirectoryState::Refreshing => {
+                        let copy = if self.sidebar.request_phase(path)
+                            == Some(sidebar::DirectoryRequestPhase::Queued)
+                        {
+                            "Refresh queued…"
+                        } else {
+                            "Refreshing…"
+                        };
+                        label = label.push(
+                            text(copy)
+                                .size(self.chrome_font_size())
+                                .style(text::secondary),
+                        );
+                    }
+                    _ => {}
+                }
+                let selected = self.sidebar_selection.contains(path);
+                let keyboard_focus = self.sidebar_tree_focus.as_deref() == Some(path.as_path());
+                let is_drop = drop_target.is_some_and(|target| target == path.as_path() && *is_dir);
+                let row_button = button(label)
+                    .on_press(Message::SidebarRowClick(generation, path.clone(), *is_dir))
+                    .width(Length::Fill)
+                    .height(Length::Fixed(self.sidebar_row_height()))
+                    .padding([1, 2])
+                    .style(self.sidebar_row_style(selected, keyboard_focus, is_drop));
+                mouse_area(row_button)
+                    .on_right_press(Message::SidebarMenuOpen(generation, path.clone(), *is_dir))
+                    .on_enter(Message::SidebarRowHover(
+                        generation,
+                        Some((path.clone(), *is_dir)),
+                    ))
+                    .on_exit(Message::SidebarRowHover(generation, None))
+                    .into()
+            }
+            sidebar::SidebarRenderItem::Error {
+                path,
+                depth,
+                message,
+                refresh,
+                last_loaded_at,
+            } => {
+                let error = if *refresh {
+                    let age = last_loaded_at.map(|loaded_at| {
+                        sidebar_snapshot_age_copy(
+                            std::time::Instant::now().saturating_duration_since(loaded_at),
+                        )
+                        .0
+                    });
+                    match age {
+                        Some(age) => crate::sidebar::bound_sidebar_notice(format!(
+                            "Refresh failed: {message} · {age}"
+                        )),
+                        None => crate::sidebar::bound_sidebar_notice(format!(
+                            "Refresh failed: {message}"
+                        )),
+                    }
+                } else {
+                    crate::sidebar::bound_sidebar_notice(message)
+                };
+                container(
+                    row![
+                        text(error)
+                            .size(self.chrome_font_size())
+                            .wrapping(text::Wrapping::Word)
+                            .width(Length::Fill)
+                            .style(text::danger),
+                        button(text("Retry").size(self.chrome_font_size()))
+                            .on_press(Message::SidebarRetry(generation, path.clone()))
+                            .padding([1, 6])
+                            .style(self.ghost_btn_style()),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                )
+                .height(Length::Fixed(self.sidebar_row_height()))
+                .padding([2, (20.0 + *depth as f32 * 12.0) as u16])
+                .into()
+            }
+            sidebar::SidebarRenderItem::Truncated { depth } => container(
+                text(format!(
+                    "Showing first {} entries",
+                    remote_fs::MAX_DIRECTORY_ENTRIES
+                ))
+                .size(self.chrome_font_size())
+                .style(text::secondary),
+            )
+            .height(Length::Fixed(self.sidebar_row_height()))
+            .padding([2, (20.0 + *depth as f32 * 12.0) as u16])
+            .into(),
+        }
+    }
+
+    /// The draggable divider strip for one gap of a split node (identified by
+    /// `id`). Pressing it starts a resize drag (continued via the body's
+    /// `on_move` while `dragging_divider` is set).
+    fn divider(&self, axis: Axis, id: DividerId) -> Element<'_, Message> {
+        let horizontal = matches!(axis, Axis::Horizontal);
+        let d = if horizontal {
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fixed(DIVIDER))
+        } else {
+            container(Space::new())
+                .width(Length::Fixed(DIVIDER))
+                .height(Length::Fill)
+        };
+        let interaction = if horizontal {
+            iced::mouse::Interaction::ResizingVertically
+        } else {
+            iced::mouse::Interaction::ResizingHorizontally
+        };
+        let active = self.hovered_divider.as_ref() == Some(&id)
+            || self.dragging_divider.as_ref() == Some(&id);
+        mouse_area(d.style(self.divider_style(active)))
+            .on_press(Message::DividerDragStart(id.clone()))
+            .on_enter(Message::DividerHover(Some(id.clone())))
+            .on_exit(Message::DividerHover(None))
+            .interaction(interaction)
+            .into()
+    }
+
+    /// Recursively build the pane layout widget tree. `path` is the child-index
+    /// route from the root to `node`, used to tag each divider with a
+    /// [`DividerId`].
+    fn render_tree(&self, node: &PaneTree, path: &[usize]) -> Element<'_, Message> {
+        match node {
+            PaneTree::Leaf(session) => {
+                // The focus outline and the header strip are only meaningful
+                // while split: a lone pane is already named by the tab bar.
+                let split = self.is_split();
+                let focused = split && *session == self.active;
+                let body: Element<'_, Message> = if split {
+                    column![
+                        self.pane_header(*session),
+                        container(self.pane_view(*session))
+                            .width(Length::Fill)
+                            .height(Length::Fill),
+                    ]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+                } else {
+                    self.pane_view(*session)
+                };
+                let framed: Element<'_, Message> = container(body)
+                    .style(self.pane_frame_style(focused))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into();
+                let direction = self.sessions.get(*session).and_then(|session| {
+                    self.tab_split_drop
+                        .filter(|drop| drop.target_session_id == session.id)
+                        .map(|drop| drop.direction)
+                });
+                if let Some(direction) = direction {
+                    stack![framed, self.split_drop_overlay(direction)].into()
+                } else {
+                    framed
+                }
+            }
+            PaneTree::Split {
+                axis,
+                children,
+                ratios,
+            } => {
+                let horizontal = matches!(axis, Axis::Horizontal);
+                let n = children.len();
+                let mut items: Vec<Element<'_, Message>> =
+                    Vec::with_capacity(2 * n.saturating_sub(1) + 1);
+                for (i, child) in children.iter().enumerate() {
+                    if i > 0 {
+                        items.push(self.divider(
+                            *axis,
+                            DividerId {
+                                path: path.to_vec(),
+                                gap: i - 1,
+                            },
+                        ));
+                    }
+                    let share = ratios.get(i).copied().unwrap_or(1.0 / n as f32);
+                    let portion = (share * 1000.0).round().max(1.0) as u16;
+                    let mut child_path = path.to_vec();
+                    child_path.push(i);
+                    let el = self.render_tree(child, &child_path);
+                    let el: Element<'_, Message> = if horizontal {
+                        container(el)
+                            .width(Length::Fill)
+                            .height(Length::FillPortion(portion))
+                            .into()
+                    } else {
+                        container(el)
+                            .width(Length::FillPortion(portion))
+                            .height(Length::Fill)
+                            .into()
+                    };

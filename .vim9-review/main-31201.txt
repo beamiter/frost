@@ -1,0 +1,300 @@
+            ));
+        }
+        // Same trick for the file-ops menu anchor: track the window-space
+        // pointer only while it is over the dock with the file tree showing,
+        // so motion elsewhere never rebuilds the view.
+        if self.sidebar_hovered && self.dock_open() && self.sidebar_panel == SidebarPanel::Files {
+            subs.push(iced::event::listen_with(
+                |event, _status, _id| match event {
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                        Some(Message::SidebarPointerMoved(position))
+                    }
+                    _ => None,
+                },
+            ));
+        }
+        // Transfer progress poll: four updates a second while one runs, which
+        // is also the sink's own throttle quantum.
+        if self.sidebar_transfer.is_some() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(250))
+                    .map(|_| Message::SidebarTransferTick),
+            );
+        }
+        if self.dock_open()
+            && self.sidebar_panel == SidebarPanel::Files
+            && self.sidebar.root.last_loaded_at.is_some()
+        {
+            subs.push(
+                iced::time::every(std::time::Duration::from_secs(30))
+                    .map(|_| Message::SidebarSnapshotTick),
+            );
+        }
+        // A cooldown may be the only reason queued work has no running worker
+        // left to wake dispatch. Poll cheaply while such work exists; ordinary
+        // queues still drain immediately on each completion.
+        if self.sidebar_scans.queued_len() > 0 {
+            subs.push(
+                iced::time::every(std::time::Duration::from_secs(1))
+                    .map(|_| Message::SidebarScanTick),
+            );
+        }
+        if self.tab_drag_hover_since.is_some() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(50))
+                    .map(|_| Message::TabDragHoverTick),
+            );
+        }
+        subs.push(
+            iced::time::every(std::time::Duration::from_millis(1500)).map(|_| Message::ConfigTick),
+        );
+        // Background work must drain even while hidden. Parked review state
+        // only needs display refreshes in the focused, visible Tasks panel;
+        // an already loaded diff must not keep a hidden panel polling forever.
+        let tasks_open = self.focused
+            && self.config.experimental_task_sidebar
+            && self.dock_open()
+            && self.sidebar_panel == SidebarPanel::Tasks;
+        if self.agent_runtime.has_any_activity()
+            || self.task_panel.pending_creation.is_some()
+            || self.task_panel.diff.state().loading
+            || tasks_open
+        {
+            let interval = if self.agent_runtime.needs_fast_poll()
+                || self.task_panel.pending_creation.is_some()
+                || self.task_panel.diff.state().loading
+            {
+                std::time::Duration::from_millis(50)
+            } else {
+                std::time::Duration::from_millis(500)
+            };
+            subs.push(iced::time::every(interval).map(|_| Message::TaskTick));
+        }
+        // The blink tick redraws and re-shapes the whole grid every 530ms purely
+        // to animate blinking cells. Run it only while focused AND when a visible
+        // pane actually has blinking text — the common case (no blink, or
+        // unfocused) then stays fully idle.
+        let has_blink = self.layout().leaves().iter().any(|&idx| {
+            self.sessions.get(idx).is_some_and(|s| {
+                s.projection
+                    .cells()
+                    .iter()
+                    .flatten()
+                    .any(|cell| cell.flags.blink())
+            })
+        });
+        if self.focused && has_blink {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(530))
+                    .map(|_| Message::BlinkTick),
+            );
+        }
+        // Running output can be quiet for minutes (sleep, a remote build, a
+        // network wait), so PTY reads alone cannot animate its elapsed badge.
+        // Keep the timer scoped to visible panes while block chrome is on;
+        // the normal idle terminal still has no extra redraw subscription.
+        let pane_running_badge_interval = |index: usize| {
+            self.sessions.get(index).and_then(|session| {
+                // Exactly the paint-side gate, so the tick is armed if and
+                // only if a chip is actually on screen to animate.
+                let (_, _, elapsed_ms) = self.running_badge_target(session)?;
+                Some(if elapsed_ms < 3_600_000 {
+                    std::time::Duration::from_secs(1)
+                } else {
+                    // The family duration formatter drops seconds at one
+                    // hour, so its visible text changes once per minute.
+                    std::time::Duration::from_secs(60)
+                })
+            })
+        };
+        let running_badge_interval = if let Some((_, _, elapsed)) = self.chat_running_status() {
+            Some(std::time::Duration::from_secs(if elapsed < 3_600_000 {
+                1
+            } else {
+                60
+            }))
+        } else if !self.config.is_block_mode() {
+            None
+        } else if self.is_split() && self.pane_zoomed {
+            pane_running_badge_interval(self.active)
+        } else {
+            self.layout()
+                .leaves()
+                .iter()
+                .filter_map(|&idx| pane_running_badge_interval(idx))
+                .min()
+        };
+        if let Some(interval) = running_badge_interval {
+            subs.push(iced::time::every(interval).map(|_| Message::BlockElapsedTick));
+        }
+        if self.sessions.iter().any(Session::has_pending_write) {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(8))
+                    .map(|_| Message::PtyWriteTick),
+            );
+        }
+        if self.search.is_open && self.search_dirty {
+            // Live search refreshes are debounced to 300 ms (ember's
+            // LIVE_SEARCH_REFRESH_INTERVAL) instead of re-running the
+            // full-buffer search every 50 ms during streaming output.
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(300))
+                    .map(|_| Message::SearchRefreshTick),
+            );
+        }
+        if self.history_reflow_due.is_some() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(50))
+                    .map(|_| Message::HistoryReflowTick),
+            );
+        }
+        if !self.toasts.is_empty() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(250))
+                    .map(|_| Message::ToastTick),
+            );
+        }
+        Subscription::batch(subs)
+    }
+}
+
+/// A labeled settings row: fixed-width label, the control, then its value.
+fn slider_row<'a>(
+    label: &'static str,
+    value: String,
+    control: Element<'a, Message>,
+    font_size: f32,
+) -> Element<'a, Message> {
+    row![
+        text(label).size(font_size).width(Length::Fixed(120.0)),
+        control,
+        text(value)
+            .size(font_size)
+            .width(Length::Fixed((font_size * 5.0).max(64.0))),
+    ]
+    .spacing(10)
+    .align_y(iced::Alignment::Center)
+    .into()
+}
+
+fn sidebar_scan_task(request: sidebar::DirectoryRequest) -> Task<Message> {
+    let generation = request.generation;
+    let request_id = request.request_id;
+    let path = request.path.clone();
+    Task::perform(
+        async move {
+            match tokio::task::spawn_blocking(move || sidebar::load_directory(request)).await {
+                Ok(result) => result,
+                Err(_) => sidebar::DirectoryResult {
+                    generation,
+                    request_id,
+                    path,
+                    entries: Err(sidebar::DirectoryError::internal()),
+                    truncated: false,
+                },
+            }
+        },
+        Message::SidebarLoaded,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarLoadApply {
+    Rejected,
+    Replaced,
+    Reconciled,
+    RefreshFailed,
+    NavigationCommitted,
+    NavigationFailed,
+}
+
+/// Apply one directory worker result. Rejected generations are completely
+/// inert; a preserving directory refresh keeps a still-live hover, while an ordinary
+/// replacement retires it. The caller prunes the remaining path contexts only
+/// after a successful reconciliation can actually remove rows.
+fn apply_sidebar_load_result(
+    sidebar: &mut sidebar::Sidebar,
+    hovered_row: &mut Option<(std::path::PathBuf, bool)>,
+    result: sidebar::DirectoryResult,
+) -> SidebarLoadApply {
+    let navigation =
+        sidebar.is_pending_navigation_result(result.generation, result.request_id, &result.path);
+    let navigation_succeeded = navigation && result.entries.is_ok();
+    let preserving_refresh =
+        sidebar.accepts_generation(result.generation) && sidebar.node_is_refreshing(&result.path);
+    let refresh_succeeded = preserving_refresh && result.entries.is_ok();
+    let applied = sidebar.apply_load(result);
+    if !applied {
+        return SidebarLoadApply::Rejected;
+    }
+    if navigation {
+        if navigation_succeeded {
+            *hovered_row = None;
+            return SidebarLoadApply::NavigationCommitted;
+        }
+        return SidebarLoadApply::NavigationFailed;
+    }
+    if preserving_refresh {
+        if refresh_succeeded {
+            SidebarLoadApply::Reconciled
+        } else {
+            SidebarLoadApply::RefreshFailed
+        }
+    } else {
+        *hovered_row = None;
+        SidebarLoadApply::Replaced
+    }
+}
+
+/// Remove every path-scoped UI intent invalidated by one accepted root
+/// reconciliation. Contexts opened before the refresh also carry an older
+/// generation and are retired even when their text path happens to survive.
+#[allow(clippy::too_many_arguments)]
+fn prune_sidebar_context_after_reconcile(
+    sidebar: &sidebar::Sidebar,
+    reconciled_dir: &std::path::Path,
+    selection: &mut Vec<std::path::PathBuf>,
+    selection_anchor: &mut Option<std::path::PathBuf>,
+    hovered_row: &mut Option<(std::path::PathBuf, bool)>,
+    menu: &mut Option<SidebarMenuState>,
+    dialog: &mut Option<SidebarDialogState>,
+    delete_confirm: &mut Option<SidebarDeleteConfirmation>,
+    drop_burst: &mut Vec<std::path::PathBuf>,
+    drop_debounce_generation: &mut Option<u64>,
+    drop_hint: &mut bool,
+) {
+    let is_in_reconciled_tree = |path: &std::path::Path| path.starts_with(reconciled_dir);
+    selection.retain(|path| !is_in_reconciled_tree(path) || sidebar.contains_path(path));
+    if selection_anchor
+        .as_ref()
+        .is_some_and(|path| is_in_reconciled_tree(path) && !sidebar.contains_path(path))
+    {
+        *selection_anchor = selection.first().cloned();
+    }
+
+    let hover_removed = hovered_row.as_ref().is_some_and(|(path, is_dir)| {
+        is_in_reconciled_tree(path) && sidebar.node_is_dir(path) != Some(*is_dir)
+    });
+    if hover_removed {
+        *hovered_row = None;
+    }
+    let generation = sidebar.generation();
+    if menu.as_ref().is_some_and(|state| {
+        state.generation != generation
+            || (is_in_reconciled_tree(&state.path)
+                && sidebar.node_is_dir(&state.path) != Some(state.is_dir))
+            || state.targets.iter().any(|(path, is_dir)| {
+                is_in_reconciled_tree(path) && sidebar.node_is_dir(path) != Some(*is_dir)
+            })
+    }) {
+        *menu = None;
+    }
+    if dialog.as_ref().is_some_and(|state| {
+        state.generation != generation
+            || match state.kind {
+                SidebarDialogKind::NewFile | SidebarDialogKind::NewFolder => {
+                    is_in_reconciled_tree(&state.path)
+                        && sidebar.node_is_dir(&state.path) != Some(true)
+                }
+                SidebarDialogKind::Rename => {
+                    is_in_reconciled_tree(&state.path) && !sidebar.contains_path(&state.path)

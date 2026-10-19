@@ -1,0 +1,300 @@
+
+    /// Restore the blocks removed by the active pane's most recent Clear
+    /// Blocks (anvil/forge's Undo Clear Blocks). The stash is pane-local and
+    /// single-level: restored blocks re-enter above anything produced since,
+    /// while the selection and bookmarks the clear discarded stay discarded.
+    fn undo_block_clear(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Undo Clear Blocks") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+        let restored = sess.terminal.undo_clear_completed_blocks();
+        if restored == 0 {
+            self.push_toast(
+                "No cleared command blocks to restore".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
+        sess.refresh();
+        self.links_cache_key = None;
+        self.links.clear();
+        self.refresh_kitty_handles();
+        self.push_toast(
+            format!(
+                "Restored {restored} command block{}",
+                if restored == 1 { "" } else { "s" }
+            ),
+            ToastKind::Success,
+        );
+        Task::none()
+    }
+
+    /// Expand or contract the selected range by moving its active edge one
+    /// completed block. Used by Shift+Up/Down while a block selection owns
+    /// keyboard navigation.
+    fn block_extend_selection_step(&mut self, older: bool) -> Task<Message> {
+        if !self.ensure_block_action_available("Block selection") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+        let ids: Vec<u64> = sess
+            .terminal
+            .command_zones
+            .iter()
+            .map(|zone| zone.id)
+            .collect();
+        sess.block_selection.retain(&ids);
+        let Some(target) = sess.block_selection.extend_step(&ids, older) else {
+            return Task::none();
+        };
+        if let Some(prompt_start) = sess
+            .terminal
+            .zone_by_id(target)
+            .filter(|zone| !zone.rows_evicted)
+            .map(|zone| zone.prompt_start)
+        {
+            sess.reveal_absolute_cell(prompt_start, 0);
+        }
+        sess.refresh();
+        Task::none()
+    }
+
+    /// Reinput every selected command in terminal order without submitting
+    /// it. A multi-command selection is one editable bracketed-paste buffer;
+    /// without DECSET 2004 the shared safe policy keeps only the first logical
+    /// line, so later selected commands cannot execute as embedded newlines.
+    fn insert_reviewed_block_commands(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Block command reinput") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+        if sess.block_selection.is_empty() {
+            self.push_toast("No command blocks selected".to_string(), ToastKind::Info);
+            return Task::none();
+        }
+        let prompt_status = sess.agent_prompt_status();
+        if let Some(reason) = block_prompt_replace_blocker(prompt_status) {
+            self.push_toast(
+                format!("Commands not reinput: {reason}"),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+
+        let (session_id, commands) = {
+            let sess = &mut self.sessions[self.active];
+            let ids: Vec<u64> = sess
+                .terminal
+                .command_zones
+                .iter()
+                .map(|zone| zone.id)
+                .collect();
+            sess.block_selection.retain(&ids);
+            let commands = block_mode::selected_commands(
+                sess.terminal
+                    .command_zones
+                    .iter()
+                    .map(|zone| (zone.id, zone.command.as_deref(), zone.command_truncated)),
+                &sess.block_selection,
+                crate::review_text::MAX_PROMPT_INSERT_BYTES,
+            );
+            (sess.id, commands)
+        };
+        let selected_commands = match commands {
+            Ok(commands) => commands,
+            Err(block_mode::SelectedCommandsError::Empty) => {
+                self.push_toast(
+                    "Selected blocks have no commands to reinput".to_string(),
+                    ToastKind::Info,
+                );
+                return Task::none();
+            }
+            Err(block_mode::SelectedCommandsError::Truncated) => {
+                self.push_toast(
+                    "Commands not reinput: a selected command was truncated or unavailable"
+                        .to_string(),
+                    ToastKind::Warning,
+                );
+                return Task::none();
+            }
+            Err(block_mode::SelectedCommandsError::TooLarge) => {
+                self.push_toast(
+                    "Commands not reinput: the selected commands are too large".to_string(),
+                    ToastKind::Warning,
+                );
+                return Task::none();
+            }
+            Err(block_mode::SelectedCommandsError::Unsafe) => {
+                self.push_toast(
+                    "Commands not reinput: a selected command contains control or visual-spoofing characters"
+                        .to_string(),
+                    ToastKind::Warning,
+                );
+                return Task::none();
+            }
+        };
+        let command_count = selected_commands.block_count;
+        let commands = selected_commands.text;
+        let commands = match crate::review_text::sanitize_prompt_payload(
+            &commands,
+            crate::review_text::MAX_PROMPT_INSERT_BYTES,
+        ) {
+            Ok(commands) => commands,
+            Err(error) => {
+                self.push_toast(format!("Commands not reinput: {error}"), ToastKind::Warning);
+                return Task::none();
+            }
+        };
+        if commands.trim().is_empty() {
+            self.push_toast(
+                "Selected blocks have no safe command text to reinput".to_string(),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        if let Err(reason) = self.session_prompt_replace_ready(session_id) {
+            self.push_toast(
+                format!("Commands not reinput: {reason}"),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        if self.write_paste_to_session(session_id, &commands, block_reinput_policy(), true)
+            == paste_feedback::PasteOutcome::Written
+        {
+            self.push_toast(
+                format!(
+                    "Reinput {command_count} selected block{} (not run)",
+                    if command_count == 1 { "" } else { "s" }
+                ),
+                ToastKind::Success,
+            );
+        }
+        Task::none()
+    }
+
+    /// Move the block selection to a neighbouring completed zone (`older` =
+    /// toward the top) and reveal its first row, exactly the row
+    /// [`Self::block_jump_first_failed`] scrolls to. With no selection — or a
+    /// selection whose zone was trimmed away — Up resets to the newest completed
+    /// zone while Down remains unowned. Up clamps at the oldest block; Down past
+    /// the newest clears selection, matching anvil/forge.
+    fn block_select_step(&mut self, older: bool) -> Task<Message> {
+        if !self.ensure_block_action_available("Block selection") {
+            return Task::none();
+        }
+        let (navigation, has_blocks) = {
+            let Some(sess) = self.sessions.get_mut(self.active) else {
+                return Task::none();
+            };
+            let ids: Vec<u64> = sess
+                .terminal
+                .command_zones
+                .iter()
+                .map(|zone| zone.id)
+                .collect();
+            let has_blocks = !ids.is_empty();
+            sess.block_selection.retain(&ids);
+            (
+                block_mode::selection_navigation_with_count(
+                    &ids,
+                    sess.block_selection.active(),
+                    sess.block_selection.len(),
+                    older,
+                ),
+                has_blocks,
+            )
+        };
+        match navigation {
+            block_mode::SelectionNavigation::Select(target) => {
+                self.select_and_reveal_block(target);
+            }
+            block_mode::SelectionNavigation::Clear => {
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    sess.block_selection.clear();
+                    sess.refresh();
+                }
+                self.push_toast("Block selection cleared".to_string(), ToastKind::Info);
+            }
+            // Two different causes, and they need different answers: the
+            // pane has no zones at all, or "newer" was asked with no live
+            // selection — deliberately unowned, because Up is the entry
+            // point. The contextual Ctrl+↑/↓ path resolves Passthrough
+            // separately and keeps ordinary scrolling; reaching it *here*
+            // means an explicit palette pick (or a user-bound chord), which
+            // has to say why nothing happened instead of doing nothing.
+            block_mode::SelectionNavigation::Passthrough => {
+                let message = if has_blocks {
+                    "No block selected — select an older block first (Ctrl+↑)".to_string()
+                } else {
+                    self.block_absent_toast("command blocks to select")
+                };
+                self.push_toast(message, ToastKind::Info);
+            }
+        }
+        Task::none()
+    }
+
+    /// The completed zone a whole-block action (copy block / copy Markdown)
+    /// should act on: the selected zone — a vanished selection toasts and
+    /// cancels (never a silent substitution) — else the newest completed
+    /// zone. `None` means a toast was already pushed.
+    fn block_target_zone_id(&mut self, verb: &str) -> Option<u64> {
+        let sess = self.sessions.get(self.active)?;
+        match sess.block_selection.active() {
+            Some(id) => {
+                if sess.terminal.zone_by_id(id).is_none() {
+                    self.clear_stale_block_selection();
+                    return None;
+                }
+                Some(id)
+            }
+            None => {
+                let newest = sess.terminal.command_zones.back().map(|zone| zone.id);
+                if newest.is_none() {
+                    self.push_toast(
+                        self.block_absent_toast(&format!("block to {verb}")),
+                        ToastKind::Info,
+                    );
+                }
+                newest
+            }
+        }
+    }
+
+    /// Copy the selected block (newest when nothing is selected) as plain
+    /// text via [`block_mode::block_copy_text`] (anvil's clipboard rule):
+    /// command + newline + output, a blank output copying the bare command
+    /// with no trailing newline, and background zones (no command) copying
+    /// their output alone.
+    fn block_copy_block_task(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Block copy") {
+            return Task::none();
+        }
+        if let Some(task) = self.block_copy_selected_task(block_mode::SelectedClipboardMode::Blocks)
+        {
+            return task;
+        }
+        let Some(id) = self.block_target_zone_id("copy") else {
+            return Task::none();
+        };
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let Some(zone) = sess.terminal.zone_by_id(id) else {
+            return Task::none();
+        };
+        let output = match sess.terminal.zone_output_export_capped(id) {
+            Some(terminal::ZoneOutputExport::Available { text, .. }) => Some(text),
+            Some(terminal::ZoneOutputExport::Empty) => None,
+            Some(terminal::ZoneOutputExport::Unavailable) => {
+                self.push_toast(
+                    "Block output is no longer retained; copy the command separately".to_string(),
+                    ToastKind::Warning,

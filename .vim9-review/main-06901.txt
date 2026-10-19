@@ -1,0 +1,300 @@
+    history_picker: Option<history_picker::HistoryPickerState>,
+    /// Never reset on focus loss: Iced drops synthetic focus-change key events.
+    /// If the real release is missed off-window, one extra press/release cycle
+    /// may be consumed, rather than letting an ambiguous repeat execute input.
+    prompt_recall_enter_latch: PromptRecallEnterLatch,
+    native_enter_ownership: native_enter::SharedOwnership,
+    terminal_ime: terminal_ime::Ownership,
+    /// Workflow overlay (Ctrl+Shift+M): fuzzy picker over TOML/YAML workflow
+    /// files, then a per-argument form before the rendered command is typed
+    /// into the active pane for review (never executed).
+    workflow_overlay: Option<workflow_picker::WorkflowOverlay>,
+    /// Cross-block search picker overlay (`block:search`, Ctrl+Alt+F).
+    block_search: Option<BlockSearchState>,
+    /// Last matching intent for this window. Memory-only: cache/results and
+    /// pane identity are rebuilt fresh whenever the picker opens.
+    block_search_memory: BlockSearchMemory,
+    /// Window-wide monotonic source for async block-search build identities.
+    /// It deliberately survives picker close/reopen within the same pane.
+    next_block_search_epoch: u64,
+    block_search_job: Option<BlockSearchJob>,
+    /// Context actions for the finalized block right-clicked anywhere in its card.
+    block_menu: Option<BlockMenuState>,
+    block_review: Option<BlockReview>,
+    /// Counted destructive confirmation for clearing one stable pane's block
+    /// history. Revalidated before deletion in case PTY output changed it.
+    block_clear_confirm: Option<BlockClearConfirmation>,
+    /// Close-confirmation overlay for a pane or tab with a running foreground
+    /// process. Holds `(target_id, process_name, what_to_close)`.
+    tab_close_confirm: Option<(usize, String, PendingClose)>,
+    /// Last desktop notification launch. OSC 9/777 originates inside the PTY
+    /// (and may be remote over SSH), so process spawning is globally rate-limited.
+    last_notification_at: Option<std::time::Instant>,
+    /// Last read-only hint for typing into a held-open task transcript. The
+    /// toast is throttled so key repeat cannot stack duplicates.
+    read_only_hint_at: Option<std::time::Instant>,
+    /// Sessions whose history needs one width-normalization pass after resize
+    /// activity settles, keyed by stable session id.
+    history_reflow_sessions: std::collections::HashSet<usize>,
+    history_reflow_due: Option<std::time::Instant>,
+    /// Held for the process lifetime to enforce single-instance behavior. When
+    /// `None`, another instance already holds the lock and this one runs fresh
+    /// (no session restore, no snapshot writes) to avoid clobbering its history.
+    /// The guard also publishes its descriptor so freshly forked PTY children
+    /// close their inherited copies immediately.
+    _instance_lock: Option<session_persistence::InstanceLock>,
+    is_first_instance: bool,
+}
+
+impl Frost {
+    fn new(
+        config: Config,
+        config_diagnostic: Option<String>,
+        config_revision: Option<persistence::FileRevision>,
+        native_enter_ownership: native_enter::SharedOwnership,
+    ) -> (Self, Task<Message>) {
+        let ai_temperature_draft = config
+            .ai_temperature
+            .map(|t| format!("{t}"))
+            .unwrap_or_default();
+        let theme = Theme::get_theme(&config.theme).unwrap_or_default();
+        let mono = resolve_mono_font(&config.font_family);
+        let metrics = Metrics::with_font(
+            mono,
+            Config::clamp_font_size(config.font_size),
+            config.line_spacing,
+            config.padding,
+            config.is_card_mode(),
+        );
+        let cols = config.cols.max(1);
+        let rows = config.rows.max(1);
+        let win_size = Size::new(config.initial_width, config.initial_height);
+        let keybindings_load = keybindings::KeyBindings::load_with_diagnostics();
+        let keybindings_revision = keybindings_load.revision.clone();
+
+        // Single-instance lock: a second instance starts fresh and never writes
+        // the session snapshot, so it cannot clobber the first instance's history.
+        let instance_lock = session_persistence::try_acquire_instance_lock();
+        let is_first_instance = instance_lock.is_some();
+        if !is_first_instance {
+            eprintln!("[SessionPersistence] Another instance is running, starting fresh");
+        }
+
+        let cjk_mono = resolve_optional_font(Config::cjk_monospace_font_family());
+        let symbol_mono = resolve_optional_font(Config::symbol_monospace_font_family());
+        let math_symbol = resolve_optional_font(Config::math_symbol_font_family());
+        let nerd_symbol = resolve_optional_font(Config::nerd_symbol_font_family());
+
+        // Restore prior tabs (their cwds + active index) when enabled and we are
+        // the first instance; otherwise start with a single default session.
+        let RestoredState {
+            sessions,
+            active,
+            next_id,
+            tabs: saved_tabs,
+            active_tab: saved_active_tab,
+            legacy_tree: saved_tree,
+            legacy_split: saved_split,
+            diagnostic: session_diagnostic,
+            startup_recovery,
+            session_writes_blocked,
+        } = Self::restore_or_spawn(&config, cols, rows, is_first_instance);
+
+        // In Side mode the dock hosts the tab list and starts open (there is no
+        // top bar to show tabs otherwise); in Top mode it starts collapsed.
+        let side_tabs = config.tab_position == config::TabPosition::Side;
+        let sidebar_panel = if side_tabs {
+            SidebarPanel::Tabs
+        } else {
+            SidebarPanel::Files
+        };
+        let sidebar_open = side_tabs;
+
+        let mut app = Frost {
+            terminal_interaction_mode: config.effective_terminal_mode(),
+            terminal_interaction_epoch: 0,
+            terminal_pane_owners: None,
+            config,
+            organism: organism::Organism::default(),
+            organism_motion_control: organism_motion_control::MotionControl::default(),
+            organism_wake_counts: organism_wake_plan::WakeCounters::default(),
+            organism_pointer_buttons: Vec::new(),
+            organism_body_geometry: None,
+            organism_geometry_epoch: 0,
+            theme,
+            metrics,
+            sessions,
+            active,
+            next_id,
+            cols,
+            rows,
+            focused: true,
+            modifiers: keyboard::Modifiers::default(),
+            font_wheel: font_zoom::WheelZoom::default(),
+            click_tracker: TerminalClickTracker::default(),
+            terminal_mouse_gestures: [None; 3],
+            mono,
+            cjk_mono,
+            symbol_mono,
+            math_symbol,
+            nerd_symbol,
+            search: search::SearchState::new(),
+            search_dirty: false,
+            search_replace: search_replace_panel::SearchReplacePanelState::new(),
+            palette: command_palette::PaletteState::new(),
+            block_export_in_flight: false,
+            host_clipboard_read_owner: None,
+            host_clipboard_read_generation: 0,
+            host_clipboard_read_task: None,
+            host_clipboard_read_reply: None,
+            osc52_write_window_started: std::time::Instant::now(),
+            osc52_writes_in_window: 0,
+            agent: agent::AgentUi::new(),
+            command_corrections: command_correction::CorrectionRegistry::default(),
+            ai_chats: ai_chats::AiChatsUi::new(is_first_instance),
+            ai_ask: None,
+            ai_suggestion: None,
+            ai_suggestion_generation: 0,
+            task_manager: agent_task::TaskManager::new(),
+            agent_runtime: agent_task::AgentRuntimeManager::new(),
+            task_panel: agent_task_ui::TaskPanel::new(),
+            keybindings: keybindings_load.bindings,
+            config_panel_open: false,
+            help_open: false,
+            debug_open: false,
+            blink_on: true,
+            win_size,
+            config_revision,
+            config_write_blocked: config_diagnostic.is_some(),
+            config_diagnostic,
+            keybindings_revision,
+            keybindings_diagnostics: keybindings_load.diagnostics,
+            session_diagnostic,
+            startup_recovery,
+            ai_temperature_draft,
+            ai_key_draft: String::new(),
+            config_dirty: false,
+            config_save_retry: config_retry::ConfigSaveRetry::default(),
+            link_detector: link::LinkDetector::new(link::LinkDetectionConfig::default()),
+            links: Vec::new(),
+            links_cache_key: None,
+            kitty_handles: std::collections::HashMap::new(),
+            last_session_save: None,
+            session_dirty: true,
+            session_writes_blocked,
+            last_ingest_us: 0,
+            last_ingest_bytes: 0,
+            // Placeholder; the real tabs are installed below, after the
+            // snapshot has been validated against the sessions that spawned.
+            tabs: vec![Tab::new(0, active)],
+            active_tab: 0,
+            next_tab_id: 1,
+            theme_editor: None,
+            sidebar: sidebar::Sidebar::new(),
+            sidebar_scans: sidebar::DirectoryScanCoordinator::default(),
+            sidebar_open,
+            sidebar_panel,
+            dock_width: SIDEBAR_W,
+            dragging_sidebar: false,
+            sidebar_menu: None,
+            sidebar_dialog: None,
+            sidebar_delete_confirm: None,
+            sidebar_clipboard: None,
+            sidebar_next_clipboard_id: 0,
+            sidebar_transfer: None,
+            sidebar_hovered_row: None,
+            sidebar_selection: Vec::new(),
+            sidebar_selection_anchor: None,
+            sidebar_filter: None,
+            sidebar_path_input: None,
+            sidebar_drop_burst: Vec::new(),
+            sidebar_drop_intents: SidebarDropIntents::default(),
+            sidebar_drop_debounce_generation: None,
+            sidebar_drop_hint: false,
+            sidebar_hovered: false,
+            sidebar_files_focused: false,
+            sidebar_tree_focus: None,
+            sidebar_tree_offset_y: 0.0,
+            sidebar_tree_viewport_h: 400.0,
+            sidebar_pointer: iced::Point::ORIGIN,
+            sidebar_notice: None,
+            sidebar_hosts_epoch: 0,
+            sidebar_context_epoch: Some(0),
+            sidebar_follow_intent_epoch: Some(0),
+            sidebar_follow_observed: None,
+            sidebar_follow_retry_once: None,
+            sidebar_follow_retry_available: None,
+            sidebar_follow_pending: None,
+            sidebar_follow_next_token: 0,
+            dragging_divider: None,
+            hovered_divider: None,
+            last_divider_press: None,
+            pane_zoomed: false,
+            pane_drag: None,
+            tab_split_drop: None,
+            hovered_tab: None,
+            dragging_tab: None,
+            tab_drag_origin: None,
+            tab_drag_moved: false,
+            tab_drag_hover_since: None,
+            tab_menu: None,
+            tab_rename: None,
+            tab_pointer: iced::Point::ORIGIN,
+            tab_menu_at: iced::Point::ORIGIN,
+            toasts: Vec::new(),
+            jsh_prompt: None,
+            jsh_notice_dismissed: false,
+            tab_switcher: None,
+            remote_picker: None,
+            remote_host_editor: remote_host_editor::RemoteHostEditor::default(),
+            history_picker: None,
+            prompt_recall_enter_latch: PromptRecallEnterLatch::default(),
+            native_enter_ownership,
+            terminal_ime: terminal_ime::Ownership::default(),
+            workflow_overlay: None,
+            block_search: None,
+            block_search_memory: BlockSearchMemory::default(),
+            next_block_search_epoch: 0,
+            block_search_job: None,
+            block_menu: None,
+            block_review: None,
+            block_clear_confirm: None,
+            tab_close_confirm: None,
+            last_notification_at: None,
+            read_only_hint_at: None,
+            history_reflow_sessions: std::collections::HashSet::new(),
+            history_reflow_due: None,
+            _instance_lock: instance_lock,
+            is_first_instance,
+        };
+        // Re-apply the saved tabs once the sessions exist. The snapshot is
+        // external input, so every index is validated before use.
+        app.restore_tabs(saved_tabs, saved_active_tab, saved_tree, saved_split);
+        app.sync_organism_motion(false);
+        app.sync_organism_attention_owner();
+        app.sync_theme_colors();
+        // The startup banner occupies real layout space even for a single pane.
+        if app.startup_recovery.visible() {
+            let term_w = (app.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
+            (app.cols, app.rows) = app.metrics.grid_size(term_w, app.term_height());
+        }
+        app.relayout();
+        // The file tree carries a snapshot of the configured remote hosts.
+        app.sidebar.set_hosts(app.config.remote_hosts.clone());
+        // frost prefers jsh as its shell, so it is worth noticing when the
+        // machine has none or an old one. Nothing is installed without an
+        // explicit click.
+        let jsh_check = Self::jsh_update_check_task(&app.config.jsh_update_check);
+        (app, jsh_check)
+    }
+
+    fn title(&self) -> String {
+        let title = self.tab_label(self.active_tab);
+        if title.is_empty() {
+            "frost".to_string()
+        } else {
+            title
+        }
+    }
+
+    fn iced_theme(&self) -> iced::Theme {

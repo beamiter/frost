@@ -1,0 +1,300 @@
+            organism_layout(640.0, true, true, true),
+            OrganismLayout {
+                glyph: true,
+                body: true,
+                explanation: true,
+            }
+        );
+        assert_eq!(
+            organism_layout(640.0, true, false, true),
+            OrganismLayout {
+                glyph: true,
+                body: false,
+                explanation: false,
+            }
+        );
+    }
+
+    #[test]
+    fn companion_card_admission_tracks_zoom_and_unzoom_in_both_card_modes() {
+        let tree = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![PaneTree::Leaf(0), PaneTree::Leaf(1)],
+            ratios: vec![0.85, 0.15],
+        };
+        // A sidebar already reduces the available terminal width. The right
+        // leaf has a nonzero origin, which must not reduce its zoomed width.
+        let area = pane_layout::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+        };
+        let mut panes = Vec::new();
+        collect_pane_rects(&tree, area, DIVIDER, &mut panes);
+        assert!(panes[1].rect.x > 600.0);
+        for mode in [config::TerminalMode::Block, config::TerminalMode::Chat] {
+            let config = Config {
+                terminal_mode: Some(mode),
+                ..Config::default()
+            };
+            for expanded in [false, true] {
+                for zoomed in [false, true, false] {
+                    let width = organism_card_width(&panes, 1, zoomed, area.width, 8.0);
+                    let layout =
+                        organism_host_layout(width, true, expanded, false, config.is_card_mode());
+                    assert_eq!(layout.presentable(), zoomed, "{mode:?}, zoomed={zoomed}");
+                    if zoomed {
+                        assert_eq!(width, 800.0 - 8.0 - terminal_view::SCROLLBAR_WIDTH - 16.0);
+                        assert_eq!(layout.explanation, expanded);
+                    }
+                    assert!(!organism_host_layout(
+                        width,
+                        false,
+                        expanded,
+                        false,
+                        config.is_card_mode()
+                    )
+                    .presentable());
+                }
+            }
+        }
+        for zoomed in [false, true] {
+            assert_eq!(organism_card_width(&panes, 99, zoomed, 800.0, 8.0), 0.0);
+            assert_eq!(organism_card_width(&[], 0, zoomed, 800.0, 8.0), 0.0);
+        }
+        // A zoomed terminal can itself be too narrow after sidebar allocation.
+        let width = organism_card_width(&panes, 1, true, 150.0, 8.0);
+        assert!(!organism_host_layout(width, true, true, false, true).presentable());
+        // Normal mode still uses the window-level bottom-bar contract.
+        assert!(!organism_host_layout(800.0, true, true, false, false).presentable());
+        assert!(organism_host_layout(800.0, true, true, true, false).presentable());
+    }
+
+    #[test]
+    fn companion_card_zoom_admission_uses_rendered_width_and_existing_ownership() {
+        let source = include_str!("main.rs");
+        let layout = source
+            .split_once("    fn organism_layout(&self)")
+            .unwrap()
+            .1
+            .split_once("    fn sync_organism_geometry(")
+            .unwrap()
+            .0;
+        assert!(layout.contains("organism_card_width("));
+        assert!(layout.contains("self.is_split() && self.pane_zoomed"));
+        assert!(layout.contains("self.term_width()"));
+        assert!(layout.contains("self.config.is_card_mode()"));
+        let view = source
+            .split_once(
+                "let panes_body: Element<'_, Message> = if self.is_split() && self.pane_zoomed",
+            )
+            .unwrap()
+            .1;
+        assert!(view.starts_with(" {"));
+        assert!(view
+            .split_once("} else {")
+            .unwrap()
+            .0
+            .contains("self.pane_view(self.active)"));
+        let owner = source
+            .split_once("    fn organism_observation_owner(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_watch_owner(")
+            .unwrap()
+            .0;
+        assert!(owner.contains("!self.organism_layout().presentable()"));
+        assert!(owner.contains("!self.terminal_input_active()"));
+    }
+
+    #[test]
+    fn narrow_companion_preserves_height_and_stops_maintenance_without_presentable_geometry() {
+        for enabled in [false, true] {
+            for expanded in [false, true] {
+                for bottom_bar in [false, true] {
+                    let height = companion_strip_height(enabled, expanded, bottom_bar);
+                    for width in [700.0, 500.0, 219.0, 500.0, 700.0] {
+                        let layout = organism_layout(width, enabled, expanded, bottom_bar);
+                        assert!(!layout.maintenance_eligible(false));
+                        assert_eq!(layout.maintenance_eligible(true), layout.presentable());
+                        assert_eq!(
+                            companion_strip_height(enabled, expanded, bottom_bar),
+                            height
+                        );
+                        if !enabled || !bottom_bar {
+                            assert!(!layout.presentable());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shrinking_away_the_glyph_cancels_visit_without_rearming_on_width_restore() {
+        use jterm_core::organism_live::{LiveAttention, LiveAttentionEvent, LiveAttentionInput};
+        use std::time::Duration;
+        let context = jterm_core::organism_daily::PreviewPose::Calm.context();
+        let mut greeting = LiveAttention::default();
+        greeting.set_owner(Some(1));
+        let mut input = LiveAttentionInput {
+            base_context: context,
+            hard_eligible: true,
+            activity: jterm_core::organism_live::LiveActivityKnowledge::KnownIdle,
+            hover_available: true,
+            pointer_inside: true,
+        };
+        let ticket = greeting.entry_offer().unwrap();
+        greeting
+            .advance(
+                Duration::ZERO,
+                &1,
+                input,
+                LiveAttentionEvent::PointerEntered { ticket },
+            )
+            .unwrap();
+        assert_ne!(
+            greeting
+                .advance(
+                    Duration::from_millis(600),
+                    &1,
+                    input,
+                    LiveAttentionEvent::Reconcile
+                )
+                .unwrap()
+                .presentation,
+            context
+        );
+        for width in [500.0, 219.0, 700.0] {
+            let layout = organism_layout(width, true, true, true);
+            input.hover_available = layout.glyph;
+            input.hard_eligible = layout.presentable();
+            greeting
+                .advance(
+                    Duration::from_millis(700),
+                    &1,
+                    input,
+                    LiveAttentionEvent::Reconcile,
+                )
+                .unwrap();
+        }
+        // A new native offer cannot rearm the still-consumed physical visit.
+        let ticket = greeting.entry_offer().unwrap();
+        greeting
+            .advance(
+                Duration::from_millis(800),
+                &1,
+                input,
+                LiveAttentionEvent::PointerEntered { ticket },
+            )
+            .unwrap();
+        let snapshot = greeting
+            .snapshot(Duration::from_millis(800), &1, input)
+            .unwrap();
+        assert!(snapshot.next_deadline().is_none());
+        assert_eq!(snapshot.presentation, context);
+    }
+
+    #[test]
+    fn narrow_companion_owner_view_and_subscription_share_geometry_without_second_target() {
+        let source = include_str!("main.rs");
+        let owner = source
+            .split_once("    fn organism_observation_owner(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_watch_owner(")
+            .unwrap()
+            .0;
+        assert!(owner.contains("!self.organism_layout().presentable()"));
+        assert!(owner.contains("!self.terminal_input_active()"));
+        assert!(owner.contains("!s.terminal.is_alt_buffer_active()"));
+        let bar = source
+            .split_once("    fn status_bar(")
+            .unwrap()
+            .1
+            .split_once("    /// One-line offer")
+            .unwrap()
+            .0;
+        assert!(bar.contains("let layout = self.organism_layout()"));
+        assert!(bar.contains("if !layout.body || presentation.explanation.is_empty()"));
+        assert!(bar.contains("layout.explanation.then("));
+        assert!(bar.contains("if layout.glyph"));
+        assert_eq!(
+            bar.matches(".on_enter(Message::OrganismHoverEnter(")
+                .count(),
+            1
+        );
+        let subs = source
+            .split_once("        let preview_visible =")
+            .unwrap()
+            .1
+            .split_once("        // A right-press on a tab")
+            .unwrap()
+            .0;
+        assert!(subs.contains("let live_layout = self.organism_layout()"));
+        assert!(subs.contains("live_layout.maintenance_eligible(self.focused)"));
+        assert!(subs.contains("organism_pointer_observation_needed("));
+        assert!(subs.contains("organism_wake_plan::periodic(organism_wake_plan::ScheduleFacts"));
+        assert!(subs.contains("motion: effective"));
+        assert!(subs.contains("live_owner: self.organism_owner().is_some()"));
+        assert!(subs.contains("iced::time::every(reason.interval())"));
+        assert_eq!(subs.matches("iced::time::every(").count(), 1);
+        let resize = source
+            .split_once("            Message::Resized(size) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::Focus(f)")
+            .unwrap()
+            .0;
+        assert!(
+            resize.find("self.sync_organism_geometry()").unwrap()
+                < resize.find("self.metrics.grid_size").unwrap()
+        );
+        let sync = source
+            .split_once("    fn sync_organism_geometry(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_effective_motion(")
+            .unwrap()
+            .0;
+        assert!(sync.contains("!self.config.is_card_mode() && layout.glyph"));
+        assert!(sync.contains("layout.presentable()"));
+        assert!(sync.contains("self.organism_geometry_epoch"));
+        assert!(!sync.contains("enter_live_greeting"));
+        assert!(!sync.contains("preview"));
+        assert!(!sync.contains("demo"));
+    }
+
+    #[test]
+    fn expanded_companion_reserves_height_only_for_explicit_config() {
+        for enabled in [false, true] {
+            for expanded in [false, true] {
+                for bottom_bar in [false, true] {
+                    let expected = if enabled && expanded && bottom_bar {
+                        88.0
+                    } else {
+                        0.0
+                    };
+                    assert_eq!(
+                        companion_strip_height(enabled, expanded, bottom_bar),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn companion_height_is_stable_and_tiny_terminal_viewports_are_nonnegative() {
+        let reserved = companion_strip_height(true, true, true);
+        for window_height in [0.0, 1.0, 40.0, 88.0, 100.0, 800.0] {
+            for reading_height in [0.0, 64.0, 116.0] {
+                let compact = terminal_height_after_chrome(
+                    window_height,
+                    14.0,
+                    14.0,
+                    true,
+                    reading_height,
+                    0.0,
+                );

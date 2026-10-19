@@ -1,0 +1,300 @@
+                        self.keybindings_revision = Some(revision);
+                    }
+                    let changed = diagnostics != self.keybindings_diagnostics;
+                    self.keybindings_diagnostics = diagnostics;
+                    if changed {
+                        if self.keybindings_diagnostics.is_empty() {
+                            self.push_toast("Keybindings reloaded", ToastKind::Success);
+                        } else {
+                            self.push_toast(
+                                "Some keybindings could not be loaded",
+                                ToastKind::Warning,
+                            );
+                        }
+                    }
+                }
+                // Periodically persist tabs so a recent snapshot (with up-to-date
+                // cwds) survives even an abrupt exit. Only when something that
+                // feeds the snapshot may have changed since the last save.
+                if self.session_dirty {
+                    self.save_session_snapshot();
+                }
+                // Refresh cwd + foreground-process caches for every session so
+                // tab labels reflect both. These are cheap /proc reads at 1.5s
+                // cadence and let inactive tabs still show "vim · src" etc.
+                // The git meta rides the same cadence; its probe is served by
+                // a coalesced background worker with a bounded wait. Probed
+                // while either consumer (pane header, bottom bar) is on.
+                let want_git = self.config.show_repo_strip || self.config.bottom_bar;
+                for sess in self.sessions.iter_mut() {
+                    sess.terminal.check_sync_output_timeout();
+                    sess.refresh();
+                    sess.cwd_cache = sess.cwd();
+                    sess.fg_proc_cache = sess.fg_proc();
+                    sess.git_meta_cache = if want_git { sess.git_meta() } else { None };
+                }
+                let remote_follow_task = self.poll_sidebar_remote_follow();
+                self.expire_toasts();
+                if let Some(request) = sidebar_reload_request {
+                    return Task::batch([self.queue_sidebar_load(request), remote_follow_task]);
+                }
+                return remote_follow_task;
+            }
+            Message::TabMenuOpen(id) => {
+                // The menu is keyed on the tab id the strip handed out, not on
+                // a session id: a tab with several panes has one id here and a
+                // different one per pane.
+                if self.tab_index_by_id(id).is_some() {
+                    self.tab_menu = Some(id);
+                    self.tab_rename = None;
+                    // Freeze the anchor now; the pointer moves on toward the
+                    // panel as soon as it appears.
+                    self.tab_menu_at = self.tab_pointer;
+                }
+            }
+            Message::TabPointerMoved(position) => self.tab_pointer = position,
+            Message::TabMenuClose => {
+                self.tab_menu = None;
+                self.tab_rename = None;
+            }
+            Message::TabMenuAction(action) => {
+                self.tab_menu = None;
+                self.tab_rename = None;
+                return self.execute_tab_menu_action(action);
+            }
+            Message::TabRenameStart(id) => {
+                let Some(tab) = self.tab_index_by_id(id) else {
+                    return Task::none();
+                };
+                // Seed the editor with what the strip currently shows, so a
+                // rename starts from the label the user just right-clicked.
+                self.tab_rename = Some((id, self.tab_real_label(tab)));
+                return iced::widget::operation::focus(TAB_RENAME_INPUT_ID.clone());
+            }
+            Message::TabRenameInput(draft) => {
+                if let Some((_, current)) = self.tab_rename.as_mut() {
+                    *current = crate::session_persistence::bound_tab_title_draft(draft);
+                }
+            }
+            Message::TabRenameSubmit => {
+                if let Some((id, draft)) = self.tab_rename.take() {
+                    self.apply_tab_rename(id, draft);
+                }
+                self.tab_menu = None;
+            }
+            Message::ToastTick => self.expire_toasts(),
+            Message::ToastDismiss(i) => {
+                if i < self.toasts.len() {
+                    self.toasts.remove(i);
+                }
+            }
+            Message::TabSwitcherClose => self.tab_switcher = None,
+            Message::TabSwitcherInput(q) => {
+                if let Some(s) = self.tab_switcher.as_mut() {
+                    s.set_query(q);
+                }
+            }
+            Message::TabSwitcherJump(id) => {
+                self.tab_switcher = None;
+                if let Some(tab) = self.tab_index_by_id(id) {
+                    if tab != self.active_tab {
+                        self.activate_tab(tab);
+                    }
+                }
+            }
+            Message::HistoryPickerClose => self.history_picker = None,
+            Message::BlockSearchRefresh => {
+                let rebuild = self.force_block_search_rebuild();
+                return Task::batch([
+                    rebuild,
+                    iced::widget::operation::focus(BLOCK_SEARCH_INPUT_ID.clone()),
+                ]);
+            }
+            Message::BlockSearchClose => self.close_block_search(),
+            Message::BlockSearchCacheBuilt(identity, result) => {
+                if !finish_block_search_job(&mut self.block_search_job, identity, false) {
+                    return Task::none();
+                }
+                let accepts = self
+                    .block_search
+                    .as_ref()
+                    .is_some_and(|state| state.accepts_build(identity))
+                    && self.sessions.get(self.active).is_some_and(|sess| {
+                        sess.id == identity.session_id && !sess.terminal.is_alt_buffer_active()
+                    });
+                if !accepts {
+                    return Task::none();
+                }
+                let current_version = self
+                    .sessions
+                    .get(self.active)
+                    .filter(|session| session.id == identity.session_id)
+                    .map(|session| BlockSearchZoneVersion::from_terminal(&session.terminal));
+                let build_version = self.block_search.as_ref().map(|state| state.zone_version);
+                if current_version != build_version {
+                    if let Some(state) = self.block_search.as_mut() {
+                        state.loading = false;
+                    }
+                    // Release the stale completed build before extracting a
+                    // replacement source snapshot; do not overlap generations.
+                    drop(result);
+                    return self.begin_block_search_rebuild();
+                }
+                if self
+                    .block_search
+                    .as_mut()
+                    .is_some_and(BlockSearchState::take_manual_refresh_followup)
+                {
+                    if let Some(state) = self.block_search.as_mut() {
+                        state.loading = false;
+                    }
+                    // F5 was pressed after this source snapshot began. Drop
+                    // the older generation before taking exactly one fresh
+                    // snapshot; begin_block_search_rebuild clears the flag.
+                    drop(result);
+                    return self.begin_block_search_rebuild();
+                }
+                match result {
+                    Ok(build) => {
+                        let should_match = self
+                            .block_search
+                            .as_mut()
+                            .is_some_and(|state| state.install_cache(build));
+                        if should_match {
+                            self.block_search_recompute();
+                        }
+                        return self.block_search_snap_task();
+                    }
+                    Err(error) => {
+                        if let Some(state) = self.block_search.as_mut() {
+                            state.loading = false;
+                            state.cache = Vec::new();
+                            state.hits = Vec::new();
+                            state.capped = false;
+                            state.refresh_intent = None;
+                            state.match_pending = false;
+                            state.rebuild_pending = false;
+                        }
+                        log::warn!("{error}");
+                        self.push_toast(
+                            "Could not index command blocks".to_string(),
+                            ToastKind::Warning,
+                        );
+                    }
+                }
+            }
+            Message::BlockSearchMatched(identity, result) => {
+                if !finish_block_search_job(&mut self.block_search_job, identity, true) {
+                    return Task::none();
+                }
+                if !self
+                    .block_search
+                    .as_ref()
+                    .is_some_and(|state| state.accepts_build(identity))
+                {
+                    // The old owner may already be closed or replaced. Drop
+                    // its cache before the update wrapper starts the new one.
+                    return Task::none();
+                }
+                let current_version = self
+                    .sessions
+                    .get(self.active)
+                    .filter(|sess| {
+                        sess.id == identity.session_id && !sess.terminal.is_alt_buffer_active()
+                    })
+                    .map(|sess| BlockSearchZoneVersion::from_terminal(&sess.terminal));
+                let Some(current_version) = current_version else {
+                    self.close_block_search();
+                    return Task::none();
+                };
+                let filter = self.block_search.as_ref().expect("current picker").filter;
+                let eligible = self.block_search_eligible(filter);
+                let state = self.block_search.as_mut().expect("current picker");
+                match result {
+                    Ok(build) => {
+                        if state.install_match(identity, build, current_version, &eligible) {
+                            return self.block_search_snap_task();
+                        }
+                    }
+                    Err(error) => {
+                        state.matching = false;
+                        state.match_pending = false;
+                        state.rebuild_pending = false;
+                        state.matched_intent = None;
+                        state.query_error = Some(
+                            "Could not search command blocks; close and reopen the browser".into(),
+                        );
+                        log::warn!("{error}");
+                    }
+                }
+            }
+            Message::BlockSearchInput(query) => {
+                let accepted = self.block_search.as_mut().is_some_and(|state| {
+                    // A focused text input may capture the plain-B repeats
+                    // produced after Ctrl/Shift are released. The physical-B
+                    // latch is the only reliable cross-event signal here.
+                    state.apply_query_input(query)
+                });
+                if !accepted {
+                    return Task::none();
+                }
+                self.block_search_recompute();
+                // The result set changed and the highlight reset to the top:
+                // bring the list back to the top with it.
+                return self.block_search_snap_task();
+            }
+            Message::BlockSearchReset => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.reset_intent();
+                }
+                self.block_search_recompute();
+                return self.block_search_refocus_task();
+            }
+            Message::BlockSearchSetFilter(filter) => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.filter = filter;
+                }
+                self.block_search_recompute();
+                return self.block_search_refocus_task();
+            }
+            Message::BlockSearchSetCaseSensitive(case_sensitive) => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.case_sensitive = case_sensitive;
+                }
+                self.block_search_recompute();
+                return self.block_search_refocus_task();
+            }
+            Message::BlockSearchSetRegex(regex) => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.regex = regex;
+                }
+                self.block_search_recompute();
+                return self.block_search_refocus_task();
+            }
+            Message::BlockSearchSetWholeWord(whole_word) => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.whole_word = whole_word;
+                }
+                self.block_search_recompute();
+                return self.block_search_refocus_task();
+            }
+            Message::BlockSearchSetScope(scope) => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.scope = scope;
+                }
+                self.block_search_recompute();
+                return self.block_search_refocus_task();
+            }
+            Message::BlockSearchAccept(hit) => {
+                let current = self.sessions.get(self.active).map(|session| {
+                    (
+                        session.id,
+                        BlockSearchZoneVersion::from_terminal(&session.terminal),
+                    )
+                });
+                let accepts = current.is_some_and(|(session_id, zone_version)| {
+                    self.block_search
+                        .as_ref()
+                        .is_some_and(|state| state.accepts_hit(&hit, session_id, zone_version))
+                });
+                if !accepts {

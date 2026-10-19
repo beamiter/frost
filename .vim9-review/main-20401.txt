@@ -1,0 +1,300 @@
+            }
+        }
+    }
+
+    fn tab_bar(&self) -> Element<'_, Message> {
+        let mut tabs = row![].spacing(2).padding(2);
+        // Sidebar/dock toggle button at the far left of the tab bar.
+        tabs = tabs.push(
+            button(text("☰").size(self.chrome_font_size()))
+                .on_press(Message::ToggleSidebar)
+                .padding([3, 8])
+                .style(self.tab_btn_style(self.sidebar_open)),
+        );
+        // In side-tab mode the tab list lives in the dock; the top bar keeps only
+        // the dock toggle plus a button to move tabs back to the top.
+        if self.config.tab_position == config::TabPosition::Side {
+            tabs = tabs.push(
+                button(text("▔").size(self.chrome_font_size()))
+                    .on_press(Message::SetTabPosition(config::TabPosition::Top))
+                    .padding([3, 8])
+                    .style(self.ghost_btn_style()),
+            );
+            if self.pane_drag.is_some() {
+                tabs = tabs.push(self.pane_to_tab_drop_hint(false));
+                let tabs = mouse_area(tabs.width(Length::Fill))
+                    .on_release(Message::PanePromoteToTab(None))
+                    .interaction(iced::mouse::Interaction::Grabbing);
+                return self.top_bar_with_close(tabs.into());
+            }
+            return self.top_bar_with_close(tabs.into());
+        }
+        // Dock the tab strip into the left sidebar (vertical tab list).
+        tabs = tabs.push(
+            button(text("◧").size(self.chrome_font_size()))
+                .on_press(Message::SetTabPosition(config::TabPosition::Side))
+                .padding([3, 8])
+                .style(self.ghost_btn_style()),
+        );
+        for i in 0..self.tabs.len() {
+            let id = self.tabs[i].id;
+            let active = i == self.active_tab;
+            // A tab shows its selected pane.
+            let label = self.tab_label(i);
+            let label = if label.chars().count() > 24 {
+                let truncated: String = label.chars().take(23).collect();
+                format!("{truncated}…")
+            } else {
+                label
+            };
+            // The label and close button share one styled outer container. The
+            // label keeps its own mouse area so dragging it cannot accidentally
+            // trigger the close button.
+            let hovered = self.hovered_tab == Some(id);
+            let dragging_this = self.dragging_tab == Some(id);
+            let label = format!("{}{label}", self.tab_state_prefix(i));
+            let tab_label = container(text(label).size(self.chrome_font_size())).padding([3, 8]);
+            // Drag press/release lives on the label so a press on the close
+            // button never starts a tab drag. Right-click opens the context menu.
+            let tab: Element<'_, Message> = mouse_area(tab_label)
+                .on_press(Message::TabDragStart(id))
+                .on_release(Message::TabDragEnd(id))
+                .on_right_press(Message::TabMenuOpen(id))
+                .into();
+            // Reveal the close button only on the active or hovered tab to cut
+            // visual noise; keep its footprint reserved otherwise so tabs don't
+            // jump when hovered.
+            let show_close = active || hovered;
+            let close: Element<'_, Message> = if show_close {
+                button(text("×").size(self.chrome_font_size()))
+                    .on_press(Message::CloseTab(id))
+                    .padding([3, 6])
+                    .style(self.tab_close_btn_style())
+                    .into()
+            } else {
+                Space::new().width(Length::Fixed(18.0)).into()
+            };
+            let cell = container(row![tab, close].align_y(iced::Alignment::Center))
+                .style(self.tab_container_style(active, hovered, dragging_this));
+            // Hover tracking on the whole cell so moving onto the close
+            // button does not collapse it out of the layout.
+            tabs = tabs.push(
+                mouse_area(cell)
+                    .on_enter(Message::TabHover(Some(id)))
+                    .on_exit(Message::TabHover(None)),
+            );
+        }
+        tabs = tabs.push(
+            button(text("+").size(self.chrome_font_size()))
+                .on_press(Message::NewSession)
+                .padding([3, 8])
+                .style(self.ghost_btn_style()),
+        );
+        if self.pane_drag.is_some() {
+            tabs = tabs.push(self.pane_to_tab_drop_hint(false));
+        }
+        let scroller: Element<'_, Message> = scrollable(tabs)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(0).scroller_width(0),
+            ))
+            .width(Length::Fill)
+            .into();
+        let scroller = if self.pane_drag.is_some() {
+            mouse_area(scroller)
+                .on_release(Message::PanePromoteToTab(None))
+                .interaction(iced::mouse::Interaction::Grabbing)
+                .into()
+        } else {
+            scroller
+        };
+        self.top_bar_with_close(scroller)
+    }
+
+    fn chat_running_status(&self) -> Option<(usize, u64, u64)> {
+        if !self.config.is_chat_mode()
+            || self.win_size.width < 240.0
+            || !self.layout().contains_session(self.active)
+        {
+            return None;
+        }
+        let session = self.sessions.get(self.active)?;
+        (session.terminal.chat_surface() == chat_mode::ChatSurface::Running
+            && !session.transcript_read_only())
+        .then(|| {
+            Some((
+                session.id,
+                session.terminal.watch_generation()?,
+                session.terminal.running_duration_ms()?,
+            ))
+        })
+        .flatten()
+    }
+
+    /// The top bar doubles as the window's title bar: the window is
+    /// undecorated, so this row owns the title, the window buttons, and
+    /// drag-to-move.
+    fn top_bar_with_close<'a>(&'a self, content: Element<'a, Message>) -> Element<'a, Message> {
+        let window_btn = |glyph: &str, msg: Message| {
+            button(text(glyph.to_string()).size(self.chrome_font_size()))
+                .on_press(msg)
+                .padding([3, 9])
+                .style(self.ghost_btn_style())
+        };
+        let close = button(text("×").size(self.chrome_font_size()))
+            .on_press(Message::WindowClose)
+            .padding([3, 9])
+            .style(self.close_btn_style());
+
+        let mut bar = row![container(content).width(Length::Fill)];
+        if let Some((id, _, elapsed)) = self.chat_running_status() {
+            let label = if self.win_size.width >= 440.0 {
+                format!("Running · {}", block_mode::running_badge_text(elapsed))
+            } else {
+                block_mode::running_badge_text(elapsed)
+            };
+            bar = bar.push(
+                text(label)
+                    .size(self.chrome_font_size())
+                    .color(self.c_text_dim()),
+            );
+            let session = &self.sessions[self.active];
+            let token = session
+                .enabled_chat_control(chat_mode::ControlKind::Interrupt, self.chat_input_ready(id));
+            let stop = container(
+                text(if token.is_some() { "Stop" } else { "Ctrl+C" }).size(self.chrome_font_size()),
+            )
+            .padding([3, 7]);
+            bar = bar.push(chat_mode::press_control(
+                stop,
+                token.map(Message::ChatInterrupt),
+            ));
+        }
+        // In Side mode the tab labels live in the dock, so the title is the
+        // only place the active session is named and there is room for it. In
+        // Top mode the active tab already shows the very same string
+        // (`Frost::title` is the active session's label), so repeating it here
+        // would only steal width from the strip.
+        if self.config.tab_position == config::TabPosition::Side {
+            bar = bar.push(
+                container(
+                    text(self.title())
+                        .size(self.chrome_font_size())
+                        .wrapping(text::Wrapping::None)
+                        .style(text::secondary),
+                )
+                .padding([0, 8])
+                .clip(true),
+            );
+        }
+        let bar = bar
+            .push(window_btn("—", Message::WindowMinimize))
+            .push(window_btn("▢", Message::WindowToggleMaximize))
+            .push(close)
+            .align_y(iced::Alignment::Center)
+            .width(Length::Fill);
+        // Presses that no button or tab consumed fall through to here and move
+        // the window, the way a title bar is expected to behave. `mouse_area`
+        // runs its content first and bails once the event is captured, so the
+        // chrome above keeps working.
+        let bar = mouse_area(bar)
+            .on_press(Message::WindowDrag)
+            .on_double_click(Message::WindowToggleMaximize);
+        container(bar)
+            .width(Length::Fill)
+            .height(Length::Fixed(self.tab_bar_height()))
+            .style(self.chrome_bar_style())
+            .into()
+    }
+
+    /// Floating tab context menu, the same item set anvil/forge put on their
+    /// sidebar tabs: New Tab, Duplicate, Rename, Mark, Pin, the close family,
+    /// and one entry per configured `[[remote_hosts]]` destination.
+    ///
+    /// Background mouse_area dismisses on outside-click; Esc also closes via
+    /// the key handler (and backs out of an open rename editor first).
+    fn tab_context_menu(&self, id: usize) -> Element<'_, Message> {
+        // Everything here is keyed on the tab id, never on a session id: a tab
+        // with several panes owns several sessions but only one strip entry.
+        let i = self.tab_index_by_id(id).unwrap_or(self.active_tab);
+        let label = self.tab_label(i);
+        let label = if label.is_empty() {
+            format!("Tab {}", i + 1)
+        } else {
+            label
+        };
+        let row_btn = |t: &str, msg: Message| -> Element<'_, Message> {
+            button(self.popup_text(t.to_string()))
+                .on_press(msg)
+                .padding([4, 10])
+                .width(Length::Fill)
+                .style(self.ghost_btn_style())
+                .into()
+        };
+        let only_one = self.tabs.len() <= 1;
+        let last_idx = self.tabs.len().saturating_sub(1);
+        let pinned = self.tabs.get(i).is_some_and(|tab| tab.pinned);
+        let private_title = self.tabs.get(i).is_some_and(|tab| tab.private_title);
+        let marked_count = self.tabs.iter().filter(|tab| tab.marked).count();
+        let is_marked = self.tabs.get(i).is_some_and(|tab| tab.marked);
+
+        let mut menu = column![self
+            .popup_text(label)
+            .size(self.effective_font_size())
+            .color(self.c_text_dim())]
+        .spacing(2);
+
+        // Renaming replaces the item list with an inline editor so the menu
+        // stays one panel; Enter commits, Esc backs out to the items.
+        if let Some((_, draft)) = self.tab_rename.as_ref().filter(|(target, _)| *target == id) {
+            menu = menu.push(
+                text_input("Tab name (empty = follow shell)", draft)
+                    .style(self.popup_input_style())
+                    .id(TAB_RENAME_INPUT_ID.clone())
+                    .on_input(Message::TabRenameInput)
+                    .on_submit(Message::TabRenameSubmit)
+                    .font(self.mono)
+                    .size(self.effective_font_size()),
+            );
+            menu = menu.push(row_btn("Rename", Message::TabRenameSubmit));
+            menu = menu.push(row_btn("Cancel", Message::TabMenuClose));
+            // 3 rows: the input plus two buttons.
+            return self.float_tab_menu(menu, 3);
+        }
+
+        menu = menu.push(row_btn(
+            "New Tab",
+            Message::TabMenuAction(TabMenuAction::NewTab),
+        ));
+        menu = menu.push(row_btn(
+            "Duplicate",
+            Message::TabMenuAction(TabMenuAction::Duplicate(id)),
+        ));
+        menu = menu.push(row_btn("Rename", Message::TabRenameStart(id)));
+        menu = menu.push(row_btn(
+            if private_title {
+                "Show Title Details"
+            } else {
+                "Hide Title Details"
+            },
+            Message::TabMenuAction(TabMenuAction::TogglePrivateTitle(id)),
+        ));
+        menu = menu.push(row_btn(
+            if is_marked {
+                "Unmark"
+            } else {
+                "Mark Important"
+            },
+            Message::TabMenuAction(TabMenuAction::ToggleMarked(id)),
+        ));
+        menu = menu.push(row_btn(
+            if pinned { "Unpin Tab" } else { "Pin Tab" },
+            Message::TabMenuAction(TabMenuAction::TogglePinned(id)),
+        ));
+        menu = menu.push(row_btn(
+            "Close",
+            Message::TabMenuAction(TabMenuAction::Close(id)),
+        ));
+        if !only_one {
+            menu = menu.push(row_btn(
+                "Close Others",
+                Message::TabMenuAction(TabMenuAction::CloseOthers(id)),

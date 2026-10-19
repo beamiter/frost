@@ -1,0 +1,300 @@
+            self.theme.tabbar.active_border,
+        ];
+        let cell_w_bits = self.metrics.cell_w.to_bits();
+        let running_badge = sess
+            .terminal
+            .running_duration_ms()
+            .map(block_mode::running_badge_text);
+        {
+            let cache = sess.block_chrome_cache.borrow();
+            if let Some(cached) = cache.as_ref() {
+                let key = &cached.key;
+                if key.projection == projection_key
+                    && key.theme_rgbs == theme_rgbs
+                    && key.cell_w_bits == cell_w_bits
+                    && key.selection == sess.block_selection
+                    && key.bookmarks == sess.block_bookmarks
+                    && key.running_badge == running_badge
+                {
+                    return (
+                        cached.paint.clone(),
+                        cached.failed_markers.clone(),
+                        cached.bookmark_markers.clone(),
+                    );
+                }
+            }
+        }
+        let paint = self.build_block_paint_rows(sess);
+        let failed_markers = self.block_marker_fractions(sess);
+        let bookmark_markers = self.block_bookmark_marker_fractions(sess);
+        *sess.block_chrome_cache.borrow_mut() = Some(BlockChromeCache {
+            key: BlockChromeKey {
+                projection: projection_key,
+                theme_rgbs,
+                cell_w_bits,
+                selection: sess.block_selection.clone(),
+                bookmarks: sess.block_bookmarks.clone(),
+                running_badge,
+            },
+            paint: paint.clone(),
+            failed_markers: failed_markers.clone(),
+            bookmark_markers: bookmark_markers.clone(),
+        });
+        (paint, failed_markers, bookmark_markers)
+    }
+
+    /// Block-mode metadata for each of `sess`'s visible rows: card grouping,
+    /// real (not viewport-clipped) edges, state/tint, outcome stripes and
+    /// first-row badges. Raw zone anchors enter the snapshot only through exact
+    /// projected origins; structural padding and stale rows fail closed.
+    /// Empty when the feature is off or a full-screen app owns the grid.
+    ///
+    /// Callers go through [`Self::block_chrome`], which caches this build.
+    fn build_block_paint_rows(&self, sess: &Session) -> Vec<terminal_view::BlockPaintRow> {
+        use block_mode::BlockOutcome;
+
+        if !self.config.is_block_mode() || sess.terminal.is_alt_buffer_active() {
+            return Vec::new();
+        }
+        let rows = sess.projection.cells().len();
+        if rows == 0 {
+            return Vec::new();
+        }
+        let terminal = &sess.terminal;
+        let total = terminal.scrollback_len() + terminal.grid.rows();
+        let running = terminal.running_zone_start();
+        let live_prompt = terminal.live_prompt_row();
+        let live_boundary = running.or(live_prompt).unwrap_or(total);
+
+        // Zones whose rows were trimmed away have no rows to paint (their
+        // clamped prompt_start would corrupt the span arithmetic).
+        let zones: Vec<&terminal::CommandZone> = terminal
+            .command_zones
+            .iter()
+            .filter(|zone| !zone.rows_evicted)
+            .collect();
+        let starts: Vec<usize> = zones.iter().map(|zone| zone.prompt_start).collect();
+        let spans = block_mode::spans(&starts, live_boundary);
+        // UI/navigation accent stays independent of OSC 12 cursor overrides,
+        // matching the semantic Block palette in Anvil/Forge.
+        let accent = self.c_accent();
+        let mut paint = vec![terminal_view::BlockPaintRow::default(); rows];
+        for (row, kind) in paint.iter_mut().zip(sess.projection.row_kinds()) {
+            row.host_spacer = matches!(kind, terminal::ProjectedRowKind::BlockSpacer { .. });
+        }
+        let view_absolute_rows: Vec<_> = (0..rows)
+            .map(|row| sess.projection.view_row_absolute(row))
+            .collect();
+        let mut memberships = projected_zone_memberships(&view_absolute_rows, &spans);
+        let zone_indexes: std::collections::HashMap<u64, usize> = zones
+            .iter()
+            .enumerate()
+            .map(|(index, zone)| (zone.id, index))
+            .collect();
+        let mut summary_bounds = vec![(None, None); zones.len()];
+        for (view_row, kind) in sess.projection.row_kinds().iter().enumerate() {
+            if let terminal::ProjectedRowKind::BlockChrome { boundary, .. } = kind {
+                if let terminal::ChromeKind::Header { zone_id } = boundary.kind {
+                    if let Some(&zone_index) = zone_indexes.get(&zone_id) {
+                        memberships.rows[view_row] =
+                            Some((zone_index, zones[zone_index].prompt_start));
+                    }
+                }
+                continue;
+            }
+            let terminal::ProjectedRowKind::CollapsedSummary { key, .. } = kind else {
+                continue;
+            };
+            let Some(&zone_index) = zone_indexes.get(&key.zone_id) else {
+                continue;
+            };
+            let zone = zones[zone_index];
+            memberships.rows[view_row] =
+                Some((zone_index, zone.output_start.unwrap_or(zone.prompt_start)));
+            let (first, last) = &mut summary_bounds[zone_index];
+            *first = Some(first.map_or(view_row, |row: usize| row.min(view_row)));
+            *last = Some(last.map_or(view_row, |row: usize| row.max(view_row)));
+        }
+        let zone_view_edges: Vec<_> = spans
+            .iter()
+            .enumerate()
+            .map(|(zone_index, &(zone_start, zone_end))| {
+                let visible_raw_top = terminal
+                    .raw_row_id_at_absolute(zone_start)
+                    .and_then(|row| sess.projection.raw_row_view_bounds(row))
+                    .map(|(first, _)| first);
+                let header_top = sess.projection.row_kinds().iter().position(|kind| matches!(kind,
+                    terminal::ProjectedRowKind::BlockChrome { boundary: terminal::ChromeBoundary {
+                        kind: terminal::ChromeKind::Header { zone_id }, .. }, line: 0 } if *zone_id == zones[zone_index].id));
+                let top = header_top.or_else(|| projected_card_real_top(
+                    visible_raw_top,
+                    summary_bounds[zone_index].0,
+                    block_mode::classify(
+                        zones[zone_index].command.as_deref(),
+                        zones[zone_index].exit_code,
+                    ),
+                ).filter(|row| *row > 0 || sess.projection.uses_identity_fast_path()));
+                let bottom = if sess
+                    .projection
+                    .effective_collapsed()
+                    .contains(&zones[zone_index].id)
+                {
+                    // The synthetic summary is the real visual bottom even
+                    // when a same-row command prefix leaves the raw row mapped.
+                    summary_bounds[zone_index].1.or_else(|| {
+                        zone_end
+                            .checked_sub(1)
+                            .and_then(|row| terminal.raw_row_id_at_absolute(row))
+                            .and_then(|row| sess.projection.raw_row_view_bounds(row))
+                            .map(|(_, last)| last)
+                    })
+                } else {
+                    zone_end
+                        .checked_sub(1)
+                        .and_then(|row| terminal.raw_row_id_at_absolute(row))
+                        .and_then(|row| sess.projection.raw_row_view_bounds(row))
+                        .map(|(_, last)| last)
+                };
+                (top, bottom)
+            })
+            .collect();
+
+        // Populate all finished-card rows in one projection-order sweep. The
+        // old per-zone `filter().collect()` rescanned and allocated for every
+        // zone (up to 256 * viewport rows on every frame).
+        for (view_row, membership) in memberships.rows.iter().copied().enumerate() {
+            let Some((zone_index, absolute_row)) = membership else {
+                continue;
+            };
+            let zone = zones[zone_index];
+            let (zone_start, _) = spans[zone_index];
+            let (top_view, bottom_view) = zone_view_edges[zone_index];
+            let outcome = block_mode::classify(zone.command.as_deref(), zone.exit_code);
+            let color = match outcome {
+                BlockOutcome::Success => self.theme.ansi_color(2),
+                BlockOutcome::Failed(_) => self.theme.ansi_color(1),
+                BlockOutcome::Unknown => self.theme.ansi_color(3),
+                BlockOutcome::Background => accent,
+            };
+            let card_kind = match outcome {
+                BlockOutcome::Success => terminal_view::BlockCardKind::Finished,
+                BlockOutcome::Failed(_) => terminal_view::BlockCardKind::Failed,
+                BlockOutcome::Unknown => terminal_view::BlockCardKind::Unknown,
+                BlockOutcome::Background => terminal_view::BlockCardKind::Background,
+            };
+            let selected = sess.block_selection.contains(zone.id);
+            let active = sess.block_selection.active() == Some(zone.id);
+            let row = &mut paint[view_row];
+            row.selectable = true;
+            row.zone_id = Some(zone.id);
+            row.header_end_col = block_mode::finished_header_end_col(
+                zone.command
+                    .as_deref()
+                    .is_some_and(|command| !command.trim().is_empty()),
+                zone_start,
+                zone.output_start,
+                zone.output_start_col,
+                absolute_row,
+            );
+            if let Some(terminal::ProjectedRowKind::CollapsedSummary {
+                key,
+                hidden_display_rows,
+                ..
+            }) = sess.projection.row_kinds().get(view_row)
+            {
+                row.header_end_col = 0;
+                row.output_preview = zone.output_preview.clone();
+                row.collapsed_summary = Some(terminal_view::CollapsedSummaryPaint {
+                    key: *key,
+                    hidden_display_rows: *hidden_display_rows,
+                });
+            }
+            row.stripe = Some(color);
+            row.stripe_strong = active;
+            // Zero is reserved for the live/input card below. The value is
+            // viewport-local; stable interactions continue to key on the
+            // terminal zone id rather than this paint grouping.
+            row.card_group = Some(zone_index + 1);
+            row.card_kind = card_kind;
+            row.card_top = top_view == Some(view_row);
+            row.card_bottom = bottom_view == Some(view_row);
+            row.card_selected = selected;
+            row.card_selection_active = active;
+        }
+
+        // Separators and badges exist only on a zone's real projected top, so
+        // this bounded zone pass never scans viewport rows.
+        for (zone_index, zone) in zones.iter().copied().enumerate() {
+            let Some(top_view) = zone_view_edges[zone_index].0 else {
+                continue;
+            };
+            let outcome = block_mode::classify(zone.command.as_deref(), zone.exit_code);
+            let color = match outcome {
+                BlockOutcome::Success => self.theme.ansi_color(2),
+                BlockOutcome::Failed(_) => self.theme.ansi_color(1),
+                BlockOutcome::Unknown => self.theme.ansi_color(3),
+                BlockOutcome::Background => accent,
+            };
+            let active = sess.block_selection.active() == Some(zone.id);
+            let row = &mut paint[top_view];
+            if matches!(
+                sess.projection.row_kinds().get(top_view),
+                Some(terminal::ProjectedRowKind::BlockChrome { .. })
+            ) {
+                let cwd = zone.cwd.as_deref().unwrap_or("unknown directory");
+                let cwd = crate::review_text::bound_toast_text(cwd.to_owned());
+                let clock = zone
+                    .finished_at_ms
+                    .map(|ms| {
+                        block_mode::clock_at_offset(
+                            ms,
+                            block_mode::local_offset_secs((ms / 1000) as i64),
+                        )
+                    })
+                    .unwrap_or_default();
+                let badge = block_mode::badge_ladder(
+                    outcome,
+                    zone.duration_ms,
+                    zone.start_mark_seen,
+                    zone.completion_provenance,
+                    None,
+                )
+                .next()
+                .unwrap_or_default();
+                row.native_header = Some(terminal_view::BlockHeaderPaint {
+                    label: format!("cwd · {cwd} · {clock} · {badge}"),
+                    status: match outcome {
+                        BlockOutcome::Success => "✓",
+                        BlockOutcome::Failed(_) => "×",
+                        BlockOutcome::Unknown => "?",
+                        BlockOutcome::Background => "·",
+                    },
+                    collapsed: sess.projection_policy.is_collapsed(zone.id),
+                });
+                row.header_end_col = usize::MAX;
+                row.bookmarked = sess.block_bookmarks.contains(zone.id);
+                continue;
+            }
+            row.separator = true;
+            row.bookmarked = sess.block_bookmarks.contains(zone.id);
+            // The selected block's badge appends its LOCAL finish time; when
+            // that no longer fits the ladder falls back through progressively
+            // shorter forms rather than dropping the badge altogether.
+            let clock = zone.finished_at_ms.filter(|_| active).map(|ms| {
+                let offset = block_mode::local_offset_secs((ms / 1000) as i64);
+                block_mode::clock_at_offset(ms, offset)
+            });
+            let inset = self.block_badge_inset();
+            let cells = &sess.projection.cells()[top_view];
+            let unavailable = zone.command_truncated
+                && zone
+                    .command
+                    .as_deref()
+                    .is_none_or(|command| command.trim().is_empty());
+            let badges: Box<dyn Iterator<Item = String>> = if unavailable {
+                Box::new(
+                    ["Command unavailable", "Incomplete", "?"]
+                        .into_iter()
+                        .map(str::to_string),
+                )
+            } else {

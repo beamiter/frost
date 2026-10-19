@@ -1,0 +1,300 @@
+                        &dashboard.counts,
+                    ))
+                    .size(self.chrome_font_size()),
+                )
+                .style(self.tab_btn_style(self.task_panel.dashboard_view == view))
+                .on_press(Message::TaskDashboardView(view)),
+            );
+        }
+        body = body.push(filters.wrap());
+        body = body.push(
+            text(format!(
+                "{} shown · {} search matches · {} need you · {} awaiting approval",
+                dashboard.rows.len(),
+                dashboard.counts.total,
+                dashboard.counts.attention,
+                dashboard.counts.pending_approval,
+            ))
+            .size(self.chrome_font_size())
+            .style(text::secondary),
+        );
+        if !self.task_panel.dashboard_query.is_empty()
+            || self.task_panel.dashboard_view != agent_task::DashboardView::All
+        {
+            body = body.push(
+                button(text("Clear filters").size(self.chrome_font_size()))
+                    .on_press(Message::TaskDashboardClear),
+            );
+        }
+        if self.task_panel.saved_draft_count() > 0 {
+            if let Some(confirmation) = self.task_panel.draft_discard_confirmation() {
+                body = body.push(
+                    text(format!(
+                        "Permanently discard {} saved drafts? Current draft stays.",
+                        self.task_panel.saved_draft_count()
+                    ))
+                    .size(self.chrome_font_size()),
+                );
+                body = body.push(
+                    row![
+                        button(text("Confirm discard").size(self.chrome_font_size()))
+                            .on_press(Message::TaskDiscardSavedDrafts(confirmation.clone())),
+                        button(text("Cancel").size(self.chrome_font_size()))
+                            .on_press(Message::TaskCancelDiscardSavedDrafts(confirmation)),
+                    ]
+                    .spacing(6),
+                );
+            } else {
+                body = body.push(
+                    button(
+                        text(format!(
+                            "Discard saved drafts ({})",
+                            self.task_panel.saved_draft_count()
+                        ))
+                        .size(self.chrome_font_size()),
+                    )
+                    .on_press(Message::TaskRequestDiscardSavedDrafts(
+                        self.task_panel.draft_cleanup_reference(),
+                    )),
+                );
+            }
+        }
+        let selected_hidden = self.task_panel.selected.is_some_and(|id| {
+            self.task_manager
+                .get(id)
+                .is_some_and(|task| task.status != agent_task::TaskStatus::Archived)
+                && dashboard.selected_index(Some(id)).is_none()
+        });
+        if selected_hidden {
+            body = body
+                .push(text("Selected task is hidden by filters.").size(self.chrome_font_size()));
+            body = body.push(
+                button(text("Show selected task").size(self.chrome_font_size()))
+                    .on_press(Message::TaskDashboardClear),
+            );
+        }
+        let tasks: Vec<_> = dashboard
+            .rows
+            .iter()
+            .filter_map(|row| self.task_manager.get(row.id))
+            .collect();
+        let has_tasks = self
+            .task_manager
+            .tasks()
+            .iter()
+            .any(|task| task.status != agent_task::TaskStatus::Archived);
+        if tasks.is_empty() && has_tasks {
+            body = body.push(text("No tasks match these filters.").size(self.chrome_font_size()));
+        }
+        if tasks.is_empty()
+            && !has_tasks
+            && self.task_panel.pending_creation.is_none()
+            && self.task_panel.provider_picker.is_none()
+        {
+            body = body.push(text("No Agent tasks yet").size(self.chrome_font_size()));
+            body = body.push(
+                text("Create one from a failed command block's menu (Create task). Pick Codex, Claude, OpenCode, or Kimi; each task gets its own Git worktree.")
+                    .size(self.chrome_font_size())
+                    .style(text::secondary),
+            );
+        }
+        for task in &tasks {
+            let mut label = crate::review_text::visible_bounded(
+                &task.title,
+                agent_task_ui::MAX_TASK_TITLE_DISPLAY_BYTES,
+            );
+            if self.task_manager.task_needs_attention(task.id) {
+                label = format!("● {label}");
+            }
+            let row_button = button(text(label).size(self.chrome_font_size()))
+                .on_press(Message::TaskSelect(task.id))
+                .padding([2, 6])
+                .style(self.tab_btn_style(self.task_panel.selected == Some(task.id)));
+            let mut task_row = column![
+                row_button,
+                text(format!(
+                    "{} · {}",
+                    crate::review_text::bound_provider_label(task.provider.display_name()),
+                    task.status.label()
+                ))
+                .size(self.chrome_font_size())
+                .style(text::secondary),
+            ]
+            .spacing(1);
+            if let Some(reason) = agent_task_ui::task_reason(
+                task.status,
+                task.validation.status,
+                task.status_detail.as_deref(),
+                task.validation.status_detail.as_deref(),
+            ) {
+                let columns = ((self.dock_width - 24.0).max(6.0) / 6.0) as usize;
+                let preview = agent_task_ui::reason_preview(&reason, columns);
+                task_row = task_row.push(tooltip(
+                    container(
+                        text(preview)
+                            .size(self.chrome_font_size())
+                            .font(iced::Font::MONOSPACE)
+                            .wrapping(text::Wrapping::None)
+                            .style(text::secondary),
+                    )
+                    .width(Length::Fill)
+                    .clip(true),
+                    container(
+                        text(reason)
+                            .size(self.chrome_font_size())
+                            .wrapping(text::Wrapping::WordOrGlyph),
+                    )
+                    .padding(6)
+                    .width(Length::Fixed(320.0))
+                    .max_height(180.0)
+                    .clip(true),
+                    tooltip::Position::Top,
+                ));
+            }
+            body = body.push(task_row);
+        }
+        if let Some(task_id) = self
+            .task_panel
+            .selected
+            .filter(|id| dashboard.selected_index(Some(*id)).is_some())
+        {
+            if let Some(task) = self.task_manager.get(task_id) {
+                body = body.push(self.task_card(task));
+            }
+        }
+        scrollable(body).height(Length::Fill).into()
+    }
+
+    /// The selected task's detail card: lifecycle state, native turn view,
+    /// approvals (display-and-deny), review/validation/terminal actions.
+    fn task_card(&self, task: &agent_task::AgentTask) -> Element<'_, Message> {
+        use agent_task::{TaskRuntimeKind, TaskStatus, TaskValidationStatus};
+
+        let mut card = column![].spacing(6);
+        card = card.push(
+            text(crate::review_text::visible_bounded(&task.title, 200))
+                .size(self.chrome_font_size()),
+        );
+        card = card.push(
+            text(format!(
+                "Status: {} · Runtime: {:?}",
+                task.status.label(),
+                task.runtime_kind
+            ))
+            .size(self.chrome_font_size())
+            .style(text::secondary),
+        );
+        card = card.push(
+            text(format!(
+                "Branch {} · {}",
+                crate::review_text::visible_bounded(&task.branch, 128),
+                agent_task::diff::visible_diff_cwd(&task.worktree_path),
+            ))
+            .size(self.chrome_font_size())
+            .style(text::secondary),
+        );
+        if let Some(detail) = task.status_detail.as_deref() {
+            card = card.push(
+                text(crate::review_text::visible_bounded(
+                    detail,
+                    agent_task_ui::MAX_TASK_DETAIL_DISPLAY_BYTES,
+                ))
+                .size(self.chrome_font_size())
+                .style(text::secondary),
+            );
+        }
+
+        let preparing = self.agent_runtime.has_preparing(task.id);
+        let running = self.agent_runtime.has_running(task.id);
+        let stream_active = self.task_manager.has_active_agent_event_stream(task.id);
+
+        // Native session projection: current/latest turn plus pending
+        // approvals (display-and-deny) and bounded completed-turn history.
+        if let Some(snapshot) = self.agent_runtime.snapshot(task.id) {
+            card = card.push(
+                text(crate::review_text::bound_toast_text(format!(
+                    "Native session: {:?}",
+                    snapshot.phase
+                )))
+                .size(self.chrome_font_size())
+                .style(text::secondary),
+            );
+            if !snapshot.agent_text.is_empty() {
+                let truncated = if snapshot.agent_text_truncated {
+                    " (compacted)"
+                } else {
+                    ""
+                };
+                card = card.push(
+                    container(
+                        scrollable(
+                            text(format!(
+                                "{}{}",
+                                crate::review_text::visible_bounded(
+                                    &snapshot.agent_text,
+                                    64 * 1024
+                                ),
+                                truncated
+                            ))
+                            .size(self.chrome_font_size())
+                            .font(iced::Font::MONOSPACE),
+                        )
+                        .height(Length::Fixed(160.0)),
+                    )
+                    .padding(6)
+                    .style(container::bordered_box),
+                );
+            }
+            for command in &snapshot.commands {
+                card = card.push(
+                    text(format!(
+                        "$ {} · {}",
+                        crate::review_text::visible_bounded(&command.command, 512),
+                        crate::review_text::visible_bounded(&command.status.to_string(), 64)
+                    ))
+                    .size(self.chrome_font_size())
+                    .style(text::secondary),
+                );
+            }
+            for approval in &snapshot.pending_approvals {
+                let mut approval_card = column![].spacing(4);
+                approval_card = approval_card.push(
+                    text(crate::review_text::bound_toast_text(format!(
+                        "Managed approval request ({:?}); accepting is disabled",
+                        approval.kind
+                    )))
+                    .size(self.chrome_font_size())
+                    .style(text::danger),
+                );
+                if let Some(command) = approval.command.as_deref() {
+                    approval_card = approval_card.push(
+                        text(crate::review_text::visible_bounded(command, 1024))
+                            .size(self.chrome_font_size())
+                            .font(iced::Font::MONOSPACE),
+                    );
+                }
+                for path in &approval.file_paths {
+                    approval_card = approval_card.push(
+                        text(crate::review_text::visible_bounded(path, 512))
+                            .size(self.chrome_font_size())
+                            .font(iced::Font::MONOSPACE),
+                    );
+                }
+                if let Some(reason) = approval.reason.as_deref() {
+                    approval_card = approval_card.push(
+                        text(crate::review_text::visible_bounded(reason, 512))
+                            .size(self.chrome_font_size())
+                            .style(text::secondary),
+                    );
+                }
+                approval_card = approval_card.push(
+                    button(text("Deny").size(self.chrome_font_size()))
+                        .style(button::danger)
+                        .on_press(Message::TaskApprovalDeny(task.id, approval.id)),
+                );
+                card = card.push(
+                    container(approval_card)
+                        .padding(6)
+                        .style(container::bordered_box),
+                );
+            }

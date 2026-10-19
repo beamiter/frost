@@ -1,0 +1,300 @@
+    ClearOnly,
+    DispatchApp,
+}
+
+fn overlay_release_disposition(
+    gesture: Option<TerminalMouseGesture>,
+    source_session_id: usize,
+    button: MouseButton,
+) -> OverlayReleaseDisposition {
+    let Some(gesture) = gesture else {
+        return OverlayReleaseDisposition::Reject;
+    };
+    if gesture.session_id != source_session_id || gesture.button != button {
+        return OverlayReleaseDisposition::Reject;
+    }
+    if gesture.consumed || !gesture.report_to_app {
+        OverlayReleaseDisposition::ClearOnly
+    } else {
+        OverlayReleaseDisposition::DispatchApp
+    }
+}
+
+struct Frost {
+    config: Config,
+    terminal_interaction_mode: config::TerminalMode,
+    terminal_interaction_epoch: u64,
+    terminal_pane_owners: Option<TerminalPaneOwners>,
+    organism: organism::Organism,
+    organism_motion_control: organism_motion_control::MotionControl,
+    organism_wake_counts: organism_wake_plan::WakeCounters,
+    organism_pointer_buttons: Vec<iced::mouse::Button>,
+    organism_body_geometry: Option<(usize, terminal_view::OrganismBodyGeometry)>,
+    organism_geometry_epoch: u64,
+    theme: Theme,
+    metrics: Metrics,
+    sessions: Vec<Session>,
+    active: usize,
+    next_id: usize,
+    cols: usize,
+    rows: usize,
+    focused: bool,
+    modifiers: keyboard::Modifiers,
+    font_wheel: font_zoom::WheelZoom,
+    /// Tells a plain click apart from the start of a selection drag, so only
+    /// the former places the shell's edit cursor.
+    click_tracker: TerminalClickTracker,
+    terminal_mouse_gestures: [Option<TerminalMouseGesture>; 3],
+    mono: iced::Font,
+    cjk_mono: Option<iced::Font>,
+    symbol_mono: Option<iced::Font>,
+    math_symbol: Option<iced::Font>,
+    nerd_symbol: Option<iced::Font>,
+    search: search::SearchState,
+    /// PTY output marks active-search results stale; a short timer coalesces
+    /// bursts so each chunk does not rescan the entire scrollback.
+    search_dirty: bool,
+    /// Find & Replace modal (Ctrl+Alt+R): rewrites the current selection into
+    /// the clipboard or the prompt — the scrollback itself is never mutated.
+    search_replace: search_replace_panel::SearchReplacePanelState,
+    palette: command_palette::PaletteState,
+    /// Whole-session exports can retain a bounded multi-megabyte snapshot and
+    /// serialized buffer. Keep only one worker in flight across the window so
+    /// a repeated shortcut cannot queue unbounded copies of terminal output.
+    block_export_in_flight: bool,
+    /// iced's clipboard read is process-global. PTY-originated OSC 52/5522 reads
+    /// must share one in-flight host read across every session.
+    host_clipboard_read_owner: Option<(usize, RawFd)>,
+    host_clipboard_read_generation: u64,
+    host_clipboard_read_task: Option<iced::task::Handle>,
+    host_clipboard_read_reply: Option<HostClipboardReply>,
+    /// Rolling window for OSC 52 SET rate limiting (two writes per second).
+    osc52_write_window_started: std::time::Instant,
+    osc52_writes_in_window: usize,
+    agent: agent::AgentUi,
+    /// Review-first command-correction requests and presented cards, keyed by
+    /// stable terminal-session id (per-pane, generation-guarded).
+    command_corrections: command_correction::CorrectionRegistry,
+    /// Persistent AI chats library panel (ported from anvil's AI panel).
+    ai_chats: ai_chats::AiChatsUi,
+    /// The inline AI command-generation request overlay's text, while open.
+    ai_ask: Option<String>,
+    /// The pane-bound, review-only AI command suggestion card (never
+    /// auto-runs; insert goes through the guarded prompt path).
+    ai_suggestion: Option<ai_command::CommandSuggestion>,
+    /// Monotonic id for every suggestion request this window launches. The
+    /// worker reply carries it back through `AiSuggestionResolved`, and it is
+    /// the only thing distinguishing a superseded request's late reply from
+    /// the live one — so it must never restart with a new card (anvil's
+    /// `command_suggestion_generation`).
+    ai_suggestion_generation: u64,
+    /// Provider-neutral task lifecycle reducer for the experimental Tasks
+    /// dashboard (runtime-only metadata; nothing is persisted).
+    task_manager: agent_task::TaskManager,
+    /// Owner of native Codex provider sessions and their bounded views.
+    agent_runtime: agent_task::AgentRuntimeManager,
+    /// iced-side state for the Tasks dashboard overlay.
+    task_panel: agent_task_ui::TaskPanel,
+    keybindings: keybindings::KeyBindings,
+    config_panel_open: bool,
+    help_open: bool,
+    debug_open: bool,
+    /// Blink clock phase, toggled by a timer; drives blinking-attribute cells.
+    blink_on: bool,
+    win_size: Size,
+    /// Exact bytes this in-memory config was loaded/saved against. `None`
+    /// fails closed because a concurrent-safe comparison is impossible.
+    config_revision: Option<persistence::FileRevision>,
+    config_diagnostic: Option<String>,
+    /// A malformed/unreadable user config must never be overwritten by
+    /// background auto-save. Explicit Reset is the recovery escape hatch.
+    config_write_blocked: bool,
+    keybindings_revision: Option<persistence::FileRevision>,
+    keybindings_diagnostics: Vec<String>,
+    session_diagnostic: Option<String>,
+    /// Durable startup repair facts, independent of ephemeral shell errors.
+    startup_recovery: StartupRecovery,
+    /// Persistent settings-panel changes are live-applied immediately and saved
+    /// on the next config tick. Ephemeral font zoom never sets this flag.
+    /// 温度输入框的原始文本（含合法值之外的中间编辑态）。
+    ai_temperature_draft: String,
+    /// 设置面板中待存储的 API key 明文；提交后立即清空，从不落入配置。
+    ai_key_draft: String,
+    config_dirty: bool,
+    config_save_retry: config_retry::ConfigSaveRetry,
+    link_detector: link::LinkDetector,
+    links: Vec<link::Link>,
+    /// Stable session plus the complete immutable projection identity used by
+    /// the cached visible links.
+    links_cache_key: Option<(usize, ProjectionKey)>,
+    /// Cached GPU image handles keyed by (stable session id, Kitty image id,
+    /// source-crop rectangle). The generation invalidates same-sized
+    /// retransmissions; the crop is part of the key because `x=`/`y=`/`w=`/`h=`
+    /// let two placements show different sub-rectangles of one image.
+    kitty_handles: std::collections::HashMap<KittyHandleKey, (iced::advanced::image::Handle, u64)>,
+    /// Last persisted session-snapshot JSON, to skip redundant disk writes.
+    last_session_save: Option<String>,
+    /// Set when session state that feeds the snapshot may have changed (PTY
+    /// output can move the cwd, tab switches move the active index). The periodic
+    /// save is skipped while this is false, so a fully idle app does no per-tab
+    /// `readlink` or JSON serialization on every tick.
+    session_dirty: bool,
+    /// Fail closed when an unreadable or repaired startup snapshot could not
+    /// be preserved. The user can repair/move it and restart; this instance
+    /// will not overwrite evidence it was unable to preserve.
+    session_writes_blocked: bool,
+    /// Diagnostics (F12): wall-clock microseconds spent ingesting the
+    /// most recent PTY-output batch (parse + refresh) and its byte count, used
+    /// to derive a throughput figure for profiling.
+    last_ingest_us: u128,
+    last_ingest_bytes: usize,
+    /// Open tabs, each owning its own pane tree. Invariants: every session
+    /// appears in exactly one leaf of exactly one tab, `active_tab` is in
+    /// range, and `active == tabs[active_tab].focus`.
+    tabs: Vec<Tab>,
+    active_tab: usize,
+    /// Monotonic source of `Tab::id`.
+    next_tab_id: usize,
+    /// Active custom-theme editor overlay, or `None` when closed.
+    theme_editor: Option<ThemeEditState>,
+    /// File-tree sidebar (left panel) and whether it is currently shown.
+    sidebar: sidebar::Sidebar,
+    /// Hard-bounded admission and two-slot dispatch for local/remote directory
+    /// scans. This is the sole path from a DirectoryRequest to worker work.
+    sidebar_scans: sidebar::DirectoryScanCoordinator,
+    sidebar_open: bool,
+    /// Which content the sidebar dock shows (file tree or tab list).
+    sidebar_panel: SidebarPanel,
+    /// Current dock width in pixels (drag-resizable).
+    dock_width: f32,
+    /// Whether the sidebar-resize divider is being dragged.
+    dragging_sidebar: bool,
+    /// Right-click file-ops menu of the file tree (floating, pointer-anchored).
+    sidebar_menu: Option<SidebarMenuState>,
+    /// Modal New File / New Folder / Rename input of the file tree.
+    sidebar_dialog: Option<SidebarDialogState>,
+    /// Delete confirmation targets; the modal shows the count and the first
+    /// few full paths before dispatch.
+    sidebar_delete_confirm: Option<SidebarDeleteConfirmation>,
+    /// Location-scoped clipboard for sidebar Copy/Cut/Paste.
+    sidebar_clipboard: Option<FsClipboard>,
+    /// Monotonic identity for real Copy/Cut replacements. A completed old cut
+    /// may retire only the exact clipboard generation it started from.
+    sidebar_next_clipboard_id: u64,
+    /// In-flight cross-location transfer (progress notice + cancel button).
+    sidebar_transfer: Option<SidebarTransferUi>,
+    /// Tree row under the pointer right now (path, is_dir) — the drop target
+    /// hit-test runs against this, updated by the rows' enter/exit areas.
+    sidebar_hovered_row: Option<(std::path::PathBuf, bool)>,
+    /// Multi-select state: insertion-ordered selected rows plus the
+    /// shift-click anchor (the last plain/ctrl-clicked row).
+    sidebar_selection: Vec<std::path::PathBuf>,
+    sidebar_selection_anchor: Option<std::path::PathBuf>,
+    /// Inline tree filter: Some(query) while the filter row is open.
+    sidebar_filter: Option<String>,
+    /// Transactional absolute-path editor. Its draft has no filesystem
+    /// authority until validation succeeds on submit.
+    sidebar_path_input: Option<String>,
+    /// Paths of the in-flight drop burst (iced delivers one event per path).
+    sidebar_drop_burst: Vec<std::path::PathBuf>,
+    sidebar_drop_intents: SidebarDropIntents,
+    /// Tree generation whose drop burst owns the armed debounce task.
+    sidebar_drop_debounce_generation: Option<u64>,
+    /// Whether the current sidebar notice is the drop hint (cleared on
+    /// hover-out or drop flush; never clobbers a real notice).
+    sidebar_drop_hint: bool,
+    /// Pointer-over-dock flag gating the window-space pointer tracker.
+    sidebar_hovered: bool,
+    /// Files panel owns arrow/Enter/Delete until the terminal is clicked or Esc.
+    sidebar_files_focused: bool,
+    /// Keyboard focus row in the Files tree (path of a visible node).
+    sidebar_tree_focus: Option<std::path::PathBuf>,
+    /// Virtualized tree scroll offset and last known viewport height.
+    sidebar_tree_offset_y: f32,
+    sidebar_tree_viewport_h: f32,
+    /// Last window-space pointer position over the dock (menu anchor).
+    sidebar_pointer: iced::Point,
+    /// Transient status line under the files header (op failures/success);
+    /// the flag marks neutral (progress/cancelled) vs error styling.
+    sidebar_notice: Option<(String, bool)>,
+    /// Monotonic identity of the sidebar's remote-host snapshot. Picker
+    /// messages rendered against an older list are refused rather than having
+    /// their numeric index reinterpreted.
+    sidebar_hosts_epoch: u64,
+    /// Changes only when a remote context is forcibly invalidated. File-op
+    /// reports stamped before that boundary are ignored when they arrive.
+    /// `None` is a fail-closed terminal state if the identity space is ever
+    /// exhausted; it can never alias an earlier worker report.
+    sidebar_context_epoch: Option<u64>,
+    /// User pane/sidebar/file-operation intent. A staged automatic follow may
+    /// commit only if this value is unchanged; A→B→A UI movement therefore
+    /// cannot look current merely because its final values happen to match.
+    sidebar_follow_intent_epoch: Option<u64>,
+    /// Last real SSH argv seen in the active local pane. Keeping the structured
+    /// argv suppresses repeat probes without ever trusting terminal text.
+    sidebar_follow_observed: Option<(usize, Vec<String>)>,
+    /// One automatic retry for the startup race where jsh's shared SSH master
+    /// is still being created when the first non-interactive probe runs.
+    sidebar_follow_retry_once: Option<(usize, Vec<String>)>,
+    /// After the bounded automatic retry, keep one exact live-command identity
+    /// behind the Files notice's explicit Retry action.
+    sidebar_follow_retry_available: Option<(usize, Vec<String>)>,
+    sidebar_follow_pending: Option<SidebarRemoteFollow>,
+    sidebar_follow_next_token: u64,
+    /// Divider being dragged, identified by its owning split node's path + gap.
+    dragging_divider: Option<DividerId>,
+    /// Divider under the pointer (drives its hover highlight).
+    hovered_divider: Option<DividerId>,
+    /// Last divider press (time + divider id), for double-click detection
+    /// (double-click equalizes the panes of that divider's node).
+    last_divider_press: Option<(std::time::Instant, DividerId)>,
+    /// Focused pane temporarily expanded to the full terminal area (tmux-style
+    /// zoom). Only meaningful while split; cleared when the split collapses.
+    pane_zoomed: bool,
+    /// In-flight header drag that will swap two panes on release.
+    pane_drag: Option<PaneDrag>,
+    /// Directional pane edge currently armed for a tab-to-split drop.
+    tab_split_drop: Option<TabSplitDrop>,
+    /// Stable id of the tab the pointer is hovering (drives close-button reveal).
+    hovered_tab: Option<usize>,
+    /// Source-tab id recorded on mouse press over a tab. Cleared on mouse
+    /// release (anywhere) by the global mouse-up listener; in between, it
+    /// drives tab-drag visual feedback and the reorder-on-release.
+    dragging_tab: Option<usize>,
+    /// Tab that was active before drag-hover previews began, restored on cancel.
+    tab_drag_origin: Option<usize>,
+    /// Whether the pointer actually left the pressed tab during this gesture.
+    /// Distinguishes a click-to-activate from a drag that returned to source.
+    tab_drag_moved: bool,
+    /// Stable tab id and timestamp for a pending delayed hover preview.
+    tab_drag_hover_since: Option<(usize, std::time::Instant)>,
+    /// Right-click context menu state: stable id of its target tab, or None.
+    /// Rendered as a centered floating panel (Esc / click-outside dismiss).
+    tab_menu: Option<usize>,
+    /// Rename editor inside the open tab menu: target tab id plus the draft.
+    /// Lives beside `tab_menu` rather than inside it because dismissing the
+    /// menu must also drop a half-typed name.
+    tab_rename: Option<(usize, String)>,
+    /// Last pointer position seen over a tab, in the same logical space the
+    /// widget layout uses. `mouse_area` right-presses carry no coordinates, so
+    /// this is what the context menu anchors to.
+    tab_pointer: iced::Point,
+    /// Where the open tab menu was summoned. Frozen at open time: the pointer
+    /// keeps moving as the user walks over to the panel.
+    tab_menu_at: iced::Point,
+    /// Transient bottom-right toast queue with absolute expiry timestamps.
+    /// Cleared lazily on each render and on ConfigTick.
+    toasts: Vec<Toast>,
+    /// Offer produced by the background "is a newer jsh published?" check, and
+    /// whether the user waved it away for this launch.
+    jsh_prompt: Option<jterm_core::jsh_install::Prompt>,
+    jsh_notice_dismissed: bool,
+    /// Tab-switcher overlay (Ctrl+Shift+L): when open, a small fuzzy list of
+    /// tab labels lets the user jump by typing. Field holds the typed query
+    /// and current selection index.
+    tab_switcher: Option<TabSwitcherState>,
+    /// Remote host picker: one opening identity, profile snapshot and selection.
+    remote_picker: Option<RemotePickerState>,
+    remote_host_editor: remote_host_editor::RemoteHostEditor,
+    /// History-picker overlay (Ctrl+Shift+H): fuzzy search over the persisted
+    /// command-history index; Enter types the selection into the active pane.

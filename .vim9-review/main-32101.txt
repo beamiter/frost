@@ -1,0 +1,300 @@
+/// Lexical component matching only: no filesystem lookup or canonicalization.
+/// Non-UTF8/empty home paths retain the original display policy.
+fn abbreviate_home_with(path: &str, home: Option<&std::path::Path>) -> String {
+    let Some(home) = home.filter(|home| !home.as_os_str().is_empty() && home.to_str().is_some())
+    else {
+        return path.to_string();
+    };
+    let Ok(rest) = std::path::Path::new(path).strip_prefix(home) else {
+        return path.to_string();
+    };
+    match rest.to_str() {
+        Some("") => "~".to_string(),
+        Some(rest) => format!("~/{rest}"),
+        None => path.to_string(),
+    }
+}
+
+/// Submit an OSC 9/777 notification to one bounded worker. The worker owns and
+/// waits for every `notify-send` child, preventing zombies; a stuck notifier can
+/// fill at most this small queue instead of spawning unbounded processes/threads.
+fn bound_desktop_notification_pair(title: String, body: String) -> (String, String) {
+    (
+        crate::review_text::bound_toast_text(title),
+        crate::review_text::bound_toast_text(body),
+    )
+}
+
+fn enqueue_desktop_notification(title: String, body: String) {
+    type Notification = (String, String);
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::SyncSender<Notification>> =
+        std::sync::OnceLock::new();
+    let (title, body) = bound_desktop_notification_pair(title, body);
+
+    let sender = SENDER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Notification>(8);
+        let _ = std::thread::Builder::new()
+            .name("frost-notifications".to_string())
+            .spawn(move || {
+                while let Ok((title, body)) = receiver.recv() {
+                    let _ = jterm_core::helper::notify_send(&title, &body);
+                }
+            });
+        sender
+    });
+    let _ = sender.try_send((title, body));
+}
+
+/// Bytes that put an approved agent command on the bound session's prompt and
+/// run it.
+///
+/// `clear_line_first` is unconditional: the "prompt is ready" the approval UI
+/// implies says nothing about the line buffer being empty, so without the
+/// `Ctrl+U` the command is appended to whatever the user had half-typed and
+/// submitted in that mangled form. The submitting CR lands outside the frame
+/// because readline deliberately does not execute newlines inside a bracketed
+/// paste. The local compatibility gate rejects visual spoofing, and the
+/// payload policy strips C0/C1 again immediately before the PTY write.
+fn agent_command_payload(
+    command: &str,
+    bracketed: bool,
+) -> Result<pty_input::Paste, crate::review_text::ReviewTextError> {
+    let command = crate::review_text::sanitize_untrusted_single_line(
+        command,
+        crate::review_text::MAX_AGENT_COMMAND_BYTES,
+    )?;
+    Ok(pty_input::encode_prompt_insert(
+        &command,
+        PasteModes { bracketed },
+        PastePolicy {
+            strip_controls: true,
+            submit: true,
+            ..PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim)
+        },
+        true,
+    ))
+}
+
+/// Build a single OSC 5522 packet: `ESC ] 5522 ; <metadata> [; <payload>] ESC \`.
+fn osc_5522_packet(metadata: &str, payload: Option<&str>) -> Vec<u8> {
+    let mut packet = Vec::new();
+    packet.extend_from_slice(b"\x1b]5522;");
+    packet.extend_from_slice(metadata.as_bytes());
+    if let Some(payload) = payload {
+        packet.extend_from_slice(b";");
+        packet.extend_from_slice(payload.as_bytes());
+    }
+    packet.extend_from_slice(b"\x1b\\");
+    packet
+}
+
+/// Build the OK/DATA/DONE sequence answering an OSC 5522 MIME-data read.
+fn clipboard_5522_response_for_mime(mime_type: &str, data: &[u8]) -> Vec<u8> {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let encoded_mime = engine.encode(mime_type.as_bytes());
+    let encoded_data = engine.encode(data);
+    let mut output = Vec::new();
+    output.extend_from_slice(&osc_5522_packet("type=read:status=OK", None));
+    output.extend_from_slice(&osc_5522_packet(
+        &format!("type=read:status=DATA:mime={encoded_mime}"),
+        Some(&encoded_data),
+    ));
+    output.extend_from_slice(&osc_5522_packet("type=read:status=DONE", None));
+    output
+}
+
+fn organism_deadline_subscription(
+    wake: organism_wake_plan::DeadlineWake<std::time::Instant>,
+) -> Subscription<Message> {
+    Subscription::run_with(wake, |wake| {
+        let wake = wake.clone();
+        iced::futures::stream::once(async move {
+            tokio::time::sleep_until(wake.at.into()).await;
+            Message::OrganismTick(organism_wake_plan::WakeCause::Deadline(wake))
+        })
+    })
+}
+
+fn pty_subscription(key: PtySubscriptionKey) -> Subscription<Message> {
+    // Key on the stable session id (not the raw fd): a closed session's fd
+    // number can be reused by a new session, and keying on fd alone would let
+    // iced confuse the two and reuse the old reader thread on the reused fd.
+    Subscription::run_with(key, |key: &PtySubscriptionKey| pty_stream(key.clone()))
+}
+
+fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Message> {
+    use iced::futures::{SinkExt, StreamExt};
+    iced::stream::channel(
+        2,
+        move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            let id = key.id;
+            let fd = key.master_fd;
+            let mut watch_source = key.watch_source.start();
+            // Each message is capped at 1 MiB below. Two shallow handoff queues
+            // keep only a few MiB resident per session while backpressuring read(2).
+            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(2);
+            // Self-pipe so dropping this subscription (session/tab closed) wakes the
+            // reader thread and stops it BEFORE it can read from a PTY fd whose
+            // number may have been reused by a freshly spawned session.
+            let (shutdown_r, shutdown_w) = match Pty::make_shutdown_pipe() {
+                Ok((read_fd, write_fd)) => {
+                    // SAFETY: make_shutdown_pipe returns two fresh owned fds.
+                    unsafe {
+                        (
+                            OwnedFd::from_raw_fd(read_fd),
+                            OwnedFd::from_raw_fd(write_fd),
+                        )
+                    }
+                }
+                Err(error) => {
+                    log::error!("[PTY] failed to create reader shutdown pipe: {error}");
+                    let _ = output.send(Message::PtyExited(id, fd, -1)).await;
+                    return;
+                }
+            };
+            let reader_fd = key.reader_fd;
+            let child_pid = key.child_pid;
+            let spawn_result = std::thread::Builder::new()
+                .name(format!("frost-pty-{id}"))
+                .spawn(move || {
+                    let reader_raw = reader_fd.as_raw_fd();
+                    let shutdown_raw = shutdown_r.as_raw_fd();
+                    // Drain everything currently readable into one message instead of
+                    // emitting a separate message per 64 KiB read. Bursty output (e.g.
+                    // `cat bigfile`) then triggers far fewer process/refresh/render
+                    // cycles, while a lone keystroke still hits WouldBlock immediately
+                    // and is delivered with no added latency. Capped so the UI gets a
+                    // chance to repaint between very large bursts.
+                    const COALESCE_CAP: usize = 1 << 20; // 1 MiB per message
+                    let mut buf = vec![0u8; 65536];
+                    loop {
+                        match Pty::wait_fd_or_shutdown(reader_raw, shutdown_raw, 200) {
+                            Ok(ReaderPoll::Shutdown) => break,
+                            Ok(ReaderPoll::Timeout) => continue,
+                            Ok(ReaderPoll::Data) => {
+                                let mut acc: Vec<u8> = Vec::new();
+                                let mut first_read = None;
+                                let mut hangup = false;
+                                let mut errored = false;
+                                loop {
+                                    let n = unsafe {
+                                        libc::read(
+                                            reader_raw,
+                                            buf.as_mut_ptr() as *mut libc::c_void,
+                                            buf.len(),
+                                        )
+                                    };
+                                    if n > 0 {
+                                        first_read.get_or_insert_with(std::time::Instant::now);
+                                        acc.extend_from_slice(&buf[..n as usize]);
+                                        if acc.len() >= COALESCE_CAP {
+                                            break;
+                                        }
+                                    } else if n == 0 {
+                                        // read(2) == 0 on a PTY master is a
+                                        // hangup, the same class as EIO below.
+                                        hangup = true;
+                                        break;
+                                    } else {
+                                        let err = std::io::Error::last_os_error();
+                                        if err.kind() == std::io::ErrorKind::WouldBlock {
+                                            break;
+                                        }
+                                        if err.raw_os_error() == Some(libc::EINTR) {
+                                            continue;
+                                        }
+                                        // Linux PTY masters report EIO (rather
+                                        // than read(2) == 0) once the final
+                                        // slave fd closes. The child may still
+                                        // be alive; never fabricate an exit
+                                        // from the fd state alone.
+                                        if err.raw_os_error() == Some(libc::EIO) {
+                                            hangup = true;
+                                            break;
+                                        }
+                                        errored = true;
+                                        break;
+                                    }
+                                }
+                                if !acc.is_empty()
+                                    && iced::futures::executor::block_on(tx.send(
+                                        Message::PtyOutput(
+                                            id,
+                                            fd,
+                                            acc,
+                                            first_read.and_then(|at| watch_source.stamp(at)),
+                                        ),
+                                    ))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                if errored {
+                                    let _ = iced::futures::executor::block_on(
+                                        tx.send(Message::PtyExited(id, fd, -1)),
+                                    );
+                                    break;
+                                }
+                                if hangup {
+                                    match wait_out_hangup(
+                                        id,
+                                        fd,
+                                        reader_raw,
+                                        shutdown_raw,
+                                        child_pid,
+                                        &mut tx,
+                                        &mut watch_source,
+                                    ) {
+                                        HangupOutcome::Recovered => continue,
+                                        HangupOutcome::Exited | HangupOutcome::Shutdown => break,
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                let _ = iced::futures::executor::block_on(
+                                    tx.send(Message::PtyExited(id, fd, -1)),
+                                );
+                                break;
+                            }
+                        }
+                    }
+                });
+            if let Err(error) = spawn_result {
+                log::error!("[PTY] failed to spawn reader thread: {error}");
+                let _ = output.send(Message::PtyExited(id, fd, -1)).await;
+                return;
+            }
+            // Dropping this owned write end (subscription removed) signals the reader.
+            let _shutdown_guard = shutdown_w;
+            while let Some(msg) = rx.next().await {
+                if output.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        },
+    )
+}
+
+/// Outcome of riding out a PTY hangup in the reader thread.
+enum HangupOutcome {
+    /// The slave side is open again (or data arrived); resume normal reading.
+    Recovered,
+    /// The child is actually gone, or the stream is genuinely broken; the
+    /// exit message has been queued.
+    Exited,
+    /// The session was closed while probing; leave quietly.
+    Shutdown,
+}
+
+/// Ride out a PTY hangup (Linux EIO, or `read(2) == 0` elsewhere): the slave
+/// stream is closed, but the child may still be alive — a daemonized
+/// program, or one that did setsid and closed its ctty — and may even reopen
+/// /dev/tty later. Probe with bounded backoff (50→250 ms) and declare exit
+/// only once waitid says the child is gone, never from the fd state alone.
+/// The backoff wait is paced by the shutdown pipe so session close stays
+/// prompt; an EIO master stays permanently readable and cannot pace it.
+fn wait_out_hangup(
+    id: usize,
+    fd: RawFd,
+    reader_raw: RawFd,

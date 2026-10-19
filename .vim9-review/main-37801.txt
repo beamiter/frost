@@ -1,0 +1,300 @@
+                false,
+            );
+        }
+        assert_eq!(
+            tracker.update(
+                MouseInput::Release {
+                    row: 0,
+                    col: 7,
+                    button: MouseButton::Left,
+                },
+                7,
+                after.key(),
+                false
+            ),
+            Some(click_cursor::Cell::new(0, 7))
+        );
+        assert!(!tracker.cancelled);
+    }
+
+    #[test]
+    fn terminal_click_projection_real_drag_preserves_wide_combining_and_blank_copy() {
+        let mut terminal = terminal::TerminalState::new(32, 12);
+        terminal.process_input(
+            concat!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07",
+                "A中e\u{301}\r\n\r\nlast\r\n\x1b]133;D;0\x07",
+                "\x1b]133;A\x07$ \x1b]133;B\x07echo hello",
+            )
+            .as_bytes(),
+        );
+        let mut policy = terminal::ProjectionPolicy::new();
+        policy.set_native_chrome(true, 0);
+        let view = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+        let first = view
+            .cells()
+            .iter()
+            .position(|row| row[0].character == 'A')
+            .unwrap();
+        let last = view
+            .cells()
+            .iter()
+            .position(|row| row[0].character == 'l')
+            .unwrap();
+        assert_eq!(last, first + 2, "genuine blank output row stays visible");
+        let mut tracker = TerminalClickTracker::default();
+        tracker.update(caret_test_press(first, 0), 7, view.key(), false);
+        terminal.start_selection_in_projection(&view, (first, 0), terminal::SelectionMode::Normal);
+        tracker.update(
+            MouseInput::Drag {
+                row: last,
+                col: 3,
+                count: 1,
+            },
+            7,
+            view.key(),
+            false,
+        );
+        terminal.update_selection_in_projection(&view, (last, 3));
+        let copy = terminal.copy_selection().unwrap();
+        assert!(copy.contains("A中"), "{copy:?}");
+        assert!(copy.contains("e\u{301}") || copy.contains('é'), "{copy:?}");
+        assert_eq!(
+            copy.lines().count(),
+            3,
+            "real blank row survives copy: {copy:?}"
+        );
+        terminal.on_resize(24, 12);
+        let after = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+        assert_eq!(
+            tracker.update(
+                MouseInput::Release {
+                    row: last,
+                    col: 3,
+                    button: MouseButton::Left,
+                },
+                7,
+                after.key(),
+                false
+            ),
+            None
+        );
+        assert!(
+            !tracker.cancelled,
+            "real selection drag keeps its normal copy path"
+        );
+    }
+
+    #[test]
+    fn terminal_click_projection_release_in_another_cell_is_not_a_caret_click() {
+        let mut terminal = terminal::TerminalState::new(32, 8);
+        let view = terminal.get_projected_viewport(true);
+        let mut tracker = TerminalClickTracker::default();
+        tracker.update(caret_test_press(0, 7), 7, view.key(), false);
+        assert_eq!(
+            tracker.update(
+                MouseInput::Release {
+                    row: 0,
+                    col: 8,
+                    button: MouseButton::Left,
+                },
+                7,
+                view.key(),
+                false
+            ),
+            None
+        );
+        assert!(!tracker.cancelled);
+    }
+
+    #[test]
+    fn terminal_click_projection_geometry_changes_only_cancel_actual_caret_gestures() {
+        let mut terminal = terminal::TerminalState::new(32, 8);
+        let view = terminal.get_projected_viewport(true);
+        let before = Metrics::new(14.0, 1.0, 4.0, true);
+        let mut changes = vec![before];
+        let mut width = before;
+        width.cell_w += 1.0;
+        changes.push(width);
+        let mut height = before;
+        height.cell_h += 1.0;
+        changes.push(height);
+        let mut padding = before;
+        padding.padding += 1.0;
+        changes.push(padding);
+        let mut gutter = before;
+        gutter.block_gutter = false;
+        changes.push(gutter);
+        for (index, after) in changes.into_iter().enumerate() {
+            let mut tracker = TerminalClickTracker::default();
+            tracker.update(caret_test_press(0, 7), 7, view.key(), false);
+            tracker.geometry_changed(before, after);
+            let clicked = tracker.update(
+                MouseInput::Release {
+                    row: 0,
+                    col: 7,
+                    button: MouseButton::Left,
+                },
+                7,
+                view.key(),
+                false,
+            );
+            assert_eq!(clicked.is_some(), index == 0);
+            assert_eq!(tracker.cancelled, index != 0);
+        }
+    }
+
+    #[test]
+    fn terminal_click_projection_change_before_first_drag_preserves_actual_selection_copy() {
+        for resize in [false, true] {
+            let mut terminal = terminal::TerminalState::new(32, 8);
+            terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hello");
+            let before = terminal.get_projected_viewport(true);
+            let mut tracker = TerminalClickTracker::default();
+            tracker.update(caret_test_press(0, 2), 7, before.key(), false);
+            terminal.start_selection_in_projection(
+                &before,
+                (0, 2),
+                terminal::SelectionMode::Normal,
+            );
+            if resize {
+                terminal.on_resize(24, 8);
+            } else {
+                tracker.update(
+                    MouseInput::Wheel {
+                        row: 0,
+                        col: 2,
+                        up: true,
+                        ctrl: false,
+                        shift: false,
+                        lines: 1,
+                        app_eligible: false,
+                    },
+                    7,
+                    before.key(),
+                    false,
+                );
+                assert!(tracker.cancelled);
+            }
+            let after = terminal.get_projected_viewport(true);
+            tracker.update(
+                MouseInput::Drag {
+                    row: 0,
+                    col: 5,
+                    count: 1,
+                },
+                7,
+                after.key(),
+                false,
+            );
+            terminal.update_selection_in_projection(&after, (0, 5));
+            assert_eq!(
+                tracker.update(
+                    MouseInput::Release {
+                        row: 0,
+                        col: 5,
+                        button: MouseButton::Left,
+                    },
+                    7,
+                    after.key(),
+                    false
+                ),
+                None
+            );
+            assert!(
+                !tracker.cancelled,
+                "actual drag after change still copies, resize={resize}"
+            );
+            assert_eq!(terminal.copy_selection().as_deref(), Some("echo"));
+        }
+    }
+
+    #[test]
+    fn terminal_click_projection_app_owned_gesture_keeps_paired_release() {
+        let mut terminal = terminal::TerminalState::new(32, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hello\x1b[?1002h\x1b[?1006h");
+        let before = terminal.get_projected_viewport(true);
+        let mut tracker = TerminalClickTracker::default();
+        tracker.update(caret_test_press(0, 7), 7, before.key(), true);
+        let gesture = TerminalMouseGesture {
+            session_id: 7,
+            button: MouseButton::Left,
+            report_to_app: true,
+            last_app_cell: Some((7, 0)),
+            consumed: false,
+        };
+        terminal.on_resize(24, 8);
+        let after = terminal.get_projected_viewport(true);
+        assert_eq!(
+            tracker.update(
+                MouseInput::Release {
+                    row: 0,
+                    col: 7,
+                    button: MouseButton::Left,
+                },
+                7,
+                after.key(),
+                true
+            ),
+            None
+        );
+        assert!(
+            !tracker.cancelled,
+            "application gesture is never a canceled local click"
+        );
+        let current = projected_live_grid_cell(&terminal, &after, 0, 7);
+        let (col, row) = gesture.app_release_cell(current, 24, 8).unwrap();
+        assert_eq!(
+            terminal.get_mouse_release_report(btn_code(MouseButton::Left), col, row),
+            Some(b"\x1b[<0;8;1m".to_vec())
+        );
+    }
+
+    #[test]
+    fn terminal_click_projection_current_prompt_roundtrips_native_and_chat_resizes() {
+        let mut terminal = terminal::TerminalState::new(32, 12);
+        terminal.process_input(
+            concat!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07",
+                "A中e\u{301}\r\n\r\nlast\r\n\x1b]133;D;0\x07",
+                "\x1b]133;A\x07$ \x1b]133;B\x07echo hello",
+            )
+            .as_bytes(),
+        );
+        let mut policy = terminal::ProjectionPolicy::new();
+        policy.set_native_chrome(true, 0);
+        let zone = terminal.command_zones.front().unwrap().id;
+        for chat in [false, true, false] {
+            policy.set_chat(chat);
+            for collapsed in [true, false] {
+                if collapsed {
+                    policy.collapse(zone);
+                } else {
+                    policy.expand(zone);
+                }
+                for width in [32, 24, 40] {
+                    terminal.on_resize(width, 12);
+                    let view = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+                    let cursor = terminal.get_cursor_pos();
+                    let raw = terminal
+                        .raw_cell_origin_at_absolute(terminal.scrollback_len() + cursor.0, cursor.1)
+                        .unwrap();
+                    let displayed = view
+                        .raw_to_view(raw)
+                        .expect("visible current prompt cursor");
+                    assert_eq!(view.view_to_raw(displayed), Some(raw));
+                    assert_eq!(
+                        projected_live_grid_cell(&terminal, &view, displayed.row, displayed.col),
+                        Some((cursor.1, cursor.0))
+                    );
+                    assert!(
+                        chat || !view.row_kinds().iter().any(|kind| matches!(
+                            kind,
+                            terminal::ProjectedRowKind::BlockSpacer { .. }
+                        )),
+                        "native gap removal must not return during policy/resize transitions"
+                    );
+                }
+            }
+        }
+    }

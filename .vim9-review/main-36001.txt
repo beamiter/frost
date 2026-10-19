@@ -1,0 +1,300 @@
+    /// nothing observable survives to assert at runtime.
+    fn frost_source() -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        )
+        .expect("frost's own source is readable from its manifest directory")
+    }
+
+    /// The argument list of the call `source` starts with, paren-matched so a
+    /// nested call such as `as_deref()` does not end it early.
+    fn paren_arguments(source: &str) -> &str {
+        let mut depth = 0usize;
+        for (offset, character) in source.char_indices() {
+            match character {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[..offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the call is closed");
+    }
+
+    /// The body of the `{ ... }` block that `opener` (which must end in `{`)
+    /// opens, with `//` tails dropped first so a brace inside prose cannot
+    /// unbalance the walk. Only used over regions known to be free of `//`
+    /// inside string literals.
+    fn braced_block_after(source: &str, opener: &str) -> String {
+        let rest = source
+            .split_once(opener)
+            .unwrap_or_else(|| panic!("{opener} appears in frost's source"))
+            .1;
+        let code = rest
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut depth = 1usize;
+        for (offset, character) in code.char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return code[..offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the block {opener} opens is closed");
+    }
+
+    fn sidebar_remote_profile(name: &str, host: &str) -> jterm_core::jsh_remote::RemoteHostConfig {
+        let mut profile = config::default_remote_hosts()[0].clone();
+        profile.name = name.to_string();
+        profile.host = host.to_string();
+        profile
+    }
+
+    #[test]
+    fn stale_sidebar_load_does_not_clear_the_live_hover_target() {
+        let mut sidebar = sidebar::Sidebar::new();
+        let stale = sidebar.set_current_dir(std::path::PathBuf::from("/stale"));
+        let current = sidebar.set_current_dir(std::path::PathBuf::from("/current"));
+        let live_hover = (std::path::PathBuf::from("/current/item"), false);
+        let mut hovered = Some(live_hover.clone());
+
+        assert_eq!(
+            apply_sidebar_load_result(
+                &mut sidebar,
+                &mut hovered,
+                sidebar::DirectoryResult {
+                    generation: stale.generation,
+                    request_id: stale.request_id,
+                    path: stale.path,
+                    entries: Ok(Vec::new()),
+                    truncated: false,
+                },
+            ),
+            SidebarLoadApply::Rejected
+        );
+        assert_eq!(hovered, Some(live_hover));
+
+        assert_eq!(
+            apply_sidebar_load_result(
+                &mut sidebar,
+                &mut hovered,
+                sidebar::DirectoryResult {
+                    generation: current.generation,
+                    request_id: current.request_id,
+                    path: current.path,
+                    entries: Ok(Vec::new()),
+                    truncated: false,
+                },
+            ),
+            SidebarLoadApply::Replaced
+        );
+        assert_eq!(hovered, None, "an accepted replacement retires hover");
+    }
+
+    #[test]
+    fn transactional_navigation_failure_keeps_hover_and_success_commits_once() {
+        let mut sidebar = sidebar::Sidebar::new();
+        let initial = sidebar.set_current_dir(std::path::PathBuf::from("/current"));
+        assert!(sidebar.apply_load(sidebar::DirectoryResult {
+            generation: initial.generation,
+            request_id: initial.request_id,
+            path: initial.path,
+            entries: Ok(Vec::new()),
+            truncated: false,
+        }));
+        let live_hover = (std::path::PathBuf::from("/current/item"), false);
+        let mut hovered = Some(live_hover.clone());
+
+        let failed = sidebar
+            .begin_navigation(std::path::PathBuf::from("/missing"))
+            .expect("candidate navigation");
+        assert_eq!(
+            apply_sidebar_load_result(
+                &mut sidebar,
+                &mut hovered,
+                sidebar::DirectoryResult::failed(
+                    failed,
+                    sidebar::DirectoryError::from_io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "private remote",
+                    )),
+                ),
+            ),
+            SidebarLoadApply::NavigationFailed
+        );
+        assert_eq!(sidebar.current_dir, std::path::Path::new("/current"));
+        assert_eq!(hovered, Some(live_hover));
+
+        let succeeded = sidebar
+            .begin_navigation(std::path::PathBuf::from("/next"))
+            .expect("replacement candidate");
+        assert_eq!(
+            apply_sidebar_load_result(
+                &mut sidebar,
+                &mut hovered,
+                sidebar::DirectoryResult {
+                    generation: succeeded.generation,
+                    request_id: succeeded.request_id,
+                    path: succeeded.path,
+                    entries: Ok(Vec::new()),
+                    truncated: false,
+                },
+            ),
+            SidebarLoadApply::NavigationCommitted
+        );
+        assert_eq!(sidebar.current_dir, std::path::Path::new("/next"));
+        assert_eq!(hovered, None);
+    }
+
+    #[test]
+    fn retired_same_path_load_does_not_clear_the_live_hover_target() {
+        let mut sidebar = sidebar::Sidebar::new();
+        let old = sidebar.set_current_dir(std::path::PathBuf::from("/current"));
+        let current = sidebar.begin_load_root();
+        assert_eq!(old.generation, current.generation);
+        assert!(old.cancellation.is_cancelled());
+        let live_hover = (std::path::PathBuf::from("/current/item"), false);
+        let mut hovered = Some(live_hover.clone());
+
+        assert_eq!(
+            apply_sidebar_load_result(
+                &mut sidebar,
+                &mut hovered,
+                sidebar::DirectoryResult {
+                    generation: old.generation,
+                    request_id: old.request_id,
+                    path: old.path,
+                    entries: Ok(Vec::new()),
+                    truncated: false,
+                },
+            ),
+            SidebarLoadApply::Rejected
+        );
+        assert_eq!(hovered, Some(live_hover));
+
+        assert_eq!(
+            apply_sidebar_load_result(
+                &mut sidebar,
+                &mut hovered,
+                sidebar::DirectoryResult {
+                    generation: current.generation,
+                    request_id: current.request_id,
+                    path: current.path,
+                    entries: Ok(Vec::new()),
+                    truncated: false,
+                },
+            ),
+            SidebarLoadApply::Replaced
+        );
+        assert_eq!(hovered, None);
+    }
+
+    #[test]
+    fn root_reconcile_prunes_removed_path_and_delayed_contexts() {
+        let root =
+            std::env::temp_dir().join(format!("frost-sidebar-context-{}", uuid::Uuid::new_v4()));
+        let kept = root.join("kept");
+        let removed = root.join("removed");
+        std::fs::create_dir_all(&kept).expect("create kept directory");
+        std::fs::create_dir_all(&removed).expect("create removed directory");
+        let mut sidebar = sidebar::Sidebar::new();
+        let initial = sidebar.set_current_dir(root.clone());
+        assert!(sidebar.apply_load(sidebar::load_directory(initial)));
+        let refresh = sidebar.refresh();
+        std::fs::remove_dir_all(&removed).expect("remove stale row");
+
+        let mut selection = vec![kept.clone(), removed.clone()];
+        let mut anchor = Some(removed.clone());
+        let mut hovered = Some((removed.clone(), true));
+        let mut menu = Some(SidebarMenuState {
+            path: removed.clone(),
+            is_dir: true,
+            at: iced::Point::ORIGIN,
+            targets: vec![(removed.clone(), true)],
+            generation: refresh.generation,
+            clipboard_id: None,
+            cursor: 0,
+        });
+        let mut dialog = Some(SidebarDialogState {
+            kind: SidebarDialogKind::Rename,
+            path: removed.clone(),
+            input: "renamed".to_string(),
+            error: None,
+            generation: refresh.generation,
+        });
+        let mut delete_confirm = Some(SidebarDeleteConfirmation {
+            paths: vec![removed.clone()],
+            generation: refresh.generation,
+        });
+        let mut drop_burst = vec![std::path::PathBuf::from("/local/source")];
+        let mut drop_generation = Some(refresh.generation);
+        let mut drop_hint = true;
+
+        assert_eq!(
+            apply_sidebar_load_result(&mut sidebar, &mut hovered, sidebar::load_directory(refresh),),
+            SidebarLoadApply::Reconciled
+        );
+        prune_sidebar_context_after_reconcile(
+            &sidebar,
+            &root,
+            &mut selection,
+            &mut anchor,
+            &mut hovered,
+            &mut menu,
+            &mut dialog,
+            &mut delete_confirm,
+            &mut drop_burst,
+            &mut drop_generation,
+            &mut drop_hint,
+        );
+        assert_eq!(selection, vec![kept.clone()]);
+        assert_eq!(anchor, Some(kept));
+        assert_eq!(hovered, None);
+        assert!(menu.is_none() && dialog.is_none() && delete_confirm.is_none());
+        assert!(drop_burst.is_empty());
+        assert_eq!(drop_generation, None);
+        assert!(!drop_hint);
+
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn directory_reconcile_prunes_only_its_own_subtree() {
+        let root =
+            std::env::temp_dir().join(format!("frost-sidebar-scope-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&source).expect("create source");
+        std::fs::create_dir_all(&destination).expect("create destination");
+        let mut sidebar = sidebar::Sidebar::new();
+        let initial = sidebar.set_current_dir(root.clone());
+        assert!(sidebar.apply_load(sidebar::load_directory(initial)));
+
+        // This is the selection path after a cross-parent rename remap, before
+        // the destination parent's refresh has returned.
+        let remapped = destination.join("moved.txt");
+        let mut selection = vec![remapped.clone()];
+        let mut anchor = Some(remapped.clone());
+        let mut hovered = None;
+        let mut menu = None;
+        let mut dialog = None;
+        let mut delete_confirm = None;
+        let mut drop_burst = Vec::new();
+        let mut drop_generation = Some(sidebar.generation());
+        let mut drop_hint = false;
+        prune_sidebar_context_after_reconcile(
+            &sidebar,
+            &source,
+            &mut selection,

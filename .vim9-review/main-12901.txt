@@ -1,0 +1,300 @@
+                state.select_last();
+                return Some(self.block_search_snap_task());
+            }
+            Key::Named(Named::PageUp) => {
+                state.select_page(false);
+                return Some(self.block_search_snap_task());
+            }
+            Key::Named(Named::PageDown) => {
+                state.select_page(true);
+                return Some(self.block_search_snap_task());
+            }
+            Key::Named(Named::Backspace) => {
+                state.query.pop();
+                self.block_search_recompute();
+                return Some(self.block_search_snap_task());
+            }
+            // Tab walks the filter chips; the overlay owns every key while it
+            // is open, so without this they are mouse-only. Shift is checked
+            // first so Shift+Tab cannot fall through to the forward arm.
+            Key::Named(Named::Tab) => {
+                state.filter = state.filter.cycled(!mods.shift());
+                self.block_search_recompute();
+                return Some(self.block_search_snap_task());
+            }
+            // Same chords the find bar uses (Alt is the JWM window-manager
+            // modifier, so it stays clear here too).
+            Key::Character(c) if mods.control() => {
+                match c.chars().next().map(|c| c.to_ascii_lowercase()) {
+                    Some('r') => {
+                        state.regex = !state.regex;
+                        self.block_search_recompute();
+                        return Some(self.block_search_snap_task());
+                    }
+                    Some('i') => {
+                        state.case_sensitive = !state.case_sensitive;
+                        self.block_search_recompute();
+                        return Some(self.block_search_snap_task());
+                    }
+                    Some('w') => {
+                        state.whole_word = !state.whole_word;
+                        self.block_search_recompute();
+                        return Some(self.block_search_snap_task());
+                    }
+                    Some('o') => {
+                        state.scope = state.scope.cycled();
+                        self.block_search_recompute();
+                        return Some(self.block_search_snap_task());
+                    }
+                    Some('u') => {
+                        if mods.shift() {
+                            state.reset_intent();
+                        } else {
+                            state.query.clear();
+                        }
+                        self.block_search_recompute();
+                        return Some(self.block_search_snap_task());
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        if !mods.control() && !mods.alt() {
+            if let Some(t) = text {
+                let printable: String = t.chars().filter(|c| !c.is_control()).collect();
+                if !printable.is_empty() {
+                    state.query.push_str(&printable);
+                    state.query =
+                        block_mode::bounded_block_search_query(std::mem::take(&mut state.query));
+                    self.block_search_recompute();
+                    return Some(self.block_search_snap_task());
+                }
+            }
+        }
+        // Swallow all other keys while the overlay owns the keyboard.
+        Some(Task::none())
+    }
+
+    /// Paste-to-prompt: queue `text` into the active pane with the same framing,
+    /// input-queue bounds and rejection toast as a clipboard paste, and never
+    /// append Enter — the user still submits explicitly. The text is appended
+    /// to the pending line; command recall goes through
+    /// [`Self::recall_into_active_pane`] instead.
+    fn type_into_active_pane(&mut self, text: String) -> Task<Message> {
+        let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
+            return Task::none();
+        };
+        Task::done(Message::PromptInsert(id, text))
+    }
+
+    /// History recall: replace the prompt's pending line with `command`. Still
+    /// never appends Enter — the user submits explicitly.
+    fn recall_into_active_pane(&mut self, command: String) -> Task<Message> {
+        // Claim any held Enter before asynchronous prompt revalidation, not
+        // only after a successful write or a keyboard-based confirmation.
+        self.native_enter_ownership.lock().claim_pressed();
+        self.prompt_recall_enter_latch.begin_recall();
+        let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
+            return Task::none();
+        };
+        Task::done(Message::PromptRecall(id, command))
+    }
+
+    /// Re-check prompt ownership at the final PTY-write boundary. A recall is
+    /// delivered through `Task::done`, so the prompt that was safe when the
+    /// task was created may have received input or entered a foreground app by
+    /// the next update.
+    fn session_prompt_replace_ready(&mut self, id: usize) -> Result<(), &'static str> {
+        let sess = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == id)
+            .ok_or("the terminal session is no longer available")?;
+        if sess.terminal.is_alt_buffer_active() {
+            return Err("a full-screen program is active");
+        }
+        match block_prompt_replace_blocker(sess.agent_prompt_status()) {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
+    }
+
+    /// Encode one payload for session `id` and queue it on that PTY.
+    ///
+    /// The single choke point for everything this app writes as a *payload*
+    /// rather than a keystroke, and it goes through `pty_input` because that
+    /// unconditionally removes `ESC[200~`/`ESC[201~` from the body.
+    /// The local encoder this replaced framed the clipboard verbatim, so a
+    /// payload carrying its own `ESC[201~` closed the frame early and the shell
+    /// read the remainder as typed lines and ran them. Do not add a second path
+    /// that frames a payload without coming through here.
+    ///
+    /// `clear_line_first` prefixes a `Ctrl+U`; with it `false` this is exactly
+    /// `encode_paste`. True for command recall, false for pastes and appends.
+    fn write_paste_to_session(
+        &mut self,
+        id: usize,
+        text: &str,
+        policy: PastePolicy,
+        clear_line_first: bool,
+    ) -> paste_feedback::PasteOutcome {
+        if clear_line_first {
+            self.native_enter_ownership.lock().claim_pressed();
+            self.prompt_recall_enter_latch.begin_recall();
+        }
+        // Clipboard completion may arrive after its target lost focus or closed.
+        // A refused attempt on the current input owner still dismisses attention.
+        self.organism.retreat_for_input_attempt(
+            id,
+            self.sessions.get(self.active).map(|session| session.id),
+            self.focused && self.terminal_input_active(),
+        );
+        let mut outcome = paste_feedback::PasteOutcome::Empty;
+        let mut dead_input = false;
+        if let Some(sess) = self.sessions.iter_mut().find(|session| session.id == id) {
+            if sess.transcript_read_only() {
+                // Held-open task transcript: pasting is a visible no-op.
+                dead_input = true;
+            } else {
+                let modes = PasteModes {
+                    bracketed: sess.terminal.is_bracketed_paste_enabled(),
+                };
+                outcome = paste_feedback::encode_and_write(
+                    text,
+                    modes,
+                    policy,
+                    clear_line_first,
+                    |bytes| {
+                        // Check encoded bytes after framing and control stripping.
+                        if !sess.can_queue_user_bytes(bytes.len()) {
+                            return false;
+                        }
+                        // Preserve the same selection, scrolling and refresh effects.
+                        sess.block_selection.clear();
+                        sess.terminal.scroll_to_bottom();
+                        sess.projection_view_state.scroll_to_bottom();
+                        let written = sess.write_pty(bytes);
+                        sess.refresh();
+                        written
+                    },
+                );
+            }
+        }
+        if dead_input {
+            self.hint_read_only_transcript();
+            return outcome;
+        }
+        let written = outcome.written();
+        if written
+            && self.organism.is_local(id)
+            && self.sessions.get(self.active).is_some_and(|s| {
+                s.id == id
+                    && !s.managed_remote
+                    && !matches!(s.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
+            })
+        {
+            self.organism.accepted_input();
+        }
+        if outcome == paste_feedback::PasteOutcome::Rejected {
+            self.push_toast(
+                "Paste rejected: terminal input queue is full",
+                ToastKind::Warning,
+            );
+        }
+        if let Some(message) = outcome.feedback() {
+            self.push_toast(message, ToastKind::Info);
+        }
+        outcome
+    }
+
+    /// History picker key handling. Mirrors `handle_tab_switcher_key`: typed
+    /// text filters, arrows move the selection, Enter types the highlighted
+    /// command into the active pane's prompt, Esc/Ctrl+Shift+H dismisses.
+    fn handle_history_picker_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+        text: Option<&str>,
+    ) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        if chrome_shortcut(key, mods) == Some(ChromeShortcut::HistoryPicker) {
+            self.history_picker = None;
+            return Some(Task::none());
+        }
+        let state = self.history_picker.as_mut()?;
+        if mods == keyboard::Modifiers::CTRL {
+            if let Key::Character(character) = key {
+                let action = match character.to_ascii_lowercase().as_str() {
+                    "d" => Some(history_picker::HistoryFilterAction::ToggleDirectory),
+                    "o" => Some(history_picker::HistoryFilterAction::SetStatus(
+                        state.status().next(),
+                    )),
+                    "u" => Some(history_picker::HistoryFilterAction::ToggleUnique),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    state.apply_filter(action);
+                    return Some(self.history_picker_snap_task());
+                }
+            }
+        }
+        match key {
+            Key::Named(Named::Escape) => {
+                self.history_picker = None;
+                return Some(Task::none());
+            }
+            Key::Named(Named::Enter) => {
+                let command = state.selected_command();
+                self.history_picker = None;
+                return Some(match command {
+                    Some(command) => self.recall_into_active_pane(command),
+                    None => Task::none(),
+                });
+            }
+            Key::Named(Named::ArrowDown) => {
+                state.select_next();
+                return Some(self.history_picker_snap_task());
+            }
+            Key::Named(Named::ArrowUp) => {
+                state.select_prev();
+                return Some(self.history_picker_snap_task());
+            }
+            Key::Named(Named::Backspace) => {
+                state.backspace();
+                return Some(self.history_picker_snap_task());
+            }
+            _ => {}
+        }
+        if !mods.control() && !mods.alt() {
+            if let Some(t) = text {
+                if state.push_query_text(t) {
+                    return Some(self.history_picker_snap_task());
+                }
+            }
+        }
+        // Swallow all other keys while the overlay owns the keyboard.
+        Some(Task::none())
+    }
+
+    fn history_picker_snap_task(&self) -> Task<Message> {
+        let Some(state) = self.history_picker.as_ref() else {
+            return Task::none();
+        };
+        let len = state.filtered().len();
+        let y = if len <= 1 {
+            0.0
+        } else {
+            state.selected.min(len - 1) as f32 / (len - 1) as f32
+        };
+        iced::widget::operation::snap_to(
+            HISTORY_PICKER_LIST_ID.clone(),
+            iced::widget::operation::RelativeOffset { x: 0.0, y },
+        )
+    }
+
+    /// Open the workflow picker over the current search path
+    /// (`~/.config/frost/workflows/`, `FROST_WORKFLOW_DIR`, XDG data dirs,
+    /// then the bundled examples). Shared by Ctrl+Shift+M and the command
+    /// palette so both entry points behave identically. The load is bounded

@@ -1,0 +1,300 @@
+        assert_eq!(
+            session_label("codex".to_string(), true),
+            format!("codex{READ_ONLY_LABEL_SUFFIX}")
+        );
+        assert_eq!(session_label("codex".to_string(), false), "codex");
+    }
+
+    #[test]
+    fn block_key_ownership_preserves_running_program_input() {
+        assert!(block_selection_owns_keys(true, true, false, false));
+        assert!(!block_selection_owns_keys(true, true, false, true));
+        assert!(!block_selection_owns_keys(true, true, true, false));
+        assert!(!block_selection_owns_keys(false, true, false, false));
+
+        // Escape is local only while an idle primary-screen block selection is
+        // visible; running and alternate-screen programs retain ESC.
+        assert!(block_escape_owns_key(true, true, false, false, true));
+        assert!(!block_escape_owns_key(true, false, false, false, true));
+        assert!(!block_escape_owns_key(true, true, false, false, false));
+        assert!(!block_escape_owns_key(true, true, false, true, true));
+        assert!(!block_escape_owns_key(true, true, true, false, true));
+    }
+
+    #[test]
+    fn terminal_mouse_routing_prefers_finished_history_over_live_app_mode() {
+        // Primary-screen app reporting owns its live surface.
+        assert!(app_owns_terminal_mouse(true, false, true, false));
+        // Finished or pre-zone scrollback, padding and scrollbar strips all
+        // arrive ineligible and cannot be inferred from `!finalized`.
+        assert!(!app_owns_terminal_mouse(true, false, false, false));
+        // Shift and Ctrl+link remain local overrides on the live surface too.
+        assert!(!app_owns_terminal_mouse(true, true, true, false));
+        assert!(!app_owns_terminal_mouse(true, false, true, true));
+        assert!(!app_owns_terminal_mouse(false, false, true, false));
+
+        assert!(app_owns_terminal_wheel(true, false, true));
+        assert!(!app_owns_terminal_wheel(true, false, false));
+        assert!(!app_owns_terminal_wheel(true, true, true));
+        assert!(!app_owns_terminal_wheel(false, false, true));
+
+        assert!(!app_mouse_uses_full_grid(true, false, true));
+        assert!(app_mouse_uses_full_grid(true, false, false));
+        assert!(app_mouse_uses_full_grid(true, true, true));
+        assert!(app_mouse_uses_full_grid(false, false, true));
+    }
+
+    #[test]
+    fn projected_prompt_navigation_chooses_the_nearest_strict_boundary() {
+        let prompts = [2, 8, 15, 23];
+        assert_eq!(prompt_jump_target(prompts.into_iter(), 15, true), Some(8));
+        assert_eq!(prompt_jump_target(prompts.into_iter(), 15, false), Some(23));
+        assert_eq!(prompt_jump_target(prompts.into_iter(), 2, true), None);
+        assert_eq!(prompt_jump_target(prompts.into_iter(), 23, false), None);
+    }
+
+    mod find_reveal_keyboard {
+        include!("find_reveal_tests.rs");
+    }
+
+    struct SearchRevealFixture {
+        terminal: terminal::TerminalState,
+        policy: terminal::ProjectionPolicy,
+        view_state: terminal::ProjectionViewState,
+        projection: std::sync::Arc<terminal::ProjectedViewport>,
+        search: search::SearchState,
+        target: SearchRevealTarget,
+        other_zone: u64,
+    }
+
+    fn search_reveal_fixture() -> SearchRevealFixture {
+        let mut terminal = terminal::TerminalState::new(40, 10);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07first\r\n\x1b]133;C\x07needle\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07second\r\n\x1b]133;C\x07other needle\r\n\x1b]133;D;0\x07",
+        );
+        let ids: Vec<_> = terminal.command_zones.iter().map(|zone| zone.id).collect();
+        assert_eq!(ids.len(), 2);
+        let mut policy = terminal::ProjectionPolicy::new();
+        assert!(policy.collapse(ids[0]));
+        assert!(policy.collapse(ids[1]));
+        let mut view_state = terminal::ProjectionViewState::default();
+        let projection = terminal.get_projected_viewport_with_state(true, &policy, &mut view_state);
+        let mut search = search::SearchState::new();
+        search.toggle();
+        search.set_query("needle");
+        search.refresh_matches(terminal.search_lines(), 7);
+        assert_eq!(search.matches.len(), 2);
+        let target = search_reveal_target(&search, false, 7, &terminal, &projection, &policy)
+            .expect("hidden result exposes its reveal control");
+        assert_eq!(target.zone_id, ids[0]);
+        SearchRevealFixture {
+            terminal,
+            policy,
+            view_state,
+            projection,
+            search,
+            target,
+            other_zone: ids[1],
+        }
+    }
+
+    #[test]
+    fn search_reveal_expands_only_the_matching_block_and_locates_real_output() {
+        let mut fixture = search_reveal_fixture();
+        let raw = fixture.terminal.grid.to_vec();
+        assert!(apply_search_reveal(
+            &fixture.target,
+            &fixture.search,
+            false,
+            7,
+            &fixture.terminal,
+            &fixture.projection,
+            &mut fixture.policy
+        ));
+        assert!(!fixture.policy.is_collapsed(fixture.target.zone_id));
+        assert!(fixture.policy.is_collapsed(fixture.other_zone));
+        assert_eq!(
+            fixture.terminal.grid.to_vec(),
+            raw,
+            "reveal only changes presentation"
+        );
+        assert!(fixture.terminal.reveal_raw_cell_in_projection(
+            &fixture.policy,
+            &mut fixture.view_state,
+            fixture.target.origin
+        ));
+        let revealed = fixture.terminal.get_projected_viewport_with_state(
+            true,
+            &fixture.policy,
+            &mut fixture.view_state,
+        );
+        assert!(matches!(
+            fixture
+                .terminal
+                .locate_raw_cell_in_projection(&revealed, fixture.target.origin),
+            terminal::ProjectedRawCellLocation::Visible(_)
+        ));
+    }
+
+    #[test]
+    fn search_reveal_declines_stale_query_owner_match_and_projection() {
+        for stale in [
+            "query",
+            "session",
+            "selection",
+            "lost_match",
+            "mode",
+            "case",
+            "closed",
+            "dirty",
+            "policy",
+            "output",
+        ] {
+            let mut fixture = search_reveal_fixture();
+            let mut session_id = 7;
+            let mut dirty = false;
+            match stale {
+                "query" => fixture.search.set_query("changed"),
+                "session" => session_id = 8,
+                "selection" => fixture.search.current_match_index = 1,
+                "lost_match" => fixture.search.matches.clear(),
+                "mode" => fixture.search.use_regex = true,
+                "case" => fixture.search.case_sensitive = true,
+                "closed" => fixture.search.close(),
+                "dirty" => dirty = true,
+                "policy" => {
+                    fixture.policy.expand(fixture.other_zone);
+                }
+                "output" => {
+                    fixture.terminal.process_input(b"\x1b[2;1H\x1b[2Kgone");
+                }
+                _ => unreachable!(),
+            }
+            let revision = fixture.policy.revision();
+            assert!(
+                !apply_search_reveal(
+                    &fixture.target,
+                    &fixture.search,
+                    dirty,
+                    session_id,
+                    &fixture.terminal,
+                    &fixture.projection,
+                    &mut fixture.policy
+                ),
+                "{stale}"
+            );
+            assert!(
+                fixture.policy.is_collapsed(fixture.target.zone_id),
+                "{stale}"
+            );
+            assert_eq!(
+                fixture.policy.revision(),
+                revision,
+                "rejected {stale} click mutates nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn search_reveal_control_only_exists_for_a_current_hidden_match() {
+        let mut fixture = search_reveal_fixture();
+        assert!(search_reveal_target(
+            &fixture.search,
+            false,
+            7,
+            &fixture.terminal,
+            &fixture.projection,
+            &fixture.policy
+        )
+        .is_some());
+        assert!(search_reveal_target(
+            &fixture.search,
+            true,
+            7,
+            &fixture.terminal,
+            &fixture.projection,
+            &fixture.policy
+        )
+        .is_none());
+        fixture.policy.expand(fixture.target.zone_id);
+        fixture.projection = fixture.terminal.get_projected_viewport_with_state(
+            true,
+            &fixture.policy,
+            &mut fixture.view_state,
+        );
+        assert!(
+            search_reveal_target(
+                &fixture.search,
+                false,
+                7,
+                &fixture.terminal,
+                &fixture.projection,
+                &fixture.policy
+            )
+            .is_none(),
+            "visible results have no reveal control"
+        );
+        fixture.search.matches.clear();
+        assert!(search_reveal_target(
+            &fixture.search,
+            false,
+            7,
+            &fixture.terminal,
+            &fixture.projection,
+            &fixture.policy
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn search_reveal_control_is_absent_when_chat_keeps_the_output_visible() {
+        let mut fixture = search_reveal_fixture();
+        fixture
+            .terminal
+            .process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        fixture.policy.set_chat(true);
+        let projection = fixture.terminal.get_projected_viewport_with_state(
+            true,
+            &fixture.policy,
+            &mut fixture.view_state,
+        );
+        assert!(!matches!(
+            fixture
+                .terminal
+                .locate_raw_cell_in_projection(&projection, fixture.target.origin),
+            terminal::ProjectedRawCellLocation::Hidden { .. }
+        ));
+        assert!(search_reveal_target(
+            &fixture.search,
+            false,
+            7,
+            &fixture.terminal,
+            &projection,
+            &fixture.policy
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn search_matches_use_exact_projected_origins_and_fail_closed() {
+        let mut terminal = terminal::TerminalState::new(4, 3);
+        let mut raw = vec![terminal::TerminalCell::default(); 8];
+        for (cell, ch) in raw.iter_mut().zip("abcdef".chars()) {
+            cell.character = ch;
+        }
+        terminal
+            .scrollback
+            .push_back(terminal::ScrollbackLine::compress(&raw, false));
+        terminal.set_scroll_offset(1);
+        let projection = terminal.get_projected_viewport(true);
+
+        assert_eq!(
+            project_search_match(
+                &terminal,
+                &projection,
+                &search::SearchMatch {
+                    line: 0,
+                    col_start: 4,
+                    col_end: 6,
+                },
+            ),

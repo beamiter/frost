@@ -1,0 +1,300 @@
+                                self.organism.accepted_input();
+                            }
+                            sess.refresh();
+                        }
+                    }
+                    if dead_input {
+                        self.hint_read_only_transcript();
+                    }
+                }
+            }
+            Message::ImeCancelledCommit => self.terminal_ime.retire_cancelled_commit(),
+            Message::Ime(event) => {
+                use iced::advanced::input_method::Event as Ime;
+                let ime_admitted = self.terminal_ime.admit(&event);
+                if !self.terminal_input_active() || !ime_admitted {
+                    return Task::none();
+                }
+                let mut dead_input = false;
+                let Some(sess) = self.sessions.get_mut(self.active) else {
+                    return Task::none();
+                };
+                if !sess.transcript_read_only()
+                    && matches!(&event, Ime::Preedit(..) | Ime::Commit(_))
+                {
+                    self.organism.retreat();
+                }
+                match event {
+                    Ime::Opened => {
+                        sess.terminal.ime_enabled = true;
+                    }
+                    Ime::Closed => {
+                        sess.terminal.ime_enabled = false;
+                        sess.terminal.clear_preedit();
+                        sess.refresh();
+                    }
+                    Ime::Preedit(content, selection) => {
+                        if !sess.transcript_read_only()
+                            && !sess.managed_remote
+                            && self.organism.is_local(sess.id)
+                            && !matches!(
+                                sess.fg_proc_cache.as_deref(),
+                                Some("ssh" | "mosh" | "telnet")
+                            )
+                        {
+                            self.organism.accepted_input();
+                        }
+                        sess.terminal.set_preedit(content, selection);
+                        sess.refresh();
+                    }
+                    Ime::Commit(text) => {
+                        sess.terminal.clear_preedit();
+                        if sess.transcript_read_only() {
+                            // Same read-only rule as typed keys.
+                            dead_input = true;
+                        } else {
+                            // PTY-bound input dismisses the block selection, same
+                            // as `encode_key` and the paste paths.
+                            sess.block_selection.clear();
+                            sess.terminal.scroll_to_bottom();
+                            sess.projection_view_state.scroll_to_bottom();
+                            if sess.write_pty(text.as_bytes())
+                                && !sess.managed_remote
+                                && self.organism.is_local(sess.id)
+                                && !matches!(
+                                    sess.fg_proc_cache.as_deref(),
+                                    Some("ssh" | "mosh" | "telnet")
+                                )
+                            {
+                                self.organism.accepted_input();
+                            }
+                        }
+                        sess.refresh();
+                    }
+                }
+                if dead_input {
+                    self.hint_read_only_transcript();
+                }
+            }
+            Message::ModifiersChanged(mods) => {
+                self.modifiers = mods;
+                if !mods.control() {
+                    self.font_wheel.clear();
+                }
+            }
+            Message::FontWheel(group, delta) => {
+                // A modal may have opened after this event was queued.
+                if !self.font_zoom_enabled() {
+                    self.font_wheel.clear();
+                    return Task::none();
+                }
+                let (y, pixels) = match delta {
+                    iced::mouse::ScrollDelta::Lines { y, .. } => (y, false),
+                    iced::mouse::ScrollDelta::Pixels { y, .. } => (y, true),
+                };
+                let steps = self.font_wheel.steps(group, y, pixels);
+                if steps != 0.0 {
+                    match group {
+                        font_zoom::Group::Content => self.adjust_font_size(steps),
+                        font_zoom::Group::Chrome => {
+                            self.set_chrome_font_size(self.chrome_font_size() + steps);
+                        }
+                    }
+                }
+            }
+            Message::SummaryActivate(session_id, activation) => {
+                if !self.terminal_mouse_active() {
+                    return Task::none();
+                }
+                return self.handle_summary_activation(session_id, activation);
+            }
+            Message::MousePane(session_id, input) => {
+                if matches!(input, MouseInput::Press { .. }) {
+                    self.sidebar_files_focused = false;
+                }
+                if !self.terminal_mouse_active() {
+                    // Only an app-owned release may cross modal ownership, and
+                    // it still goes to its stable origin pane below. A local or
+                    // consumed release merely closes bookkeeping: executing a
+                    // hidden click-to-caret/copy after a context menu opened
+                    // would mutate the prompt or clipboard behind the overlay.
+                    let MouseInput::Release { button, .. } = input else {
+                        return Task::none();
+                    };
+                    let slot = button.slot();
+                    match overlay_release_disposition(
+                        self.terminal_mouse_gestures[slot],
+                        session_id,
+                        button,
+                    ) {
+                        OverlayReleaseDisposition::Reject => return Task::none(),
+                        OverlayReleaseDisposition::ClearOnly => {
+                            self.terminal_mouse_gestures[slot] = None;
+                            if button == MouseButton::Left {
+                                self.click_tracker.cancel();
+                            }
+                            return Task::none();
+                        }
+                        OverlayReleaseDisposition::DispatchApp => {}
+                    }
+                }
+                // Only a press switches the focused pane. Release/Drag aren't
+                // bounds-gated in the widget, so every pane emits them — letting
+                // those move focus would let the wrong pane steal it on release.
+                if matches!(input, MouseInput::Press { .. }) {
+                    let Some(session) = self.session_index_by_id(session_id) else {
+                        return Task::none();
+                    };
+                    if !self.layout().contains_session(session) {
+                        return Task::none();
+                    }
+                    self.set_focus(session);
+                    self.session_dirty = true;
+                    self.refresh_active_context();
+                }
+                self.organism.retreat();
+                if self.sessions.get(self.active).is_some_and(|s| {
+                    s.id == session_id
+                        && !s.managed_remote
+                        && !s.transcript_read_only()
+                        && self.organism.is_local(s.id)
+                        && !matches!(s.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
+                }) {
+                    self.organism.accepted_input();
+                }
+                return self.handle_mouse(session_id, input);
+            }
+            Message::ImageDropped(path) => {
+                if !self.terminal_input_active() {
+                    self.push_toast(
+                        "Image drop ignored while another panel owns input",
+                        ToastKind::Info,
+                    );
+                    return Task::none();
+                }
+                match image_drop::prompt_payload(&[path]) {
+                    Ok(payload) => {
+                        let Some(id) = self.sessions.get(self.active).map(|session| session.id)
+                        else {
+                            return Task::none();
+                        };
+                        return Task::done(Message::PromptInsert(id, payload));
+                    }
+                    Err(error) => {
+                        self.push_toast(format!("Image drop rejected: {error}"), ToastKind::Warning)
+                    }
+                }
+            }
+            Message::Pasted(id, Some(text)) => {
+                match crate::review_text::sanitize_prompt_payload(
+                    &text,
+                    MAX_PTY_WRITE_QUEUE_BYTES,
+                ) {
+                    Ok(text) => {
+                        self.write_paste_to_session(
+                            id,
+                            &text,
+                            PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+                            false,
+                        );
+                    }
+                    Err(error) => self.push_toast(
+                        format!(
+                            "Paste rejected: this build has no safe Unicode-risk confirmation ({error})"
+                        ),
+                        ToastKind::Warning,
+                    ),
+                }
+            }
+            Message::Pasted(_, None) => {}
+            Message::PromptInsert(id, text) => {
+                match crate::review_text::sanitize_prompt_payload(
+                    &text,
+                    crate::review_text::MAX_PROMPT_INSERT_BYTES,
+                ) {
+                    Ok(text) => {
+                        self.write_paste_to_session(
+                            id,
+                            &text,
+                            PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+                            false,
+                        );
+                    }
+                    Err(error) => self.push_toast(
+                        format!("Prompt insertion rejected: {error}"),
+                        ToastKind::Warning,
+                    ),
+                }
+            }
+            Message::PromptRecall(id, command) => {
+                // Recall replays a row the history picker showed, so it must
+                // accept everything that picker accepts.
+                match crate::review_text::sanitize_untrusted_single_line(
+                    &command,
+                    crate::history_picker::MAX_SHARED_HISTORY_COMMAND_BYTES,
+                ) {
+                    Ok(command) => {
+                        if let Err(reason) = self.session_prompt_replace_ready(id) {
+                            self.push_toast(
+                                format!("History recall rejected: {reason}"),
+                                ToastKind::Warning,
+                            );
+                            return Task::none();
+                        }
+                        self.write_paste_to_session(
+                            id,
+                            &command,
+                            PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+                            true,
+                        );
+                    }
+                    Err(error) => self.push_toast(
+                        format!("History recall rejected: {error}"),
+                        ToastKind::Warning,
+                    ),
+                }
+            }
+            Message::Resized(size) => {
+                let search_was_compact = block_search_layout::compact(
+                    block_search_layout::panel_size(self.win_size),
+                    self.effective_font_size(),
+                );
+                self.win_size = size;
+                self.sync_organism_geometry();
+                let term_h = self.term_height();
+                let term_w = (self.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
+                let (cols, rows) = self.metrics.grid_size(term_w, term_h);
+                if cols != self.cols || rows != self.rows {
+                    self.cols = cols;
+                    self.rows = rows;
+                    // Apply either full-tab or pane dimensions exactly once.
+                    self.relayout();
+                    self.refresh_active_context();
+                }
+                if self.block_search.is_some()
+                    && (search_was_compact
+                        || block_search_layout::compact(
+                            block_search_layout::panel_size(size),
+                            self.effective_font_size(),
+                        ))
+                {
+                    self.recompute_links();
+                    self.refresh_kitty_handles();
+                    return self.block_search_snap_task();
+                }
+            }
+            Message::Focus(f) => {
+                if !f {
+                    self.font_wheel.clear();
+                    self.remote_host_editor.retire();
+                    self.organism_pointer_buttons.clear();
+                    self.cancel_layout_drags();
+                    self.hovered_tab = None;
+                    for gesture in retire_terminal_mouse_gestures(
+                        &mut self.terminal_mouse_gestures,
+                        &mut self.click_tracker,
+                    ) {
+                        self.finish_cancelled_terminal_mouse_gesture(gesture);
+                    }
+                    if let Some(state) = self.block_search.as_mut() {
+                        state.bookmark_key_held = false;

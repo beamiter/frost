@@ -1,0 +1,300 @@
+                // of misclassifying our own write as an external conflict.
+                if let Some(revision) = error.committed_revision().cloned() {
+                    self.before_clipboard_permission_change(candidate.allow_clipboard_read);
+                    self.config = candidate;
+                    self.config_revision = Some(revision);
+                    self.config_dirty = true;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn block_config_writes(&mut self, diagnostic: String) {
+        let changed = self.config_diagnostic.as_deref() != Some(diagnostic.as_str());
+        self.config_write_blocked = true;
+        self.config_diagnostic = Some(crate::review_text::bound_diagnostic_text(diagnostic));
+        if changed {
+            self.push_toast(
+                "Config changed or became unreadable; keeping last-known-good values",
+                ToastKind::Warning,
+            );
+        }
+    }
+
+    fn note_config_save_error(&mut self, error: &persistence::AtomicWriteError) {
+        // Display text excludes revision bytes; retain only a bounded key.
+        // Categories stay distinct even if two errors have the same wording.
+        let key = format!(
+            "{:?}:{}",
+            std::mem::discriminant(error),
+            crate::review_text::bound_diagnostic_text(error.to_string()),
+        );
+        if self
+            .config_save_retry
+            .failed(std::time::Instant::now(), key)
+        {
+            eprintln!("[Config] Save failed: {error}");
+        }
+        if error.blocks_automatic_writes() {
+            self.block_config_writes(error.to_string());
+        }
+    }
+
+    fn persist_live_config(&mut self) {
+        if !self.config_dirty || self.config_write_blocked {
+            return;
+        }
+        if !self.config_save_retry.ready(std::time::Instant::now()) {
+            return;
+        }
+        if let Err(error) = self.save_config_checked() {
+            self.note_config_save_error(&error);
+        }
+    }
+
+    /// Observe external edits before attempting auto-save. Exact content
+    /// revisions detect changes even on filesystems with coarse mtimes. Dirty
+    /// local state is never merged or overwritten silently: it stays live and
+    /// writes are blocked until the user explicitly resets/resolves it.
+    fn reload_config_if_changed(&mut self) -> Option<sidebar::DirectoryRequest> {
+        let disk_revision = match Config::config_revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                self.block_config_writes(error);
+                return None;
+            }
+        };
+        let changed = self.config_revision.as_ref() != Some(&disk_revision);
+        if !changed && !self.config_write_blocked {
+            return None;
+        }
+        if self.config_dirty {
+            if changed {
+                self.config_revision = Some(disk_revision);
+                self.block_config_writes(
+                    "Config changed outside this window while local edits were pending; Reset explicitly before overwriting it"
+                        .to_string(),
+                );
+            }
+            return None;
+        }
+        // Preserve the panel's stable editing surface. With no local dirty
+        // state there is nothing to save, so deferring the reload is safe.
+        if self.config_panel_open {
+            return None;
+        }
+
+        let path = match Config::config_path() {
+            Ok(path) => path,
+            Err(error) => {
+                self.block_config_writes(error.to_string());
+                return None;
+            }
+        };
+        self.config_revision = Some(disk_revision.clone());
+        match Config::from_revision(&path, &disk_revision) {
+            Ok(config) => {
+                let recovered = self.config_diagnostic.take().is_some();
+                let old_scale = self.scale_factor();
+                if self.config.experimental_task_sidebar != config.experimental_task_sidebar {
+                    self.task_panel.retire_panel_callbacks();
+                }
+                self.prepare_organism_motion_config(config.ascii_organism_motion);
+                self.remote_host_editor.retire();
+                self.before_clipboard_permission_change(config.allow_clipboard_read);
+                self.config = config;
+                self.win_size =
+                    logical_viewport_after_scale(self.win_size, old_scale, self.scale_factor());
+                self.ai_temperature_draft = self
+                    .config
+                    .ai_temperature
+                    .map(|temperature| temperature.to_string())
+                    .unwrap_or_default();
+                self.config_dirty = false;
+                self.config_save_retry.reset();
+                self.config_write_blocked = false;
+                self.sync_tab_position_ui();
+                self.apply_config();
+                let sidebar_request = self.reconcile_sidebar_remote_hosts();
+                if recovered {
+                    self.push_toast("Config fixed and reloaded", ToastKind::Success);
+                }
+                sidebar_request
+            }
+            Err(error) => {
+                self.block_config_writes(error);
+                None
+            }
+        }
+    }
+
+    /// Whether the left dock is shown. Follows the manual `sidebar_open` toggle
+    /// in both tab-position modes, so the dock can always be collapsed.
+    fn dock_open(&self) -> bool {
+        self.sidebar_open
+    }
+
+    /// Whether the terminal itself owns text/IME input. Every overlay with an
+    /// editable field or modal action takes ownership until it closes.
+    fn sync_terminal_ime_owner(&mut self) {
+        let owner = (self.focused && self.terminal_input_active())
+            .then(|| {
+                self.sessions
+                    .get(self.active)
+                    .map(|session| terminal_ime::Owner {
+                        session: session.id,
+                        instance: Arc::clone(&session.ime_identity),
+                    })
+            })
+            .flatten();
+        if self.terminal_ime.sync(owner) {
+            for session in &mut self.sessions {
+                session.terminal.clear_preedit();
+                session.refresh();
+            }
+        }
+    }
+
+    fn terminal_input_active(&self) -> bool {
+        !self.search.is_open
+            && !self.search_replace.is_open
+            && !self.palette.is_open
+            && !self.ai_chats.is_open
+            && self.ai_ask.is_none()
+            && !self.config_panel_open
+            && !self.help_open
+            && !self.debug_open
+            && self.tab_menu.is_none()
+            && self.tab_switcher.is_none()
+            && self.history_picker.is_none()
+            && self.workflow_overlay.is_none()
+            && self.block_search.is_none()
+            && self.block_menu.is_none()
+            && self.block_review.is_none()
+            && self.block_clear_confirm.is_none()
+            && self.remote_picker.is_none()
+            && self.tab_close_confirm.is_none()
+            && self.sidebar_menu.is_none()
+            && self.sidebar_dialog.is_none()
+            && self.sidebar_delete_confirm.is_none()
+            && !self.sidebar_files_focused
+    }
+
+    fn chat_input_ready(&self, session_id: usize) -> bool {
+        self.config.is_chat_mode()
+            && self.focused
+            && self.terminal_input_active()
+            && self
+                .sessions
+                .get(self.active)
+                .is_some_and(|session| session.id == session_id)
+            && self.layout().contains_session(self.active)
+            && self.prompt_recall_enter_latch.pressed == 0
+            && self.prompt_recall_enter_latch.owned == 0
+            && !self.history_reflow_sessions.contains(&session_id)
+    }
+
+    /// Search is intentionally non-modal for scrolling/selection. The remaining
+    /// overlays block pointer actions from reaching panes underneath them.
+    fn terminal_mouse_active(&self) -> bool {
+        !self.search_replace.is_open
+            && !self.palette.is_open
+            && !self.ai_chats.is_open
+            && self.ai_ask.is_none()
+            && !self.config_panel_open
+            && !self.help_open
+            && !self.debug_open
+            && self.tab_menu.is_none()
+            && self.tab_switcher.is_none()
+            && self.history_picker.is_none()
+            && self.workflow_overlay.is_none()
+            && self.block_search.is_none()
+            && self.block_menu.is_none()
+            && self.block_review.is_none()
+            && self.block_clear_confirm.is_none()
+            && self.remote_picker.is_none()
+            && self.tab_close_confirm.is_none()
+            && self.sidebar_menu.is_none()
+            && self.sidebar_dialog.is_none()
+            && self.sidebar_delete_confirm.is_none()
+    }
+
+    fn local_sidebar_fallback_root(&self) -> std::path::PathBuf {
+        self.sessions
+            .get(self.active)
+            .and_then(|session| session.cwd_cache.clone().or_else(|| session.cwd()))
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("/"))
+    }
+
+    fn clear_sidebar_tree_intent(&mut self) {
+        self.sidebar_menu = None;
+        self.sidebar_dialog = None;
+        self.sidebar_delete_confirm = None;
+        self.sidebar_hovered_row = None;
+        self.sidebar_tree_focus = None;
+        self.sidebar_tree_offset_y = 0.0;
+        self.sidebar_drop_burst.clear();
+        self.sidebar_drop_intents.clear();
+        self.sidebar_drop_debounce_generation = None;
+        self.sidebar_drop_hint = false;
+    }
+
+    /// Retire asynchronous/multi-step work before changing which host a numeric
+    /// location denotes. Reports stamped before this boundary become inert.
+    fn invalidate_sidebar_pending_work(&mut self) {
+        self.sidebar_context_epoch = next_sidebar_context_epoch(self.sidebar_context_epoch);
+        self.clear_sidebar_tree_intent();
+        if let Some(transfer) = self.sidebar_transfer.take() {
+            transfer.progress.cancel();
+        }
+    }
+
+    /// Drop every target that was interpreted inside the old remote tree.
+    /// Worker requests already carry immutable host snapshots, while their
+    /// generation/location guards prevent results from refreshing this new
+    /// Local view. Transfers additionally expose cancellation and are stopped.
+    fn clear_sidebar_remote_context(&mut self) {
+        self.invalidate_sidebar_remote_follow_intent();
+        self.invalidate_sidebar_pending_work();
+        self.sidebar_clipboard = None;
+        self.sidebar_selection.clear();
+        self.sidebar_selection_anchor = None;
+        self.sidebar_filter = None;
+    }
+
+    /// Return the Files panel to a known local root after a host-config
+    /// replacement. The sidebar must cache the retained remote root while the
+    /// old host snapshot still defines its numeric location, then install
+    /// `hosts` and fall back in one state transition.
+    fn reset_sidebar_to_local_with_hosts(
+        &mut self,
+        hosts: Vec<jterm_core::jsh_remote::RemoteHostConfig>,
+        notice: String,
+    ) -> sidebar::DirectoryRequest {
+        self.clear_sidebar_remote_context();
+        let request = self
+            .sidebar
+            .reset_to_local_with_hosts(self.local_sidebar_fallback_root(), hosts);
+        self.set_sidebar_notice(notice, false);
+        request
+    }
+
+    fn cancel_sidebar_remote_follow(&mut self) {
+        if let Some(pending) = self.sidebar_follow_pending.take() {
+            pending.cancellation.cancel();
+        }
+    }
+
+    fn invalidate_sidebar_remote_follow_intent(&mut self) {
+        self.cancel_sidebar_remote_follow();
+        // If an automatic retry was armed, convert it back into the observed
+        // dedupe key before cancelling. A user action during that short wait
+        // must not accidentally turn the same SSH command into a fresh probe.
+        suppress_armed_sidebar_retry(
+            &mut self.sidebar_follow_observed,
+            &mut self.sidebar_follow_retry_once,
+        );
+        self.sidebar_follow_retry_available = None;
