@@ -15,7 +15,8 @@ def replace_once(text, old, new):
 
 path = ROOT / 'src/main.rs'
 text = path.read_text()
-text = replace_once(text, 'mod terminal_view;\n', 'mod terminal_view;\nmod vim9_ide;\n')
+if 'mod vim9_ide;' not in text:
+    text = replace_once(text, 'mod terminal_view;\n', 'mod terminal_view;\nmod vim9_ide;\n')
 text = replace_once(text, '    env_logger::init();\n', '    env_logger::init();\n    if let Some(result) = vim9_ide::run_if_requested() {\n        return result;\n    }\n')
 text = replace_once(text, 'enum Message {\n', 'enum Message {\n    OpenVim9Ide,\n')
 anchor = '            Message::PtyOutput(id, fd, data, watch_stamp) => {\n'
@@ -41,5 +42,7 @@ for name in tracked:
 
 path = ROOT / 'src/vim9_ide.rs'
 text = path.read_text().replace('use std::sync::Arc;\n', '')
+if 'mod native_tests;' not in text:
+    text += '\n#[cfg(test)]\n#[path = "vim9_ide_native_tests.rs"]\nmod native_tests;\n'
 path.write_text(text)
 print('Vim9 workbench wiring applied')
