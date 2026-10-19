@@ -14,8 +14,12 @@ pub(crate) fn panel_size(window: Size) -> Size {
     )
 }
 
-pub(crate) fn compact(panel: Size) -> bool {
-    panel.height < 360.0
+pub(crate) fn compact(panel: Size, font_size: f32) -> bool {
+    // The browser has seven count chips and bulk presentation controls. Large
+    // type or wrapped controls need one measured scroll area below the query;
+    // reserving their height above a second list would starve the results.
+    let scale = (font_size / 14.0).max(1.0);
+    panel.height < 500.0 * scale || panel.width < 560.0 * scale
 }
 
 /// Run only after an explicit query, navigation, filter, rebuild or resize.
@@ -117,13 +121,15 @@ mod tests {
             let panel = panel_size(window);
             assert!(panel.width + 32.0 <= window.width);
             assert!(panel.height + 32.0 <= window.height);
-            assert!(compact(panel));
+            assert!(compact(panel, 14.0));
         }
         assert_eq!(
             panel_size(Size::new(1280.0, 720.0)),
             Size::new(720.0, 560.0)
         );
-        assert!(!compact(panel_size(Size::new(1280.0, 720.0))));
+        assert!(!compact(panel_size(Size::new(1280.0, 720.0)), 14.0));
+        assert!(compact(Size::new(400.0, 560.0), 14.0));
+        assert!(compact(Size::new(720.0, 560.0), 24.0));
     }
 
     #[test]

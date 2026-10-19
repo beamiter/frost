@@ -181,19 +181,52 @@ fn run_child(root: &Path) {
 
         if config.is_block_mode() {
             let _ = app.update(Message::BlockBrowse);
+            let _ = app.update(Message::BlockSearchInput("needle".into()));
             let open = app.block_search.as_ref().expect("Block search opened");
             let identity = BlockSearchBuildIdentity {
                 session_id: open.session_id,
                 epoch: open.epoch,
             };
-            // Same production cache builder/completion reducer, without spawning
-            // an executor solely to deliver this deterministic worker result.
+            // Same production cache builder and matcher completion reducers,
+            // without spawning an executor for deterministic fixture results.
+            // The discarded Tasks own their inputs, so retain this tiny fixture
+            // cache explicitly for the second completion.
             let build = block_mode::build_block_search_cache(
                 Frost::block_search_source_snapshot(&app.sessions[0]),
                 block_mode::BLOCK_SEARCH_CACHE_MAX_BYTES,
             );
+            let cache = build.zones.clone();
             let _ = app.update(Message::BlockSearchCacheBuilt(identity, Ok(build)));
-            let _ = app.update(Message::BlockSearchInput("needle".into()));
+            let open = app.block_search.as_ref().unwrap();
+            assert!(open.matching);
+            assert!(open.hits.is_empty(), "the worker has not published yet");
+            let identity = BlockSearchBuildIdentity {
+                session_id: open.session_id,
+                epoch: open.epoch,
+            };
+            let intent = open.intent();
+            let eligible = app.block_search_eligible(intent.filter);
+            let result = block_mode::browse_or_search_blocks(
+                &cache,
+                &intent.query,
+                block_mode::BlockSearchOptions {
+                    case_sensitive: intent.case_sensitive,
+                    regex: intent.regex,
+                    whole_word: intent.whole_word,
+                },
+                intent.scope,
+                |zone_id| eligible.contains(&zone_id),
+                || true,
+            );
+            let _ = app.update(Message::BlockSearchMatched(
+                identity,
+                Ok(BlockSearchMatchBuild {
+                    cache,
+                    intent,
+                    eligible,
+                    result,
+                }),
+            ));
             let hit = app
                 .block_search
                 .as_ref()

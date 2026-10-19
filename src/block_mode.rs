@@ -1851,6 +1851,7 @@ pub fn build_block_search_cache(
 
 /// A finished block search: hits (newest zones first) plus whether the
 /// [`BLOCK_SEARCH_HIT_CAP`] stopped the scan with matches unreported.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockSearchResults {
     pub hits: Vec<BlockSearchHit>,
     pub capped: bool,
@@ -1872,9 +1873,13 @@ pub(crate) fn display_block_search_text(text: &str) -> String {
     crate::review_text::visible_bounded(text, 8 * 1024)
 }
 
-fn first_meaningful_line(text: &str) -> Option<(usize, &str)> {
+fn first_meaningful_line(
+    text: &str,
+    mut keep_searching: impl FnMut() -> bool,
+) -> Option<(usize, &str)> {
     text.lines()
         .enumerate()
+        .take_while(|_| keep_searching())
         .find(|(_, line)| !line.trim().is_empty())
 }
 
@@ -1890,22 +1895,36 @@ pub fn metadata_block_search_hit(
     zone: &CachedBlockSearchZone,
     scope: BlockSearchScope,
 ) -> Option<BlockSearchHit> {
-    let command = zone
-        .command
-        .as_deref()
-        .and_then(|text| first_meaningful_line(text).map(|(_, line)| line));
-    let output = zone
-        .output
-        .as_deref()
-        .and_then(first_meaningful_line)
-        .map(|(index, line)| (line, index + 1));
+    metadata_block_search_hit_cancellable(zone, scope, &mut || true)
+}
+
+fn metadata_block_search_hit_cancellable<F: FnMut() -> bool>(
+    zone: &CachedBlockSearchZone,
+    scope: BlockSearchScope,
+    keep_searching: &mut F,
+) -> Option<BlockSearchHit> {
+    let command = if scope.includes_command() {
+        zone.command.as_deref().and_then(|text| {
+            first_meaningful_line(text, &mut *keep_searching).map(|(_, line)| line)
+        })
+    } else {
+        None
+    };
+    // Command-only browsing and All rows with a command must not scan output.
+    // Output browsing still checks cancellation between leading blank lines.
+    let output = |keep_searching: &mut F| {
+        zone.output
+            .as_deref()
+            .and_then(|text| first_meaningful_line(text, keep_searching))
+            .map(|(index, line)| (line, index + 1))
+    };
     let (line_text, is_output_line, line_no) = match scope {
         BlockSearchScope::All => command
             .map(|line| (line, false, 0))
-            .or_else(|| output.map(|(line, line_no)| (line, true, line_no)))?,
+            .or_else(|| output(keep_searching).map(|(line, line_no)| (line, true, line_no)))?,
         BlockSearchScope::Command => (command?, false, 0),
         BlockSearchScope::Output => {
-            let (line, line_no) = output?;
+            let (line, line_no) = output(keep_searching)?;
             (line, true, line_no)
         }
     };
@@ -2175,6 +2194,7 @@ pub fn search_blocks_with_options_filtered(
 }
 
 /// Option-aware search whose surface scope is enforced before the result cap.
+#[allow(dead_code)] // Compatibility surface; the interactive browser also supports cancellation.
 pub fn search_blocks_with_options_filtered_in_scope(
     cache: &[CachedBlockSearchZone],
     query: &str,
@@ -2191,20 +2211,88 @@ pub fn search_blocks_with_options_filtered_in_scope(
     ))
 }
 
+/// Browser/search worker entry point. A blank query lists one representative
+/// row per retained text block, newest first. Cancellation is observed before
+/// compilation and between output lines, including lines with no match.
+/// Partial results are never published when a newer request supersedes this one.
+pub fn browse_or_search_blocks(
+    cache: &[CachedBlockSearchZone],
+    query: &str,
+    options: BlockSearchOptions,
+    scope: BlockSearchScope,
+    mut include_zone: impl FnMut(u64) -> bool,
+    mut keep_searching: impl FnMut() -> bool,
+) -> Option<Result<BlockSearchResults, BlockSearchQueryError>> {
+    if !keep_searching() {
+        return None;
+    }
+    let matcher = match BlockSearchMatcher::compile(query, options) {
+        Ok(matcher) => matcher,
+        Err(error) => return Some(Err(error)),
+    };
+    if matcher.is_some() {
+        return search_blocks_with_matcher_cancellable(
+            cache,
+            matcher,
+            scope,
+            include_zone,
+            keep_searching,
+        )
+        .map(Ok);
+    }
+
+    let mut results = BlockSearchResults {
+        hits: Vec::new(),
+        capped: false,
+    };
+    for zone in cache.iter().rev() {
+        if !keep_searching() {
+            return None;
+        }
+        if !include_zone(zone.zone_id) {
+            continue;
+        }
+        let Some(hit) = metadata_block_search_hit_cancellable(zone, scope, &mut keep_searching)
+        else {
+            continue;
+        };
+        if results.hits.len() >= BLOCK_SEARCH_HIT_CAP {
+            results.capped = true;
+            break;
+        }
+        results.hits.push(hit);
+    }
+    keep_searching().then_some(Ok(results))
+}
+
 fn search_blocks_with_matcher(
     cache: &[CachedBlockSearchZone],
     matcher: Option<BlockSearchMatcher>,
     scope: BlockSearchScope,
-    mut include_zone: impl FnMut(u64) -> bool,
+    include_zone: impl FnMut(u64) -> bool,
 ) -> BlockSearchResults {
+    search_blocks_with_matcher_cancellable(cache, matcher, scope, include_zone, || true)
+        .expect("an uncancelled search always returns a result")
+}
+
+fn search_blocks_with_matcher_cancellable(
+    cache: &[CachedBlockSearchZone],
+    matcher: Option<BlockSearchMatcher>,
+    scope: BlockSearchScope,
+    mut include_zone: impl FnMut(u64) -> bool,
+    mut keep_searching: impl FnMut() -> bool,
+) -> Option<BlockSearchResults> {
     let mut results = BlockSearchResults {
         hits: Vec::new(),
         capped: false,
     };
     let Some(matcher) = matcher else {
-        return results;
+        return Some(results);
     };
     'zones: for zone in cache.iter().rev() {
+        if !keep_searching() {
+            return None;
+        }
         if !include_zone(zone.zone_id) {
             continue;
         }
@@ -2241,13 +2329,15 @@ fn search_blocks_with_matcher(
             .as_deref()
             .into_iter()
             .flat_map(str::lines);
-        let output_hits = output_lines.zip(lowercase_lines).enumerate().filter_map(
-            |(index, (line, lowercase))| {
+        let output_hits = output_lines
+            .zip(lowercase_lines)
+            .take_while(|_| keep_searching())
+            .enumerate()
+            .filter_map(|(index, (line, lowercase))| {
                 matcher
                     .find(line, Some(lowercase))
                     .map(|span| (true, index + 1, line, span))
-            },
-        );
+            });
         for (is_output_line, line_no, line, match_span) in command_hit.chain(output_hits) {
             if results.hits.len() >= BLOCK_SEARCH_HIT_CAP {
                 results.capped = true;
@@ -2264,7 +2354,7 @@ fn search_blocks_with_matcher(
             });
         }
     }
-    results
+    keep_searching().then_some(results)
 }
 
 /// Scrollbar-track fractions (0.0 = top of the buffer, approaching 1.0 at the
@@ -3442,6 +3532,194 @@ mod tests {
                 assert!(metadata_block_search_hit(&textless, scope).is_none());
             }
         }
+    }
+
+    #[test]
+    fn browser_empty_query_lists_newest_blocks_and_preserves_scope_and_filter() {
+        let cache = [
+            source(1, Some("older"), Some("old output")),
+            source(2, Some("newer"), Some("new output")),
+            source(3, None, Some("\nbackground")),
+            source(4, None, None),
+        ];
+        let run = |scope, include_background| {
+            browse_or_search_blocks(
+                &cache,
+                "  ",
+                BlockSearchOptions::default(),
+                scope,
+                |id| include_background || id != 3,
+                || true,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let all = run(BlockSearchScope::All, true);
+        assert_eq!(
+            all.hits.iter().map(|hit| hit.zone_id).collect::<Vec<_>>(),
+            [3, 2, 1]
+        );
+        assert!(all.hits.iter().all(|hit| hit.match_span.is_none()));
+        assert_eq!(all.hits[0].line_no, 2);
+        assert_eq!(run(BlockSearchScope::Command, true).hits.len(), 2);
+        let output = run(BlockSearchScope::Output, false);
+        assert_eq!(output.hits.len(), 2);
+        assert!(output.hits.iter().all(|hit| hit.is_output_line));
+        assert_eq!(output.hits[0].line_text, "new output");
+    }
+
+    #[test]
+    fn browser_cancel_discards_partial_results_even_during_nonmatching_output() {
+        let output = format!("needle\n{}", "no match here\n".repeat(20_000));
+        let cache = [source(1, Some("command"), Some(&output))];
+        let mut checkpoints = 0;
+        let result = browse_or_search_blocks(
+            &cache,
+            "needle",
+            BlockSearchOptions {
+                regex: true,
+                ..Default::default()
+            },
+            BlockSearchScope::Output,
+            |_| true,
+            || {
+                checkpoints += 1;
+                checkpoints < 12
+            },
+        );
+        assert!(
+            result.is_none(),
+            "the earlier hit must not escape a cancelled pass"
+        );
+        assert!(
+            checkpoints <= 13,
+            "unmatched lines must check cancellation too"
+        );
+        assert!(
+            browse_or_search_blocks(
+                &cache,
+                "[",
+                BlockSearchOptions {
+                    regex: true,
+                    ..Default::default()
+                },
+                BlockSearchScope::All,
+                |_| true,
+                || false,
+            )
+            .is_none(),
+            "a cancelled query must not compile its regex"
+        );
+        let output = format!("{}later output", "\n".repeat(20_000));
+        let cache = [source(1, Some("command"), Some(&output))];
+        let mut checkpoints = 0;
+        let result = browse_or_search_blocks(
+            &cache,
+            "",
+            BlockSearchOptions::default(),
+            BlockSearchScope::Output,
+            |_| true,
+            || {
+                checkpoints += 1;
+                checkpoints < 12
+            },
+        );
+        assert!(
+            result.is_none(),
+            "blank-query output browsing is cancellable too"
+        );
+        assert!(
+            checkpoints <= 13,
+            "leading empty lines must check cancellation"
+        );
+
+        for scope in [BlockSearchScope::All, BlockSearchScope::Command] {
+            let mut checkpoints = 0;
+            let hit = metadata_block_search_hit_cancellable(&cache[0], scope, &mut || {
+                checkpoints += 1;
+                true
+            })
+            .unwrap();
+            assert_eq!(hit.line_text, "command");
+            assert_eq!(checkpoints, 1, "unused output must not be scanned");
+        }
+    }
+
+    #[test]
+    fn browser_worker_matches_the_existing_search_engine_for_all_controls() {
+        let cache = [
+            source(1, Some("Cargo TEST"), Some("Test\ntester\n雪 test")),
+            source(2, Some("printf İ"), Some("i\u{307} next\nTEST")),
+        ];
+        for regex in [false, true] {
+            for case_sensitive in [false, true] {
+                for whole_word in [false, true] {
+                    let options = BlockSearchOptions {
+                        regex,
+                        case_sensitive,
+                        whole_word,
+                    };
+                    for scope in [
+                        BlockSearchScope::All,
+                        BlockSearchScope::Command,
+                        BlockSearchScope::Output,
+                    ] {
+                        let expected = search_blocks_with_options_filtered_in_scope(
+                            &cache,
+                            "test",
+                            options,
+                            scope,
+                            |_| true,
+                        );
+                        let actual = browse_or_search_blocks(
+                            &cache,
+                            "test",
+                            options,
+                            scope,
+                            |_| true,
+                            || true,
+                        );
+                        assert_eq!(
+                            actual,
+                            Some(expected),
+                            "options={options:?} scope={scope:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn browser_browsing_honors_the_result_cap_and_rejects_invalid_queries() {
+        let cache: Vec<_> = (0..BLOCK_SEARCH_HIT_CAP + 20)
+            .map(|id| source(id as u64, Some("command"), None))
+            .collect();
+        let result = browse_or_search_blocks(
+            &cache,
+            "",
+            BlockSearchOptions::default(),
+            BlockSearchScope::All,
+            |_| true,
+            || true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.hits.len(), BLOCK_SEARCH_HIT_CAP);
+        assert!(result.capped);
+        assert_eq!(result.hits[0].zone_id, (cache.len() - 1) as u64);
+        let too_long = " ".repeat(BLOCK_SEARCH_QUERY_MAX_BYTES + 1);
+        assert_eq!(
+            browse_or_search_blocks(
+                &cache,
+                &too_long,
+                BlockSearchOptions::default(),
+                BlockSearchScope::All,
+                |_| true,
+                || true
+            ),
+            Some(Err(BlockSearchQueryError::TooLong))
+        );
     }
 
     #[test]

@@ -1,5 +1,63 @@
 # Engineering handoff
 
+## 2026-10-19 — complete block browser and asynchronous matching
+
+- Browse / Ctrl+Alt+F now lists one representative row per completed text block
+  for an empty query, newest first. Existing literal/regex, case, whole-word,
+  scope, bookmark and exact-row reveal behavior remains available.
+- Success and Unread join the metadata filters. Every chip reports retained
+  block counts; Unread uses the same `ReadingHistory::seen_through` watermark as
+  the reading bar. Counts deliberately describe retained metadata, not text
+  matches or an assertion that every block still has indexed text.
+  A constant-time filter-context stamp refreshes settled Slow/Unread results
+  when hot-reloaded thresholds or the reading watermark change, even if the
+  finalized-zone set stays identical; rejected-input diagnostics survive.
+- A single window-owned job slot serializes both index builds and matching,
+  including close/reopen and pane switches. Matching takes the bounded cache
+  by value and returns it; the UI never clones a multi-MiB cache per keystroke.
+  Pending edits replace only bounded intent fields. Cancellation is checked
+  before regex compilation and between every output line, including misses.
+  Empty-query Command browsing skips output; All reads output only when no
+  command supplies its row. Output browsing checks cancellation while skipping
+  leading blank lines as well.
+  Identity, finalized-zone version, current intent and filter membership gate
+  installation. A completed stale worker cannot release a newer job slot.
+  A rejected input keeps its diagnostic across matching and index refreshes;
+  neither completion silently acknowledges it or reactivates old results.
+  Selection-preserving refreshes resolve the latest visible highlight when
+  matching finishes, so navigation during the worker is not overwritten.
+- New source extraction waits for the previous matcher to return. The old
+  cache is released before the 8 MiB source snapshot is collected; the 16 MiB
+  resident index bound and 500-hit limit stay in place. One regex operation
+  may delay cooperative cancellation, but does not run on the event loop.
+- Completed-output Collapse all / Expand all is available directly in the
+  browser. The action is pane-bound and only resolves finished output with
+  current provenance; running commands and raw cells remain unchanged.
+- Browser controls wrap; narrow/short/large-font panels use one measured
+  scroller below the query. Normal panels reserve the remaining height for
+  their result scroller and keep the footer accessible.
+- Regression coverage lives in `src/block_browser_tests.rs`, the browser
+  tests in `src/block_mode.rs`, and `src/block_search_layout.rs`.
+  The real Bash/readline fixture now delivers both index and match completions
+  before accepting a result; draft, cursor and Undo checks still pass.
+
+- `cargo check --locked --bin frost` passed.
+- `cargo test --locked --bin frost -- block_ --quiet` passed on shared-core
+  revision `7685678048412b6353eb5b135a354e5b44b17c8b`: 200 tests, including
+  15 new browser/cancellation/filter/ownership/folding regressions.
+- `cargo test --all-targets --all-features --locked --no-fail-fast -- --quiet`
+  passed before the final metadata/navigation follow-up and core pin update:
+  1750 tests, 0 failures, 1 existing ignored Chat PTY test. The follow-up is
+  covered by the final 200-test block run above.
+- `cargo test --locked --bin frost -- readline_preservation_tests --quiet`
+  passed again on the final core pin and metadata/navigation changes.
+- `cargo clippy --all-targets --all-features --locked -- -D warnings` passed.
+- `cargo fmt --all -- --check` and `git diff --check` passed.
+
+This environment needed `RUSTFLAGS='-C codegen-units=1'` to avoid an existing
+Rust 1.99.1/syn 3.0.4 archive error (`memory map must have a non-zero length`);
+no toolchain setting or dependency override is added to the repository.
+
 Updated: 2026-10-04 (upgrade round 387 — files-panel notices omit spoofing)
 
 ## 2026-10-04 (upgrade round 387)

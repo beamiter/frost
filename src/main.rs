@@ -1923,28 +1923,95 @@ impl TabSwitcherState {
 /// output (captured-snapshot-first, so trimmed-away zones still match).
 ///
 /// Zone text is extracted into a bounded cache; lowercasing is performed on a
-/// worker and each keystroke only rescans the finished index. The owning
-/// session and monotonic build epoch reject late worker results. Finalized-zone
+/// worker. One cancellable matcher owns that cache at a time; new edits replace
+/// only the pending intent. The owning session and monotonic work epoch reject
+/// late worker results. Finalized-zone
 /// version changes rebuild the open picker so newly completed blocks appear.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BlockSearchFilter {
     #[default]
     All,
     Failed,
+    Success,
     Slow,
     Bookmarked,
+    Unread,
     Background,
+}
+
+/// Metadata that can change without adding or removing a finalized zone.
+/// Checking this stamp never scans retained command/output text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockSearchFilterContext {
+    Stable,
+    Slow(u64),
+    Unread(Option<u64>),
 }
 
 impl BlockSearchFilter {
     /// Display order of the filter chips, which is also the order Tab walks.
-    const ORDER: [Self; 5] = [
+    const ORDER: [Self; 7] = [
         Self::All,
         Self::Failed,
+        Self::Success,
         Self::Slow,
         Self::Bookmarked,
+        Self::Unread,
         Self::Background,
     ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Failed => "Failed",
+            Self::Success => "Success",
+            Self::Slow => "Slow",
+            Self::Bookmarked => "Bookmarked",
+            Self::Unread => "Unread",
+            Self::Background => "Background",
+        }
+    }
+
+    fn context(
+        self,
+        seen_through: Option<u64>,
+        slow_threshold_ms: u64,
+    ) -> BlockSearchFilterContext {
+        match self {
+            Self::Slow => BlockSearchFilterContext::Slow(slow_threshold_ms),
+            Self::Unread => BlockSearchFilterContext::Unread(seen_through),
+            _ => BlockSearchFilterContext::Stable,
+        }
+    }
+
+    fn matches(
+        self,
+        zone: &terminal::CommandZone,
+        bookmarked: bool,
+        seen_through: Option<u64>,
+        slow_threshold_ms: u64,
+    ) -> bool {
+        match self {
+            Self::All => true,
+            Self::Failed => matches!(
+                block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                block_mode::BlockOutcome::Failed(_)
+            ),
+            Self::Success => matches!(
+                block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                block_mode::BlockOutcome::Success
+            ),
+            Self::Slow => zone
+                .duration_ms
+                .is_some_and(|duration| duration >= slow_threshold_ms),
+            Self::Bookmarked => bookmarked,
+            Self::Unread => seen_through.is_none_or(|seen| zone.id > seen),
+            Self::Background => matches!(
+                block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                block_mode::BlockOutcome::Background
+            ),
+        }
+    }
 
     /// Next/previous filter, wrapping. Keyboard-only users could otherwise
     /// never reach the chips: the overlay owns every key while it is open.
@@ -1965,6 +2032,47 @@ impl BlockSearchFilter {
 struct BlockSearchBuildIdentity {
     session_id: usize,
     epoch: u64,
+}
+
+/// One background operation for the entire window, including close/reopen and
+/// pane switches. The next desired request lives only in the open picker; it
+/// replaces any earlier pending intent instead of retaining another index.
+struct BlockSearchJob {
+    identity: BlockSearchBuildIdentity,
+    matching: bool,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BlockSearchJob {
+    fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn finish_block_search_job(
+    slot: &mut Option<BlockSearchJob>,
+    identity: BlockSearchBuildIdentity,
+    matching: bool,
+) -> bool {
+    if !slot
+        .as_ref()
+        .is_some_and(|job| job.identity == identity && job.matching == matching)
+    {
+        return false;
+    }
+    *slot = None;
+    true
+}
+
+#[derive(Clone, Debug)]
+struct BlockSearchMatchBuild {
+    /// Ownership returns to the UI only after the matcher has stopped. An
+    /// index refresh therefore never overlaps the old and new caches.
+    cache: Vec<block_mode::CachedBlockSearchZone>,
+    intent: BlockSearchIntent,
+    eligible: std::collections::HashSet<u64>,
+    result: Option<Result<block_mode::BlockSearchResults, block_mode::BlockSearchQueryError>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2058,7 +2166,7 @@ impl BlockSearchBookmarkNotice {
         match self {
             Self::Bookmarked => "Bookmarked block ★",
             Self::Removed => "Removed block bookmark ☆",
-            Self::Busy => "Bookmarks are disabled while the index refreshes",
+            Self::Busy => "Bookmarks are available when results finish updating",
             Self::NoSelection => "No search result selected",
             Self::Stale => "Search result is no longer available",
         }
@@ -2079,7 +2187,7 @@ fn block_search_bookmark_button_text(bookmarked: bool) -> &'static str {
 
 fn block_search_bookmark_button_help(bookmarked: bool, stale: bool) -> &'static str {
     if stale {
-        "Bookmarks are disabled while the index refreshes"
+        "Bookmarks are available when results finish updating"
     } else if bookmarked {
         "Remove the bookmark from this block"
     } else {
@@ -2186,11 +2294,21 @@ impl BlockSearchMemory {
 struct BlockSearchState {
     /// Pane identity owning the cache. Zone ids are only pane-local.
     session_id: usize,
-    /// Monotonic window-wide generation of the cache build currently owned by
+    /// Monotonic window-wide generation of the background operation owned by
     /// this picker. Session id alone cannot distinguish close/reopen races.
     epoch: u64,
     /// True while source text is being lowercased on the worker.
     loading: bool,
+    /// Matching owns the cache on a worker; pending edits overwrite only the
+    /// bounded intent fields and never queue another cache or task.
+    matching: bool,
+    match_pending: bool,
+    rebuild_pending: bool,
+    match_anchor: Option<BlockSearchSelectionAnchor>,
+    /// Repeated UI messages for the same intent/filter membership are free.
+    matched_intent: Option<BlockSearchIntent>,
+    matched_eligible: std::collections::HashSet<u64>,
+    filter_context: Option<BlockSearchFilterContext>,
     /// The source or resident budget omitted at least one older zone.
     older_not_indexed: bool,
     /// Finalized-zone set represented by the current/in-flight cache.
@@ -2207,8 +2325,8 @@ struct BlockSearchState {
     /// intact, but disable activation until the query compiles again.
     query_error: Option<String>,
     filter: BlockSearchFilter,
-    /// Highlighted row among `hits` (all hits are drawn and navigable, in a
-    /// scrollable list).
+    /// Highlighted row among `hits`; rendering windows the list while every
+    /// retained result remains reachable by keyboard.
     selected: usize,
     hits: Vec<block_mode::BlockSearchHit>,
     /// The 500-hit matching cap stopped the scan early (older zones were
@@ -2235,6 +2353,111 @@ struct BlockSearchState {
 }
 
 impl BlockSearchState {
+    fn busy(&self) -> bool {
+        self.loading || self.matching || self.match_pending || self.rebuild_pending
+    }
+
+    fn selected_anchor(&self) -> Option<BlockSearchSelectionAnchor> {
+        self.hits
+            .get(self.selected)
+            .cloned()
+            .map(|hit| BlockSearchSelectionAnchor {
+                hit,
+                index: self.selected,
+            })
+    }
+
+    /// Hot reload and returning to live can change filter membership while
+    /// finalized-zone identity remains stable. Keep input errors authoritative
+    /// and coalesce metadata updates just like pending text edits.
+    fn observe_filter_context(&mut self, context: BlockSearchFilterContext) {
+        if self.filter_context == Some(context) {
+            return;
+        }
+        self.filter_context = Some(context);
+        if self.query_error.is_some() {
+            self.match_pending = false;
+            return;
+        }
+        if !self.match_pending {
+            self.match_anchor = self.selected_anchor();
+            self.match_pending = true;
+        }
+    }
+
+    /// Installing index text cannot acknowledge an input error: only a new
+    /// accepted edit or an explicit control change can do that. The caller
+    /// has already checked this build's owner, epoch and source version.
+    fn install_cache(&mut self, build: block_mode::BlockSearchCacheBuild) -> bool {
+        self.cache = build.zones;
+        self.older_not_indexed = build.older_not_indexed;
+        self.loading = false;
+        if self.query_error.is_some() {
+            self.match_pending = false;
+            self.refresh_intent = None;
+            return false;
+        }
+        true
+    }
+
+    /// Restore cache ownership first, then admit only the latest intent and
+    /// membership. Superseded results keep the previous visible hits inert.
+    fn install_match(
+        &mut self,
+        identity: BlockSearchBuildIdentity,
+        build: BlockSearchMatchBuild,
+        current_version: BlockSearchZoneVersion,
+        eligible: &std::collections::HashSet<u64>,
+    ) -> bool {
+        if !self.matching || !self.accepts_build(identity) {
+            return false;
+        }
+        self.matching = false;
+        self.cache = build.cache;
+        if current_version != self.zone_version || self.rebuild_pending {
+            self.rebuild_pending = true;
+            return false;
+        }
+        if self.take_manual_refresh_followup() {
+            self.rebuild_pending = true;
+            return false;
+        }
+        if self.query_error.is_some() {
+            // A rejected unsafe paste must retain its diagnostic even when
+            // the earlier, valid request has completed in the meantime.
+            self.match_pending = false;
+            return false;
+        }
+        if build.intent != self.intent() || build.eligible != *eligible || build.result.is_none() {
+            self.match_pending = true;
+            return false;
+        }
+        self.match_pending = false;
+        match build.result.expect("checked completed match") {
+            Ok(results) => {
+                // A selection-preserving refresh must follow navigation that
+                // occurred during matching. Real query/control edits clear
+                // match_anchor, so their result sets still start at the top.
+                let anchor = self
+                    .match_anchor
+                    .take()
+                    .map(|original| self.selected_anchor().unwrap_or(original));
+                self.selected =
+                    block_search_refresh_selection_index(&results.hits, anchor.as_ref());
+                self.hits = results.hits;
+                self.capped = results.capped;
+                self.matched_intent = Some(build.intent);
+                self.matched_eligible = build.eligible;
+            }
+            Err(error) => {
+                self.query_error = Some(crate::review_text::bound_query_error(error));
+                self.matched_intent = None;
+                self.match_anchor = None;
+            }
+        }
+        true
+    }
+
     fn intent(&self) -> BlockSearchIntent {
         BlockSearchIntent {
             query: self.query.clone(),
@@ -2268,7 +2491,7 @@ impl BlockSearchState {
         if self.query_error.is_some() {
             return false;
         }
-        if self.loading {
+        if self.loading || self.matching || self.rebuild_pending {
             self.manual_refresh_pending = true;
             false
         } else {
@@ -2285,24 +2508,10 @@ impl BlockSearchState {
         if !std::mem::take(&mut self.manual_refresh_pending) {
             return false;
         }
-        let Ok(query) = block_mode::validated_block_search_query(&self.query) else {
-            return false;
-        };
-        if query.is_empty() && self.filter == BlockSearchFilter::All {
-            return false;
-        }
-        block_mode::search_blocks_with_options_filtered_in_scope(
-            &[],
-            &self.query,
-            block_mode::BlockSearchOptions {
-                case_sensitive: self.case_sensitive,
-                regex: self.regex,
-                whole_word: self.whole_word,
-            },
-            self.scope,
-            |_| true,
-        )
-        .is_ok()
+        // Keep regex compilation on the matcher, including F5 coalescing.
+        // An already diagnosed expression cannot request another rebuild;
+        // a newly edited one is validated by the next bounded worker pass.
+        self.query_error.is_none() && block_mode::validated_block_search_query(&self.query).is_ok()
     }
 
     fn reset_intent(&mut self) {
@@ -2331,6 +2540,9 @@ impl BlockSearchState {
             ));
             return false;
         }
+        if query == self.query && self.query_error.is_none() {
+            return false;
+        }
         self.query = query;
         true
     }
@@ -2345,7 +2557,7 @@ impl BlockSearchState {
         session_id: usize,
         zone_version: BlockSearchZoneVersion,
     ) -> bool {
-        !self.loading
+        !self.busy()
             && self.query_error.is_none()
             && self.session_id == session_id
             && self.zone_version == zone_version
@@ -2358,7 +2570,7 @@ impl BlockSearchState {
         session_id: usize,
         zone_version: BlockSearchZoneVersion,
     ) -> BlockSearchBookmarkPlan {
-        if self.loading {
+        if self.busy() {
             return BlockSearchBookmarkPlan::Busy;
         }
         let Some(hit) = requested else {
@@ -2385,7 +2597,8 @@ impl BlockSearchState {
         // path that ACTS on a hit is gated on `loading`.
         self.cache = Vec::new();
         self.older_not_indexed = false;
-        self.query_error = None;
+        self.matched_intent = None;
+        self.matched_eligible.clear();
     }
 
     fn select_next(&mut self) {
@@ -2435,7 +2648,12 @@ impl BlockSearchState {
     /// necessarily exist.
     fn count_label(&self) -> String {
         let count = self.hits.len();
-        let noun = if count == 1 { "match" } else { "matches" };
+        let noun = match (self.query.trim().is_empty(), count == 1) {
+            (true, true) => "block",
+            (true, false) => "blocks",
+            (false, true) => "match",
+            (false, false) => "matches",
+        };
         // Position, not just a total: walking a query's hits with the arrows
         // otherwise gives no sense of how far through the list you are.
         let mut label = if count == 0 {
@@ -2495,6 +2713,31 @@ fn expand_block_search_hit(
         terminal.locate_raw_cell_in_projection(projection, origin),
         terminal::ProjectedRawCellLocation::Hidden { zone_id } if zone_id == hit.zone_id
     ) && policy.expand(hit.zone_id)
+}
+
+/// Change only finalized output presentation. Provenance is resolved again at
+/// the action boundary; the live prompt/running command is never a candidate.
+fn set_completed_output_collapsed(
+    terminal: &TerminalState,
+    policy: &mut ProjectionPolicy,
+    collapsed: bool,
+) -> usize {
+    if terminal.is_alt_buffer_active() {
+        return 0;
+    }
+    terminal
+        .command_zones
+        .iter()
+        .filter(|zone| {
+            if collapsed {
+                !policy.is_collapsed(zone.id)
+                    && terminal.finished_output_range(zone.id).is_some()
+                    && policy.collapse(zone.id)
+            } else {
+                policy.expand(zone.id)
+            }
+        })
+        .count()
 }
 
 /// Place a pointer-anchored overlay inside the visible window. Prefer below
@@ -4801,6 +5044,8 @@ enum Message {
     BlockReviewCopy,
     BlockReadingNavigate(bool),
     BlockGoLive,
+    /// Presentation-only bulk folding, bound to the pane that drew the control.
+    BlockSetAllCollapsed(usize, bool),
     BlockSearchInput(String),
     /// Reset query, matching controls, scope, and metadata filter to defaults.
     BlockSearchReset,
@@ -4820,6 +5065,10 @@ enum Message {
     BlockSearchCacheBuilt(
         BlockSearchBuildIdentity,
         Result<block_mode::BlockSearchCacheBuild, String>,
+    ),
+    BlockSearchMatched(
+        BlockSearchBuildIdentity,
+        Result<BlockSearchMatchBuild, String>,
     ),
     /// Select and reveal the clicked hit's zone (and close the picker).
     BlockSearchAccept(block_mode::BlockSearchHit),
@@ -6650,6 +6899,7 @@ struct Frost {
     /// Window-wide monotonic source for async block-search build identities.
     /// It deliberately survives picker close/reopen within the same pane.
     next_block_search_epoch: u64,
+    block_search_job: Option<BlockSearchJob>,
     /// Context actions for the finalized block right-clicked anywhere in its card.
     block_menu: Option<BlockMenuState>,
     block_review: Option<BlockReview>,
@@ -6887,6 +7137,7 @@ impl Frost {
             block_search: None,
             block_search_memory: BlockSearchMemory::default(),
             next_block_search_epoch: 0,
+            block_search_job: None,
             block_menu: None,
             block_review: None,
             block_clear_confirm: None,
@@ -12051,8 +12302,8 @@ impl Frost {
     /// open its own key handler owns the chord, so dispatch normally only
     /// sees the closed state — the guard here covers the palette entry.
     /// Opening snapshots at most 8 MiB of newest source text, then lowercases
-    /// it under a 16 MiB resident-cache budget on a worker. Per-keystroke
-    /// searches remain synchronous but only rescan that bounded cache.
+    /// it under a 16 MiB resident-cache budget on a worker. Matching also runs
+    /// on that single worker, with pending edits coalesced to the latest intent.
     fn toggle_block_search(&mut self) -> Task<Message> {
         if self.block_search.is_some() {
             self.close_block_search();
@@ -12096,15 +12347,16 @@ impl Frost {
         let Some(session_id) = self.block_search.as_ref().map(|state| state.session_id) else {
             return Task::none();
         };
-        // One cache worker at a time. Finalized-zone churn while it runs is
-        // detected against the terminal when the result arrives, then one
-        // fresh rebuild is launched. This coalesces bursts without retaining
-        // several 8/16 MiB build generations concurrently.
-        if self
-            .block_search
-            .as_ref()
-            .is_some_and(|state| state.loading)
-        {
+        // This slot survives picker close/reopen and pane changes. Wait for a
+        // previous matcher/build to release its cache before extracting new
+        // source text, so there is never an old+source+new cache peak.
+        if let Some(job) = &self.block_search_job {
+            if job.matching {
+                job.cancel();
+            }
+            if let Some(state) = self.block_search.as_mut() {
+                state.rebuild_pending = true;
+            }
             return Task::none();
         }
         let Some(version) = self
@@ -12125,6 +12377,9 @@ impl Frost {
         if let Some(state) = self.block_search.as_mut() {
             state.epoch = epoch;
             state.loading = true;
+            state.matching = false;
+            state.match_pending = false;
+            state.rebuild_pending = false;
             state.manual_refresh_pending = false;
             state.zone_version = version;
             if state.refresh_intent.is_none() {
@@ -12143,6 +12398,12 @@ impl Frost {
             self.close_block_search();
             return Task::none();
         };
+
+        self.block_search_job = Some(BlockSearchJob {
+            identity,
+            matching: false,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
 
         Task::perform(
             async move {
@@ -12188,14 +12449,16 @@ impl Frost {
     }
 
     fn close_block_search(&mut self) {
+        if let Some(job) = &self.block_search_job {
+            job.cancel();
+        }
         if let Some(state) = self.block_search.take() {
             self.block_search_memory.capture(&state);
         }
     }
 
-    /// Re-run the block search over the bounded cache with the current query.
-    /// Never re-extracts terminal output; while a worker is loading, edits are
-    /// retained and the matching completed build performs the recompute.
+    /// Replace the pending matching intent. The update wrapper dispatches at
+    /// most one worker after the reducer, including reducers with early returns.
     fn block_search_recompute(&mut self) {
         self.block_search_recompute_with_anchor(None);
     }
@@ -12207,93 +12470,131 @@ impl Frost {
         &mut self,
         selection_anchor: Option<BlockSearchSelectionAnchor>,
     ) {
-        let Some(open) = self.block_search.as_mut() else {
+        let Some(state) = self.block_search.as_mut() else {
             return;
         };
-        open.bookmark_notice = None;
-        if open.loading {
-            return;
+        state.bookmark_notice = None;
+        state.match_pending = true;
+        state.query_error = None;
+        state.match_anchor = selection_anchor.or_else(|| state.take_refresh_selection_anchor());
+        if let Some(job) = &self.block_search_job {
+            if job.matching {
+                job.cancel();
+            }
         }
-        let filter = open.filter;
-        let slow_threshold_ms = self.config.notify_long_block_threshold_ms;
-        let eligible: std::collections::HashSet<u64> = self
-            .sessions
+    }
+
+    fn block_search_eligible(&self, filter: BlockSearchFilter) -> std::collections::HashSet<u64> {
+        self.sessions
             .get(self.active)
             .map(|sess| {
                 sess.terminal
                     .command_zones
                     .iter()
-                    .filter(|zone| match filter {
-                        BlockSearchFilter::All => true,
-                        BlockSearchFilter::Failed => matches!(
-                            block_mode::classify(zone.command.as_deref(), zone.exit_code),
-                            block_mode::BlockOutcome::Failed(_)
-                        ),
-                        BlockSearchFilter::Slow => zone
-                            .duration_ms
-                            .is_some_and(|duration| duration >= slow_threshold_ms),
-                        BlockSearchFilter::Bookmarked => sess.block_bookmarks.contains(zone.id),
-                        BlockSearchFilter::Background => matches!(
-                            block_mode::classify(zone.command.as_deref(), zone.exit_code),
-                            block_mode::BlockOutcome::Background
-                        ),
+                    .filter(|zone| {
+                        filter.matches(
+                            zone,
+                            sess.block_bookmarks.contains(zone.id),
+                            sess.block_reading.seen_through,
+                            self.config.notify_long_block_threshold_ms,
+                        )
                     })
                     .map(|zone| zone.id)
                     .collect()
             })
-            .unwrap_or_default();
-        let Some(state) = self.block_search.as_mut() else {
-            return;
-        };
-        let selection_anchor = selection_anchor.or_else(|| state.take_refresh_selection_anchor());
-        let results = match block_mode::validated_block_search_query(&state.query) {
-            Err(error) => Err(error),
-            Ok(validated) if validated.is_empty() && filter != BlockSearchFilter::All => {
-                let mut hits = Vec::new();
-                let mut capped = false;
-                for zone in state
-                    .cache
-                    .iter()
-                    .rev()
-                    .filter(|zone| eligible.contains(&zone.zone_id))
-                {
-                    let Some(hit) = block_mode::metadata_block_search_hit(zone, state.scope) else {
-                        continue;
-                    };
-                    if hits.len() >= block_mode::BLOCK_SEARCH_HIT_CAP {
-                        capped = true;
-                        break;
-                    }
-                    hits.push(hit);
-                }
-                Ok(block_mode::BlockSearchResults { hits, capped })
-            }
-            Ok(_) => block_mode::search_blocks_with_options_filtered_in_scope(
-                &state.cache,
-                &state.query,
-                block_mode::BlockSearchOptions {
-                    case_sensitive: state.case_sensitive,
-                    regex: state.regex,
-                    whole_word: state.whole_word,
-                },
-                state.scope,
-                |zone_id| eligible.contains(&zone_id),
-            ),
-        };
-        match results {
-            Ok(results) => {
-                state.selected =
-                    block_search_refresh_selection_index(&results.hits, selection_anchor.as_ref());
-                state.hits = results.hits;
-                state.capped = results.capped;
-                state.query_error = None;
-            }
-            Err(error) => {
-                // Preserve the last valid result/index so correcting one
-                // character is cheap. The error gates Enter/click activation.
-                state.query_error = Some(crate::review_text::bound_query_error(error));
-            }
+            .unwrap_or_default()
+    }
+
+    /// Schedule only the latest pending work. No matching/regex compilation
+    /// runs in the event loop, and no queued request owns a second index.
+    fn dispatch_block_search_work(&mut self) -> Task<Message> {
+        if self.block_search_job.is_some() {
+            return Task::none();
         }
+        let Some(open) = self.block_search.as_ref() else {
+            return Task::none();
+        };
+        let current = self
+            .sessions
+            .get(self.active)
+            .filter(|sess| sess.id == open.session_id && !sess.terminal.is_alt_buffer_active())
+            .map(|sess| {
+                (
+                    BlockSearchZoneVersion::from_terminal(&sess.terminal),
+                    open.filter.context(
+                        sess.block_reading.seen_through,
+                        self.config.notify_long_block_threshold_ms,
+                    ),
+                )
+            });
+        let Some((current_version, filter_context)) = current else {
+            self.close_block_search();
+            return Task::none();
+        };
+        if open.rebuild_pending || current_version != open.zone_version {
+            return self.begin_block_search_rebuild();
+        }
+        let state = self.block_search.as_mut().expect("current picker");
+        state.observe_filter_context(filter_context);
+        if state.loading || !state.match_pending {
+            return Task::none();
+        }
+        let filter = state.filter;
+        let eligible = self.block_search_eligible(filter);
+        let Some(state) = self.block_search.as_mut() else {
+            return Task::none();
+        };
+        let intent = state.intent();
+        if state.matched_intent.as_ref() == Some(&intent) && state.matched_eligible == eligible {
+            state.match_pending = false;
+            state.match_anchor = None;
+            return Task::none();
+        }
+        let Some(epoch) = next_block_search_epoch(&mut self.next_block_search_epoch) else {
+            self.close_block_search();
+            return Task::none();
+        };
+        let identity = BlockSearchBuildIdentity {
+            session_id: state.session_id,
+            epoch,
+        };
+        let cache = std::mem::take(&mut state.cache);
+        state.epoch = epoch;
+        state.matching = true;
+        state.match_pending = false;
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.block_search_job = Some(BlockSearchJob {
+            identity,
+            matching: true,
+            cancelled: Arc::clone(&cancelled),
+        });
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let result = block_mode::browse_or_search_blocks(
+                        &cache,
+                        &intent.query,
+                        block_mode::BlockSearchOptions {
+                            case_sensitive: intent.case_sensitive,
+                            regex: intent.regex,
+                            whole_word: intent.whole_word,
+                        },
+                        intent.scope,
+                        |zone_id| eligible.contains(&zone_id),
+                        || !cancelled.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                    BlockSearchMatchBuild {
+                        cache,
+                        intent,
+                        eligible,
+                        result,
+                    }
+                })
+                .await
+                .map_err(|error| format!("block-search match worker failed: {error}"))
+            },
+            move |result| Message::BlockSearchMatched(identity, result),
+        )
     }
 
     /// Recompute-and-snap, plus returning focus to the query input.
@@ -12318,7 +12619,10 @@ impl Frost {
         let Some(state) = self.block_search.as_ref() else {
             return Task::none();
         };
-        if block_search_layout::compact(block_search_layout::panel_size(self.win_size)) {
+        if block_search_layout::compact(
+            block_search_layout::panel_size(self.win_size),
+            self.effective_font_size(),
+        ) {
             return block_search_layout::reveal();
         }
         // The list widget holds only the windowed rows, so the fraction must
@@ -12519,7 +12823,7 @@ impl Frost {
                 // check's `loading` gate itself: while a rebuild is in flight
                 // the retained hits describe the PREVIOUS index and may no
                 // longer name a live zone/line.
-                if state.query_error.is_some() || state.loading {
+                if state.query_error.is_some() || state.busy() {
                     return Some(Task::none());
                 }
                 let owner = state.session_id;
@@ -15527,7 +15831,7 @@ impl Frost {
         // message, not after an Iced message batch or a widget tree redraw.
         self.sync_terminal_pane_owners();
         self.sync_terminal_ime_owner();
-        task
+        Task::batch([task, self.dispatch_block_search_work()])
     }
 
     fn update_message(&mut self, message: Message) -> Task<Message> {
@@ -17596,8 +17900,10 @@ impl Frost {
                 }
             }
             Message::Resized(size) => {
-                let search_was_compact =
-                    block_search_layout::compact(block_search_layout::panel_size(self.win_size));
+                let search_was_compact = block_search_layout::compact(
+                    block_search_layout::panel_size(self.win_size),
+                    self.effective_font_size(),
+                );
                 self.win_size = size;
                 self.sync_organism_geometry();
                 let term_h = self.term_height();
@@ -17612,7 +17918,10 @@ impl Frost {
                 }
                 if self.block_search.is_some()
                     && (search_was_compact
-                        || block_search_layout::compact(block_search_layout::panel_size(size)))
+                        || block_search_layout::compact(
+                            block_search_layout::panel_size(size),
+                            self.effective_font_size(),
+                        ))
                 {
                     self.recompute_links();
                     self.refresh_kitty_handles();
@@ -19242,6 +19551,9 @@ impl Frost {
             }
             Message::BlockSearchClose => self.close_block_search(),
             Message::BlockSearchCacheBuilt(identity, result) => {
+                if !finish_block_search_job(&mut self.block_search_job, identity, false) {
+                    return Task::none();
+                }
                 let accepts = self
                     .block_search
                     .as_ref()
@@ -19283,12 +19595,13 @@ impl Frost {
                 }
                 match result {
                     Ok(build) => {
-                        if let Some(state) = self.block_search.as_mut() {
-                            state.cache = build.zones;
-                            state.older_not_indexed = build.older_not_indexed;
-                            state.loading = false;
+                        let should_match = self
+                            .block_search
+                            .as_mut()
+                            .is_some_and(|state| state.install_cache(build));
+                        if should_match {
+                            self.block_search_recompute();
                         }
-                        self.block_search_recompute();
                         return self.block_search_snap_task();
                     }
                     Err(error) => {
@@ -19298,12 +19611,59 @@ impl Frost {
                             state.hits = Vec::new();
                             state.capped = false;
                             state.refresh_intent = None;
+                            state.match_pending = false;
+                            state.rebuild_pending = false;
                         }
                         log::warn!("{error}");
                         self.push_toast(
                             "Could not index command blocks".to_string(),
                             ToastKind::Warning,
                         );
+                    }
+                }
+            }
+            Message::BlockSearchMatched(identity, result) => {
+                if !finish_block_search_job(&mut self.block_search_job, identity, true) {
+                    return Task::none();
+                }
+                if !self
+                    .block_search
+                    .as_ref()
+                    .is_some_and(|state| state.accepts_build(identity))
+                {
+                    // The old owner may already be closed or replaced. Drop
+                    // its cache before the update wrapper starts the new one.
+                    return Task::none();
+                }
+                let current_version = self
+                    .sessions
+                    .get(self.active)
+                    .filter(|sess| {
+                        sess.id == identity.session_id && !sess.terminal.is_alt_buffer_active()
+                    })
+                    .map(|sess| BlockSearchZoneVersion::from_terminal(&sess.terminal));
+                let Some(current_version) = current_version else {
+                    self.close_block_search();
+                    return Task::none();
+                };
+                let filter = self.block_search.as_ref().expect("current picker").filter;
+                let eligible = self.block_search_eligible(filter);
+                let state = self.block_search.as_mut().expect("current picker");
+                match result {
+                    Ok(build) => {
+                        if state.install_match(identity, build, current_version, &eligible) {
+                            return self.block_search_snap_task();
+                        }
+                    }
+                    Err(error) => {
+                        state.matching = false;
+                        state.match_pending = false;
+                        state.rebuild_pending = false;
+                        state.matched_intent = None;
+                        state.query_error = Some(
+                            "Could not search command blocks; close and reopen the browser".into(),
+                        );
+                        log::warn!("{error}");
                     }
                 }
             }
@@ -19419,6 +19779,29 @@ impl Frost {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
                     sess.block_selection.clear();
                     sess.scroll_to_bottom();
+                }
+            }
+            Message::BlockSetAllCollapsed(session_id, collapsed) => {
+                if self.block_action_available() {
+                    let changed = self
+                        .sessions
+                        .get_mut(self.active)
+                        .filter(|sess| sess.id == session_id)
+                        .map(|sess| {
+                            let changed = set_completed_output_collapsed(
+                                &sess.terminal,
+                                &mut sess.projection_policy,
+                                collapsed,
+                            );
+                            if changed > 0 {
+                                sess.refresh();
+                            }
+                            changed
+                        })
+                        .unwrap_or(0);
+                    if changed > 0 {
+                        self.refresh_active_context();
+                    }
                 }
             }
             Message::BlockMenuClose => self.block_menu = None,
@@ -21503,7 +21886,27 @@ impl Frost {
     /// a click selects the hit's zone and reveals it; nothing executes.
     fn block_search_view(&self, state: &BlockSearchState) -> Element<'_, Message> {
         let panel_size = block_search_layout::panel_size(self.win_size);
-        let compact = block_search_layout::compact(panel_size);
+        let compact = block_search_layout::compact(panel_size, self.effective_font_size());
+        let owner = self
+            .sessions
+            .iter()
+            .find(|sess| sess.id == state.session_id);
+        let filter_counts = BlockSearchFilter::ORDER.map(|filter| {
+            owner.map_or(0, |sess| {
+                sess.terminal
+                    .command_zones
+                    .iter()
+                    .filter(|zone| {
+                        filter.matches(
+                            zone,
+                            sess.block_bookmarks.contains(zone.id),
+                            sess.block_reading.seen_through,
+                            self.config.notify_long_block_threshold_ms,
+                        )
+                    })
+                    .count()
+            })
+        });
         let case_toggle = button(text("Aa").size(self.effective_font_size()))
             .on_press(Message::BlockSearchSetCaseSensitive(!state.case_sensitive))
             .padding([3, 7])
@@ -21551,7 +21954,7 @@ impl Frost {
         let query_line = || {
             row![
                 text("⌕").size(self.effective_font_size()),
-                text_input("Search command blocks…", &state.query)
+                text_input("Search or browse completed blocks…", &state.query)
                     .id(BLOCK_SEARCH_INPUT_ID.clone())
                     .on_input(Message::BlockSearchInput)
                     .size(self.effective_font_size())
@@ -21580,31 +21983,69 @@ impl Frost {
             scope_btn("Out", block_mode::BlockSearchScope::Output),
         ]
         .spacing(4)
-        .align_y(iced::Alignment::Center);
-        let filter_btn = |label: &str, filter: BlockSearchFilter| {
-            button(text(label.to_string()).size(self.effective_font_size()))
-                .on_press(Message::BlockSearchSetFilter(filter))
-                .padding([3, 7])
-                .style(if state.filter == filter {
-                    button::primary
-                } else {
-                    button::secondary
-                })
+        .align_y(iced::Alignment::Center)
+        .wrap();
+        let filter_btn = |filter: BlockSearchFilter| {
+            let index = BlockSearchFilter::ORDER
+                .iter()
+                .position(|value| *value == filter)
+                .unwrap_or(0);
+            button(
+                text(format!("{} {}", filter.label(), filter_counts[index]))
+                    .size(self.effective_font_size()),
+            )
+            .on_press(Message::BlockSearchSetFilter(filter))
+            .padding([3, 7])
+            .style(if state.filter == filter {
+                button::primary
+            } else {
+                button::secondary
+            })
         };
         let filters_top = row![
-            filter_btn("All", BlockSearchFilter::All),
-            filter_btn("Failed", BlockSearchFilter::Failed),
-            filter_btn("Slow", BlockSearchFilter::Slow),
+            filter_btn(BlockSearchFilter::All),
+            filter_btn(BlockSearchFilter::Failed),
+            filter_btn(BlockSearchFilter::Success),
+            filter_btn(BlockSearchFilter::Slow),
         ]
         .spacing(4)
-        .align_y(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center)
+        .wrap();
         let filters_bottom = row![
-            filter_btn("Bookmarked", BlockSearchFilter::Bookmarked),
-            filter_btn("Background", BlockSearchFilter::Background),
+            filter_btn(BlockSearchFilter::Bookmarked),
+            filter_btn(BlockSearchFilter::Unread),
+            filter_btn(BlockSearchFilter::Background),
         ]
         .spacing(4)
-        .align_y(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center)
+        .wrap();
         let filters = column![scopes, filters_top, filters_bottom].spacing(4);
+        let can_collapse = owner.is_some_and(|sess| {
+            sess.terminal.command_zones.iter().any(|zone| {
+                !sess.projection_policy.is_collapsed(zone.id)
+                    && sess.terminal.finished_output_range(zone.id).is_some()
+            })
+        });
+        let can_expand =
+            owner.is_some_and(|sess| sess.projection_policy.collapsed_zone_ids().next().is_some());
+        let folding = row![
+            text("Completed output").size(self.effective_font_size()),
+            button(text("Collapse all").size(self.effective_font_size()))
+                .on_press_maybe(
+                    can_collapse.then_some(Message::BlockSetAllCollapsed(state.session_id, true))
+                )
+                .padding([3, 7])
+                .style(button::secondary),
+            button(text("Expand all").size(self.effective_font_size()))
+                .on_press_maybe(
+                    can_expand.then_some(Message::BlockSetAllCollapsed(state.session_id, false))
+                )
+                .padding([3, 7])
+                .style(button::secondary),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center)
+        .wrap();
 
         // Outcome/duration for each hit's block, resolved once instead of
         // rescanning the zone deque per drawn row.
@@ -21656,13 +22097,27 @@ impl Frost {
         }
         .push(matching_actions)
         .push(filters)
+        .push(
+            text(format!(
+                "Counts: retained blocks · newest first · Slow ≥ {}",
+                block_mode::format_duration(self.config.notify_long_block_threshold_ms)
+            ))
+            .size(self.effective_font_size())
+            .wrapping(text::Wrapping::Word)
+            .style(text::secondary),
+        )
+        .push(folding)
         .spacing(8);
-        if state.loading && state.hits.is_empty() {
+        if state.busy() && state.hits.is_empty() {
             body = body.push(
                 container(
-                    text("Indexing blocks…")
-                        .size(self.effective_font_size())
-                        .style(text::secondary),
+                    text(if state.loading || state.rebuild_pending {
+                        "Indexing blocks…"
+                    } else {
+                        "Searching blocks…"
+                    })
+                    .size(self.effective_font_size())
+                    .style(text::secondary),
                 )
                 .id(block_search_layout::FEEDBACK_ID),
             );
@@ -21689,34 +22144,24 @@ impl Frost {
                 )
                 .id(block_search_layout::FEEDBACK_ID),
             );
-        } else if state.query.trim().is_empty() && state.filter == BlockSearchFilter::All {
-            let hint = if state.older_not_indexed {
-                "Type to search, or choose a filter · older blocks not indexed"
-            } else {
-                "Type to search, or choose a filter to browse blocks"
-            };
-            body = body.push(
-                container(
-                    text(hint)
-                        .size(self.effective_font_size())
-                        .style(text::secondary),
-                )
-                .id(block_search_layout::FEEDBACK_ID),
-            );
         } else if state.hits.is_empty() {
             let has_bookmarked_indexed_text = block_search_bookmarks_have_indexed_text(
                 &state.cache,
                 &bookmarked_zone_ids,
                 state.scope,
             );
-            let empty = block_search_empty_message(
-                &state.query,
-                state.filter,
-                state.scope,
-                !bookmarked_zone_ids.is_empty(),
-                has_bookmarked_indexed_text,
-                state.older_not_indexed,
-            );
+            let empty = if state.filter == BlockSearchFilter::Unread && filter_counts[5] == 0 {
+                "No unread blocks. New completions appear here while you read older output; Go live marks them seen.".to_string()
+            } else {
+                block_search_empty_message(
+                    &state.query,
+                    state.filter,
+                    state.scope,
+                    !bookmarked_zone_ids.is_empty(),
+                    has_bookmarked_indexed_text,
+                    state.older_not_indexed,
+                )
+            };
             body = body.push(
                 container(
                     text(empty)
@@ -21730,19 +22175,19 @@ impl Frost {
             // picker does not blank out, but they must be unmistakably stale:
             // every path that acts on one is refused until the rebuild lands.
             body = body.push(
-                text(if state.loading {
-                    format!("{} · refreshing…", state.count_label())
+                text(if state.busy() {
+                    format!("{} · updating…", state.count_label())
                 } else {
                     state.count_label()
                 })
                 .size(self.effective_font_size())
-                .style(if state.loading {
+                .style(if state.busy() {
                     text::warning
                 } else {
                     text::secondary
                 }),
             );
-            let stale = state.loading;
+            let stale = state.busy();
             let window = block_mode::block_search_view_window(
                 state.hits.len(),
                 state.selected,
@@ -21851,7 +22296,7 @@ impl Frost {
                 body.push(
                     scrollable(list)
                         .id(BLOCK_SEARCH_LIST_ID.clone())
-                        .height(Length::Shrink),
+                        .height(Length::Fill),
                 )
             };
         }
@@ -21890,13 +22335,9 @@ impl Frost {
             .id(block_search_layout::PANEL_ID)
             .width(Length::Fixed(panel_size.width))
             .max_height(panel_size.height)
+            .height(Length::Fixed(panel_size.height))
             .padding(12)
             .style(container::dark);
-        let panel = if compact {
-            panel.height(Length::Fixed(panel_size.height))
-        } else {
-            panel
-        };
         let dismiss = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -32413,6 +32854,9 @@ fn xterm_modify_other_keys_encode(
 }
 
 #[cfg(test)]
+mod block_browser_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn ime_owner_sync_brackets_every_reducer_and_admission_precedes_pty_write() {
@@ -39970,7 +40414,7 @@ mod tests {
     }
 
     #[test]
-    fn block_search_busy_followup_skips_invalid_or_empty_unfiltered_intent() {
+    fn block_search_busy_followup_skips_invalid_queries_but_refreshes_all_browsing() {
         let mut state = BlockSearchState {
             manual_refresh_pending: true,
             query: "needle".to_string(),
@@ -39982,11 +40426,11 @@ mod tests {
         state.manual_refresh_pending = true;
         state.query.clear();
         state.filter = BlockSearchFilter::All;
-        assert!(!state.take_manual_refresh_followup());
+        assert!(state.take_manual_refresh_followup());
         assert!(!state.manual_refresh_pending);
 
         // Empty-query metadata browsing still consumes the cache, so a
-        // coalesced request remains meaningful for every non-All filter.
+        // coalesced request remains meaningful for every filter, including All.
         state.manual_refresh_pending = true;
         state.filter = BlockSearchFilter::Failed;
         assert!(state.take_manual_refresh_followup());
@@ -39994,10 +40438,12 @@ mod tests {
         state.manual_refresh_pending = true;
         state.query = "[".to_string();
         state.regex = true;
+        state.query_error = Some("invalid regex".into());
         assert!(!state.take_manual_refresh_followup());
         assert!(!state.manual_refresh_pending);
 
         state.manual_refresh_pending = true;
+        state.query_error = None;
         state.query = "x".repeat(block_mode::BLOCK_SEARCH_QUERY_MAX_BYTES + 1);
         assert!(!state.take_manual_refresh_followup());
         assert!(!state.manual_refresh_pending);
@@ -40408,7 +40854,7 @@ mod tests {
         );
         assert_eq!(
             block_search_bookmark_button_help(false, true),
-            "Bookmarks are disabled while the index refreshes"
+            "Bookmarks are available when results finish updating"
         );
         assert!(BLOCK_SEARCH_KEYBOARD_HELP.contains("toggle bookmark on selected result"));
         assert!(
@@ -40869,7 +41315,7 @@ mod tests {
 
     #[test]
     fn block_search_filter_cycles_through_every_chip_in_both_directions() {
-        // Tab must reach all five chips: while the picker is open it owns the
+        // Tab must reach every chip: while the picker is open it owns the
         // keyboard, so a chip the cycle skips is mouse-only.
         let mut seen = Vec::new();
         let mut filter = BlockSearchFilter::default();
@@ -40918,7 +41364,7 @@ mod tests {
         assert!(state.case_sensitive && state.regex && state.whole_word);
         assert_eq!(state.scope, block_mode::BlockSearchScope::Output);
         assert_eq!(state.filter, BlockSearchFilter::Failed);
-        assert!(state.query_error.is_none());
+        assert_eq!(state.query_error.as_deref(), Some("old"));
         // The previous hits stay so an open picker is not blanked by a block
         // finishing behind it. They are shown as stale, and every path that
         // acts on one refuses while `loading` is set.
@@ -41206,6 +41652,7 @@ mod tests {
     #[test]
     fn block_search_count_label_reports_all_hits_and_the_cap() {
         let mut state = BlockSearchState {
+            query: "needle".into(),
             hits: vec![block_search_hit(1)],
             ..BlockSearchState::default()
         };
@@ -41238,6 +41685,10 @@ mod tests {
         state.capped = false;
         state.older_not_indexed = false;
         assert_eq!(state.count_label(), "0 matches");
+        state.query.clear();
+        assert_eq!(state.count_label(), "0 blocks");
+        state.hits.push(block_search_hit(1));
+        assert_eq!(state.count_label(), "1 of 1 block");
     }
 
     fn sidebar_clipboard(
