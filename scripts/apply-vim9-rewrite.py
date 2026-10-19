@@ -20,7 +20,12 @@ if 'mod vim9_ide;' not in text:
 text = replace_once(text, '    env_logger::init();\n', '    env_logger::init();\n    if let Some(result) = vim9_ide::run_if_requested() {\n        return result;\n    }\n')
 text = replace_once(text, 'enum Message {\n', 'enum Message {\n    OpenVim9Ide,\n')
 anchor = '            Message::PtyOutput(id, fd, data, watch_stamp) => {\n'
-text = replace_once(text, anchor, '            Message::OpenVim9Ide => {\n                vim9_ide::open_from_terminal(self);\n                Task::none()\n            }\n' + anchor)
+old_arm = '            Message::OpenVim9Ide => {\n                vim9_ide::open_from_terminal(self);\n                Task::none()\n            }\n'
+new_arm = '            Message::OpenVim9Ide => {\n                vim9_ide::open_from_terminal(self);\n            }\n'
+if old_arm in text:
+    text = replace_once(text, old_arm, new_arm)
+elif new_arm not in text:
+    text = replace_once(text, anchor, new_arm + anchor)
 text = replace_once(text, '        let bar = bar\n            .push(window_btn("—", Message::WindowMinimize))', '        let bar = bar\n            .push(window_btn("Vim9 IDE", Message::OpenVim9Ide))\n            .push(window_btn("—", Message::WindowMinimize))')
 path.write_text(text)
 
