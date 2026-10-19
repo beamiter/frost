@@ -2,6 +2,8 @@ mod chat_projection;
 #[cfg(all(test, target_os = "linux"))]
 mod chat_pty_tests;
 #[cfg(test)]
+mod line_selection_tests;
+#[cfg(test)]
 mod projection_properties;
 #[cfg(test)]
 mod projection_state_properties;
@@ -2147,6 +2149,38 @@ impl ProjectionPlan {
         }
     }
 
+    /// Whole-line endpoints for a retained document row, including offscreen
+    /// anchors. Direct row indexing and the first/last slices keep each drag
+    /// O(1) in history size; no source cells are decoded or plan cloned here.
+    fn selection_line_endpoints(
+        &self,
+        document_row: usize,
+    ) -> Option<(ProjectedSelectionEndpoint, ProjectedSelectionEndpoint)> {
+        let row = self.rows.get(document_row)?;
+        if !matches!(row.kind, ProjectedRowKind::Raw) {
+            return None;
+        }
+        if let (Some(first), Some(last)) = (row.raw_slices.first(), row.raw_slices.last()) {
+            return Some((
+                ProjectedSelectionEndpoint::from_raw_slice(document_row, first, 0)?,
+                ProjectedSelectionEndpoint::from_raw_slice(
+                    document_row,
+                    last,
+                    last.len.checked_sub(1)?,
+                )?,
+            ));
+        }
+        let raw_row = row.row_source?.raw_row;
+        if !raw_row.is_tracked() {
+            return None;
+        }
+        let endpoint = |col| ProjectedSelectionEndpoint {
+            point: (document_row, col),
+            anchor: ProjectedSelectionAnchor::Row { row: raw_row, col },
+        };
+        Some((endpoint(0), endpoint(self.cols.checked_sub(1)?)))
+    }
+
     /// Whether a planned row carries real content rather than a collapsed
     /// summary or structural padding.
     fn row_is_raw(&self, document_row: usize) -> bool {
@@ -2948,34 +2982,19 @@ struct ProjectedSelectionEndpoint {
     anchor: ProjectedSelectionAnchor,
 }
 
-impl ProjectedSelectionAnchor {
-    fn raw_row(self) -> RawRowId {
-        match self {
-            Self::Cell(origin) => origin.row,
-            Self::Row { row, .. } => row,
-        }
-    }
-
-    /// Re-aim this identity at another column of the same physical row.
-    ///
-    /// Word and line extension synthesize a column from the *other* endpoint,
-    /// which routinely lands past the row's real text, so the result is always
-    /// the row-scoped variant: it must never claim to be a retained cell that
-    /// does not exist.
-    fn with_col(self, col: usize) -> Self {
-        Self::Row {
-            row: self.raw_row(),
-            col,
-        }
-    }
-}
-
 impl ProjectedSelectionEndpoint {
-    fn with_col(self, row: usize, col: usize) -> Self {
-        Self {
-            point: (row, col),
-            anchor: self.anchor.with_col(col),
+    fn from_raw_slice(document_row: usize, slice: &RawSlice, offset: usize) -> Option<Self> {
+        let origin = slice.origin?;
+        if !origin.row.is_tracked() || offset >= slice.len {
+            return None;
         }
+        Some(Self {
+            point: (document_row, slice.view_col_start.checked_add(offset)?),
+            anchor: ProjectedSelectionAnchor::Cell(RawCellOrigin {
+                row: origin.row,
+                col: origin.col_start.checked_add(offset)?,
+            }),
+        })
     }
 }
 
@@ -13283,13 +13302,19 @@ impl TerminalState {
                 return;
             }
             let origin_row = selection.anchor.point.0;
+            let Some((origin_start, origin_end)) = self
+                .projection_plan_cache
+                .as_ref()
+                .and_then(|(_, plan)| plan.selection_line_endpoints(origin_row))
+            else {
+                self.clear_text_selection();
+                return;
+            };
             if target_start.point.0 < origin_row {
-                let col = selection.anchor.point.1.max(selection.active.point.1);
-                selection.anchor = selection.anchor.with_col(origin_row, col);
+                selection.anchor = origin_end;
                 selection.active = target_start;
             } else {
-                let col = selection.anchor.point.1.min(selection.active.point.1);
-                selection.anchor = selection.anchor.with_col(origin_row, col);
+                selection.anchor = origin_start;
                 selection.active = target_end;
             }
             selection.mode = SelectionMode::Normal;
