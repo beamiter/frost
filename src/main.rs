@@ -34099,7 +34099,7 @@ mod tests {
         let tooltip = bar.split_once("let detail = container(").unwrap().1;
         let tooltip = tooltip.split_once("tooltip(slot, detail").unwrap().0;
         assert!(tooltip.contains(".width(Length::Fixed(220.0))"));
-        assert!(tooltip.contains(".max_height(160.0)"));
+        assert!(tooltip.contains(".max_height(220.0)"));
         assert!(tooltip.contains(".clip(true)"));
         assert_eq!(bar.matches(".clip(true)").count(), 4);
     }
@@ -35006,7 +35006,7 @@ mod tests {
         assert!(slot.contains("if explanation.is_empty() || !self.terminal_input_active()"));
         assert!(slot.contains("Length::Fixed(64.0)"));
         assert!(slot.contains("text(sprite).font(iced::Font::MONOSPACE)"));
-        assert!(slot.contains(".max_height(160.0)"));
+        assert!(slot.contains(".max_height(220.0)"));
         assert!(slot.contains("tooltip(slot, detail, tooltip::Position::Top)"));
         assert!(!slot.contains("on_press"));
     }

@@ -10,8 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 main = (ROOT / 'src/main.rs').read_text()
 sidebar = (ROOT / 'src/sidebar.rs').read_text()
 
-def function(source, name):
-    start = source.index('fn ' + name + '(')
+def block(source, marker):
+    start = source.index(marker)
     opening = source.index('{', start)
     depth = 1
     end = opening + 1
@@ -19,6 +19,9 @@ def function(source, name):
         depth += (source[end] == '{') - (source[end] == '}')
         end += 1
     return source[start:end]
+
+def function(source, name):
+    return block(source, 'fn ' + name + '(')
 
 # Verify real startup/live-config/zoom wiring, not an independent sample model.
 assert 'Config::clamp_font_size(config.font_size)' in main
@@ -51,7 +54,14 @@ assert terminal.count('self.metrics.font_size * 0.72,') == 1
 assert terminal.count('self.metrics.font_size * 0.82,') == 3
 assert 'self.metrics.font_size * 0.9,' not in terminal
 assert 'Pixels((font_size * 0.9)' not in terminal
-assert 'let badge_w = 19.0 * cw;' in terminal
+# The lifecycle label now sizes to its actual text at the current cell width.
+# Keep the full-size glyphs, matching bounds and narrow-pane admission coupled.
+life_badge = block(terminal, 'let badge_w = presentation.life.chars().count() as f32 * cw;')
+assert 'if detail_w > 14.0 * cw + 12.0 + badge_w {' in life_badge
+assert 'presentation.life,' in life_badge
+assert 'x: area.x + area.width - 12.0 - 3.0 * cw - badge_w,' in life_badge
+assert 'width: badge_w,' in life_badge
+assert re.search(r'\},\s*self\.mono,\s*self\.metrics\.font_size,', life_badge)
 assert 'column![nav_row.wrap(), action_row.wrap()]' in main
 assert 'container(header.wrap())' in main
 settings = main.split('    fn config_panel', 1)[1].split('    fn theme_editor_view', 1)[0]
