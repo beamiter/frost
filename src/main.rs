@@ -15920,7 +15920,6 @@ impl Frost {
         match message {
             Message::OpenVim9Ide => {
                 vim9_ide::open_from_terminal(self);
-                Task::none()
             }
             Message::PtyOutput(id, fd, data, watch_stamp) => {
                 let t0 = std::time::Instant::now();
