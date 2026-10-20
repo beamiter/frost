@@ -140,14 +140,18 @@ pub enum TabPosition {
     Side,
 }
 
+fn default_organism_enabled() -> bool {
+    true
+}
+
 fn default_organism_expanded() -> bool {
     true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Offline companion in the existing bottom status bar; opt-in.
-    #[serde(default)]
+    /// Offline companion, enabled unless explicitly disabled.
+    #[serde(default = "default_organism_enabled")]
     pub ascii_organism_enabled: bool,
     /// Reserve a full-body card by default when enabled; explicit collapse is retained.
     #[serde(default = "default_organism_expanded")]
@@ -657,7 +661,7 @@ fn default_jsh_update_check() -> String {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            ascii_organism_enabled: false,
+            ascii_organism_enabled: default_organism_enabled(),
             ascii_organism_expanded: true,
             ascii_organism_motion: None,
             jsh_update_check: default_jsh_update_check(),
@@ -1382,7 +1386,7 @@ mod tests {
             let config =
                 Config::from_toml(&format!("ascii_organism_expanded = {expanded}\n")).unwrap();
             assert_eq!(config.ascii_organism_expanded, expanded);
-            assert!(!config.ascii_organism_enabled);
+            assert!(config.ascii_organism_enabled);
             let saved = toml::to_string(&config).unwrap();
             assert_eq!(
                 Config::from_toml(&saved).unwrap().ascii_organism_expanded,
@@ -1416,9 +1420,9 @@ mod tests {
     }
 
     #[test]
-    fn ascii_organism_is_opt_in_and_motion_round_trips() {
+    fn ascii_organism_defaults_on_and_motion_round_trips() {
         let default = Config::from_toml("").unwrap();
-        assert!(!default.ascii_organism_enabled);
+        assert!(default.ascii_organism_enabled);
         assert_eq!(default.ascii_organism_motion, None);
         for (label, motion) in [
             ("full", crate::organism::Motion::Full),

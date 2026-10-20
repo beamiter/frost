@@ -7,5 +7,6 @@
 # Example customizations:
 # font_size = 14.0  # main content (Block / Chat / VTE and split panes)
 # chrome_font_size = 14.0  # top bar + sidebar; omitted legacy values inherit font_size once
-# ascii_organism_enabled = true
+# ASCII organism is enabled by default; uncomment to turn it off.
+# ascii_organism_enabled = false
 # terminal_mode = "block"
