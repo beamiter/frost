@@ -1706,6 +1706,74 @@ fn should_use_cjk_fallback_font(ch: char) -> bool {
     )
 }
 
+thread_local! {
+    // Share the font database between metrics and native-editor fallback
+    // resolution. Scanning it again during each zoom would stall input.
+    static METRICS_FONT_SYSTEM: std::cell::RefCell<Option<cosmic_text::FontSystem>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_metrics_font_system<T>(read: impl FnOnce(&mut cosmic_text::FontSystem) -> T) -> T {
+    METRICS_FONT_SYSTEM.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        read(slot.get_or_insert_with(cosmic_text::FontSystem::new))
+    })
+}
+
+/// A missing named font may fall back to a proportional sans face in
+/// cosmic-text. Merely placing those glyphs at fixed columns still lets wide
+/// letters overlap. Resolve a real installed monospace family before both
+/// measuring and painting; keep an explicitly available family unchanged.
+pub(crate) fn resolve_native_editor_font(font: iced::Font) -> iced::Font {
+    with_metrics_font_system(|system| {
+        let db = system.db();
+        if let iced::font::Family::Name(requested) = font.family {
+            if let Some(name) = db
+                .faces()
+                .flat_map(|face| &face.families)
+                .map(|(name, _)| name)
+                .find(|name| name.eq_ignore_ascii_case(requested))
+            {
+                return iced::Font {
+                    family: crate::resolve_mono_font(name).family,
+                    ..font
+                };
+            }
+        } else if font.family != iced::font::Family::Monospace {
+            return font;
+        }
+        let installed: Vec<_> = db
+            .faces()
+            .filter(|face| face.monospaced)
+            .flat_map(|face| &face.families)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let preferred = [
+            "DejaVu Sans Mono",
+            "Noto Sans Mono",
+            "Liberation Mono",
+            "Noto Sans Mono CJK SC",
+        ];
+        let family = preferred
+            .iter()
+            .find_map(|wanted| {
+                installed
+                    .iter()
+                    .copied()
+                    .find(|name| name.eq_ignore_ascii_case(wanted))
+            })
+            .or_else(|| installed.first().copied());
+        if let Some(family) = family {
+            iced::Font {
+                family: crate::resolve_mono_font(family).family,
+                ..font
+            }
+        } else {
+            font
+        }
+    })
+}
+
 /// The primary font's advance width for printable ASCII at `font_size`,
 /// measured through cosmic-text — the same library and version iced's
 /// renderers shape with. Returns `None` when the font cannot be resolved or
@@ -1756,15 +1824,7 @@ fn measure_mono_ascii_advance(font: iced::Font, font_size: f32) -> Option<f32> {
         iced::font::Style::Oblique => Style::Oblique,
     };
 
-    thread_local! {
-        // FontSystem::new scans the system font database once; reuse it
-        // across font-size zooms. It lives on the UI thread, like iced's own.
-        static FONT_SYSTEM: std::cell::RefCell<Option<cosmic_text::FontSystem>> =
-            const { std::cell::RefCell::new(None) };
-    }
-    FONT_SYSTEM.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let font_system = slot.get_or_insert_with(cosmic_text::FontSystem::new);
+    with_metrics_font_system(|font_system| {
         let mut buffer = Buffer::new(font_system, TextMetrics::new(font_size, font_size));
         buffer.set_size(font_system, Some(4096.0), Some(font_size * 2.0));
         let attrs = Attrs::new()
@@ -1866,6 +1926,32 @@ fn run_layout_width(cw: f32, len: usize) -> f32 {
     cw * (len + 1) as f32
 }
 
+/// Limit CPU shaping to cells near the actual paint clip. Native Vim split
+/// views call the terminal painter only for the remaining separators/status
+/// bands; shaping the entire hidden grid for every band would multiply work
+/// by the number of splits. Two cells of slack retain a wide glyph whose
+/// trailing cell intersects the clip and natural italic/font overhang.
+fn clipped_cell_range(
+    origin: f32,
+    advance: f32,
+    count: usize,
+    clip_start: f32,
+    clip_size: f32,
+) -> std::ops::Range<usize> {
+    if advance <= 0.0 || !advance.is_finite() {
+        return 0..count;
+    }
+    let first = (((clip_start - origin) / advance).floor().max(0.0) as usize)
+        .saturating_sub(2)
+        .min(count);
+    let last = ((((clip_start + clip_size - origin) / advance)
+        .ceil()
+        .max(0.0) as usize)
+        .saturating_add(2))
+    .min(count);
+    first..last.max(first)
+}
+
 /// Clip for the collapsed-summary label. The label lays out with unbounded
 /// width (like iced's own canvas text) because a finite width would wrap it
 /// onto the next row for the reason `run_layout_width` gives; it is cut off
@@ -1904,6 +1990,71 @@ mod tests {
         BLOCK_CARD_INSET, BLOCK_CARD_RADIUS, BLOCK_GUTTER_WIDTH,
     };
     use iced::{Color, Point, Rectangle};
+
+    #[test]
+    fn missing_editor_font_resolves_a_real_monospace_family_before_bold_paint() {
+        let missing = iced::Font::with_name("Jterm definitely unavailable font 7bd8ae21");
+        let font = super::resolve_native_editor_font(missing);
+        // Font-less build images can still compile all pure geometry tests.
+        // GUI acceptance explicitly installs DejaVu/Noto and tests real pixels.
+        if font == missing {
+            return;
+        }
+        let normal = super::measure_mono_ascii_advance(font, 20.0)
+            .expect("fallback must provide a measured monospace advance");
+        for style in [iced::font::Style::Normal, iced::font::Style::Italic] {
+            let bold = iced::Font {
+                weight: iced::font::Weight::Bold,
+                style,
+                ..font
+            };
+            let advance = super::measure_mono_ascii_advance(bold, 20.0)
+                .expect("bold/italic fallback must retain fixed character advances");
+            assert!(
+                (advance - normal).abs() < 0.01,
+                "bold fallback width {advance} must match the cursor grid {normal}"
+            );
+        }
+        assert_eq!(
+            super::resolve_native_editor_font(font),
+            font,
+            "installed family choice must remain stable"
+        );
+    }
+
+    #[test]
+    fn clip_culling_keeps_wide_leads_and_overhang_without_shaping_hidden_grid() {
+        let origin = 3.5;
+        let advance = 8.25;
+        let columns = 400;
+        for x in -20..200 {
+            for width in [0.5, advance, 80.0] {
+                let range = super::clipped_cell_range(origin, advance, columns, x as f32, width);
+                for column in 0..columns {
+                    let left = origin + column as f32 * advance;
+                    // A wide glyph's leading cell must survive when only its
+                    // second cell is visible. Include natural italic overhang.
+                    let intersects = left - advance * 0.25 < x as f32 + width
+                        && left + advance * 2.25 > x as f32;
+                    if intersects {
+                        assert!(
+                            range.contains(&column),
+                            "clipped visible wide lead {column}"
+                        );
+                    }
+                }
+            }
+        }
+        let narrow = super::clipped_cell_range(origin, advance, columns, 400.0, advance);
+        assert!(
+            narrow.len() <= 6,
+            "a separator band must not shape 400 hidden cells"
+        );
+        assert_eq!(
+            super::clipped_cell_range(origin, advance, columns, origin, advance * columns as f32),
+            0..columns
+        );
+    }
 
     #[test]
     fn chat_submit_hit_is_the_clipped_paint_rect_and_body_stays_above_footer() {
@@ -3877,11 +4028,24 @@ where
             buckets
         };
 
-        for (row_idx, row) in self.grid.iter().enumerate() {
+        let visible_rows = clipped_cell_range(oy, ch, self.grid.len(), clip.y, clip.height);
+        for (row_idx, row) in self
+            .grid
+            .iter()
+            .enumerate()
+            .take(visible_rows.end)
+            .skip(visible_rows.start)
+        {
             let y = oy + row_idx as f32 * ch;
+            let visible_columns = clipped_cell_range(ox, cw, row.len(), clip.x, clip.width);
 
             // Backgrounds.
-            for (col_idx, cell) in row.iter().enumerate() {
+            for (col_idx, cell) in row
+                .iter()
+                .enumerate()
+                .take(visible_columns.end)
+                .skip(visible_columns.start)
+            {
                 if cell.flags.wide_continuation() {
                     continue;
                 }
@@ -4034,7 +4198,12 @@ where
                 *len = 0;
             };
 
-            for (col_idx, cell) in row.iter().enumerate() {
+            for (col_idx, cell) in row
+                .iter()
+                .enumerate()
+                .take(visible_columns.end)
+                .skip(visible_columns.start)
+            {
                 if cell.flags.wide_continuation() {
                     continue;
                 }

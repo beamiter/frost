@@ -528,7 +528,9 @@ impl Ide {
         size: Size,
     ) -> (Self, Task<Message>) {
         let theme = Theme::get_theme(&config.theme).unwrap_or_default();
-        let mono = super::resolve_mono_font(&config.font_family);
+        let mono = crate::terminal_view::resolve_native_editor_font(super::resolve_mono_font(
+            &config.font_family,
+        ));
         let metrics = Metrics::with_font(
             mono,
             Config::clamp_font_size(config.font_size),

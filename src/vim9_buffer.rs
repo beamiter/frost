@@ -2,7 +2,7 @@
 //!
 //! The established PTY input adapter is retained for mouse, focus and IME.
 //! Its painter is clipped to Vim's command line / compatible margins. The
-//! buffer rectangle is drawn exclusively from authenticated GUI text runs.
+//! buffer rectangles are drawn exclusively from authenticated GUI text runs.
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer::{self, Quad};
@@ -20,10 +20,12 @@ pub(crate) fn usable(frame: &Vim9RenderFrame, rows: usize, columns: usize) -> bo
     frame.supported
         && frame.rows == rows
         && frame.columns == columns
-        && frame.view.rows > 0
-        && frame.view.columns > 0
-        && frame.view.row.saturating_add(frame.view.rows) <= rows
-        && frame.view.column.saturating_add(frame.view.columns) <= columns
+        && frame.paint_views().all(|view| {
+            view.rows > 0
+                && view.columns > 0
+                && view.row.saturating_add(view.rows) <= rows
+                && view.column.saturating_add(view.columns) <= columns
+        })
 }
 
 fn rgb(value: u32) -> Color {
@@ -46,8 +48,7 @@ fn quad(bounds: Rectangle) -> Quad {
     }
 }
 
-/// Non-overlapping terminal-only bands. In the usual one-window editor this
-/// leaves only the command line/status and the outer padding to paint.
+/// Subtract one contained rectangle without overlapping the remaining bands.
 fn outside(bounds: Rectangle, view: Rectangle) -> [Rectangle; 4] {
     [
         Rectangle {
@@ -72,6 +73,26 @@ fn outside(bounds: Rectangle, view: Rectangle) -> [Rectangle; 4] {
             height: view.height,
         },
     ]
+}
+
+/// Preserve every split separator, status row and outer margin. Subtracting
+/// each window from the disjoint bands also works for mixed horizontal and
+/// vertical splits; no terminal glyph can later overpaint a native buffer.
+fn compatibility_bands(bounds: Rectangle, views: &[Rectangle]) -> Vec<Rectangle> {
+    let mut bands = vec![bounds];
+    for view in views {
+        bands = bands
+            .into_iter()
+            .flat_map(|band| match band.intersection(view) {
+                Some(covered) if covered.area() > 0.0 => outside(band, covered)
+                    .into_iter()
+                    .filter(|part| part.width > 0.0 && part.height > 0.0)
+                    .collect::<Vec<_>>(),
+                _ => vec![band],
+            })
+            .collect();
+    }
+    bands
 }
 
 pub(crate) struct NativeBuffer<'a, Message> {
@@ -174,181 +195,199 @@ where
         let m = self.metrics;
         let origin = Point::new(bounds.x + m.padding, bounds.y + m.padding);
         let frame = self.frame;
-        let view = Rectangle {
-            x: origin.x + frame.view.column as f32 * m.cell_w,
-            y: origin.y + frame.view.row as f32 * m.cell_h,
-            width: frame.view.columns as f32 * m.cell_w,
-            height: frame.view.rows as f32 * m.cell_h,
-        };
-        let Some(view) = view.intersection(&clip) else {
+        let views: Vec<_> = frame
+            .paint_views()
+            .filter_map(|view| {
+                Rectangle {
+                    x: origin.x + view.column as f32 * m.cell_w,
+                    y: origin.y + view.row as f32 * m.cell_h,
+                    width: view.columns as f32 * m.cell_w,
+                    height: view.rows as f32 * m.cell_h,
+                }
+                .intersection(&clip)
+                .map(|clipped| (view, clipped))
+            })
+            .collect();
+        if views.is_empty() {
             self.input
                 .draw(tree, renderer, theme, style, layout, cursor, viewport);
             return;
-        };
-        for band in outside(clip, view) {
-            if band.width > 0.0 && band.height > 0.0 {
-                renderer.with_layer(band, |renderer| {
-                    self.input
-                        .draw(tree, renderer, theme, style, layout, cursor, &band);
-                });
-            }
+        }
+        let rectangles: Vec<_> = views.iter().map(|(_, rect)| *rect).collect();
+        for band in compatibility_bands(clip, &rectangles) {
+            renderer.with_layer(band, |renderer| {
+                self.input
+                    .draw(tree, renderer, theme, style, layout, cursor, &band);
+            });
         }
         let (normal_fg, normal_bg, _) = colors(&frame.default_style, &frame.default_style);
-        renderer.with_layer(view, |renderer| {
-            renderer.fill_quad(quad(view), Background::Color(normal_bg));
-            // Keep italic overhang intact across adjacent highlight runs.
-            for run in &frame.runs {
-                let (_, bg, _) = colors(&run.style, &frame.default_style);
-                renderer.fill_quad(
-                    quad(Rectangle {
+        for (logical_view, view) in views {
+            renderer.with_layer(view, |renderer| {
+                renderer.fill_quad(quad(view), Background::Color(normal_bg));
+                // Keep italic overhang intact across adjacent highlight runs.
+                for run in &frame.runs {
+                    if !logical_view.contains(run.row, run.column) || run.cells == 0 {
+                        continue;
+                    }
+                    let (_, bg, _) = colors(&run.style, &frame.default_style);
+                    renderer.fill_quad(
+                        quad(Rectangle {
+                            x: origin.x + run.column as f32 * m.cell_w,
+                            y: origin.y + run.row as f32 * m.cell_h,
+                            width: run.cells as f32 * m.cell_w,
+                            height: m.cell_h,
+                        }),
+                        Background::Color(bg),
+                    );
+                }
+                for run in &frame.runs {
+                    if !logical_view.contains(run.row, run.column) || run.cells == 0 {
+                        continue;
+                    }
+                    let area = Rectangle {
                         x: origin.x + run.column as f32 * m.cell_w,
                         y: origin.y + run.row as f32 * m.cell_h,
                         width: run.cells as f32 * m.cell_w,
                         height: m.cell_h,
-                    }),
-                    Background::Color(bg),
-                );
-            }
-            for run in &frame.runs {
-                let area = Rectangle {
-                    x: origin.x + run.column as f32 * m.cell_w,
-                    y: origin.y + run.row as f32 * m.cell_h,
-                    width: run.cells as f32 * m.cell_w,
-                    height: m.cell_h,
-                };
-                let text_area = Rectangle {
-                    x: area.x - m.font_size * 0.25,
-                    width: area.width + m.font_size * 0.5,
-                    ..area
-                };
-                let Some(run_clip) = text_area.intersection(&view) else {
-                    continue;
-                };
-                if run.cells == 0 {
-                    continue;
-                }
-                let (fg, _, special) = colors(&run.style, &frame.default_style);
-                let font = Font {
-                    weight: if run.style.bold {
-                        iced::font::Weight::Bold
-                    } else {
-                        iced::font::Weight::Normal
-                    },
-                    style: if run.style.italic {
-                        iced::font::Style::Italic
-                    } else {
-                        iced::font::Style::Normal
-                    },
-                    ..self.font
-                };
-                let mut draw_text = |content: String, x: f32| {
-                    renderer.fill_text(
-                        Text {
-                            content,
-                            // iced 0.14's text cache can wrap despite Wrapping::None
-                            // at a finite rounded grid width. Clipping belongs to
-                            // the native run/view, never to the shaping bounds.
-                            bounds: Size::new(f32::INFINITY, m.cell_h),
-                            size: Pixels(m.font_size),
-                            line_height: text::LineHeight::Absolute(Pixels(m.cell_h)),
-                            font,
-                            align_x: text::Alignment::Left,
-                            align_y: iced::alignment::Vertical::Center,
-                            shaping: text::Shaping::Advanced,
-                            wrapping: text::Wrapping::None,
-                        },
-                        Point::new(x, area.center_y()),
-                        fg,
-                        run_clip,
-                    );
-                };
-                // A legal configured face or its bold/italic fallback need
-                // not have the measured primary advance. Preserve native GUI
-                // glyphs/colors but place ASCII at Vim's authoritative columns.
-                if run.text.is_ascii()
-                    && run.text.len() == run.cells
-                    && (!m.mono_advance_exact || font != self.font)
-                {
-                    for (column, ch) in run.text.chars().enumerate() {
-                        draw_text(ch.to_string(), area.x + column as f32 * m.cell_w);
+                    };
+                    let text_area = Rectangle {
+                        x: area.x - m.font_size * 0.25,
+                        width: area.width + m.font_size * 0.5,
+                        ..area
+                    };
+                    let Some(run_clip) = text_area.intersection(&view) else {
+                        continue;
+                    };
+                    if run.cells == 0 {
+                        continue;
                     }
-                } else {
-                    draw_text(run.text.clone(), area.x);
-                }
-                let thickness = (m.font_size / 14.0).clamp(1.0, 2.0);
-                let underline_y = area.y + area.height - thickness * 1.5;
-                if run.style.undercurl {
-                    let step = (m.font_size / 5.0).max(2.0);
-                    let mut x = area.x;
-                    let mut up = true;
-                    while x < area.x + area.width {
+                    let (fg, _, special) = colors(&run.style, &frame.default_style);
+                    let font = Font {
+                        weight: if run.style.bold {
+                            iced::font::Weight::Bold
+                        } else {
+                            iced::font::Weight::Normal
+                        },
+                        style: if run.style.italic {
+                            iced::font::Style::Italic
+                        } else {
+                            iced::font::Style::Normal
+                        },
+                        ..self.font
+                    };
+                    let mut draw_text = |content: String, x: f32| {
+                        renderer.fill_text(
+                            Text {
+                                content,
+                                // iced 0.14's text cache can wrap despite Wrapping::None
+                                // at a finite rounded grid width. Clipping belongs to
+                                // the native run/view, never to the shaping bounds.
+                                bounds: Size::new(f32::INFINITY, m.cell_h),
+                                size: Pixels(m.font_size),
+                                line_height: text::LineHeight::Absolute(Pixels(m.cell_h)),
+                                font,
+                                align_x: text::Alignment::Left,
+                                align_y: iced::alignment::Vertical::Center,
+                                shaping: text::Shaping::Advanced,
+                                wrapping: text::Wrapping::None,
+                            },
+                            Point::new(x, area.center_y()),
+                            fg,
+                            run_clip,
+                        );
+                    };
+                    // A legal configured face or its bold/italic fallback need
+                    // not have the measured primary advance. Preserve native GUI
+                    // glyphs/colors but place ASCII at Vim's authoritative columns.
+                    if run.text.is_ascii()
+                        && run.text.len() == run.cells
+                        && (!m.mono_advance_exact || font != self.font)
+                    {
+                        for (column, ch) in run.text.chars().enumerate() {
+                            draw_text(ch.to_string(), area.x + column as f32 * m.cell_w);
+                        }
+                    } else {
+                        draw_text(run.text.clone(), area.x);
+                    }
+                    let thickness = (m.font_size / 14.0).clamp(1.0, 2.0);
+                    let underline_y = area.y + area.height - thickness * 1.5;
+                    if run.style.undercurl {
+                        let step = (m.font_size / 5.0).max(2.0);
+                        let mut x = area.x;
+                        let mut up = true;
+                        while x < area.x + area.width {
+                            renderer.fill_quad(
+                                quad(Rectangle {
+                                    x,
+                                    y: underline_y - if up { thickness } else { 0.0 },
+                                    width: step.min(area.x + area.width - x),
+                                    height: thickness,
+                                }),
+                                Background::Color(special),
+                            );
+                            x += step;
+                            up = !up;
+                        }
+                    } else if run.style.underline {
                         renderer.fill_quad(
                             quad(Rectangle {
-                                x,
-                                y: underline_y - if up { thickness } else { 0.0 },
-                                width: step.min(area.x + area.width - x),
+                                y: underline_y,
                                 height: thickness,
+                                ..area
                             }),
                             Background::Color(special),
                         );
-                        x += step;
-                        up = !up;
                     }
-                } else if run.style.underline {
-                    renderer.fill_quad(
-                        quad(Rectangle {
-                            y: underline_y,
-                            height: thickness,
-                            ..area
-                        }),
-                        Background::Color(special),
-                    );
+                    if run.style.strikethrough {
+                        renderer.fill_quad(
+                            quad(Rectangle {
+                                y: area.center_y(),
+                                height: thickness,
+                                ..area
+                            }),
+                            Background::Color(special),
+                        );
+                    }
                 }
-                if run.style.strikethrough {
-                    renderer.fill_quad(
-                        quad(Rectangle {
-                            y: area.center_y(),
-                            height: thickness,
-                            ..area
-                        }),
-                        Background::Color(special),
-                    );
-                }
-            }
-            if frame.cursor.visible && (!self.focused || self.blink_on) {
-                let cursor = Rectangle {
-                    x: origin.x + frame.cursor.column as f32 * m.cell_w,
-                    y: origin.y + frame.cursor.row as f32 * m.cell_h,
-                    width: frame.cursor.width.max(1) as f32 * m.cell_w,
-                    height: m.cell_h,
-                };
-                if self.focused && (frame.mode.starts_with('i') || frame.mode.starts_with('R')) {
-                    renderer.fill_quad(
-                        quad(Rectangle {
-                            width: 2.0,
-                            ..cursor
-                        }),
-                        Background::Color(normal_fg),
-                    );
-                } else {
-                    renderer.fill_quad(
-                        Quad {
-                            bounds: cursor,
-                            border: iced::Border {
-                                color: normal_fg,
-                                width: 1.0,
-                                radius: 1.0.into(),
+                if frame.cursor.visible
+                    && logical_view.contains(frame.cursor.row, frame.cursor.column)
+                    && (!self.focused || self.blink_on)
+                {
+                    let cursor = Rectangle {
+                        x: origin.x + frame.cursor.column as f32 * m.cell_w,
+                        y: origin.y + frame.cursor.row as f32 * m.cell_h,
+                        width: frame.cursor.width.max(1) as f32 * m.cell_w,
+                        height: m.cell_h,
+                    };
+                    if self.focused && (frame.mode.starts_with('i') || frame.mode.starts_with('R'))
+                    {
+                        renderer.fill_quad(
+                            quad(Rectangle {
+                                width: 2.0,
+                                ..cursor
+                            }),
+                            Background::Color(normal_fg),
+                        );
+                    } else {
+                        renderer.fill_quad(
+                            Quad {
+                                bounds: cursor,
+                                border: iced::Border {
+                                    color: normal_fg,
+                                    width: 1.0,
+                                    radius: 1.0.into(),
+                                },
+                                ..Quad::default()
                             },
-                            ..Quad::default()
-                        },
-                        Background::Color(Color {
-                            a: if self.focused { 0.18 } else { 0.0 },
-                            ..normal_fg
-                        }),
-                    );
+                            Background::Color(Color {
+                                a: if self.focused { 0.18 } else { 0.0 },
+                                ..normal_fg
+                            }),
+                        );
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 }
 
@@ -411,5 +450,65 @@ mod tests {
         }
         let total: f32 = bands.iter().map(Rectangle::area).sum();
         assert_eq!(total + view.area(), bounds.area());
+    }
+
+    #[test]
+    fn mixed_split_bands_preserve_status_and_separator_at_fractional_scales() {
+        for scale in [1.0, 1.25, 2.0] {
+            let rect = |x, y, width, height| Rectangle {
+                x: x * scale,
+                y: y * scale,
+                width: width * scale,
+                height: height * scale,
+            };
+            let bounds = rect(3.5, 7.25, 800.0, 600.0);
+            let views = [
+                rect(13.5, 17.25, 380.0, 260.0),
+                rect(403.5, 17.25, 390.0, 540.0),
+                rect(13.5, 297.25, 380.0, 260.0),
+            ];
+            let bands = compatibility_bands(bounds, &views);
+            for (i, band) in bands.iter().enumerate() {
+                for view in &views {
+                    assert!(band.intersection(view).is_none_or(|r| r.area() < 0.01));
+                }
+                for other in bands.iter().skip(i + 1) {
+                    assert!(band.intersection(other).is_none_or(|r| r.area() < 0.01));
+                }
+            }
+            let area: f32 = bands.iter().chain(&views).map(Rectangle::area).sum();
+            assert!((area - bounds.area()).abs() < 0.1);
+            for (x, y) in [(398.5, 100.0), (100.0, 287.25), (100.0, 580.0)] {
+                let point = Point::new(x * scale, y * scale);
+                assert_eq!(
+                    bands.iter().filter(|band| band.contains(point)).count(),
+                    1,
+                    "separator/status/command point must be drawn exactly once"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_split_must_fit_current_terminal_geometry() {
+        let mut frame: Vim9RenderFrame = serde_json::from_value(serde_json::json!({
+            "supported": true, "rows": 30, "columns": 120,
+            "view": {"row": 0, "column": 0, "rows": 28, "columns": 59},
+            "windows": [
+                {"window": 1, "view": {"row": 0, "column": 0, "rows": 28, "columns": 59}},
+                {"window": 2, "view": {"row": 0, "column": 60, "rows": 28, "columns": 60}}
+            ]
+        }))
+        .unwrap();
+        assert!(usable(&frame, 30, 120));
+        assert!(
+            !usable(&frame, 30, 119),
+            "resize must expose current Vim screen"
+        );
+        frame.windows[1].view.columns = 61;
+        assert!(
+            !usable(&frame, 30, 120),
+            "invalid inactive window cannot be hidden"
+        );
     }
 }

@@ -16,12 +16,16 @@ document model is introduced.
 attributes; underline, undercurl, strikethrough, the cursor and Visual selection
 are GUI decoration layers. The established input adapter continues to handle
 Vim mouse reports and native IME; its terminal painter is clipped outside the
-GUI buffer rectangle so it cannot constrain buffer colors or glyphs.
+GUI buffer rectangles so it cannot constrain buffer colors or glyphs. The
+compatibility bands are disjoint even for mixed horizontal and vertical splits;
+separators and status rows remain visible and keep their Vim input behavior.
 
 The status line shows **GUI buffer · RGB** while a supported frame is present.
-Vim's command/status rows remain in the compatible surface. Multiple internal
-Vim windows, folds, diff, popup completion, conceal and unsupported shaping
-temporarily use **Compatible view**, with the runtime's reason shown. Resize,
+Vim's command/status rows remain in the compatible surface. Horizontal,
+vertical and mixed internal Vim windows use native text in every supported
+window, with a cursor and IME anchor only in the active one. Folds, diff,
+popup completion, conceal and unsupported shaping temporarily use
+**Compatible view**, with the runtime's reason shown. Resize,
 disconnection and a terminal-local Shift selection also use the compatible
 path until a current supported frame is available. Old native frames are never
 kept over a known unsupported state.
@@ -29,7 +33,11 @@ kept over a known unsupported state.
 Vim's logical display columns are retained for correct input positioning.
 Proportional text layout, arbitrary per-line heights and native completion
 popups are future work. Ctrl+wheel changes the IDE's font size without changing
-other terminal processes, native form text sizes or saved configuration.
+other terminal processes, native form text sizes or saved configuration. If
+the configured font family is absent, the IDE resolves an installed monospace
+family before measuring and painting it. This keeps regular, bold and italic
+text on the same Vim columns instead of squeezing a proportional substitute
+into a guessed cell width.
 
 ## Launch
 
@@ -216,8 +224,12 @@ the runtime removes its bootstrap token before it starts build jobs.
 
 The focused GUI-buffer test compares actual native-window pixels against an
 exact GUI RGB color while `termguicolors` is disabled and `ctermfg` deliberately
-uses a different color. It checks real editing/Ctrl+S/undo and removal/restoration
-of the native layer when a Vim split opens/closes:
+uses a different color. It checks real editing/Ctrl+S/undo, RGB pixels in
+every vertical/mixed split, active-window changes and editing, window resize,
+and font zoom. It verifies the explicit fallback reason when a real Vim
+horizontal scroll clips a CJK glyph, recovery after Vim returns to column zero,
+and removal/restoration when an unsupported window-local display option is
+toggled:
 
 ```sh
 xvfb-run -a -s '-screen 0 1600x1000x24' python3 scripts/native-vim9-buffer-smoke.py \
@@ -259,3 +271,10 @@ It sends a real
 and verifies isolated terminal state/data files remain byte-for-byte unchanged.
 These checks do not certify physical GPU performance, every Wayland compositor,
 CJK IME behavior on a user's desktop, or all plugin configurations.
+
+
+### Recovery validation — 2026-10-20
+
+Pinned shared core: `c387ab33caff52a0bd4f759fb20a35aae2586cd0`.
+Passed 11 focused tests and the real X11/WGPU window smoke: RGB in all three panes, Unicode, edit/save/undo, resize, font zoom, compatibility fallback/recovery and normal quit.
+These runs use Xvfb/software graphics; physical GPU, Wayland and OS IME candidate windows are not certified.
