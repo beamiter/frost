@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ctypes as C
 import ctypes.util
+import json
 import os
 from pathlib import Path
 import shutil
@@ -106,6 +107,28 @@ def main() -> None:
         # An exact filename match would outrank both fuzzy matches if ignore
         # handling regressed, so selecting the second result detects it.
         (ignored / 'dpndl').write_text('not a quick-open candidate\n')
+        search_rs = project / 'search-target.rs'
+        search_rs.write_text('jtermneedle\nJTermNeedle\nJTERMNEEDLE\njtermneedles\njtermother\n')
+        (project / 'search-target.txt').write_text('jtermneedle\n')
+        quickfix = root / 'quickfix.json'
+        location = root / 'location.json'
+        slow_search = root / 'slow-search.pid'
+        binary_path = root / 'bin'
+        binary_path.mkdir()
+        ripgrep = shutil.which('rg')
+        require(ripgrep is not None, 'Install ripgrep')
+        # Forward every normal search/index to actual ripgrep. One deliberate
+        # slow query creates a cancellable process without spawning descendants.
+        rg_wrapper = binary_path / 'rg'
+        rg_wrapper.write_text(
+            '#!' + sys.executable + '\nimport os, sys, time\n'
+            'from pathlib import Path\n'
+            'if "JTERM_SLOW_NATIVE" in sys.argv[1:]:\n'
+            f'    Path({str(slow_search)!r}).write_text(str(os.getpid()))\n'
+            '    time.sleep(30)\n'
+            f'os.execv({ripgrep!r}, [{ripgrep!r}, *sys.argv[1:]])\n'
+        )
+        rg_wrapper.chmod(0o700)
         position, windows, buffers = [root / name for name in ('position', 'windows', 'buffers')]
         ready, modified, current, mode = [root / name for name in ('ready', 'modified', 'current', 'mode')]
         vimrc = (
@@ -121,6 +144,8 @@ def main() -> None:
             f'  call writefile([printf("%d:%d", line("."), col("."))], {vim_string(position)})\n'
             f'  call writefile([string(winnr("$"))], {vim_string(windows)})\n'
             f'  call writefile(map(getbufinfo({{"buflisted": 1}}), {{_, info -> info.name}}), {vim_string(buffers)})\n'
+            f'  call writefile([json_encode(getqflist({{"items": 0, "title": 0, "idx": 0}}))], {vim_string(quickfix)})\n'
+            f'  call writefile([json_encode([expand("%:p"), line("."), col(".")])], {vim_string(location)})\n'
             'endfunction\n'
             "autocmd VimEnter * call timer_start(40, function('FrostRecordCursor'), {'repeat': -1})\n"
         )
@@ -128,7 +153,8 @@ def main() -> None:
         env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(root / 'config'),
                    XDG_CACHE_HOME=str(root / 'cache'), XDG_STATE_HOME=str(state),
                    XDG_DATA_HOME=str(data), XDG_RUNTIME_DIR=str(root / 'runtime'),
-                   LIBGL_ALWAYS_SOFTWARE='1', ICED_BACKEND='wgpu')
+                   LIBGL_ALWAYS_SOFTWARE='1', ICED_BACKEND='wgpu',
+                   WINIT_X11_SCALE_FACTOR='1', PATH=str(binary_path) + os.pathsep + os.environ.get('PATH', ''))
         for variable in ('WAYLAND_DISPLAY', 'VIMINIT', 'EXINIT', 'GVIMINIT'):
             env.pop(variable, None)
         log_path = root / 'window.log'
@@ -158,6 +184,7 @@ def main() -> None:
 
                 wait(lambda: read(ready) == 'ready\n', 'waiting for real Vim startup', 30)
                 window = int(wait(visible_window, 'waiting for the visible WGPU window', 30))
+                xdo('windowsize', '--sync', str(window), '1200', '700')
                 xdo('windowfocus', '--sync', str(window))
                 time.sleep(0.3)
                 # No --window option: xdotool uses real XTest events, not a
@@ -206,6 +233,12 @@ def main() -> None:
                 xdo('type', '--clearmodifiers', '--delay', '30', '2:3')
                 xdo('key', '--clearmodifiers', 'Return')
                 wait(lambda: read(position).strip() == '2:3', 'jumping through the native line:column form')
+                xdo('key', '--clearmodifiers', 'alt+Left')
+                wait(lambda: read(current).strip() == str(quick_b) and read(position).strip() == '1:1',
+                     'returning to the prior Vim location with native Alt+Left')
+                xdo('key', '--clearmodifiers', 'alt+Right')
+                wait(lambda: read(current).strip() == str(quick_b) and read(position).strip() == '2:3',
+                     'moving forward through the same Vim jump list with native Alt+Right')
                 xdo('type', '--clearmodifiers', '--delay', '30', 'iGOTO-')
                 xdo('key', '--clearmodifiers', 'Escape')
                 wait(lambda: read(modified) == '1\n', 'editing after native line navigation')
@@ -242,6 +275,94 @@ def main() -> None:
                 xdo('click', '1')
                 wait(lambda: read(windows).strip() == '2', 'splitting through the native toolbar')
 
+                def qf_items(query: str, count: int):
+                    try:
+                        value = json.loads(read(quickfix))
+                    except (ValueError, OSError):
+                        return None
+                    if value.get('title') == 'Search: ' + query and len(value.get('items', [])) == count:
+                        return value['items']
+                    return None
+
+                # The default form preserves literal smart-case matching.
+                # Results are sampled from Vim's real quickfix list, not the UI.
+                xdo('key', '--clearmodifiers', 'ctrl+shift+f')
+                time.sleep(0.2)
+                xdo('type', '--clearmodifiers', '--delay', '20', 'jtermneedle')
+                xdo('key', '--clearmodifiers', 'Return')
+                wait(lambda: qf_items('jtermneedle', 5), 'searching with the default native smart-case form')
+
+                def search_control(dx: int, dy: int):
+                    # This fixture fixes the viewport and X11 scale above. The
+                    # native search card is centered; these are control centers
+                    # relative to that center, not synthetic reducer messages.
+                    xdo('mousemove', '--window', str(window), str(600 + dx), str(350 + dy))
+                    xdo('click', '1')
+
+                xdo('key', '--clearmodifiers', 'ctrl+shift+f')
+                time.sleep(0.25)
+                search_control(-132, -14)  # Match case
+                search_control(-93, 19)  # Whole word
+                search_control(0, 54)  # File glob
+                xdo('type', '--clearmodifiers', '--delay', '20', '*.rs')
+                xdo('key', '--clearmodifiers', 'Return')
+                exact = wait(lambda: qf_items('jtermneedle', 1),
+                             'applying native match-case, whole-word and file-glob controls')
+                require(exact[0]['lnum'] == 1, 'Filtered search selected the wrong source line')
+
+                xdo('key', '--clearmodifiers', 'ctrl+shift+f')
+                time.sleep(0.25)
+                search_control(-66, -14)  # Ignore case
+                search_control(-262, 19)  # Regular expression
+                search_control(0, -55)  # Query
+                xdo('key', '--clearmodifiers', 'ctrl+a')
+                expression = '^jterm(needle|other)$'
+                xdo('type', '--clearmodifiers', '--delay', '20', expression)
+
+                def editor_location():
+                    # Vim's sampler may be in writefile() while the test reads.
+                    # Parse one complete record rather than comparing a partial
+                    # empty file or independently sampled filename/coordinates.
+                    try:
+                        value = json.loads(read(location))
+                    except (ValueError, OSError):
+                        return None
+                    return value if isinstance(value, list) and len(value) == 3 else None
+
+                previous_location = wait(editor_location, 'sampling Vim before native form navigation')
+                xdo('key', '--clearmodifiers', 'alt+Left')
+                time.sleep(0.15)
+                current_location = wait(editor_location, 'sampling Vim after native form navigation')
+                require(current_location == previous_location,
+                        f'Native form navigation moved Vim: {previous_location!r} -> {current_location!r}')
+                xdo('key', '--clearmodifiers', 'Return')
+                regex_rows = wait(lambda: qf_items(expression, 4),
+                                  'applying native regex and ignore-case with retained whole-word/glob options')
+                require({item['lnum'] for item in regex_rows} == {1, 2, 3, 5},
+                        'Regex/case options did not reach the actual ripgrep search')
+
+                xdo('key', '--clearmodifiers', 'ctrl+shift+f')
+                time.sleep(0.2)
+                xdo('key', '--clearmodifiers', 'ctrl+a')
+                xdo('type', '--clearmodifiers', '--delay', '10', 'JTERM_SLOW_NATIVE')
+                xdo('key', '--clearmodifiers', 'Return')
+                wait(lambda: read(slow_search), 'starting the deliberately slow cancellable search')
+                slow_pid = int(read(slow_search))
+                xdo('key', '--clearmodifiers', 'ctrl+shift+f')
+                time.sleep(0.25)
+                search_control(-58, 137)  # Stop search, without closing the form
+
+                def slow_search_stopped():
+                    try:
+                        os.kill(slow_pid, 0)
+                    except ProcessLookupError:
+                        return True
+                    return False
+
+                wait(slow_search_stopped, 'cancelling the real search job through the native Stop search button', 5)
+                require(qf_items(expression, 4) == regex_rows, 'Cancelled search replaced the previous quickfix list')
+                xdo('key', '--clearmodifiers', 'Escape')
+
                 # The native build form must preserve literal user review and
                 # then start the same typed async build path as its Apply button.
                 built = project / 'native-build.marker'
@@ -255,7 +376,7 @@ def main() -> None:
                 require(process.wait(timeout=10) == 0, 'Saved editor did not exit gracefully')
                 require(snapshot(state) == before_state, 'IDE changed persistent terminal state')
                 require(snapshot(data) == before_data, 'IDE changed persistent terminal data')
-                print('PASS: real XTest edit, native save/open/build, recursive fuzzy picker and selection, line:column jump, native split, buffer navigation/dirty-close refusal, WM dirty-close refusal, graceful exit, unchanged terminal state/data')
+                print('PASS: real XTest edit, native save/open/build, search case/regex/whole-word/glob controls and job cancellation, recursive fuzzy picker and selection, line:column jump and back/forward, native split, buffer navigation/dirty-close refusal, WM dirty-close refusal, graceful exit, unchanged terminal state/data')
             finally:
                 # Cleanup applies only to this explicitly created test process
                 # after a failure. It is never evidence for a successful exit.

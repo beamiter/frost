@@ -11,13 +11,14 @@ use std::time::{Duration, Instant};
 use iced::advanced::input_method;
 use iced::advanced::widget::{self, operation, Id};
 use iced::widget::{
-    button, column, container, mouse_area, row, scrollable, stack, text, text_input, tooltip, Space,
+    button, checkbox, column, container, mouse_area, row, scrollable, stack, text, text_input,
+    tooltip, Space,
 };
 use iced::{keyboard, Element, Length, Size, Subscription, Task};
 use jterm_core::pty_input::{self, PasteModes, PastePolicy, UnbracketedMultiline};
 use jterm_core::vim9::{
     self, ProjectEntry, Vim9Command, Vim9ProjectFile, Vim9ProjectIndex, Vim9ProjectSnapshot,
-    Vim9Session, Vim9Snapshot,
+    Vim9SearchCase, Vim9SearchOptions, Vim9Session, Vim9Snapshot,
 };
 
 use super::{config, native_enter, terminal, terminal_ime, terminal_view};
@@ -205,7 +206,7 @@ impl FormKind {
             Self::QuickOpen => "Search project filenames. ↑ / ↓ selects, Enter opens, Esc returns to Vim. Ignore rules are respected.",
             Self::Goto => "Enter a line or line:column. The column is a Vim byte column. The current buffer stays open.",
             Self::Open => "Enter a local filename. New files require an existing parent directory. Vim retains its normal unsaved-buffer checks.",
-            Self::Search => "Literal project search using ripgrep. No shell interpretation. Results replace Vim's quickfix list.",
+            Self::Search => "Search project text using ripgrep. Choose literal or regular expression matching and an optional file glob. Results replace Vim's quickfix list.",
             Self::Build => "Review this shell command before running it. Empty uses Vim's makeprg. Nothing is saved or executed automatically.",
             Self::SaveAndBuild => "Save all buffers, then run this reviewed build command. If saving fails, the build will not start.",
             Self::Rename => "Requires a configured Vim9 LSP provider. Enter the new symbol name.",
@@ -236,6 +237,10 @@ enum Message {
     Command(Vim9Command),
     ShowForm(FormKind),
     FormInput(String),
+    SearchCase(Vim9SearchCase),
+    SearchRegex(bool),
+    SearchWholeWord(bool),
+    SearchGlob(String),
     SubmitForm,
     CancelForm,
     RefreshIndex,
@@ -278,6 +283,7 @@ struct Ide {
     quick_matches: Vec<Vim9ProjectFile>,
     build_command: String,
     search_query: String,
+    search_options: Vim9SearchOptions,
     error: Option<String>,
     size: Size,
     focused: bool,
@@ -326,6 +332,28 @@ fn bounded_input(value: String) -> String {
     bounded_text(value, MAX_INPUT)
 }
 
+fn search_options_summary(options: &Vim9SearchOptions) -> String {
+    let matching = if options.regex { "Regex" } else { "Literal" };
+    let case = match options.case {
+        Vim9SearchCase::Smart => "Smart case",
+        Vim9SearchCase::Sensitive => "Match case",
+        Vim9SearchCase::Ignore => "Ignore case",
+    };
+    format!(
+        "{matching} · {case}{} · Files: {}",
+        if options.whole_word {
+            " · Whole word"
+        } else {
+            ""
+        },
+        if options.glob.is_empty() {
+            "all eligible files".to_owned()
+        } else {
+            visible_label(&options.glob)
+        }
+    )
+}
+
 fn bounded_text(mut value: String, limit: usize) -> String {
     if value.len() > limit {
         let mut end = limit;
@@ -367,10 +395,19 @@ enum Shortcut {
     CloseCurrentBuffer,
     NextProblem,
     PreviousProblem,
+    NavigateBack,
+    NavigateForward,
 }
 
 fn native_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Option<Shortcut> {
     use keyboard::key::Named;
+    if modifiers.alt() && !modifiers.control() && !modifiers.shift() && !modifiers.logo() {
+        return match key {
+            keyboard::Key::Named(Named::ArrowLeft) => Some(Shortcut::NavigateBack),
+            keyboard::Key::Named(Named::ArrowRight) => Some(Shortcut::NavigateForward),
+            _ => None,
+        };
+    }
     if modifiers.alt() || modifiers.logo() {
         return None;
     }
@@ -511,6 +548,7 @@ impl Ide {
             quick_matches: Vec::new(),
             build_command,
             search_query: String::new(),
+            search_options: Vim9SearchOptions::default(),
             error,
             size,
             focused: true,
@@ -647,6 +685,11 @@ impl Ide {
         }
         widget::operate(operation::focusable::focus(Id::new(INPUT_ID)))
     }
+    fn search_form_open(&self) -> bool {
+        self.form
+            .as_ref()
+            .is_some_and(|form| form.kind == FormKind::Search)
+    }
     fn submit(&mut self) {
         let Some(form) = self.form.take() else {
             return;
@@ -703,7 +746,10 @@ impl Ide {
             FormKind::Search => {
                 self.search_query.clone_from(&form.value);
                 self.output_tab = false;
-                Vim9Command::Search { query: form.value }
+                Vim9Command::SearchWithOptions {
+                    query: form.value,
+                    options: self.search_options.clone(),
+                }
             }
             FormKind::Build | FormKind::SaveAndBuild => {
                 self.build_command.clone_from(&form.value);
@@ -723,6 +769,7 @@ impl Ide {
         if matches!(
             action,
             Vim9Command::Search { .. }
+                | Vim9Command::SearchWithOptions { .. }
                 | Vim9Command::Build { .. }
                 | Vim9Command::SaveAndBuild { .. }
         ) {
@@ -785,6 +832,8 @@ impl Ide {
             Shortcut::CloseCurrentBuffer => Vim9Command::CloseCurrentBuffer,
             Shortcut::NextProblem => Vim9Command::NextDiagnostic,
             Shortcut::PreviousProblem => Vim9Command::PreviousDiagnostic,
+            Shortcut::NavigateBack => Vim9Command::NavigateBack,
+            Shortcut::NavigateForward => Vim9Command::NavigateForward,
         };
         self.send(command);
         Task::none()
@@ -948,6 +997,26 @@ impl Ide {
                     form.selected = 0;
                 }
                 self.refresh_quick_matches(false);
+            }
+            Message::SearchCase(value) => {
+                if self.search_form_open() {
+                    self.search_options.case = value;
+                }
+            }
+            Message::SearchRegex(value) => {
+                if self.search_form_open() {
+                    self.search_options.regex = value;
+                }
+            }
+            Message::SearchWholeWord(value) => {
+                if self.search_form_open() {
+                    self.search_options.whole_word = value;
+                }
+            }
+            Message::SearchGlob(value) => {
+                if self.search_form_open() {
+                    self.search_options.glob = bounded_input(value);
+                }
             }
             Message::SubmitForm => self.submit(),
             Message::RefreshIndex => self.refresh_index(),
@@ -1388,6 +1457,22 @@ impl Ide {
             .on_press_maybe(self.snapshot.connected.then_some(Message::Command(command)))
             .into()
     }
+    fn navigation_button(
+        &self,
+        label: &'static str,
+        help: &'static str,
+        available: bool,
+        command: Vim9Command,
+    ) -> Element<'_, Message> {
+        tooltip(
+            button(text(label).size(14)).padding([4, 8]).on_press_maybe(
+                (self.snapshot.connected && available).then_some(Message::Command(command)),
+            ),
+            text(help).size(12),
+            tooltip::Position::Bottom,
+        )
+        .into()
+    }
     fn optional_button(
         &self,
         label: &'static str,
@@ -1580,13 +1665,59 @@ impl Ide {
                 );
             }
         } else {
-            if self.snapshot.search.running {
-                contents = contents.push(text("Searching project…").size(12));
-            } else if !self.snapshot.search.query.is_empty() {
+            let search = &self.snapshot.search;
+            if search.running {
+                contents = contents.push(
+                    row![
+                        text(if search.cancelled {
+                            "Stopping project search…"
+                        } else {
+                            "Searching project…"
+                        })
+                        .size(12),
+                        button(text("Stop search").size(12)).on_press_maybe(
+                            (self.snapshot.connected && !search.cancelled)
+                                .then_some(Message::Command(Vim9Command::CancelSearch))
+                        ),
+                    ]
+                    .spacing(8),
+                );
+            } else if !search.query.is_empty() {
                 contents = contents.push(
                     text(format!(
-                        "Search: {} retained, {} omitted",
-                        self.snapshot.search.count, self.snapshot.search.truncated
+                        "Last project search{}: {} · {} collected, {} omitted",
+                        if search.cancelled {
+                            " (cancelled; previous quickfix kept)"
+                        } else if !(0..=1).contains(&search.exit_code) {
+                            " (failed; previous quickfix kept)"
+                        } else {
+                            ""
+                        },
+                        visible_label(&search.query),
+                        search.count,
+                        search.truncated
+                    ))
+                    .size(12),
+                );
+            }
+            if !search.query.is_empty() {
+                contents = contents.push(
+                    text(format!(
+                        "Last search options: {}",
+                        search_options_summary(&search.options)
+                    ))
+                    .size(11),
+                );
+            }
+            let quickfix = &self.snapshot.quickfix;
+            if !quickfix.title.is_empty() || quickfix.count > 0 {
+                contents = contents.push(
+                    text(format!(
+                        "Vim quickfix · {} · {} / {} · {}",
+                        visible_label(&quickfix.source),
+                        quickfix.index,
+                        quickfix.count,
+                        visible_label(&quickfix.title)
                     ))
                     .size(12),
                 );
@@ -1631,6 +1762,18 @@ impl Ide {
     fn view(&self) -> Element<'_, Message> {
         let header = row![
             text("FROST / VIM9").size(15),
+            self.navigation_button(
+                "←",
+                "Back to previous location (Alt+Left)",
+                self.snapshot.navigation.can_go_back,
+                Vim9Command::NavigateBack,
+            ),
+            self.navigation_button(
+                "→",
+                "Forward to next location (Alt+Right)",
+                self.snapshot.navigation.can_go_forward,
+                Vim9Command::NavigateForward,
+            ),
             button(text("Quick open…").size(13)).on_press(Message::ShowForm(FormKind::QuickOpen)),
             button(text("Files").size(13)).on_press(Message::ToggleFiles),
             button(text("Open…").size(13)).on_press(Message::ShowForm(FormKind::Open)),
@@ -1807,6 +1950,52 @@ impl Ide {
             );
         }
         let quick = form.kind == FormKind::QuickOpen;
+        if form.kind == FormKind::Search {
+            let mut cases = row![text("Case:").size(13)]
+                .spacing(6)
+                .align_y(iced::Alignment::Center);
+            for (label, case) in [
+                ("Smart", Vim9SearchCase::Smart),
+                ("Match", Vim9SearchCase::Sensitive),
+                ("Ignore", Vim9SearchCase::Ignore),
+            ] {
+                cases = cases.push(
+                    button(text(label).size(13))
+                        .style(if self.search_options.case == case {
+                            button::primary
+                        } else {
+                            button::secondary
+                        })
+                        .on_press(Message::SearchCase(case)),
+                );
+            }
+            dialog_body = dialog_body
+                .push(cases)
+                .push(
+                    row![
+                        checkbox(self.search_options.regex)
+                            .label("Regular expression")
+                            .text_size(13)
+                            .on_toggle(Message::SearchRegex),
+                        checkbox(self.search_options.whole_word)
+                            .label("Whole word")
+                            .text_size(13)
+                            .on_toggle(Message::SearchWholeWord),
+                    ]
+                    .spacing(20),
+                )
+                .push(
+                    text_input("Files: one glob, e.g. *.rs or src/**", &self.search_options.glob)
+                        .on_input(Message::SearchGlob)
+                        .on_submit(Message::SubmitForm)
+                        .size(13)
+                        .padding(8),
+                )
+                .push(
+                    text("Smart case matches case only when the query contains uppercase. An empty file glob searches all eligible files; spaces belong to the glob.")
+                        .size(12),
+                );
+        }
         if quick {
             let index_state = if self.project.scanning {
                 "Indexing project files…".to_string()
@@ -1880,6 +2069,16 @@ impl Ide {
             button("Cancel").on_press(Message::CancelForm),
         ]
         .spacing(8);
+        if form.kind == FormKind::Search {
+            actions = actions.push(
+                button("Stop search").on_press_maybe(
+                    (self.snapshot.connected
+                        && self.snapshot.search.running
+                        && !self.snapshot.search.cancelled)
+                        .then_some(Message::Command(Vim9Command::CancelSearch)),
+                ),
+            );
+        }
         if quick {
             actions = actions
                 .push(Space::new().width(Length::Fill))
@@ -2015,6 +2214,25 @@ mod tests {
             native_shortcut(&Key::Named(Named::PageDown), chord),
             Some(Shortcut::NextBuffer)
         );
+        assert_eq!(
+            native_shortcut(&Key::Named(Named::ArrowLeft), Modifiers::ALT),
+            Some(Shortcut::NavigateBack)
+        );
+        assert_eq!(
+            native_shortcut(&Key::Named(Named::ArrowRight), Modifiers::ALT),
+            Some(Shortcut::NavigateForward)
+        );
+        for modifiers in [
+            Modifiers::CTRL,
+            Modifiers::empty(),
+            Modifiers::ALT | Modifiers::CTRL,
+            Modifiers::ALT | Modifiers::SHIFT,
+            Modifiers::ALT | Modifiers::LOGO,
+        ] {
+            for direction in [Named::ArrowLeft, Named::ArrowRight] {
+                assert_eq!(native_shortcut(&Key::Named(direction), modifiers), None);
+            }
+        }
         for key in ["p", "o", "w", "g", "f", "b"] {
             assert_eq!(
                 native_shortcut(&Key::Character(key.into()), Modifiers::CTRL),

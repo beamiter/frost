@@ -61,6 +61,13 @@ within the current buffer, including unnamed buffers, and uses Vim's byte
 column convention. Invalid coordinates keep the form open with an explanation.
 The typed request does not interpolate user text into an Ex command.
 
+**Back / Forward** (the header arrows, `Alt+Left` / `Alt+Right`) follow Vim's
+actual jump list. Native file opens and line jumps participate in that list,
+so a definition, Quick Open result or diagnostic can be followed and then
+returned from. The arrows reflect whether Vim has a previous/next location.
+Ordinary `Ctrl+O` and `Ctrl+I` still reach Vim; no separate GUI cursor history
+can diverge from Vim's own navigation. Modified-buffer checks remain active.
+
 The project sidebar lists one directory at a time, directories first, with Up
 and Refresh controls. Reads run on a worker with a single in-flight scan and
 one latest queued request. The list is capped at 1,024 entries. Directory
@@ -81,12 +88,27 @@ column and line count, filetype, encoding, split count, pending requests and
 connection state appear in the status line. Vertical split and Horizontal split
 open real Vim splits; regular Vim window commands continue to navigate them.
 
-Search uses the shared runtime's **literal ripgrep search** and honors its
-ignore rules. Install `rg` for this action. Search results and build diagnostics
-use Vim quickfix and the native Problems view. Clicking a diagnostic opens its
-real filename and location. Search retains up to 256 matching lines and reports
-omitted matches. Buffer and diagnostic snapshots are also bounded to 256 items;
-truncation is indicated rather than presented as a complete list.
+Search uses ripgrep with native controls for **Smart / Match / Ignore case**,
+**Regular expression**, **Whole word**, and an optional **single file glob**.
+The defaults preserve literal smart-case search: a lowercase query ignores
+case, while uppercase text makes matching case-sensitive. `*.rs` narrows the
+search to Rust files; an empty glob searches all eligible files. Spaces belong
+to the glob and are never split into shell arguments. Options persist for the
+current editor process, and are sent only when Apply or Enter starts a search.
+Ignore rules still apply. Install `rg` for this action. Invalid expressions and
+search failures remain visible. **Stop search** is available in the form and
+the Problems view while a search runs; cancellation is shown explicitly.
+
+Search results and build diagnostics use Vim quickfix and the native Problems
+view. Clicking a diagnostic opens its real filename and location. The panel
+separately labels the current quickfix title, source and active entry, and the
+last project search count and executed options, so a build that replaces
+quickfix cannot appear to be the previous search. Changing search controls
+does not relabel the options used for existing results. Other Vim diagnostic
+providers can contribute their own entries. Search retains up to 256 matching
+lines and reports omissions.
+Buffer and diagnostic snapshots are also bounded to 256 items; truncation is
+indicated rather than presented as a complete list.
 
 Build opens a command-entry form for explicit review. An empty value uses Vim's
 `makeprg`; Cargo projects initially suggest `cargo check --message-format=short`.
@@ -114,6 +136,7 @@ editor font size for this process without rewriting configuration.
 | --- | --- |
 | Ctrl+Shift+P | Quick Open project filename picker |
 | Ctrl+Shift+G | Go to line or line:column |
+| Alt+Left / Alt+Right | Back / forward through Vim's jump list |
 | Ctrl+Shift+O | Open a file/new-file path form |
 | Ctrl+S | Save current buffer |
 | Ctrl+Shift+F | Search project form |
@@ -186,9 +209,15 @@ The window test requires X11/Xvfb, xdotool, libX11 and libxkbcommon-x11. It
 requires the WGPU renderer (without a tiny-skia fallback) and uses actual XTest
 input through the Iced window and native forms/shortcuts. It verifies recursive
 fuzzy Quick Open with ignored paths excluded, arrow selection, line:column
-navigation, immediate Escape-then-save, Ctrl+S, real splits, buffer switching,
+navigation and jump-list back/forward, immediate Escape-then-save, Ctrl+S, real
+splits, buffer switching,
 dirty buffer-close refusal and rapid navigation followed by current-buffer
-close. It sends a real
+close. Search checks click the native case/regex/whole-word/file-glob controls
+and inspect actual ripgrep results in Vim's quickfix list. A deliberately slow
+search fixture verifies the Stop search button terminates its job while keeping
+the previous quickfix list; other searches use the installed ripgrep binary.
+The test also verifies that Alt+Left in a native form does not move Vim's cursor.
+It sends a real
 `WM_DELETE_WINDOW` request, checks dirty-close refusal and graceful saved exit,
 and verifies isolated terminal state/data files remain byte-for-byte unchanged.
 These checks do not certify physical GPU performance, every Wayland compositor,

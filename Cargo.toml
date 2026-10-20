@@ -22,7 +22,7 @@ cosmic-text = "0.15"
 iced_winit = { version = "=0.14.0", default-features = false }
 libc = "0.2"
 # Pin the shared contract so a branch move cannot silently change a release build.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "3b6b0590799bca0a64441f1f5fe17e2cf0234cbd" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "d042bf2511dd34962886858ec55c9542df695f6e" }
 tokio = { version = "1", features = ["rt"] }
 anyhow = "1.0"
 log = "0.4"
@@ -69,4 +69,4 @@ wayland-client = { path = "vendor/wayland-client" }
 
 
 [dev-dependencies]
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "3b6b0590799bca0a64441f1f5fe17e2cf0234cbd", features = ["session-parity-tests"] }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "d042bf2511dd34962886858ec55c9542df695f6e", features = ["session-parity-tests"] }
