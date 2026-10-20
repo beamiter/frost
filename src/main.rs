@@ -6583,6 +6583,36 @@ fn immersive_block_command(command: &str) -> bool {
         .rsplit('/')
         .next()
         .unwrap_or("");
+    // Help and batch/print invocations are not immersive CLIs. Preserve
+    // normal block navigation for them, including `codex exec` and `claude -p`.
+    if words
+        .clone()
+        .any(|arg| matches!(arg, "-h" | "--help" | "--version"))
+    {
+        return false;
+    }
+    const AGENTS: &[&str] = &[
+        "codex",
+        "@openai/codex",
+        "claude",
+        "@anthropic-ai/claude-code",
+        "gemini",
+        "opencode",
+        "aider",
+    ];
+    const NON_INTERACTIVE: &[&str] = &[
+        "exec",
+        "e",
+        "completion",
+        "login",
+        "logout",
+        "--print",
+        "-p",
+        "--prompt",
+    ];
+    if AGENTS.contains(&name) && words.any(|arg| NON_INTERACTIVE.contains(&arg)) {
+        return false;
+    }
     const APPS: &[&str] = &[
         "vi",
         "vim",
@@ -6629,8 +6659,9 @@ fn block_reading_bar_should_show(
     block_mode
         && !user_hidden
         && !alternate_screen
-        && !running_command.is_some_and(immersive_block_command)
-        && !foreground_process.is_some_and(immersive_block_command)
+        && !running_command
+            .or(foreground_process)
+            .is_some_and(immersive_block_command)
 }
 
 fn terminal_panes_body<'a, Message: 'a, Renderer: iced::advanced::Renderer + 'a>(
@@ -9111,7 +9142,11 @@ impl Frost {
             self.block_bar_user_hidden,
             session.is_some_and(|session| session.terminal.is_alt_buffer_active()),
             session.and_then(|session| session.terminal.running_command_text()),
-            session.and_then(|session| session.fg_proc_cache.as_deref()),
+            session.and_then(|session| {
+                (!session.terminal.agent_prompt_status().is_ready())
+                    .then(|| session.fg_proc_cache.as_deref())
+                    .flatten()
+            }),
         )
     }
 
@@ -33305,6 +33340,14 @@ mod tests {
         assert!(tui("pnpm dlx codex"));
         assert!(!tui("echo codex"));
         assert!(!tui("cargo test"));
+        assert!(!tui("codex exec --json"));
+        assert!(!tui("npx @openai/codex exec"));
+        assert!(!tui("claude -p hello"));
+        assert!(!tui("gemini --prompt hello"));
+        assert!(!tui("vim --version"));
+        assert!(tui("codex --no-alt-screen"));
+        assert!(visible(true, false, false, Some("codex exec --json"), Some("codex")));
+        assert!(visible(true, false, false, Some("cargo test"), Some("codex")));
         assert!(visible(true, false, false, Some("cargo test"), None));
         assert!(visible(true, false, false, None, None));
         assert!(!visible(true, false, true, None, None));
