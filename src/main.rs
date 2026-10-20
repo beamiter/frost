@@ -5068,6 +5068,9 @@ enum Message {
     BlockComparisonCopy,
     BlockReadingNavigate(bool),
     BlockGoLive,
+    BlockReadingMenuOpened(usize),
+    BlockReadingMenuClosed,
+    BlockReadingMenuAction(usize, &'static str),
     /// Presentation-only bulk folding, bound to the pane that drew the control.
     BlockSetAllCollapsed(usize, bool),
     BlockSearchInput(String),
@@ -6917,6 +6920,9 @@ struct Frost {
     workflow_overlay: Option<workflow_picker::WorkflowOverlay>,
     /// Cross-block search picker overlay (`block:search`, Ctrl+Alt+F).
     block_search: Option<BlockSearchState>,
+    /// The compact toolbar popup owns input until an action or dismissal.
+    block_reading_menu: Option<usize>,
+    block_reading_menu_epoch: Arc<()>,
     /// Last matching intent for this window. Memory-only: cache/results and
     /// pane identity are rebuilt fresh whenever the picker opens.
     block_search_memory: BlockSearchMemory,
@@ -7159,6 +7165,8 @@ impl Frost {
             terminal_ime: terminal_ime::Ownership::default(),
             workflow_overlay: None,
             block_search: None,
+            block_reading_menu: None,
+            block_reading_menu_epoch: Arc::new(()),
             block_search_memory: BlockSearchMemory::default(),
             next_block_search_epoch: 0,
             block_search_job: None,
@@ -7676,6 +7684,7 @@ impl Frost {
             && self.history_picker.is_none()
             && self.workflow_overlay.is_none()
             && self.block_search.is_none()
+            && self.block_reading_menu.is_none()
             && self.block_menu.is_none()
             && self.block_review.is_none()
             && self.block_clear_confirm.is_none()
@@ -7716,6 +7725,7 @@ impl Frost {
             && self.history_picker.is_none()
             && self.workflow_overlay.is_none()
             && self.block_search.is_none()
+            && self.block_reading_menu.is_none()
             && self.block_menu.is_none()
             && self.block_review.is_none()
             && self.block_clear_confirm.is_none()
@@ -9020,16 +9030,35 @@ impl Frost {
         if !self.config.is_block_mode() {
             return 0.0;
         }
-        let scale = (self.effective_font_size() / 11.0).max(1.0);
-        let logical_width = self.term_width() / scale;
-        let height = if logical_width < 220.0 {
-            116.0
-        } else if logical_width < 430.0 {
-            90.0
-        } else {
-            64.0
-        };
-        height * scale
+        // One line at every width. Reserve the actual text line plus control
+        // and container padding, so narrowing a pane or selecting a block
+        // never grows the toolbar and reflows the terminal underneath it.
+        ui_typography::row_height(self.effective_font_size(), 36.0, 14.0)
+    }
+
+    fn block_reading_bar_compact(&self) -> bool {
+        self.term_width() < 680.0 * (self.effective_font_size() / 14.0).max(1.0)
+    }
+
+    fn block_reading_menu_available(&self, owner: usize) -> bool {
+        self.focused
+            && self.config.is_block_mode()
+            && self.block_reading_bar_compact()
+            && self.sessions.get(self.active).is_some_and(|session| {
+                session.id == owner
+                    && !session.terminal.is_alt_buffer_active()
+                    && (!session.terminal.command_zones.is_empty()
+                        || session.projection.scroll_offset() > 0
+                        || !session.block_selection.is_empty())
+            })
+    }
+
+    fn close_block_reading_menu(&mut self) {
+        if self.block_reading_menu.take().is_some() {
+            // Iced's pick_list has no public dismiss operation. Recreate only
+            // this popup subtree so Escape cannot leave an invisible input owner.
+            self.block_reading_menu_epoch = Arc::new(());
+        }
     }
 
     fn organism_strip_height(&self) -> f32 {
@@ -11490,6 +11519,7 @@ impl Frost {
     /// there would send a stray ESC to the foreground program.
     fn overlay_owns_escape(&self) -> bool {
         self.block_clear_confirm.is_some()
+            || self.block_reading_menu.is_some()
             || self.tab_close_confirm.is_some()
             || self.block_menu.is_some()
             || self.block_review.is_some()
@@ -15872,6 +15902,12 @@ impl Frost {
         self.sync_terminal_ime_owner();
         self.sync_terminal_pane_owners();
         let task = self.update_message(message);
+        if self
+            .block_reading_menu
+            .is_some_and(|owner| !self.block_reading_menu_available(owner))
+        {
+            self.close_block_reading_menu();
+        }
         self.sync_organism_motion(false);
         self.organism.observe_agent(
             self.agent
@@ -17244,7 +17280,8 @@ impl Frost {
                     || self.palette.is_open
                     || self.workflow_overlay.is_some()
                     || self.block_review.is_some()
-                    || self.block_menu.is_some();
+                    || self.block_menu.is_some()
+                    || self.block_reading_menu.is_some();
                 if recall_surface_open {
                     self.native_enter_ownership.lock().claim_held();
                 }
@@ -17252,6 +17289,21 @@ impl Frost {
                     .prompt_recall_enter_latch
                     .consume(&event, recall_surface_open)
                 {
+                    return Task::none();
+                }
+                // Iced's pick_list handles pointer input only. Own every key
+                // while our Actions popup is visible, especially Escape, which
+                // otherwise becomes a stray readline prefix in the shell.
+                if self.block_reading_menu.is_some() {
+                    if matches!(
+                        event,
+                        keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                            ..
+                        }
+                    ) {
+                        self.close_block_reading_menu();
+                    }
                     return Task::none();
                 }
                 if let keyboard::Event::KeyReleased { key, .. } = &event {
@@ -19857,6 +19909,29 @@ impl Frost {
                     sess.scroll_to_bottom();
                 }
             }
+            Message::BlockReadingMenuOpened(owner) => {
+                if self.block_reading_menu_available(owner) {
+                    self.block_reading_menu = Some(owner);
+                    self.native_enter_ownership.lock().claim_held();
+                }
+            }
+            Message::BlockReadingMenuClosed => self.close_block_reading_menu(),
+            Message::BlockReadingMenuAction(owner, action) => {
+                let current = self.block_reading_menu == Some(owner)
+                    && self.block_reading_menu_available(owner);
+                self.close_block_reading_menu();
+                if current {
+                    return self.update(match action {
+                        "Back" => Message::BlockReadingNavigate(true),
+                        "Forward" => Message::BlockReadingNavigate(false),
+                        "Browse" => Message::BlockBrowse,
+                        "Details" => Message::BlockReviewOpen,
+                        "Review selection" => Message::BlockReviewSelected,
+                        "Go live" => Message::BlockGoLive,
+                        _ => return Task::none(),
+                    });
+                }
+            }
             Message::BlockSetAllCollapsed(session_id, collapsed) => {
                 if self.block_action_available() {
                     let changed = self
@@ -22430,6 +22505,9 @@ impl Frost {
     /// Persistent navigation for the active pane, outside the projected grid.
     fn block_reading_bar(&self) -> Element<'_, Message> {
         let sess = &self.sessions[self.active];
+        let font_size = self.effective_font_size();
+        let compact = self.block_reading_bar_compact();
+        let session_id = sess.id;
         let reading = sess.projection.scroll_offset() > 0 || !sess.block_selection.is_empty();
         let unseen = sess
             .block_reading
@@ -22442,67 +22520,172 @@ impl Frost {
         } else {
             format!("Live · {} blocks", sess.terminal.command_zones.len())
         };
-        let control = |label: &'static str, message, enabled: bool| {
+        let control = |label: &'static str, help: &'static str, message, enabled: bool| {
             let ghost = self.ghost_btn_style();
-            button(text(label).size(self.effective_font_size()))
+            let button = button(text(label).size(font_size))
                 .on_press_maybe(enabled.then_some(message))
-                .padding([4, 7])
+                .padding([3, 7])
                 .style(move |theme, status| {
                     let mut style = ghost(theme, status);
                     if status == button::Status::Disabled {
                         style.text_color.a *= 0.4;
                     }
                     style
-                })
+                });
+            tooltip(
+                button,
+                text(help).size(font_size),
+                tooltip::Position::Bottom,
+            )
+            .delay(std::time::Duration::from_millis(500))
+            .gap(4)
+            .padding(6)
+            .style(container::dark)
         };
         let live_ids: Vec<_> = sess.terminal.command_zones.iter().map(|z| z.id).collect();
-        let navigation = row![
-            control(
-                "Back",
-                Message::BlockReadingNavigate(true),
-                sess.block_reading.can_navigate(&live_ids, true)
-            ),
-            control(
-                "Forward",
-                Message::BlockReadingNavigate(false),
-                sess.block_reading.can_navigate(&live_ids, false)
-            ),
-            control("Browse", Message::BlockBrowse, !live_ids.is_empty()),
-            control("Details", Message::BlockReviewOpen, !live_ids.is_empty()),
-            control(
-                "Review selection",
-                Message::BlockReviewSelected,
-                !sess.block_selection.is_empty()
-            ),
-        ]
-        .spacing(3)
-        .wrap();
         let content: Element<'_, Message> = if sess.terminal.is_alt_buffer_active() {
-            column![
-                text("Block review paused · alternate screen").size(self.effective_font_size()),
-                text("Return to the shell to review retained blocks.")
-                    .size(self.effective_font_size())
-            ]
-            .spacing(4)
+            tooltip(
+                container(
+                    text("Block review paused · alternate screen")
+                        .size(font_size)
+                        .wrapping(text::Wrapping::None)
+                        .color(self.c_text_dim()),
+                )
+                .width(Length::Fill)
+                .clip(true),
+                text("Return to the shell to review retained blocks.").size(font_size),
+                tooltip::Position::Bottom,
+            )
+            .delay(std::time::Duration::from_millis(500))
+            .gap(4)
+            .padding(6)
+            .style(container::dark)
             .into()
         } else {
-            column![
-                row![
-                    text(status).size(self.effective_font_size()),
-                    Space::new().width(Length::Fill),
-                    control("Go live", Message::BlockGoLive, reading)
-                ]
-                .align_y(iced::Alignment::Center),
-                navigation
-            ]
-            .spacing(3)
-            .into()
+            let status_label = if compact {
+                if reading {
+                    if sess.block_selection.is_empty() {
+                        format!("Reading · {unseen} new")
+                    } else {
+                        format!("{} selected", sess.block_selection.len())
+                    }
+                } else {
+                    format!("Live · {}", live_ids.len())
+                }
+            } else {
+                status.clone()
+            };
+            let status = tooltip(
+                container(
+                    text(status_label)
+                        .size(font_size)
+                        .wrapping(text::Wrapping::None)
+                        .color(if reading {
+                            self.c_text()
+                        } else {
+                            self.c_text_dim()
+                        }),
+                )
+                .width(Length::Fill)
+                .clip(true),
+                text(status).size(font_size),
+                tooltip::Position::Bottom,
+            )
+            .delay(std::time::Duration::from_millis(500))
+            .gap(4)
+            .padding(6)
+            .style(container::dark);
+            let back = sess.block_reading.can_navigate(&live_ids, true);
+            let forward = sess.block_reading.can_navigate(&live_ids, false);
+            let has_blocks = !live_ids.is_empty();
+            let has_selection = !sess.block_selection.is_empty();
+            let mut bar = row![status].spacing(4).align_y(iced::Alignment::Center);
+            if compact {
+                // All enabled operations remain reachable without wrapping or
+                // reserving a second row. The app owns keyboard/IME dismissal.
+                let mut actions = Vec::new();
+                if back {
+                    actions.push("Back");
+                }
+                if forward {
+                    actions.push("Forward");
+                }
+                if has_blocks {
+                    actions.extend(["Browse", "Details"]);
+                }
+                if has_selection {
+                    actions.push("Review selection");
+                }
+                if reading {
+                    actions.push("Go live");
+                }
+                if !actions.is_empty() {
+                    bar = bar.push(widget_identity_scope::scope(
+                        self.block_reading_menu_epoch.clone(),
+                        pick_list(actions, None::<&str>, move |action| {
+                            Message::BlockReadingMenuAction(session_id, action)
+                        })
+                        .on_open(Message::BlockReadingMenuOpened(session_id))
+                        .on_close(Message::BlockReadingMenuClosed)
+                        .placeholder("Actions")
+                        .text_size(font_size)
+                        .padding([3, 7])
+                        .style(move |theme, status| {
+                            let mut style = pick_list::default(theme, status);
+                            style.placeholder_color = self.c_text();
+                            style
+                        }),
+                    ));
+                }
+            } else {
+                bar = bar
+                    .push(control(
+                        "‹",
+                        "Back",
+                        Message::BlockReadingNavigate(true),
+                        back,
+                    ))
+                    .push(control(
+                        "›",
+                        "Forward",
+                        Message::BlockReadingNavigate(false),
+                        forward,
+                    ))
+                    .push(control(
+                        "Browse",
+                        "Browse and search blocks",
+                        Message::BlockBrowse,
+                        has_blocks,
+                    ))
+                    .push(control(
+                        "Details",
+                        "Review active block",
+                        Message::BlockReviewOpen,
+                        has_blocks,
+                    ));
+                if has_selection {
+                    bar = bar.push(control(
+                        "Review selection",
+                        "Review selected blocks",
+                        Message::BlockReviewSelected,
+                        true,
+                    ));
+                }
+                bar = bar.push(control(
+                    "Go live",
+                    "Return to the live prompt",
+                    Message::BlockGoLive,
+                    reading,
+                ));
+            }
+            bar.into()
         };
         container(content)
             .padding([4, 10])
             .width(Length::Fill)
             .height(Length::Fixed(self.block_reading_bar_height()))
-            .style(container::dark)
+            .align_y(iced::Alignment::Center)
+            .style(self.chrome_bar_style())
             .into()
     }
 
@@ -30989,6 +31172,7 @@ impl Frost {
             || self.palette.is_open
             || self.workflow_overlay.is_some()
             || self.block_review.is_some()
+            || self.block_reading_menu.is_some()
         {
             self.native_enter_ownership.lock().claim_held();
         }
@@ -33684,8 +33868,10 @@ mod tests {
         let source = include_str!("main.rs");
         let production = source.split_once("#[cfg(test)]\nmod tests {").unwrap().0;
         assert_eq!(
-            production.matches("widget_identity_scope::scope(").count(),
-            8
+            production
+                .matches("widget_identity_scope::scope(self.remote_host_editor.identity(),")
+                .count(),
+            1
         );
         assert!(production.contains(
             "widget_identity_scope::scope(self.remote_host_editor.identity(), remote_hosts_section)"

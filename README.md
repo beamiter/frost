@@ -84,7 +84,8 @@ Block 阅读栏的 **Browse** 或 `Ctrl+Alt+F` 打开命令块浏览器。首次
 
 ## 比较两次命令输出与导出所选记录
 
-在 Block 模式选中两个已完成命令块后，打开阅读栏的 **Review selection**，点击
+在 Block 模式选中两个已完成命令块后，打开阅读栏的 **Review selection**（窄窗口位于
+**Actions** 菜单内），点击
 **Compare output**。也可在命令面板选择 **Compare Selected Block Output**。
 `Shift` 点击扩展连续选择，`Ctrl+Shift` 点击可逐个切换选择，适合比较相隔多次运行的结果。
 
@@ -1108,13 +1109,17 @@ the profile be selected again for a retry.
 
 ### Block reading workspace
 
-Block Mode now keeps a compact reading strip above the terminal. **Browse** opens
+Block Mode keeps a single-line reading strip above the terminal (36px at the
+default font size, growing only when larger text needs it). Narrow windows move
+the controls into **Actions** instead of adding rows; Escape dismisses that menu
+without sending input to the shell. Selection changes keep the terminal height
+stable. **Browse** opens
 cross-block search; **Details** opens a bounded, read-only snapshot of the selected
 (or newest) retained block. Details show command and working-directory capture,
 exit/duration, lifecycle evidence, row retention, and text-output provenance.
 Large previews are explicitly clipped; images remain in the terminal grid.
 
-**← / →** retrace up to 64 block visits in this pane. They use stable block IDs and
+**‹ / ›** retrace up to 64 block visits in this pane. They use stable block IDs and
 skip evicted records. Reading a selected block pins the viewport even if it began
 at the live edge. New retained completions are counted without pulling the reader
 to the bottom. **Go live** explicitly clears block selection and resumes following.
