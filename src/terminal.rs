@@ -6885,6 +6885,14 @@ impl TerminalState {
         self.current_command_started_at.is_some()
     }
 
+    /// Shell-reported command text from the current OSC 133 C..D interval.
+    /// This lets the host preserve native TUI space before the /proc poll.
+    pub fn running_command_text(&self) -> Option<&str> {
+        self.is_command_running()
+            .then(|| self.current_command_text.as_deref())
+            .flatten()
+    }
+
     /// Elapsed wall time for the live OSC 133 command. This is renderer-only
     /// state: the completed zone still prefers a shell-reported duration at
     /// `D`, while the live block badge uses this local monotonic clock.

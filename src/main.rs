@@ -4971,6 +4971,7 @@ enum Message {
     ChatSubmit(chat_mode::ControlToken),
     ChatInterrupt(chat_mode::ControlToken),
     SetBlockCompact(bool),
+    ToggleBlockReadingBar,
     SetShowRepoStrip(bool),
     SetBottomBar(bool),
     SetAsciiOrganism(bool),
@@ -6558,6 +6559,42 @@ fn retire_closing_terminal_mouse_gestures(
     retired
 }
 
+/// TUI detection is intentionally conservative: only the command executable
+/// (and common JS launchers) can suppress the Blocks chrome. We do not hide it
+/// for an arbitrary long-running shell command or a substring in its arguments.
+fn immersive_block_command(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    let first = words.next().unwrap_or("");
+    let name = first.trim_matches(|ch| ch == '\'' || ch == '"').rsplit('/').next().unwrap_or("");
+    let name = if matches!(name, "npx" | "bunx") {
+        words.next().unwrap_or("")
+    } else if name == "pnpm" && matches!(words.next(), Some("dlx" | "exec")) {
+        words.next().unwrap_or("")
+    } else {
+        name
+    };
+    let name = name.trim_matches(|ch| ch == '\'' || ch == '"').rsplit('/').next().unwrap_or("");
+    matches!(name,
+        "vi" | "vim" | "nvim" | "view" | "vimdiff" | "emacs" | "nano"
+        | "hx" | "helix" | "kak" | "less" | "most" | "more"
+        | "top" | "htop" | "btop" | "yazi" | "ranger" | "nnn"
+        | "tmux" | "screen" | "lazygit" | "lazydocker" | "k9s"
+        | "codex" | "@openai/codex" | "claude" | "@anthropic-ai/claude-code"
+        | "gemini" | "opencode" | "aider")
+}
+
+fn block_reading_bar_should_show(
+    block_mode: bool,
+    user_hidden: bool,
+    alternate_screen: bool,
+    running_command: Option<&str>,
+    foreground_process: Option<&str>,
+) -> bool {
+    block_mode && !user_hidden && !alternate_screen
+        && !running_command.is_some_and(immersive_block_command)
+        && !foreground_process.is_some_and(immersive_block_command)
+}
+
 fn terminal_panes_body<'a, Message: 'a, Renderer: iced::advanced::Renderer + 'a>(
     reading_bar: Option<Element<'a, Message, iced::Theme, Renderer>>,
     panes: Element<'a, Message, iced::Theme, Renderer>,
@@ -6920,6 +6957,8 @@ struct Frost {
     workflow_overlay: Option<workflow_picker::WorkflowOverlay>,
     /// Cross-block search picker overlay (`block:search`, Ctrl+Alt+F).
     block_search: Option<BlockSearchState>,
+    /// User-controlled preference within this window. TUI auto-hide always takes precedence.
+    block_bar_user_hidden: bool,
     /// The compact toolbar popup owns input until an action or dismissal.
     block_reading_menu: Option<usize>,
     block_reading_menu_epoch: Arc<()>,
@@ -7165,6 +7204,7 @@ impl Frost {
             terminal_ime: terminal_ime::Ownership::default(),
             workflow_overlay: None,
             block_search: None,
+            block_bar_user_hidden: false,
             block_reading_menu: None,
             block_reading_menu_epoch: Arc::new(()),
             block_search_memory: BlockSearchMemory::default(),
@@ -9026,8 +9066,19 @@ impl Frost {
     /// status bar. The top bar is always reserved (even in side-tab mode, where
     /// it hosts the dock toggle) so floating chrome never overlaps terminal
     /// content.
+    fn block_reading_bar_visible(&self) -> bool {
+        let session = self.sessions.get(self.active);
+        block_reading_bar_should_show(
+            self.config.is_block_mode(),
+            self.block_bar_user_hidden,
+            session.is_some_and(|session| session.terminal.is_alt_buffer_active()),
+            session.and_then(|session| session.terminal.running_command_text()),
+            session.and_then(|session| session.fg_proc_cache.as_deref()),
+        )
+    }
+
     fn block_reading_bar_height(&self) -> f32 {
-        if !self.config.is_block_mode() {
+        if !self.block_reading_bar_visible() {
             return 0.0;
         }
         // One line at every width. Reserve the actual text line plus control
@@ -9042,7 +9093,7 @@ impl Frost {
 
     fn block_reading_menu_available(&self, owner: usize) -> bool {
         self.focused
-            && self.config.is_block_mode()
+            && self.block_reading_bar_visible()
             && self.block_reading_bar_compact()
             && self.sessions.get(self.active).is_some_and(|session| {
                 session.id == owner
@@ -9075,6 +9126,15 @@ impl Frost {
         } else {
             0.0
         }
+    }
+
+    /// One visibility transition must update both the Iced layout and PTY grid.
+    /// Reflow only on a transition, never on every frame or process-cache tick.
+    fn sync_block_reading_bar_geometry(&mut self) {
+        let term_w = (self.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
+        (self.cols, self.rows) = self.metrics.grid_size(term_w, self.term_height());
+        self.relayout();
+        self.refresh_active_context();
     }
 
     fn term_height(&self) -> f32 {
@@ -15901,7 +15961,11 @@ impl Frost {
     fn update(&mut self, message: Message) -> Task<Message> {
         self.sync_terminal_ime_owner();
         self.sync_terminal_pane_owners();
+        let reading_bar_was_visible = self.block_reading_bar_visible();
         let task = self.update_message(message);
+        if reading_bar_was_visible != self.block_reading_bar_visible() {
+            self.sync_block_reading_bar_geometry();
+        }
         if self
             .block_reading_menu
             .is_some_and(|owner| !self.block_reading_menu_available(owner))
@@ -19199,6 +19263,10 @@ impl Frost {
                 self.sync_organism_geometry();
                 self.refresh_active_context();
             }
+            Message::ToggleBlockReadingBar => {
+                self.block_bar_user_hidden = !self.block_bar_user_hidden;
+                self.close_block_reading_menu();
+            }
             Message::SetShowRepoStrip(show) => {
                 self.config.show_repo_strip = show;
                 // Hide immediately; the periodic tick would otherwise show a
@@ -20671,6 +20739,10 @@ impl Frost {
             );
         }
         let bar = bar
+            .push(window_btn(
+                if self.block_bar_user_hidden { "▣ Blocks" } else { "▤ Blocks" },
+                Message::ToggleBlockReadingBar,
+            ))
             .push(window_btn("Vim9 IDE", Message::OpenVim9Ide))
             .push(window_btn("—", Message::WindowMinimize))
             .push(window_btn("▢", Message::WindowToggleMaximize))
@@ -26346,8 +26418,7 @@ impl Frost {
             panes_body
         };
         let panes_body = terminal_panes_body(
-            self.config
-                .is_block_mode()
+            self.block_reading_bar_visible()
                 .then(|| self.block_reading_bar()),
             panes_body,
         );
@@ -33177,6 +33248,28 @@ mod block_browser_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn blocks_navigator_auto_hides_only_for_immersive_sessions() {
+        use super::{block_reading_bar_should_show as visible, immersive_block_command as tui};
+        for executable in ["vim", "nvim", "codex", "claude", "gemini", "opencode", "htop", "tmux"] {
+            assert!(tui(executable), "missing TUI: {executable}");
+            assert!(!visible(true, false, false, Some(executable), None));
+            assert!(!visible(true, false, false, None, Some(executable)));
+        }
+        assert!(tui("/usr/bin/vim README.md"));
+        assert!(tui("npx @openai/codex"));
+        assert!(tui("pnpm dlx codex"));
+        assert!(!tui("echo codex"));
+        assert!(!tui("cargo test"));
+        assert!(visible(true, false, false, Some("cargo test"), None));
+        assert!(visible(true, false, false, None, None));
+        assert!(!visible(true, false, true, None, None));
+        assert!(!visible(true, true, false, None, None));
+        assert!(!visible(false, false, false, None, None));
+        // Returning from the TUI restores the bar without resetting user intent.
+        assert!(visible(true, false, false, None, None));
+    }
+
     #[test]
     fn ime_owner_sync_brackets_every_reducer_and_admission_precedes_pty_write() {
         let source = include_str!("main.rs")
