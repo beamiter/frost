@@ -31,6 +31,7 @@ mod font_zoom;
 mod font_zoom_scope;
 mod history_picker;
 mod image_drop;
+mod immersive_command;
 mod keybindings;
 mod kitty_graphics;
 mod link;
@@ -6562,92 +6563,7 @@ fn retire_closing_terminal_mouse_gestures(
 /// TUI detection is intentionally conservative: only the command executable
 /// (and common JS launchers) can suppress the Blocks chrome. We do not hide it
 /// for an arbitrary long-running shell command or a substring in its arguments.
-fn immersive_block_command(command: &str) -> bool {
-    let mut words = command.split_whitespace();
-    let first = words.next().unwrap_or("");
-    let name = first
-        .trim_matches(|ch| ch == '\'' || ch == '"')
-        .rsplit('/')
-        .next()
-        .unwrap_or("");
-    let name = match name {
-        "npx" | "bunx" => words.next().unwrap_or(""),
-        "pnpm" => match words.next() {
-            Some("dlx" | "exec") => words.next().unwrap_or(""),
-            _ => name,
-        },
-        _ => name,
-    };
-    let name = name
-        .trim_matches(|ch| ch == '\'' || ch == '"')
-        .rsplit('/')
-        .next()
-        .unwrap_or("");
-    // Help and batch/print invocations are not immersive CLIs. Preserve
-    // normal block navigation for them, including `codex exec` and `claude -p`.
-    if words
-        .clone()
-        .any(|arg| matches!(arg, "-h" | "--help" | "--version"))
-    {
-        return false;
-    }
-    const AGENTS: &[&str] = &[
-        "codex",
-        "@openai/codex",
-        "claude",
-        "@anthropic-ai/claude-code",
-        "gemini",
-        "opencode",
-        "aider",
-    ];
-    const NON_INTERACTIVE: &[&str] = &[
-        "exec",
-        "e",
-        "completion",
-        "login",
-        "logout",
-        "--print",
-        "-p",
-        "--prompt",
-    ];
-    if AGENTS.contains(&name) && words.any(|arg| NON_INTERACTIVE.contains(&arg)) {
-        return false;
-    }
-    const APPS: &[&str] = &[
-        "vi",
-        "vim",
-        "nvim",
-        "view",
-        "vimdiff",
-        "emacs",
-        "nano",
-        "hx",
-        "helix",
-        "kak",
-        "less",
-        "most",
-        "more",
-        "top",
-        "htop",
-        "btop",
-        "yazi",
-        "ranger",
-        "nnn",
-        "tmux",
-        "screen",
-        "lazygit",
-        "lazydocker",
-        "k9s",
-        "codex",
-        "@openai/codex",
-        "claude",
-        "@anthropic-ai/claude-code",
-        "gemini",
-        "opencode",
-        "aider",
-    ];
-    APPS.contains(&name)
-}
+use crate::immersive_command::immersive_block_command;
 
 fn block_reading_bar_should_show(
     block_mode: bool,
