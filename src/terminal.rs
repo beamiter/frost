@@ -6889,7 +6889,7 @@ impl TerminalState {
     /// This lets the host preserve native TUI space before the /proc poll.
     pub fn running_command_text(&self) -> Option<&str> {
         self.is_command_running()
-            .then(|| self.current_command_text.as_deref())
+            .then_some(self.current_command_text.as_deref())
             .flatten()
     }
 

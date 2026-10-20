@@ -6565,22 +6565,32 @@ fn retire_closing_terminal_mouse_gestures(
 fn immersive_block_command(command: &str) -> bool {
     let mut words = command.split_whitespace();
     let first = words.next().unwrap_or("");
-    let name = first.trim_matches(|ch| ch == '\'' || ch == '"').rsplit('/').next().unwrap_or("");
-    let name = if matches!(name, "npx" | "bunx") {
-        words.next().unwrap_or("")
-    } else if name == "pnpm" && matches!(words.next(), Some("dlx" | "exec")) {
-        words.next().unwrap_or("")
-    } else {
-        name
+    let name = first
+        .trim_matches(|ch| ch == '\'' || ch == '"')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    let name = match name {
+        "npx" | "bunx" => words.next().unwrap_or(""),
+        "pnpm" => match words.next() {
+            Some("dlx" | "exec") => words.next().unwrap_or(""),
+            _ => name,
+        },
+        _ => name,
     };
-    let name = name.trim_matches(|ch| ch == '\'' || ch == '"').rsplit('/').next().unwrap_or("");
-    matches!(name,
-        "vi" | "vim" | "nvim" | "view" | "vimdiff" | "emacs" | "nano"
-        | "hx" | "helix" | "kak" | "less" | "most" | "more"
-        | "top" | "htop" | "btop" | "yazi" | "ranger" | "nnn"
-        | "tmux" | "screen" | "lazygit" | "lazydocker" | "k9s"
-        | "codex" | "@openai/codex" | "claude" | "@anthropic-ai/claude-code"
-        | "gemini" | "opencode" | "aider")
+    let name = name
+        .trim_matches(|ch| ch == '\'' || ch == '"')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    const APPS: &[&str] = &[
+        "vi", "vim", "nvim", "view", "vimdiff", "emacs", "nano", "hx", "helix",
+        "kak", "less", "most", "more", "top", "htop", "btop", "yazi", "ranger",
+        "nnn", "tmux", "screen", "lazygit", "lazydocker", "k9s", "codex",
+        "@openai/codex", "claude", "@anthropic-ai/claude-code", "gemini",
+        "opencode", "aider",
+    ];
+    APPS.contains(&name)
 }
 
 fn block_reading_bar_should_show(
@@ -6590,7 +6600,9 @@ fn block_reading_bar_should_show(
     running_command: Option<&str>,
     foreground_process: Option<&str>,
 ) -> bool {
-    block_mode && !user_hidden && !alternate_screen
+    block_mode
+        && !user_hidden
+        && !alternate_screen
         && !running_command.is_some_and(immersive_block_command)
         && !foreground_process.is_some_and(immersive_block_command)
 }
@@ -20740,7 +20752,11 @@ impl Frost {
         }
         let bar = bar
             .push(window_btn(
-                if self.block_bar_user_hidden { "▣ Blocks" } else { "▤ Blocks" },
+                if self.block_bar_user_hidden {
+                    "▣ Blocks"
+                } else {
+                    "▤ Blocks"
+                },
                 Message::ToggleBlockReadingBar,
             ))
             .push(window_btn("Vim9 IDE", Message::OpenVim9Ide))
@@ -33251,7 +33267,9 @@ mod tests {
     #[test]
     fn blocks_navigator_auto_hides_only_for_immersive_sessions() {
         use super::{block_reading_bar_should_show as visible, immersive_block_command as tui};
-        for executable in ["vim", "nvim", "codex", "claude", "gemini", "opencode", "htop", "tmux"] {
+        for executable in [
+            "vim", "nvim", "codex", "claude", "gemini", "opencode", "htop", "tmux",
+        ] {
             assert!(tui(executable), "missing TUI: {executable}");
             assert!(!visible(true, false, false, Some(executable), None));
             assert!(!visible(true, false, false, None, Some(executable)));
