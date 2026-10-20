@@ -8,6 +8,12 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 
 启动方式、操作、可选语言服务及测试命令见 [Vim9 IDE 文档](docs/VIM9_IDE.md)。
 
+编辑区正文通过独立 GUI buffer 协议交给 iced 直接绘制：使用 Vim 的
+`guifg`、`guibg`、`guisp` 真彩色样式、粗体/斜体、下划线/波浪线和选区，
+不从终端 ANSI 色号取色。状态栏显示 **GUI buffer · RGB**；复杂 Vim 视图
+会显示 **Compatible view** 及原因，并使用原有显示路径。Ctrl+滚轮只改变
+当前 IDE 进程的字体，不修改其他终端或侧栏的字号。
+
 ## 独立 Chat 模式
 
 在设置的 Terminal 选单选择 Chat，或配置 `terminal_mode = "chat"`。短命令在右侧胶囊中显示，输出保持左侧完整列宽，当前 shell 的原始输入区固定在底部；查看历史不会把草稿带走。可选 ASCII 伙伴使用已有的本地状态与动作设置。

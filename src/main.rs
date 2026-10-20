@@ -64,6 +64,7 @@ mod terminal_ime;
 mod terminal_view;
 mod theme;
 mod ui_typography;
+mod vim9_buffer;
 mod vim9_ide;
 mod widget_identity_scope;
 mod workflow_focus;

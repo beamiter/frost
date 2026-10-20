@@ -1,4 +1,4 @@
-//! Real Vim, rendered by Frost's native GPU terminal, with a typed IDE sidebar.
+//! Real Vim with an independent GUI buffer surface and a typed IDE workbench.
 //!
 //! This application is deliberately separate from `Frost::new`: it never takes
 //! the terminal instance lock, restores shell tabs, or persists editor argv.
@@ -37,6 +37,42 @@ const MAX_INPUT: usize = 16 * 1024;
 const MAX_QUICK_QUERY: usize = 256;
 const QUICK_MATCH_LIMIT: usize = 80;
 const QUICK_VISIBLE_ROWS: usize = 8;
+
+struct RenderSubscription {
+    session_id: usize,
+    interval_ms: u64,
+    editor: Vim9Session,
+}
+
+impl std::hash::Hash for RenderSubscription {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.session_id, state);
+        std::hash::Hash::hash(&self.interval_ms, state);
+    }
+}
+
+fn render_stream(key: &RenderSubscription) -> impl iced::futures::Stream<Item = Message> + use<> {
+    use iced::futures::SinkExt;
+    let editor = key.editor.clone();
+    let interval = Duration::from_millis(key.interval_ms);
+    iced::stream::channel(
+        1,
+        move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            let mut previous = None;
+            loop {
+                let frame = editor.render_snapshot();
+                let revision = frame.as_ref().map(|frame| frame.revision);
+                if revision != previous {
+                    previous = revision;
+                    if output.send(Message::RenderFrame(frame)).await.is_err() {
+                        break;
+                    }
+                }
+                tokio::time::sleep(interval).await;
+            }
+        },
+    )
+}
 
 /// Preserve the pre-existing no-IDE launch path. Once --ide is selected, reject
 /// extra options instead of quietly running a different command or project.
@@ -225,6 +261,7 @@ struct Form {
 enum Message {
     Terminal(Box<super::Message>),
     Tick,
+    RenderFrame(Option<std::sync::Arc<vim9::Vim9RenderFrame>>),
     Drain,
     Keyboard(iced::window::Id, keyboard::Event, bool),
     Modifiers(keyboard::Modifiers),
@@ -268,6 +305,8 @@ struct Ide {
     session: Option<Session>,
     editor: Option<Vim9Session>,
     snapshot: Vim9Snapshot,
+    render_frame: Option<std::sync::Arc<vim9::Vim9RenderFrame>>,
+    render_subscribed: bool,
     root: PathBuf,
     directory: PathBuf,
     entries: Vec<ProjectEntry>,
@@ -533,6 +572,8 @@ impl Ide {
             session,
             editor,
             snapshot: Vim9Snapshot::default(),
+            render_frame: None,
+            render_subscribed: false,
             directory: root.clone(),
             root: root.clone(),
             entries: Vec::new(),
@@ -881,9 +922,20 @@ impl Ide {
     }
     fn reduce(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::RenderFrame(frame) => {
+                self.render_frame = frame;
+            }
             Message::Tick => {
                 if let Some(editor) = &self.editor {
                     self.snapshot = editor.snapshot();
+                    if !self.snapshot.connected {
+                        self.render_subscribed = false;
+                        self.render_frame = None;
+                    } else if !self.render_subscribed {
+                        self.render_subscribed = editor
+                            .send(Vim9Command::SetRender { enabled: true })
+                            .is_ok();
+                    }
                 }
                 if let Some(index) = &self.project_index {
                     let snapshot = index.snapshot();
@@ -1432,6 +1484,16 @@ impl Ide {
             iced::time::every(Duration::from_millis(if self.focused { 80 } else { 250 }))
                 .map(|_| Message::Tick),
         ];
+        if let (Some(editor), Some(session)) = (&self.editor, &self.session) {
+            subscriptions.push(Subscription::run_with(
+                RenderSubscription {
+                    session_id: session.id,
+                    interval_ms: if self.focused { 16 } else { 100 },
+                    editor: editor.clone(),
+                },
+                render_stream,
+            ));
+        }
         if let Some(s) = self.session.as_ref().filter(|_| !self.child_exited) {
             subscriptions.push(
                 super::pty_subscription(super::PtySubscriptionKey {
@@ -1501,6 +1563,16 @@ impl Ide {
         let Some(s) = &self.session else {
             return container(text(self.error.as_deref().unwrap_or("Vim could not be launched. Install Vim 9 with +channel, +job, +timers and +quickfix."))).padding(24).center_x(Length::Fill).center_y(Length::Fill).into();
         };
+        let native_frame = self.render_frame.as_deref().filter(|frame| {
+            self.snapshot.connected
+                && s.projection.scroll_offset() == 0
+                && !s.terminal.has_text_selection()
+                && crate::vim9_buffer::usable(
+                    frame,
+                    s.projection.cells().len(),
+                    s.projection.cells().first().map_or(0, Vec::len),
+                )
+        });
         let selection = if s.terminal.has_text_selection() {
             (0..s.projection.cells().len())
                 .map(|row| {
@@ -1511,9 +1583,12 @@ impl Ide {
         } else {
             Vec::new()
         };
-        TermWidget::new(
+        let terminal = TermWidget::new(
             s.projection.cells(),
-            s.cursor,
+            native_frame
+                .filter(|frame| frame.cursor.visible)
+                .map(|frame| (frame.cursor.row, frame.cursor.column))
+                .unwrap_or(s.cursor),
             s.cursor_visible,
             s.terminal.cursor_shape,
             self.input_active(),
@@ -1552,8 +1627,20 @@ impl Ide {
         )
         .blink_on(self.blink_on)
         .opacity(1.0)
-        .on_mouse(Message::Mouse)
-        .into()
+        .on_mouse(Message::Mouse);
+        if let Some(frame) = native_frame {
+            crate::vim9_buffer::NativeBuffer::new(
+                terminal,
+                frame,
+                self.metrics,
+                self.mono,
+                self.input_active(),
+                self.blink_on,
+            )
+            .into()
+        } else {
+            terminal.into()
+        }
     }
     fn files(&self) -> Element<'_, Message> {
         let parent = self
@@ -1892,8 +1979,19 @@ impl Ide {
         } else {
             "BRIDGE OFFLINE"
         };
+        let render_state = self
+            .render_frame
+            .as_ref()
+            .map(|frame| {
+                if frame.supported {
+                    "GUI buffer · RGB".to_owned()
+                } else {
+                    format!("Compatible view: {}", frame.fallback_reason)
+                }
+            })
+            .unwrap_or_else(|| "Connecting GUI buffer".to_owned());
         let status = format!(
-            "{state} | {} | {}{} | {}:{} / {} | {} · {} | {} split(s) | {} pending{}",
+            "{state} | {render_state} | {} | {}{} | {}:{} / {} | {} · {} | {} split(s) | {} pending{}",
             visible_label(&self.snapshot.mode),
             visible_label(&self.snapshot.file),
             if self.snapshot.modified { " *" } else { "" },

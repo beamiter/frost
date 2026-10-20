@@ -1,12 +1,35 @@
 # Frost native Vim9 IDE
 
-Frost provides a native Iced workbench around **a real Vim 9 process**, rendered
-by Frost's existing GPU terminal grid. Vim owns text, modes, undo, registers,
+Frost provides a native Iced workbench and buffer text surface around **a real
+Vim 9 process**. Vim owns text, modes, undo, registers,
 macros, buffers, splits, completion and plugins. The file/buffer/build/problem
 controls are native widgets; they send typed operations over the shared
-`jterm_core::vim9` authenticated channel. This is not Neovim, Vim key emulation,
-or a second editor document model. The center editor is Vim's terminal UI, not
-a new implementation of Vim's own GUI drawing protocol.
+`jterm_core::vim9` authenticated channel. The buffer uses the same channel to
+publish visible text and GUI styles. Frost's `NativeBuffer` widget draws those
+runs directly with Iced text shaping and RGB decorations. No second editable
+document model is introduced.
+
+## GUI buffer rendering
+
+`guifg`, `guibg` and `guisp` are preserved as exact RGB values independently of
+`ctermfg`, ANSI palettes and `termguicolors`. Bold and italic use native font
+attributes; underline, undercurl, strikethrough, the cursor and Visual selection
+are GUI decoration layers. The established input adapter continues to handle
+Vim mouse reports and native IME; its terminal painter is clipped outside the
+GUI buffer rectangle so it cannot constrain buffer colors or glyphs.
+
+The status line shows **GUI buffer · RGB** while a supported frame is present.
+Vim's command/status rows remain in the compatible surface. Multiple internal
+Vim windows, folds, diff, popup completion, conceal and unsupported shaping
+temporarily use **Compatible view**, with the runtime's reason shown. Resize,
+disconnection and a terminal-local Shift selection also use the compatible
+path until a current supported frame is available. Old native frames are never
+kept over a known unsupported state.
+
+Vim's logical display columns are retained for correct input positioning.
+Proportional text layout, arbitrary per-line heights and native completion
+popups are future work. Ctrl+wheel changes the IDE's font size without changing
+other terminal processes, native form text sizes or saved configuration.
 
 ## Launch
 
@@ -190,6 +213,20 @@ sessions. Bridge environment entries are passed only to the dedicated child;
 the runtime removes its bootstrap token before it starts build jobs.
 
 ## Reproduce the checks
+
+The focused GUI-buffer test compares actual native-window pixels against an
+exact GUI RGB color while `termguicolors` is disabled and `ctermfg` deliberately
+uses a different color. It checks real editing/Ctrl+S/undo and removal/restoration
+of the native layer when a Vim split opens/closes:
+
+```sh
+xvfb-run -a -s '-screen 0 1600x1000x24' python3 scripts/native-vim9-buffer-smoke.py \
+  --binary target/debug/frost --app frost --output /tmp/frost-native-buffer
+```
+
+Requires xdotool, ImageMagick and Pillow. The output retains PNG evidence and
+JSON results. X11/software-GPU acceptance does not certify Wayland, physical
+GPU drivers or an interactive IME.
 
 ```sh
 cargo fmt --all -- --check
