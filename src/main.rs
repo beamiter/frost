@@ -9144,7 +9144,7 @@ impl Frost {
             session.and_then(|session| session.terminal.running_command_text()),
             session.and_then(|session| {
                 (!session.terminal.agent_prompt_status().is_ready())
-                    .then(|| session.fg_proc_cache.as_deref())
+                    .then_some(session.fg_proc_cache.as_deref())
                     .flatten()
             }),
         )
@@ -33346,8 +33346,20 @@ mod tests {
         assert!(!tui("gemini --prompt hello"));
         assert!(!tui("vim --version"));
         assert!(tui("codex --no-alt-screen"));
-        assert!(visible(true, false, false, Some("codex exec --json"), Some("codex")));
-        assert!(visible(true, false, false, Some("cargo test"), Some("codex")));
+        assert!(visible(
+            true,
+            false,
+            false,
+            Some("codex exec --json"),
+            Some("codex")
+        ));
+        assert!(visible(
+            true,
+            false,
+            false,
+            Some("cargo test"),
+            Some("codex")
+        ));
         assert!(visible(true, false, false, Some("cargo test"), None));
         assert!(visible(true, false, false, None, None));
         assert!(!visible(true, false, true, None, None));
