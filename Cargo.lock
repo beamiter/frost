@@ -644,9 +644,9 @@ name = "clipboard_x11"
 version = "0.4.3"
 dependencies = [
  "rustix 1.1.4",
- "x11rb-protocol",
  "thiserror 2.0.20",
  "x11rb",
+ "x11rb-protocol",
 ]
 
 [[package]]
@@ -2004,7 +2004,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=5a34a710825900b897d56a27f6c7c806a7a925d5#5a34a710825900b897d56a27f6c7c806a7a925d5"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=3b6b0590799bca0a64441f1f5fe17e2cf0234cbd#3b6b0590799bca0a64441f1f5fe17e2cf0234cbd"
 dependencies = [
  "crossbeam-channel",
  "dirs",

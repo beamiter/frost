@@ -94,6 +94,19 @@ def main() -> None:
         first, second = project / 'first.txt', project / 'second odd |%#.txt'
         first.write_text('original\n')
         second.write_text('second\n')
+        nested = project / 'src'
+        nested.mkdir()
+        quick_a, quick_b = nested / 'deep needle a.rs', nested / 'deep needle b.rs'
+        quick_a.write_text('line one\nline two\nline three\n')
+        quick_b.write_text('line one\nline two\nline three\n')
+        (project / '.git').mkdir()
+        (project / '.gitignore').write_text('ignored/\n')
+        ignored = project / 'ignored'
+        ignored.mkdir()
+        # An exact filename match would outrank both fuzzy matches if ignore
+        # handling regressed, so selecting the second result detects it.
+        (ignored / 'dpndl').write_text('not a quick-open candidate\n')
+        position, windows, buffers = [root / name for name in ('position', 'windows', 'buffers')]
         ready, modified, current, mode = [root / name for name in ('ready', 'modified', 'current', 'mode')]
         vimrc = (
             'set nocompatible nomore noswapfile\nset shortmess+=I\n'
@@ -102,6 +115,14 @@ def main() -> None:
             f'autocmd ModeChanged * call writefile([v:event.new_mode], {vim_string(mode)})\n'
             f'autocmd BufEnter * call writefile([expand("%:p")], {vim_string(current)})\n'
             f'autocmd TextChanged,TextChangedI,BufWritePost * call writefile([string(&modified)], {vim_string(modified)})\n'
+            # Channel callbacks can move the actual cursor without immediately
+            # firing CursorMoved. Sample Vim's real position independently.
+            'function! FrostRecordCursor(timer)\n'
+            f'  call writefile([printf("%d:%d", line("."), col("."))], {vim_string(position)})\n'
+            f'  call writefile([string(winnr("$"))], {vim_string(windows)})\n'
+            f'  call writefile(map(getbufinfo({{"buflisted": 1}}), {{_, info -> info.name}}), {vim_string(buffers)})\n'
+            'endfunction\n'
+            "autocmd VimEnter * call timer_start(40, function('FrostRecordCursor'), {'repeat': -1})\n"
         )
         (home / '.vimrc').write_text(vimrc)
         env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(root / 'config'),
@@ -144,9 +165,12 @@ def main() -> None:
                 xdo('type', '--clearmodifiers', '--delay', '30', 'inative-gui ')
                 xdo('key', '--clearmodifiers', 'Escape')
                 wait(lambda: read(modified) == '1\n', 'editing the real Vim buffer')
-                wait(lambda: read(mode) == 'n\n', 'returning to Vim normal mode')
+                # Save immediately after Escape, while Vim may still be
+                # finishing terminal key decoding. The request must reach its
+                # next safe state instead of requiring another manual save.
                 xdo('key', '--clearmodifiers', 'ctrl+shift+s')
-                wait(lambda: read(first) == 'native-gui original\n', 'saving through the native Save All shortcut')
+                wait(lambda: read(first) == 'native-gui original\n', 'saving immediately after Escape with native Save All')
+                wait(lambda: read(mode) == 'n\n', 'returning to Vim normal mode')
 
                 xdo('key', '--clearmodifiers', 'ctrl+shift+o')
                 time.sleep(0.2)
@@ -165,6 +189,58 @@ def main() -> None:
                 require(read(second) == 'second\n', 'Close implicitly saved a dirty file')
                 xdo('key', '--clearmodifiers', 'ctrl+shift+s')
                 wait(lambda: read(second) == 'dirty second\n', 'saving after dirty-close refusal')
+                # Quick Open is a native project filename picker, including
+                # subsequence matching and keyboard result selection. The
+                # ignored exact match must never displace either fuzzy result.
+                xdo('key', '--clearmodifiers', 'ctrl+shift+p')
+                time.sleep(0.8)
+                xdo('type', '--clearmodifiers', '--delay', '30', 'dpndl')
+                time.sleep(0.25)
+                xdo('key', '--clearmodifiers', 'Down')
+                xdo('key', '--clearmodifiers', 'Return')
+                wait(lambda: read(current).strip() == str(quick_b), 'opening the selected recursive fuzzy match')
+
+                xdo('key', '--clearmodifiers', 'ctrl+shift+g')
+                time.sleep(0.2)
+                xdo('key', '--clearmodifiers', 'ctrl+a')
+                xdo('type', '--clearmodifiers', '--delay', '30', '2:3')
+                xdo('key', '--clearmodifiers', 'Return')
+                wait(lambda: read(position).strip() == '2:3', 'jumping through the native line:column form')
+                xdo('type', '--clearmodifiers', '--delay', '30', 'iGOTO-')
+                xdo('key', '--clearmodifiers', 'Escape')
+                wait(lambda: read(modified) == '1\n', 'editing after native line navigation')
+                wait(lambda: read(mode) == 'n\n', 'finishing the edit before native buffer actions')
+                xdo('key', '--clearmodifiers', 'ctrl+shift+w')
+                time.sleep(0.35)
+                require(read(current).strip() == str(quick_b), 'Close buffer discarded unsaved changes')
+                require(read(quick_b) == 'line one\nline two\nline three\n', 'Close buffer implicitly saved')
+                xdo('key', '--clearmodifiers', 'ctrl+s')
+                wait(lambda: read(quick_b) == 'line one\nliGOTO-ne two\nline three\n', 'saving with native Ctrl+S')
+                xdo('key', '--clearmodifiers', 'ctrl+shift+Page_Up')
+                wait(lambda: read(current).strip() == str(second), 'switching to the previous buffer')
+                xdo('key', '--clearmodifiers', 'ctrl+shift+Page_Down')
+                wait(lambda: read(current).strip() == str(quick_b), 'switching to the next buffer')
+                xdo('key', '--clearmodifiers', 'ctrl+shift+w')
+                wait(lambda: read(current).strip() in {str(first), str(second)}, 'closing the saved current buffer')
+                # This intentionally follows NextBuffer immediately. Resolving
+                # the target from the UI's last 80 ms snapshot closes the wrong
+                # (previous) buffer instead of the actual current Vim buffer.
+                def closed_only_current():
+                    names = read(buffers).splitlines()
+                    return str(second) in names and str(quick_b) not in names
+                wait(closed_only_current, 'retaining the previous buffer after rapid current-buffer close')
+
+                xdo('key', '--clearmodifiers', 'ctrl+shift+p')
+                time.sleep(0.2)
+                xdo('type', '--clearmodifiers', '--delay', '20', 'no_such_project_file_xyz')
+                xdo('key', '--clearmodifiers', 'Escape')
+                time.sleep(0.15)
+                require(process.poll() is None, 'Cancelling empty Quick Open closed the editor')
+                # Click the first split control in the native tools strip. The
+                # independent Vim sampler must observe a real second window.
+                xdo('mousemove', '--window', str(window), '130', '54')
+                xdo('click', '1')
+                wait(lambda: read(windows).strip() == '2', 'splitting through the native toolbar')
 
                 # The native build form must preserve literal user review and
                 # then start the same typed async build path as its Apply button.
@@ -179,7 +255,7 @@ def main() -> None:
                 require(process.wait(timeout=10) == 0, 'Saved editor did not exit gracefully')
                 require(snapshot(state) == before_state, 'IDE changed persistent terminal state')
                 require(snapshot(data) == before_data, 'IDE changed persistent terminal data')
-                print('PASS: real XTest edit, native save/open/build, WM dirty-close refusal, graceful exit, unchanged terminal state/data')
+                print('PASS: real XTest edit, native save/open/build, recursive fuzzy picker and selection, line:column jump, native split, buffer navigation/dirty-close refusal, WM dirty-close refusal, graceful exit, unchanged terminal state/data')
             finally:
                 # Cleanup applies only to this explicitly created test process
                 # after a failure. It is never evidence for a successful exit.

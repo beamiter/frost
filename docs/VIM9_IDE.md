@@ -44,18 +44,42 @@ managed cache. A missing executable or failed bridge is shown in the window.
 
 ## Workbench
 
+**Quick open…** (`Ctrl+Shift+P`) searches the whole project by filename. A
+background ripgrep index respects ignore files, includes useful hidden files,
+and skips Git internals without following directory symlinks. Results use
+case-insensitive subsequence matching with a filename preference: `dpndl` can
+find `src/deep needle.rs`. Type to filter, use Up/Down or Page Up/Page Down to
+select, and Enter to open. Escape cancels. Matching runs only when the query or
+index changes; the window does not rescan the filesystem while typing. The
+index retains at most 20,000 files and the picker shows the best 80 matches,
+with the current selection kept visible. Refresh rebuilds the index; indexing,
+errors and truncation are shown in the picker. Use Open… for a new filename or
+an explicit external path.
+
+**Go to…** (`Ctrl+Shift+G`) accepts a positive `line` or `line:column`. It moves
+within the current buffer, including unnamed buffers, and uses Vim's byte
+column convention. Invalid coordinates keep the form open with an explanation.
+The typed request does not interpolate user text into an Ex command.
+
 The project sidebar lists one directory at a time, directories first, with Up
 and Refresh controls. Reads run on a worker with a single in-flight scan and
 one latest queued request. The list is capped at 1,024 entries. Directory
 navigation, including resolved symlinks, stays inside the project root. Open
 accepts an explicit local path outside that sidebar as well. This release uses
-a native path-entry form, not an operating-system file-picker dialog.
+a native path-entry form in addition to the indexed Quick Open picker.
 
 The buffer strip reflects real Vim buffer IDs, the selected buffer and modified
-markers. Save and Save All retain Vim's normal write hooks and error handling.
+markers. Hover a tab to see its full path. Each tab has a close control that
+requests a non-forced buffer deletion; modified buffers keep Vim's refusal and
+remain recoverable. Ctrl+Shift+Page Up/Page Down switches buffers, and
+Ctrl+Shift+W closes the current one, resolved inside Vim after any preceding
+navigation. Save and Save All retain Vim's normal write hooks and error handling.
+The status line reports when a save is waiting for Vim to finish input.
 Navigation does not silently discard unsaved changes; with `hidden` disabled,
 Vim can refuse to leave a dirty buffer. Modes, filenames, cursor line/byte
-column, pending requests and connection state appear in the status line.
+column and line count, filetype, encoding, split count, pending requests and
+connection state appear in the status line. Vertical split and Horizontal split
+open real Vim splits; regular Vim window commands continue to navigate them.
 
 Search uses the shared runtime's **literal ripgrep search** and honors its
 ignore rules. Install `rg` for this action. Search results and build diagnostics
@@ -67,11 +91,15 @@ truncation is indicated rather than presented as a complete list.
 Build opens a command-entry form for explicit review. An empty value uses Vim's
 `makeprg`; Cargo projects initially suggest `cargo check --message-format=short`.
 Apply starts an asynchronous job in the project root. **Build does not save
-files implicitly.** Stop Build requests cancellation. Vim's `errorformat`
-parses compiler output; use `:compiler` or your vimrc for a different toolchain.
+files implicitly.** A separate **Save + build…** action explicitly saves all
+buffers before running its reviewed command; a failed write prevents that build
+from starting. Stop Build is available while a build is running, and cancelled
+builds have their own status. Vim's `errorformat` parses compiler output; use
+`:compiler` or your vimrc for a different toolchain.
 The native output view shows the shared runtime's bounded 80-line tail and
-reported exit status. Search and build share the current quickfix result list,
-so a later operation can replace the previous list.
+reported exit status and the number of omitted output lines. Search and build
+share the current quickfix result list, so a later operation can replace the
+previous list.
 
 Files and Problems/output can be toggled. Large windows show the project
 sidebar and bottom dock. The sidebar is hidden below 820 logical pixels and
@@ -84,16 +112,22 @@ editor font size for this process without rewriting configuration.
 
 | Shortcut | Native action |
 | --- | --- |
+| Ctrl+Shift+P | Quick Open project filename picker |
+| Ctrl+Shift+G | Go to line or line:column |
 | Ctrl+Shift+O | Open a file/new-file path form |
+| Ctrl+S | Save current buffer |
 | Ctrl+Shift+F | Search project form |
 | Ctrl+Shift+B | Review build/test command |
 | Ctrl+Shift+S | Save all buffers |
+| Ctrl+Shift+Page Up / Page Down | Previous / next buffer |
+| Ctrl+Shift+W | Close current buffer, retaining unsaved-change checks |
+| F8 / Shift+F8 | Next / previous diagnostic |
 | Ctrl+Shift+C | Copy a terminal selection explicitly |
 | Ctrl+Shift+V | Paste explicitly into Vim |
 
-Save-current is available in the toolbar or through Vim's `:write`. Other
-ordinary Vim chords, including Ctrl+P, Ctrl+O and Ctrl+W, are not commandeered by
-the terminal workspace. A focused native form owns its typing and Enter; held
+Save-current is also available in the toolbar or through Vim's `:write`.
+Ordinary Vim chords, including Ctrl+P, Ctrl+O and Ctrl+W, remain available through
+the editor. A focused native form owns its typing and Enter; held
 Enter ownership is tracked physically so submission does not become input in
 the editor below it. IME preedit/commit uses Frost's native ownership adapter.
 
@@ -150,7 +184,11 @@ and a real child exit. It leaves reaping to the production PTY owner.
 
 The window test requires X11/Xvfb, xdotool, libX11 and libxkbcommon-x11. It
 requires the WGPU renderer (without a tiny-skia fallback) and uses actual XTest
-input through the Iced window and native forms/shortcuts, sends a real
+input through the Iced window and native forms/shortcuts. It verifies recursive
+fuzzy Quick Open with ignored paths excluded, arrow selection, line:column
+navigation, immediate Escape-then-save, Ctrl+S, real splits, buffer switching,
+dirty buffer-close refusal and rapid navigation followed by current-buffer
+close. It sends a real
 `WM_DELETE_WINDOW` request, checks dirty-close refusal and graceful saved exit,
 and verifies isolated terminal state/data files remain byte-for-byte unchanged.
 These checks do not certify physical GPU performance, every Wayland compositor,

@@ -68,7 +68,7 @@ for test in ['legacy_font_groups_split_before_first_edit_and_survive_reload',
     code += '#[test]\n' + function(config, test) + '\n'
 code += '} }\n'
 # The unchanged pinned jterm_core bottom_bar::BAR_HEIGHT contract is 22 px.
-assert 'rev = "5a34a710825900b897d56a27f6c7c806a7a925d5"' in (ROOT / 'Cargo.toml').read_text()
+assert 'rev = "3b6b0590799bca0a64441f1f5fe17e2cf0234cbd"' in (ROOT / 'Cargo.toml').read_text()
 for constant in ['TAB_BAR_H', 'STATUS_BAR_H']:
     code += re.search(r'const ' + constant + r': f32 = [^;]+;', main).group().replace('jterm_core::bottom_bar::BAR_HEIGHT', '22.0') + '\n'
 code += function(main, 'chrome_height') + '\n' + function(main, 'terminal_height_after_chrome')

@@ -11,11 +11,14 @@ use std::time::{Duration, Instant};
 use iced::advanced::input_method;
 use iced::advanced::widget::{self, operation, Id};
 use iced::widget::{
-    button, column, container, mouse_area, row, scrollable, stack, text, text_input, Space,
+    button, column, container, mouse_area, row, scrollable, stack, text, text_input, tooltip, Space,
 };
 use iced::{keyboard, Element, Length, Size, Subscription, Task};
 use jterm_core::pty_input::{self, PasteModes, PastePolicy, UnbracketedMultiline};
-use jterm_core::vim9::{self, ProjectEntry, Vim9Command, Vim9Session, Vim9Snapshot};
+use jterm_core::vim9::{
+    self, ProjectEntry, Vim9Command, Vim9ProjectFile, Vim9ProjectIndex, Vim9ProjectSnapshot,
+    Vim9Session, Vim9Snapshot,
+};
 
 use super::{config, native_enter, terminal, terminal_ime, terminal_view};
 use super::{
@@ -30,6 +33,9 @@ const SIDEBAR: f32 = 250.0;
 const DOCK: f32 = 200.0;
 const INPUT_ID: &str = "frost-vim9-input";
 const MAX_INPUT: usize = 16 * 1024;
+const MAX_QUICK_QUERY: usize = 256;
+const QUICK_MATCH_LIMIT: usize = 80;
+const QUICK_VISIBLE_ROWS: usize = 8;
 
 /// Preserve the pre-existing no-IDE launch path. Once --ide is selected, reject
 /// extra options instead of quietly running a different command or project.
@@ -174,25 +180,34 @@ pub(super) fn open_from_terminal(app: &mut super::Frost) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FormKind {
+    QuickOpen,
+    Goto,
     Open,
     Search,
     Build,
+    SaveAndBuild,
     Rename,
 }
 impl FormKind {
     fn label(self) -> &'static str {
         match self {
+            Self::QuickOpen => "Quick open",
+            Self::Goto => "Go to line",
             Self::Open => "Open file",
             Self::Search => "Search project",
             Self::Build => "Build / test",
+            Self::SaveAndBuild => "Save all and build",
             Self::Rename => "Rename symbol",
         }
     }
     fn help(self) -> &'static str {
         match self {
+            Self::QuickOpen => "Search project filenames. ↑ / ↓ selects, Enter opens, Esc returns to Vim. Ignore rules are respected.",
+            Self::Goto => "Enter a line or line:column. The column is a Vim byte column. The current buffer stays open.",
             Self::Open => "Enter a local filename. New files require an existing parent directory. Vim retains its normal unsaved-buffer checks.",
             Self::Search => "Literal project search using ripgrep. No shell interpretation. Results replace Vim's quickfix list.",
             Self::Build => "Review this shell command before running it. Empty uses Vim's makeprg. Nothing is saved or executed automatically.",
+            Self::SaveAndBuild => "Save all buffers, then run this reviewed build command. If saving fails, the build will not start.",
             Self::Rename => "Requires a configured Vim9 LSP provider. Enter the new symbol name.",
         }
     }
@@ -201,6 +216,8 @@ impl FormKind {
 struct Form {
     kind: FormKind,
     value: String,
+    selected: usize,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +238,9 @@ enum Message {
     FormInput(String),
     SubmitForm,
     CancelForm,
+    RefreshIndex,
+    QuickOpenFile(PathBuf),
+    MoveQuickSelection(isize),
     Browse(PathBuf),
     Directory(u64, Result<(PathBuf, Vec<ProjectEntry>), String>),
     OpenFile(PathBuf),
@@ -253,6 +273,9 @@ struct Ide {
     dock_open: bool,
     output_tab: bool,
     form: Option<Form>,
+    project_index: Option<Vim9ProjectIndex>,
+    project: Vim9ProjectSnapshot,
+    quick_matches: Vec<Vim9ProjectFile>,
     build_command: String,
     search_query: String,
     error: Option<String>,
@@ -299,15 +322,102 @@ fn visible_label(value: &str) -> String {
     result
 }
 
-fn bounded_input(mut value: String) -> String {
-    if value.len() > MAX_INPUT {
-        let mut end = MAX_INPUT;
+fn bounded_input(value: String) -> String {
+    bounded_text(value, MAX_INPUT)
+}
+
+fn bounded_text(mut value: String, limit: usize) -> String {
+    if value.len() > limit {
+        let mut end = limit;
         while !value.is_char_boundary(end) {
             end -= 1;
         }
         value.truncate(end);
     }
     value
+}
+
+/// Reject ambiguous/truncated coordinates instead of sending arbitrary Ex text.
+fn goto_position(value: &str) -> Result<(u64, Option<u64>), &'static str> {
+    let mut parts = value.trim().split(':');
+    let positive = |part: &str| {
+        let part = part.trim();
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        part.parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0 && *value <= i32::MAX as u64)
+    };
+    let line = parts.next().and_then(positive);
+    let column = parts.next().map(positive);
+    if parts.next().is_some() || line.is_none() || column == Some(None) {
+        return Err("Use a positive line or line:column, for example 42 or 42:8");
+    }
+    Ok((line.unwrap(), column.flatten()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shortcut {
+    Form(FormKind),
+    Save,
+    SaveAll,
+    NextBuffer,
+    PreviousBuffer,
+    CloseCurrentBuffer,
+    NextProblem,
+    PreviousProblem,
+}
+
+fn native_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Option<Shortcut> {
+    use keyboard::key::Named;
+    if modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    if *key == keyboard::Key::Named(Named::F8) && !modifiers.control() {
+        return Some(if modifiers.shift() {
+            Shortcut::PreviousProblem
+        } else {
+            Shortcut::NextProblem
+        });
+    }
+    if !modifiers.control() {
+        return None;
+    }
+    if !modifiers.shift() {
+        return matches!(key, keyboard::Key::Character(value) if value.eq_ignore_ascii_case("s"))
+            .then_some(Shortcut::Save);
+    }
+    match key {
+        keyboard::Key::Named(Named::PageUp) => Some(Shortcut::PreviousBuffer),
+        keyboard::Key::Named(Named::PageDown) => Some(Shortcut::NextBuffer),
+        keyboard::Key::Character(value) => match value.to_ascii_lowercase().as_str() {
+            "p" => Some(Shortcut::Form(FormKind::QuickOpen)),
+            "g" => Some(Shortcut::Form(FormKind::Goto)),
+            "o" => Some(Shortcut::Form(FormKind::Open)),
+            "f" => Some(Shortcut::Form(FormKind::Search)),
+            "b" => Some(Shortcut::Form(FormKind::Build)),
+            "s" => Some(Shortcut::SaveAll),
+            "w" => Some(Shortcut::CloseCurrentBuffer),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn moved_selection(current: usize, delta: isize, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    current.saturating_add_signed(delta).min(count - 1)
+}
+
+fn quick_window(selected: usize, count: usize, rows: usize) -> std::ops::Range<usize> {
+    let rows = rows.max(1);
+    let start = selected
+        .saturating_sub(rows / 2)
+        .min(count.saturating_sub(rows));
+    start..(start + rows).min(count)
 }
 
 fn editor_session(editor: &Vim9Session, config: &Config, clean: bool) -> anyhow::Result<Session> {
@@ -396,6 +506,9 @@ impl Ide {
             dock_open: true,
             output_tab: false,
             form: None,
+            project_index: None,
+            project: Vim9ProjectSnapshot::default(),
+            quick_matches: Vec::new(),
             build_command,
             search_query: String::new(),
             error,
@@ -513,12 +626,25 @@ impl Ide {
         self.invalidate_input();
         self.native_enter.lock().claim_pressed();
         let value = match kind {
+            FormKind::QuickOpen => String::new(),
+            FormKind::Goto => self.snapshot.line.max(1).to_string(),
             FormKind::Open => format!("{}/", self.directory.display()),
             FormKind::Search => self.search_query.clone(),
-            FormKind::Build => self.build_command.clone(),
+            FormKind::Build | FormKind::SaveAndBuild => self.build_command.clone(),
             FormKind::Rename => String::new(),
         };
-        self.form = Some(Form { kind, value });
+        self.form = Some(Form {
+            kind,
+            value,
+            selected: 0,
+            error: None,
+        });
+        if kind == FormKind::QuickOpen {
+            if self.project_index.is_none() {
+                self.refresh_index();
+            }
+            self.refresh_quick_matches(false);
+        }
         widget::operate(operation::focusable::focus(Id::new(INPUT_ID)))
     }
     fn submit(&mut self) {
@@ -529,9 +655,36 @@ impl Ide {
         self.native_enter.lock().claim_pressed();
         self.invalidate_input();
         let action = match form.kind {
+            FormKind::QuickOpen => {
+                let Some(file) = self.quick_matches.get(form.selected) else {
+                    let mut form = form;
+                    form.error = Some(if self.project.scanning {
+                        "Still indexing project files…".into()
+                    } else {
+                        "No matching file. Use Open… to enter a new or external path.".into()
+                    });
+                    self.form = Some(form);
+                    return;
+                };
+                Vim9Command::Open {
+                    path: file.path.to_string_lossy().into_owned(),
+                    line: None,
+                    column: None,
+                }
+            }
+            FormKind::Goto => match goto_position(&form.value) {
+                Ok((line, column)) => Vim9Command::Goto { line, column },
+                Err(error) => {
+                    let mut form = form;
+                    form.error = Some(error.into());
+                    self.form = Some(form);
+                    return;
+                }
+            },
             FormKind::Open => {
                 if form.value.is_empty() || form.value.contains(['\r', '\n', '\0']) {
-                    self.error = Some("Enter a single-line filename".into());
+                    let mut form = form;
+                    form.error = Some("Enter a single-line filename".into());
                     self.form = Some(form);
                     return;
                 }
@@ -552,18 +705,89 @@ impl Ide {
                 self.output_tab = false;
                 Vim9Command::Search { query: form.value }
             }
-            FormKind::Build => {
+            FormKind::Build | FormKind::SaveAndBuild => {
                 self.build_command.clone_from(&form.value);
                 self.output_tab = true;
-                Vim9Command::Build {
-                    command: form.value,
+                if form.kind == FormKind::SaveAndBuild {
+                    Vim9Command::SaveAndBuild {
+                        command: form.value,
+                    }
+                } else {
+                    Vim9Command::Build {
+                        command: form.value,
+                    }
                 }
             }
             FormKind::Rename => Vim9Command::Rename { name: form.value },
         };
-        self.dock_open = true;
-        self.resize();
+        if matches!(
+            action,
+            Vim9Command::Search { .. }
+                | Vim9Command::Build { .. }
+                | Vim9Command::SaveAndBuild { .. }
+        ) {
+            self.dock_open = true;
+            self.resize();
+        }
         self.send(action);
+    }
+
+    fn refresh_index(&mut self) {
+        self.project_index = Some(Vim9ProjectIndex::start(&self.root));
+        if let Some(index) = &self.project_index {
+            self.project = index.snapshot();
+        }
+        self.refresh_quick_matches(false);
+    }
+
+    fn refresh_quick_matches(&mut self, preserve_selection: bool) {
+        let Some(form) = self
+            .form
+            .as_mut()
+            .filter(|form| form.kind == FormKind::QuickOpen)
+        else {
+            return;
+        };
+        let selected_path = preserve_selection
+            .then(|| {
+                self.quick_matches
+                    .get(form.selected)
+                    .map(|file| file.path.clone())
+            })
+            .flatten();
+        self.quick_matches = self.project.matches(&form.value, QUICK_MATCH_LIMIT);
+        form.error = None;
+        form.selected = selected_path
+            .and_then(|path| self.quick_matches.iter().position(|file| file.path == path))
+            .unwrap_or(0);
+    }
+
+    fn move_quick_selection(&mut self, delta: isize) {
+        if let Some(form) = self
+            .form
+            .as_mut()
+            .filter(|form| form.kind == FormKind::QuickOpen)
+        {
+            form.selected = moved_selection(form.selected, delta, self.quick_matches.len());
+            form.error = None;
+        }
+    }
+
+    fn shortcut(&mut self, shortcut: Shortcut) -> Task<Message> {
+        let command = match shortcut {
+            Shortcut::Form(kind) => return self.form(kind),
+            Shortcut::Save => Vim9Command::Save,
+            Shortcut::SaveAll => Vim9Command::SaveAll,
+            Shortcut::NextBuffer => Vim9Command::NextBuffer,
+            Shortcut::PreviousBuffer => Vim9Command::PreviousBuffer,
+            // Resolve current inside Vim, after any earlier queued navigation.
+            // The UI snapshot can still identify the previous buffer here.
+            Shortcut::CloseCurrentBuffer => Vim9Command::CloseCurrentBuffer,
+            Shortcut::NextProblem => Vim9Command::NextDiagnostic,
+            Shortcut::PreviousProblem => Vim9Command::PreviousDiagnostic,
+        };
+        self.send(command);
+        Task::none()
     }
 
     fn browse(&mut self, path: PathBuf) -> Task<Message> {
@@ -611,6 +835,14 @@ impl Ide {
             Message::Tick => {
                 if let Some(editor) = &self.editor {
                     self.snapshot = editor.snapshot();
+                }
+                if let Some(index) = &self.project_index {
+                    let snapshot = index.snapshot();
+                    let changed = !std::sync::Arc::ptr_eq(&snapshot.files, &self.project.files);
+                    self.project = snapshot;
+                    if changed {
+                        self.refresh_quick_matches(true);
+                    }
                 }
                 self.blink_on = (self.blink_started.elapsed().as_millis() / 500).is_multiple_of(2);
             }
@@ -707,10 +939,37 @@ impl Ide {
             Message::ShowForm(kind) => return self.form(kind),
             Message::FormInput(value) => {
                 if let Some(form) = &mut self.form {
-                    form.value = bounded_input(value);
+                    form.value = if form.kind == FormKind::QuickOpen {
+                        bounded_text(value, MAX_QUICK_QUERY)
+                    } else {
+                        bounded_input(value)
+                    };
+                    form.error = None;
+                    form.selected = 0;
                 }
+                self.refresh_quick_matches(false);
             }
             Message::SubmitForm => self.submit(),
+            Message::RefreshIndex => self.refresh_index(),
+            Message::QuickOpenFile(path) => {
+                // A click always opens the file from the displayed row, never a
+                // new result which happens to occupy the same numeric index.
+                if self
+                    .form
+                    .as_ref()
+                    .is_some_and(|form| form.kind == FormKind::QuickOpen)
+                    && self.quick_matches.iter().any(|file| file.path == path)
+                {
+                    self.form = None;
+                    self.native_enter.lock().claim_pressed();
+                    self.send(Vim9Command::Open {
+                        path: path.to_string_lossy().into_owned(),
+                        line: None,
+                        column: None,
+                    });
+                }
+            }
+            Message::MoveQuickSelection(delta) => self.move_quick_selection(delta),
             Message::CancelForm => {
                 self.form = None;
                 self.invalidate_input();
@@ -785,6 +1044,30 @@ impl Ide {
         event: keyboard::Event,
         captured: bool,
     ) -> Task<Message> {
+        if self
+            .form
+            .as_ref()
+            .is_some_and(|form| form.kind == FormKind::QuickOpen)
+        {
+            if let keyboard::Event::KeyPressed { key, modifiers, .. } = &event {
+                if !modifiers.control() && !modifiers.alt() && !modifiers.logo() {
+                    let movement = match key {
+                        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some(-1),
+                        keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Some(1),
+                        keyboard::Key::Named(keyboard::key::Named::PageUp) => {
+                            Some(-(QUICK_VISIBLE_ROWS as isize))
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::PageDown) => {
+                            Some(QUICK_VISIBLE_ROWS as isize)
+                        }
+                        _ => None,
+                    };
+                    if let Some(delta) = movement {
+                        return self.reduce(Message::MoveQuickSelection(delta));
+                    }
+                }
+            }
+        }
         if captured {
             self.native_enter.lock().acknowledge_captured(id, &event);
             if self.form.is_some()
@@ -829,16 +1112,12 @@ impl Ide {
         if !self.input_active() {
             return Task::none();
         }
+        if let Some(shortcut) = native_shortcut(&key, modifiers) {
+            return self.shortcut(shortcut);
+        }
         if modifiers.control() && modifiers.shift() && !modifiers.alt() && !modifiers.logo() {
             if let keyboard::Key::Character(value) = &key {
                 match value.to_ascii_lowercase().as_str() {
-                    "o" => return self.form(FormKind::Open),
-                    "f" => return self.form(FormKind::Search),
-                    "b" => return self.form(FormKind::Build),
-                    "s" => {
-                        self.send(Vim9Command::SaveAll);
-                        return Task::none();
-                    }
                     "v" => {
                         let epoch = self.input_epoch;
                         return iced::clipboard::read()
@@ -1273,8 +1552,12 @@ impl Ide {
             contents = contents.push(
                 text(format!(
                     "{}  {}",
-                    if build.running {
+                    if build.running && build.cancelled {
+                        "Stopping…".to_owned()
+                    } else if build.running {
                         "Running".to_owned()
+                    } else if build.cancelled {
+                        "Cancelled".to_owned()
                     } else {
                         build
                             .exit_code
@@ -1285,6 +1568,10 @@ impl Ide {
                 ))
                 .size(12),
             );
+            if build.truncated > 0 {
+                contents = contents
+                    .push(text(format!("{} output lines omitted", build.truncated)).size(11));
+            }
             for line in &build.output {
                 contents = contents.push(
                     text(visible_label(line))
@@ -1326,6 +1613,9 @@ impl Ide {
                         .on_press_maybe(action),
                 );
             }
+            for error in &self.snapshot.search.errors {
+                contents = contents.push(text(visible_label(error)).size(12));
+            }
             if self.snapshot.diagnostics.is_empty() {
                 contents = contents.push(
                     text("No diagnostics. Build or search to populate Vim quickfix.").size(12),
@@ -1341,19 +1631,29 @@ impl Ide {
     fn view(&self) -> Element<'_, Message> {
         let header = row![
             text("FROST / VIM9").size(15),
+            button(text("Quick open…").size(13)).on_press(Message::ShowForm(FormKind::QuickOpen)),
             button(text("Files").size(13)).on_press(Message::ToggleFiles),
             button(text("Open…").size(13)).on_press(Message::ShowForm(FormKind::Open)),
             self.command_button("Save", Vim9Command::Save),
             self.command_button("Save all", Vim9Command::SaveAll),
             button(text("Search…").size(13)).on_press(Message::ShowForm(FormKind::Search)),
             button(text("Build…").size(13)).on_press(Message::ShowForm(FormKind::Build)),
-            self.command_button("Stop build", Vim9Command::CancelBuild),
+            button(text("Save + build…").size(13)).on_press_maybe(
+                (!self.snapshot.build.running).then_some(Message::ShowForm(FormKind::SaveAndBuild))
+            ),
+            button(text("Stop build").size(13)).on_press_maybe(
+                (self.snapshot.connected && self.snapshot.build.running)
+                    .then_some(Message::Command(Vim9Command::CancelBuild))
+            ),
             button(text("Problems / output").size(13)).on_press(Message::ToggleDock),
             button(text("Close").size(13)).on_press(Message::Close)
         ]
         .spacing(5)
         .align_y(iced::Alignment::Center);
         let tools = row![
+            button(text("Go to…").size(13)).on_press(Message::ShowForm(FormKind::Goto)),
+            self.command_button("Vertical split", Vim9Command::Split { vertical: true }),
+            self.command_button("Horizontal split", Vim9Command::Split { vertical: false }),
             self.optional_button("Definition", "definition", Vim9Command::Definition),
             self.optional_button("Hover", "hover", Vim9Command::Hover),
             self.optional_button("References", "references", Vim9Command::References),
@@ -1365,8 +1665,8 @@ impl Ide {
                     .then_some(Message::ShowForm(FormKind::Rename))
                 ),
             self.optional_button("Format", "format", Vim9Command::Format),
-            self.command_button("Previous problem", Vim9Command::PreviousDiagnostic),
-            self.command_button("Next problem", Vim9Command::NextDiagnostic),
+            self.command_button("Previous problem ⇧F8", Vim9Command::PreviousDiagnostic),
+            self.command_button("Next problem F8", Vim9Command::NextDiagnostic),
             text("Vim owns editing, mappings and undo").size(12)
         ]
         .spacing(5)
@@ -1384,9 +1684,38 @@ impl Ide {
                 visible_label(name),
                 if buffer.modified { " *" } else { "" }
             );
+            let tab = button(text(label).size(12))
+                .on_press_maybe(
+                    self.snapshot
+                        .connected
+                        .then_some(Message::Command(Vim9Command::Buffer { buffer: buffer.id })),
+                )
+                .style(if buffer.current {
+                    button::primary
+                } else {
+                    button::secondary
+                });
+            let close = button(text("×").size(12)).padding([4, 5]).on_press_maybe(
+                self.snapshot
+                    .connected
+                    .then_some(Message::Command(Vim9Command::CloseBuffer {
+                        buffer: buffer.id,
+                    })),
+            );
             buffers = buffers.push(
-                button(text(label).size(12))
-                    .on_press(Message::Command(Vim9Command::Buffer { buffer: buffer.id })),
+                row![
+                    tooltip(
+                        tab,
+                        text(visible_label(&buffer.name)),
+                        tooltip::Position::Bottom
+                    ),
+                    tooltip(
+                        close,
+                        text("Close buffer (refuses unsaved changes)"),
+                        tooltip::Position::Bottom
+                    )
+                ]
+                .spacing(1),
             );
         }
         if self.snapshot.buffers_truncated {
@@ -1413,18 +1742,24 @@ impl Ide {
         }
         let state = if self.child_exited {
             "EXITED"
+        } else if self.snapshot.connected && self.snapshot.waiting_for_input {
+            "WAITING FOR VIM INPUT"
         } else if self.snapshot.connected {
             "CONNECTED"
         } else {
             "BRIDGE OFFLINE"
         };
         let status = format!(
-            "{state} | {} | {}{} | {}:{} | {} pending{}",
+            "{state} | {} | {}{} | {}:{} / {} | {} · {} | {} split(s) | {} pending{}",
             visible_label(&self.snapshot.mode),
             visible_label(&self.snapshot.file),
             if self.snapshot.modified { " *" } else { "" },
             self.snapshot.line,
             self.snapshot.column,
+            self.snapshot.line_count,
+            visible_label(&self.snapshot.filetype),
+            visible_label(&self.snapshot.encoding),
+            self.snapshot.window_count,
             self.snapshot.pending,
             if self.error.is_some() || self.snapshot.error.is_some() {
                 " | Error: open Problems / output"
@@ -1432,8 +1767,14 @@ impl Ide {
                 ""
             }
         );
+        let status = self
+            .error
+            .as_deref()
+            .or(self.snapshot.error.as_deref())
+            .map(|error| format!("Error: {} · {}", visible_label(error), status))
+            .unwrap_or(status);
         body = body.push(
-            container(text(status).size(12))
+            container(text(status).size(12).wrapping(text::Wrapping::None))
                 .padding([4, 8])
                 .height(Length::Fixed(STATUS))
                 .width(Length::Fill)
@@ -1452,22 +1793,119 @@ impl Ide {
             .on_submit(Message::SubmitForm)
             .size(15)
             .padding(8);
-        let dialog = container(
-            column![
-                text(form.kind.label()).size(20),
-                text(form.kind.help()).size(13),
-                field,
+        let mut dialog_body = column![
+            text(form.kind.label()).size(20),
+            text(form.kind.help()).size(13),
+            field,
+        ]
+        .spacing(10);
+        if let Some(error) = &form.error {
+            dialog_body = dialog_body.push(
+                text(visible_label(error))
+                    .size(12)
+                    .color(iced::Color::from_rgb8(226, 129, 114)),
+            );
+        }
+        let quick = form.kind == FormKind::QuickOpen;
+        if quick {
+            let index_state = if self.project.scanning {
+                "Indexing project files…".to_string()
+            } else {
+                format!(
+                    "{} files indexed · showing {} matches{}",
+                    self.project.files.len(),
+                    self.quick_matches.len(),
+                    if self.project.truncated {
+                        " · index limit reached"
+                    } else {
+                        ""
+                    }
+                )
+            };
+            dialog_body = dialog_body.push(
                 row![
-                    button("Apply").on_press(Message::SubmitForm),
-                    button("Cancel").on_press(Message::CancelForm)
+                    text(index_state).size(12),
+                    Space::new().width(Length::Fill),
+                    button(text("Refresh").size(12))
+                        .on_press_maybe((!self.project.scanning).then_some(Message::RefreshIndex)),
                 ]
-                .spacing(8)
-            ]
-            .spacing(12),
-        )
-        .padding(20)
-        .width(Length::Fixed((self.size.width - 32.0).clamp(1.0, 580.0)))
-        .style(container::rounded_box);
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+            );
+            if let Some(error) = &self.project.error {
+                dialog_body = dialog_body.push(text(visible_label(error)).size(12));
+            }
+            let rows = (((self.size.height - 280.0).max(44.0) / 44.0) as usize)
+                .clamp(1, QUICK_VISIBLE_ROWS);
+            for index in quick_window(form.selected, self.quick_matches.len(), rows) {
+                let file = &self.quick_matches[index];
+                let name = file
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(&file.relative);
+                dialog_body = dialog_body.push(
+                    button(
+                        column![
+                            text(visible_label(name))
+                                .size(14)
+                                .wrapping(text::Wrapping::None),
+                            text(visible_label(&file.relative))
+                                .size(11)
+                                .wrapping(text::Wrapping::None),
+                        ]
+                        .spacing(1),
+                    )
+                    .width(Length::Fill)
+                    .padding([5, 8])
+                    .style(if index == form.selected {
+                        button::primary
+                    } else {
+                        button::text
+                    })
+                    .on_press(Message::QuickOpenFile(file.path.clone())),
+                );
+            }
+            if self.quick_matches.is_empty() && !self.project.scanning {
+                dialog_body = dialog_body.push(
+                    text("No matching files. Try fewer letters or use Open… for an explicit path.")
+                        .size(13),
+                );
+            }
+        }
+        let mut actions = row![
+            button(if quick { "Open" } else { "Apply" }).on_press_maybe(
+                (!quick || !self.quick_matches.is_empty()).then_some(Message::SubmitForm)
+            ),
+            button("Cancel").on_press(Message::CancelForm),
+        ]
+        .spacing(8);
+        if quick {
+            actions = actions
+                .push(Space::new().width(Length::Fill))
+                .push(button("↑").on_press(Message::MoveQuickSelection(-1)))
+                .push(button("↓").on_press(Message::MoveQuickSelection(1)))
+                .push(
+                    text(format!(
+                        "{} / {}",
+                        if self.quick_matches.is_empty() {
+                            0
+                        } else {
+                            form.selected + 1
+                        },
+                        self.quick_matches.len()
+                    ))
+                    .size(12),
+                );
+        }
+        dialog_body = dialog_body.push(actions);
+        let dialog = container(scrollable(dialog_body).height(Length::Shrink))
+            .padding(20)
+            .max_height((self.size.height - 32.0).max(1.0))
+            .width(Length::Fixed(
+                (self.size.width - 32.0).clamp(1.0, if quick { 680.0 } else { 580.0 }),
+            ))
+            .style(container::rounded_box);
         let scrim = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -1527,6 +1965,95 @@ mod tests {
         let text = bounded_input("界".repeat(MAX_INPUT));
         assert!(text.len() <= MAX_INPUT);
         assert!(text.ends_with('界'));
+    }
+    #[test]
+    fn goto_validates_coordinates_and_never_accepts_ex_commands() {
+        assert_eq!(goto_position("42"), Ok((42, None)));
+        assert_eq!(goto_position(" 42 : 8 "), Ok((42, Some(8))));
+        for invalid in [
+            "",
+            "0",
+            "-1",
+            "+2",
+            "2:",
+            ":2",
+            "2:0",
+            "2:3:4",
+            "２",
+            "1|quit",
+            "4294967296",
+            "999999999999999999999999999999",
+        ] {
+            assert!(goto_position(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+    #[test]
+    fn native_shortcuts_leave_vim_control_navigation_available() {
+        use keyboard::{key::Named, Key, Modifiers};
+        let chord = Modifiers::CTRL | Modifiers::SHIFT;
+        assert_eq!(
+            native_shortcut(&Key::Character("P".into()), chord),
+            Some(Shortcut::Form(FormKind::QuickOpen))
+        );
+        assert_eq!(
+            native_shortcut(&Key::Character("g".into()), chord),
+            Some(Shortcut::Form(FormKind::Goto))
+        );
+        assert_eq!(
+            native_shortcut(&Key::Character("s".into()), Modifiers::CTRL),
+            Some(Shortcut::Save)
+        );
+        assert_eq!(
+            native_shortcut(&Key::Named(Named::F8), Modifiers::SHIFT),
+            Some(Shortcut::PreviousProblem)
+        );
+        assert_eq!(
+            native_shortcut(&Key::Named(Named::F8), Modifiers::empty()),
+            Some(Shortcut::NextProblem)
+        );
+        assert_eq!(
+            native_shortcut(&Key::Named(Named::PageDown), chord),
+            Some(Shortcut::NextBuffer)
+        );
+        for key in ["p", "o", "w", "g", "f", "b"] {
+            assert_eq!(
+                native_shortcut(&Key::Character(key.into()), Modifiers::CTRL),
+                None
+            );
+        }
+        assert_eq!(
+            native_shortcut(&Key::Character("p".into()), chord | Modifiers::ALT),
+            None
+        );
+        assert_eq!(
+            native_shortcut(&Key::Character("p".into()), chord | Modifiers::LOGO),
+            None
+        );
+        assert_eq!(
+            native_shortcut(&Key::Named(Named::F8), Modifiers::CTRL),
+            None
+        );
+    }
+    #[test]
+    fn quick_open_navigation_stays_visible_and_empty_lists_are_safe() {
+        assert_eq!(moved_selection(0, -1, 0), 0);
+        assert_eq!(moved_selection(0, -1, 80), 0);
+        assert_eq!(moved_selection(79, 1, 80), 79);
+        assert_eq!(moved_selection(4, 8, 80), 12);
+        for count in 1..=QUICK_MATCH_LIMIT {
+            for selected in 0..count {
+                for rows in 1..=QUICK_VISIBLE_ROWS {
+                    let range = quick_window(selected, count, rows);
+                    assert!(range.contains(&selected));
+                    assert!(range.end <= count);
+                    assert!(range.len() <= rows);
+                }
+            }
+        }
+        assert!(quick_window(0, 0, 8).is_empty());
+        let query = bounded_text("界".repeat(MAX_QUICK_QUERY), MAX_QUICK_QUERY);
+        assert!(query.len() <= MAX_QUICK_QUERY);
+        assert!(query.ends_with('界'));
     }
     #[test]
     fn startup_and_closing_do_not_own_shell_persistence_or_force_editor_exit() {

@@ -9,6 +9,9 @@ impl Scratch {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!("frost-vim9-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
+        // An ancestor (including /tmp) may itself be a checkout. Project
+        // discovery must be bounded by this test's isolated fixture.
+        fs::create_dir(path.join(".git")).unwrap();
         Self(path)
     }
 }
@@ -90,6 +93,7 @@ fn real_vim9_native_pty() {
     };
     let editor =
         Vim9Session::start(&first).expect("Vim9 must be installed for the explicit native test");
+    assert_eq!(editor.root(), scratch.0);
     let mut session = editor_session(&editor, &config, true).unwrap();
     wait_for(&mut session, &editor, |s| {
         s.connected && s.file == first.to_str().unwrap() && s.mode == "n"
