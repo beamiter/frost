@@ -64,6 +64,7 @@ mod terminal_ime;
 mod terminal_view;
 mod theme;
 mod ui_typography;
+mod vim9_ide;
 mod widget_identity_scope;
 mod workflow_focus;
 mod workflow_picker;
@@ -4551,6 +4552,9 @@ fn main() -> iced::Result {
         app_version: env!("CARGO_PKG_VERSION"),
     });
     env_logger::init();
+    if let Some(result) = vim9_ide::run_if_requested() {
+        return result;
+    }
     let config::ConfigLoad {
         config,
         diagnostic: config_diagnostic,
@@ -4626,6 +4630,7 @@ fn main() -> iced::Result {
 
 #[derive(Debug, Clone)]
 enum Message {
+    OpenVim9Ide,
     /// Observe an Enter already consumed by a widget, without repeating its action.
     CapturedEnterPress(iced::window::Id, keyboard::Event),
     WindowKey(iced::window::Id, keyboard::Event),
@@ -15913,6 +15918,9 @@ impl Frost {
             self.sync_organism_watch();
         }
         match message {
+            Message::OpenVim9Ide => {
+                vim9_ide::open_from_terminal(self);
+            }
             Message::PtyOutput(id, fd, data, watch_stamp) => {
                 let t0 = std::time::Instant::now();
                 let is_active_output = self
@@ -20587,6 +20595,7 @@ impl Frost {
             );
         }
         let bar = bar
+            .push(window_btn("Vim9 IDE", Message::OpenVim9Ide))
             .push(window_btn("—", Message::WindowMinimize))
             .push(window_btn("▢", Message::WindowToggleMaximize))
             .push(close)
