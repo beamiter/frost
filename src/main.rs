@@ -157,7 +157,8 @@ const WINDOW_APP_ID: &str = "io.github.beamiter.frost";
 const WINDOW_ICON_PNG: &[u8] = include_bytes!("../data/io.github.beamiter.frost-128.png");
 
 /// Height reserved for the tab bar at the top of the window.
-const TAB_BAR_H: f32 = 30.0;
+const TAB_BAR_H: f32 = 40.0;
+const TAB_BAR_PADDING: f32 = 20.0;
 /// Height reserved for the status bar at the bottom of the window. The family
 /// constant, so all four jterms reserve the same room for the same bar.
 const STATUS_BAR_H: f32 = jterm_core::bottom_bar::BAR_HEIGHT;
@@ -178,7 +179,7 @@ const RESIZE_CORNER: f32 = 12.0;
 /// Vertical chrome around the terminal area: the always-present tab bar plus
 /// the bottom bar when the `bottom_bar` toggle is on.
 fn chrome_height(font_size: f32, chrome_font_size: f32, bottom_bar: bool) -> f32 {
-    ui_typography::row_height(chrome_font_size, TAB_BAR_H, 14.0)
+    ui_typography::row_height(chrome_font_size, TAB_BAR_H, TAB_BAR_PADDING)
         + if bottom_bar {
             ui_typography::row_height(font_size, STATUS_BAR_H, 4.0)
         } else {
@@ -7350,7 +7351,7 @@ impl Frost {
     }
 
     fn tab_bar_height(&self) -> f32 {
-        ui_typography::row_height(self.chrome_font_size(), TAB_BAR_H, 14.0)
+        ui_typography::row_height(self.chrome_font_size(), TAB_BAR_H, TAB_BAR_PADDING)
     }
 
     fn status_bar_height(&self) -> f32 {
@@ -20683,8 +20684,96 @@ impl Frost {
         }
     }
 
+    fn workspace_toolbar(&self) -> Element<'_, Message> {
+        let font_size = self.chrome_font_size();
+        let height = self.tab_bar_height() - 10.0;
+        let base = Theme::rgb_to_color32(self.theme.tabbar.bg);
+        let inactive = Theme::rgb_to_color32(self.theme.tabbar.inactive_text);
+        let accent = self.c_accent();
+        let blocks_visible = !self.block_bar_user_hidden;
+        let vim9 = tooltip(
+            button(text("Vim9").size(font_size).center())
+                .on_press(Message::OpenVim9Ide)
+                .width(Length::Fixed(52.0_f32.max(font_size * 3.2 + 6.0)))
+                .height(Length::Fixed(height))
+                .padding(0)
+                .style(move |_, status| button::Style {
+                    background: Some(
+                        blend(
+                            base,
+                            inactive,
+                            match status {
+                                button::Status::Hovered => 0.20,
+                                button::Status::Pressed => 0.26,
+                                _ => 0.12,
+                            },
+                        )
+                        .into(),
+                    ),
+                    text_color: inactive,
+                    border: iced::Border {
+                        radius: 5.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            container(text("Open this project in the native Vim9 IDE").size(font_size))
+                .padding([4, 8])
+                .style(self.popup_style()),
+            tooltip::Position::Bottom,
+        );
+        let blocks = tooltip(
+            button(text("▤").size(font_size.min(18.0)).center())
+                .on_press(Message::ToggleBlockReadingBar)
+                .width(Length::Fixed(26.0_f32.max(font_size * 1.3 + 8.0)))
+                .height(Length::Fixed(height))
+                .padding(0)
+                .style(move |_, status| button::Style {
+                    background: Some(
+                        blend(
+                            base,
+                            accent,
+                            match status {
+                                button::Status::Hovered => 0.22,
+                                button::Status::Pressed => 0.28,
+                                _ => 0.08,
+                            },
+                        )
+                        .into(),
+                    ),
+                    text_color: if blocks_visible { accent } else { inactive },
+                    border: iced::Border {
+                        radius: 5.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            container(
+                text(if blocks_visible {
+                    "Hide Blocks navigator (auto-hidden inside interactive apps)"
+                } else {
+                    "Show Blocks navigator at the shell (interactive apps stay full-screen)"
+                })
+                .size(font_size),
+            )
+            .padding([4, 8])
+            .style(self.popup_style()),
+            tooltip::Position::Bottom,
+        );
+        container(
+            row![vim9, blocks]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+        )
+        .padding([0, 6])
+        .into()
+    }
+
     fn tab_bar(&self) -> Element<'_, Message> {
-        let mut tabs = row![].spacing(2).padding(2);
+        let mut tabs = row![]
+            .spacing(2)
+            .padding(2)
+            .align_y(iced::Alignment::Center);
         // Sidebar/dock toggle button at the far left of the tab bar.
         tabs = tabs.push(
             button(text("☰").size(self.chrome_font_size()))
@@ -20701,6 +20790,7 @@ impl Frost {
                     .padding([3, 8])
                     .style(self.ghost_btn_style()),
             );
+            tabs = tabs.push(self.workspace_toolbar());
             if self.pane_drag.is_some() {
                 tabs = tabs.push(self.pane_to_tab_drop_hint(false));
                 let tabs = mouse_area(tabs.width(Length::Fill))
@@ -20717,6 +20807,7 @@ impl Frost {
                 .padding([3, 8])
                 .style(self.ghost_btn_style()),
         );
+        tabs = tabs.push(self.workspace_toolbar());
         for i in 0..self.tabs.len() {
             let id = self.tabs[i].id;
             let active = i == self.active_tab;
@@ -20868,15 +20959,6 @@ impl Frost {
             );
         }
         let bar = bar
-            .push(window_btn(
-                if self.block_bar_user_hidden {
-                    "▣ Blocks"
-                } else {
-                    "▤ Blocks"
-                },
-                Message::ToggleBlockReadingBar,
-            ))
-            .push(window_btn("Vim9 IDE", Message::OpenVim9Ide))
             .push(window_btn("—", Message::WindowMinimize))
             .push(window_btn("▢", Message::WindowToggleMaximize))
             .push(close)
@@ -20892,6 +20974,7 @@ impl Frost {
         container(bar)
             .width(Length::Fill)
             .height(Length::Fixed(self.tab_bar_height()))
+            .align_y(iced::Alignment::Center)
             .style(self.chrome_bar_style())
             .into()
     }
