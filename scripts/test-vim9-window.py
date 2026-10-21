@@ -19,6 +19,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 
@@ -41,6 +42,30 @@ def read(path: Path) -> str:
 
 def snapshot(path: Path) -> dict[str, bytes]:
     return {str(file.relative_to(path)): file.read_bytes() for file in path.rglob('*') if file.is_file()}
+
+
+def edited_buffer(state_path: Path, expected_file: Path, expected_text: list[str]) -> bool:
+    """Read Vim's actual current buffer, independently of TextChanged delivery."""
+    try:
+        state = json.loads(state_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+    require(isinstance(state, dict), 'Invalid Vim sample: expected an object')
+    require(type(state.get('buffer')) is int and state['buffer'] > 0,
+            'Invalid Vim sample: missing buffer identity')
+    require(isinstance(state.get('current'), str), 'Invalid Vim sample: missing current filename')
+    require(type(state.get('modified')) is int and state['modified'] in (0, 1),
+            'Invalid Vim sample: missing modified state')
+    require(isinstance(state.get('text'), list) and all(isinstance(line, str) for line in state['text']),
+            'Invalid Vim sample: missing buffer text')
+    require(isinstance(state.get('buffers'), list), 'Invalid Vim sample: missing listed buffers')
+    for buffer in state['buffers']:
+        require(isinstance(buffer, dict) and type(buffer.get('number')) is int
+                and isinstance(buffer.get('name'), str), 'Invalid Vim sample: invalid listed buffer')
+    name = str(expected_file)
+    return (state['current'] == name and state['modified'] == 1 and state['text'] == expected_text
+            and any(buffer['number'] == state['buffer'] and buffer['name'] == name
+                    for buffer in state['buffers']))
 
 
 def x11_input_state() -> dict:
@@ -86,13 +111,16 @@ def preserve_failure(root: Path, window: int | None, error: BaseException, elaps
             report['screenshot_stderr'] = result.stderr
     except Exception as capture_error:
         report['screenshot_error'] = repr(capture_error)
-    # These are all synthetic fixture files. Exclude transient runtime sockets
-    # and caches; retain the project, vimrc, log, command timeline and samplers.
+    # Archive these synthetic files so upload-artifact does not reject the
+    # deliberately exercised filename containing |. The original names and
+    # vimrc remain intact inside the archive; omit runtime sockets and caches.
     try:
-        shutil.copytree(root, destination / 'fixture',
-                        ignore=lambda path, names: {'runtime', 'cache'} if Path(path) == root else set())
+        with tarfile.open(destination / 'fixture.tar.gz', 'w:gz') as archive:
+            for path in sorted(root.iterdir()):
+                if path.name not in ('runtime', 'cache', 'diagnostic-state.json.tmp'):
+                    archive.add(path, arcname='fixture/' + path.name)
     except Exception as capture_error:
-        report['fixture_copy_error'] = repr(capture_error)
+        report['fixture_archive_error'] = repr(capture_error)
     (destination / 'failure.json').write_text(json.dumps(report, indent=2) + '\n')
     print('FAILURE EVIDENCE: ' + str(destination), file=sys.stderr, flush=True)
     print(json.dumps(report, indent=2), file=sys.stderr, flush=True)
@@ -223,7 +251,7 @@ def main() -> None:
             # This independent sample distinguishes missing text input from a
             # TextChanged observation that did not fire. It changes no editor
             # state and never consumes or manufactures a key.
-            f'  call writefile([json_encode({{"version": v:versionlong, "mode": mode(1), "state": state("mSa"), "buffer": bufnr(), "window": win_getid(), "current": expand("%:p"), "line": line("."), "column": col("."), "modified": &modified, "changedtick": b:changedtick, "text": getline(1, min([line("$"), 100])), "errmsg": v:errmsg, "cmdline": getcmdline()}})], {vim_string(diagnostic_temporary)})\n'
+            f'  call writefile([json_encode({{"version": v:versionlong, "mode": mode(1), "state": state("mSa"), "buffer": bufnr(), "window": win_getid(), "current": expand("%:p"), "line": line("."), "column": col("."), "modified": &modified, "changedtick": b:changedtick, "text": getline(1, min([line("$"), 100])), "buffers": map(getbufinfo({{"buflisted": 1}}), {{_, info -> {{"number": info.bufnr, "name": info.name}}}}), "errmsg": v:errmsg, "cmdline": getcmdline()}})], {vim_string(diagnostic_temporary)})\n'
             f'  call rename({vim_string(diagnostic_temporary)}, {vim_string(diagnostic_state)})\n'
             'endfunction\n'
             "autocmd VimEnter * call timer_start(40, function('FrostRecordCursor'), {'repeat': -1})\n"
@@ -280,7 +308,8 @@ def main() -> None:
                 # synthetic application-level key message.
                 xdo('type', '--clearmodifiers', '--delay', '30', 'inative-gui ')
                 xdo('key', '--clearmodifiers', 'Escape')
-                wait(lambda: read(modified) == '1\n', 'editing the real Vim buffer')
+                wait(lambda: edited_buffer(diagnostic_state, first, ['native-gui original']),
+                     'editing the real Vim buffer')
                 # Save immediately after Escape, while Vim may still be
                 # finishing terminal key decoding. The request must reach its
                 # next safe state instead of requiring another manual save.
@@ -296,7 +325,8 @@ def main() -> None:
                 wait(lambda: read(current).strip() == str(second), 'opening a special filename through the native form')
                 xdo('type', '--clearmodifiers', '--delay', '30', 'idirty ')
                 xdo('key', '--clearmodifiers', 'Escape')
-                wait(lambda: read(modified) == '1\n', 'making the second buffer dirty')
+                wait(lambda: edited_buffer(diagnostic_state, second, ['dirty second']),
+                     'making the second buffer dirty')
                 wait(lambda: read(mode) == 'n\n', 'finishing the second edit')
 
                 wm_delete(window)
@@ -330,7 +360,9 @@ def main() -> None:
                      'moving forward through the same Vim jump list with native Alt+Right')
                 xdo('type', '--clearmodifiers', '--delay', '30', 'iGOTO-')
                 xdo('key', '--clearmodifiers', 'Escape')
-                wait(lambda: read(modified) == '1\n', 'editing after native line navigation')
+                wait(lambda: edited_buffer(diagnostic_state, quick_b,
+                                           ['line one', 'liGOTO-ne two', 'line three']),
+                     'editing after native line navigation')
                 wait(lambda: read(mode) == 'n\n', 'finishing the edit before native buffer actions')
                 xdo('key', '--clearmodifiers', 'ctrl+shift+w')
                 time.sleep(0.35)
