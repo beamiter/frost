@@ -43,6 +43,61 @@ def snapshot(path: Path) -> dict[str, bytes]:
     return {str(file.relative_to(path)): file.read_bytes() for file in path.rglob('*') if file.is_file()}
 
 
+def x11_input_state() -> dict:
+    """Read the server's focus and held keys without injecting any input."""
+    lib = C.CDLL(ctypes.util.find_library('X11') or 'libX11.so.6')
+    lib.XOpenDisplay.argtypes = [C.c_char_p]
+    lib.XOpenDisplay.restype = C.c_void_p
+    lib.XGetInputFocus.argtypes = [C.c_void_p, C.POINTER(C.c_ulong), C.POINTER(C.c_int)]
+    lib.XQueryKeymap.argtypes = [C.c_void_p, C.POINTER(C.c_char)]
+    lib.XCloseDisplay.argtypes = [C.c_void_p]
+    display = lib.XOpenDisplay(None)
+    require(bool(display), 'Cannot inspect the test X11 display')
+    try:
+        focus, revert_to = C.c_ulong(), C.c_int()
+        lib.XGetInputFocus(display, C.byref(focus), C.byref(revert_to))
+        keys = C.create_string_buffer(32)
+        lib.XQueryKeymap(display, keys)
+        return {'focus_window': focus.value, 'revert_to': revert_to.value,
+                'pressed_keycodes': [key for key in range(256) if keys.raw[key // 8] & (1 << (key % 8))]}
+    finally:
+        lib.XCloseDisplay(display)
+
+
+def preserve_failure(root: Path, window: int | None, error: BaseException, elapsed: float) -> None:
+    """Keep the failed fixture and real state before terminating its process."""
+    destination = Path(os.environ.get('FROST_VIM9_WINDOW_ARTIFACTS', str(root) + '-artifacts'))
+    destination = destination.resolve() / root.name
+    destination.mkdir(parents=True, exist_ok=False)
+    report = {'error': repr(error), 'elapsed_seconds': elapsed, 'window': window,
+              'legacy_observations': {name: read(root / name) for name in
+                                      ('ready', 'mode', 'current', 'position', 'modified', 'windows', 'buffers')},
+              'vim_state': read(root / 'diagnostic-state.json')}
+    try:
+        report['x11'] = x11_input_state()
+    except Exception as capture_error:
+        report['x11_error'] = repr(capture_error)
+    try:
+        result = subprocess.run(['import', '-window', str(window) if window else 'root',
+                                 str(destination / 'failure-window.png')],
+                                capture_output=True, text=True, timeout=5)
+        report['screenshot_returncode'] = result.returncode
+        if result.stderr:
+            report['screenshot_stderr'] = result.stderr
+    except Exception as capture_error:
+        report['screenshot_error'] = repr(capture_error)
+    # These are all synthetic fixture files. Exclude transient runtime sockets
+    # and caches; retain the project, vimrc, log, command timeline and samplers.
+    try:
+        shutil.copytree(root, destination / 'fixture',
+                        ignore=lambda path, names: {'runtime', 'cache'} if Path(path) == root else set())
+    except Exception as capture_error:
+        report['fixture_copy_error'] = repr(capture_error)
+    (destination / 'failure.json').write_text(json.dumps(report, indent=2) + '\n')
+    print('FAILURE EVIDENCE: ' + str(destination), file=sys.stderr, flush=True)
+    print(json.dumps(report, indent=2), file=sys.stderr, flush=True)
+
+
 def wm_delete(window: int) -> None:
     """Send the same ICCCM request as a WM close button, without destroying X resources."""
     lib = C.CDLL(ctypes.util.find_library('X11') or 'libX11.so.6')
@@ -86,6 +141,14 @@ def main() -> None:
     require(shutil.which('xdotool') is not None, 'Install xdotool')
     with tempfile.TemporaryDirectory(prefix='frost-vim9-window-') as directory:
         root = Path(directory)
+        started = time.monotonic()
+        window = None
+
+        def trace(event: str, **details) -> None:
+            with (root / 'input-timeline.jsonl').open('a') as timeline:
+                timeline.write(json.dumps({'elapsed_seconds': time.monotonic() - started,
+                                           'event': event, **details}) + '\n')
+
         home, project, state, data = [root / value for value in ('home', 'project', 'state', 'data')]
         for folder in (home, project, state, data, root / 'config', root / 'cache', root / 'runtime'):
             folder.mkdir(mode=0o700)
@@ -140,6 +203,8 @@ def main() -> None:
         rg_wrapper.chmod(0o700)
         position, windows, buffers = [root / name for name in ('position', 'windows', 'buffers')]
         ready, modified, current, mode = [root / name for name in ('ready', 'modified', 'current', 'mode')]
+        diagnostic_state = root / 'diagnostic-state.json'
+        diagnostic_temporary = root / 'diagnostic-state.json.tmp'
         vimrc = (
             'set nocompatible nomore noswapfile\nset shortmess+=I\n'
             'set errorformat=%f:%l:%c:%m\n'
@@ -155,6 +220,11 @@ def main() -> None:
             f'  call writefile(map(getbufinfo({{"buflisted": 1}}), {{_, info -> info.name}}), {vim_string(buffers)})\n'
             f'  call writefile([json_encode(getqflist({{"items": 0, "title": 0, "idx": 0}}))], {vim_string(quickfix)})\n'
             f'  call writefile([json_encode([expand("%:p"), line("."), col(".")])], {vim_string(location)})\n'
+            # This independent sample distinguishes missing text input from a
+            # TextChanged observation that did not fire. It changes no editor
+            # state and never consumes or manufactures a key.
+            f'  call writefile([json_encode({{"version": v:versionlong, "mode": mode(1), "state": state("mSa"), "buffer": bufnr(), "window": win_getid(), "current": expand("%:p"), "line": line("."), "column": col("."), "modified": &modified, "changedtick": b:changedtick, "text": getline(1, min([line("$"), 100])), "errmsg": v:errmsg, "cmdline": getcmdline()}})], {vim_string(diagnostic_temporary)})\n'
+            f'  call rename({vim_string(diagnostic_temporary)}, {vim_string(diagnostic_state)})\n'
             'endfunction\n'
             "autocmd VimEnter * call timer_start(40, function('FrostRecordCursor'), {'repeat': -1})\n"
         )
@@ -171,17 +241,27 @@ def main() -> None:
             process = subprocess.Popen([str(binary), '--ide', str(first)], cwd=project, env=env, stdout=log, stderr=log)
             try:
                 def wait(predicate, description, timeout=15.0):
+                    trace('wait_start', description=description, timeout=timeout)
                     deadline = time.monotonic() + timeout
                     while True:
                         value = predicate()
                         if value:
+                            trace('wait_pass', description=description)
                             return value
                         require(process.poll() is None, f'Window exited unexpectedly while {description}: {read(log_path)[-8000:]}')
                         require(time.monotonic() < deadline, f'Timed out {description}: {read(log_path)[-8000:]}')
                         time.sleep(0.04)
 
                 def xdo(*args: str) -> str:
-                    return subprocess.check_output(['xdotool', *args], env=env, text=True, timeout=5).strip()
+                    trace('xdotool_start', args=args)
+                    if args and args[0] == 'type' and args[-1] in ('inative-gui ', 'iGOTO-'):
+                        try:
+                            trace('x11_before_edit', x11=x11_input_state(), window=window)
+                        except Exception as capture_error:
+                            trace('x11_observation_error', error=repr(capture_error))
+                    result = subprocess.check_output(['xdotool', *args], env=env, text=True, timeout=5).strip()
+                    trace('xdotool_finish', args=args, output=result)
+                    return result
 
                 def visible_window():
                     result = subprocess.run(
@@ -386,6 +466,13 @@ def main() -> None:
                 require(snapshot(state) == before_state, 'IDE changed persistent terminal state')
                 require(snapshot(data) == before_data, 'IDE changed persistent terminal data')
                 print('PASS: real XTest edit, native save/open/build, search case/regex/whole-word/glob controls and job cancellation, recursive fuzzy picker and selection, line:column jump and back/forward, native split, buffer navigation/dirty-close refusal, WM dirty-close refusal, graceful exit, unchanged terminal state/data')
+            except BaseException as error:
+                try:
+                    trace('failure', error=repr(error))
+                    preserve_failure(root, window, error, time.monotonic() - started)
+                except Exception as capture_error:
+                    print(f'Failure evidence capture failed: {capture_error!r}', file=sys.stderr, flush=True)
+                raise
             finally:
                 # Cleanup applies only to this explicitly created test process
                 # after a failure. It is never evidence for a successful exit.
