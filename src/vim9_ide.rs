@@ -17,8 +17,8 @@ use iced::widget::{
 use iced::{keyboard, Element, Length, Size, Subscription, Task};
 use jterm_core::pty_input::{self, PasteModes, PastePolicy, UnbracketedMultiline};
 use jterm_core::vim9::{
-    self, ProjectEntry, Vim9Command, Vim9ProjectFile, Vim9ProjectIndex, Vim9ProjectSnapshot,
-    Vim9SearchCase, Vim9SearchOptions, Vim9Session, Vim9Snapshot,
+    self, ProjectEntry, Vim9Command, Vim9EntryRequest, Vim9ProjectFile, Vim9ProjectIndex,
+    Vim9ProjectSnapshot, Vim9SearchCase, Vim9SearchOptions, Vim9Session, Vim9Snapshot,
 };
 
 use super::{config, native_enter, terminal, terminal_ime, terminal_view};
@@ -47,6 +47,7 @@ struct RenderSubscription {
 impl std::hash::Hash for RenderSubscription {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::hash::Hash::hash(&self.session_id, state);
+        std::hash::Hash::hash(&self.editor.entry_id(), state);
         std::hash::Hash::hash(&self.interval_ms, state);
     }
 }
@@ -64,7 +65,14 @@ fn render_stream(key: &RenderSubscription) -> impl iced::futures::Stream<Item = 
                 let revision = frame.as_ref().map(|frame| frame.revision);
                 if revision != previous {
                     previous = revision;
-                    if output.send(Message::RenderFrame(frame)).await.is_err() {
+                    if output
+                        .send(Message::RenderFrame {
+                            entry_id: editor.entry_id(),
+                            frame,
+                        })
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -145,11 +153,16 @@ pub(super) fn run_if_requested() -> Option<iced::Result> {
         .ok(),
         ..Default::default()
     };
+    let entry = std::sync::Mutex::new(Some(Vim9EntryRequest::command_line(target)));
     Some(
         iced::application(
             move || {
                 Ide::new(
-                    target.clone(),
+                    entry
+                        .lock()
+                        .expect("IDE launch lock")
+                        .take()
+                        .expect("explicit IDE launch is consumed once"),
                     config.clone(),
                     loaded.diagnostic.clone(),
                     native.clone(),
@@ -170,7 +183,7 @@ pub(super) fn run_if_requested() -> Option<iced::Result> {
 
 /// The ordinary terminal's launcher never injects a command into its shell.
 /// Reap the separate process without tying its lifetime to a terminal pane.
-pub(super) fn open_from_terminal(app: &mut super::Frost) {
+pub(super) fn entry_from_terminal(app: &mut super::Frost) -> Option<Vim9EntryRequest> {
     let target = app.sessions.get(app.active).and_then(|session| {
         if session.managed_remote
             || session.observed_ssh_command().is_some()
@@ -191,13 +204,17 @@ pub(super) fn open_from_terminal(app: &mut super::Frost) {
             "Select a local terminal, or run frost --ide /path/to/project",
             super::ToastKind::Warning,
         );
-        return;
+        return None;
     };
+    Some(Vim9EntryRequest::user_action(target))
+}
+
+pub(super) fn open_from_terminal(app: &mut super::Frost, request: Vim9EntryRequest) {
     let spawn = std::env::current_exe().and_then(|executable| {
         std::process::Command::new(executable)
             .arg("--ide")
-            .arg(&target)
-            .current_dir(&target)
+            .arg(request.target())
+            .current_dir(request.target())
             .spawn()
     });
     match spawn {
@@ -261,7 +278,10 @@ struct Form {
 enum Message {
     Terminal(Box<super::Message>),
     Tick,
-    RenderFrame(Option<std::sync::Arc<vim9::Vim9RenderFrame>>),
+    RenderFrame {
+        entry_id: uuid::Uuid,
+        frame: Option<std::sync::Arc<vim9::Vim9RenderFrame>>,
+    },
     Drain,
     Keyboard(iced::window::Id, keyboard::Event, bool),
     Modifiers(keyboard::Modifiers),
@@ -334,6 +354,18 @@ struct Ide {
     blink_started: Instant,
     blink_on: bool,
     child_exited: bool,
+}
+
+fn accepts_render_entry(active: Option<uuid::Uuid>, incoming: uuid::Uuid, exited: bool) -> bool {
+    !exited && active == Some(incoming)
+}
+
+impl Drop for Ide {
+    fn drop(&mut self) {
+        if let Some(editor) = &self.editor {
+            editor.revoke();
+        }
+    }
 }
 
 fn chrome(size: Size, files_open: bool, dock_open: bool) -> (f32, f32) {
@@ -521,7 +553,7 @@ fn editor_session(editor: &Vim9Session, config: &Config, clean: bool) -> anyhow:
 
 impl Ide {
     fn new(
-        target: PathBuf,
+        request: Vim9EntryRequest,
         config: Config,
         diagnostic: Option<String>,
         native_enter: native_enter::SharedOwnership,
@@ -541,8 +573,8 @@ impl Ide {
         let mut error = diagnostic;
         let mut session = None;
         let mut editor = None;
-        let mut root = target;
-        match Vim9Session::start(&root) {
+        let mut root = request.target().to_owned();
+        match Vim9Session::start(request) {
             Ok(controller) => {
                 root = controller.root().to_owned();
                 match editor_session(&controller, &config, false) {
@@ -694,6 +726,10 @@ impl Ide {
     }
     fn close(&mut self) -> Task<Message> {
         if self.session.is_none() || self.child_exited {
+            if let Some(editor) = self.editor.take() {
+                editor.revoke();
+            }
+            self.render_frame = None;
             return iced::exit();
         }
         self.send(Vim9Command::Quit);
@@ -924,8 +960,15 @@ impl Ide {
     }
     fn reduce(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::RenderFrame(frame) => {
-                self.render_frame = frame;
+            Message::RenderFrame { entry_id, frame } => {
+                let active_entry = self
+                    .editor
+                    .as_ref()
+                    .filter(|editor| editor.is_active())
+                    .map(Vim9Session::entry_id);
+                if accepts_render_entry(active_entry, entry_id, self.child_exited) {
+                    self.render_frame = frame;
+                }
             }
             Message::Tick => {
                 if let Some(editor) = &self.editor {
@@ -990,6 +1033,13 @@ impl Ide {
                         .is_some_and(|s| s.id == id && s.master_fd == fd) =>
                 {
                     self.child_exited = true;
+                    if let Some(editor) = self.editor.take() {
+                        editor.revoke();
+                    }
+                    self.render_frame = None;
+                    self.render_subscribed = false;
+                    self.snapshot = Vim9Snapshot::default();
+                    self.form = None;
                     self.invalidate_input();
                     if status == 0 {
                         return iced::exit();
@@ -2391,3 +2441,17 @@ mod tests {
 #[cfg(test)]
 #[path = "vim9_ide_native_tests.rs"]
 mod native_tests;
+
+#[cfg(test)]
+mod explicit_entry_tests {
+    #[test]
+    fn queued_paint_cannot_revive_or_cross_an_entry() {
+        let old = uuid::Uuid::new_v4();
+        let next = uuid::Uuid::new_v4();
+        assert!(super::accepts_render_entry(Some(old), old, false));
+        assert!(!super::accepts_render_entry(None, old, false));
+        assert!(!super::accepts_render_entry(Some(old), old, true));
+        assert!(!super::accepts_render_entry(Some(next), old, false));
+        assert!(super::accepts_render_entry(Some(next), next, false));
+    }
+}

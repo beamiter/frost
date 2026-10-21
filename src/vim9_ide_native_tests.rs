@@ -91,8 +91,8 @@ fn real_vim9_native_pty() {
         ascii_organism_enabled: false,
         ..Config::default()
     };
-    let editor =
-        Vim9Session::start(&first).expect("Vim9 must be installed for the explicit native test");
+    let editor = Vim9Session::start(Vim9EntryRequest::user_action(first.clone()))
+        .expect("Vim9 must be installed for the explicit native test");
     assert_eq!(editor.root(), scratch.0);
     let mut session = editor_session(&editor, &config, true).unwrap();
     wait_for(&mut session, &editor, |s| {

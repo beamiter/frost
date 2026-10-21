@@ -16009,7 +16009,9 @@ impl Frost {
         }
         match message {
             Message::OpenVim9Ide => {
-                vim9_ide::open_from_terminal(self);
+                if let Some(request) = vim9_ide::entry_from_terminal(self) {
+                    vim9_ide::open_from_terminal(self, request);
+                }
             }
             Message::PtyOutput(id, fd, data, watch_stamp) => {
                 let t0 = std::time::Instant::now();
