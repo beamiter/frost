@@ -108,9 +108,17 @@ impl ScrollState {
     }
 
     pub(crate) fn compatibility_mouse(&mut self, input: MouseInput) -> Option<MouseInput> {
+        self.compatibility_mouse_with(input, true)
+    }
+
+    fn compatibility_mouse_with(
+        &mut self,
+        input: MouseInput,
+        protect_fractional: bool,
+    ) -> Option<MouseInput> {
         self.clear();
         if let MouseInput::Press { button, .. } = input {
-            if self.fractional_surface_at_pointer() {
+            if protect_fractional && self.fractional_surface_at_pointer() {
                 // The renderer can lose native ownership before its fallback
                 // image is drawn. Do not reinterpret that last moving image
                 // as stationary PTY cells in this intervening event batch.
@@ -152,7 +160,7 @@ impl ScrollState {
         metrics: Vim9RenderMetrics,
         wheel: NativeWheel,
     ) {
-        if self.pointer.is_some() || frame.mode != "n" {
+        if self.pointer.is_some() || frame.completion.is_some() || frame.mode != "n" {
             return;
         }
         let Some(window) = frame.windows.iter().find(|w| {
@@ -195,6 +203,10 @@ impl ScrollState {
             self.clear();
             return;
         };
+        if frame.completion.is_some() {
+            self.clear();
+            return;
+        }
         self.pixels.retain(|id, scroll| {
             frame
                 .windows
@@ -231,6 +243,9 @@ impl ScrollState {
         window: i64,
         metrics: Vim9RenderMetrics,
     ) -> f32 {
+        if frame.completion.is_some() {
+            return 0.0;
+        }
         self.pixels
             .get(&window)
             .map_or(0.0, |scroll| scroll.offset(frame, metrics))
@@ -393,6 +408,13 @@ impl ScrollState {
         modifiers: keyboard::Modifiers,
         input: MouseInput,
     ) -> NativeInput {
+        // Completion owns screen-cell mouse semantics, including selection
+        // and cancellation. Never translate its overlay to a buffer position.
+        if frame.completion.is_some() {
+            return self
+                .compatibility_mouse_with(input, false)
+                .map_or(NativeInput::Handled, NativeInput::Compatibility);
+        }
         let unmodified = modifiers.is_empty();
         if let MouseInput::Press {
             button,
@@ -531,7 +553,7 @@ fn wheel_at(
     position: Point,
     delta: mouse::ScrollDelta,
 ) -> Option<NativeWheel> {
-    if frame.mode != "n" {
+    if frame.completion.is_some() || frame.mode != "n" {
         return None;
     }
     let (row, column) = geometry.cell_at(position.x, position.y)?;
@@ -823,6 +845,9 @@ where
             }
         }
         if self.focused
+            && self
+                .frame
+                .is_some_and(|frame| frame.mode == "n" && frame.completion.is_none())
             && self.precision_enabled
             && !self.modifiers.control()
             && !self.modifiers.shift()
@@ -936,6 +961,9 @@ where
         for prepared in views {
             self.paint_native_view(renderer, frame, &prepared, cursor_on);
         }
+        // Popup geometry belongs to the full editor grid. Draw it after all
+        // splits and cursors so it can cover a neighboring split or separator.
+        self.paint_completion(renderer, frame, geometry, clip);
         if let Some(state) = self.scroll {
             state.borrow_mut().record_presentation(
                 frame,
@@ -951,7 +979,7 @@ impl<Message> NativeBuffer<'_, Message> {
     fn paint_ink<Renderer>(
         &self,
         renderer: &mut Renderer,
-        frame: &Vim9RenderFrame,
+        normal: &Vim9RenderStyle,
         projected: &Vim9ProjectedRun<'_>,
         view: Rectangle,
         override_color: Option<Color>,
@@ -969,7 +997,7 @@ impl<Message> NativeBuffer<'_, Message> {
         let Some(run_clip) = text_area.intersection(&view) else {
             return;
         };
-        let (fg, _, special) = colors(&run.style, &frame.default_style);
+        let (fg, _, special) = colors(&run.style, normal);
         let fg = override_color.unwrap_or(fg);
         let special = override_color.unwrap_or(special);
         let font = crate::terminal_view::native_editor_glyph_font(
@@ -1053,6 +1081,58 @@ impl<Message> NativeBuffer<'_, Message> {
         }
     }
 
+    fn paint_completion<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        frame: &Vim9RenderFrame,
+        metrics: Vim9RenderMetrics,
+        editor_clip: Rectangle,
+    ) where
+        Renderer: text::Renderer<Font = Font>,
+    {
+        let Some(menu) = frame.completion.as_ref() else {
+            return;
+        };
+        let Some(view) = metrics.rect(&menu.view).map(rectangle) else {
+            return;
+        };
+        let Some(clip) = view.intersection(&editor_clip) else {
+            return;
+        };
+        let (_, background, _) = colors(&menu.default_style, &frame.default_style);
+        renderer.with_layer(clip, |renderer| {
+            renderer.fill_quad(quad(view), Background::Color(background));
+            let runs: Vec<_> = menu
+                .runs
+                .iter()
+                .filter_map(|run| {
+                    Some(Vim9ProjectedRun {
+                        run,
+                        rect: metrics.cell_rect(run.row, run.column, run.cells)?,
+                        clip: Vim9PixelRect {
+                            x: clip.x,
+                            y: clip.y,
+                            width: clip.width,
+                            height: clip.height,
+                        },
+                    })
+                })
+                .collect();
+            // Paint every row's full background before glyphs, preserving
+            // padding and italic overhang exactly as the supplied GUI runs.
+            for projected in &runs {
+                let (_, background, _) = colors(&projected.run.style, &menu.default_style);
+                renderer.fill_quad(
+                    quad(rectangle(projected.rect)),
+                    Background::Color(background),
+                );
+            }
+            for projected in &runs {
+                self.paint_ink(renderer, &menu.default_style, projected, clip, None);
+            }
+        });
+    }
+
     fn paint_native_view<Renderer>(
         &self,
         renderer: &mut Renderer,
@@ -1075,7 +1155,7 @@ impl<Message> NativeBuffer<'_, Message> {
                 renderer.fill_quad(quad(area), Background::Color(bg));
             }
             for projected in &prepared.runs {
-                self.paint_ink(renderer, frame, projected, view, None);
+                self.paint_ink(renderer, &frame.default_style, projected, view, None);
             }
             if let Some(cursor) = prepared.cursor.filter(|_| !self.focused || cursor_on) {
                 if let Some(appearance) = &frame.cursor.appearance {
@@ -1116,7 +1196,13 @@ impl<Message> NativeBuffer<'_, Message> {
                                 .iter()
                                 .filter(|p| rectangle(p.rect).intersects(&caret))
                             {
-                                self.paint_ink(renderer, frame, projected, caret, Some(rgb(fg)));
+                                self.paint_ink(
+                                    renderer,
+                                    &frame.default_style,
+                                    projected,
+                                    caret,
+                                    Some(rgb(fg)),
+                                );
                             }
                         });
                     }
@@ -1402,6 +1488,94 @@ mod tests {
             state.offset(&acknowledged, 20, metrics),
             -10.0,
             "a repeated frame cannot double-rebase"
+        );
+    }
+
+    #[test]
+    fn completion_resets_pixel_offsets_and_retains_raw_mouse_ownership() {
+        let mut frame = direct_frame();
+        let metrics = geometry();
+        let mut state = ScrollState::default();
+        state.wheel(&frame, metrics, wheel(0.5));
+        assert_eq!(state.offset(&frame, 20, metrics), -10.0);
+        frame.completion = Some(
+            serde_json::from_value(serde_json::json!({
+                "view": {"row": 2, "column": 38, "rows": 2, "columns": 16},
+                "default_style": {"background": 0x123456},
+                "runs": [{"row": 2, "column": 38, "text": "native candidate", "cells": 16}]
+            }))
+            .unwrap(),
+        );
+        // The overlay can extend from one split across the separator. Its
+        // appearance immediately cancels stale source-bound wheel motion.
+        assert_eq!(state.offset(&frame, 20, metrics), 0.0);
+        assert!(wheel_at(
+            &frame,
+            metrics,
+            Point::new(340.0, 35.0),
+            mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }
+        )
+        .is_none());
+        state.observe(Some(&frame), metrics, true, |_| false);
+        assert!(state.pixels.is_empty());
+        state.wheel(&frame, metrics, wheel(1.0));
+        assert!(state.scroll_commands().is_empty());
+        assert!(matches!(
+            state.route_mouse(&frame, metrics, keyboard::Modifiers::default(), press(1)),
+            NativeInput::Compatibility(_)
+        ));
+    }
+
+    #[test]
+    fn completion_consumes_preexisting_native_drag_tail_but_passes_new_presses() {
+        let frame = Arc::new(direct_frame());
+        let metrics = geometry();
+        let mut state = ScrollState {
+            position: Some(Point::new(340.0, 35.0)),
+            ..Default::default()
+        };
+        state.wheel(&frame, metrics, wheel(0.5));
+        state.record_presentation(
+            &frame,
+            metrics,
+            metrics,
+            Rectangle::with_size(Size::new(640.0, 400.0)),
+        );
+        assert!(matches!(
+            state.route_mouse(&frame, metrics, keyboard::Modifiers::default(), press(1)),
+            NativeInput::Handled
+        ));
+        assert!(state.native_pressed);
+        let mut completion = (*frame).clone();
+        completion.completion = Some(Default::default());
+        let release = MouseInput::Release {
+            col: 42,
+            row: 2,
+            button: MouseButton::Left,
+        };
+        assert!(
+            matches!(
+                state.route_mouse(
+                    &completion,
+                    metrics,
+                    keyboard::Modifiers::default(),
+                    release
+                ),
+                NativeInput::Handled
+            ),
+            "a captured pre-menu press must not leak an orphan PTY release"
+        );
+        assert!(
+            matches!(
+                state.route_mouse(
+                    &completion,
+                    metrics,
+                    keyboard::Modifiers::default(),
+                    press(1)
+                ),
+                NativeInput::Compatibility(_)
+            ),
+            "a fresh menu press belongs to Vim even before its first draw"
         );
     }
 
@@ -1779,6 +1953,10 @@ mod tests {
             Wheel(NativeWheel),
         }
         let frame = Arc::new(direct_frame());
+        let completion_frame = Arc::new(Vim9RenderFrame {
+            completion: Some(Default::default()),
+            ..(*frame).clone()
+        });
         let state = RefCell::new(ScrollState::default());
         let mut terminal = crate::terminal::TerminalState::new(80, 20);
         let projection = terminal.get_projected_viewport(false);
@@ -1931,6 +2109,33 @@ mod tests {
                 }))
             ),
             "the real terminal widget must see the first click when counting a multi-click"
+        );
+        // A menu can arrive between the last buffer paint and the next
+        // event. Its wheel must reach the PTY, even while the stored
+        // presentation still advertises normal-mode semantic scrolling.
+        widget.frame = Some(&completion_frame);
+        output.clear();
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+            &mut widget,
+            &mut tree,
+            &Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &(),
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut output),
+            &bounds,
+        );
+        assert!(
+            matches!(
+                output.as_slice(),
+                [Output::Mouse(NativeInput::Compatibility(
+                    MouseInput::Wheel { .. }
+                ))]
+            ),
+            "a completion wheel must not be captured against an older native presentation"
         );
     }
 

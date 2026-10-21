@@ -515,7 +515,11 @@ enum Shortcut {
     ToggleDock,
 }
 
-fn native_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Option<Shortcut> {
+fn native_shortcut(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    tool_panel_visible: bool,
+) -> Option<Shortcut> {
     use keyboard::key::Named;
     if modifiers.alt() && !modifiers.control() && !modifiers.shift() && !modifiers.logo() {
         return match key {
@@ -527,7 +531,7 @@ fn native_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Optio
     if modifiers.alt() || modifiers.logo() {
         return None;
     }
-    if *key == keyboard::Key::Named(Named::F8) && !modifiers.control() {
+    if tool_panel_visible && *key == keyboard::Key::Named(Named::F8) && !modifiers.control() {
         return Some(if modifiers.shift() {
             Shortcut::PreviousProblem
         } else {
@@ -1525,7 +1529,7 @@ impl Ide {
         if !self.input_active() {
             return Task::none();
         }
-        if let Some(shortcut) = native_shortcut(&key, modifiers) {
+        if let Some(shortcut) = native_shortcut(&key, modifiers, self.dock_open) {
             return self.shortcut(shortcut);
         }
         if modifiers.control() && modifiers.shift() && !modifiers.alt() && !modifiers.logo() {
@@ -2684,6 +2688,7 @@ mod tests {
     fn native_shortcuts_leave_vim_control_navigation_available() {
         use keyboard::{key::Named, Key, Modifiers};
         let chord = Modifiers::CTRL | Modifiers::SHIFT;
+        let native_shortcut = |key: &Key, modifiers| super::native_shortcut(key, modifiers, true);
         assert_eq!(
             native_shortcut(&Key::Character("P".into()), chord),
             Some(Shortcut::Form(FormKind::QuickOpen))
@@ -2754,6 +2759,34 @@ mod tests {
             None
         );
     }
+    #[test]
+    fn diagnostic_keys_belong_to_vim_while_the_tool_dock_is_hidden() {
+        use keyboard::{key::Named, Key, Modifiers};
+        for modifiers in [Modifiers::empty(), Modifiers::SHIFT] {
+            assert_eq!(
+                native_shortcut(&Key::Named(Named::F8), modifiers, false),
+                None
+            );
+            assert!(native_shortcut(&Key::Named(Named::F8), modifiers, true).is_some());
+        }
+        assert_eq!(
+            native_shortcut(&Key::Named(Named::F5), Modifiers::empty(), false),
+            None
+        );
+        assert_eq!(
+            native_shortcut(&Key::Character("s".into()), Modifiers::CTRL, false),
+            Some(Shortcut::Save)
+        );
+        assert_eq!(
+            native_shortcut(
+                &Key::Character("j".into()),
+                Modifiers::CTRL | Modifiers::SHIFT,
+                false
+            ),
+            Some(Shortcut::ToggleDock)
+        );
+    }
+
     #[test]
     fn quick_open_navigation_stays_visible_and_empty_lists_are_safe() {
         assert_eq!(moved_selection(0, -1, 0), 0);

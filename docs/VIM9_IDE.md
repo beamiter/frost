@@ -97,15 +97,15 @@ The optional GUI status bar shows **GUI buffer · RGB** while a supported frame 
 Vim's command/status rows remain in the compatible surface. Horizontal,
 vertical and mixed internal Vim windows use native text in every supported
 window, with a cursor and IME anchor only in the active one. Folds, diff,
-popup completion, conceal and unsupported shaping temporarily use
+complex/scrolling completion, conceal and unsupported shaping temporarily use
 **Compatible view**, with the runtime's reason shown. Resize,
 disconnection and a terminal-local Shift selection also use the compatible
 path until a current supported frame is available. Old native frames are never
 kept over a known unsupported state.
 
 Vim's logical display columns are retained for correct input positioning.
-Proportional text layout, arbitrary per-line heights and native completion
-popups are future work. Ctrl+wheel changes the IDE's font size without changing
+Proportional text layout and arbitrary per-line heights are future work.
+Ordinary fully visible completion menus now use native GUI paint. Ctrl+wheel changes the IDE's font size without changing
 other terminal processes, native form text sizes or saved configuration. If
 the configured font family is absent, the IDE resolves an installed monospace
 family before measuring and painting it. This keeps regular, bold and italic
@@ -281,7 +281,7 @@ editor font size for this process without rewriting configuration.
 | Ctrl+Shift+S | Save all buffers |
 | Ctrl+Shift+Page Up / Page Down | Previous / next buffer |
 | Ctrl+Shift+W | Close current buffer, retaining unsaved-change checks |
-| F8 / Shift+F8 | Next / previous diagnostic |
+| F8 / Shift+F8 | Next / previous diagnostic while the tool dock is visible; otherwise Vim owns the keys |
 | Ctrl+Shift+C | Copy a terminal selection explicitly |
 | Ctrl+Shift+V | Paste explicitly into Vim |
 
@@ -517,3 +517,64 @@ checks remain passing. Artifacts: `/tmp/frost-vim9-cursor-2fa9112-v2`.
 The shared core passes 80 Rust Vim9 checks plus the explicit real-PTY round
 trip and 99 real-Vim runtime regressions. These are X11/software-renderer
 checks, not a physical-display or Wayland performance certification.
+
+
+## Native Insert completion — 2026-10-21
+
+Pinned core: `20a1c694792f5737c8b92b32ef02e40f6e2c08d9` (render protocol 5).
+Ordinary Insert completion menus now paint above the native GUI buffer, with
+Vim's GUI `Pmenu`/`PmenuSel`, kind and extra-column colors. Word/abbreviation,
+kind/menu labels, CJK and combining characters use the existing native glyph
+path. The menu keeps Vim's screen geometry and padding and can cross split
+separators without being clipped to one editing pane.
+
+Vim still owns candidate generation and keyboard/mouse behavior. Ctrl-N/P
+select, Ctrl-Y accepts and Ctrl-E cancels through the original PTY; the menu
+never takes keyboard or IME focus. Its appearance cancels old buffer scroll
+transforms, and completion mouse/wheel input bypasses semantic buffer actions.
+Previously captured native gestures retain their cancelled physical tails.
+Closing the menu clears the overlay and restores the same source buffer.
+
+The list must fit fully without a scrollbar, use default column order and
+contain unclipped ordinary labels. Long/filtered/fuzzy menus, separate info
+popups, borders, opacity, custom `pumopt` and distinct `PmenuMatch[Sel]` styles
+retain explicit compatibility reasons. Available per-item highlight metadata
+is applied, but older Vim builds (including this host's 9.2.0858) omit those
+fields from `complete_info()` and expose only standard menu highlight groups.
+Hosts using render protocols 1–4 always retain their live compatibility menu.
+
+Shared validation: 82 focused core Rust checks and the explicit real-PTY round
+trip pass. The real-Vim runtime suite runs 106 checks: 105 pass, with one
+per-item highlight test skipped because this Vim omits that optional metadata.
+Menu GUI RGB, Unicode, selection, acceptance/cancellation, cross-split geometry,
+row-delta closing and old-protocol/scrolled-menu compatibility are covered.
+
+Frost passes the locked build, native buffer/shortcut checks and all-target/
+all-feature Clippy (`-D warnings`; the vendored Iced dependency retains its
+pre-existing deprecation notices). The complete Xvfb/software-GPU smoke passes
+standard/selected menu foreground and background RGB, CJK, Ctrl-N/P/Y/E, a
+real PTY mouse click, cross-split overlay and scrollbar fallback/recovery,
+followed by existing cursor/wheel/edit/save/undo/split/resize/zoom checks.
+The menu background retains 19460 exact GUI RGB pixels across the split;
+selected background/foreground retain 5843/950 pixels. Artifacts:
+`/tmp/frost-vim9-completion-20a1c69-v5`.
+
+F8/Shift-F8 now navigate diagnostics only while the tool dock is visible.
+The default buffer-first surface leaves these keys to Vim; the real menu
+fixture uses a Vim F8 mapping to verify this. New completion cancels old
+source transforms while preserving already-captured physical pointer tails;
+wheel events arriving before the first menu paint also stay on the original
+PTY route. These are headless X11/software-renderer checks, not a physical
+display or Wayland performance certification.
+
+Panel-toggle waits now require the source grid, published native frame and
+painted GUI RGB to agree with the requested rows/columns. A separate short,
+traced repeat-toggle check exposed a remaining Vim-side resize delay: two
+31→39-row dock cycles were observed correctly; on a later close, the GUI's
+`TIOCSWINSZ` successfully set 39 rows × 115 columns and Vim received `SIGWINCH`,
+but Vim kept reporting its previous 31-row grid until a later event caused it
+to read the new size. The GUI resize syscall itself succeeded. The complete
+ordinary v5 smoke passed; this does not establish reliable immediate source
+resize handling for arbitrary repeated dock toggles. Diagnostic artifacts:
+`/tmp/frost-vim9-dock-resize-20a1c69/ioctl.trace` and
+`/tmp/frost-vim9-dock-resize-20a1c69/diagnostic.json`.
