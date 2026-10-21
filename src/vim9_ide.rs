@@ -304,8 +304,8 @@ enum Message {
     Focus(bool),
     Resize(Size),
     Close,
-    Mouse(MouseInput),
     NativeWheel(crate::vim9_buffer::NativeWheel),
+    NativeMouse(crate::vim9_buffer::NativeInput),
     Command(Vim9Command),
     ShowForm(FormKind),
     FormInput(String),
@@ -765,6 +765,7 @@ impl Ide {
         }
     }
     fn send(&mut self, command: Vim9Command) {
+        self.scroll.borrow_mut().clear();
         self.invalidate_input();
         self.error = None;
         let result = self
@@ -776,6 +777,82 @@ impl Ide {
             self.error = Some(error);
         }
     }
+    fn native_frame(&self) -> Option<&vim9::Vim9RenderFrame> {
+        let session = self.session.as_ref()?;
+        self.render_frame.as_deref().filter(|frame| {
+            self.config.vim9.native_buffer
+                && self.snapshot.connected
+                && session.projection.scroll_offset() == 0
+                && !session.terminal.has_text_selection()
+                && crate::vim9_buffer::usable(
+                    frame,
+                    session.projection.cells().len(),
+                    session.projection.cells().first().map_or(0, Vec::len),
+                )
+        })
+    }
+
+    fn refresh_native_input(&mut self) {
+        // Frame acknowledgement and request completion must come from the
+        // same locked bridge observation; independent reads can lose input.
+        let observed = self
+            .editor
+            .as_ref()
+            .map(Vim9Session::input_snapshot)
+            .unwrap_or_default();
+        if observed.frame.is_none()
+            || observed.frame.as_ref().is_some_and(|new| {
+                self.render_frame
+                    .as_ref()
+                    .is_none_or(|old| new.revision >= old.revision)
+            })
+        {
+            self.render_frame = observed.frame.clone();
+        }
+        let enabled = self.input_active()
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.terminal.preedit_text.is_empty());
+        self.scroll.borrow_mut().observe(
+            self.native_frame(),
+            crate::vim9_buffer::local_metrics(self.metrics),
+            enabled,
+            |id| observed.command_pending(id),
+        );
+    }
+
+    fn flush_native_input(&mut self) {
+        self.refresh_native_input();
+        let Some(editor) = self.editor.as_ref() else {
+            return;
+        };
+        let commands = if self.native_frame().is_some_and(|frame| frame.mode == "n") {
+            self.scroll.borrow().scroll_commands()
+        } else {
+            Vec::new()
+        };
+        for (window, command) in commands {
+            match editor.send(command) {
+                Ok(id) => self.scroll.borrow_mut().scroll_submitted(window, id),
+                Err(error) => {
+                    self.scroll.borrow_mut().scroll_failed(window);
+                    self.error = Some(error.to_string());
+                }
+            }
+        }
+        let command = self.scroll.borrow().pointer_command();
+        if let Some(command) = command {
+            match editor.send(command) {
+                Ok(id) => self.scroll.borrow_mut().pointer_submitted(id),
+                Err(error) => {
+                    self.scroll.borrow_mut().pointer_failed();
+                    self.error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
     fn close(&mut self) -> Task<Message> {
         if self.session.is_none() || self.child_exited {
             if let Some(editor) = self.editor.take() {
@@ -791,6 +868,7 @@ impl Ide {
         Task::none()
     }
     fn form(&mut self, kind: FormKind) -> Task<Message> {
+        self.scroll.borrow_mut().clear();
         self.retire_gestures();
         self.invalidate_input();
         self.native_enter.lock().claim_pressed();
@@ -1021,17 +1099,8 @@ impl Ide {
                     .filter(|editor| editor.is_active())
                     .map(Vim9Session::entry_id);
                 if accepts_render_entry(active_entry, entry_id, self.child_exited) {
-                    self.scroll.borrow_mut().observe(
-                        self.render_frame.as_ref(),
-                        frame.as_ref(),
-                        self.metrics.cell_h,
-                        self.config.vim9.smooth_scroll
-                            && self
-                                .session
-                                .as_ref()
-                                .is_none_or(|session| session.terminal.preedit_text.is_empty()),
-                    );
                     self.render_frame = frame;
+                    self.flush_native_input();
                 }
             }
             Message::Tick => {
@@ -1057,6 +1126,7 @@ impl Ide {
                         self.refresh_quick_matches(true);
                     }
                 }
+                self.flush_native_input();
                 self.blink_on = (self.blink_started.elapsed().as_millis() / 500).is_multiple_of(2);
             }
             Message::Drain => {
@@ -1164,18 +1234,27 @@ impl Ide {
                 self.resize();
             }
             Message::Close => return self.close(),
-            Message::Mouse(input) => return self.mouse(input),
             Message::NativeWheel(wheel) => {
                 if self.input_active() && self.snapshot.connected {
-                    let lines = self.scroll.borrow_mut().wheel(wheel);
-                    if lines != 0 {
-                        self.send(Vim9Command::Scroll {
-                            window: wheel.window,
-                            lines,
-                        });
+                    self.invalidate_input();
+                    self.refresh_native_input();
+                    if let Some(frame) = self.native_frame() {
+                        self.scroll.borrow_mut().wheel(
+                            frame,
+                            crate::vim9_buffer::local_metrics(self.metrics),
+                            wheel,
+                        );
                     }
+                    self.flush_native_input();
                 }
             }
+            Message::NativeMouse(input) => match input {
+                crate::vim9_buffer::NativeInput::Compatibility(input) => return self.mouse(input),
+                crate::vim9_buffer::NativeInput::Handled => {
+                    self.invalidate_input();
+                    self.flush_native_input();
+                }
+            },
             Message::Command(action) => {
                 self.scroll.borrow_mut().clear();
                 self.send(action);
@@ -1261,6 +1340,7 @@ impl Ide {
                 column: None,
             }),
             Message::Pasted(epoch, value) => {
+                self.scroll.borrow_mut().clear();
                 if epoch != self.input_epoch || !self.input_active() {
                     return Task::none();
                 }
@@ -1711,17 +1791,7 @@ impl Ide {
         let Some(s) = &self.session else {
             return container(text(self.error.as_deref().unwrap_or("Vim could not be launched. Install Vim 9 with +channel, +job, +timers and +quickfix."))).padding(24).center_x(Length::Fill).center_y(Length::Fill).into();
         };
-        let native_frame = self.render_frame.as_deref().filter(|frame| {
-            self.config.vim9.native_buffer
-                && self.snapshot.connected
-                && s.projection.scroll_offset() == 0
-                && !s.terminal.has_text_selection()
-                && crate::vim9_buffer::usable(
-                    frame,
-                    s.projection.cells().len(),
-                    s.projection.cells().first().map_or(0, Vec::len),
-                )
-        });
+        let native_frame = self.native_frame();
         let selection = if s.terminal.has_text_selection() {
             (0..s.projection.cells().len())
                 .map(|row| {
@@ -1776,21 +1846,36 @@ impl Ide {
         )
         .blink_on(self.blink_on)
         .opacity(1.0)
-        .on_mouse(Message::Mouse);
-        if let Some(frame) = native_frame {
-            crate::vim9_buffer::NativeBuffer::new(
-                terminal,
-                frame,
-                self.metrics,
-                self.mono,
-                self.input_active(),
-                self.blink_on,
-            )
-            .scroll(&self.scroll, self.modifiers, Message::NativeWheel)
-            .into()
-        } else {
-            terminal.into()
-        }
+        .on_mouse(move |input| {
+            if let Some(frame) = native_frame {
+                Message::NativeMouse(self.scroll.borrow_mut().route_mouse(
+                    frame,
+                    crate::vim9_buffer::local_metrics(self.metrics),
+                    self.modifiers,
+                    input,
+                ))
+            } else {
+                Message::NativeMouse(self.scroll.borrow_mut().compatibility_mouse(input).map_or(
+                    crate::vim9_buffer::NativeInput::Handled,
+                    crate::vim9_buffer::NativeInput::Compatibility,
+                ))
+            }
+        });
+        crate::vim9_buffer::NativeBuffer::new(
+            terminal,
+            native_frame.and(self.render_frame.as_ref()),
+            self.metrics,
+            self.mono,
+            self.input_active(),
+            self.blink_on,
+        )
+        .scroll(
+            &self.scroll,
+            self.modifiers,
+            self.config.vim9.smooth_scroll,
+            Message::NativeWheel,
+        )
+        .into()
     }
     fn files(&self) -> Element<'_, Message> {
         let parent = self

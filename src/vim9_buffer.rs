@@ -1,6 +1,6 @@
 //! Native Vim buffer text, independent of terminal cells and ANSI palettes.
 //!
-//! The established PTY input adapter is retained for mouse, focus and IME.
+//! The established PTY input adapter retains focus and compatibility gestures.
 //! Its painter is clipped to Vim's command line / compatible margins. The
 //! buffer rectangles are drawn exclusively from authenticated GUI text runs.
 
@@ -14,195 +14,502 @@ use iced::{
     Size,
 };
 use jterm_core::vim9::{
-    Vim9PixelRect, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect, Vim9RenderRun,
-    Vim9RenderStyle, Vim9ScrollAccumulator, Vim9ScrollAnimation,
+    Vim9BufferPosition, Vim9Command, Vim9PixelRect, Vim9PixelScroll, Vim9PointerPhase,
+    Vim9ProjectedRun, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect, Vim9RenderStyle,
+    Vim9Viewport,
 };
 use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use crate::terminal_view::{Metrics, TermWidget};
+use crate::terminal_view::{Metrics, MouseButton, MouseInput, TermWidget};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct NativeWheel {
     pub window: i64,
     /// Positive means down. Precision devices retain fractional lines.
     pub lines: f64,
+    buffer: i64,
+    changedtick: u64,
+    view: Vim9RenderRect,
+    cell_width: f32,
+    line_height: f32,
 }
 
-struct Motion {
-    previous: Arc<Vim9RenderFrame>,
-    outgoing: VecDeque<Arc<Vim9RenderFrame>>,
-    animation: Vim9ScrollAnimation,
-    total_pixels: f32,
+/// Compatibility gestures keep the existing terminal click counter and modifiers.
+/// Only an advertised plain primary gesture is translated to source bytes.
+#[derive(Debug, Clone)]
+pub(crate) enum NativeInput {
+    Compatibility(MouseInput),
+    Handled,
 }
 
-/// Scrolling belongs to a Vim window, never to the terminal's scrollback.
-/// Animate only acknowledged viewport changes following a real wheel event.
-/// Source edits, keyboard navigation, layout changes and fallback settle at once.
-pub(crate) struct ScrollState {
-    epoch: Instant,
-    accumulator: Vim9ScrollAccumulator,
-    requested: BTreeMap<i64, Instant>,
-    motions: BTreeMap<i64, Motion>,
+#[derive(Clone, Debug)]
+struct PointerGesture {
+    id: u64,
+    metrics: Vim9RenderMetrics,
+    view: Vim9RenderRect,
+    source: Vim9BufferPosition,
+    last: Vim9BufferPosition,
+    press: Option<Vim9BufferPosition>,
+    latest: Option<(Vim9BufferPosition, Vim9PointerPhase)>,
+    pending: Option<u64>,
+    released: bool,
 }
 
-impl Default for ScrollState {
-    fn default() -> Self {
-        Self {
-            epoch: Instant::now(),
-            accumulator: Vim9ScrollAccumulator::default(),
-            requested: BTreeMap::new(),
-            motions: BTreeMap::new(),
-        }
+#[derive(Clone)]
+struct PresentedFrame {
+    frame: Arc<Vim9RenderFrame>,
+    metrics: Vim9RenderMetrics,
+    local_metrics: Vim9RenderMetrics,
+    offsets: BTreeMap<i64, f32>,
+    clip: Rectangle,
+}
+
+impl PresentedFrame {
+    fn viewport(&self, window: i64) -> Option<Vim9Viewport<'_>> {
+        Vim9Viewport::new(
+            &self.frame,
+            window,
+            self.metrics,
+            *self.offsets.get(&window).unwrap_or(&0.0),
+        )
     }
+
+    fn caret(&self) -> Option<Rectangle> {
+        self.viewport(self.frame.window)?
+            .cursor_rect()
+            .map(rectangle)
+            .and_then(|rect| rect.intersection(&self.clip))
+    }
+}
+
+/// One source-bound precision transaction per split. Paint, raw mouse hits and
+/// IME use the same viewport offset. No second momentum curve is synthesized.
+#[derive(Default)]
+pub(crate) struct ScrollState {
+    pixels: BTreeMap<i64, Vim9PixelScroll>,
+    pointer: Option<PointerGesture>,
+    // A cancelled native press still owns its drag/release tail. Never leak it
+    // as a compatibility drag without a corresponding compatibility press.
+    native_pressed: bool,
+    consumed_buttons: [bool; 3],
+    next_gesture: u64,
+    position: Option<Point>,
+    presented: Option<PresentedFrame>,
 }
 
 impl ScrollState {
     pub(crate) fn clear(&mut self) {
-        self.accumulator.clear();
-        self.requested.clear();
-        self.motions.clear();
+        self.pixels.clear();
+        self.pointer = None;
     }
 
-    pub(crate) fn wheel(&mut self, wheel: NativeWheel) -> i32 {
-        let lines = self.accumulator.add(wheel.window, wheel.lines);
-        if lines != 0 {
-            self.requested.insert(wheel.window, Instant::now());
+    pub(crate) fn compatibility_mouse(&mut self, input: MouseInput) -> Option<MouseInput> {
+        self.clear();
+        if let MouseInput::Press { button, .. } = input {
+            if self.fractional_surface_at_pointer() {
+                // The renderer can lose native ownership before its fallback
+                // image is drawn. Do not reinterpret that last moving image
+                // as stationary PTY cells in this intervening event batch.
+                if button == MouseButton::Left {
+                    self.native_pressed = true;
+                } else {
+                    self.consumed_buttons[button.slot()] = true;
+                }
+                return None;
+            }
         }
-        lines
+        match input {
+            MouseInput::Release { button, .. } if self.consumed_buttons[button.slot()] => {
+                self.consumed_buttons[button.slot()] = false;
+                None
+            }
+            MouseInput::Drag { .. } if self.native_pressed => None,
+            MouseInput::Release {
+                button: MouseButton::Left,
+                ..
+            } if self.native_pressed => {
+                self.native_pressed = false;
+                None
+            }
+            MouseInput::Press {
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.native_pressed = false;
+                Some(input)
+            }
+            _ => Some(input),
+        }
     }
 
-    fn seconds(&self, now: Instant) -> f64 {
-        now.saturating_duration_since(self.epoch).as_secs_f64()
-    }
-
-    fn active(&self, now: Instant) -> bool {
-        let seconds = self.seconds(now);
-        self.motions
-            .values()
-            .any(|motion| motion.animation.is_active(seconds))
+    pub(crate) fn wheel(
+        &mut self,
+        frame: &Vim9RenderFrame,
+        metrics: Vim9RenderMetrics,
+        wheel: NativeWheel,
+    ) {
+        if self.pointer.is_some() || frame.mode != "n" {
+            return;
+        }
+        let Some(window) = frame.windows.iter().find(|w| {
+            w.window == wheel.window
+                && w.buffer == wheel.buffer
+                && w.changedtick == wheel.changedtick
+                && w.view == wheel.view
+                && metrics.cell_width == wheel.cell_width
+                && metrics.line_height == wheel.line_height
+        }) else {
+            return;
+        };
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.pixels.entry(wheel.window) {
+            let Some(scroll) = Vim9PixelScroll::new(window, metrics) else {
+                return;
+            };
+            entry.insert(scroll);
+        }
+        if let Some(scroll) = self.pixels.get_mut(&wheel.window) {
+            scroll.push(wheel.lines);
+        }
     }
 
     pub(crate) fn observe(
         &mut self,
-        previous: Option<&Arc<Vim9RenderFrame>>,
-        next: Option<&Arc<Vim9RenderFrame>>,
-        line_height: f32,
+        frame: Option<&Vim9RenderFrame>,
+        metrics: Vim9RenderMetrics,
         enabled: bool,
+        pending: impl Fn(u64) -> bool,
     ) {
-        self.observe_at(previous, next, line_height, enabled, Instant::now());
-    }
-
-    fn observe_at(
-        &mut self,
-        previous: Option<&Arc<Vim9RenderFrame>>,
-        next: Option<&Arc<Vim9RenderFrame>>,
-        line_height: f32,
-        enabled: bool,
-        now: Instant,
-    ) {
-        if !enabled {
-            self.motions.clear();
-            return;
-        }
-        let Some((previous, next)) = previous.zip(next).filter(|(old, new)| {
-            old.supported
-                && new.supported
-                && old.rows == new.rows
-                && old.columns == new.columns
-                && old.default_style == new.default_style
-                && line_height.is_finite()
-                && line_height > 0.0
-        }) else {
+        let Some(frame) = frame.filter(|f| f.supported && enabled) else {
             self.clear();
             return;
         };
-        let seconds = self.seconds(now);
-        self.requested
-            .retain(|_, at| now.saturating_duration_since(*at) < Duration::from_millis(350));
-        self.motions.retain(|id, motion| {
-            motion.animation.is_active(seconds)
-                && next.windows.iter().any(|window| window.window == *id)
-        });
-        for window in &next.windows {
-            let Some(old) = previous.windows.iter().find(|old| {
-                old.window == window.window
-                    && old.buffer == window.buffer
-                    && old.changedtick == window.changedtick
-                    && old.view == window.view
-                    && old.leftcol == window.leftcol
-                    && old.textoff == window.textoff
-            }) else {
-                self.motions.remove(&window.window);
-                continue;
-            };
-            let delta = i128::from(window.topline) - i128::from(old.topline);
-            if delta == 0 {
-                continue;
-            }
-            if !self.requested.contains_key(&window.window)
-                || delta.unsigned_abs() >= window.view.rows as u128
-            {
-                self.motions.remove(&window.window);
-                continue;
-            }
-            let motion = self.motions.entry(window.window).or_insert_with(|| Motion {
-                previous: Arc::clone(previous),
-                outgoing: VecDeque::new(),
-                animation: Vim9ScrollAnimation::default(),
-                total_pixels: 0.0,
-            });
-            motion
-                .animation
-                .retarget(delta as f64 * f64::from(line_height), seconds);
-            motion.outgoing.push_back(Arc::clone(previous));
-            // Retargeting can leave more than one wheel step in flight. Keep a
-            // bounded set of outgoing viewports and choose the newest one that
-            // covers the exposed edge. Keeping the gesture's first frame would
-            // force a visible snap every time it travelled one viewport.
-            while motion.outgoing.len() > 32 {
-                motion.outgoing.pop_front();
-            }
-            let offset = motion.animation.offset(seconds);
-            let height = window.view.rows as f64 * f64::from(line_height);
-            if offset.abs() >= height {
-                self.motions.remove(&window.window);
-                continue;
-            }
-            let covering = motion
-                .outgoing
+        self.pixels.retain(|id, scroll| {
+            frame
+                .windows
                 .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(index, frame)| {
-                    let origin = frame
-                        .windows
-                        .iter()
-                        .find(|origin| origin.window == window.window)?;
-                    let total = (i128::from(window.topline) - i128::from(origin.topline)) as f64
-                        * f64::from(line_height);
-                    let covers = if offset >= 0.0 {
-                        total >= offset && total <= height
-                    } else {
-                        total <= offset && total >= -height
-                    };
-                    covers.then(|| (index, Arc::clone(frame), total as f32))
+                .find(|w| w.window == *id)
+                .is_some_and(|window| {
+                    let waiting = scroll.request_id().is_some_and(&pending);
+                    scroll.reconcile(window, metrics, waiting)
+                })
+        });
+        if let Some(gesture) = self.pointer.as_mut() {
+            let valid = gesture.metrics == metrics
+                && frame.windows.iter().any(|window| {
+                    window.native_pointer
+                        && window.window == gesture.source.window
+                        && window.buffer == gesture.source.buffer
+                        && window.changedtick == gesture.source.changedtick
+                        && window.view == gesture.view
                 });
-            if let Some((index, frame, total)) = covering {
-                motion.previous = frame;
-                motion.total_pixels = total;
-                // Keep the selected frame and every newer candidate: a frame
-                // that is too recent now can cover the edge on the next step.
-                drop(motion.outgoing.drain(..index));
-            } else {
-                // A displacement larger than the available viewport cannot be
-                // presented without inventing text; show Vim's current frame.
-                self.motions.remove(&window.window);
+            if !valid {
+                self.pointer = None;
+            } else if gesture.pending.is_some_and(|id| !pending(id)) {
+                gesture.pending = None;
+                if gesture.released && gesture.press.is_none() && gesture.latest.is_none() {
+                    self.pointer = None;
+                }
             }
         }
     }
+
+    pub(crate) fn offset(
+        &self,
+        frame: &Vim9RenderFrame,
+        window: i64,
+        metrics: Vim9RenderMetrics,
+    ) -> f32 {
+        self.pixels
+            .get(&window)
+            .map_or(0.0, |scroll| scroll.offset(frame, metrics))
+    }
+
+    pub(crate) fn scroll_commands(&self) -> Vec<(i64, Vim9Command)> {
+        if self.pointer.is_some() {
+            return Vec::new();
+        }
+        self.pixels
+            .iter()
+            .filter_map(|(window, scroll)| scroll.command().map(|command| (*window, command)))
+            .collect()
+    }
+
+    pub(crate) fn scroll_submitted(&mut self, window: i64, id: u64) {
+        if let Some(scroll) = self.pixels.get_mut(&window) {
+            scroll.submitted(id);
+        }
+    }
+
+    pub(crate) fn scroll_failed(&mut self, window: i64) {
+        self.pixels.remove(&window);
+    }
+
+    pub(crate) fn pointer_command(&self) -> Option<Vim9Command> {
+        let gesture = self.pointer.as_ref()?;
+        if gesture.pending.is_some() {
+            return None;
+        }
+        let (target, phase) = gesture
+            .press
+            .as_ref()
+            .map(|p| (p, Vim9PointerPhase::Press))
+            .or_else(|| gesture.latest.as_ref().map(|(p, phase)| (p, *phase)))?;
+        Some(pointer_command(target, gesture.id, phase))
+    }
+
+    pub(crate) fn pointer_submitted(&mut self, id: u64) {
+        if let Some(gesture) = self.pointer.as_mut() {
+            if gesture.press.take().is_none() {
+                gesture.latest = None;
+            }
+            gesture.pending = Some(id);
+        }
+    }
+
+    pub(crate) fn pointer_failed(&mut self) {
+        self.pointer = None;
+    }
+
+    fn fractional_surface_at_pointer(&self) -> bool {
+        let Some((presented, point)) = self.presented.as_ref().zip(self.position) else {
+            return false;
+        };
+        presented.clip.contains(point)
+            && presented.frame.windows.iter().any(|window| {
+                presented
+                    .offsets
+                    .get(&window.window)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .abs()
+                    >= 0.01
+                    && presented
+                        .viewport(window.window)
+                        .is_some_and(|view| view.clip().contains(point.x, point.y))
+            })
+    }
+
+    fn anchor_at(
+        &self,
+        current: &Vim9RenderFrame,
+        metrics: Vim9RenderMetrics,
+        fractional_only: bool,
+    ) -> Option<Vim9BufferPosition> {
+        let point = self.position?;
+        let presented = self
+            .presented
+            .as_ref()
+            .filter(|p| p.local_metrics == metrics && p.clip.contains(point))?;
+        presented
+            .frame
+            .windows
+            .iter()
+            .filter(|w| w.native_pointer)
+            .find_map(|window| {
+                if fractional_only
+                    && presented
+                        .offsets
+                        .get(&window.window)
+                        .copied()
+                        .unwrap_or(0.0)
+                        .abs()
+                        < 0.01
+                {
+                    return None;
+                }
+                if !current.windows.iter().any(|w| {
+                    w.native_pointer
+                        && w.window == window.window
+                        && w.buffer == window.buffer
+                        && w.changedtick == window.changedtick
+                        && w.view == window.view
+                }) {
+                    return None;
+                }
+                presented
+                    .viewport(window.window)?
+                    .anchor_at(point.x, point.y)
+                    .map(|anchor| anchor.position)
+            })
+    }
+
+    fn presented_view(&self, window: i64) -> Option<Vim9RenderRect> {
+        self.presented
+            .as_ref()?
+            .frame
+            .windows
+            .iter()
+            .find(|w| w.window == window)
+            .map(|w| w.view.clone())
+    }
+
+    fn projection(
+        &self,
+        frame: &Arc<Vim9RenderFrame>,
+        metrics: Vim9RenderMetrics,
+        local_metrics: Vim9RenderMetrics,
+        clip: Rectangle,
+    ) -> PresentedFrame {
+        let offsets = frame
+            .windows
+            .iter()
+            .map(|w| (w.window, self.offset(frame, w.window, local_metrics)))
+            .collect();
+        PresentedFrame {
+            frame: Arc::clone(frame),
+            metrics,
+            local_metrics,
+            offsets,
+            clip,
+        }
+    }
+
+    fn record_presentation(
+        &mut self,
+        frame: &Arc<Vim9RenderFrame>,
+        metrics: Vim9RenderMetrics,
+        local_metrics: Vim9RenderMetrics,
+        clip: Rectangle,
+    ) {
+        self.presented = Some(self.projection(frame, metrics, local_metrics, clip));
+    }
+
+    pub(crate) fn route_mouse(
+        &mut self,
+        frame: &Vim9RenderFrame,
+        metrics: Vim9RenderMetrics,
+        modifiers: keyboard::Modifiers,
+        input: MouseInput,
+    ) -> NativeInput {
+        let unmodified = modifiers.is_empty();
+        if let MouseInput::Press {
+            button,
+            count,
+            app_eligible,
+            ..
+        } = input
+        {
+            self.consumed_buttons[button.slot()] = false;
+            let supported = button == MouseButton::Left && count == 1 && unmodified && app_eligible;
+            if self.fractional_surface_at_pointer() && !supported {
+                // Settle unsupported gestures without sending their moving
+                // screen coordinates to the stationary PTY. The next press on
+                // a drawn stationary frame retains the normal Vim semantics.
+                self.clear();
+                if button == MouseButton::Left {
+                    self.native_pressed = true;
+                } else {
+                    self.consumed_buttons[button.slot()] = true;
+                }
+                return NativeInput::Handled;
+            }
+        }
+        match input {
+            MouseInput::Release { button, .. } if self.consumed_buttons[button.slot()] => {
+                self.consumed_buttons[button.slot()] = false;
+                return NativeInput::Handled;
+            }
+            MouseInput::Press {
+                button: MouseButton::Left,
+                count,
+                app_eligible,
+                ..
+            } => {
+                // The terminal adapter has already counted this press. It sees
+                // every click, including the first native click of a double.
+                self.native_pressed = false;
+                self.pointer = None;
+                if count == 1 && unmodified && app_eligible {
+                    if let Some(target) = self.anchor_at(frame, metrics, true) {
+                        self.next_gesture = self.next_gesture.wrapping_add(1).max(1);
+                        self.native_pressed = true;
+                        self.pointer = Some(PointerGesture {
+                            id: self.next_gesture,
+                            metrics,
+                            view: self.presented_view(target.window).unwrap(),
+                            source: target,
+                            last: target,
+                            press: Some(target),
+                            latest: None,
+                            pending: None,
+                            released: false,
+                        });
+                        return NativeInput::Handled;
+                    }
+                    if self.fractional_surface_at_pointer() {
+                        // The visible image has no valid source target now.
+                        // Do not replay its click into a replacement buffer.
+                        self.clear();
+                        self.native_pressed = true;
+                        return NativeInput::Handled;
+                    }
+                }
+                self.clear();
+            }
+            MouseInput::Drag { .. } if self.native_pressed => {
+                let target = unmodified
+                    .then(|| self.anchor_at(frame, metrics, false))
+                    .flatten();
+                if let (Some(gesture), Some(target)) = (self.pointer.as_mut(), target) {
+                    if target.window == gesture.source.window
+                        && target.buffer == gesture.source.buffer
+                        && target.changedtick == gesture.source.changedtick
+                        && target != gesture.last
+                    {
+                        gesture.last = target;
+                        gesture.latest = Some((target, Vim9PointerPhase::Drag));
+                    }
+                } else if !unmodified {
+                    self.pointer = None;
+                }
+                return NativeInput::Handled;
+            }
+            MouseInput::Release {
+                button: MouseButton::Left,
+                ..
+            } if self.native_pressed => {
+                self.native_pressed = false;
+                let target = self.anchor_at(frame, metrics, false);
+                if let Some(gesture) = self.pointer.as_mut() {
+                    let target = target
+                        .filter(|target| {
+                            target.window == gesture.source.window
+                                && target.buffer == gesture.source.buffer
+                                && target.changedtick == gesture.source.changedtick
+                        })
+                        .unwrap_or(gesture.last);
+                    gesture.last = target;
+                    gesture.latest = Some((target, Vim9PointerPhase::Release));
+                    gesture.released = true;
+                }
+                return NativeInput::Handled;
+            }
+            _ => self.clear(),
+        }
+        NativeInput::Compatibility(input)
+    }
+}
+
+fn pointer_command(
+    target: &Vim9BufferPosition,
+    gesture: u64,
+    phase: Vim9PointerPhase,
+) -> Vim9Command {
+    Vim9Command::Pointer {
+        window: target.window,
+        buffer: target.buffer,
+        changedtick: target.changedtick,
+        line: target.line,
+        byte_column: target.byte_column,
+        gesture,
+        phase,
+    }
+}
+
+pub(crate) fn local_metrics(metrics: Metrics) -> Vim9RenderMetrics {
+    render_metrics(Rectangle::with_size(Size::ZERO), metrics)
 }
 
 fn wheel_at(
@@ -211,11 +518,14 @@ fn wheel_at(
     position: Point,
     delta: mouse::ScrollDelta,
 ) -> Option<NativeWheel> {
+    if frame.mode != "n" {
+        return None;
+    }
     let (row, column) = geometry.cell_at(position.x, position.y)?;
     let window = frame
         .windows
         .iter()
-        .find(|window| window.view.contains(row, column))?;
+        .find(|window| window.native_pointer && window.view.contains(row, column))?;
     let lines = match delta {
         mouse::ScrollDelta::Lines { y, .. } => -f64::from(y) * 3.0,
         mouse::ScrollDelta::Pixels { y, .. } => -f64::from(y) / f64::from(geometry.line_height),
@@ -223,6 +533,11 @@ fn wheel_at(
     (lines.is_finite() && lines != 0.0).then_some(NativeWheel {
         window: window.window,
         lines,
+        buffer: window.buffer,
+        changedtick: window.changedtick,
+        view: window.view.clone(),
+        cell_width: geometry.cell_width,
+        line_height: geometry.line_height,
     })
 }
 
@@ -277,10 +592,9 @@ fn render_metrics(bounds: Rectangle, metrics: Metrics) -> Vim9RenderMetrics {
 }
 
 struct PaintView<'a> {
-    window: i64,
-    logical: &'a Vim9RenderRect,
     clip: Rectangle,
-    runs: Vec<&'a Vim9RenderRun>,
+    runs: Vec<Vim9ProjectedRun<'a>>,
+    cursor: Option<Rectangle>,
 }
 
 /// Prepare each window once, preserving run order for background/text layering.
@@ -291,44 +605,27 @@ fn paint_views(
     frame: &Vim9RenderFrame,
     metrics: Vim9RenderMetrics,
     clip: Rectangle,
+    offset: impl Fn(i64) -> f32,
 ) -> Vec<PaintView<'_>> {
-    let mut indices = std::collections::BTreeMap::new();
-    let mut views = Vec::new();
-    let windows: Vec<_> = if frame.windows.is_empty() {
-        vec![(frame.window, &frame.view)]
-    } else {
-        frame.windows.iter().map(|w| (w.window, &w.view)).collect()
-    };
-    for (window, logical) in windows {
-        if let Some(visible) = metrics
-            .rect(logical)
-            .map(rectangle)
-            .and_then(|rect| rect.intersection(&clip))
-            .filter(|rect| rect.area() > 0.0)
-        {
-            indices.insert(window, views.len());
-            views.push(PaintView {
-                window,
-                logical,
+    frame
+        .windows
+        .iter()
+        .filter_map(|window| {
+            let viewport = Vim9Viewport::new(frame, window.window, metrics, offset(window.window))?;
+            let visible = rectangle(viewport.clip())
+                .intersection(&clip)
+                .filter(|r| r.area() > 0.0)?;
+            Some(PaintView {
                 clip: visible,
-                runs: Vec::new(),
-            });
-        }
-    }
-    for run in &frame.runs {
-        let window = if frame.windows.is_empty() {
-            frame.window
-        } else {
-            run.window
-        };
-        if let Some(index) = indices.get(&window) {
-            let view = &mut views[*index];
-            if run.cells > 0 && view.logical.contains(run.row, run.column) {
-                view.runs.push(run);
-            }
-        }
-    }
-    views
+                runs: viewport.runs().collect(),
+                cursor: (window.window == frame.window)
+                    .then(|| viewport.cursor_rect())
+                    .flatten()
+                    .map(rectangle)
+                    .and_then(|r| r.intersection(&visible)),
+            })
+        })
+        .collect()
 }
 
 /// Subtract one contained rectangle without overlapping the remaining bands.
@@ -380,7 +677,7 @@ fn compatibility_bands(bounds: Rectangle, views: &[Rectangle]) -> Vec<Rectangle>
 
 pub(crate) struct NativeBuffer<'a, Message> {
     input: TermWidget<'a, Message>,
-    frame: &'a Vim9RenderFrame,
+    frame: Option<&'a Arc<Vim9RenderFrame>>,
     metrics: Metrics,
     font: Font,
     focused: bool,
@@ -388,12 +685,13 @@ pub(crate) struct NativeBuffer<'a, Message> {
     scroll: Option<&'a RefCell<ScrollState>>,
     modifiers: keyboard::Modifiers,
     on_scroll: Option<Box<dyn Fn(NativeWheel) -> Message + 'a>>,
+    precision_enabled: bool,
 }
 
 impl<'a, Message> NativeBuffer<'a, Message> {
     pub(crate) fn new(
         input: TermWidget<'a, Message>,
-        frame: &'a Vim9RenderFrame,
+        frame: Option<&'a Arc<Vim9RenderFrame>>,
         metrics: Metrics,
         font: Font,
         focused: bool,
@@ -409,6 +707,7 @@ impl<'a, Message> NativeBuffer<'a, Message> {
             scroll: None,
             modifiers: keyboard::Modifiers::default(),
             on_scroll: None,
+            precision_enabled: true,
         }
     }
 
@@ -416,10 +715,12 @@ impl<'a, Message> NativeBuffer<'a, Message> {
         mut self,
         state: &'a RefCell<ScrollState>,
         modifiers: keyboard::Modifiers,
+        precision_enabled: bool,
         on_scroll: impl Fn(NativeWheel) -> Message + 'a,
     ) -> Self {
         self.scroll = Some(state);
         self.modifiers = modifiers;
+        self.precision_enabled = precision_enabled;
         self.on_scroll = Some(Box::new(on_scroll));
         self
     }
@@ -465,19 +766,36 @@ where
         viewport: &Rectangle,
     ) {
         if let Some(state) = self.scroll {
-            // Never generate input against a moving visual row. Settle before
-            // delegating button/selection/IME geometry to the real PTY adapter.
-            if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_))) {
+            state.borrow_mut().position = cursor.position();
+            if matches!(
+                event,
+                Event::Keyboard(_)
+                    | Event::InputMethod(_)
+                    | Event::Window(iced::window::Event::Unfocused)
+            ) {
                 state.borrow_mut().clear();
-                shell.request_redraw();
             }
-            if let Event::Window(iced::window::Event::RedrawRequested(_)) = event {
-                if state.borrow().active(Instant::now()) {
-                    shell.request_redraw();
-                }
+            // Iced asks for IME geometry on RedrawRequested immediately
+            // before drawing. Resolve from that same immutable projection;
+            // pointer events continue to use the last image actually drawn.
+            if let Some(frame) = self.frame {
+                let caret = state
+                    .borrow()
+                    .projection(
+                        frame,
+                        render_metrics(layout.bounds(), self.metrics),
+                        local_metrics(self.metrics),
+                        layout
+                            .bounds()
+                            .intersection(viewport)
+                            .unwrap_or(Rectangle::with_size(Size::ZERO)),
+                    )
+                    .caret();
+                self.input.set_native_ime_cursor(caret);
             }
         }
         if self.focused
+            && self.precision_enabled
             && !self.modifiers.control()
             && !self.modifiers.shift()
             && !self.modifiers.alt()
@@ -493,12 +811,12 @@ where
                 cursor.position_over(layout.bounds()),
             ) {
                 if viewport.contains(position) {
-                    if let Some(wheel) = wheel_at(
-                        self.frame,
-                        render_metrics(layout.bounds(), self.metrics),
-                        position,
-                        *delta,
-                    ) {
+                    let wheel = self.scroll.and_then(|state| {
+                        let state = state.borrow();
+                        let presented = state.presented.as_ref()?;
+                        wheel_at(&presented.frame, presented.metrics, position, *delta)
+                    });
+                    if let Some(wheel) = wheel {
                         shell.publish(callback(wheel));
                         shell.capture_event();
                         return;
@@ -535,18 +853,38 @@ where
         let Some(clip) = bounds.intersection(viewport) else {
             return;
         };
+        let Some(frame) = self.frame else {
+            self.input
+                .draw(tree, renderer, theme, style, layout, cursor, viewport);
+            if let Some(state) = self.scroll {
+                state.borrow_mut().presented = None;
+            }
+            return;
+        };
         let m = self.metrics;
         let geometry = render_metrics(bounds, m);
         if !geometry.is_valid() {
             self.input
                 .draw(tree, renderer, theme, style, layout, cursor, viewport);
+            if let Some(state) = self.scroll {
+                state.borrow_mut().presented = None;
+            }
             return;
         }
-        let frame = self.frame;
-        let views = paint_views(frame, geometry, clip);
+        let views = {
+            let scroll = self.scroll.map(RefCell::borrow);
+            paint_views(frame, geometry, clip, |window| {
+                scroll.as_ref().map_or(0.0, |state| {
+                    state.offset(frame, window, local_metrics(self.metrics))
+                })
+            })
+        };
         if views.is_empty() {
             self.input
                 .draw(tree, renderer, theme, style, layout, cursor, viewport);
+            if let Some(state) = self.scroll {
+                state.borrow_mut().presented = None;
+            }
             return;
         }
         let rectangles: Vec<_> = views.iter().map(|view| view.clip).collect();
@@ -556,36 +894,16 @@ where
                     .draw(tree, renderer, theme, style, layout, cursor, &band);
             });
         }
-        let (_, normal_bg, _) = colors(&frame.default_style, &frame.default_style);
-        let scroll = self.scroll.map(RefCell::borrow);
-        let seconds = scroll.as_ref().map(|state| state.seconds(Instant::now()));
         for prepared in views {
-            renderer.fill_quad(quad(prepared.clip), Background::Color(normal_bg));
-            let motion = scroll
-                .as_ref()
-                .and_then(|state| state.motions.get(&prepared.window))
-                .filter(|motion| motion.animation.is_active(seconds.unwrap_or(0.0)));
-            let offset = motion.map_or(0.0, |motion| {
-                motion.animation.offset(seconds.unwrap_or(0.0)) as f32
-            });
-            if let Some(motion) = motion {
-                // The old viewport supplies the exposed edge while the new one
-                // moves into place. Both stay clipped to this same Vim split.
-                if let Some(previous) = paint_views(&motion.previous, geometry, prepared.clip)
-                    .into_iter()
-                    .find(|view| view.window == prepared.window)
-                {
-                    self.paint_native_view(
-                        renderer,
-                        &motion.previous,
-                        &previous,
-                        geometry,
-                        offset - motion.total_pixels,
-                        false,
-                    );
-                }
-            }
-            self.paint_native_view(renderer, frame, &prepared, geometry, offset, true);
+            self.paint_native_view(renderer, frame, &prepared);
+        }
+        if let Some(state) = self.scroll {
+            state.borrow_mut().record_presentation(
+                frame,
+                geometry,
+                local_metrics(self.metrics),
+                clip,
+            );
         }
     }
 }
@@ -596,46 +914,24 @@ impl<Message> NativeBuffer<'_, Message> {
         renderer: &mut Renderer,
         frame: &Vim9RenderFrame,
         prepared: &PaintView<'_>,
-        geometry: Vim9RenderMetrics,
-        offset: f32,
-        draw_cursor: bool,
     ) where
         Renderer: text::Renderer<Font = Font>,
     {
         let m = self.metrics;
-        let logical_view = prepared.logical;
-        let geometry = Vim9RenderMetrics {
-            origin_y: geometry.origin_y + offset,
-            ..geometry
-        };
-        let Some(view) = geometry
-            .rect(logical_view)
-            .map(rectangle)
-            .and_then(|moved| moved.intersection(&prepared.clip))
-        else {
-            return;
-        };
+        let view = prepared.clip;
         let (normal_fg, normal_bg, _) = colors(&frame.default_style, &frame.default_style);
         renderer.with_layer(view, |renderer| {
             renderer.fill_quad(quad(view), Background::Color(normal_bg));
             // Keep italic overhang intact across adjacent highlight runs.
-            for run in &prepared.runs {
-                let Some(area) = geometry
-                    .cell_rect(run.row, run.column, run.cells)
-                    .map(rectangle)
-                else {
-                    continue;
-                };
+            for projected in &prepared.runs {
+                let run = projected.run;
+                let area = rectangle(projected.rect);
                 let (_, bg, _) = colors(&run.style, &frame.default_style);
                 renderer.fill_quad(quad(area), Background::Color(bg));
             }
-            for run in &prepared.runs {
-                let Some(area) = geometry
-                    .cell_rect(run.row, run.column, run.cells)
-                    .map(rectangle)
-                else {
-                    continue;
-                };
+            for projected in &prepared.runs {
+                let run = projected.run;
+                let area = rectangle(projected.rect);
                 let text_area = Rectangle {
                     x: area.x - m.font_size * 0.25,
                     width: area.width + m.font_size * 0.5,
@@ -732,14 +1028,7 @@ impl<Message> NativeBuffer<'_, Message> {
                     );
                 }
             }
-            if draw_cursor
-                && frame.cursor.visible
-                && logical_view.contains(frame.cursor.row, frame.cursor.column)
-                && (!self.focused || self.blink_on)
-            {
-                let Some(cursor) = geometry.cursor_rect(&frame.cursor).map(rectangle) else {
-                    return;
-                };
+            if let Some(cursor) = prepared.cursor.filter(|_| !self.focused || self.blink_on) {
                 if self.focused && frame.mode.starts_with('i') {
                     renderer.fill_quad(
                         quad(Rectangle {
@@ -819,17 +1108,103 @@ mod tests {
         .unwrap()
     }
 
-    fn scrolled_frame(topline: u64) -> Arc<Vim9RenderFrame> {
+    fn direct_frame() -> Vim9RenderFrame {
         let mut frame = split_frame();
-        frame.windows[0].topline = 1;
-        frame.windows[1].topline = topline;
-        frame.windows[1].botline = topline + 17;
-        Arc::new(frame)
+        frame.mode = "n".into();
+        frame.window = 20;
+        for window in &mut frame.windows {
+            window.native_pointer = true;
+            window.topline = if window.window == 20 { 8 } else { 1 };
+            window.botline = window.topline + window.view.rows as u64;
+            window.line_count = 100;
+            window.line_lengths = vec![0; window.view.rows];
+            window.line_lengths[0] = if window.window == 20 { 4 } else { 3 };
+            window.line_lengths[1] = 4;
+            window.overscan = vec![jterm_core::vim9::Vim9RenderMarginRow {
+                row: window.view.rows as i32,
+                line: window.topline + window.view.rows as u64,
+                byte_length: 4,
+                runs: vec![jterm_core::vim9::Vim9RenderRun {
+                    window: window.window,
+                    column: window.view.column + 2,
+                    text: "edge".into(),
+                    cells: 4,
+                    line: window.topline + window.view.rows as u64,
+                    byte_start: 0,
+                    byte_end: 4,
+                    ..Default::default()
+                }],
+            }];
+        }
+        frame.runs.push(jterm_core::vim9::Vim9RenderRun {
+            window: 20,
+            row: 2,
+            column: 42,
+            text: "next".into(),
+            cells: 4,
+            line: 9,
+            byte_start: 0,
+            byte_end: 4,
+            ..Default::default()
+        });
+        frame.windows[1].cursor = jterm_core::vim9::Vim9RenderCursor {
+            row: 2,
+            column: 42,
+            width: 1,
+            visible: true,
+            line: 9,
+            byte_column: 0,
+        };
+        frame.cursor = frame.windows[1].cursor.clone();
+        frame
+    }
+
+    fn geometry() -> Vim9RenderMetrics {
+        Vim9RenderMetrics {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            cell_width: 8.0,
+            line_height: 20.0,
+        }
+    }
+
+    fn wheel(lines: f64) -> NativeWheel {
+        wheel_at(
+            &direct_frame(),
+            geometry(),
+            Point::new(340.0, 35.0),
+            mouse::ScrollDelta::Pixels {
+                x: 0.0,
+                y: -(lines as f32) * 20.0,
+            },
+        )
+        .unwrap()
+    }
+
+    fn press(count: u32) -> MouseInput {
+        MouseInput::Press {
+            col: 42,
+            row: 2,
+            button: MouseButton::Left,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            count,
+            finalized: false,
+            link_eligible: false,
+            app_eligible: true,
+            block: None,
+            block_zone_id: None,
+            link: false,
+            link_revision: 0,
+            x: 340.0,
+            y: 35.0,
+        }
     }
 
     #[test]
     fn precision_wheel_uses_hovered_split_and_rejects_non_buffer_pixels() {
-        let frame = split_frame();
+        let frame = direct_frame();
         let geometry = Vim9RenderMetrics {
             origin_x: 3.25,
             origin_y: 5.5,
@@ -890,120 +1265,673 @@ mod tests {
     }
 
     #[test]
-    fn acknowledged_scroll_keeps_previous_edge_rows_and_retargets_continuously() {
+    fn direct_fraction_is_presented_before_vim_reply_and_rebases_once() {
+        let frame = direct_frame();
+        let metrics = geometry();
         let mut state = ScrollState::default();
-        let first = scrolled_frame(1);
-        let second = scrolled_frame(4);
-        let third = scrolled_frame(7);
-        let now = state.epoch;
-        state.requested.insert(20, now);
-        state.observe_at(Some(&first), Some(&second), 20.0, true, now);
-        assert_eq!(state.motions.len(), 1);
-        let motion = &state.motions[&20];
-        assert!(Arc::ptr_eq(&motion.previous, &first));
-        assert_eq!(motion.total_pixels, 60.0);
-        assert_eq!(motion.animation.offset(0.0), 60.0);
-        assert!(!state.motions.contains_key(&10), "peer split must not move");
-        state.observe_at(
-            Some(&second),
-            Some(&third),
-            20.0,
-            true,
-            now + Duration::from_millis(50),
-        );
-        let motion = &state.motions[&20];
-        assert!(
-            Arc::ptr_eq(&motion.previous, &first),
-            "retain the initial edge during rapid scrolling"
-        );
-        assert_eq!(motion.total_pixels, 120.0);
-        assert!((motion.animation.offset(0.05) - 67.5).abs() < 1e-5);
-        // The old and new viewport extents overlap throughout the transition;
-        // no blank strip or stale terminal row may fill the exposed edge.
-        for step in 0..=10 {
-            let offset = motion.animation.offset(0.05 + f64::from(step) * 0.01) as f32;
-            let old_start = offset - motion.total_pixels;
-            let old_end = old_start + 340.0;
-            let new_start = offset;
-            let new_end = new_start + 340.0;
-            assert!(old_start <= 0.0);
-            assert!(new_end >= 340.0);
-            assert!(old_end >= new_start);
-        }
-        assert!(!state.active(now + Duration::from_millis(160)));
-    }
-
-    #[test]
-    fn sustained_scroll_rebases_edge_frames_without_periodic_snaps() {
-        for direction in [1_i64, -1] {
-            let mut state = ScrollState::default();
-            let epoch = state.epoch;
-            let mut previous = scrolled_frame(100);
-            for step in 0..30_u64 {
-                let now = epoch + Duration::from_millis(step * 16);
-                let seconds = state.seconds(now);
-                let before = state
-                    .motions
-                    .get(&20)
-                    .map_or(0.0, |motion| motion.animation.offset(seconds));
-                let topline = (100 + (step as i64 + 1) * direction * 3) as u64;
-                let next = scrolled_frame(topline);
-                state.requested.insert(20, now);
-                state.observe_at(Some(&previous), Some(&next), 20.0, true, now);
-                let motion = state
-                    .motions
-                    .get(&20)
-                    .expect("continuous scrolling must not snap after one viewport");
-                let offset = motion.animation.offset(seconds);
-                assert!((offset - before - direction as f64 * 60.0).abs() < 1e-5);
-                assert!(offset.abs() > 0.0 && offset.abs() < 340.0);
-                assert!(motion.outgoing.len() <= 32);
-                for tick in 0..=10 {
-                    let offset = motion.animation.offset(seconds + f64::from(tick) * 0.01);
-                    let old_start = offset - f64::from(motion.total_pixels);
-                    let old_end = old_start + 340.0;
-                    let new_start = offset;
-                    let new_end = new_start + 340.0;
-                    assert!(old_start.min(new_start) <= 0.0);
-                    assert!(old_end.max(new_end) >= 340.0);
-                    assert!(old_start.max(new_start) <= old_end.min(new_end));
+        state.wheel(&frame, metrics, wheel(0.25));
+        assert_eq!(state.offset(&frame, 20, metrics), -5.0);
+        assert_eq!(state.offset(&frame, 10, metrics), 0.0);
+        assert!(state.scroll_commands().is_empty());
+        state.observe(Some(&frame), metrics, true, |_| false);
+        assert_eq!(state.offset(&frame, 20, metrics), -5.0);
+        state.wheel(&frame, metrics, wheel(1.0));
+        assert!(matches!(
+            state.scroll_commands().as_slice(),
+            [(
+                _,
+                Vim9Command::ScrollView {
+                    lines: 1,
+                    topline: 8,
+                    ..
                 }
-                previous = next;
+            )]
+        ));
+        state.scroll_submitted(20, 41);
+        state.wheel(&frame, metrics, wheel(0.25));
+        assert!(
+            state.scroll_commands().is_empty(),
+            "one request per split may be in flight"
+        );
+        state.observe(Some(&frame), metrics, true, |id| id == 41);
+        assert_eq!(
+            state.offset(&frame, 20, metrics),
+            -20.0,
+            "presentation is bounded to sampled margins"
+        );
+        let mut acknowledged = frame.clone();
+        acknowledged.windows[1].topline += 1;
+        acknowledged.windows[1].scroll_ack = 41;
+        state.observe(Some(&acknowledged), metrics, true, |_| false);
+        assert_eq!(state.offset(&acknowledged, 20, metrics), -10.0);
+        assert!(state.scroll_commands().is_empty());
+        state.observe(Some(&acknowledged), metrics, true, |_| false);
+        assert_eq!(
+            state.offset(&acknowledged, 20, metrics),
+            -10.0,
+            "a repeated frame cannot double-rebase"
+        );
+    }
+
+    #[test]
+    fn queued_wheel_survives_its_ack_but_cannot_scroll_a_replacement_source() {
+        let old = direct_frame();
+        let metrics = geometry();
+        let event = wheel(0.25);
+        let mut next = old.clone();
+        next.windows[1].topline += 1;
+        next.windows[1].scroll_ack = 22;
+        let mut state = ScrollState::default();
+        state.wheel(&next, metrics, event.clone());
+        assert_eq!(state.offset(&next, 20, metrics), -5.0);
+        for case in 0..4 {
+            let mut frame = next.clone();
+            let mut changed_metrics = metrics;
+            match case {
+                0 => frame.windows[1].buffer += 1,
+                1 => frame.windows[1].changedtick += 1,
+                2 => frame.windows[1].view.column += 1,
+                _ => changed_metrics.line_height += 1.0,
             }
+            let mut state = ScrollState::default();
+            state.wheel(&frame, changed_metrics, event.clone());
+            assert!(state.pixels.is_empty());
         }
     }
 
     #[test]
-    fn non_wheel_navigation_edits_fallback_and_reduced_motion_settle_immediately() {
-        let first = scrolled_frame(1);
-        let second = scrolled_frame(4);
+    fn moving_text_paint_source_hit_and_caret_share_one_projection() {
+        let frame = direct_frame();
+        let metrics = geometry();
         let mut state = ScrollState::default();
-        let now = state.epoch;
-        state.observe_at(Some(&first), Some(&second), 20.0, true, now);
-        assert!(
-            state.motions.is_empty(),
-            "keyboard navigation is never eased"
+        state.wheel(&frame, metrics, wheel(0.5));
+        let views = paint_views(
+            &frame,
+            metrics,
+            Rectangle::with_size(Size::new(640.0, 400.0)),
+            |window| state.offset(&frame, window, metrics),
         );
-        state.requested.insert(20, now);
-        state.observe_at(Some(&first), Some(&second), 20.0, true, now);
-        assert_eq!(state.motions.len(), 1);
-        let mut edited = (*second).clone();
-        edited.windows[1].changedtick += 1;
-        state.observe_at(Some(&second), Some(&Arc::new(edited)), 20.0, true, now);
-        assert!(state.motions.is_empty());
-        state.observe_at(Some(&first), Some(&second), 20.0, true, now);
-        assert_eq!(state.motions.len(), 1);
-        state.observe_at(Some(&first), Some(&second), 20.0, false, now);
-        assert!(state.motions.is_empty());
-        state.observe_at(Some(&first), Some(&second), 20.0, true, now);
-        state.observe_at(Some(&second), None, 20.0, true, now);
-        assert!(state.motions.is_empty());
-        assert!(state.requested.is_empty());
-        state.requested.insert(20, now);
-        state.observe_at(Some(&first), Some(&scrolled_frame(100)), 20.0, true, now);
+        let view = &views[1];
+        let text = view.runs.iter().find(|p| p.run.text == "next").unwrap();
+        assert_eq!(text.rect.y, 30.0);
+        assert_eq!(view.cursor.unwrap().y, text.rect.y);
         assert!(
-            state.motions.is_empty(),
-            "large jumps are displayed immediately"
+            view.runs.iter().any(|p| p.run.text == "edge"),
+            "fractional bottom edge uses sampled text"
+        );
+        state.record_presentation(
+            &Arc::new(frame.clone()),
+            metrics,
+            metrics,
+            Rectangle::with_size(Size::new(640.0, 400.0)),
+        );
+        state.position = Some(Point::new(340.0, 35.0));
+        assert!(matches!(
+            state.route_mouse(&frame, metrics, keyboard::Modifiers::default(), press(1)),
+            NativeInput::Handled
+        ));
+        assert!(matches!(
+            state.pointer_command(),
+            Some(Vim9Command::Pointer {
+                line: 9,
+                byte_column: 0,
+                phase: Vim9PointerPhase::Press,
+                ..
+            })
+        ));
+        assert_eq!(
+            state.offset(&frame, 20, metrics),
+            -10.0,
+            "native press must not snap its captured image"
+        );
+    }
+
+    #[test]
+    fn pointer_coalesces_motion_and_keeps_press_release_order() {
+        let frame = direct_frame();
+        let metrics = geometry();
+        let mut state = ScrollState::default();
+        state.wheel(&frame, metrics, wheel(0.5));
+        state.record_presentation(
+            &Arc::new(frame.clone()),
+            metrics,
+            metrics,
+            Rectangle::with_size(Size::new(640.0, 400.0)),
+        );
+        state.position = Some(Point::new(340.0, 35.0));
+        state.route_mouse(&frame, metrics, keyboard::Modifiers::default(), press(1));
+        state.pointer_submitted(51);
+        for x in [348.0, 356.0, 364.0] {
+            state.position = Some(Point::new(x, 35.0));
+            state.route_mouse(
+                &frame,
+                metrics,
+                keyboard::Modifiers::default(),
+                MouseInput::Drag {
+                    col: 45,
+                    row: 2,
+                    count: 1,
+                },
+            );
+        }
+        assert!(state.pointer_command().is_none());
+        state.position = None;
+        state.route_mouse(
+            &frame,
+            metrics,
+            keyboard::Modifiers::default(),
+            MouseInput::Release {
+                col: 79,
+                row: 19,
+                button: MouseButton::Left,
+            },
+        );
+        state.observe(Some(&frame), metrics, true, |_| false);
+        assert!(
+            matches!(
+                state.pointer_command(),
+                Some(Vim9Command::Pointer {
+                    line: 9,
+                    byte_column: 3,
+                    phase: Vim9PointerPhase::Release,
+                    ..
+                })
+            ),
+            "release outside the split must use the last valid captured source"
+        );
+        state.pointer_submitted(52);
+        state.observe(Some(&frame), metrics, true, |_| false);
+        assert!(state.pointer.is_none());
+    }
+
+    #[test]
+    fn cancelled_native_press_never_leaks_an_unpaired_compatibility_drag() {
+        let frame = direct_frame();
+        let metrics = geometry();
+        let mut state = ScrollState::default();
+        state.wheel(&frame, metrics, wheel(0.5));
+        state.record_presentation(
+            &Arc::new(frame.clone()),
+            metrics,
+            metrics,
+            Rectangle::with_size(Size::new(640.0, 400.0)),
+        );
+        state.position = Some(Point::new(340.0, 35.0));
+        state.route_mouse(&frame, metrics, keyboard::Modifiers::default(), press(1));
+        let mut edited = frame.clone();
+        edited.windows[1].changedtick += 1;
+        state.observe(Some(&edited), metrics, true, |_| false);
+        assert!(state.pointer_command().is_none());
+        assert!(state
+            .compatibility_mouse(MouseInput::Drag {
+                col: 45,
+                row: 2,
+                count: 1
+            })
+            .is_none());
+        assert!(state
+            .compatibility_mouse(MouseInput::Release {
+                col: 45,
+                row: 2,
+                button: MouseButton::Left
+            })
+            .is_none());
+        state.record_presentation(
+            &Arc::new(edited),
+            metrics,
+            metrics,
+            Rectangle::with_size(Size::new(640.0, 400.0)),
+        );
+        assert!(state.compatibility_mouse(press(1)).is_some());
+        state.wheel(&frame, metrics, wheel(0.5));
+        state.record_presentation(
+            &Arc::new(frame.clone()),
+            metrics,
+            metrics,
+            Rectangle::with_size(Size::new(640.0, 400.0)),
+        );
+        state.position = Some(Point::new(340.0, 35.0));
+        state.route_mouse(&frame, metrics, keyboard::Modifiers::default(), press(1));
+        state.clear(); // Escape, preedit, resize, zoom or focus loss.
+        assert!(matches!(
+            state.route_mouse(
+                &frame,
+                metrics,
+                keyboard::Modifiers::default(),
+                MouseInput::Drag {
+                    col: 45,
+                    row: 2,
+                    count: 1
+                }
+            ),
+            NativeInput::Handled
+        ));
+        assert!(state.pointer_command().is_none());
+    }
+
+    #[test]
+    fn modifiers_multiclick_and_unadvertised_pointer_keep_compatibility_semantics() {
+        let frame = direct_frame();
+        let metrics = geometry();
+        for (count, modifiers) in [
+            (2, keyboard::Modifiers::default()),
+            (3, keyboard::Modifiers::default()),
+            (1, keyboard::Modifiers::SHIFT),
+            (1, keyboard::Modifiers::CTRL),
+            (1, keyboard::Modifiers::ALT),
+        ] {
+            let mut state = ScrollState::default();
+            state.record_presentation(
+                &Arc::new(frame.clone()),
+                metrics,
+                metrics,
+                Rectangle::with_size(Size::new(640.0, 400.0)),
+            );
+            state.position = Some(Point::new(340.0, 35.0));
+            assert!(
+                matches!(state.route_mouse(&frame, metrics, modifiers, press(count)),
+                NativeInput::Compatibility(MouseInput::Press { count: actual, .. }) if count == actual)
+            );
+            assert!(state.pointer_command().is_none());
+        }
+        let mut unsupported = frame.clone();
+        unsupported.windows[1].native_pointer = false;
+        let mut state = ScrollState {
+            position: Some(Point::new(340.0, 45.0)),
+            ..Default::default()
+        };
+        assert!(matches!(
+            state.route_mouse(
+                &unsupported,
+                metrics,
+                keyboard::Modifiers::default(),
+                press(1)
+            ),
+            NativeInput::Compatibility(_)
+        ));
+        assert!(wheel_at(
+            &unsupported,
+            metrics,
+            Point::new(340.0, 45.0),
+            mouse::ScrollDelta::Pixels { x: 0.0, y: -3.0 }
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn unsupported_fractional_press_settles_and_consumes_its_tail() {
+        let frame = direct_frame();
+        let metrics = geometry();
+        for (count, modifiers) in [
+            (2, keyboard::Modifiers::default()),
+            (1, keyboard::Modifiers::SHIFT),
+        ] {
+            let mut state = ScrollState::default();
+            state.wheel(&frame, metrics, wheel(0.5));
+            state.record_presentation(
+                &Arc::new(frame.clone()),
+                metrics,
+                metrics,
+                Rectangle::with_size(Size::new(640.0, 400.0)),
+            );
+            state.position = Some(Point::new(340.0, 35.0));
+            assert!(matches!(
+                state.route_mouse(&frame, metrics, modifiers, press(count)),
+                NativeInput::Handled
+            ));
+            assert!(state.pixels.is_empty());
+            assert!(state.pointer_command().is_none());
+            assert!(state
+                .compatibility_mouse(MouseInput::Release {
+                    col: 42,
+                    row: 1,
+                    button: MouseButton::Left
+                })
+                .is_none());
+            state.record_presentation(
+                &Arc::new(frame.clone()),
+                metrics,
+                metrics,
+                Rectangle::with_size(Size::new(640.0, 400.0)),
+            );
+            assert!(matches!(
+                state.route_mouse(&frame, metrics, modifiers, press(count)),
+                NativeInput::Compatibility(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn changed_source_under_fractional_image_consumes_click_instead_of_retargeting() {
+        let frame = direct_frame();
+        let metrics = geometry();
+        let mut state = ScrollState::default();
+        state.wheel(&frame, metrics, wheel(0.5));
+        state.record_presentation(
+            &Arc::new(frame.clone()),
+            metrics,
+            metrics,
+            Rectangle::with_size(Size::new(640.0, 400.0)),
+        );
+        state.position = Some(Point::new(340.0, 35.0));
+        let mut next = frame.clone();
+        next.windows[1].buffer += 1;
+        assert!(matches!(
+            state.route_mouse(&next, metrics, keyboard::Modifiers::default(), press(1)),
+            NativeInput::Handled
+        ));
+        assert!(state.pointer_command().is_none());
+        assert!(state
+            .compatibility_mouse(MouseInput::Drag {
+                col: 45,
+                row: 2,
+                count: 1
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn stationary_click_stays_in_vim_and_unpainted_ack_cannot_retarget_hit() {
+        let frame = direct_frame();
+        let metrics = geometry();
+        let mut state = ScrollState::default();
+        state.record_presentation(
+            &Arc::new(frame.clone()),
+            metrics,
+            metrics,
+            Rectangle::with_size(Size::new(640.0, 400.0)),
+        );
+        state.position = Some(Point::new(340.0, 35.0));
+        assert!(matches!(
+            state.route_mouse(&frame, metrics, keyboard::Modifiers::default(), press(1)),
+            NativeInput::Compatibility(_)
+        ));
+        state.wheel(&frame, metrics, wheel(0.5));
+        state.record_presentation(
+            &Arc::new(frame.clone()),
+            metrics,
+            metrics,
+            Rectangle::with_size(Size::new(640.0, 400.0)),
+        );
+        let mut newer = frame.clone();
+        newer.revision += 1;
+        newer.windows[1].topline += 1;
+        newer
+            .runs
+            .iter_mut()
+            .filter(|r| r.window == 20)
+            .for_each(|r| r.line += 1);
+        state.position = Some(Point::new(340.0, 35.0));
+        assert!(matches!(
+            state.route_mouse(&newer, metrics, keyboard::Modifiers::default(), press(1)),
+            NativeInput::Handled
+        ));
+        assert!(
+            matches!(
+                state.pointer_command(),
+                Some(Vim9Command::Pointer {
+                    line: 9,
+                    byte_column: 0,
+                    ..
+                })
+            ),
+            "hit must follow the drawn row, even when a newer ack arrived before paint"
+        );
+    }
+
+    #[test]
+    fn native_widget_projects_raw_mouse_and_ime_from_the_submitted_image() {
+        #[derive(Debug, Clone)]
+        enum Output {
+            Mouse(NativeInput),
+            Wheel(NativeWheel),
+        }
+        let frame = Arc::new(direct_frame());
+        let state = RefCell::new(ScrollState::default());
+        let mut terminal = crate::terminal::TerminalState::new(80, 20);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = crate::Theme::default();
+        let mut metrics = Metrics::new(14.0, 1.0, 0.0, false);
+        metrics.cell_w = 8.0;
+        metrics.cell_h = 20.0;
+        let input = TermWidget::new(
+            projection.cells(),
+            (2, 42),
+            true,
+            crate::terminal::CursorShape::Block,
+            true,
+            &theme,
+            metrics,
+            Font::MONOSPACE,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            0,
+            0,
+        )
+        .app_mouse_full_grid(true)
+        .on_mouse(|input| {
+            Output::Mouse(state.borrow_mut().route_mouse(
+                &frame,
+                local_metrics(metrics),
+                keyboard::Modifiers::default(),
+                input,
+            ))
+        });
+        let mut widget =
+            NativeBuffer::new(input, Some(&frame), metrics, Font::MONOSPACE, true, true).scroll(
+                &state,
+                keyboard::Modifiers::default(),
+                true,
+                Output::Wheel,
+            );
+        let mut tree = Tree::new(&widget as &dyn Widget<Output, iced::Theme, ()>);
+        let bounds = Rectangle::with_size(Size::new(640.0, 400.0));
+        let node = layout::Node::new(bounds.size());
+        let point = Point::new(340.0, 35.0);
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::draw(
+            &widget,
+            &tree,
+            &mut (),
+            &iced::Theme::Dark,
+            &renderer::Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &bounds,
+        );
+        let mut output = Vec::new();
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+            &mut widget,
+            &mut tree,
+            &Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -10.0 },
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &(),
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut output),
+            &bounds,
+        );
+        let Output::Wheel(wheel) = output.remove(0) else {
+            panic!("native raw pixel wheel expected");
+        };
+        assert_eq!(wheel.lines, 0.5);
+        state
+            .borrow_mut()
+            .wheel(&frame, local_metrics(metrics), wheel);
+        let mut shell = Shell::new(&mut output);
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+            &mut widget,
+            &mut tree,
+            &Event::Window(iced::window::Event::RedrawRequested(
+                std::time::Instant::now(),
+            )),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &(),
+            &mut iced::advanced::clipboard::Null,
+            &mut shell,
+            &bounds,
+        );
+        assert!(
+            matches!(shell.input_method(), iced::advanced::input_method::InputMethod::Enabled { cursor, .. }
+            if cursor.y == 30.0 && cursor.x == 336.0)
+        );
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::draw(
+            &widget,
+            &tree,
+            &mut (),
+            &iced::Theme::Dark,
+            &renderer::Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &bounds,
+        );
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+                &mut widget,
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &(),
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut output),
+                &bounds,
+            );
+        }
+        state.borrow_mut().clear();
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::draw(
+            &widget,
+            &tree,
+            &mut (),
+            &iced::Theme::Dark,
+            &renderer::Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &bounds,
+        );
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+            &mut widget,
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &(),
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut output),
+            &bounds,
+        );
+        assert!(matches!(output[0], Output::Mouse(NativeInput::Handled)));
+        assert!(matches!(output[1], Output::Mouse(NativeInput::Handled)));
+        assert!(
+            matches!(
+                output[2],
+                Output::Mouse(NativeInput::Compatibility(MouseInput::Press {
+                    count: 2,
+                    ..
+                }))
+            ),
+            "the real terminal widget must see the first click when counting a multi-click"
+        );
+    }
+
+    #[test]
+    fn fallback_draw_retires_the_old_fractional_image_but_consumes_its_press_tail() {
+        let frame = Arc::new(direct_frame());
+        let mut state = ScrollState::default();
+        let bounds = Rectangle::with_size(Size::new(640.0, 400.0));
+        state.wheel(&frame, geometry(), wheel(0.5));
+        state.record_presentation(&frame, geometry(), geometry(), bounds);
+        state.clear();
+        let state = RefCell::new(state);
+        let mut terminal = crate::terminal::TerminalState::new(80, 20);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = crate::Theme::default();
+        let mut metrics = Metrics::new(14.0, 1.0, 0.0, false);
+        metrics.cell_w = 8.0;
+        metrics.cell_h = 20.0;
+        let input = TermWidget::new(
+            projection.cells(),
+            (2, 42),
+            true,
+            crate::terminal::CursorShape::Block,
+            true,
+            &theme,
+            metrics,
+            Font::MONOSPACE,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            0,
+            0,
+        )
+        .app_mouse_full_grid(true)
+        .on_mouse(|input| state.borrow_mut().compatibility_mouse(input));
+        let mut widget = NativeBuffer::new(input, None, metrics, Font::MONOSPACE, true, true)
+            .scroll(&state, keyboard::Modifiers::default(), true, |_| None);
+        let mut tree = Tree::new(&widget as &dyn Widget<Option<MouseInput>, iced::Theme, ()>);
+        let node = layout::Node::new(bounds.size());
+        let point = Point::new(340.0, 35.0);
+        let mut output = Vec::new();
+        <NativeBuffer<'_, Option<MouseInput>> as Widget<Option<MouseInput>, iced::Theme, ()>>::update(
+            &mut widget,
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &(),
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut output),
+            &bounds,
+        );
+        assert_eq!(output.len(), 1);
+        assert!(
+            output[0].is_none(),
+            "the old moving image still owns this press"
+        );
+        <NativeBuffer<'_, Option<MouseInput>> as Widget<Option<MouseInput>, iced::Theme, ()>>::draw(
+            &widget,
+            &tree,
+            &mut (),
+            &iced::Theme::Dark,
+            &renderer::Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &bounds,
+        );
+        assert!(state.borrow().presented.is_none());
+        for event in [
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+        ] {
+            <NativeBuffer<'_, Option<MouseInput>> as Widget<Option<MouseInput>, iced::Theme, ()>>::update(
+                &mut widget,
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &(),
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut output),
+                &bounds,
+            );
+        }
+        assert!(
+            output[1].is_none(),
+            "the consumed press must retain its release"
+        );
+        assert!(
+            matches!(output[2], Some(MouseInput::Press { .. })),
+            "the actually drawn fallback must restore ordinary Vim mouse input"
         );
     }
 
@@ -1018,13 +1946,13 @@ mod tests {
         frame.runs.push(wrong_window);
         let metrics = Metrics::new(14.0, 1.0, 4.0, false);
         let bounds = Rectangle::with_size(Size::new(1000.0, 700.0));
-        let views = paint_views(&frame, render_metrics(bounds, metrics), bounds);
+        let views = paint_views(&frame, render_metrics(bounds, metrics), bounds, |_| 0.0);
         assert_eq!(views.len(), 2);
         assert_eq!(
             views[0]
                 .runs
                 .iter()
-                .map(|r| r.text.as_str())
+                .map(|r| r.run.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["界", "next"]
         );
@@ -1032,7 +1960,7 @@ mod tests {
             views[1]
                 .runs
                 .iter()
-                .map(|r| r.text.as_str())
+                .map(|r| r.run.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["peer"]
         );
@@ -1060,7 +1988,7 @@ mod tests {
                 geometry.cell_at(run_rect.x + metrics.cell_w * 1.5, run_rect.center_y()),
                 Some((1, 3))
             );
-            let views = paint_views(&frame, geometry, bounds);
+            let views = paint_views(&frame, geometry, bounds, |_| 0.0);
             assert!(views[0].clip.contains(anchor_rect.center()));
             assert!(!views[1].clip.contains(anchor_rect.center()));
         }

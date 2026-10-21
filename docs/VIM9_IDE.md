@@ -50,19 +50,39 @@ overlay if the added status bar is hidden.
 
 Wheel and trackpad events target the Vim split under the pointer without
 changing the active window. Discrete wheel notches request three lines;
-trackpad pixels retain fractional lines using the actual font line height.
-The authenticated bridge scrolls that window, and the GUI eases the resulting
-acknowledged viewport over 100 ms. Old edge rows remain clipped inside their
-own split while new rows enter, so status rows, separators and peer buffers
-stay fixed. Animation follows display redraws and stops at rest. Keyboard
-input, mouse selection, edits, resizing, font changes and compatibility
-fallback settle immediately to Vim's authoritative grid. `smooth_scroll =
-false` disables the easing while retaining precise wheel accumulation.
+trackpad pixels move the displayed text immediately using the measured line
+height. The shared `Vim9PixelScroll` keeps one source-bound request in flight
+per split, rebases the remaining fraction from Vim's explicit acknowledgement,
+and clears accumulated movement at file edges. No second momentum animation is
+added to the operating system's event stream. Requests carry buffer generation
+and view identity, so a queued wheel cannot scroll a replacement buffer. The
+bridge frame and request completion are observed together to avoid retiring a
+valid gesture between its acknowledgement and response.
 
-The current protocol supplies visible rows only: sub-line input accumulates
-until Vim can scroll a whole row, and then its acknowledged view is eased.
-This does not yet provide a speculative fractional viewport or offscreen row
-overscan.
+`Vim9Viewport` projects visible text, up to two supplied margin rows, the caret,
+source hits and the IME candidate rectangle through the same pixel transform.
+Missing margin coverage bounds the visible movement rather than inventing
+offscreen text. Separators, status rows and peer splits stay fixed. The mouse
+uses an immutable snapshot of the frame and offsets actually drawn, including
+when a newer acknowledgement has arrived but has not yet been painted.
+Keyboard input, preedit, source/layout changes, zoom, focus loss and compatible
+rendering retire pending gestures. `smooth_scroll = false` uses the existing
+Vim wheel-reporting path.
+
+A plain primary click during a presented fractional scroll captures source
+UTF-8 bytes; its character drag and release stay in the same buffer generation.
+Motion is coalesced while a pointer request is pending. Stationary clicks,
+modifiers, custom mappings, multi-clicks and unsupported modes retain the
+compatibility path while the image is stationary. An unsupported press on a
+fractionally moved image settles the view and consumes that press and its
+release; the next press on the stationary image uses the original Vim path.
+This also covers native rendering falling back before its next image is drawn.
+A cancelled native press consumes its remaining drag and release instead of
+emitting an unpaired terminal gesture. Native fractional
+drag currently stops at the last valid position when leaving its split; edge
+autoscroll and cross-split selection are not implemented. A multi-click that
+begins during a fractional native gesture does not promise Vim's complete
+word/line multi-click behavior; stationary multi-clicks remain Vim-owned.
 
 `guifg`, `guibg` and `guisp` are preserved as exact RGB values independently of
 `ctermfg`, ANSI palettes and `termguicolors`. Bold and italic use native font
@@ -92,11 +112,10 @@ family before measuring and painting it. This keeps regular, bold and italic
 text on the same Vim columns instead of squeezing a proportional substitute
 into a guessed cell width.
 
-Every native view, glyph background and cursor now uses the shared
-`Vim9RenderMetrics` logical-pixel transform. Fractional padding, line heights
-and font zoom stay intact. Rendering first groups runs by their Vim window ID,
-then paints each window's backgrounds and glyphs in stable order, so the
-renderer no longer rescans every buffer's runs twice for each split. Replace
+Every native view, glyph background and cursor uses the shared
+`Vim9Viewport` logical-pixel projection built from `Vim9RenderMetrics`.
+Fractional padding, line heights and font zoom stay intact. Projected runs are
+prepared once for each window and painted in background/text order. Replace
 mode has a horizontal cursor; Insert mode retains the vertical cursor.
 
 The shared core exposes semantic anchors with frame revision, Vim window and
@@ -343,11 +362,21 @@ xvfb-run -a -s '-screen 0 1600x1000x24' python3 scripts/test-shell-vim-gui.py \
 ```sh
 cargo fmt --all -- --check
 cargo check --tests --locked
+cargo test --bin frost --locked vim9_buffer::tests -- --test-threads=1
 cargo test --bin frost --locked vim9_ide::tests -- --test-threads=1
 cargo test --bin frost --locked vim9_ide::native_tests::real_vim9_native_pty -- --ignored --exact --test-threads=1
 cargo build --locked --bin frost
 WGPU_BACKEND=gl xvfb-run -a -s '-screen 0 1600x1000x24' python3 scripts/test-vim9-window.py target/debug/frost
 ```
+
+The buffer tests include real Iced widget `update`/`draw` calls with a null
+renderer: raw pixel-wheel dispatch, painted-frame capture, source-byte pointer
+routing, terminal multi-click counting and the projected IME candidate
+rectangle. State tests cover acknowledgement rebasing, one request per split,
+coalesced pointer release, stale source/geometry cancellation, compatibility
+fallback and a new acknowledgement arriving before repaint. These tests verify
+event routing and geometry; they do not measure physical touchpad latency or
+certify an OS input method.
 
 The explicit PTY test requires Vim 9, ripgrep and loopback sockets. It drives
 the actual Frost PTY/parser and shared Rust/Vim bridge: editing, dirty quit

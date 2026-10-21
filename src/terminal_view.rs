@@ -1003,6 +1003,9 @@ pub struct TermWidget<'a, Message> {
     /// as its cursor/selection. Supplied to the runtime each redraw so it can
     /// paint the over-the-spot composition overlay at the terminal cursor.
     preedit: Option<(String, Option<std::ops::Range<usize>>)>,
+    /// Native Vim supplies its projected caret in window pixels. Some(None)
+    /// means the caret is outside the clipped split; do not invent an anchor.
+    native_ime_cursor: Option<Option<Rectangle>>,
     /// Current phase of the blink clock: when false, cells with the blink
     /// attribute hide their glyph (drawn as background only).
     blink_on: bool,
@@ -1081,9 +1084,14 @@ impl<'a, Message> TermWidget<'a, Message> {
             images: Vec::new(),
             scrollbar_always: true,
             preedit: None,
+            native_ime_cursor: None,
             blink_on: true,
             opacity: 1.0,
         }
+    }
+
+    pub(crate) fn set_native_ime_cursor(&mut self, cursor: Option<Rectangle>) {
+        self.native_ime_cursor = Some(cursor);
     }
 
     /// Retire local state even when a mode changes away and back in one batch.
@@ -3515,19 +3523,21 @@ where
                     ),
                     Size::new(self.metrics.cell_w, self.metrics.cell_h),
                 );
-                let preedit =
-                    self.preedit
-                        .as_ref()
-                        .map(|(content, selection)| input_method::Preedit {
-                            content: content.as_str(),
-                            selection: selection.clone(),
-                            text_size: Some(Pixels(self.metrics.font_size)),
-                        });
-                shell.request_input_method(&InputMethod::Enabled {
-                    cursor: cursor_rect,
-                    purpose: input_method::Purpose::Terminal,
-                    preedit,
-                });
+                if let Some(cursor_rect) = self.native_ime_cursor.unwrap_or(Some(cursor_rect)) {
+                    let preedit =
+                        self.preedit
+                            .as_ref()
+                            .map(|(content, selection)| input_method::Preedit {
+                                content: content.as_str(),
+                                selection: selection.clone(),
+                                text_size: Some(Pixels(self.metrics.font_size)),
+                            });
+                    shell.request_input_method(&InputMethod::Enabled {
+                        cursor: cursor_rect,
+                        purpose: input_method::Purpose::Terminal,
+                        preedit,
+                    });
+                }
             }
         }
 
