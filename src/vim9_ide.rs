@@ -299,6 +299,7 @@ struct Form {
 pub(super) enum Message {
     Terminal(Box<super::Message>),
     Tick,
+    ScrollFrame,
     RenderFrame {
         entry_id: uuid::Uuid,
         frame: Option<std::sync::Arc<vim9::Vim9RenderFrame>>,
@@ -1191,6 +1192,7 @@ impl Ide {
                     s.flush_write_queue();
                 }
             }
+            Message::ScrollFrame => self.flush_native_input(),
             Message::Terminal(message) => match *message {
                 super::Message::PtyOutput(id, fd, bytes, _) => {
                     if let Some(s) = &mut self.session {
@@ -1779,6 +1781,9 @@ impl Ide {
             subscriptions.push(events);
         }
         if self.config.vim9.native_buffer {
+            if self.focused && self.scroll.borrow().animating() {
+                subscriptions.push(iced::window::frames().map(|_| Message::ScrollFrame));
+            }
             if let (Some(editor), Some(session)) = (&self.editor, &self.session) {
                 subscriptions.push(Subscription::run_with(
                     RenderSubscription {

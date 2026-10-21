@@ -22,7 +22,7 @@ cosmic-text = "0.15"
 iced_winit = { version = "=0.14.0", default-features = false }
 libc = "0.2"
 # Pin the shared shell GUI entry and precise scrolling contract.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "feae27f7cd965332253a81723095f75850241e81" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "2b00c1d3d92f4f5555969d6b62a410866d4acb34" }
 tokio = { version = "1", features = ["rt"] }
 anyhow = "1.0"
 log = "0.4"
@@ -59,6 +59,8 @@ opt-level = 3
 # cryoglyph 0.1.0 requires the unsound lru 0.16 line. This Rust-source-identical
 # local copy changes only that dependency to the RustSec-fixed 0.18.2 release.
 [patch.crates-io]
+# X11 legacy wheel release must not emit a second scroll notch.
+winit = { path = "vendor/winit" }
 cryoglyph = { path = "vendor/cryoglyph" }
 iced_winit = { path = "vendor/iced_winit" }
 window_clipboard = { path = "vendor/window_clipboard" }
@@ -69,4 +71,4 @@ wayland-client = { path = "vendor/wayland-client" }
 
 
 [dev-dependencies]
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "feae27f7cd965332253a81723095f75850241e81", features = ["session-parity-tests"] }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "2b00c1d3d92f4f5555969d6b62a410866d4acb34", features = ["session-parity-tests"] }

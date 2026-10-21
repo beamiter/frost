@@ -29,6 +29,7 @@ pub(crate) struct NativeWheel {
     pub window: i64,
     /// Positive means down. Precision devices retain fractional lines.
     pub lines: f64,
+    discrete: bool,
     buffer: i64,
     changedtick: u64,
     view: Vim9RenderRect,
@@ -170,8 +171,16 @@ impl ScrollState {
             entry.insert(scroll);
         }
         if let Some(scroll) = self.pixels.get_mut(&wheel.window) {
-            scroll.push(wheel.lines);
+            if wheel.discrete {
+                scroll.push_wheel(wheel.lines);
+            } else {
+                scroll.push(wheel.lines);
+            }
         }
+    }
+
+    pub(crate) fn animating(&self) -> bool {
+        self.pixels.values().any(Vim9PixelScroll::is_animating)
     }
 
     pub(crate) fn observe(
@@ -425,6 +434,9 @@ impl ScrollState {
                     if let Some(target) = self.anchor_at(frame, metrics, true) {
                         self.next_gesture = self.next_gesture.wrapping_add(1).max(1);
                         self.native_pressed = true;
+                        for scroll in self.pixels.values_mut() {
+                            scroll.stop_animation();
+                        }
                         self.pointer = Some(PointerGesture {
                             id: self.next_gesture,
                             metrics,
@@ -533,6 +545,7 @@ fn wheel_at(
     (lines.is_finite() && lines != 0.0).then_some(NativeWheel {
         window: window.window,
         lines,
+        discrete: matches!(delta, mouse::ScrollDelta::Lines { .. }),
         buffer: window.buffer,
         changedtick: window.changedtick,
         view: window.view.clone(),
@@ -766,6 +779,9 @@ where
         viewport: &Rectangle,
     ) {
         if let Some(state) = self.scroll {
+            if state.borrow().animating() {
+                shell.request_redraw();
+            }
             state.borrow_mut().position = cursor.position();
             if matches!(
                 event,
