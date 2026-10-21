@@ -407,3 +407,34 @@ CJK IME behavior on a user's desktop, or all plugin configurations.
 Pinned shared core: `c387ab33caff52a0bd4f759fb20a35aae2586cd0`.
 Passed 11 focused tests and the real X11/WGPU window smoke: RGB in all three panes, Unicode, edit/save/undo, resize, font zoom, compatibility fallback/recovery and normal quit.
 These runs use Xvfb/software graphics; physical GPU, Wayland and OS IME candidate windows are not certified.
+
+
+## Native plugin highlights
+
+Single-line `matchadd()` / `:match` patterns and byte-based `matchaddpos()`
+positions now use native GUI RGB paint, including the built-in `matchparen`
+plugin. Match priorities, equal-priority insertion order, search precedence,
+Visual selection and independent split-window ownership follow Vim. Plugin
+matches update and disappear without editing the buffer or emitting a special
+invalidation hook. Syntax, properties, text, undo and input remain Vim-owned.
+
+Multiline/context-dependent/zero-width regexes and conceal matches retain an
+explicit compatibility reason. Native paint is bounded to 64 matches and 2048
+positions per window and 512 match/search ranges per source line; exceeding a
+budget shows the real Vim compatibility view instead of partial decoration.
+
+CJK fallback now checks actual font outlines rather than accepting a Latin
+family returned by a generic Fontconfig language query. If a CJK family has no
+slanted face with glyph coverage, its upright face keeps the text readable;
+GUI colors, bold weight, decorations and Vim's source/display advances remain.
+
+### Plugin validation — 2026-10-21
+
+Pinned shared core: `feae27f7cd965332253a81723095f75850241e81`.
+The 19 native-buffer/config tests, the real CJK glyph-coverage regression
+(normal/bold/italic combinations), and all-target/all-feature Clippy with
+`-D warnings` pass. The Xvfb/software-WGPU buffer smoke passes, including
+90 exact plugin-regex RGB pixels and 77 positional CJK RGB pixels with
+`notermguicolors`, removal without a buffer edit, split edit/save/undo, resize,
+zoom and compatibility recovery. Font coverage and screenshots were inspected.
+Artifacts: `/tmp/frost-vim9-plugin-feae27f-v2` on the validation host.

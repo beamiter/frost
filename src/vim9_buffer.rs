@@ -941,19 +941,12 @@ impl<Message> NativeBuffer<'_, Message> {
                     continue;
                 };
                 let (fg, _, special) = colors(&run.style, &frame.default_style);
-                let font = Font {
-                    weight: if run.style.bold {
-                        iced::font::Weight::Bold
-                    } else {
-                        iced::font::Weight::Normal
-                    },
-                    style: if run.style.italic {
-                        iced::font::Style::Italic
-                    } else {
-                        iced::font::Style::Normal
-                    },
-                    ..self.font
-                };
+                let font = crate::terminal_view::native_editor_glyph_font(
+                    self.font,
+                    &run.text,
+                    run.style.bold,
+                    run.style.italic,
+                );
                 let mut draw_text = |content: String, x: f32| {
                     renderer.fill_text(
                         Text {

@@ -1782,6 +1782,102 @@ pub(crate) fn resolve_native_editor_font(font: iced::Font) -> iced::Font {
     })
 }
 
+/// Cache an installed CJK family with verified glyph coverage. Fontconfig's
+/// monospace:lang query can return a Latin face whose slanted fallback has no
+/// CJK glyphs. Choose real outlines before applying plugin font attributes.
+fn native_editor_cjk_font() -> Option<(iced::font::Family, iced::font::Style)> {
+    static CJK: std::sync::OnceLock<Option<(iced::font::Family, iced::font::Style)>> =
+        std::sync::OnceLock::new();
+    *CJK.get_or_init(|| {
+        with_metrics_font_system(|system| {
+            let preferred = [
+                "Noto Sans Mono CJK SC",
+                "Noto Sans CJK SC",
+                "Noto Sans Mono CJK JP",
+                "Noto Sans CJK JP",
+            ];
+            let mut faces: Vec<_> = system
+                .db()
+                .faces()
+                .filter_map(|face| {
+                    let name = face.families.first()?.0.clone();
+                    let rank = preferred
+                        .iter()
+                        .position(|want| name.eq_ignore_ascii_case(want))
+                        .unwrap_or(preferred.len());
+                    Some((
+                        rank,
+                        face.weight.0.abs_diff(400),
+                        face.id,
+                        name,
+                        face.style,
+                        face.weight,
+                    ))
+                })
+                .collect();
+            faces.sort_by_key(|face| (face.0, face.1));
+            let covers = |system: &mut cosmic_text::FontSystem, id, weight| {
+                system.get_font(id, weight).is_some_and(|font| {
+                    let map = font.as_swash().charmap();
+                    ['中', 'あ', '한'].into_iter().all(|ch| map.map(ch) != 0)
+                })
+            };
+            for (_, _, id, name, style, weight) in &faces {
+                if *style != cosmic_text::fontdb::Style::Normal || !covers(system, *id, *weight) {
+                    continue;
+                }
+                let slant = faces
+                    .iter()
+                    .find_map(|(_, _, id, family, style, weight)| {
+                        if family != name
+                            || *style == cosmic_text::fontdb::Style::Normal
+                            || !covers(system, *id, *weight)
+                        {
+                            return None;
+                        }
+                        Some(if *style == cosmic_text::fontdb::Style::Oblique {
+                            iced::font::Style::Oblique
+                        } else {
+                            iced::font::Style::Italic
+                        })
+                    })
+                    .unwrap_or(iced::font::Style::Normal);
+                return Some((crate::resolve_mono_font(name).family, slant));
+            }
+            None
+        })
+    })
+}
+
+/// Preserve Vim's advances and use an available CJK face. Regular-only CJK
+/// families stay upright under an italic highlight instead of showing tofu.
+pub(crate) fn native_editor_glyph_font(
+    primary: iced::Font,
+    text: &str,
+    bold: bool,
+    italic: bool,
+) -> iced::Font {
+    let cjk = text
+        .chars()
+        .next()
+        .filter(|ch| should_use_cjk_fallback_font(*ch))
+        .and_then(|_| native_editor_cjk_font());
+    iced::Font {
+        family: cjk.map(|font| font.0).unwrap_or(primary.family),
+        weight: if bold {
+            iced::font::Weight::Bold
+        } else {
+            iced::font::Weight::Normal
+        },
+        style: if italic {
+            cjk.map(|font| font.1).unwrap_or(iced::font::Style::Italic)
+        } else {
+            iced::font::Style::Normal
+        },
+        ..primary
+    }
+}
+
 /// The primary font's advance width for printable ASCII at `font_size`,
 /// measured through cosmic-text — the same library and version iced's
 /// renderers shape with. Returns `None` when the font cannot be resolved or
@@ -3192,6 +3288,47 @@ mod tests {
                 !Metrics::with_font(iced::Font::MONOSPACE, 14.0, 1.0, 2.0, false)
                     .mono_advance_exact
             );
+        }
+    }
+
+    #[test]
+    fn native_editor_cjk_plugin_styles_shape_real_glyphs_instead_of_notdef() {
+        use cosmic_text::{
+            Attrs, Buffer, Family, FontSystem, Metrics as TextMetrics, Shaping, Style, Weight,
+        };
+
+        // Distribution CI provides Noto CJK. A fontless unit-test host cannot
+        // certify glyph coverage and keeps the ordinary advanced fallback.
+        if super::native_editor_cjk_font().is_none() {
+            return;
+        }
+        let mut system = FontSystem::new();
+        for bold in [false, true] {
+            for italic in [false, true] {
+                let font =
+                    super::native_editor_glyph_font(iced::Font::MONOSPACE, "中", bold, italic);
+                let iced::font::Family::Name(name) = font.family else {
+                    panic!("installed CJK family must be selected explicitly");
+                };
+                let attrs = Attrs::new()
+                    .family(Family::Name(name))
+                    .weight(if bold { Weight::BOLD } else { Weight::NORMAL })
+                    .style(match font.style {
+                        iced::font::Style::Italic => Style::Italic,
+                        iced::font::Style::Oblique => Style::Oblique,
+                        iced::font::Style::Normal => Style::Normal,
+                    });
+                let mut buffer = Buffer::new(&mut system, TextMetrics::new(20.0, 25.0));
+                buffer.set_size(&mut system, Some(f32::INFINITY), Some(25.0));
+                buffer.set_text(&mut system, "中文界", &attrs, Shaping::Advanced, None);
+                let runs: Vec<_> = buffer.layout_runs().collect();
+                assert_eq!(runs.len(), 1);
+                assert_eq!(runs[0].glyphs.len(), 3);
+                assert!(
+                    runs[0].glyphs.iter().all(|g| g.glyph_id != 0),
+                    "bold={bold}, italic={italic}, font={font:?}"
+                );
+            }
         }
     }
 
