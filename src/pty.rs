@@ -807,10 +807,7 @@ mod unix_pty {
                             argv.push(session_flag.clone());
                             argv.push(sid.clone());
                         }
-                        (
-                            cstr_or_bail!(bash_path, "bash path contains NUL"),
-                            argv,
-                        )
+                        (cstr_or_bail!(bash_path, "bash path contains NUL"), argv)
                     } else {
                         let mut argv = vec![dash_shell_cstr.clone()];
                         if let Some(ref arg) = login_arg {
