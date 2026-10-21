@@ -89,6 +89,15 @@ def main() -> None:
         home, project, state, data = [root / value for value in ('home', 'project', 'state', 'data')]
         for folder in (home, project, state, data, root / 'config', root / 'cache', root / 'runtime'):
             folder.mkdir(mode=0o700)
+        # This suite exercises optional workbench controls. Native buffer smoke
+        # coverage separately verifies the new chrome-free default viewport.
+        frost_config = root / 'config' / 'frost'
+        frost_config.mkdir()
+        (frost_config / 'config.toml').write_text(
+            '[vim9]\nnative_buffer = true\ntoolbar = true\n'
+            'buffer_tabs = true\nstatus_bar = true\n'
+            'project_panel = true\ntool_panel = true\n'
+        )
         (state / 'existing-workspace.bin').write_bytes(b'shell-state-must-remain-untouched\x00\xff')
         (data / 'existing-data.bin').write_bytes(b'existing-terminal-data\x00')
         before_state, before_data = snapshot(state), snapshot(data)

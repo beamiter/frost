@@ -54,7 +54,7 @@ def main():
     quoted = lambda value: "'" + str(value).replace("'", "''") + "'"
     vimrc.write_text(
         "set nocompatible viminfofile=NONE noswapfile nomore notermguicolors\n"
-        "set runtimepath=$VIMRUNTIME packpath=\n"
+        "set runtimepath=$VIMRUNTIME packpath= noloadplugins\n"
         "set nowrap mouse=a laststatus=0 nonumber norelativenumber\n"
         "set nospell nolist conceallevel=0\n"
         f"nnoremap <silent> <C-S> <Cmd>call writefile(['raw_ctrl_s'], {quoted(out / 'raw-control-s.txt')}, 'a')<CR>\n"
@@ -154,6 +154,33 @@ def main():
         xdo("windowfocus", "--sync", window)
         wait_for(lambda: state().get("termguicolors") == 0, "Vim notermguicolors fixture", app)
         report["native_rgb_pixels"] = wait_for(lambda: color_count("native") > 30 and color_count("native"), "GUI RGB pixels", app)
+        if args.app == "frost":
+            # A missing [vim9] section must leave the GUI buffer enabled while
+            # giving it the area formerly occupied by persistent IDE controls.
+            regions = color_regions("buffer-first")
+            assert regions["x_regions"][0][0] < 80, "Project panel reserved default space"
+            assert regions["y_regions"][0][0] < 80, "Toolbar/tabs reserved default space"
+            original_grid = (state()["screen_columns"], state()["screen_rows"])
+            xdo("key", "ctrl+shift+e")
+            files_grid = wait_for(
+                lambda: state() if state().get("screen_columns", original_grid[0]) < original_grid[0] else None,
+                "explicit project panel takes columns", app)
+            xdo("key", "ctrl+shift+e")
+            wait_for(lambda: state().get("screen_columns") == original_grid[0],
+                     "closing project panel returns columns", app)
+            xdo("key", "ctrl+shift+j")
+            tools_grid = wait_for(
+                lambda: state() if state().get("screen_rows", original_grid[1]) < original_grid[1] else None,
+                "explicit tool panel takes rows", app)
+            xdo("key", "ctrl+shift+j")
+            wait_for(lambda: state().get("screen_rows") == original_grid[1],
+                     "closing tool panel returns rows", app)
+            report["buffer_first_chrome"] = {
+                "default_grid": list(original_grid),
+                "project_columns": files_grid["screen_columns"],
+                "tool_rows": tools_grid["screen_rows"],
+                "restored_grid": [state()["screen_columns"], state()["screen_rows"]],
+            }
         xdo("key", "Escape")
         xdo("type", "--clearmodifiers", "--delay", "20", "ggIsaved_native_")
         wait_for(lambda: state().get("text", "").startswith("saved_native_"), "Vim received insert text", app)

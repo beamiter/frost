@@ -368,7 +368,12 @@ impl Drop for Ide {
     }
 }
 
-fn chrome(size: Size, files_open: bool, dock_open: bool) -> (f32, f32) {
+fn chrome(
+    size: Size,
+    presentation: &vim9::Vim9UiConfig,
+    files_open: bool,
+    dock_open: bool,
+) -> (f32, f32) {
     let sidebar = if files_open && size.width >= 820.0 {
         SIDEBAR
     } else {
@@ -379,7 +384,17 @@ fn chrome(size: Size, files_open: bool, dock_open: bool) -> (f32, f32) {
     } else {
         0.0
     };
-    (sidebar, HEADER + TOOLS + BUFFERS + STATUS + dock)
+    let vertical = if presentation.toolbar {
+        HEADER + TOOLS
+    } else {
+        0.0
+    } + if presentation.buffer_tabs {
+        BUFFERS
+    } else {
+        0.0
+    } + if presentation.status_bar { STATUS } else { 0.0 }
+        + dock;
+    (sidebar, vertical)
 }
 
 fn visible_label(value: &str) -> String {
@@ -468,6 +483,8 @@ enum Shortcut {
     PreviousProblem,
     NavigateBack,
     NavigateForward,
+    ToggleFiles,
+    ToggleDock,
 }
 
 fn native_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Option<Shortcut> {
@@ -507,6 +524,8 @@ fn native_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Optio
             "b" => Some(Shortcut::Form(FormKind::Build)),
             "s" => Some(Shortcut::SaveAll),
             "w" => Some(Shortcut::CloseCurrentBuffer),
+            "e" => Some(Shortcut::ToggleFiles),
+            "j" => Some(Shortcut::ToggleDock),
             _ => None,
         },
         _ => None,
@@ -594,6 +613,8 @@ impl Ide {
         } else {
             String::new()
         };
+        let files_open = config.vim9.project_panel;
+        let dock_open = config.vim9.tool_panel;
         let mut state = Self {
             config,
             theme,
@@ -614,8 +635,8 @@ impl Ide {
             scan_busy: false,
             scan_epoch: 0,
             queued_scan: None,
-            files_open: true,
-            dock_open: true,
+            files_open,
+            dock_open,
             output_tab: false,
             form: None,
             project_index: None,
@@ -638,7 +659,7 @@ impl Ide {
         };
         state.resize();
         state.sync_ime();
-        let task = if state.session.is_some() {
+        let task = if state.session.is_some() && state.files_open {
             state.browse(root)
         } else {
             Task::none()
@@ -693,7 +714,12 @@ impl Ide {
     }
     fn resize(&mut self) {
         self.retire_gestures();
-        let (sidebar, vertical) = chrome(self.size, self.files_open, self.dock_open);
+        let (sidebar, vertical) = chrome(
+            self.size,
+            &self.config.vim9,
+            self.files_open,
+            self.dock_open,
+        );
         let (cols, rows) = self.metrics.grid_size(
             (self.size.width - sidebar - terminal_view::SCROLLBAR_WIDTH).max(1.0),
             (self.size.height - vertical).max(1.0),
@@ -913,6 +939,8 @@ impl Ide {
             Shortcut::PreviousProblem => Vim9Command::PreviousDiagnostic,
             Shortcut::NavigateBack => Vim9Command::NavigateBack,
             Shortcut::NavigateForward => Vim9Command::NavigateForward,
+            Shortcut::ToggleFiles => return self.reduce(Message::ToggleFiles),
+            Shortcut::ToggleDock => return self.reduce(Message::ToggleDock),
         };
         self.send(command);
         Task::none()
@@ -978,7 +1006,9 @@ impl Ide {
                         self.render_frame = None;
                     } else if !self.render_subscribed {
                         self.render_subscribed = editor
-                            .send(Vim9Command::SetRender { enabled: true })
+                            .send(Vim9Command::SetRender {
+                                enabled: self.config.vim9.native_buffer,
+                            })
                             .is_ok();
                     }
                 }
@@ -1195,6 +1225,9 @@ impl Ide {
             Message::ToggleFiles => {
                 self.files_open = !self.files_open;
                 self.resize();
+                if self.files_open {
+                    return self.browse(self.directory.clone());
+                }
             }
             Message::ToggleDock => {
                 self.dock_open = !self.dock_open;
@@ -1536,15 +1569,17 @@ impl Ide {
             iced::time::every(Duration::from_millis(if self.focused { 80 } else { 250 }))
                 .map(|_| Message::Tick),
         ];
-        if let (Some(editor), Some(session)) = (&self.editor, &self.session) {
-            subscriptions.push(Subscription::run_with(
-                RenderSubscription {
-                    session_id: session.id,
-                    interval_ms: if self.focused { 16 } else { 100 },
-                    editor: editor.clone(),
-                },
-                render_stream,
-            ));
+        if self.config.vim9.native_buffer {
+            if let (Some(editor), Some(session)) = (&self.editor, &self.session) {
+                subscriptions.push(Subscription::run_with(
+                    RenderSubscription {
+                        session_id: session.id,
+                        interval_ms: if self.focused { 16 } else { 100 },
+                        editor: editor.clone(),
+                    },
+                    render_stream,
+                ));
+            }
         }
         if let Some(s) = self.session.as_ref().filter(|_| !self.child_exited) {
             subscriptions.push(
@@ -1616,7 +1651,8 @@ impl Ide {
             return container(text(self.error.as_deref().unwrap_or("Vim could not be launched. Install Vim 9 with +channel, +job, +timers and +quickfix."))).padding(24).center_x(Length::Fill).center_y(Length::Fill).into();
         };
         let native_frame = self.render_frame.as_deref().filter(|frame| {
-            self.snapshot.connected
+            self.config.vim9.native_buffer
+                && self.snapshot.connected
                 && s.projection.scroll_offset() == 0
                 && !s.terminal.has_text_selection()
                 && crate::vim9_buffer::usable(
@@ -1704,7 +1740,8 @@ impl Ide {
             text("PROJECT").size(13),
             Space::new().width(Length::Fill),
             button(text("Up").size(12)).on_press_maybe(parent.map(Message::Browse)),
-            button(text("↻").size(13)).on_press(Message::Browse(self.directory.clone()))
+            button(text("↻").size(13)).on_press(Message::Browse(self.directory.clone())),
+            button(text("×").size(13)).on_press(Message::ToggleFiles)
         ]
         .spacing(4);
         let mut listing = column![
@@ -1758,7 +1795,9 @@ impl Ide {
                 .size(12)
             )
             .on_press(Message::OutputTab(false)),
-            button(text("Build output").size(12)).on_press(Message::OutputTab(true))
+            button(text("Build output").size(12)).on_press(Message::OutputTab(true)),
+            Space::new().width(Length::Fill),
+            button(text("×").size(13)).on_press(Message::ToggleDock)
         ]
         .spacing(5);
         let mut contents = column![].spacing(3);
@@ -1899,111 +1938,126 @@ impl Ide {
             .into()
     }
     fn view(&self) -> Element<'_, Message> {
-        let header = row![
-            text("FROST / VIM9").size(15),
-            self.navigation_button(
-                "←",
-                "Back to previous location (Alt+Left)",
-                self.snapshot.navigation.can_go_back,
-                Vim9Command::NavigateBack,
-            ),
-            self.navigation_button(
-                "→",
-                "Forward to next location (Alt+Right)",
-                self.snapshot.navigation.can_go_forward,
-                Vim9Command::NavigateForward,
-            ),
-            button(text("Quick open…").size(13)).on_press(Message::ShowForm(FormKind::QuickOpen)),
-            button(text("Files").size(13)).on_press(Message::ToggleFiles),
-            button(text("Open…").size(13)).on_press(Message::ShowForm(FormKind::Open)),
-            self.command_button("Save", Vim9Command::Save),
-            self.command_button("Save all", Vim9Command::SaveAll),
-            button(text("Search…").size(13)).on_press(Message::ShowForm(FormKind::Search)),
-            button(text("Build…").size(13)).on_press(Message::ShowForm(FormKind::Build)),
-            button(text("Save + build…").size(13)).on_press_maybe(
-                (!self.snapshot.build.running).then_some(Message::ShowForm(FormKind::SaveAndBuild))
-            ),
-            button(text("Stop build").size(13)).on_press_maybe(
-                (self.snapshot.connected && self.snapshot.build.running)
-                    .then_some(Message::Command(Vim9Command::CancelBuild))
-            ),
-            button(text("Problems / output").size(13)).on_press(Message::ToggleDock),
-            button(text("Close").size(13)).on_press(Message::Close)
-        ]
-        .spacing(5)
-        .align_y(iced::Alignment::Center);
-        let tools = row![
-            button(text("Go to…").size(13)).on_press(Message::ShowForm(FormKind::Goto)),
-            self.command_button("Vertical split", Vim9Command::Split { vertical: true }),
-            self.command_button("Horizontal split", Vim9Command::Split { vertical: false }),
-            self.optional_button("Definition", "definition", Vim9Command::Definition),
-            self.optional_button("Hover", "hover", Vim9Command::Hover),
-            self.optional_button("References", "references", Vim9Command::References),
-            button(text("Rename…").size(13))
-                .padding([4, 8])
-                .on_press_maybe(
-                    (self.snapshot.connected
-                        && self.snapshot.capabilities.iter().any(|c| c == "rename"))
-                    .then_some(Message::ShowForm(FormKind::Rename))
+        let mut body = column![];
+        if self.config.vim9.toolbar {
+            let header = row![
+                text("FROST / VIM9").size(15),
+                self.navigation_button(
+                    "←",
+                    "Back to previous location (Alt+Left)",
+                    self.snapshot.navigation.can_go_back,
+                    Vim9Command::NavigateBack,
                 ),
-            self.optional_button("Format", "format", Vim9Command::Format),
-            self.command_button("Previous problem ⇧F8", Vim9Command::PreviousDiagnostic),
-            self.command_button("Next problem F8", Vim9Command::NextDiagnostic),
-            text("Vim owns editing, mappings and undo").size(12)
-        ]
-        .spacing(5)
-        .align_y(iced::Alignment::Center);
-        let mut buffers = row![].spacing(4);
-        for buffer in &self.snapshot.buffers {
-            let name = Path::new(&buffer.name)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("[No Name]");
-            let label = format!(
-                "{}{}{}",
-                if buffer.current { "> " } else { "" },
-                visible_label(name),
-                if buffer.modified { " *" } else { "" }
-            );
-            let tab = button(text(label).size(12))
-                .on_press_maybe(
-                    self.snapshot
-                        .connected
-                        .then_some(Message::Command(Vim9Command::Buffer { buffer: buffer.id })),
-                )
-                .style(if buffer.current {
-                    button::primary
-                } else {
-                    button::secondary
-                });
-            let close = button(text("×").size(12)).padding([4, 5]).on_press_maybe(
-                self.snapshot
-                    .connected
-                    .then_some(Message::Command(Vim9Command::CloseBuffer {
-                        buffer: buffer.id,
-                    })),
-            );
-            buffers = buffers.push(
-                row![
-                    tooltip(
-                        tab,
-                        text(visible_label(&buffer.name)),
-                        tooltip::Position::Bottom
+                self.navigation_button(
+                    "→",
+                    "Forward to next location (Alt+Right)",
+                    self.snapshot.navigation.can_go_forward,
+                    Vim9Command::NavigateForward,
+                ),
+                button(text("Quick open…").size(13))
+                    .on_press(Message::ShowForm(FormKind::QuickOpen)),
+                button(text("Files").size(13)).on_press(Message::ToggleFiles),
+                button(text("Open…").size(13)).on_press(Message::ShowForm(FormKind::Open)),
+                self.command_button("Save", Vim9Command::Save),
+                self.command_button("Save all", Vim9Command::SaveAll),
+                button(text("Search…").size(13)).on_press(Message::ShowForm(FormKind::Search)),
+                button(text("Build…").size(13)).on_press(Message::ShowForm(FormKind::Build)),
+                button(text("Save + build…").size(13)).on_press_maybe(
+                    (!self.snapshot.build.running)
+                        .then_some(Message::ShowForm(FormKind::SaveAndBuild))
+                ),
+                button(text("Stop build").size(13)).on_press_maybe(
+                    (self.snapshot.connected && self.snapshot.build.running)
+                        .then_some(Message::Command(Vim9Command::CancelBuild))
+                ),
+                button(text("Problems / output").size(13)).on_press(Message::ToggleDock),
+                button(text("Close").size(13)).on_press(Message::Close)
+            ]
+            .spacing(5)
+            .align_y(iced::Alignment::Center);
+            let tools = row![
+                button(text("Go to…").size(13)).on_press(Message::ShowForm(FormKind::Goto)),
+                self.command_button("Vertical split", Vim9Command::Split { vertical: true }),
+                self.command_button("Horizontal split", Vim9Command::Split { vertical: false }),
+                self.optional_button("Definition", "definition", Vim9Command::Definition),
+                self.optional_button("Hover", "hover", Vim9Command::Hover),
+                self.optional_button("References", "references", Vim9Command::References),
+                button(text("Rename…").size(13))
+                    .padding([4, 8])
+                    .on_press_maybe(
+                        (self.snapshot.connected
+                            && self.snapshot.capabilities.iter().any(|c| c == "rename"))
+                        .then_some(Message::ShowForm(FormKind::Rename))
                     ),
-                    tooltip(
-                        close,
-                        text("Close buffer (refuses unsaved changes)"),
-                        tooltip::Position::Bottom
+                self.optional_button("Format", "format", Vim9Command::Format),
+                self.command_button("Previous problem ⇧F8", Vim9Command::PreviousDiagnostic),
+                self.command_button("Next problem F8", Vim9Command::NextDiagnostic),
+                text("Vim owns editing, mappings and undo").size(12)
+            ]
+            .spacing(5)
+            .align_y(iced::Alignment::Center);
+            body = body
+                .push(self.strip(header.into(), HEADER))
+                .push(self.strip(tools.into(), TOOLS));
+        }
+        if self.config.vim9.buffer_tabs {
+            let mut buffers = row![].spacing(4);
+            for buffer in &self.snapshot.buffers {
+                let name = Path::new(&buffer.name)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("[No Name]");
+                let label = format!(
+                    "{}{}{}",
+                    if buffer.current { "> " } else { "" },
+                    visible_label(name),
+                    if buffer.modified { " *" } else { "" }
+                );
+                let tab = button(text(label).size(12))
+                    .on_press_maybe(
+                        self.snapshot
+                            .connected
+                            .then_some(Message::Command(Vim9Command::Buffer { buffer: buffer.id })),
                     )
-                ]
-                .spacing(1),
-            );
+                    .style(if buffer.current {
+                        button::primary
+                    } else {
+                        button::secondary
+                    });
+                let close =
+                    button(text("×").size(12)).padding([4, 5]).on_press_maybe(
+                        self.snapshot.connected.then_some(Message::Command(
+                            Vim9Command::CloseBuffer { buffer: buffer.id },
+                        )),
+                    );
+                buffers = buffers.push(
+                    row![
+                        tooltip(
+                            tab,
+                            text(visible_label(&buffer.name)),
+                            tooltip::Position::Bottom
+                        ),
+                        tooltip(
+                            close,
+                            text("Close buffer (refuses unsaved changes)"),
+                            tooltip::Position::Bottom
+                        )
+                    ]
+                    .spacing(1),
+                );
+            }
+            if self.snapshot.buffers_truncated {
+                buffers = buffers.push(text("More buffers in :ls").size(12));
+            }
+            body = body.push(self.strip(buffers.into(), BUFFERS));
         }
-        if self.snapshot.buffers_truncated {
-            buffers = buffers.push(text("More buffers in :ls").size(12));
-        }
-        let (side, vertical) = chrome(self.size, self.files_open, self.dock_open);
+        let (side, _) = chrome(
+            self.size,
+            &self.config.vim9,
+            self.files_open,
+            self.dock_open,
+        );
         let mut middle = row![];
         if side > 0.0 {
             middle = middle.push(self.files());
@@ -2013,36 +2067,35 @@ impl Ide {
                 .width(Length::Fill)
                 .height(Length::Fill),
         );
-        let mut body = column![
-            self.strip(header.into(), HEADER),
-            self.strip(tools.into(), TOOLS),
-            self.strip(buffers.into(), BUFFERS),
-            middle.height(Length::Fill)
-        ];
-        if vertical > HEADER + TOOLS + BUFFERS + STATUS {
+        body = body.push(middle.height(Length::Fill));
+        if self.dock_open && self.size.height >= 580.0 {
             body = body.push(self.dock());
         }
-        let state = if self.child_exited {
-            "EXITED"
-        } else if self.snapshot.connected && self.snapshot.waiting_for_input {
-            "WAITING FOR VIM INPUT"
-        } else if self.snapshot.connected {
-            "CONNECTED"
-        } else {
-            "BRIDGE OFFLINE"
-        };
-        let render_state = self
-            .render_frame
-            .as_ref()
-            .map(|frame| {
-                if frame.supported {
-                    "GUI buffer · RGB".to_owned()
-                } else {
-                    format!("Compatible view: {}", frame.fallback_reason)
-                }
-            })
-            .unwrap_or_else(|| "Connecting GUI buffer".to_owned());
-        let status = format!(
+        if self.config.vim9.status_bar {
+            let state = if self.child_exited {
+                "EXITED"
+            } else if self.snapshot.connected && self.snapshot.waiting_for_input {
+                "WAITING FOR VIM INPUT"
+            } else if self.snapshot.connected {
+                "CONNECTED"
+            } else {
+                "BRIDGE OFFLINE"
+            };
+            let render_state = if !self.config.vim9.native_buffer {
+                "Compatible view (configured)".to_owned()
+            } else {
+                self.render_frame
+                    .as_ref()
+                    .map(|frame| {
+                        if frame.supported {
+                            "GUI buffer · RGB".to_owned()
+                        } else {
+                            format!("Compatible view: {}", frame.fallback_reason)
+                        }
+                    })
+                    .unwrap_or_else(|| "Connecting GUI buffer".to_owned())
+            };
+            let status = format!(
             "{state} | {render_state} | {} | {}{} | {}:{} / {} | {} · {} | {} split(s) | {} pending{}",
             visible_label(&self.snapshot.mode),
             visible_label(&self.snapshot.file),
@@ -2060,23 +2113,48 @@ impl Ide {
                 ""
             }
         );
-        let status = self
-            .error
-            .as_deref()
-            .or(self.snapshot.error.as_deref())
-            .map(|error| format!("Error: {} · {}", visible_label(error), status))
-            .unwrap_or(status);
-        body = body.push(
-            container(text(status).size(12).wrapping(text::Wrapping::None))
-                .padding([4, 8])
-                .height(Length::Fixed(STATUS))
-                .width(Length::Fill)
-                .clip(true),
-        );
-        let base: Element<'_, Message> = container(body)
+            let status = self
+                .error
+                .as_deref()
+                .or(self.snapshot.error.as_deref())
+                .map(|error| format!("Error: {} · {}", visible_label(error), status))
+                .unwrap_or(status);
+            body = body.push(
+                container(text(status).size(12).wrapping(text::Wrapping::None))
+                    .padding([4, 8])
+                    .height(Length::Fixed(STATUS))
+                    .width(Length::Fill)
+                    .clip(true),
+            );
+        }
+        let mut base: Element<'_, Message> = container(body)
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
+        // Failures must remain discoverable when all persistent chrome is off.
+        // This transient overlay does not take rows from Vim's viewport.
+        if !self.config.vim9.status_bar {
+            if let Some(error) = self.error.as_deref().or(self.snapshot.error.as_deref()) {
+                let notice = container(
+                    row![
+                        text(visible_label(error)).size(12),
+                        button(text("Dismiss").size(12)).on_press(Message::DismissError),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding(8)
+                .style(container::rounded_box);
+                base = stack![
+                    base,
+                    container(notice)
+                        .align_bottom(Length::Fill)
+                        .center_x(Length::Fill)
+                        .padding(8),
+                ]
+                .into();
+            }
+        }
         let Some(form) = &self.form else {
             return base;
         };
@@ -2303,9 +2381,55 @@ mod tests {
     }
     #[test]
     fn chrome_reserves_only_visible_panels_and_keeps_small_windows_usable() {
-        assert_eq!(chrome(Size::new(480.0, 320.0), true, true), (0.0, 136.0));
-        assert_eq!(chrome(Size::new(1000.0, 700.0), true, true), (250.0, 336.0));
-        assert_eq!(chrome(Size::new(1000.0, 700.0), false, false), (0.0, 136.0));
+        let minimal = vim9::Vim9UiConfig::default();
+        assert_eq!(
+            chrome(Size::new(480.0, 320.0), &minimal, false, false),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            chrome(Size::new(1000.0, 700.0), &minimal, false, false),
+            (0.0, 0.0)
+        );
+        // An explicitly revealed panel reserves only its own area.
+        assert_eq!(
+            chrome(Size::new(1000.0, 700.0), &minimal, true, false),
+            (250.0, 0.0)
+        );
+        assert_eq!(
+            chrome(Size::new(1000.0, 700.0), &minimal, false, true),
+            (0.0, 200.0)
+        );
+        assert_eq!(
+            chrome(Size::new(480.0, 320.0), &minimal, true, true),
+            (0.0, 0.0)
+        );
+
+        let workbench = vim9::Vim9UiConfig {
+            toolbar: true,
+            buffer_tabs: true,
+            status_bar: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            chrome(Size::new(480.0, 320.0), &workbench, true, true),
+            (0.0, 136.0)
+        );
+        assert_eq!(
+            chrome(Size::new(1000.0, 700.0), &workbench, true, true),
+            (250.0, 336.0)
+        );
+        assert_eq!(
+            chrome(Size::new(1000.0, 700.0), &workbench, false, false),
+            (0.0, 136.0)
+        );
+        let tabs_only = vim9::Vim9UiConfig {
+            buffer_tabs: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            chrome(Size::new(1000.0, 700.0), &tabs_only, false, false),
+            (0.0, 34.0)
+        );
     }
     #[test]
     fn labels_cannot_hide_controls_and_inputs_keep_utf8_boundaries() {
@@ -2349,6 +2473,14 @@ mod tests {
             Some(Shortcut::Form(FormKind::Goto))
         );
         assert_eq!(
+            native_shortcut(&Key::Character("e".into()), chord),
+            Some(Shortcut::ToggleFiles)
+        );
+        assert_eq!(
+            native_shortcut(&Key::Character("j".into()), chord),
+            Some(Shortcut::ToggleDock)
+        );
+        assert_eq!(
             native_shortcut(&Key::Character("s".into()), Modifiers::CTRL),
             Some(Shortcut::Save)
         );
@@ -2383,7 +2515,7 @@ mod tests {
                 assert_eq!(native_shortcut(&Key::Named(direction), modifiers), None);
             }
         }
-        for key in ["p", "o", "w", "g", "f", "b"] {
+        for key in ["p", "o", "w", "g", "f", "b", "e", "j"] {
             assert_eq!(
                 native_shortcut(&Key::Character(key.into()), Modifiers::CTRL),
                 None

@@ -12,7 +12,10 @@ use iced::advanced::{Clipboard, Shell};
 use iced::{
     mouse, Background, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Size,
 };
-use jterm_core::vim9::{Vim9RenderFrame, Vim9RenderStyle};
+use jterm_core::vim9::{
+    Vim9PixelRect, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect, Vim9RenderRun,
+    Vim9RenderStyle,
+};
 
 use crate::terminal_view::{Metrics, TermWidget};
 
@@ -46,6 +49,77 @@ fn quad(bounds: Rectangle) -> Quad {
         bounds,
         ..Quad::default()
     }
+}
+
+fn rectangle(rect: Vim9PixelRect) -> Rectangle {
+    Rectangle {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    }
+}
+
+fn render_metrics(bounds: Rectangle, metrics: Metrics) -> Vim9RenderMetrics {
+    Vim9RenderMetrics {
+        origin_x: bounds.x + metrics.padding,
+        origin_y: bounds.y + metrics.padding,
+        cell_width: metrics.cell_w,
+        line_height: metrics.cell_h,
+    }
+}
+
+struct PaintView<'a> {
+    logical: &'a Vim9RenderRect,
+    clip: Rectangle,
+    runs: Vec<&'a Vim9RenderRun>,
+}
+
+/// Prepare each window once, preserving run order for background/text layering.
+/// Window identity selects paint ownership; overlapping pixel clips never move
+/// a run to another buffer. The same logical-pixel transform is used by the
+/// shared semantic anchor API for future GUI overlays.
+fn paint_views(
+    frame: &Vim9RenderFrame,
+    metrics: Vim9RenderMetrics,
+    clip: Rectangle,
+) -> Vec<PaintView<'_>> {
+    let mut indices = std::collections::BTreeMap::new();
+    let mut views = Vec::new();
+    let windows: Vec<_> = if frame.windows.is_empty() {
+        vec![(frame.window, &frame.view)]
+    } else {
+        frame.windows.iter().map(|w| (w.window, &w.view)).collect()
+    };
+    for (window, logical) in windows {
+        if let Some(visible) = metrics
+            .rect(logical)
+            .map(rectangle)
+            .and_then(|rect| rect.intersection(&clip))
+            .filter(|rect| rect.area() > 0.0)
+        {
+            indices.insert(window, views.len());
+            views.push(PaintView {
+                logical,
+                clip: visible,
+                runs: Vec::new(),
+            });
+        }
+    }
+    for run in &frame.runs {
+        let window = if frame.windows.is_empty() {
+            frame.window
+        } else {
+            run.window
+        };
+        if let Some(index) = indices.get(&window) {
+            let view = &mut views[*index];
+            if run.cells > 0 && view.logical.contains(run.row, run.column) {
+                view.runs.push(run);
+            }
+        }
+    }
+    views
 }
 
 /// Subtract one contained rectangle without overlapping the remaining bands.
@@ -193,27 +267,20 @@ where
             return;
         };
         let m = self.metrics;
-        let origin = Point::new(bounds.x + m.padding, bounds.y + m.padding);
+        let geometry = render_metrics(bounds, m);
+        if !geometry.is_valid() {
+            self.input
+                .draw(tree, renderer, theme, style, layout, cursor, viewport);
+            return;
+        }
         let frame = self.frame;
-        let views: Vec<_> = frame
-            .paint_views()
-            .filter_map(|view| {
-                Rectangle {
-                    x: origin.x + view.column as f32 * m.cell_w,
-                    y: origin.y + view.row as f32 * m.cell_h,
-                    width: view.columns as f32 * m.cell_w,
-                    height: view.rows as f32 * m.cell_h,
-                }
-                .intersection(&clip)
-                .map(|clipped| (view, clipped))
-            })
-            .collect();
+        let views = paint_views(frame, geometry, clip);
         if views.is_empty() {
             self.input
                 .draw(tree, renderer, theme, style, layout, cursor, viewport);
             return;
         }
-        let rectangles: Vec<_> = views.iter().map(|(_, rect)| *rect).collect();
+        let rectangles: Vec<_> = views.iter().map(|view| view.clip).collect();
         for band in compatibility_bands(clip, &rectangles) {
             renderer.with_layer(band, |renderer| {
                 self.input
@@ -221,34 +288,28 @@ where
             });
         }
         let (normal_fg, normal_bg, _) = colors(&frame.default_style, &frame.default_style);
-        for (logical_view, view) in views {
+        for prepared in views {
+            let logical_view = prepared.logical;
+            let view = prepared.clip;
             renderer.with_layer(view, |renderer| {
                 renderer.fill_quad(quad(view), Background::Color(normal_bg));
                 // Keep italic overhang intact across adjacent highlight runs.
-                for run in &frame.runs {
-                    if !logical_view.contains(run.row, run.column) || run.cells == 0 {
+                for run in &prepared.runs {
+                    let Some(area) = geometry
+                        .cell_rect(run.row, run.column, run.cells)
+                        .map(rectangle)
+                    else {
                         continue;
-                    }
+                    };
                     let (_, bg, _) = colors(&run.style, &frame.default_style);
-                    renderer.fill_quad(
-                        quad(Rectangle {
-                            x: origin.x + run.column as f32 * m.cell_w,
-                            y: origin.y + run.row as f32 * m.cell_h,
-                            width: run.cells as f32 * m.cell_w,
-                            height: m.cell_h,
-                        }),
-                        Background::Color(bg),
-                    );
+                    renderer.fill_quad(quad(area), Background::Color(bg));
                 }
-                for run in &frame.runs {
-                    if !logical_view.contains(run.row, run.column) || run.cells == 0 {
+                for run in &prepared.runs {
+                    let Some(area) = geometry
+                        .cell_rect(run.row, run.column, run.cells)
+                        .map(rectangle)
+                    else {
                         continue;
-                    }
-                    let area = Rectangle {
-                        x: origin.x + run.column as f32 * m.cell_w,
-                        y: origin.y + run.row as f32 * m.cell_h,
-                        width: run.cells as f32 * m.cell_w,
-                        height: m.cell_h,
                     };
                     let text_area = Rectangle {
                         x: area.x - m.font_size * 0.25,
@@ -258,9 +319,6 @@ where
                     let Some(run_clip) = text_area.intersection(&view) else {
                         continue;
                     };
-                    if run.cells == 0 {
-                        continue;
-                    }
                     let (fg, _, special) = colors(&run.style, &frame.default_style);
                     let font = Font {
                         weight: if run.style.bold {
@@ -353,17 +411,23 @@ where
                     && logical_view.contains(frame.cursor.row, frame.cursor.column)
                     && (!self.focused || self.blink_on)
                 {
-                    let cursor = Rectangle {
-                        x: origin.x + frame.cursor.column as f32 * m.cell_w,
-                        y: origin.y + frame.cursor.row as f32 * m.cell_h,
-                        width: frame.cursor.width.max(1) as f32 * m.cell_w,
-                        height: m.cell_h,
+                    let Some(cursor) = geometry.cursor_rect(&frame.cursor).map(rectangle) else {
+                        return;
                     };
-                    if self.focused && (frame.mode.starts_with('i') || frame.mode.starts_with('R'))
-                    {
+                    if self.focused && frame.mode.starts_with('i') {
                         renderer.fill_quad(
                             quad(Rectangle {
                                 width: 2.0,
+                                ..cursor
+                            }),
+                            Background::Color(normal_fg),
+                        );
+                    } else if self.focused && frame.mode.starts_with('R') {
+                        let height = (cursor.height * 0.2).max(2.0);
+                        renderer.fill_quad(
+                            quad(Rectangle {
+                                y: cursor.y + cursor.height - height,
+                                height,
                                 ..cursor
                             }),
                             Background::Color(normal_fg),
@@ -406,6 +470,88 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn split_frame() -> Vim9RenderFrame {
+        serde_json::from_value(serde_json::json!({
+            "revision": 7, "supported": true, "rows": 20, "columns": 80,
+            "window": 10, "buffer": 3, "changedtick": 8,
+            "view": {"row": 1, "column": 0, "rows": 17, "columns": 39},
+            "windows": [
+                {"window": 10, "buffer": 3, "changedtick": 8,
+                 "view": {"row": 1, "column": 0, "rows": 17, "columns": 39}},
+                {"window": 20, "buffer": 4, "changedtick": 2,
+                 "view": {"row": 1, "column": 40, "rows": 17, "columns": 40}}
+            ],
+            "runs": [
+                {"window": 10, "row": 1, "column": 2, "text": "界", "cells": 2,
+                 "line": 1, "byte_start": 0, "byte_end": 3},
+                {"window": 20, "row": 1, "column": 42, "text": "peer", "cells": 4,
+                 "line": 8, "byte_start": 0, "byte_end": 4},
+                {"window": 10, "row": 2, "column": 2, "text": "next", "cells": 4,
+                 "line": 2, "byte_start": 0, "byte_end": 4}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn prepared_views_keep_window_identity_and_stable_paint_order() {
+        let mut frame = split_frame();
+        // A wrong-window run must not become visible merely because its pixel
+        // coordinates happen to lie inside another split.
+        let mut wrong_window = frame.runs[0].clone();
+        wrong_window.window = 20;
+        wrong_window.text = "wrong".into();
+        frame.runs.push(wrong_window);
+        let metrics = Metrics::new(14.0, 1.0, 4.0, false);
+        let bounds = Rectangle::with_size(Size::new(1000.0, 700.0));
+        let views = paint_views(&frame, render_metrics(bounds, metrics), bounds);
+        assert_eq!(views.len(), 2);
+        assert_eq!(
+            views[0]
+                .runs
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["界", "next"]
+        );
+        assert_eq!(
+            views[1]
+                .runs
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["peer"]
+        );
+    }
+
+    #[test]
+    fn native_text_and_semantic_anchors_share_fractional_pixel_geometry() {
+        let frame = split_frame();
+        for font_size in [11.0, 14.5, 22.0] {
+            let metrics = Metrics::new(font_size, 1.15, 3.25, false);
+            let bounds = Rectangle {
+                x: 7.25,
+                y: 9.5,
+                width: 1200.0,
+                height: 800.0,
+            };
+            let geometry = render_metrics(bounds, metrics);
+            let anchor = frame.anchor_at_cell(1, 3).unwrap();
+            assert_eq!(anchor.window, 10);
+            assert_eq!(anchor.buffer, 3);
+            let anchor_rect = rectangle(geometry.rect(&anchor.rect).unwrap());
+            let run_rect = rectangle(geometry.cell_rect(1, 2, 2).unwrap());
+            assert_eq!(anchor_rect, run_rect);
+            assert_eq!(
+                geometry.cell_at(run_rect.x + metrics.cell_w * 1.5, run_rect.center_y()),
+                Some((1, 3))
+            );
+            let views = paint_views(&frame, geometry, bounds);
+            assert!(views[0].clip.contains(anchor_rect.center()));
+            assert!(!views[1].clip.contains(anchor_rect.center()));
+        }
+    }
     #[test]
     fn rgb_highlights_preserve_gui_colors() {
         let normal = Vim9RenderStyle {

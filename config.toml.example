@@ -10,3 +10,13 @@
 # ASCII organism is enabled by default; uncomment to turn it off.
 # ascii_organism_enabled = false
 # terminal_mode = "block"
+
+# Vim buffer rendering and optional workbench controls are independent.
+# Explicitly enter with frost --ide [file-or-project].
+[vim9]
+native_buffer = true
+toolbar = false
+buffer_tabs = false
+status_bar = false
+project_panel = false
+tool_panel = false

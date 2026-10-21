@@ -150,6 +150,10 @@ fn default_organism_expanded() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Native Vim buffer presentation is independent of optional IDE panels.
+    #[serde(default)]
+    pub vim9: jterm_core::vim9::Vim9UiConfig,
+
     /// Offline companion, enabled unless explicitly disabled.
     #[serde(default = "default_organism_enabled")]
     pub ascii_organism_enabled: bool,
@@ -661,6 +665,7 @@ fn default_jsh_update_check() -> String {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            vim9: jterm_core::vim9::Vim9UiConfig::default(),
             ascii_organism_enabled: default_organism_enabled(),
             ascii_organism_expanded: true,
             ascii_organism_motion: None,
@@ -1301,6 +1306,40 @@ pub fn create_default_config() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vim9_buffer_defaults_are_independent_from_optional_workbench_chrome() {
+        for config in [
+            super::Config::default(),
+            super::Config::from_toml("").unwrap(),
+        ] {
+            assert!(config.vim9.native_buffer);
+            assert!(!config.vim9.toolbar);
+            assert!(!config.vim9.buffer_tabs);
+            assert!(!config.vim9.status_bar);
+            assert!(!config.vim9.project_panel);
+            assert!(!config.vim9.tool_panel);
+        }
+        let config = super::Config::from_toml(
+            "font_size = 19.0\n[vim9]\nproject_panel = true\nstatus_bar = true\n",
+        )
+        .unwrap();
+        assert!(config.vim9.native_buffer);
+        assert!(config.vim9.project_panel);
+        assert!(config.vim9.status_bar);
+        assert!(!config.vim9.toolbar);
+        assert!(!config.vim9.buffer_tabs);
+        assert!(!config.vim9.tool_panel);
+        let reloaded = super::Config::from_toml(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(reloaded.vim9.native_buffer && reloaded.vim9.project_panel);
+        assert!(reloaded.vim9.status_bar);
+        assert!(!reloaded.vim9.toolbar);
+        assert_eq!(reloaded.font_size, 19.0);
+
+        let compatible = super::Config::from_toml("[vim9]\nnative_buffer = false\n").unwrap();
+        assert!(!compatible.vim9.native_buffer);
+        assert!(!compatible.vim9.toolbar);
+    }
+
     #[test]
     fn legacy_font_groups_split_before_first_edit_and_survive_reload() {
         for edit_chrome in [false, true] {

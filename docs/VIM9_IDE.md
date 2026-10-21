@@ -9,6 +9,40 @@ publish visible text and GUI styles. Frost's `NativeBuffer` widget draws those
 runs directly with Iced text shaping and RGB decorations. No second editable
 document model is introduced.
 
+## Buffer-first defaults
+
+Entering `frost --ide` shows the GUI buffer with Vim's own status/command rows.
+The extra workbench toolbar, buffer strip, status bar, project sidebar and
+build/problem dock are all off by default. They do not reserve empty space or
+construct their hidden widget trees. Directory scanning starts when the project
+sidebar is explicitly opened; Quick Open starts its index on demand.
+
+These keys live in `~/.config/frost/config.toml` and use the shared four-terminal
+configuration contract:
+
+```toml
+[vim9]
+native_buffer = true
+toolbar = false
+buffer_tabs = false
+status_bar = false
+project_panel = false
+tool_panel = false
+```
+
+Set individual controls to `true` to show them at editor startup. The native
+buffer renderer is independent: hiding every control still keeps GUI text and
+RGB styling enabled. Setting only `native_buffer = false` selects compatible
+terminal painting without enabling the controls. Existing configuration files
+without `[vim9]` receive these defaults.
+
+`Ctrl+Shift+E` toggles the project sidebar and `Ctrl+Shift+J` toggles the tool
+dock. Both have a close button when visible. Explicit Search/Build actions may
+reveal their result dock. Quick Open, Go to and other dialogs remain available
+on demand and Escape returns to Vim. Save, Vim mappings and editor font zoom
+continue to work without the toolbar. Errors appear in a dismissible transient
+overlay if the added status bar is hidden.
+
 ## GUI buffer rendering
 
 `guifg`, `guibg` and `guisp` are preserved as exact RGB values independently of
@@ -20,7 +54,7 @@ GUI buffer rectangles so it cannot constrain buffer colors or glyphs. The
 compatibility bands are disjoint even for mixed horizontal and vertical splits;
 separators and status rows remain visible and keep their Vim input behavior.
 
-The status line shows **GUI buffer · RGB** while a supported frame is present.
+The optional GUI status bar shows **GUI buffer · RGB** while a supported frame is present.
 Vim's command/status rows remain in the compatible surface. Horizontal,
 vertical and mixed internal Vim windows use native text in every supported
 window, with a cursor and IME anchor only in the active one. Folds, diff,
@@ -38,6 +72,22 @@ the configured font family is absent, the IDE resolves an installed monospace
 family before measuring and painting it. This keeps regular, bold and italic
 text on the same Vim columns instead of squeezing a proportional substitute
 into a guessed cell width.
+
+Every native view, glyph background and cursor now uses the shared
+`Vim9RenderMetrics` logical-pixel transform. Fractional padding, line heights
+and font zoom stay intact. Rendering first groups runs by their Vim window ID,
+then paints each window's backgrounds and glyphs in stable order, so the
+renderer no longer rescans every buffer's runs twice for each split. Replace
+mode has a horizontal cursor; Insert mode retains the vertical cursor.
+
+The shared core exposes semantic anchors with frame revision, Vim window and
+buffer IDs, changedtick, source line/UTF-8 byte range and screen rectangle. The
+native renderer uses the same transform as these anchors. This is the layout
+foundation for later floating inspectors, Markdown previews, images and color
+pickers; those complete features are not introduced by this change. Vim still
+owns text and undo, and stale buffer anchors must be resolved again after edits
+or viewport changes. Native IME continues to use Iced's existing over-the-spot
+overlay at the active GUI cursor.
 
 ## Launch
 
@@ -154,11 +204,11 @@ reported exit status and the number of omitted output lines. Search and build
 share the current quickfix result list, so a later operation can replace the
 previous list.
 
-Files and Problems/output can be toggled. Large windows show the project
-sidebar and bottom dock. The sidebar is hidden below 820 logical pixels and
-the dock below 580 pixels in this initial layout; the Open form, Vim commands
-and status line remain available. Toolbar and buffer strips scroll horizontally
-instead of forcing the terminal wider than its window. Ctrl+wheel changes the
+Files and Problems/output can be toggled on demand. Once enabled, large windows
+show the project sidebar and bottom dock. The sidebar is hidden below 820
+logical pixels and the dock below 580 pixels; the Open form and Vim commands
+remain available. Optional toolbar and buffer strips scroll horizontally
+instead of forcing the editor wider than its window. Ctrl+wheel changes the
 editor font size for this process without rewriting configuration.
 
 ## Keyboard and mouse
@@ -167,6 +217,8 @@ editor font size for this process without rewriting configuration.
 | --- | --- |
 | Ctrl+Shift+P | Quick Open project filename picker |
 | Ctrl+Shift+G | Go to line or line:column |
+| Ctrl+Shift+E | Toggle project sidebar |
+| Ctrl+Shift+J | Toggle problems/build-output dock |
 | Alt+Left / Alt+Right | Back / forward through Vim's jump list |
 | Ctrl+Shift+O | Open a file/new-file path form |
 | Ctrl+S | Save current buffer |

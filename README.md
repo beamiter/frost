@@ -4,7 +4,7 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 
 ## 原生 Vim9 IDE
 
-运行 `frost --ide [项目目录或文件]`，或点击终端工具栏的 **Vim9 IDE**，打开基于真实 Vim 9 PTY 的独立 iced/WGPU 工作台。原生界面提供项目浏览、模糊快速打开（Ctrl+Shift+P）、行列跳转（Ctrl+Shift+G）、位置后退/前进（Alt+Left/Right）、缓冲区切换/关闭、Vim 分屏、保存、可选大小写/正则/整词/文件 glob 的项目搜索及取消、异步构建、输出和诊断导航；关闭窗口会请求 Vim 正常退出，未保存的修改会阻止退出。需要安装 Vim 9 和 ripgrep。普通终端继续使用原有会话、分屏、快捷键和恢复路径。
+运行 `frost --ide [项目目录或文件]`，或点击终端工具栏的 **Vim9 IDE**，打开基于真实 Vim 9 的独立 iced/WGPU 编辑窗口。默认只显示现代 GUI buffer：工具栏、GUI buffer 标签、附加状态栏、项目侧栏和构建/诊断面板均默认关闭，可在配置的 `[vim9]` 下逐项开启。`native_buffer = true` 独立保持 GUI 文本、RGB 高亮和光标渲染。模糊快速打开（Ctrl+Shift+P）、行列跳转（Ctrl+Shift+G）、位置后退/前进（Alt+Left/Right）、保存及 Vim 原生命令继续可用；Ctrl+Shift+E/J 可临时开关项目/工具面板。关闭窗口会请求 Vim 正常退出，未保存的修改会阻止退出。需要安装 Vim 9，项目搜索需要 ripgrep。普通终端继续使用原有会话、分屏、快捷键和恢复路径。
 
 启动方式、操作、可选语言服务及测试命令见 [Vim9 IDE 文档](docs/VIM9_IDE.md)。
 
