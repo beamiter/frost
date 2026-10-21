@@ -115,14 +115,23 @@ fn target_from_args(args: &[OsString]) -> Result<Option<PathBuf>, String> {
 
 pub(super) fn run_if_requested() -> Option<iced::Result> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    let target = match target_from_args(&args) {
-        Ok(Some(target)) => target,
+    let entry_request = match vim9::shell_vim_request(&args).and_then(|request| match request {
+        Some(request) => Ok(Some(request)),
+        None => target_from_args(&args).map(|target| target.map(Vim9EntryRequest::command_line)),
+    }) {
+        Ok(Some(request)) => request,
         Ok(None) => return None,
         Err(error) => {
             eprintln!("frost: {error}");
             std::process::exit(2);
         }
     };
+    // A Vim invoked from a real shell must finish with Vim's actual status, so
+    // `vim file && build` and `:cq` keep their normal command-line semantics.
+    let shell_status = entry_request
+        .is_shell_command()
+        .then(|| std::sync::Arc::new(std::sync::atomic::AtomicI32::new(1)));
+    let application_status = shell_status.clone();
     let loaded = Config::load_with_diagnostics();
     let mut config = loaded.config;
     // These changes are process-local. There is no config writer in this app.
@@ -153,32 +162,37 @@ pub(super) fn run_if_requested() -> Option<iced::Result> {
         .ok(),
         ..Default::default()
     };
-    let entry = std::sync::Mutex::new(Some(Vim9EntryRequest::command_line(target)));
-    Some(
-        iced::application(
-            move || {
-                Ide::new(
-                    entry
-                        .lock()
-                        .expect("IDE launch lock")
-                        .take()
-                        .expect("explicit IDE launch is consumed once"),
-                    config.clone(),
-                    loaded.diagnostic.clone(),
-                    native.clone(),
-                    size,
-                )
-            },
-            Ide::update,
-            Ide::view,
-        )
-        .title("Frost - Vim9 IDE")
-        .theme(Ide::native_theme)
-        .subscription(Ide::subscription)
-        .antialiasing(false)
-        .window(window)
-        .run(),
+    let entry = std::sync::Mutex::new(Some(entry_request));
+    let result = iced::application(
+        move || {
+            Ide::new(
+                entry
+                    .lock()
+                    .expect("IDE launch lock")
+                    .take()
+                    .expect("explicit IDE launch is consumed once"),
+                config.clone(),
+                loaded.diagnostic.clone(),
+                native.clone(),
+                size,
+                application_status.clone(),
+            )
+        },
+        Ide::update,
+        Ide::view,
     )
+    .title("Frost - Vim9 IDE")
+    .theme(Ide::native_theme)
+    .subscription(Ide::subscription)
+    .antialiasing(false)
+    .window(window)
+    .run();
+    if result.is_ok() {
+        if let Some(status) = shell_status {
+            std::process::exit(status.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
+    Some(result)
 }
 
 /// The ordinary terminal's launcher never injects a command into its shell.
@@ -291,6 +305,7 @@ enum Message {
     Resize(Size),
     Close,
     Mouse(MouseInput),
+    NativeWheel(crate::vim9_buffer::NativeWheel),
     Command(Vim9Command),
     ShowForm(FormKind),
     FormInput(String),
@@ -327,6 +342,7 @@ struct Ide {
     snapshot: Vim9Snapshot,
     render_frame: Option<std::sync::Arc<vim9::Vim9RenderFrame>>,
     render_subscribed: bool,
+    scroll: std::cell::RefCell<crate::vim9_buffer::ScrollState>,
     root: PathBuf,
     directory: PathBuf,
     entries: Vec<ProjectEntry>,
@@ -354,6 +370,7 @@ struct Ide {
     blink_started: Instant,
     blink_on: bool,
     child_exited: bool,
+    shell_status: Option<std::sync::Arc<std::sync::atomic::AtomicI32>>,
 }
 
 fn accepts_render_entry(active: Option<uuid::Uuid>, incoming: uuid::Uuid, exited: bool) -> bool {
@@ -577,6 +594,7 @@ impl Ide {
         diagnostic: Option<String>,
         native_enter: native_enter::SharedOwnership,
         size: Size,
+        shell_status: Option<std::sync::Arc<std::sync::atomic::AtomicI32>>,
     ) -> (Self, Task<Message>) {
         let theme = Theme::get_theme(&config.theme).unwrap_or_default();
         let mono = crate::terminal_view::resolve_native_editor_font(super::resolve_mono_font(
@@ -629,6 +647,7 @@ impl Ide {
             snapshot: Vim9Snapshot::default(),
             render_frame: None,
             render_subscribed: false,
+            scroll: std::cell::RefCell::new(crate::vim9_buffer::ScrollState::default()),
             directory: root.clone(),
             root: root.clone(),
             entries: Vec::new(),
@@ -656,10 +675,16 @@ impl Ide {
             blink_started: Instant::now(),
             blink_on: true,
             child_exited: false,
+            shell_status,
         };
         state.resize();
         state.sync_ime();
-        let task = if state.session.is_some() && state.files_open {
+        let task = if state.session.is_none() && state.shell_status.is_some() {
+            if let Some(error) = &state.error {
+                eprintln!("frost: {error}");
+            }
+            iced::exit()
+        } else if state.session.is_some() && state.files_open {
             state.browse(root)
         } else {
             Task::none()
@@ -713,6 +738,7 @@ impl Ide {
         }
     }
     fn resize(&mut self) {
+        self.scroll.borrow_mut().clear();
         self.retire_gestures();
         let (sidebar, vertical) = chrome(
             self.size,
@@ -995,6 +1021,16 @@ impl Ide {
                     .filter(|editor| editor.is_active())
                     .map(Vim9Session::entry_id);
                 if accepts_render_entry(active_entry, entry_id, self.child_exited) {
+                    self.scroll.borrow_mut().observe(
+                        self.render_frame.as_ref(),
+                        frame.as_ref(),
+                        self.metrics.cell_h,
+                        self.config.vim9.smooth_scroll
+                            && self
+                                .session
+                                .as_ref()
+                                .is_none_or(|session| session.terminal.preedit_text.is_empty()),
+                    );
                     self.render_frame = frame;
                 }
             }
@@ -1004,6 +1040,7 @@ impl Ide {
                     if !self.snapshot.connected {
                         self.render_subscribed = false;
                         self.render_frame = None;
+                        self.scroll.borrow_mut().clear();
                     } else if !self.render_subscribed {
                         self.render_subscribed = editor
                             .send(Vim9Command::SetRender {
@@ -1063,24 +1100,33 @@ impl Ide {
                         .is_some_and(|s| s.id == id && s.master_fd == fd) =>
                 {
                     self.child_exited = true;
+                    if let Some(shell_status) = &self.shell_status {
+                        shell_status
+                            .store(status.clamp(0, 255), std::sync::atomic::Ordering::Relaxed);
+                    }
                     if let Some(editor) = self.editor.take() {
                         editor.revoke();
                     }
                     self.render_frame = None;
+                    self.scroll.borrow_mut().clear();
                     self.render_subscribed = false;
                     self.snapshot = Vim9Snapshot::default();
                     self.form = None;
                     self.invalidate_input();
-                    if status == 0 {
+                    if status == 0 || self.shell_status.is_some() {
                         return iced::exit();
                     }
                     self.error = Some(format!("Vim exited with status {status}. The final screen is retained; Close now dismisses the workbench."));
                 }
                 _ => {}
             },
-            Message::Keyboard(id, event, captured) => return self.key(id, event, captured),
+            Message::Keyboard(id, event, captured) => {
+                self.scroll.borrow_mut().clear();
+                return self.key(id, event, captured);
+            }
             Message::Modifiers(modifiers) => self.modifiers = modifiers,
             Message::Ime(event) => {
+                self.scroll.borrow_mut().clear();
                 if !self.ime.admit(&event) {
                     return Task::none();
                 }
@@ -1108,6 +1154,7 @@ impl Ide {
             }
             Message::CancelledCommit => self.ime.retire_cancelled_commit(),
             Message::Focus(focused) => {
+                self.scroll.borrow_mut().clear();
                 self.retire_gestures();
                 self.focused = focused;
                 self.invalidate_input();
@@ -1118,7 +1165,21 @@ impl Ide {
             }
             Message::Close => return self.close(),
             Message::Mouse(input) => return self.mouse(input),
-            Message::Command(action) => self.send(action),
+            Message::NativeWheel(wheel) => {
+                if self.input_active() && self.snapshot.connected {
+                    let lines = self.scroll.borrow_mut().wheel(wheel);
+                    if lines != 0 {
+                        self.send(Vim9Command::Scroll {
+                            window: wheel.window,
+                            lines,
+                        });
+                    }
+                }
+            }
+            Message::Command(action) => {
+                self.scroll.borrow_mut().clear();
+                self.send(action);
+            }
             Message::ShowForm(kind) => return self.form(kind),
             Message::FormInput(value) => {
                 if let Some(form) = &mut self.form {
@@ -1725,6 +1786,7 @@ impl Ide {
                 self.input_active(),
                 self.blink_on,
             )
+            .scroll(&self.scroll, self.modifiers, Message::NativeWheel)
             .into()
         } else {
             terminal.into()

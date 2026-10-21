@@ -11,7 +11,8 @@ document model is introduced.
 
 ## Buffer-first defaults
 
-Entering `frost --ide` shows the GUI buffer with Vim's own status/command rows.
+Running `vim` in a Frost local interactive shell, or entering `frost --ide`,
+shows the GUI buffer with Vim's own status/command rows.
 The extra workbench toolbar, buffer strip, status bar, project sidebar and
 build/problem dock are all off by default. They do not reserve empty space or
 construct their hidden widget trees. Directory scanning starts when the project
@@ -22,7 +23,9 @@ configuration contract:
 
 ```toml
 [vim9]
+auto_gui = true
 native_buffer = true
+smooth_scroll = true
 toolbar = false
 buffer_tabs = false
 status_bar = false
@@ -44,6 +47,22 @@ continue to work without the toolbar. Errors appear in a dismissible transient
 overlay if the added status bar is hidden.
 
 ## GUI buffer rendering
+
+Wheel and trackpad events target the Vim split under the pointer without
+changing the active window. Discrete wheel notches request three lines;
+trackpad pixels retain fractional lines using the actual font line height.
+The authenticated bridge scrolls that window, and the GUI eases the resulting
+acknowledged viewport over 100 ms. Old edge rows remain clipped inside their
+own split while new rows enter, so status rows, separators and peer buffers
+stay fixed. Animation follows display redraws and stops at rest. Keyboard
+input, mouse selection, edits, resizing, font changes and compatibility
+fallback settle immediately to Vim's authoritative grid. `smooth_scroll =
+false` disables the easing while retaining precise wheel accumulation.
+
+The current protocol supplies visible rows only: sub-line input accumulates
+until Vim can scroll a whole row, and then its acknowledged view is eased.
+This does not yet provide a speculative fractional viewport or offscreen row
+overscan.
 
 `guifg`, `guibg` and `guisp` are preserved as exact RGB values independently of
 `ctermfg`, ANSI palettes and `termguicolors`. Bold and italic use native font
@@ -92,10 +111,26 @@ overlay at the active GUI cursor.
 ## Launch
 
 ```sh
+vim +42 -- "file with spaces.rs" another.rs
 frost --ide ~/projects/jwm
 frost --ide ~/projects/jwm/src/main.rs
 frost --ide
 ```
+
+Frost prepends a private `vim` shim only to local interactive shell child
+environments. The shell itself performs argument expansion; the shim forwards
+the exact resulting argv and working directory to a dedicated native editor
+process and waits for its exit. `:cq 7` returns status 7 to that shell, and
+commands after `vim` resume only after Vim exits. It does not modify shell
+startup files or the parent process's PATH. Batch/Ex mode, piped input/output
+and remote shells remain ordinary terminal commands. Explicit absolute Vim
+paths and aliases/functions that bypass PATH also retain their shell meaning.
+Set `[vim9] auto_gui = false` before creating a shell to disable this behavior,
+or use `JTERM_VIM9_AUTO_GUI=0 vim file` for one invocation.
+
+Auto-entry opens the existing dedicated Frost GUI editor window. It does not
+replace the editor in the terminal's existing pane. The original shell remains
+available after the editor closes.
 
 The target is optional and defaults to the current directory. A file target
 uses the shared core's project-marker discovery. A new filename is supported
@@ -264,7 +299,9 @@ PTY child-exit event. Unsaved buffers can keep the window open. Save and close
 again, or use `:qa!` in Vim only when explicitly intending to discard changes.
 There is no hidden forced-quit fallback. A disconnected bridge is not evidence
 that Vim has exited: the editor remains accessible for `:write` and `:qa`.
-A nonzero Vim exit retains its last screen and error until you close the window.
+A nonzero Vim exit from an explicit `--ide`/toolbar launch retains its last
+screen and error until you close the window. A shell-origin launch closes on
+every real child exit and returns that exact status to the waiting shell.
 
 The IDE early launch path does not enter `Frost::new`, acquire the terminal
 instance lock, load terminal workspace snapshots or call their persistence
@@ -291,6 +328,17 @@ xvfb-run -a -s '-screen 0 1600x1000x24' python3 scripts/native-vim9-buffer-smoke
 Requires xdotool, ImageMagick and Pillow. The output retains PNG evidence and
 JSON results. X11/software-GPU acceptance does not certify Wayland, physical
 GPU drivers or an interactive IME.
+
+The actual shell round-trip test launches a normal Frost window and types
+`vim +42 -- "first file.txt" "second file.txt"` at its Bash prompt. It verifies
+exact argv/cwd, native RGB, scrolling the inactive split without moving the
+active one, shell blocking, normal exit, a second GUI entry returning `:cq 7`,
+and batch Vim staying in the terminal:
+
+```sh
+xvfb-run -a -s '-screen 0 1600x1000x24' python3 scripts/test-shell-vim-gui.py \
+  --binary target/debug/frost --output /tmp/frost-shell-vim
+```
 
 ```sh
 cargo fmt --all -- --check

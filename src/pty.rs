@@ -794,15 +794,22 @@ mod unix_pty {
                     if let Some(command) = command_cstrings {
                         command
                     } else if let ("jsh", Some(bash_path)) = (shell_name.as_str(), bash_path) {
-                        let exec_cmd =
-                            jterm_core::process::build_jsh_exec_command(&shell_path, session_id);
+                        // Bash sources user startup first; restore the managed
+                        // child PATH immediately before exec so rc files cannot
+                        // accidentally hide native Vim from the jsh prompt.
+                        let mut argv = vec![
+                            CString::new("bash").unwrap(),
+                            CString::new("-ic").unwrap(),
+                            CString::new(jterm_core::vim9::VIM9_SHELL_EXEC).unwrap(),
+                            shell_cstr.clone(),
+                        ];
+                        if let Some(ref sid) = session_id_cstr {
+                            argv.push(session_flag.clone());
+                            argv.push(sid.clone());
+                        }
                         (
                             cstr_or_bail!(bash_path, "bash path contains NUL"),
-                            vec![
-                                CString::new("bash").unwrap(),
-                                CString::new("-ic").unwrap(),
-                                cstr_or_bail!(exec_cmd, "bash wrapper command contains NUL"),
-                            ],
+                            argv,
                         )
                     } else {
                         let mut argv = vec![dash_shell_cstr.clone()];

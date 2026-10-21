@@ -5609,6 +5609,32 @@ impl Session {
         extra_env: &[(&str, &str)],
     ) -> anyhow::Result<Session> {
         let session_id = jsh_session_id(id, command_argv);
+        // Make plain `vim` a native editor in user-owned interactive shells.
+        // Validation/helper argv and explicit child environments keep their
+        // original PATH, and the bridge itself always launches absolute Vim.
+        let native_vim_env = if config.vim9.auto_gui
+            && extra_env.is_empty()
+            && command_argv.is_none_or(jterm_core::vim9::shell_argv_eligible)
+        {
+            std::env::current_exe()
+                .and_then(|exe| jterm_core::vim9::Vim9ShellIntegration::prepare(&exe))
+                .map(|integration| integration.env())
+                .unwrap_or_else(|error| {
+                    log::warn!("Native shell Vim integration unavailable: {error}");
+                    Vec::new()
+                })
+        } else if !config.vim9.auto_gui {
+            // A terminal launched from another managed terminal may inherit
+            // its shim/function; an explicit config opt-out must still win.
+            vec![("JTERM_VIM9_AUTO_GUI".into(), "0".into())]
+        } else {
+            Vec::new()
+        };
+        let child_env: Vec<_> = native_vim_env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .chain(extra_env.iter().copied())
+            .collect();
         let pty = Pty::new_with_cwd_env(
             cols,
             rows,
@@ -5616,7 +5642,7 @@ impl Session {
             session_id.as_deref(),
             config.shell.as_deref(),
             command_argv,
-            extra_env,
+            &child_env,
         )
         .map_err(|error| anyhow::anyhow!("cannot create terminal session: {error}"))?;
         let master_fd = pty.master_fd();

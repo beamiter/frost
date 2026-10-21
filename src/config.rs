@@ -1312,7 +1312,9 @@ mod tests {
             super::Config::default(),
             super::Config::from_toml("").unwrap(),
         ] {
+            assert!(config.vim9.auto_gui);
             assert!(config.vim9.native_buffer);
+            assert!(config.vim9.smooth_scroll);
             assert!(!config.vim9.toolbar);
             assert!(!config.vim9.buffer_tabs);
             assert!(!config.vim9.status_bar);
@@ -1338,6 +1340,15 @@ mod tests {
         let compatible = super::Config::from_toml("[vim9]\nnative_buffer = false\n").unwrap();
         assert!(!compatible.vim9.native_buffer);
         assert!(!compatible.vim9.toolbar);
+        let terminal_only = super::Config::from_toml(
+            "[vim9]\nauto_gui = false\nsmooth_scroll = false\n",
+        )
+        .unwrap();
+        assert!(!terminal_only.vim9.auto_gui);
+        assert!(!terminal_only.vim9.smooth_scroll);
+        assert!(terminal_only.vim9.native_buffer);
+        let reloaded = super::Config::from_toml(&toml::to_string(&terminal_only).unwrap()).unwrap();
+        assert!(!reloaded.vim9.auto_gui && !reloaded.vim9.smooth_scroll);
     }
 
     #[test]
