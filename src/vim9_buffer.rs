@@ -14,9 +14,9 @@ use iced::{
     Size,
 };
 use jterm_core::vim9::{
-    Vim9BufferPosition, Vim9Command, Vim9PixelRect, Vim9PixelScroll, Vim9PointerPhase,
-    Vim9ProjectedRun, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect, Vim9RenderStyle,
-    Vim9Viewport,
+    Vim9BufferPosition, Vim9Command, Vim9CursorBlink, Vim9PixelRect, Vim9PixelScroll,
+    Vim9PointerPhase, Vim9ProjectedRun, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect,
+    Vim9RenderStyle, Vim9Viewport,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -89,6 +89,7 @@ impl PresentedFrame {
 /// IME use the same viewport offset. No second momentum curve is synthesized.
 #[derive(Default)]
 pub(crate) struct ScrollState {
+    cursor_blink: Vim9CursorBlink,
     pixels: BTreeMap<i64, Vim9PixelScroll>,
     pointer: Option<PointerGesture>,
     // A cancelled native press still owns its drag/release tail. Never leak it
@@ -782,6 +783,16 @@ where
             if state.borrow().animating() {
                 shell.request_redraw();
             }
+            if let Some(frame) = self.frame.filter(|f| f.cursor.appearance.is_some()) {
+                let now = std::time::Instant::now();
+                let (_, next) = state
+                    .borrow_mut()
+                    .cursor_blink
+                    .sample(frame, self.focused, now);
+                if let Some(delay) = next {
+                    shell.request_redraw_at(now + delay);
+                }
+            }
             state.borrow_mut().position = cursor.position();
             if matches!(
                 event,
@@ -790,6 +801,7 @@ where
                     | Event::Window(iced::window::Event::Unfocused)
             ) {
                 state.borrow_mut().clear();
+                state.borrow_mut().cursor_blink.reset();
             }
             // Iced asks for IME geometry on RedrawRequested immediately
             // before drawing. Resolve from that same immutable projection;
@@ -910,8 +922,19 @@ where
                     .draw(tree, renderer, theme, style, layout, cursor, &band);
             });
         }
+        let cursor_on = if frame.cursor.appearance.is_some() {
+            self.scroll.is_none_or(|state| {
+                state
+                    .borrow_mut()
+                    .cursor_blink
+                    .sample(frame, self.focused, std::time::Instant::now())
+                    .0
+            })
+        } else {
+            self.blink_on
+        };
         for prepared in views {
-            self.paint_native_view(renderer, frame, &prepared);
+            self.paint_native_view(renderer, frame, &prepared, cursor_on);
         }
         if let Some(state) = self.scroll {
             state.borrow_mut().record_presentation(
@@ -925,11 +948,117 @@ where
 }
 
 impl<Message> NativeBuffer<'_, Message> {
+    fn paint_ink<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        frame: &Vim9RenderFrame,
+        projected: &Vim9ProjectedRun<'_>,
+        view: Rectangle,
+        override_color: Option<Color>,
+    ) where
+        Renderer: text::Renderer<Font = Font>,
+    {
+        let m = self.metrics;
+        let run = projected.run;
+        let area = rectangle(projected.rect);
+        let text_area = Rectangle {
+            x: area.x - m.font_size * 0.25,
+            width: area.width + m.font_size * 0.5,
+            ..area
+        };
+        let Some(run_clip) = text_area.intersection(&view) else {
+            return;
+        };
+        let (fg, _, special) = colors(&run.style, &frame.default_style);
+        let fg = override_color.unwrap_or(fg);
+        let special = override_color.unwrap_or(special);
+        let font = crate::terminal_view::native_editor_glyph_font(
+            self.font,
+            &run.text,
+            run.style.bold,
+            run.style.italic,
+        );
+        let mut draw_text = |content: String, x: f32| {
+            renderer.fill_text(
+                Text {
+                    content,
+                    // iced 0.14's text cache can wrap despite Wrapping::None
+                    // at a finite rounded grid width. Clipping belongs to
+                    // the native run/view, never to the shaping bounds.
+                    bounds: Size::new(f32::INFINITY, m.cell_h),
+                    size: Pixels(m.font_size),
+                    line_height: text::LineHeight::Absolute(Pixels(m.cell_h)),
+                    font,
+                    align_x: text::Alignment::Left,
+                    align_y: iced::alignment::Vertical::Center,
+                    shaping: text::Shaping::Advanced,
+                    wrapping: text::Wrapping::None,
+                },
+                Point::new(x, area.center_y()),
+                fg,
+                run_clip,
+            );
+        };
+        // A legal configured face or its bold/italic fallback need
+        // not have the measured primary advance. Preserve native GUI
+        // glyphs/colors but place ASCII at Vim's authoritative columns.
+        if run.text.is_ascii()
+            && run.text.len() == run.cells
+            && (!m.mono_advance_exact || font != self.font)
+        {
+            for (column, ch) in run.text.chars().enumerate() {
+                draw_text(ch.to_string(), area.x + column as f32 * m.cell_w);
+            }
+        } else {
+            draw_text(run.text.clone(), area.x);
+        }
+        let thickness = (m.font_size / 14.0).clamp(1.0, 2.0);
+        let underline_y = area.y + area.height - thickness * 1.5;
+        if run.style.undercurl {
+            let step = (m.font_size / 5.0).max(2.0);
+            let mut x = area.x;
+            let mut up = true;
+            while x < area.x + area.width {
+                renderer.fill_quad(
+                    quad(Rectangle {
+                        x,
+                        y: underline_y - if up { thickness } else { 0.0 },
+                        width: step.min(area.x + area.width - x),
+                        height: thickness,
+                    }),
+                    Background::Color(special),
+                );
+                x += step;
+                up = !up;
+            }
+        } else if run.style.underline {
+            renderer.fill_quad(
+                quad(Rectangle {
+                    y: underline_y,
+                    height: thickness,
+                    ..area
+                }),
+                Background::Color(special),
+            );
+        }
+        if run.style.strikethrough {
+            renderer.fill_quad(
+                quad(Rectangle {
+                    y: area.center_y(),
+                    height: thickness,
+                    ..area
+                }),
+                Background::Color(special),
+            );
+        }
+    }
+
     fn paint_native_view<Renderer>(
         &self,
         renderer: &mut Renderer,
         frame: &Vim9RenderFrame,
         prepared: &PaintView<'_>,
+        cursor_on: bool,
     ) where
         Renderer: text::Renderer<Font = Font>,
     {
@@ -946,99 +1075,52 @@ impl<Message> NativeBuffer<'_, Message> {
                 renderer.fill_quad(quad(area), Background::Color(bg));
             }
             for projected in &prepared.runs {
-                let run = projected.run;
-                let area = rectangle(projected.rect);
-                let text_area = Rectangle {
-                    x: area.x - m.font_size * 0.25,
-                    width: area.width + m.font_size * 0.5,
-                    ..area
-                };
-                let Some(run_clip) = text_area.intersection(&view) else {
-                    continue;
-                };
-                let (fg, _, special) = colors(&run.style, &frame.default_style);
-                let font = crate::terminal_view::native_editor_glyph_font(
-                    self.font,
-                    &run.text,
-                    run.style.bold,
-                    run.style.italic,
-                );
-                let mut draw_text = |content: String, x: f32| {
-                    renderer.fill_text(
-                        Text {
-                            content,
-                            // iced 0.14's text cache can wrap despite Wrapping::None
-                            // at a finite rounded grid width. Clipping belongs to
-                            // the native run/view, never to the shaping bounds.
-                            bounds: Size::new(f32::INFINITY, m.cell_h),
-                            size: Pixels(m.font_size),
-                            line_height: text::LineHeight::Absolute(Pixels(m.cell_h)),
-                            font,
-                            align_x: text::Alignment::Left,
-                            align_y: iced::alignment::Vertical::Center,
-                            shaping: text::Shaping::Advanced,
-                            wrapping: text::Wrapping::None,
-                        },
-                        Point::new(x, area.center_y()),
-                        fg,
-                        run_clip,
-                    );
-                };
-                // A legal configured face or its bold/italic fallback need
-                // not have the measured primary advance. Preserve native GUI
-                // glyphs/colors but place ASCII at Vim's authoritative columns.
-                if run.text.is_ascii()
-                    && run.text.len() == run.cells
-                    && (!m.mono_advance_exact || font != self.font)
-                {
-                    for (column, ch) in run.text.chars().enumerate() {
-                        draw_text(ch.to_string(), area.x + column as f32 * m.cell_w);
-                    }
-                } else {
-                    draw_text(run.text.clone(), area.x);
-                }
-                let thickness = (m.font_size / 14.0).clamp(1.0, 2.0);
-                let underline_y = area.y + area.height - thickness * 1.5;
-                if run.style.undercurl {
-                    let step = (m.font_size / 5.0).max(2.0);
-                    let mut x = area.x;
-                    let mut up = true;
-                    while x < area.x + area.width {
-                        renderer.fill_quad(
-                            quad(Rectangle {
-                                x,
-                                y: underline_y - if up { thickness } else { 0.0 },
-                                width: step.min(area.x + area.width - x),
-                                height: thickness,
-                            }),
-                            Background::Color(special),
-                        );
-                        x += step;
-                        up = !up;
-                    }
-                } else if run.style.underline {
-                    renderer.fill_quad(
-                        quad(Rectangle {
-                            y: underline_y,
-                            height: thickness,
-                            ..area
-                        }),
-                        Background::Color(special),
-                    );
-                }
-                if run.style.strikethrough {
-                    renderer.fill_quad(
-                        quad(Rectangle {
-                            y: area.center_y(),
-                            height: thickness,
-                            ..area
-                        }),
-                        Background::Color(special),
-                    );
-                }
+                self.paint_ink(renderer, frame, projected, view, None);
             }
-            if let Some(cursor) = prepared.cursor.filter(|_| !self.focused || self.blink_on) {
-                if self.focused && frame.mode.starts_with('i') {
+            if let Some(cursor) = prepared.cursor.filter(|_| !self.focused || cursor_on) {
+                if let Some(appearance) = &frame.cursor.appearance {
+                    let under = prepared
+                        .runs
+                        .iter()
+                        .find(|p| rectangle(p.rect).contains(cursor.center()))
+                        .map_or(&frame.default_style, |p| &p.run.style);
+                    let (fg, bg) = appearance.colors(under, &frame.default_style);
+                    if !self.focused {
+                        renderer.fill_quad(
+                            Quad {
+                                bounds: cursor,
+                                border: iced::Border {
+                                    color: rgb(bg),
+                                    width: 1.0,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                            Background::Color(Color::TRANSPARENT),
+                        );
+                    } else {
+                        let caret = rectangle(appearance.paint_rect(
+                            Vim9PixelRect {
+                                x: cursor.x,
+                                y: cursor.y,
+                                width: cursor.width,
+                                height: cursor.height,
+                            },
+                            m.cell_w,
+                            1.0,
+                        ));
+                        renderer.fill_quad(quad(caret), Background::Color(rgb(bg)));
+                        renderer.with_layer(caret, |renderer| {
+                            for projected in prepared
+                                .runs
+                                .iter()
+                                .filter(|p| rectangle(p.rect).intersects(&caret))
+                            {
+                                self.paint_ink(renderer, frame, projected, caret, Some(rgb(fg)));
+                            }
+                        });
+                    }
+                } else if self.focused && frame.mode.starts_with('i') {
                     renderer.fill_quad(
                         quad(Rectangle {
                             width: 2.0,
@@ -1157,6 +1239,7 @@ mod tests {
             ..Default::default()
         });
         frame.windows[1].cursor = jterm_core::vim9::Vim9RenderCursor {
+            appearance: None,
             row: 2,
             column: 42,
             width: 1,
