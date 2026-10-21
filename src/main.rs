@@ -4632,6 +4632,8 @@ fn main() -> iced::Result {
 
 #[derive(Debug, Clone)]
 enum Message {
+    PollShellVim,
+    EmbeddedVim(usize, Box<vim9_ide::Message>),
     OpenVim9Ide,
     /// Observe an Enter already consumed by a widget, without repeating its action.
     CapturedEnterPress(iced::window::Id, keyboard::Event),
@@ -6678,6 +6680,7 @@ fn overlay_release_disposition(
 }
 
 struct Frost {
+    vim9_tabs: std::collections::HashMap<usize, vim9_ide::Ide>,
     config: Config,
     terminal_interaction_mode: config::TerminalMode,
     terminal_interaction_epoch: u64,
@@ -7073,6 +7076,7 @@ impl Frost {
         let sidebar_open = side_tabs;
 
         let mut app = Frost {
+            vim9_tabs: Default::default(),
             terminal_interaction_mode: config.effective_terminal_mode(),
             terminal_interaction_epoch: 0,
             terminal_pane_owners: None,
@@ -7722,7 +7726,11 @@ impl Frost {
     }
 
     fn terminal_input_active(&self) -> bool {
-        !self.search.is_open
+        !self
+            .sessions
+            .get(self.active)
+            .is_some_and(|s| self.vim9_tabs.contains_key(&s.id))
+            && !self.search.is_open
             && !self.search_replace.is_open
             && !self.palette.is_open
             && !self.ai_chats.is_open
@@ -9717,6 +9725,13 @@ impl Frost {
     }
 
     fn close_session(&mut self, index: usize) -> Task<Message> {
+        if let Some(id) = self.sessions.get(index).map(|s| s.id) {
+            if let Some(editor) = self.vim9_tabs.get_mut(&id) {
+                return editor
+                    .close()
+                    .map(move |message| Message::EmbeddedVim(id, Box::new(message)));
+            }
+        }
         if index >= self.sessions.len() {
             return Task::none();
         }
@@ -9915,6 +9930,14 @@ impl Frost {
     /// The user can inspect and close that tab explicitly, which uses the normal
     /// per-process confirmation flow instead of silently terminating work.
     fn request_window_close(&mut self) -> Task<Message> {
+        if !self.vim9_tabs.is_empty() {
+            return Task::batch(self.vim9_tabs.iter_mut().map(|(id, editor)| {
+                let id = *id;
+                editor
+                    .close()
+                    .map(move |message| Message::EmbeddedVim(id, Box::new(message)))
+            }));
+        }
         if let Some((index, process)) = (0..self.sessions.len())
             .find_map(|index| self.busy_session_name(index).map(|name| (index, name)))
         {
@@ -16000,10 +16023,29 @@ impl Frost {
         // message, not after an Iced message batch or a widget tree redraw.
         self.sync_terminal_pane_owners();
         self.sync_terminal_ime_owner();
+        let active = self.sessions.get(self.active).map(|s| s.id);
+        for (id, editor) in &mut self.vim9_tabs {
+            editor.focus_embedded(self.focused && active == Some(*id));
+        }
         Task::batch([task, self.dispatch_block_search_work()])
     }
 
     fn update_message(&mut self, message: Message) -> Task<Message> {
+        let editor_active = self
+            .sessions
+            .get(self.active)
+            .is_some_and(|s| self.vim9_tabs.contains_key(&s.id));
+        if editor_active
+            && matches!(
+                &message,
+                Message::WindowKey(..)
+                    | Message::CapturedEnterPress(..)
+                    | Message::Ime(..)
+                    | Message::ImeCancelledCommit
+            )
+        {
+            return Task::none();
+        }
         // Defer focus operations until normal viewport/cache bookkeeping finishes.
         let mut post_update_task = Task::none();
         // Reject output provenance before generic synchronization can touch Watch.
@@ -16034,6 +16076,76 @@ impl Frost {
             self.sync_organism_watch();
         }
         match message {
+            Message::PollShellVim => {
+                let mut tasks = Vec::new();
+                for invocation in jterm_core::vim9::take_shell_vim_requests() {
+                    let Some(index) = self
+                        .sessions
+                        .iter()
+                        .position(|s| invocation.matches_pty(s.master_fd))
+                    else {
+                        continue;
+                    };
+                    let id = self.sessions[index].id;
+                    if self.vim9_tabs.contains_key(&id) {
+                        continue;
+                    }
+                    let (editor, task) = vim9_ide::Ide::embedded(
+                        invocation,
+                        self.config.clone(),
+                        self.native_enter_ownership.clone(),
+                        self.win_size,
+                    );
+                    if !editor.finished() {
+                        self.vim9_tabs.insert(id, editor);
+                        self.focus_session(index);
+                        tasks.push(
+                            task.map(move |message| Message::EmbeddedVim(id, Box::new(message))),
+                        );
+                    }
+                }
+                return Task::batch(tasks);
+            }
+            Message::EmbeddedVim(id, message) => {
+                // Keep configurable workspace tab shortcuts while Vim owns
+                // editing keys. Only the active editor can dispatch them.
+                if self.sessions.get(self.active).is_some_and(|s| s.id == id) {
+                    if let vim9_ide::Message::Keyboard(
+                        _,
+                        keyboard::Event::KeyPressed { key, modifiers, .. },
+                        false,
+                    ) = message.as_ref()
+                    {
+                        if let Some(command) =
+                            resolve_keybinding_command(&self.keybindings, key, *modifiers)
+                        {
+                            use keybindings::Command as C;
+                            if matches!(
+                                command,
+                                C::SessionNew
+                                    | C::SessionClose
+                                    | C::SessionNext
+                                    | C::SessionPrev
+                                    | C::SessionJump(_)
+                                    | C::SessionLast
+                                    | C::TerminalClosePane
+                                    | C::WindowClose
+                            ) {
+                                return self.dispatch_command(command).unwrap_or_else(Task::none);
+                            }
+                        }
+                    }
+                }
+                if let Some(editor) = self.vim9_tabs.get_mut(&id) {
+                    let task = editor
+                        .update(*message)
+                        .map(move |message| Message::EmbeddedVim(id, Box::new(message)));
+                    if editor.finished() {
+                        self.vim9_tabs.remove(&id);
+                    }
+                    return task;
+                }
+            }
             Message::OpenVim9Ide => {
                 if let Some(request) = vim9_ide::entry_from_terminal(self) {
                     vim9_ide::open_from_terminal(self, request);
@@ -24862,6 +24974,12 @@ impl Frost {
     /// cells, selection, search, links, image placement and pointer routing.
     fn pane_view(&self, sess_idx: usize) -> Element<'_, Message> {
         let sess = &self.sessions[sess_idx];
+        if let Some(editor) = self.vim9_tabs.get(&sess.id) {
+            let id = sess.id;
+            return editor
+                .embedded_view()
+                .map(move |message| Message::EmbeddedVim(id, Box::new(message)));
+        }
         let session_id = sess.id;
         let is_active = sess_idx == self.active;
         // An open overlay input owns the keyboard and IME, so the terminal pane
@@ -31282,6 +31400,18 @@ impl Frost {
                 })
             })
             .collect();
+        subs.push(
+            iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::PollShellVim),
+        );
+        for (id, editor) in &self.vim9_tabs {
+            let id = *id;
+            subs.push(
+                editor
+                    .subscription()
+                    .with(id)
+                    .map(|(id, message)| Message::EmbeddedVim(id, Box::new(message))),
+            );
+        }
         let events = iced::event::listen_with(|event, status, id| match event {
             iced::Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
                 Some(Message::ModifiersChanged(m))

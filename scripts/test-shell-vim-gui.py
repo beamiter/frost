@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise a real Frost shell -> native Vim -> original shell round trip.
+"""Exercise a real shell -> native Vim in the same GUI -> original shell round trip.
 
 Use under Xvfb with --binary and an unused --output directory. Requires
 xdotool, ImageMagick import, Pillow and Vim 9. No installed config is changed.
@@ -16,19 +16,31 @@ from PIL import Image
 
 
 def main():
+    os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True, type=Path)
+    parser.add_argument('--frontend', choices=('frost', 'forge', 'anvil'), default='frost')
+    parser.add_argument('--terminal-mode', choices=('normal', 'vte', 'block'), default=None)
     parser.add_argument('--output', required=True, type=Path)
     args = parser.parse_args()
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     for name in ('config', 'state', 'cache', 'data', 'runtime', 'project'):
         (out / name).mkdir(mode=0o700)
-    (out / 'config' / 'frost').mkdir()
-    (out / 'config' / 'frost' / 'config.toml').write_text(
+    frontend = args.frontend
+    terminal_mode = args.terminal_mode or ('normal' if frontend == 'frost' else 'vte')
+    (out / 'config' / frontend).mkdir()
+    configuration = (
         'font_size = 18.0\ninitial_width = 1200.0\ninitial_height = 800.0\n'
-        'terminal_mode = "normal"\nrestore_session = false\nshell = "/bin/bash"\n'
-        'ascii_organism_enabled = false\n', encoding='utf-8')
+        'restore_session = false\n'
+        if frontend == 'frost' else
+        'font = "Monospace 14"\nopacity = 1.0\ntab_placement = "top"\nsidebar_visible = false\n'
+    )
+    configuration += (
+        f'terminal_mode = "{terminal_mode}"\nshell = "/bin/bash"\n'
+        'ascii_organism_enabled = false\njsh_update_check = "never"\n'
+    )
+    (out / 'config' / frontend / 'config.toml').write_text(configuration, encoding='utf-8')
     first = out / 'project' / 'first file.txt'
     second = out / 'project' / 'second file.txt'
     original = ''.join(f'GUI_ROW_{number:04d} Unicode 界 e\u0301\n' for number in range(1, 181))
@@ -108,16 +120,18 @@ def main():
 
     try:
         terminal = wait(lambda: xdo('search', '--onlyvisible', '--pid', app.pid),
-                        'ordinary Frost terminal').splitlines()[0]
+                        'ordinary terminal').splitlines()[0]
+        xdo('windowsize', '--sync', terminal, 1200, 800)
         xdo('windowfocus', '--sync', terminal)
         time.sleep(0.3)
         # A real prompt executes the command. Neither --ide nor the internal
         # frontend route is passed by this test.
         status_file = out / 'exit-zero'
-        type_command('vim +42 -- ' + shlex.quote(first.name) + ' ' + shlex.quote(second.name)
+        type_command('cd ' + shlex.quote(str(out / 'project')) + '; vim +42 -- ' + shlex.quote(first.name) + ' ' + shlex.quote(second.name)
                      + '; printf "%s" "$?" > ' + shlex.quote(str(status_file)))
-        editor = wait(lambda: xdo('search', '--onlyvisible', '--name', '^Frost - Vim9 IDE$'),
-                      'automatic GUI editor').splitlines()[0]
+        editor = terminal
+        wait(lambda: state().get('line') == 42, 'editor in original tab')
+        assert xdo('search', '--onlyvisible', '--pid', app.pid).splitlines() == [terminal]
         xdo('windowfocus', '--sync', editor)
         initial = wait(lambda: state() if state().get('line') == 42 else None, 'literal +line argument')
         assert initial['cwd'] == str(out / 'project')
@@ -151,19 +165,31 @@ def main():
         report['inactive_split_scroll'] = scrolled
         report['scrolled_rgb_pixels'] = wait(lambda: native_pixels(editor, 'shell-scrolled'), 'scrolled GUI RGB')
         xdo('windowfocus', '--sync', editor)
+        vim_command("call setline(1, 'GUI_UNSAVED_CHANGE')")
+        wait(lambda: state().get('modified'), 'modified buffer')
+        vim_command('qa')
+        time.sleep(0.25)
+        assert not status_file.exists(), 'refused quit must keep shell waiting'
+        assert state().get('modified'), 'refused quit must retain edits'
+        vim_command('write')
+        wait(lambda: first.read_text().startswith('GUI_UNSAVED_CHANGE'), 'saved edit')
+        report['unsaved_quit_protected'] = True
         vim_command('qa')
         wait(lambda: status_file.exists(), 'return to original shell')
         assert status_file.read_text() == '0'
         assert app.poll() is None, 'original terminal must remain alive'
         report['shell_return_zero'] = True
+        report['same_gui_window'] = True
+        report['frontend'] = frontend
+        report['terminal_mode'] = terminal_mode
         # A second entry validates that previous GUI authority was retired and
         # that a nonzero :cquit result reaches the original shell unchanged.
         xdo('windowfocus', '--sync', terminal)
         status_nonzero = out / 'exit-seven'
         type_command('vim -- ' + shlex.quote(first.name) + '; printf "%s" "$?" > '
                      + shlex.quote(str(status_nonzero)))
-        editor = wait(lambda: xdo('search', '--onlyvisible', '--name', '^Frost - Vim9 IDE$'),
-                      'second GUI entry').splitlines()[0]
+        editor = terminal
+        wait(lambda: not status_nonzero.exists() and state().get('line') == 1, 'second editor in original tab')
         xdo('windowfocus', '--sync', editor)
         wait(lambda: native_pixels(editor, 'second-entry') > 30, 'second GUI attached')
         vim_command('cq 7')
@@ -176,7 +202,7 @@ def main():
                      + shlex.quote(str(batch_status)))
         wait(lambda: batch_status.exists(), 'batch Vim remains terminal command')
         assert batch_status.read_text() == '0'
-        assert not xdo('search', '--onlyvisible', '--name', '^Frost - Vim9 IDE$')
+        assert xdo('search', '--onlyvisible', '--pid', app.pid).splitlines() == [terminal]
         report['batch_vim_no_gui'] = True
         (out / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
         print(json.dumps(report, indent=2))

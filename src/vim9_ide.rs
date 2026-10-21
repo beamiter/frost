@@ -1,8 +1,8 @@
 //! Real Vim with an independent GUI buffer surface and a typed IDE workbench.
 //!
-//! This application is deliberately separate from `Frost::new`: it never takes
-//! the terminal instance lock, restores shell tabs, or persists editor argv.
-//! In particular, an authenticated bridge disconnect is NOT a child exit.
+//! Standalone IDE startup never takes the terminal instance lock, restores
+//! shell tabs, or persists editor argv. Managed shell entry embeds the same
+//! editor in its source pane. Bridge disconnection is not a child exit.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -115,6 +115,13 @@ fn target_from_args(args: &[OsString]) -> Result<Option<PathBuf>, String> {
 
 pub(super) fn run_if_requested() -> Option<iced::Result> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let Some(result) = vim9::forward_shell_vim(&args) {
+        let status = result.unwrap_or_else(|error| {
+            eprintln!("frost: {error}");
+            1
+        });
+        std::process::exit(status);
+    }
     let entry_request = match vim9::shell_vim_request(&args).and_then(|request| match request {
         Some(request) => Ok(Some(request)),
         None => target_from_args(&args).map(|target| target.map(Vim9EntryRequest::command_line)),
@@ -247,7 +254,7 @@ pub(super) fn open_from_terminal(app: &mut super::Frost, request: Vim9EntryReque
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FormKind {
+pub(super) enum FormKind {
     QuickOpen,
     Goto,
     Open,
@@ -289,7 +296,7 @@ struct Form {
 }
 
 #[derive(Debug, Clone)]
-enum Message {
+pub(super) enum Message {
     Terminal(Box<super::Message>),
     Tick,
     RenderFrame {
@@ -303,6 +310,7 @@ enum Message {
     CancelledCommit,
     Focus(bool),
     Resize(Size),
+    WindowResize(Size),
     Close,
     NativeWheel(crate::vim9_buffer::NativeWheel),
     NativeMouse(crate::vim9_buffer::NativeInput),
@@ -328,7 +336,9 @@ enum Message {
     DismissError,
 }
 
-struct Ide {
+pub(super) struct Ide {
+    embedded: bool,
+    completion: Option<vim9::Vim9ShellCompletion>,
     config: Config,
     theme: Theme,
     metrics: Metrics,
@@ -588,6 +598,47 @@ fn editor_session(editor: &Vim9Session, config: &Config, clean: bool) -> anyhow:
 }
 
 impl Ide {
+    pub(super) fn embedded(
+        invocation: vim9::Vim9ShellInvocation,
+        mut config: Config,
+        native: native_enter::SharedOwnership,
+        size: Size,
+    ) -> (Self, Task<Message>) {
+        config.block_mode = false;
+        config.terminal_mode = Some(config::TerminalMode::Normal);
+        config.disable_alt_screen = false;
+        config.ascii_organism_enabled = false;
+        let (mut editor, task) = Self::new(invocation.request, config, None, native, size, None);
+        editor.embedded = true;
+        editor.completion = Some(invocation.completion);
+        if editor.session.is_none() {
+            editor.child_exited = true;
+            editor.completion.take().unwrap().finish(1);
+        }
+        (editor, task)
+    }
+
+    pub(super) fn finished(&self) -> bool {
+        self.child_exited
+    }
+
+    pub(super) fn focus_embedded(&mut self, focused: bool) {
+        if focused != self.focused {
+            self.focused = focused;
+            self.retire_gestures();
+            self.scroll.borrow_mut().clear();
+            self.invalidate_input();
+            self.sync_ime();
+        }
+    }
+
+    pub(super) fn embedded_view(&self) -> Element<'_, Message> {
+        iced::widget::sensor(self.view())
+            .on_show(Message::Resize)
+            .on_resize(Message::Resize)
+            .into()
+    }
+
     fn new(
         request: Vim9EntryRequest,
         config: Config,
@@ -634,6 +685,8 @@ impl Ide {
         let files_open = config.vim9.project_panel;
         let dock_open = config.vim9.tool_panel;
         let mut state = Self {
+            embedded: false,
+            completion: None,
             config,
             theme,
             metrics,
@@ -853,13 +906,17 @@ impl Ide {
         }
     }
 
-    fn close(&mut self) -> Task<Message> {
+    pub(super) fn close(&mut self) -> Task<Message> {
         if self.session.is_none() || self.child_exited {
             if let Some(editor) = self.editor.take() {
                 editor.revoke();
             }
             self.render_frame = None;
-            return iced::exit();
+            return if self.embedded {
+                Task::none()
+            } else {
+                iced::exit()
+            };
         }
         self.send(Vim9Command::Quit);
         if !self.snapshot.connected {
@@ -1084,7 +1141,7 @@ impl Ide {
         )
     }
 
-    fn update(&mut self, message: Message) -> Task<Message> {
+    pub(super) fn update(&mut self, message: Message) -> Task<Message> {
         self.sync_ime();
         let task = self.reduce(message);
         self.sync_ime();
@@ -1170,6 +1227,9 @@ impl Ide {
                         .is_some_and(|s| s.id == id && s.master_fd == fd) =>
                 {
                     self.child_exited = true;
+                    if let Some(completion) = self.completion.take() {
+                        completion.finish(status);
+                    }
                     if let Some(shell_status) = &self.shell_status {
                         shell_status
                             .store(status.clamp(0, 255), std::sync::atomic::Ordering::Relaxed);
@@ -1183,6 +1243,9 @@ impl Ide {
                     self.snapshot = Vim9Snapshot::default();
                     self.form = None;
                     self.invalidate_input();
+                    if self.embedded {
+                        return Task::none();
+                    }
                     if status == 0 || self.shell_status.is_some() {
                         return iced::exit();
                     }
@@ -1229,7 +1292,8 @@ impl Ide {
                 self.focused = focused;
                 self.invalidate_input();
             }
-            Message::Resize(size) => {
+            Message::WindowResize(_) if self.embedded => {}
+            Message::Resize(size) | Message::WindowResize(size) => {
                 self.size = size;
                 self.resize();
             }
@@ -1681,35 +1745,39 @@ impl Ide {
         Task::none()
     }
 
-    fn subscription(&self) -> Subscription<Message> {
-        let mut subscriptions = vec![
-            iced::event::listen_with(|event, status, id| match event {
-                iced::Event::Keyboard(keyboard::Event::ModifiersChanged(value)) => {
-                    Some(Message::Modifiers(value))
-                }
-                iced::Event::Keyboard(event) => Some(Message::Keyboard(
-                    id,
-                    event,
-                    status == iced::event::Status::Captured,
-                )),
-                iced::Event::InputMethod(input_method::Event::Commit(_))
-                    if status == iced::event::Status::Captured =>
-                {
-                    Some(Message::CancelledCommit)
-                }
-                iced::Event::InputMethod(_) if status == iced::event::Status::Captured => None,
-                iced::Event::InputMethod(event) => Some(Message::Ime(event)),
-                iced::Event::Window(iced::window::Event::Resized(size)) => {
-                    Some(Message::Resize(size))
-                }
-                iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
-                iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
-                iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::Close),
-                _ => None,
-            }),
-            iced::time::every(Duration::from_millis(if self.focused { 80 } else { 250 }))
-                .map(|_| Message::Tick),
-        ];
+    pub(super) fn subscription(&self) -> Subscription<Message> {
+        let events = iced::event::listen_with(|event, status, id| match event {
+            iced::Event::Keyboard(keyboard::Event::ModifiersChanged(value)) => {
+                Some(Message::Modifiers(value))
+            }
+            iced::Event::Keyboard(event) => Some(Message::Keyboard(
+                id,
+                event,
+                status == iced::event::Status::Captured,
+            )),
+            iced::Event::InputMethod(input_method::Event::Commit(_))
+                if status == iced::event::Status::Captured =>
+            {
+                Some(Message::CancelledCommit)
+            }
+            iced::Event::InputMethod(_) if status == iced::event::Status::Captured => None,
+            iced::Event::InputMethod(event) => Some(Message::Ime(event)),
+            iced::Event::Window(iced::window::Event::Resized(size)) => {
+                Some(Message::WindowResize(size))
+            }
+            iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
+            iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
+            iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::Close),
+            _ => None,
+        });
+        let mut subscriptions =
+            vec![
+                iced::time::every(Duration::from_millis(if self.focused { 80 } else { 250 }))
+                    .map(|_| Message::Tick),
+            ];
+        if !self.embedded || self.focused {
+            subscriptions.push(events);
+        }
         if self.config.vim9.native_buffer {
             if let (Some(editor), Some(session)) = (&self.editor, &self.session) {
                 subscriptions.push(Subscription::run_with(
