@@ -599,7 +599,11 @@ fn colors(style: &Vim9RenderStyle, normal: &Vim9RenderStyle) -> (Color, Color, C
     if style.reverse {
         std::mem::swap(&mut fg, &mut bg);
     }
-    (fg, bg, style.special.map(rgb).unwrap_or(fg))
+    (
+        fg,
+        bg,
+        style.special.or(normal.special).map(rgb).unwrap_or(fg),
+    )
 }
 
 fn quad(bounds: Rectangle) -> Quad {
@@ -607,6 +611,54 @@ fn quad(bounds: Rectangle) -> Quad {
         bounds,
         ..Quad::default()
     }
+}
+
+/// Keep decoration outside Vim's content geometry and inside the editor.
+/// The final border overlays the original rectangle, including when clipped.
+fn paint_completion_surface<Renderer: renderer::Renderer>(
+    renderer: &mut Renderer,
+    view: Rectangle,
+    editor_clip: Rectangle,
+    foreground: Color,
+    paint_content: impl FnOnce(&mut Renderer, Rectangle),
+) {
+    let Some(clip) = view.intersection(&editor_clip) else {
+        return;
+    };
+    renderer.with_layer(editor_clip, |renderer| {
+        for (spread, alpha) in [(4.0, 4.0), (3.0, 5.0), (2.0, 7.0), (1.0, 10.0)] {
+            renderer.fill_quad(
+                quad(Rectangle {
+                    x: view.x - spread,
+                    y: view.y - spread,
+                    width: view.width + spread * 2.0,
+                    height: view.height + spread * 2.0,
+                }),
+                Background::Color(Color {
+                    a: alpha / 255.0,
+                    ..Color::BLACK
+                }),
+            );
+        }
+        renderer.with_layer(clip, |renderer| {
+            paint_content(renderer, clip);
+            renderer.fill_quad(
+                Quad {
+                    bounds: view,
+                    border: iced::Border {
+                        color: Color {
+                            a: foreground.a * 0.20,
+                            ..foreground
+                        },
+                        width: 1.0,
+                        ..Default::default()
+                    },
+                    ..Quad::default()
+                },
+                Background::Color(Color::TRANSPARENT),
+            );
+        });
+    });
 }
 
 fn rectangle(rect: Vim9PixelRect) -> Rectangle {
@@ -1096,11 +1148,8 @@ impl<Message> NativeBuffer<'_, Message> {
         let Some(view) = metrics.rect(&menu.view).map(rectangle) else {
             return;
         };
-        let Some(clip) = view.intersection(&editor_clip) else {
-            return;
-        };
-        let (_, background, _) = colors(&menu.default_style, &frame.default_style);
-        renderer.with_layer(clip, |renderer| {
+        let (foreground, background, _) = colors(&menu.default_style, &frame.default_style);
+        paint_completion_surface(renderer, view, editor_clip, foreground, |renderer, clip| {
             renderer.fill_quad(quad(view), Background::Color(background));
             let runs: Vec<_> = menu
                 .runs
@@ -1261,6 +1310,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct CompletionRecorder {
+        clips: Vec<Rectangle>,
+        quads: Vec<(Quad, Background, Rectangle)>,
+    }
+
+    impl renderer::Renderer for CompletionRecorder {
+        fn start_layer(&mut self, bounds: Rectangle) {
+            self.clips.push(bounds);
+        }
+        fn end_layer(&mut self) {
+            self.clips.pop().unwrap();
+        }
+        fn start_transformation(&mut self, _: iced::Transformation) {}
+        fn end_transformation(&mut self) {}
+        fn fill_quad(&mut self, quad: Quad, background: impl Into<Background>) {
+            self.quads
+                .push((quad, background.into(), *self.clips.last().unwrap()));
+        }
+        fn reset(&mut self, _: Rectangle) {}
+        fn allocate_image(
+            &mut self,
+            _: &iced::advanced::image::Handle,
+            callback: impl FnOnce(Result<iced::advanced::image::Allocation, iced::advanced::image::Error>)
+                + Send
+                + 'static,
+        ) {
+            callback(Err(iced::advanced::image::Error::Unsupported));
+        }
+    }
 
     fn split_frame() -> Vim9RenderFrame {
         serde_json::from_value(serde_json::json!({
@@ -2295,6 +2375,7 @@ mod tests {
         let normal = Vim9RenderStyle {
             foreground: Some(0x142536),
             background: Some(0x102030),
+            special: Some(0xc78d53),
             ..Default::default()
         };
         let mut style = Vim9RenderStyle {
@@ -2311,6 +2392,107 @@ mod tests {
             colors(&style, &normal),
             (rgb(0x102030), rgb(0x19c3a7), rgb(0xe83967))
         );
+        style.special = None;
+        assert_eq!(colors(&style, &normal).2, rgb(0xc78d53));
+        assert_eq!(
+            colors(&style, &Vim9RenderStyle::default()).2,
+            colors(&style, &Vim9RenderStyle::default()).0
+        );
+    }
+
+    #[test]
+    fn completion_elevation_preserves_vim_bounds_colors_and_paint_order() {
+        use renderer::Renderer as _;
+
+        let view = Rectangle {
+            x: 12.25,
+            y: 14.5,
+            width: 48.5,
+            height: 30.25,
+        };
+        let foreground = rgb(0xd8e2ef);
+        let background = rgb(0x183047);
+        let editor = Rectangle {
+            x: 10.0,
+            y: 10.0,
+            width: 80.0,
+            height: 60.0,
+        };
+        for editor_clip in [
+            editor,
+            Rectangle {
+                width: 40.0,
+                height: 25.0,
+                ..editor
+            },
+        ] {
+            let mut recorder = CompletionRecorder::default();
+            let content_clip = view.intersection(&editor_clip).unwrap();
+            paint_completion_surface(
+                &mut recorder,
+                view,
+                editor_clip,
+                foreground,
+                |renderer, clip| {
+                    assert_eq!(clip, content_clip);
+                    renderer.fill_quad(quad(view), Background::Color(background));
+                },
+            );
+            assert!(recorder.clips.is_empty());
+            assert_eq!(recorder.quads.len(), 6);
+            let (outer_shadow, shadow_color, shadow_clip) = recorder.quads[0];
+            assert_eq!(
+                outer_shadow.bounds,
+                Rectangle {
+                    x: view.x - 4.0,
+                    y: view.y - 4.0,
+                    width: view.width + 8.0,
+                    height: view.height + 8.0,
+                }
+            );
+            assert_eq!(shadow_clip, editor_clip);
+            assert_eq!(
+                shadow_color,
+                Background::Color(Color {
+                    a: 4.0 / 255.0,
+                    ..Color::BLACK
+                })
+            );
+            assert!(recorder.quads[..4]
+                .iter()
+                .all(|(_, _, clip)| *clip == editor_clip));
+            let (content, content_color, clip) = recorder.quads[4];
+            assert_eq!(
+                content.bounds, view,
+                "decoration must not move Vim's content"
+            );
+            assert_eq!(content_color, Background::Color(background));
+            assert_eq!(clip, content_clip);
+            let (border, fill, clip) = recorder.quads[5];
+            assert_eq!(
+                border.bounds, view,
+                "clipping must not introduce a new border edge"
+            );
+            assert_eq!(border.border.width, 1.0);
+            assert_eq!(
+                border.border.color,
+                Color {
+                    a: 0.20,
+                    ..foreground
+                }
+            );
+            assert_eq!(fill, Background::Color(Color::TRANSPARENT));
+            assert_eq!(clip, content_clip);
+        }
+        let mut recorder = CompletionRecorder::default();
+        paint_completion_surface(
+            &mut recorder,
+            view,
+            Rectangle::with_size(Size::new(4.0, 4.0)),
+            foreground,
+            |_, _| panic!("offscreen completion must not paint"),
+        );
+        assert!(recorder.quads.is_empty());
     }
     #[test]
     fn terminal_bands_never_cover_native_buffer() {

@@ -528,6 +528,12 @@ kind/menu labels, CJK and combining characters use the existing native glyph
 path. The menu keeps Vim's screen geometry and padding and can cross split
 separators without being clipped to one editing pane.
 
+The native menu adds a subtle four-pixel shadow clipped to the editor and a
+one-pixel inside outline derived from its GUI foreground. These decorations
+keep Vim's content rectangle, row backgrounds, padding and input geometry.
+Underline and undercurl colors also inherit `Normal`'s `guisp` when a run has
+no explicit special color, matching the other three frontends.
+
 Vim still owns candidate generation and keyboard/mouse behavior. Ctrl-N/P
 select, Ctrl-Y accepts and Ctrl-E cancels through the original PTY; the menu
 never takes keyboard or IME focus. Its appearance cancels old buffer scroll
