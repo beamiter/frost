@@ -17,7 +17,8 @@ categories = ["command-line-utilities"]
 iced = { version = "0.14", features = ["canvas", "tokio", "advanced", "image", "wgpu"] }
 # Direct handle on the shaper iced embeds (same locked version), used to
 # measure the primary font's real advance for the terminal grid.
-cosmic-text = "0.19"
+# Upgrade only together with iced_graphics, iced_tiny_skia and cryoglyph.
+cosmic-text = "=0.19.0"
 # Exact native boundary paired with the pinned local Iced shell patch.
 iced_winit = { version = "=0.14.0", default-features = false }
 libc = "0.2"
@@ -59,6 +60,8 @@ opt-level = 3
 # cryoglyph 0.1.0 requires the unsound lru 0.16 line. This Rust-source-identical
 # local copy changes only that dependency to the RustSec-fixed 0.18.2 release.
 [patch.crates-io]
+iced_graphics = { path = "vendor/iced_graphics" }
+iced_tiny_skia = { path = "vendor/iced_tiny_skia" }
 # X11 legacy wheel release must not emit a second scroll notch.
 winit = { path = "vendor/winit" }
 cryoglyph = { path = "vendor/cryoglyph" }
