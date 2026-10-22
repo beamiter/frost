@@ -3636,6 +3636,99 @@ mod tests {
     }
 
     #[test]
+    fn virtual_text_repaints_without_a_source_edit_and_keeps_split_geometry() {
+        let mut frame = direct_frame();
+        frame.cursor.visible = false;
+        for window in &mut frame.windows {
+            window.cursor.visible = false;
+        }
+        let source = frame.runs.clone();
+        for (column, text, cells) in [(6, "参", 2), (8, "e\u{301}", 1)] {
+            frame.runs.push(jterm_core::vim9::Vim9RenderRun {
+                window: 10,
+                row: 1,
+                column,
+                text: text.into(),
+                cells,
+                style: Vim9RenderStyle {
+                    foreground: Some(0x19c3a7),
+                    background: Some(0x563412),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        let mut terminal = crate::terminal::TerminalState::new(80, 20);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = crate::Theme::default();
+        let mut metrics = Metrics::new(14.0, 1.0, 0.0, false);
+        metrics.cell_w = 8.0;
+        metrics.cell_h = 20.0;
+        let input: TermWidget<'_, ()> = TermWidget::new(
+            projection.cells(),
+            (2, 42),
+            true,
+            crate::terminal::CursorShape::Block,
+            true,
+            &theme,
+            metrics,
+            Font::MONOSPACE,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            0,
+            0,
+        );
+        let widget = NativeBuffer::new(input, None, metrics, Font::MONOSPACE, true, true);
+        let editor = Rectangle::with_size(Size::new(640.0, 400.0));
+        let geometry = render_metrics(editor, metrics);
+        let draw = |frame: &Vim9RenderFrame| {
+            let mut recorder = CompletionRecorder::default();
+            for prepared in paint_views(frame, geometry, editor, |_| 0.0) {
+                widget.paint_native_view(&mut recorder, frame, &prepared, false);
+            }
+            assert!(recorder.clips.is_empty());
+            recorder
+        };
+        let rendered = draw(&frame);
+        let (_, position, color, clip) = rendered
+            .text
+            .iter()
+            .find(|(text, ..)| text == "参")
+            .expect("source-free virtual label must reach the native text painter");
+        assert_eq!(*position, Point::new(48.0, 30.0));
+        assert_eq!(*color, rgb(0x19c3a7));
+        assert!(clip.x + clip.width <= 39.0 * 8.0);
+        assert!(rendered.text.iter().any(|(text, ..)| text == "e\u{301}"));
+        assert!(rendered.quads.iter().any(|(quad, color, _)| {
+            *color == Background::Color(rgb(0x563412)) && quad.bounds.width == 16.0
+        }));
+        assert!(frame.anchor_at_cell(1, 6).is_none());
+
+        frame.runs[source.len()].style.foreground = Some(0x0abcde);
+        frame.revision += 1;
+        assert!(draw(&frame)
+            .text
+            .iter()
+            .any(|(text, _, color, _)| { text == "参" && *color == rgb(0x0abcde) }));
+        frame.runs.truncate(source.len());
+        frame.revision += 1;
+        assert_eq!(frame.changedtick, 8);
+        assert_eq!(frame.runs, source);
+        let cleared = draw(&frame);
+        assert!(!cleared
+            .text
+            .iter()
+            .any(|(text, ..)| ["参", "e\u{301}"].contains(&text.as_str())));
+        assert!(!cleared
+            .quads
+            .iter()
+            .any(|(_, color, _)| *color == Background::Color(rgb(0x563412))));
+    }
+
+    #[test]
     fn vim_popup_surfaces_cover_splits_and_preserve_zorder_rgb_and_unicode() {
         let mut frame = direct_frame();
         frame.mode = "i".into();
