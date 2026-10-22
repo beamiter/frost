@@ -4,7 +4,7 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 
 ## 原生 Vim9 IDE
 
-在 Frost 的本地交互式命令提示符直接运行 `vim 文件`，会在当前 GUI 的原标签页内显示原生 buffer 编辑器；文件参数、`+行号`、当前目录与退出码继续遵循 Vim。退出 Vim 后回到发起命令的 shell。滚轮按悬停的 Vim 分屏滚动，触摸板保留小数行增量；GUI 在等待 Vim 确认前即可按像素移动文字，并用确认帧重定位剩余小数位移；状态行和其他分屏保持固定。`[vim9] auto_gui = false` 可关闭自动进入，`smooth_scroll = false` 可切回原 Vim 滚轮路径。`JTERM_VIM9_AUTO_GUI=0 vim 文件` 可临时使用原终端显示。批处理和重定向输入仍使用普通 Vim。
+在 Frost 的本地交互式命令提示符直接运行 `vim 文件`，会在当前 GUI 的原标签页内显示原生 buffer 编辑器；文件参数、`+行号`、当前目录与退出码继续遵循 Vim。退出 Vim 后回到发起命令的 shell。普通模式和插入模式下，滚轮按悬停的 Vim 分屏滚动，触摸板保留小数行增量；GUI 在等待 Vim 确认前即可按像素移动文字，并用确认帧重定位剩余小数位移；状态行和其他分屏保持固定。`virtualedit=block` 或自定义鼠标点击映射不会关闭像素滚动。`[vim9] auto_gui = false` 可关闭自动进入，`smooth_scroll = false` 可关闭离散滚轮动画，触摸板仍保留像素精度。`JTERM_VIM9_AUTO_GUI=0 vim 文件` 可临时使用原终端显示。批处理和重定向输入仍使用普通 Vim。
 
 运行 `frost --ide [项目目录或文件]`，或点击终端工具栏的 **Vim9 IDE**，打开基于真实 Vim 9 的独立 iced/WGPU 编辑窗口。默认只显示现代 GUI buffer：工具栏、GUI buffer 标签、附加状态栏、项目侧栏和构建/诊断面板均默认关闭，可在配置的 `[vim9]` 下逐项开启。`native_buffer = true` 独立保持 GUI 文本、RGB 高亮和光标渲染。模糊快速打开（Ctrl+Shift+P）、行列跳转（Ctrl+Shift+G）、位置后退/前进（Alt+Left/Right）、保存及 Vim 原生命令继续可用；Ctrl+Shift+E/J 可临时开关项目/工具面板。关闭窗口会请求 Vim 正常退出，未保存的修改会阻止退出。需要安装 Vim 9，项目搜索需要 ripgrep。普通终端继续使用原有会话、分屏、快捷键和恢复路径。
 

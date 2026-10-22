@@ -896,7 +896,10 @@ impl Ide {
         let Some(editor) = self.editor.as_ref() else {
             return;
         };
-        let commands = if self.native_frame().is_some_and(|frame| frame.mode == "n") {
+        let commands = if self
+            .native_frame()
+            .is_some_and(|frame| matches!(frame.mode.as_str(), "n" | "i"))
+        {
             self.scroll.borrow().scroll_commands()
         } else {
             Vec::new()
@@ -1285,22 +1288,27 @@ impl Ide {
                 _ => {}
             },
             Message::Keyboard(id, event, captured) => {
-                self.scroll.borrow_mut().clear();
+                if matches!(event, keyboard::Event::KeyPressed { .. }) {
+                    self.scroll.borrow_mut().clear();
+                }
                 return self.key(id, event, captured);
             }
             Message::Modifiers(modifiers) => self.modifiers = modifiers,
             Message::Ime(event) => {
-                self.scroll.borrow_mut().clear();
                 if !self.ime.admit(&event) {
                     return Task::none();
                 }
                 if let Some(s) = &mut self.session {
                     match event {
                         input_method::Event::Preedit(value, selection) => {
+                            if !value.is_empty() || !s.terminal.preedit_text.is_empty() {
+                                self.scroll.borrow_mut().clear();
+                            }
                             s.terminal.preedit_text = value;
                             s.terminal.preedit_selection = selection;
                         }
                         input_method::Event::Commit(value) => {
+                            self.scroll.borrow_mut().clear();
                             self.native_enter.lock().claim_pressed();
                             s.terminal.preedit_text.clear();
                             s.terminal.preedit_selection = None;
@@ -1309,6 +1317,9 @@ impl Ide {
                             }
                         }
                         input_method::Event::Closed => {
+                            if !s.terminal.preedit_text.is_empty() {
+                                self.scroll.borrow_mut().clear();
+                            }
                             s.terminal.preedit_text.clear();
                             s.terminal.preedit_selection = None;
                         }

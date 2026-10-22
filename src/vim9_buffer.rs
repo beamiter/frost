@@ -8,7 +8,7 @@ use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer::{self, Quad};
 use iced::advanced::text::{self, Text};
 use iced::advanced::widget::{tree, Tree, Widget};
-use iced::advanced::{Clipboard, Shell};
+use iced::advanced::{input_method, Clipboard, Shell};
 use iced::{
     keyboard, mouse, Background, Color, Element, Event, Font, Length, Pixels, Point, Rectangle,
     Size,
@@ -160,11 +160,15 @@ impl ScrollState {
         metrics: Vim9RenderMetrics,
         wheel: NativeWheel,
     ) {
-        if self.pointer.is_some() || frame.completion.is_some() || frame.mode != "n" {
+        if self.pointer.is_some()
+            || frame.completion.is_some()
+            || !matches!(frame.mode.as_str(), "n" | "i")
+        {
             return;
         }
         let Some(window) = frame.windows.iter().find(|w| {
-            w.window == wheel.window
+            w.native_scroll
+                && w.window == wheel.window
                 && w.buffer == wheel.buffer
                 && w.changedtick == wheel.changedtick
                 && w.view == wheel.view
@@ -563,14 +567,14 @@ fn wheel_at(
     position: Point,
     delta: mouse::ScrollDelta,
 ) -> Option<NativeWheel> {
-    if frame.completion.is_some() || frame.mode != "n" {
+    if frame.completion.is_some() || !matches!(frame.mode.as_str(), "n" | "i") {
         return None;
     }
     let (row, column) = geometry.cell_at(position.x, position.y)?;
     let window = frame
         .windows
         .iter()
-        .find(|window| window.native_pointer && window.view.contains(row, column))?;
+        .find(|window| window.native_scroll && window.view.contains(row, column))?;
     let lines = match delta {
         mouse::ScrollDelta::Lines { y, .. } => -f64::from(y) * 3.0,
         mouse::ScrollDelta::Pixels { y, .. } => -f64::from(y) / f64::from(geometry.line_height),
@@ -578,7 +582,9 @@ fn wheel_at(
     (lines.is_finite() && lines != 0.0).then_some(NativeWheel {
         window: window.window,
         lines,
-        discrete: matches!(delta, mouse::ScrollDelta::Lines { .. }),
+        // X11 XI2 reports smooth touchpad axes as fractional Lines too.
+        // Preserve those samples directly instead of adding notch easing.
+        discrete: matches!(delta, mouse::ScrollDelta::Lines { y, .. } if y.fract() == 0.0),
         buffer: window.buffer,
         changedtick: window.changedtick,
         view: window.view.clone(),
@@ -783,7 +789,7 @@ pub(crate) struct NativeBuffer<'a, Message> {
     scroll: Option<&'a RefCell<ScrollState>>,
     modifiers: keyboard::Modifiers,
     on_scroll: Option<Box<dyn Fn(NativeWheel) -> Message + 'a>>,
-    precision_enabled: bool,
+    smooth_scroll: bool,
 }
 
 impl<'a, Message> NativeBuffer<'a, Message> {
@@ -805,7 +811,7 @@ impl<'a, Message> NativeBuffer<'a, Message> {
             scroll: None,
             modifiers: keyboard::Modifiers::default(),
             on_scroll: None,
-            precision_enabled: true,
+            smooth_scroll: true,
         }
     }
 
@@ -813,12 +819,12 @@ impl<'a, Message> NativeBuffer<'a, Message> {
         mut self,
         state: &'a RefCell<ScrollState>,
         modifiers: keyboard::Modifiers,
-        precision_enabled: bool,
+        smooth_scroll: bool,
         on_scroll: impl Fn(NativeWheel) -> Message + 'a,
     ) -> Self {
         self.scroll = Some(state);
         self.modifiers = modifiers;
-        self.precision_enabled = precision_enabled;
+        self.smooth_scroll = smooth_scroll;
         self.on_scroll = Some(Box::new(on_scroll));
         self
     }
@@ -878,12 +884,14 @@ where
                 }
             }
             state.borrow_mut().position = cursor.position();
-            if matches!(
-                event,
-                Event::Keyboard(_)
-                    | Event::InputMethod(_)
-                    | Event::Window(iced::window::Event::Unfocused)
-            ) {
+            let interrupts_scroll = match event {
+                Event::Keyboard(keyboard::Event::KeyPressed { .. })
+                | Event::InputMethod(input_method::Event::Commit(_))
+                | Event::Window(iced::window::Event::Unfocused) => true,
+                Event::InputMethod(input_method::Event::Preedit(value, _)) => !value.is_empty(),
+                _ => false,
+            };
+            if interrupts_scroll {
                 state.borrow_mut().clear();
                 state.borrow_mut().cursor_blink.reset();
             }
@@ -907,10 +915,9 @@ where
             }
         }
         if self.focused
-            && self
-                .frame
-                .is_some_and(|frame| frame.mode == "n" && frame.completion.is_none())
-            && self.precision_enabled
+            && self.frame.is_some_and(|frame| {
+                matches!(frame.mode.as_str(), "n" | "i") && frame.completion.is_none()
+            })
             && !self.modifiers.control()
             && !self.modifiers.shift()
             && !self.modifiers.alt()
@@ -931,7 +938,11 @@ where
                         let presented = state.presented.as_ref()?;
                         wheel_at(&presented.frame, presented.metrics, position, *delta)
                     });
-                    if let Some(wheel) = wheel {
+                    if let Some(mut wheel) = wheel {
+                        // Precision input already carries the device's pixel
+                        // trajectory. The option only controls the extra
+                        // transition synthesized for discrete wheel notches.
+                        wheel.discrete &= self.smooth_scroll;
                         shell.publish(callback(wheel));
                         shell.capture_event();
                         return;
@@ -1381,6 +1392,7 @@ mod tests {
         frame.window = 20;
         for window in &mut frame.windows {
             window.native_pointer = true;
+            window.native_scroll = true;
             window.topline = if window.window == 20 { 8 } else { 1 };
             window.botline = window.topline + window.view.rows as u64;
             window.line_count = 100;
@@ -1500,6 +1512,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(notch.lines, -3.0);
+        assert!(notch.discrete);
+        let smooth_x11 = wheel_at(
+            &frame,
+            geometry,
+            position,
+            mouse::ScrollDelta::Lines { x: 0.0, y: -0.125 },
+        )
+        .unwrap();
+        assert_eq!(smooth_x11.lines, 0.375);
+        assert!(!smooth_x11.discrete);
         for point in [
             Point::new(0.0, 50.0),
             Point::new(geometry.origin_x + 39.5 * geometry.cell_width, 50.0),
@@ -1530,6 +1552,41 @@ mod tests {
             }
         )
         .is_none());
+    }
+
+    #[test]
+    fn precision_scroll_is_independent_of_pointer_ownership_in_normal_and_insert_modes() {
+        let metrics = geometry();
+        for mode in ["n", "i"] {
+            let mut frame = direct_frame();
+            frame.mode = mode.into();
+            frame.windows[1].native_pointer = false;
+            let point = Point::new(340.0, 45.0);
+            let event = wheel_at(
+                &frame,
+                metrics,
+                point,
+                mouse::ScrollDelta::Pixels { x: 0.0, y: -3.0 },
+            )
+            .expect("click mappings and virtualedit must not disable precision scrolling");
+            let mut state = ScrollState::default();
+            state.wheel(&frame, metrics, event);
+            assert!((state.offset(&frame, 20, metrics) + 3.0).abs() < 1e-6);
+            assert!(state.scroll_commands().is_empty());
+            state.observe(Some(&frame), metrics, true, |_| false);
+            assert!((state.offset(&frame, 20, metrics) + 3.0).abs() < 1e-6);
+
+            frame.windows[1].native_scroll = false;
+            assert!(wheel_at(
+                &frame,
+                metrics,
+                point,
+                mouse::ScrollDelta::Pixels { x: 0.0, y: -3.0 }
+            )
+            .is_none());
+            state.observe(Some(&frame), metrics, true, |_| false);
+            assert!(state.pixels.is_empty());
+        }
     }
 
     #[test]
@@ -2041,13 +2098,6 @@ mod tests {
             ),
             NativeInput::Compatibility(_)
         ));
-        assert!(wheel_at(
-            &unsupported,
-            metrics,
-            Point::new(340.0, 45.0),
-            mouse::ScrollDelta::Pixels { x: 0.0, y: -3.0 }
-        )
-        .is_none());
     }
 
     #[test]
@@ -2220,7 +2270,7 @@ mod tests {
             NativeBuffer::new(input, Some(&frame), metrics, Font::MONOSPACE, true, true).scroll(
                 &state,
                 keyboard::Modifiers::default(),
-                true,
+                false,
                 Output::Wheel,
             );
         let mut tree = Tree::new(&widget as &dyn Widget<Output, iced::Theme, ()>);
@@ -2255,6 +2305,10 @@ mod tests {
             panic!("native raw pixel wheel expected");
         };
         assert_eq!(wheel.lines, 0.5);
+        assert!(
+            !wheel.discrete,
+            "raw pixels must survive smooth_scroll=false"
+        );
         state
             .borrow_mut()
             .wheel(&frame, local_metrics(metrics), wheel);
@@ -2276,6 +2330,36 @@ mod tests {
             matches!(shell.input_method(), iced::advanced::input_method::InputMethod::Enabled { cursor, .. }
             if cursor.y == 30.0 && cursor.x == 336.0)
         );
+        let released = keyboard::Key::Character("i".into());
+        for event in [
+            Event::InputMethod(input_method::Event::Opened),
+            Event::InputMethod(input_method::Event::Closed),
+            Event::InputMethod(input_method::Event::Preedit(String::new(), None)),
+            Event::Keyboard(keyboard::Event::KeyReleased {
+                key: released.clone(),
+                modified_key: released,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyI),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::default(),
+            }),
+        ] {
+            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+                &mut widget,
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &(),
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut output),
+                &bounds,
+            );
+            assert_eq!(
+                state.borrow().offset(&frame, 20, local_metrics(metrics)),
+                -10.0,
+                "IME lifecycle and key releases must not cancel precision motion"
+            );
+        }
         <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::draw(
             &widget,
             &tree,
@@ -2335,6 +2419,24 @@ mod tests {
                 }))
             ),
             "the real terminal widget must see the first click when counting a multi-click"
+        );
+        output.clear();
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+            &mut widget,
+            &mut tree,
+            &Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &(),
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut output),
+            &bounds,
+        );
+        assert!(
+            matches!(output.as_slice(), [Output::Wheel(wheel)] if wheel.lines == 3.0 && !wheel.discrete),
+            "smooth_scroll=false must only disable the synthesized notch animation"
         );
         // A menu can arrive between the last buffer paint and the next
         // event. Its wheel must reach the PTY, even while the stored
