@@ -2643,6 +2643,12 @@ impl Ide {
                 ""
             }
         );
+            let workbench = self.snapshot.workbench.status_text();
+            let status = if workbench.is_empty() {
+                status
+            } else {
+                format!("{status} | {}", visible_label(&workbench))
+            };
             let status = self
                 .error
                 .as_deref()
@@ -2718,9 +2724,15 @@ impl Ide {
             } else {
                 form.kind.help()
             }).size(13),
-            field,
         ]
         .spacing(10);
+        if quick {
+            let context = self.snapshot.workbench.status_text();
+            if !context.is_empty() {
+                dialog_body = dialog_body.push(text(visible_label(&context)).size(12));
+            }
+        }
+        dialog_body = dialog_body.push(field);
         if let Some(error) = &form.error {
             dialog_body = dialog_body.push(
                 text(visible_label(error))
