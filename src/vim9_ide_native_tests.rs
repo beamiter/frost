@@ -181,3 +181,232 @@ fn real_vim9_native_pty() {
     // The production Pty destructor is still the only reaper. No process kill
     // or synthetic PTY hangup was used to make this exit assertion pass.
 }
+
+#[test]
+#[ignore = "requires actual Vim 9, local PTYs and loopback sockets"]
+fn embedded_body_first_focus_and_active_clicks_preserve_modified_vim_mouse_gestures() {
+    let scratch = Scratch::new();
+    let program = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|path| path.join("vim"))
+        .find(|path| path.is_file())
+        .expect("Vim must be installed");
+    let mut editors = Vec::new();
+    let mut logs = Vec::new();
+    for index in 0..2 {
+        let file = scratch.0.join(format!("pane-{index}.txt"));
+        fs::write(&file, "first row\nsecond row\nthird row\n").unwrap();
+        let log = scratch.0.join(format!("mouse-{index}.log"));
+        let ready = scratch.0.join(format!("ready-{index}"));
+        let args: Vec<OsString> = [
+            "--vim-shell".into(),
+            program.as_os_str().to_owned(),
+            "--".into(),
+            "-u".into(),
+            "NONE".into(),
+            "-i".into(),
+            "NONE".into(),
+            "-n".into(),
+            file.as_os_str().to_owned(),
+        ]
+        .into();
+        let request = vim9::shell_vim_request(&args).unwrap().unwrap();
+        let mut config = Config::default();
+        config.vim9.native_buffer = false;
+        let ownership = std::sync::Arc::new(parking_lot::Mutex::new(Default::default()));
+        let (mut ide, _) = Ide::new(
+            request,
+            config,
+            None,
+            ownership,
+            Size::new(800.0, 600.0),
+            None,
+        );
+        ide.embedded = true;
+        let controller = ide.editor.as_ref().unwrap().clone();
+        wait_for(ide.session.as_mut().unwrap(), &controller, |state| {
+            state.connected && state.mode == "n"
+        });
+        let mut setup = String::from(":set nocompatible mouse=a ttymouse=sgr mousetime=1 nowrap\r");
+        for (prefix, label) in [("C", "ctrl"), ("M", "alt")] {
+            for (event, phase) in [
+                ("LeftMouse", "press"),
+                ("LeftDrag", "drag"),
+                ("LeftRelease", "release"),
+            ] {
+                setup.push_str(&format!(":nnoremap <{prefix}-{event}> <Cmd>call writefile(['{label}_{phase}'], '{}', 'a')<CR>\r", log.display()));
+            }
+        }
+        setup.push_str(&format!(
+            ":call writefile(['ready'], '{}')\r",
+            ready.display()
+        ));
+        assert!(ide.session.as_mut().unwrap().write_pty(setup.as_bytes()));
+        wait_for(ide.session.as_mut().unwrap(), &controller, |_| {
+            ready.exists()
+        });
+        pump(ide.session.as_mut().unwrap());
+        assert!(ide.session.as_ref().unwrap().terminal.is_mouse_enabled());
+        ide.focus_embedded(index == 0);
+        editors.push(ide);
+        logs.push(log);
+    }
+    let valid_entry = editors[1].editor.as_ref().unwrap().entry_id();
+    let stale_message = editors[0].body_mouse_message(MouseInput::Release {
+        col: 1,
+        row: 1,
+        button: MouseButton::Left,
+    });
+    assert!(!editors[1].accepts_body_mouse(editors[0].editor.as_ref().map(Vim9Session::entry_id)));
+    let _ = editors[1].update(stale_message);
+    assert!(
+        !editors[1].focused,
+        "a queued event from a replaced editor must not activate its successor"
+    );
+    let _ = editors[1].form(FormKind::Goto);
+    assert!(
+        !editors[1].accepts_body_mouse(Some(valid_entry)),
+        "a host form must block before workspace focus"
+    );
+    assert!(super::super::visible_embedded_body_session(
+        &super::super::PaneTree::Leaf(1),
+        202,
+        editors[1].accepts_body_mouse(Some(valid_entry)),
+        [(1, 202)]
+    )
+    .is_none());
+    editors[1].form = None;
+    let layout = super::super::PaneTree::Split {
+        axis: super::super::Axis::Vertical,
+        children: vec![
+            super::super::PaneTree::Leaf(0),
+            super::super::PaneTree::Leaf(1),
+        ],
+        ratios: vec![0.5, 0.5],
+    };
+    for (current_modifiers, expected_lines) in [
+        (keyboard::Modifiers::CTRL, 3usize),
+        (keyboard::Modifiers::ALT, 6usize),
+    ] {
+        let mut press = MouseInput::Press {
+            col: 1,
+            row: 1,
+            button: MouseButton::Left,
+            shift: false,
+            alt: true,
+            ctrl: false,
+            count: 1,
+            finalized: false,
+            link_eligible: false,
+            app_eligible: true,
+            block: None,
+            block_zone_id: None,
+            link: false,
+            link_revision: 0,
+            x: 8.0,
+            y: 20.0,
+        };
+        super::super::sync_embedded_body_modifiers(&mut press, current_modifiers);
+        let target =
+            super::super::visible_embedded_body_session(&layout, 202, true, [(0, 101), (1, 202)])
+                .unwrap();
+        // This is the workspace's production order: focus first, then route
+        // the original widget press exactly once to its stable source editor.
+        editors[target].set_workspace_modifiers(current_modifiers);
+        editors[target].focus_embedded(true);
+        let message = editors[target].body_mouse_message(press);
+        editors[target].set_workspace_modifiers(keyboard::Modifiers::empty());
+        let _ = editors[target].update(message);
+        assert!(
+            editors[target].modifiers.is_empty(),
+            "an old click must not roll back the latest keyboard state"
+        );
+        editors[target].set_workspace_modifiers(current_modifiers);
+        dispatch_body_mouse(
+            &mut editors[target],
+            MouseInput::Drag {
+                col: 2,
+                row: 1,
+                count: 1,
+            },
+        );
+        dispatch_body_mouse(
+            &mut editors[target],
+            MouseInput::Release {
+                col: 2,
+                row: 1,
+                button: MouseButton::Left,
+            },
+        );
+        let controller = editors[target].editor.as_ref().unwrap().clone();
+        wait_for(
+            editors[target].session.as_mut().unwrap(),
+            &controller,
+            |_| {
+                fs::read_to_string(&logs[target])
+                    .is_ok_and(|text| text.lines().count() >= expected_lines)
+            },
+        );
+        assert_eq!(
+            editors[target]
+                .session
+                .as_ref()
+                .unwrap()
+                .terminal
+                .has_text_selection(),
+            false
+        );
+        assert!(editors[target].gestures[MouseButton::Left.slot()].is_none());
+        assert!(
+            !logs[0].exists(),
+            "the previously active pane must not receive any part of this gesture"
+        );
+    }
+    // The workspace opens an overlay after an accepted app press. Closing
+    // that gesture must use its original cell and emit exactly one release;
+    // a physical release arriving after the overlay closes is then inert.
+    editors[1].set_workspace_modifiers(keyboard::Modifiers::CTRL);
+    let press = MouseInput::Press {
+        col: 1,
+        row: 1,
+        button: MouseButton::Left,
+        shift: false,
+        alt: false,
+        ctrl: true,
+        count: 1,
+        finalized: false,
+        link_eligible: false,
+        app_eligible: true,
+        block: None,
+        block_zone_id: None,
+        link: false,
+        link_revision: 0,
+        x: 8.0,
+        y: 20.0,
+    };
+    dispatch_body_mouse(&mut editors[1], press);
+    editors[1].cancel_body_pointer();
+    editors[1].cancel_body_pointer();
+    dispatch_body_mouse(
+        &mut editors[1],
+        MouseInput::Release {
+            col: 99,
+            row: 29,
+            button: MouseButton::Left,
+        },
+    );
+    let controller = editors[1].editor.as_ref().unwrap().clone();
+    wait_for(editors[1].session.as_mut().unwrap(), &controller, |_| {
+        fs::read_to_string(&logs[1]).is_ok_and(|text| text.lines().count() >= 8)
+    });
+    assert_eq!(
+        fs::read_to_string(&logs[1]).unwrap(),
+        "ctrl_press\nctrl_drag\nctrl_release\nalt_press\nalt_drag\nalt_release\nctrl_press\nctrl_release\n"
+    );
+    assert!(editors[1].gestures.iter().all(Option::is_none));
+    assert!(!logs[0].exists());
+}
+
+fn dispatch_body_mouse(ide: &mut Ide, input: MouseInput) {
+    let message = ide.body_mouse_message(input);
+    let _ = ide.update(message);
+}

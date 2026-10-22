@@ -66,6 +66,7 @@ mod terminal_view;
 mod theme;
 mod ui_typography;
 mod vim9_buffer;
+mod vim9_buffer_labels;
 mod vim9_ide;
 mod widget_identity_scope;
 mod workflow_focus;
@@ -6364,6 +6365,39 @@ struct TerminalMouseGesture {
     consumed: bool,
 }
 
+fn sync_embedded_body_modifiers(input: &mut MouseInput, modifiers: keyboard::Modifiers) {
+    match input {
+        MouseInput::Press {
+            shift, alt, ctrl, ..
+        } => {
+            *shift = modifiers.shift();
+            *alt = modifiers.alt();
+            *ctrl = modifiers.control();
+        }
+        MouseInput::Wheel { shift, ctrl, .. } => {
+            *shift = modifiers.shift();
+            *ctrl = modifiers.control();
+        }
+        _ => {}
+    }
+}
+
+/// Body events retain stable session identity, and cannot resurrect a closed
+/// pane or move focus into another tab after a delayed widget message.
+fn visible_embedded_body_session(
+    layout: &PaneTree,
+    source_id: usize,
+    editor_alive: bool,
+    sessions: impl IntoIterator<Item = (usize, usize)>,
+) -> Option<usize> {
+    if !editor_alive {
+        return None;
+    }
+    sessions.into_iter().find_map(|(index, id)| {
+        (id == source_id && layout.contains_session(index)).then_some(index)
+    })
+}
+
 /// Shared press-origin gate for the app handler and CPU interaction tests.
 /// Returning a button means no terminal/clipboard action may run for this
 /// press; its later drag/release remains owned by this consumed gesture.
@@ -7509,6 +7543,22 @@ impl Frost {
         self.config.set_content_font_size(next);
         self.config_dirty = true;
         self.apply_config();
+    }
+
+    /// Keyboard/palette content zoom follows the active editor, whose font
+    /// lives in its own config. Normal terminal content retains the app zoom.
+    fn zoom_focused_content(&mut self, step: Option<f32>) {
+        let editor = self
+            .sessions
+            .get(self.active)
+            .and_then(|session| self.vim9_tabs.get_mut(&session.id));
+        if let Some(editor) = editor {
+            editor.zoom_editor_font(step);
+        } else if let Some(step) = step {
+            self.adjust_font_size(step);
+        } else {
+            self.reset_font_size();
+        }
     }
 
     /// Regrid for changed chrome height without rebuilding content metrics.
@@ -11303,15 +11353,15 @@ impl Frost {
             }
             C::AgentLaunchKimi => Task::done(Message::AgentLaunch(agent_task::AgentProvider::Kimi)),
             C::FontZoomIn => {
-                self.adjust_font_size(1.0);
+                self.zoom_focused_content(Some(1.0));
                 Task::none()
             }
             C::FontZoomOut => {
-                self.adjust_font_size(-1.0);
+                self.zoom_focused_content(Some(-1.0));
                 Task::none()
             }
             C::FontZoomReset => {
-                self.reset_font_size();
+                self.zoom_focused_content(None);
                 Task::none()
             }
             C::OpacityIncrease => {
@@ -14725,15 +14775,15 @@ impl Frost {
                 Task::none()
             }
             PaletteAction::ZoomIn => {
-                self.adjust_font_size(1.0);
+                self.zoom_focused_content(Some(1.0));
                 Task::none()
             }
             PaletteAction::ZoomOut => {
-                self.adjust_font_size(-1.0);
+                self.zoom_focused_content(Some(-1.0));
                 Task::none()
             }
             PaletteAction::ZoomReset => {
-                self.reset_font_size();
+                self.zoom_focused_content(None);
                 Task::none()
             }
             PaletteAction::OpacityIncrease => {
@@ -16108,6 +16158,39 @@ impl Frost {
                 return Task::batch(tasks);
             }
             Message::EmbeddedVim(id, message) => {
+                let body_press = if let vim9_ide::Message::BodyMouse {
+                    entry_id, input, ..
+                } = message.as_ref()
+                {
+                    let Some(source) = visible_embedded_body_session(
+                        self.layout(),
+                        id,
+                        self.vim9_tabs
+                            .get(&id)
+                            .is_some_and(|editor| editor.accepts_body_mouse(*entry_id)),
+                        self.sessions
+                            .iter()
+                            .enumerate()
+                            .map(|(index, session)| (index, session.id)),
+                    ) else {
+                        return Task::none();
+                    };
+                    if !self.terminal_mouse_active() {
+                        if let Some(editor) = self.vim9_tabs.get_mut(&id) {
+                            editor.cancel_body_pointer();
+                        }
+                        return Task::none();
+                    }
+                    let press = matches!(input, MouseInput::Press { .. });
+                    if press {
+                        self.sidebar_files_focused = false;
+                        self.set_focus(source);
+                        self.refresh_active_context();
+                    }
+                    press
+                } else {
+                    false
+                };
                 // Keep configurable workspace tab shortcuts while Vim owns
                 // editing keys. Only the active editor can dispatch them.
                 if self.sessions.get(self.active).is_some_and(|s| s.id == id) {
@@ -16131,6 +16214,9 @@ impl Frost {
                                     | C::SessionLast
                                     | C::TerminalClosePane
                                     | C::WindowClose
+                                    | C::FontZoomIn
+                                    | C::FontZoomOut
+                                    | C::FontZoomReset
                             ) {
                                 return self.dispatch_command(command).unwrap_or_else(Task::none);
                             }
@@ -16138,6 +16224,11 @@ impl Frost {
                     }
                 }
                 if let Some(editor) = self.vim9_tabs.get_mut(&id) {
+                    if body_press {
+                        // Focus must precede source routing: focus_embedded
+                        // retires old gestures and must not erase this press.
+                        editor.focus_embedded(self.focused);
+                    }
                     let task = editor
                         .update(*message)
                         .map(move |message| Message::EmbeddedVim(id, Box::new(message)));
@@ -25060,7 +25151,7 @@ impl Frost {
         if let Some(editor) = self.vim9_tabs.get(&sess.id) {
             let id = sess.id;
             return editor
-                .embedded_view()
+                .embedded_view(self.modifiers)
                 .map(move |message| Message::EmbeddedVim(id, Box::new(message)));
         }
         let session_id = sess.id;
@@ -25167,7 +25258,7 @@ impl Frost {
             chat_mode::ControlKind::Submit,
             self.chat_input_ready(session_id),
         );
-        TermWidget::new(
+        let terminal = TermWidget::new(
             sess.projection.cells(),
             sess.cursor,
             sess.cursor_visible,
@@ -25250,8 +25341,8 @@ impl Frost {
         .on_mouse(move |inp| Message::MousePane(session_id, inp))
         .on_summary(sess.projection.key(), move |activation| {
             Message::SummaryActivate(session_id, activation)
-        })
-        .into()
+        });
+        self.font_zoom_region(font_zoom::Group::Content, terminal)
     }
 
     /// Left dock. A header lets the user switch between the file tree and the
@@ -26398,10 +26489,12 @@ impl Frost {
             .clip(true)
             .style(self.pane_header_style(focused, drag_source, drop_target));
 
-        mouse_area(strip)
-            .on_press(Message::PaneDragStart(sess.id))
-            .interaction(iced::mouse::Interaction::Grab)
-            .into()
+        self.font_zoom_region(
+            font_zoom::Group::Content,
+            mouse_area(strip)
+                .on_press(Message::PaneDragStart(sess.id))
+                .interaction(iced::mouse::Interaction::Grab),
+        )
     }
 
     /// Pane header background: accent-tinted when focused, strongly tinted
@@ -26640,14 +26733,17 @@ impl Frost {
             panes_body
         };
         let panes_body = terminal_panes_body(
-            self.block_reading_bar_visible()
-                .then(|| self.block_reading_bar()),
+            self.block_reading_bar_visible().then(|| {
+                self.font_zoom_region(font_zoom::Group::Content, self.block_reading_bar())
+            }),
             panes_body,
         );
         let body = container(panes_body)
             .width(Length::Fill)
             .height(Length::Fill);
-        let body = self.font_zoom_region(font_zoom::Group::Content, body);
+        // Leaf terminal/editor widgets own their content font. A capturing
+        // scope around the entire tree would resize the shell behind Vim.
+        let body: Element<'_, Message> = body.into();
         let body: Element<'_, Message> = if self.config_panel_open {
             let overlay = if self.theme_editor.is_some() {
                 self.theme_editor_view()
@@ -38164,6 +38260,55 @@ mod tests {
         record_terminal_app_mouse_cell(&mut gestures, 7, button, (9, 9));
         assert_eq!(gestures[button.slot()].unwrap().last_app_cell, Some((5, 6)));
         assert_eq!(take_terminal_mouse_gesture(&mut gestures, 7, button), None);
+    }
+
+    #[test]
+    fn embedded_body_targets_visible_source_and_refreshes_stale_modifiers() {
+        let panes = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![PaneTree::Leaf(0), PaneTree::Leaf(1)],
+            ratios: vec![0.5, 0.5],
+        };
+        let sessions = [(0, 101), (1, 202), (2, 303)];
+        assert_eq!(
+            visible_embedded_body_session(&panes, 202, true, sessions),
+            Some(1)
+        );
+        assert_eq!(
+            visible_embedded_body_session(&panes, 202, false, sessions),
+            None,
+            "an exited Vim cannot focus the ordinary shell that remains in its pane"
+        );
+        assert_eq!(
+            visible_embedded_body_session(&panes, 303, true, sessions),
+            None,
+            "a hidden tab cannot steal focus"
+        );
+        assert_eq!(
+            visible_embedded_body_session(&PaneTree::Leaf(0), 202, true, sessions),
+            None,
+            "removed panes reject queued events"
+        );
+        assert_eq!(
+            visible_embedded_body_session(&panes, 202, true, [(0, 101), (1, 404)]),
+            None,
+            "a replacement session never inherits old events"
+        );
+        for count in [1, 2, 3] {
+            let mut press = caret_test_press(7, 11);
+            if let MouseInput::Press {
+                count: actual,
+                ctrl,
+                ..
+            } = &mut press
+            {
+                *actual = count;
+                *ctrl = true;
+            }
+            sync_embedded_body_modifiers(&mut press, keyboard::Modifiers::SHIFT);
+            assert!(matches!(press, MouseInput::Press { row: 7, col: 11, count: actual, shift: true, alt: false, ctrl: false, .. } if actual == count),
+                "first focus must update stale child modifiers without losing click count or coordinates");
+        }
     }
 
     fn caret_test_press(row: usize, col: usize) -> MouseInput {

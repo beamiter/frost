@@ -316,6 +316,12 @@ pub(super) enum Message {
     Close,
     NativeWheel(crate::vim9_buffer::NativeWheel),
     NativeMouse(crate::vim9_buffer::NativeInput),
+    // Keep the original press until the workspace has focused its source pane.
+    BodyMouse {
+        entry_id: Option<uuid::Uuid>,
+        input: MouseInput,
+        snapshot: crate::vim9_buffer::BodyMouseSnapshot,
+    },
     Command(Vim9Command),
     ShowForm(FormKind),
     FormInput(String),
@@ -600,6 +606,9 @@ enum Shortcut {
     NavigateForward,
     ToggleFiles,
     ToggleDock,
+    FontIncrease,
+    FontDecrease,
+    FontReset,
 }
 
 fn native_shortcut(
@@ -628,6 +637,15 @@ fn native_shortcut(
     if !modifiers.control() {
         return None;
     }
+    if let keyboard::Key::Character(value) = key {
+        match value.as_str() {
+            "+" => return Some(Shortcut::FontIncrease),
+            "=" => return Some(Shortcut::FontIncrease),
+            "-" if !modifiers.shift() => return Some(Shortcut::FontDecrease),
+            "0" if !modifiers.shift() => return Some(Shortcut::FontReset),
+            _ => {}
+        }
+    }
     if !modifiers.shift() {
         return matches!(key, keyboard::Key::Character(value) if value.eq_ignore_ascii_case("s"))
             .then_some(Shortcut::Save);
@@ -649,6 +667,10 @@ fn native_shortcut(
         },
         _ => None,
     }
+}
+
+fn mouse_report_code(base: u8, shift: bool, alt: bool, ctrl: bool) -> u8 {
+    base | if shift { 4 } else { 0 } | if alt { 8 } else { 0 } | if ctrl { 16 } else { 0 }
 }
 
 fn moved_selection(current: usize, delta: isize, count: usize) -> usize {
@@ -714,6 +736,35 @@ impl Ide {
         self.child_exited
     }
 
+    pub(super) fn cancel_body_pointer(&mut self) {
+        // An overlay may close only an accepted app press, at its last
+        // accepted cell. Never dispatch the hidden event's coordinates.
+        self.retire_gestures();
+        self.scroll.borrow_mut().clear();
+        self.invalidate_input();
+    }
+
+    pub(super) fn set_workspace_modifiers(&mut self, modifiers: keyboard::Modifiers) {
+        self.modifiers = modifiers;
+        self.scroll.borrow_mut().seed_modifiers(modifiers);
+    }
+
+    pub(super) fn accepts_body_mouse(&self, entry_id: Option<uuid::Uuid>) -> bool {
+        entry_id.is_some()
+            && self.editor.as_ref().map(Vim9Session::entry_id) == entry_id
+            && !self.child_exited
+            && self.session.is_some()
+            && self.form.is_none()
+    }
+
+    fn body_mouse_message(&self, input: MouseInput) -> Message {
+        Message::BodyMouse {
+            entry_id: self.editor.as_ref().map(Vim9Session::entry_id),
+            input,
+            snapshot: self.scroll.borrow().capture_body_mouse(),
+        }
+    }
+
     pub(super) fn focus_embedded(&mut self, focused: bool) {
         if focused != self.focused {
             self.focused = focused;
@@ -724,7 +775,8 @@ impl Ide {
         }
     }
 
-    pub(super) fn embedded_view(&self) -> Element<'_, Message> {
+    pub(super) fn embedded_view(&self, modifiers: keyboard::Modifiers) -> Element<'_, Message> {
+        self.scroll.borrow_mut().seed_modifiers(modifiers);
         iced::widget::sensor(self.view())
             .on_show(Message::Resize)
             .on_resize(Message::Resize)
@@ -872,7 +924,12 @@ impl Ide {
             if let Some(previous) = gesture.take().filter(|g| g.report_to_app) {
                 if let (Some(s), Some((col, row))) = (&mut self.session, previous.last_app_cell) {
                     if let Some(bytes) = s.terminal.get_mouse_release_report(
-                        super::btn_code(previous.button),
+                        mouse_report_code(
+                            super::btn_code(previous.button),
+                            self.modifiers.shift(),
+                            self.modifiers.alt(),
+                            self.modifiers.control(),
+                        ),
                         col,
                         row,
                     ) {
@@ -908,6 +965,28 @@ impl Ide {
             }
             s.refresh();
         }
+    }
+
+    pub(super) fn zoom_editor_font(&mut self, step: Option<f32>) {
+        let size = Config::clamp_font_size(step.map_or_else(
+            || Config::default().font_size,
+            |step| self.config.font_size + step,
+        ));
+        if size == self.config.font_size {
+            return;
+        }
+        // Keep native controls at their existing size. This editor owns a
+        // local config copy; zoom never writes the terminal's saved settings.
+        self.config.set_content_font_size(size);
+        self.metrics = Metrics::with_font(
+            self.mono,
+            size,
+            self.config.line_spacing,
+            self.config.padding,
+            false,
+        );
+        self.invalidate_input();
+        self.resize();
     }
     fn send(&mut self, command: Vim9Command) {
         let _ = self.try_send(command);
@@ -1242,6 +1321,18 @@ impl Ide {
             Shortcut::NavigateForward => Vim9Command::NavigateForward,
             Shortcut::ToggleFiles => return self.reduce(Message::ToggleFiles),
             Shortcut::ToggleDock => return self.reduce(Message::ToggleDock),
+            Shortcut::FontIncrease => {
+                self.zoom_editor_font(Some(1.0));
+                return Task::none();
+            }
+            Shortcut::FontDecrease => {
+                self.zoom_editor_font(Some(-1.0));
+                return Task::none();
+            }
+            Shortcut::FontReset => {
+                self.zoom_editor_font(None);
+                return Task::none();
+            }
         };
         self.send(command);
         Task::none()
@@ -1400,7 +1491,7 @@ impl Ide {
                 }
                 return self.key(id, event, captured);
             }
-            Message::Modifiers(modifiers) => self.modifiers = modifiers,
+            Message::Modifiers(modifiers) => self.set_workspace_modifiers(modifiers),
             Message::Ime(event) => {
                 if !self.ime.admit(&event) {
                     return Task::none();
@@ -1460,6 +1551,31 @@ impl Ide {
                     }
                     self.flush_native_input();
                 }
+            }
+            Message::BodyMouse {
+                entry_id,
+                input,
+                snapshot,
+            } => {
+                if !self.accepts_body_mouse(entry_id) || !self.input_active() {
+                    return Task::none();
+                }
+                let metrics = crate::vim9_buffer::local_metrics(self.metrics);
+                if !snapshot.source_current(self.native_frame(), metrics) {
+                    self.cancel_body_pointer();
+                }
+                // A later workspace key release must not reinterpret this
+                // event's native eligibility or raw SGR modifier bits.
+                let latest_modifiers = std::mem::replace(&mut self.modifiers, snapshot.modifiers());
+                let routed = self.scroll.borrow_mut().route_body_mouse(
+                    self.native_frame(),
+                    metrics,
+                    input,
+                    snapshot,
+                );
+                let task = self.reduce(Message::NativeMouse(routed));
+                self.modifiers = latest_modifiers;
+                return task;
             }
             Message::NativeMouse(input) => match input {
                 crate::vim9_buffer::NativeInput::Compatibility(input) => return self.mouse(input),
@@ -1777,6 +1893,7 @@ impl Ide {
                 button,
                 shift,
                 alt,
+                ctrl,
                 count,
                 app_eligible,
                 ..
@@ -1793,9 +1910,11 @@ impl Ide {
                     if let Some((x, y)) =
                         super::projected_live_grid_cell(&s.terminal, &s.projection, row, col)
                     {
-                        if let Some(bytes) =
-                            s.terminal.get_mouse_report(super::btn_code(button), x, y)
-                        {
+                        if let Some(bytes) = s.terminal.get_mouse_report(
+                            mouse_report_code(super::btn_code(button), shift, alt, ctrl),
+                            x,
+                            y,
+                        ) {
                             if s.write_pty(&bytes) {
                                 gesture.last_app_cell = Some((x, y));
                             }
@@ -1837,7 +1956,16 @@ impl Ide {
                         if let Some((x, y)) =
                             super::projected_live_grid_cell(&s.terminal, &s.projection, row, col)
                         {
-                            if let Some(bytes) = s.terminal.get_mouse_report(32, x, y) {
+                            if let Some(bytes) = s.terminal.get_mouse_report(
+                                mouse_report_code(
+                                    32,
+                                    self.modifiers.shift(),
+                                    self.modifiers.alt(),
+                                    self.modifiers.control(),
+                                ),
+                                x,
+                                y,
+                            ) {
                                 if s.write_pty(&bytes) {
                                     gesture.last_app_cell = Some((x, y));
                                 }
@@ -1868,10 +1996,16 @@ impl Ide {
                         super::projected_live_grid_cell(&s.terminal, &s.projection, row, col)
                             .or(gesture.last_app_cell);
                     if let Some((x, y)) = cell {
-                        if let Some(bytes) =
-                            s.terminal
-                                .get_mouse_release_report(super::btn_code(button), x, y)
-                        {
+                        if let Some(bytes) = s.terminal.get_mouse_release_report(
+                            mouse_report_code(
+                                super::btn_code(button),
+                                self.modifiers.shift(),
+                                self.modifiers.alt(),
+                                self.modifiers.control(),
+                            ),
+                            x,
+                            y,
+                        ) {
                             s.write_pty(&bytes);
                         }
                     }
@@ -1889,15 +2023,7 @@ impl Ide {
             } => {
                 if ctrl {
                     let step = if up { 1.0 } else { -1.0 };
-                    self.config.font_size = Config::clamp_font_size(self.config.font_size + step);
-                    self.metrics = Metrics::with_font(
-                        self.mono,
-                        self.config.font_size,
-                        self.config.line_spacing,
-                        self.config.padding,
-                        false,
-                    );
-                    self.resize();
+                    self.zoom_editor_font(Some(step));
                     return Task::none();
                 }
                 if s.terminal.is_mouse_enabled() && !shift && app_eligible {
@@ -2040,6 +2166,11 @@ impl Ide {
         .into()
     }
     fn terminal_view(&self) -> Element<'_, Message> {
+        let modifiers = if self.embedded {
+            self.scroll.borrow().event_modifiers()
+        } else {
+            self.modifiers
+        };
         let Some(s) = &self.session else {
             return container(text(self.error.as_deref().unwrap_or("Vim could not be launched. Install Vim 9 with +channel, +job, +timers and +quickfix."))).padding(24).center_x(Length::Fill).center_y(Length::Fill).into();
         };
@@ -2075,11 +2206,7 @@ impl Ide {
             s.projection.max_scroll_offset(),
         )
         .interaction_mode(config::TerminalMode::Normal, 0)
-        .modifiers(
-            self.modifiers.shift(),
-            self.modifiers.alt(),
-            self.modifiers.control(),
-        )
+        .modifiers(modifiers.shift(), modifiers.alt(), modifiers.control())
         .scrollbar_always(true)
         .app_mouse_full_grid(true)
         .dynamic_palette(&s.terminal.dynamic_palette)
@@ -2098,21 +2225,7 @@ impl Ide {
         )
         .blink_on(self.blink_on)
         .opacity(1.0)
-        .on_mouse(move |input| {
-            if let Some(frame) = native_frame {
-                Message::NativeMouse(self.scroll.borrow_mut().route_mouse(
-                    frame,
-                    crate::vim9_buffer::local_metrics(self.metrics),
-                    self.modifiers,
-                    input,
-                ))
-            } else {
-                Message::NativeMouse(self.scroll.borrow_mut().compatibility_mouse(input).map_or(
-                    crate::vim9_buffer::NativeInput::Handled,
-                    crate::vim9_buffer::NativeInput::Compatibility,
-                ))
-            }
-        });
+        .on_mouse(|input| self.body_mouse_message(input));
         crate::vim9_buffer::NativeBuffer::new(
             terminal,
             native_frame.and(self.render_frame.as_ref()),
@@ -2123,7 +2236,7 @@ impl Ide {
         )
         .scroll(
             &self.scroll,
-            self.modifiers,
+            modifiers,
             self.config.vim9.smooth_scroll,
             Message::NativeWheel,
         )
@@ -2413,12 +2526,8 @@ impl Ide {
         }
         if self.config.vim9.buffer_tabs {
             let mut buffers = row![].spacing(4);
-            for buffer in &self.snapshot.buffers {
-                let name = Path::new(&buffer.name)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("[No Name]");
+            let labels = crate::vim9_buffer_labels::vim9_buffer_labels(&self.snapshot.buffers);
+            for (buffer, name) in self.snapshot.buffers.iter().zip(&labels) {
                 let label = format!(
                     "{}{}{}",
                     if buffer.current { "> " } else { "" },
@@ -2442,21 +2551,31 @@ impl Ide {
                             Vim9Command::CloseBuffer { buffer: buffer.id },
                         )),
                     );
-                buffers = buffers.push(
-                    row![
-                        tooltip(
-                            tab,
-                            text(visible_label(&buffer.name)),
-                            tooltip::Position::Bottom
-                        ),
-                        tooltip(
-                            close,
-                            text("Close buffer (refuses unsaved changes)"),
-                            tooltip::Position::Bottom
-                        )
-                    ]
-                    .spacing(1),
-                );
+                let tab_group = row![
+                    tooltip(
+                        tab,
+                        text(format!(
+                            "{}\nMiddle-click to close (keeps unsaved changes)",
+                            visible_label(&buffer.name)
+                        )),
+                        tooltip::Position::Bottom
+                    ),
+                    tooltip(
+                        close,
+                        text("Close buffer (refuses unsaved changes)"),
+                        tooltip::Position::Bottom
+                    )
+                ]
+                .spacing(1);
+                let tab_group = mouse_area(tab_group);
+                let tab_group = if self.snapshot.connected {
+                    tab_group.on_middle_press(Message::Command(Vim9Command::CloseBuffer {
+                        buffer: buffer.id,
+                    }))
+                } else {
+                    tab_group
+                };
+                buffers = buffers.push(tab_group);
             }
             if self.snapshot.buffers_truncated {
                 buffers = buffers.push(text("More buffers in :ls").size(12));
@@ -3038,6 +3157,55 @@ mod tests {
             assert!(goto_position(invalid).is_err(), "accepted {invalid:?}");
         }
     }
+    #[test]
+    fn editor_font_shortcuts_work_without_optional_panels() {
+        use keyboard::{Key, Modifiers};
+        for (key, modifiers, expected) in [
+            ("=", Modifiers::CTRL, Shortcut::FontIncrease),
+            (
+                "=",
+                Modifiers::CTRL | Modifiers::SHIFT,
+                Shortcut::FontIncrease,
+            ),
+            ("+", Modifiers::CTRL, Shortcut::FontIncrease),
+            (
+                "+",
+                Modifiers::CTRL | Modifiers::SHIFT,
+                Shortcut::FontIncrease,
+            ),
+            ("-", Modifiers::CTRL, Shortcut::FontDecrease),
+            ("0", Modifiers::CTRL, Shortcut::FontReset),
+        ] {
+            assert_eq!(
+                native_shortcut(&Key::Character(key.into()), modifiers, false),
+                Some(expected)
+            );
+        }
+        for modifiers in [
+            Modifiers::empty(),
+            Modifiers::ALT,
+            Modifiers::CTRL | Modifiers::ALT,
+            Modifiers::CTRL | Modifiers::LOGO,
+        ] {
+            for key in ["=", "+", "-", "0"] {
+                assert_eq!(
+                    native_shortcut(&Key::Character(key.into()), modifiers, false),
+                    None
+                );
+            }
+        }
+        for key in ["-", "0"] {
+            assert_eq!(
+                native_shortcut(
+                    &Key::Character(key.into()),
+                    Modifiers::CTRL | Modifiers::SHIFT,
+                    false
+                ),
+                None
+            );
+        }
+    }
+
     #[test]
     fn native_shortcuts_leave_vim_control_navigation_available() {
         use keyboard::{key::Named, Key, Modifiers};

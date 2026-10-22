@@ -309,6 +309,9 @@ editor font size for this process without rewriting configuration.
 | Ctrl+Shift+J | Toggle problems/build-output dock |
 | Alt+Left / Alt+Right | Back / forward through Vim's jump list |
 | Ctrl+Shift+O | Open a file/new-file path form |
+| Ctrl+= / Ctrl++ | Increase editor font size |
+| Ctrl+- | Decrease editor font size |
+| Ctrl+0 | Reset editor font size |
 | Ctrl+S | Save current buffer |
 | Ctrl+Shift+F | Search project form |
 | Ctrl+Shift+B | Review build/test command |
@@ -618,3 +621,86 @@ ordinary v5 smoke passed; this does not establish reliable immediate source
 resize handling for arbitrary repeated dock toggles. Diagnostic artifacts:
 `/tmp/frost-vim9-dock-resize-20a1c69/ioctl.trace` and
 `/tmp/frost-vim9-dock-resize-20a1c69/diagnostic.json`.
+
+## Buffer labels and pointer controls
+
+With `[vim9] buffer_tabs = true`, buffer names use the shortest distinguishing
+path suffix. For example, two `src/main.rs` files appear as
+`client/src/main.rs` and `server/src/main.rs`; full paths remain in tooltips.
+Unnamed or equivalent-path buffers retain distinct buffer IDs when needed.
+Middle-click a buffer entry to close that exact buffer. Vim refuses unsaved
+changes, just as with the existing close button.
+
+During fractional scrolling, cursor shapes retain their complete source-cell
+geometry and are clipped at the viewport edge. A partially visible row no
+longer compresses or relocates its horizontal caret. Mouse/IME coordinates
+continue to use the visible clip.
+
+## Native column highlights
+
+`set cursorcolumn` and `set colorcolumn=80,120` remain native in supported
+buffer views. Signed color columns follow Vim's `textwidth`; each split keeps
+its own guides. Syntax, search, Visual selection, tabs, wide characters and
+end-of-line whitespace retain Vim's source and highlight rules. Background
+decorations do not become source text or intercept source-position hits.
+Block-cursor inversion uses the final foreground/background at the cursor
+cell, including syntax over an underlying CursorLine or column background.
+
+## Plugin scratch buffers and per-window palettes
+
+Ordinary `nofile`, `nowrite` and `acwrite` buffers now support native text,
+source-pointer gestures and precision scrolling without changing Vim's buffer
+type, write callbacks or readonly/modifiable options. Terminal and prompt
+buffers retain compatibility rendering.
+
+A local `wincolor` keeps its own resolved Normal palette across text, empty
+rows, gutters and scroll margins. Native focus/caret fallbacks use that split's
+palette; changing the palette retires old scroll imagery. General
+`winhighlight` remapping remains a compatibility case.
+
+## Help and error-list windows
+
+Help, quickfix and location lists now use native text painting for supported
+plain views. QuickFixLine follows the list's current entry even when the text
+cursor moves independently; global and location-list state remains separate.
+These windows keep Vim's own mouse, wheel and keyboard processing, including
+Enter, Ctrl-] and double-click activation. The host does not add pixel-scroll
+animation to a window that explicitly delegates input to Vim. File/scratch
+splits alongside it retain their normal precision scrolling.
+
+Default help concealment and actual wrapped lines still require compatible
+display. User options and readonly/nomodifiable settings are preserved.
+
+Editor font zoom is also available through Ctrl+=, Ctrl+- and Ctrl+0 in both
+standalone and shell-embedded Vim views. It shares the Ctrl+wheel resize path,
+keeps workbench text sizes unchanged and affects only this editor process.
+Ctrl+0 restores Frost's default content font size.
+
+The outer terminal window does not wrap embedded Vim in its content-zoom
+interceptor. Each ordinary terminal pane keeps a separate zoom scope, while
+Vim handles its own Ctrl+wheel. Keyboard and command-palette font actions target
+the active Vim editor when one is focused. Sidebar/chrome font controls remain
+independent.
+
+Clicking the body of an inactive embedded Vim focuses that pane and delivers
+the same click to its editor. Its modifiers, click count and displayed source
+position are preserved across deferred handling; Ctrl/Alt app mouse reports
+keep their modifiers. Events from a closed or replaced editor cannot focus
+its old shell pane.
+Clicking also immediately confirms the caret at its current position and
+restarts the original `guicursor` blink wait.
+
+## Native visible whitespace
+
+Common `listchars` markers retain native buffer painting. For example:
+
+```vim
+set list listchars=tab:»·,trail:·,nbsp:␣,eol:↲
+```
+
+Explicit two/three-glyph Tab markers, `space`, `lead`, `trail`, `nbsp` and
+`eol` support single-cell symbols. Every marker keeps the original source
+bytes for clicks, selection and saving; a line-end symbol is display-only.
+Each Vim split retains its own options and GUI highlight colors.
+Complex marker fields, default `^I` Tab geometry, active horizontal-edge
+markers and wrapped EOL continuations retain compatibility rendering.

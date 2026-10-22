@@ -1643,10 +1643,14 @@ impl<'a, Message> TermWidget<'a, Message> {
     /// distinguish selection (shift) and block-selection (alt) from app mouse
     /// reporting.
     pub fn modifiers(mut self, shift: bool, alt: bool, ctrl: bool) -> Self {
+        self.set_event_modifiers(shift, alt, ctrl);
+        self
+    }
+
+    pub(crate) fn set_event_modifiers(&mut self, shift: bool, alt: bool, ctrl: bool) {
         self.shift = shift;
         self.alt = alt;
         self.ctrl = ctrl;
-        self
     }
 
     /// Convert an absolute pixel position into a clamped 0-indexed (col, row).

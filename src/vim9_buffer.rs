@@ -58,13 +58,70 @@ struct PointerGesture {
     released: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct PresentedFrame {
     frame: Arc<Vim9RenderFrame>,
     metrics: Vim9RenderMetrics,
     local_metrics: Vim9RenderMetrics,
     offsets: BTreeMap<i64, f32>,
     clip: Rectangle,
+}
+
+/// Frozen input ownership for a widget message deferred until pane focus.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BodyMouseSnapshot {
+    position: Option<Point>,
+    presented: Option<PresentedFrame>,
+    modifiers: keyboard::Modifiers,
+}
+
+impl BodyMouseSnapshot {
+    pub(crate) fn modifiers(&self) -> keyboard::Modifiers {
+        self.modifiers
+    }
+
+    pub(crate) fn source_current(
+        &self,
+        frame: Option<&Vim9RenderFrame>,
+        metrics: Vim9RenderMetrics,
+    ) -> bool {
+        let Some(presented) = &self.presented else {
+            return true;
+        };
+        let Some(point) = self.position else {
+            return true;
+        };
+        let Some(old) = presented.frame.windows.iter().find(|window| {
+            presented
+                .metrics
+                .rect(&window.view)
+                .is_some_and(|rect| rect.contains(point.x, point.y))
+        }) else {
+            return true;
+        };
+        frame.is_some_and(|frame| {
+            frame.supported
+                && presented.local_metrics == metrics
+                && frame.windows.iter().any(|new| {
+                    (
+                        new.window,
+                        new.buffer,
+                        new.changedtick,
+                        &new.view,
+                        new.leftcol,
+                        new.textoff,
+                    ) == (
+                        old.window,
+                        old.buffer,
+                        old.changedtick,
+                        &old.view,
+                        old.leftcol,
+                        old.textoff,
+                    ) && (presented.offsets.get(&old.window).copied().unwrap_or(0.0) != 0.0
+                        || new.topline == old.topline)
+                })
+        })
+    }
 }
 
 impl PresentedFrame {
@@ -99,6 +156,8 @@ pub(crate) struct ScrollState {
     next_gesture: u64,
     position: Option<Point>,
     presented: Option<PresentedFrame>,
+    event_modifiers: keyboard::Modifiers,
+    model_modifiers: Option<keyboard::Modifiers>,
 }
 
 impl ScrollState {
@@ -108,6 +167,9 @@ impl ScrollState {
     }
 
     pub(crate) fn compatibility_mouse(&mut self, input: MouseInput) -> Option<MouseInput> {
+        if matches!(input, MouseInput::Press { .. }) {
+            self.cursor_blink.reset();
+        }
         self.compatibility_mouse_with(input, true)
     }
 
@@ -415,6 +477,67 @@ impl ScrollState {
         self.presented = Some(self.projection(frame, metrics, local_metrics, clip));
     }
 
+    pub(crate) fn seed_modifiers(&mut self, modifiers: keyboard::Modifiers) {
+        if self.model_modifiers != Some(modifiers) {
+            self.model_modifiers = Some(modifiers);
+            self.event_modifiers = modifiers;
+        }
+    }
+    fn observe_modifiers(&mut self, modifiers: keyboard::Modifiers) {
+        self.event_modifiers = modifiers;
+    }
+    pub(crate) fn event_modifiers(&self) -> keyboard::Modifiers {
+        self.event_modifiers
+    }
+
+    pub(crate) fn capture_body_mouse(&self) -> BodyMouseSnapshot {
+        BodyMouseSnapshot {
+            position: self.position,
+            presented: self.presented.clone(),
+            modifiers: self.event_modifiers,
+        }
+    }
+
+    pub(crate) fn route_body_mouse(
+        &mut self,
+        frame: Option<&Vim9RenderFrame>,
+        metrics: Vim9RenderMetrics,
+        mut input: MouseInput,
+        snapshot: BodyMouseSnapshot,
+    ) -> NativeInput {
+        if !snapshot.source_current(frame, metrics) {
+            self.clear();
+            match input {
+                MouseInput::Press {
+                    button: MouseButton::Left,
+                    ..
+                } => self.native_pressed = true,
+                MouseInput::Press { button, .. } => self.consumed_buttons[button.slot()] = true,
+                MouseInput::Release { button, .. } => {
+                    self.consumed_buttons[button.slot()] = false;
+                    if button == MouseButton::Left {
+                        self.native_pressed = false;
+                    }
+                }
+                _ => {}
+            }
+            return NativeInput::Handled;
+        }
+        let modifiers = snapshot.modifiers;
+        crate::sync_embedded_body_modifiers(&mut input, modifiers);
+        let latest_position = std::mem::replace(&mut self.position, snapshot.position);
+        let latest_presentation = std::mem::replace(&mut self.presented, snapshot.presented);
+        let routed = if let Some(frame) = frame {
+            self.route_mouse(frame, metrics, modifiers, input)
+        } else {
+            self.compatibility_mouse(input)
+                .map_or(NativeInput::Handled, NativeInput::Compatibility)
+        };
+        self.position = latest_position;
+        self.presented = latest_presentation;
+        routed
+    }
+
     pub(crate) fn route_mouse(
         &mut self,
         frame: &Vim9RenderFrame,
@@ -422,6 +545,9 @@ impl ScrollState {
         modifiers: keyboard::Modifiers,
         input: MouseInput,
     ) -> NativeInput {
+        if matches!(input, MouseInput::Press { .. }) {
+            self.cursor_blink.reset();
+        }
         // Completion owns screen-cell mouse semantics, including selection
         // and cancellation. Never translate its overlay to a buffer position.
         if frame.completion.is_some() {
@@ -695,11 +821,51 @@ fn render_metrics(bounds: Rectangle, metrics: Metrics) -> Vim9RenderMetrics {
     }
 }
 
+/// The protocol places each window's resolved Normal below all decorations.
+/// Legacy frames without explicit full-width backgrounds inherit global Normal.
+fn window_normal<'a>(
+    frame: &'a Vim9RenderFrame,
+    window: &jterm_core::vim9::Vim9RenderWindow,
+) -> &'a Vim9RenderStyle {
+    frame
+        .runs
+        .iter()
+        .find(|run| {
+            run.window == window.window
+                && run.line == 0
+                && run.text.is_empty()
+                && run.byte_start == 0
+                && run.byte_end == 0
+                && run.column == window.view.column
+                && run.cells == window.view.columns
+                && window.view.contains(run.row, run.column)
+        })
+        .map_or(&frame.default_style, |run| &run.style)
+}
+
 struct PaintView<'a> {
+    normal: &'a Vim9RenderStyle,
     clip: Rectangle,
     active: bool,
     runs: Vec<Vim9ProjectedRun<'a>>,
     cursor: Option<Rectangle>,
+    raw_cursor: Option<Rectangle>,
+}
+
+impl PaintView<'_> {
+    fn cursor_style<'a>(
+        &'a self,
+        cursor: Rectangle,
+        normal: &'a Vim9RenderStyle,
+    ) -> &'a Vim9RenderStyle {
+        // Row/column backgrounds come first; the final glyph or selection
+        // style determines the appearance of the text under the cursor.
+        self.runs
+            .iter()
+            .rev()
+            .find(|run| rectangle(run.rect).contains(cursor.center()))
+            .map_or(normal, |run| &run.run.style)
+    }
 }
 
 /// Prepare each window once, preserving run order for background/text layering.
@@ -716,14 +882,27 @@ fn paint_views(
         .windows
         .iter()
         .filter_map(|window| {
-            let viewport = Vim9Viewport::new(frame, window.window, metrics, offset(window.window))?;
+            let offset = offset(window.window);
+            let viewport = Vim9Viewport::new(frame, window.window, metrics, offset)?;
             let visible = rectangle(viewport.clip())
                 .intersection(&clip)
                 .filter(|r| r.area() > 0.0)?;
             Some(PaintView {
+                normal: window_normal(frame, window),
                 clip: visible,
                 active: window.window == frame.window,
                 runs: viewport.runs().collect(),
+                // Clip the full cell only after computing the actual cursor
+                // shape. A partial row must not shrink or relocate its caret.
+                raw_cursor: (window.window == frame.window)
+                    .then(|| metrics.cursor_rect(&window.cursor))
+                    .flatten()
+                    .map(|rect| {
+                        rectangle(Vim9PixelRect {
+                            y: rect.y + offset,
+                            ..rect
+                        })
+                    }),
                 cursor: (window.window == frame.window)
                     .then(|| viewport.cursor_rect())
                     .flatten()
@@ -747,16 +926,13 @@ fn paint_split_focus<Renderer: renderer::Renderer>(
     }
     let view = prepared.clip;
     let width = 1.0_f32.min(view.width / 2.0).min(view.height / 2.0);
+    let normal = prepared.normal;
     let mut accent = frame.cursor.appearance.as_ref().map_or_else(
-        || frame.default_style.foreground.unwrap_or(0xd7dce2),
-        |appearance| {
-            appearance
-                .colors(&frame.default_style, &frame.default_style)
-                .1
-        },
+        || normal.foreground.unwrap_or(0xd7dce2),
+        |appearance| appearance.colors(normal, normal).1,
     );
-    if rgb(accent) == colors(&frame.default_style, &frame.default_style).1 {
-        accent = frame.default_style.foreground.unwrap_or(0xd7dce2);
+    if rgb(accent) == colors(normal, normal).1 {
+        accent = normal.foreground.unwrap_or(0xd7dce2);
     }
     let color = Color {
         a: if focused { 0.42 } else { 0.16 },
@@ -883,6 +1059,7 @@ impl<'a, Message> NativeBuffer<'a, Message> {
         on_scroll: impl Fn(NativeWheel) -> Message + 'a,
     ) -> Self {
         self.scroll = Some(state);
+        state.borrow_mut().seed_modifiers(modifiers);
         self.modifiers = modifiers;
         self.smooth_scroll = smooth_scroll;
         self.on_scroll = Some(Box::new(on_scroll));
@@ -930,6 +1107,23 @@ where
         viewport: &Rectangle,
     ) {
         if let Some(state) = self.scroll {
+            match event {
+                Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers))
+                | Event::Keyboard(keyboard::Event::KeyPressed { modifiers, .. })
+                | Event::Keyboard(keyboard::Event::KeyReleased { modifiers, .. }) => {
+                    state.borrow_mut().observe_modifiers(*modifiers)
+                }
+                Event::Window(iced::window::Event::Unfocused) => state
+                    .borrow_mut()
+                    .observe_modifiers(keyboard::Modifiers::empty()),
+                _ => {}
+            }
+            self.modifiers = state.borrow().event_modifiers();
+            self.input.set_event_modifiers(
+                self.modifiers.shift(),
+                self.modifiers.alt(),
+                self.modifiers.control(),
+            );
             if state.borrow().animating() {
                 shell.request_redraw();
             }
@@ -1275,27 +1469,27 @@ impl<Message> NativeBuffer<'_, Message> {
     {
         let m = self.metrics;
         let view = prepared.clip;
-        let (normal_fg, normal_bg, _) = colors(&frame.default_style, &frame.default_style);
+        let normal = prepared.normal;
+        let (normal_fg, normal_bg, _) = colors(normal, normal);
         renderer.with_layer(view, |renderer| {
             renderer.fill_quad(quad(view), Background::Color(normal_bg));
             // Keep italic overhang intact across adjacent highlight runs.
             for projected in &prepared.runs {
                 let run = projected.run;
                 let area = rectangle(projected.rect);
-                let (_, bg, _) = colors(&run.style, &frame.default_style);
+                let (_, bg, _) = colors(&run.style, normal);
                 renderer.fill_quad(quad(area), Background::Color(bg));
             }
             for projected in &prepared.runs {
-                self.paint_ink(renderer, &frame.default_style, projected, view, None);
+                self.paint_ink(renderer, normal, projected, view, None);
             }
-            if let Some(cursor) = prepared.cursor.filter(|_| !self.focused || cursor_on) {
+            if let Some(cursor) = prepared
+                .raw_cursor
+                .filter(|_| prepared.cursor.is_some() && (!self.focused || cursor_on))
+            {
                 if let Some(appearance) = &frame.cursor.appearance {
-                    let under = prepared
-                        .runs
-                        .iter()
-                        .find(|p| rectangle(p.rect).contains(cursor.center()))
-                        .map_or(&frame.default_style, |p| &p.run.style);
-                    let (fg, bg) = appearance.colors(under, &frame.default_style);
+                    let under = prepared.cursor_style(cursor, normal);
+                    let (fg, bg) = appearance.colors(under, normal);
                     if !self.focused {
                         renderer.fill_quad(
                             Quad {
@@ -1327,13 +1521,7 @@ impl<Message> NativeBuffer<'_, Message> {
                                 .iter()
                                 .filter(|p| rectangle(p.rect).intersects(&caret))
                             {
-                                self.paint_ink(
-                                    renderer,
-                                    &frame.default_style,
-                                    projected,
-                                    caret,
-                                    Some(rgb(fg)),
-                                );
+                                self.paint_ink(renderer, normal, projected, caret, Some(rgb(fg)));
                             }
                         });
                     }
@@ -2120,6 +2308,152 @@ mod tests {
     }
 
     #[test]
+    fn queued_stationary_source_changes_consume_press_drag_release() {
+        let old = Arc::new(direct_frame());
+        let metrics = geometry();
+        let bounds = Rectangle::with_size(Size::new(640.0, 400.0));
+        for change in 0..3 {
+            let mut state = ScrollState::default();
+            state.position = Some(Point::new(340.0, 35.0));
+            state.record_presentation(&old, metrics, metrics, bounds);
+            let snapshot = state.capture_body_mouse();
+            let mut current = (*old).clone();
+            match change {
+                0 => current.windows[1].buffer += 1,
+                1 => current.windows[1].changedtick += 1,
+                _ => current.windows[1].topline += 1,
+            }
+            let current = Arc::new(current);
+            assert!(!snapshot.source_current(Some(&current), metrics));
+            state.record_presentation(&current, metrics, metrics, bounds);
+            assert!(matches!(
+                state.route_body_mouse(Some(&current), metrics, press(1), snapshot),
+                NativeInput::Handled
+            ));
+            for input in [
+                MouseInput::Drag {
+                    col: 43,
+                    row: 2,
+                    count: 1,
+                },
+                MouseInput::Release {
+                    col: 43,
+                    row: 2,
+                    button: MouseButton::Left,
+                },
+            ] {
+                let snapshot = state.capture_body_mouse();
+                assert!(matches!(
+                    state.route_body_mouse(Some(&current), metrics, input, snapshot),
+                    NativeInput::Handled
+                ));
+            }
+            assert!(state.pointer_command().is_none());
+            assert!(!state.native_pressed);
+        }
+        let mut first_compat = ScrollState::default();
+        assert!(
+            matches!(
+                first_compat.route_body_mouse(
+                    None,
+                    metrics,
+                    press(1),
+                    BodyMouseSnapshot::default()
+                ),
+                NativeInput::Compatibility(MouseInput::Press { .. })
+            ),
+            "a genuine first compatibility surface remains raw"
+        );
+    }
+
+    #[test]
+    fn body_focus_precedes_source_press_and_static_click_counts_remain_raw() {
+        let frame = Arc::new(direct_frame());
+        let metrics = geometry();
+        let bounds = Rectangle::with_size(Size::new(640.0, 400.0));
+        let panes = crate::PaneTree::Split {
+            axis: crate::Axis::Vertical,
+            children: vec![crate::PaneTree::Leaf(0), crate::PaneTree::Leaf(1)],
+            ratios: vec![0.5, 0.5],
+        };
+        let mut states = [ScrollState::default(), ScrollState::default()];
+        states[1].wheel(&frame, metrics, wheel(0.5));
+        states[1].record_presentation(&frame, metrics, metrics, bounds);
+        let target =
+            crate::visible_embedded_body_session(&panes, 202, true, [(0, 101), (1, 202)]).unwrap();
+        assert_eq!(target, 1);
+        // Production focus_embedded clears old state before this raw press is
+        // routed. The retained presentation still supplies its exact source.
+        states[target].position = Some(Point::new(340.0, 35.0));
+        let snapshot = states[target].capture_body_mouse();
+        states[target].clear();
+        let mut replacement = (*frame).clone();
+        replacement.windows[1].topline += 5;
+        for run in replacement.runs.iter_mut().filter(|run| run.window == 20) {
+            run.line += 5;
+        }
+        let replacement = Arc::new(replacement);
+        states[target].record_presentation(&replacement, metrics, metrics, bounds);
+        states[target].position = Some(Point::new(20.0, 35.0));
+        assert!(matches!(
+            states[target].route_body_mouse(Some(&replacement), metrics, press(1), snapshot),
+            NativeInput::Handled
+        ));
+        assert!(matches!(
+            states[target].pointer_command(),
+            Some(Vim9Command::Pointer {
+                window: 20,
+                buffer: 4,
+                line: 9,
+                phase: Vim9PointerPhase::Press,
+                ..
+            })
+        ));
+        assert!(
+            states[0].pointer_command().is_none(),
+            "the formerly focused pane receives nothing"
+        );
+        assert_eq!(
+            states[1].presented.as_ref().unwrap().frame.windows[1].topline,
+            replacement.windows[1].topline,
+            "routing a frozen event must not replace the newest painted frame"
+        );
+        states[1].clear();
+        states[1].native_pressed = false;
+        states[1].record_presentation(&frame, metrics, metrics, bounds);
+        for count in [1, 2, 3] {
+            assert!(
+                matches!(states[1].route_mouse(&frame, metrics, keyboard::Modifiers::empty(), press(count)),
+                NativeInput::Compatibility(MouseInput::Press { count: actual, .. }) if actual == count)
+            );
+            assert!(states[1].pointer_command().is_none());
+        }
+    }
+
+    #[test]
+    fn clicking_the_same_cell_restarts_native_cursor_wait_even_on_compatibility_path() {
+        let mut frame = direct_frame();
+        frame.cursor.appearance = Some(jterm_core::vim9::Vim9CursorAppearance {
+            blinkwait: 100,
+            blinkoff: 50,
+            blinkon: 50,
+            ..Default::default()
+        });
+        let mut state = ScrollState::default();
+        let now = std::time::Instant::now();
+        assert!(state.cursor_blink.sample(&frame, true, now).0);
+        let off = now + std::time::Duration::from_millis(101);
+        assert!(!state.cursor_blink.sample(&frame, true, off).0);
+        assert!(matches!(
+            state.route_mouse(&frame, geometry(), keyboard::Modifiers::empty(), press(1)),
+            NativeInput::Compatibility(_)
+        ));
+        let (visible, wait) = state.cursor_blink.sample(&frame, true, off);
+        assert!(visible);
+        assert_eq!(wait, Some(std::time::Duration::from_millis(100)));
+    }
+
+    #[test]
     fn modifiers_multiclick_and_unadvertised_pointer_keep_compatibility_semantics() {
         let frame = direct_frame();
         let metrics = geometry();
@@ -2294,6 +2628,11 @@ mod tests {
             completion: Some(Default::default()),
             ..(*frame).clone()
         });
+        let mut render_only = (*frame).clone();
+        render_only.windows[1].native_pointer = false;
+        render_only.windows[1].native_scroll = false;
+        let render_only = Arc::new(render_only);
+        let input_frame = RefCell::new(frame.clone());
         let state = RefCell::new(ScrollState::default());
         let mut terminal = crate::terminal::TerminalState::new(80, 20);
         let projection = terminal.get_projected_viewport(false);
@@ -2321,7 +2660,7 @@ mod tests {
         .app_mouse_full_grid(true)
         .on_mouse(|input| {
             Output::Mouse(state.borrow_mut().route_mouse(
-                &frame,
+                &input_frame.borrow(),
                 local_metrics(metrics),
                 keyboard::Modifiers::default(),
                 input,
@@ -2526,6 +2865,223 @@ mod tests {
             ),
             "a completion wheel must not be captured against an older native presentation"
         );
+        // A new render-only frame must not reinterpret a previously shown
+        // fractional image as stationary PTY cells before it has been drawn.
+        state
+            .borrow_mut()
+            .wheel(&frame, local_metrics(metrics), self::wheel(0.5));
+        state.borrow_mut().record_presentation(
+            &frame,
+            render_metrics(bounds, metrics),
+            local_metrics(metrics),
+            bounds,
+        );
+        state
+            .borrow_mut()
+            .observe(Some(&render_only), local_metrics(metrics), true, |_| false);
+        *input_frame.borrow_mut() = render_only.clone();
+        widget.frame = Some(&render_only);
+        output.clear();
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+            &mut widget,
+            &mut tree,
+            &Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -10.0 },
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &(),
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut output),
+            &bounds,
+        );
+        let [Output::Wheel(stale_wheel)] = output.as_slice() else {
+            panic!("the old fractional wheel must not fall through to PTY");
+        };
+        state
+            .borrow_mut()
+            .wheel(&render_only, local_metrics(metrics), stale_wheel.clone());
+        assert!(
+            !state.borrow().needs_frame(),
+            "current render-only capabilities reject the stale native wheel"
+        );
+        output.clear();
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+                &mut widget,
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &(),
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut output),
+                &bounds,
+            );
+        }
+        assert_eq!(
+            output.len(),
+            2,
+            "the obsolete image owns both press and release"
+        );
+        assert!(output
+            .iter()
+            .all(|event| matches!(event, Output::Mouse(NativeInput::Handled))));
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::draw(
+            &widget,
+            &tree,
+            &mut (),
+            &iced::Theme::Dark,
+            &renderer::Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &bounds,
+        );
+        output.clear();
+        for event in [
+            mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            },
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+            mouse::Event::ButtonPressed(mouse::Button::Middle),
+            mouse::Event::ButtonReleased(mouse::Button::Middle),
+        ] {
+            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+                &mut widget,
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &(),
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut output),
+                &bounds,
+            );
+        }
+        assert!(matches!(
+            output.first(),
+            Some(Output::Mouse(NativeInput::Compatibility(
+                MouseInput::Wheel { .. }
+            )))
+        ));
+        assert!(output
+            .iter()
+            .all(|event| matches!(event, Output::Mouse(NativeInput::Compatibility(_)))));
+        assert!(output.iter().any(|event| matches!(event, Output::Mouse(NativeInput::Compatibility(MouseInput::Press { count, .. })) if *count >= 2)));
+        assert!(state.borrow().pointer_command().is_none());
+        assert!(!state.borrow().needs_frame());
+        output.clear();
+        let enter = keyboard::Key::Named(keyboard::key::Named::Enter);
+        let mut shell = Shell::new(&mut output);
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+            &mut widget,
+            &mut tree,
+            &Event::Keyboard(keyboard::Event::KeyPressed {
+                key: enter.clone(),
+                modified_key: enter,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::default(),
+                text: Some("\r".into()),
+                repeat: false,
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &(),
+            &mut iced::advanced::clipboard::Null,
+            &mut shell,
+            &bounds,
+        );
+        assert!(
+            !shell.is_event_captured(),
+            "Enter must remain available to the existing PTY keyboard subscription"
+        );
+        assert!(output.is_empty());
+        // Disabling semantic input on one split must not affect its peer.
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+            &mut widget,
+            &mut tree,
+            &Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -10.0 },
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(Point::new(20.0, 35.0)),
+            &(),
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut output),
+            &bounds,
+        );
+        assert!(matches!(output.as_slice(), [Output::Wheel(wheel)] if wheel.window == 10));
+        // Real widget event masks must outlive later model/key-up messages.
+        for expected in [keyboard::Modifiers::CTRL, keyboard::Modifiers::SHIFT] {
+            state.borrow_mut().seed_modifiers(expected);
+            output.clear();
+            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+                &mut widget,
+                &mut tree,
+                &Event::Keyboard(keyboard::Event::ModifiersChanged(expected)),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &(),
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut output),
+                &bounds,
+            );
+            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+                &mut widget,
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &(),
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut output),
+                &bounds,
+            );
+            let raw = output
+                .iter()
+                .find_map(|event| match event {
+                    Output::Mouse(NativeInput::Compatibility(input @ MouseInput::Press { .. })) => {
+                        Some(*input)
+                    }
+                    _ => None,
+                })
+                .expect("the child must publish its actual modified press");
+            assert!(
+                matches!(raw, MouseInput::Press { ctrl, shift, .. } if ctrl == expected.control() && shift == expected.shift())
+            );
+            let snapshot = state.borrow().capture_body_mouse();
+            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+                &mut widget,
+                &mut tree,
+                &Event::Keyboard(keyboard::Event::ModifiersChanged(
+                    keyboard::Modifiers::empty(),
+                )),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &(),
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut output),
+                &bounds,
+            );
+            state.borrow_mut().seed_modifiers(expected);
+            assert!(
+                state.borrow().event_modifiers().is_empty(),
+                "an unchanged stale view seed must not roll back key-up"
+            );
+            assert_eq!(snapshot.modifiers(), expected);
+            assert!(
+                matches!(state.borrow_mut().route_body_mouse(Some(&render_only), local_metrics(metrics), raw, snapshot),
+                NativeInput::Compatibility(MouseInput::Press { ctrl, shift, .. }) if ctrl == expected.control() && shift == expected.shift())
+            );
+            assert!(state.borrow().pointer_command().is_none());
+        }
     }
 
     #[test]
@@ -2619,6 +3175,192 @@ mod tests {
             matches!(output[2], Some(MouseInput::Press { .. })),
             "the actually drawn fallback must restore ordinary Vim mouse input"
         );
+    }
+
+    #[test]
+    fn cursor_inverts_topmost_glyph_style_above_background_runs() {
+        let mut frame = direct_frame();
+        let index = frame
+            .runs
+            .iter()
+            .position(|run| {
+                run.row == frame.cursor.row
+                    && run.column == frame.cursor.column
+                    && run.window == frame.window
+            })
+            .unwrap();
+        frame.runs[index].style.foreground = Some(0xaabbcc);
+        frame.runs[index].style.background = Some(0x223344);
+        let mut background = frame.runs[index].clone();
+        background.text.clear();
+        background.line = 0;
+        background.byte_start = 0;
+        background.byte_end = 0;
+        background.style.foreground = Some(0x556677);
+        background.style.background = Some(0x112233);
+        frame.runs.insert(0, background);
+        let bounds = Rectangle::with_size(Size::new(640.0, 400.0));
+        let views = paint_views(&frame, geometry(), bounds, |_| 0.0);
+        let active = views.iter().find(|view| view.active).unwrap();
+        let appearance = jterm_core::vim9::Vim9CursorAppearance::default();
+        assert_eq!(
+            appearance.colors(
+                active.cursor_style(active.raw_cursor.unwrap(), &frame.default_style),
+                &frame.default_style
+            ),
+            (0x223344, 0xaabbcc)
+        );
+        let background_only = PaintView {
+            normal: active.normal,
+            clip: active.clip,
+            active: true,
+            runs: vec![active.runs[0]],
+            cursor: active.cursor,
+            raw_cursor: active.raw_cursor,
+        };
+        assert_eq!(
+            appearance.colors(
+                background_only.cursor_style(active.raw_cursor.unwrap(), &frame.default_style),
+                &frame.default_style
+            ),
+            (0x112233, 0x556677),
+            "an empty source cell must still inherit its painted background"
+        );
+    }
+
+    #[test]
+    fn source_row_highlight_is_not_a_window_normal_marker() {
+        let mut frame = direct_frame();
+        let window = &frame.windows[0];
+        frame.runs.insert(
+            0,
+            jterm_core::vim9::Vim9RenderRun {
+                window: window.window,
+                row: window.view.row,
+                column: window.view.column,
+                cells: window.view.columns,
+                line: window.topline,
+                style: Vim9RenderStyle {
+                    background: Some(0xaa2266),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let views = paint_views(
+            &frame,
+            geometry(),
+            Rectangle::with_size(Size::new(640.0, 400.0)),
+            |_| 0.0,
+        );
+        assert_eq!(
+            views[0].normal, &frame.default_style,
+            "a QuickFixLine full-width source-row background must not become pane Normal"
+        );
+        assert_eq!(
+            views[0].runs[0].run.style.background,
+            Some(0xaa2266),
+            "the highlighted row still retains its own background"
+        );
+    }
+
+    #[test]
+    fn scrolled_splits_keep_independent_normal_and_focus_colors() {
+        let mut frame = direct_frame();
+        frame.cursor.appearance = Some(Default::default());
+        let palette = [(0xaabbcc, 0x102030), (0xddaabb, 0x304050)];
+        for (window, (fg, bg)) in frame.windows.iter().zip(palette) {
+            frame.runs.insert(
+                0,
+                jterm_core::vim9::Vim9RenderRun {
+                    window: window.window,
+                    row: window.view.row,
+                    column: window.view.column,
+                    cells: window.view.columns,
+                    text: String::new(),
+                    style: Vim9RenderStyle {
+                        foreground: Some(fg),
+                        background: Some(bg),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        let bounds = Rectangle::with_size(Size::new(640.0, 400.0));
+        let views = paint_views(&frame, geometry(), bounds, |_| -12.5);
+        for (view, (fg, bg)) in views.iter().zip(palette) {
+            assert_eq!(
+                colors(view.normal, view.normal),
+                (rgb(fg), rgb(bg), rgb(fg))
+            );
+        }
+        let active = views.iter().find(|view| view.active).unwrap();
+        assert_eq!(
+            frame.cursor.appearance.as_ref().unwrap().colors(
+                active.cursor_style(active.raw_cursor.unwrap(), active.normal),
+                active.normal
+            ),
+            (0x304050, 0xddaabb),
+            "unspecified glyph styles must inherit the owning split Normal"
+        );
+        let mut recorder = CompletionRecorder::default();
+        paint_split_focus(&mut recorder, &frame, active, true);
+        assert!(!recorder.quads.is_empty());
+        assert!(
+            recorder.quads.iter().all(|(_, color, _)| *color
+                == Background::Color(Color {
+                    a: 0.42,
+                    ..rgb(0xddaabb)
+                })),
+            "focus outline must use the active window palette rather than global Normal"
+        );
+    }
+
+    #[test]
+    fn fractional_scroll_clips_cursor_without_resizing_its_source_cell() {
+        let mut frame = direct_frame();
+        let metrics = geometry();
+        let bounds = Rectangle::with_size(Size::new(640.0, 400.0));
+        frame.windows[1].cursor.row = frame.windows[1].view.row;
+        frame.cursor = frame.windows[1].cursor.clone();
+        let views = paint_views(
+            &frame,
+            metrics,
+            bounds,
+            |id| if id == 20 { -12.5 } else { 0.0 },
+        );
+        let view = views.iter().find(|view| view.active).unwrap();
+        let raw = view.raw_cursor.unwrap();
+        let visible = view.cursor.unwrap();
+        assert_eq!(raw.height, metrics.line_height);
+        assert_eq!(visible.y, view.clip.y);
+        assert_eq!(raw.y + 12.5, visible.y);
+        assert_eq!(visible.height, metrics.line_height - 12.5);
+        let appearance = jterm_core::vim9::Vim9CursorAppearance {
+            shape: jterm_core::vim9::Vim9CursorShape::Horizontal,
+            percentage: 20,
+            ..Default::default()
+        };
+        let shape = rectangle(appearance.paint_rect(
+            Vim9PixelRect {
+                x: raw.x,
+                y: raw.y,
+                width: raw.width,
+                height: raw.height,
+            },
+            metrics.cell_width,
+            1.0,
+        ));
+        assert_eq!(shape.height, metrics.line_height * 0.2);
+        assert_eq!(shape.y + shape.height, raw.y + raw.height);
+        // Cropping the bottom of the same cell must hide its underline, not
+        // move the underline up to the visible edge.
+        let clipped = Rectangle {
+            height: raw.height * 0.5,
+            ..raw
+        };
+        assert!(shape.intersection(&clipped).is_none());
     }
 
     #[test]

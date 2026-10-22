@@ -342,6 +342,45 @@ mod tests {
     }
 
     #[test]
+    fn per_pane_scope_leaves_embedded_editor_zoom_with_its_child() {
+        // This is the content-tree composition: ordinary panes get the app's
+        // zoom scope, while an embedded editor owns its own font and events.
+        for (x, expected) in [(50.0, Output::Zoom(Group::Content)), (150.0, Output::Child)] {
+            let ordinary = scope(
+                Group::Content,
+                true,
+                true,
+                |group, _| Output::Zoom(group),
+                Element::new(Probe),
+            );
+            let editor = Element::new(Probe);
+            let mut element: Element<'_, Output, (), TestRenderer> =
+                iced::widget::Row::with_children([ordinary, editor]).into();
+            let mut tree = Tree::new(element.as_widget());
+            let size = Size::new(200.0, 100.0);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &TestRenderer,
+                &layout::Limits::new(Size::ZERO, size),
+            );
+            let mut output = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Pixels { x: 0.0, y: 1.0 },
+                }),
+                Layout::new(&node),
+                mouse::Cursor::Available(iced::Point::new(x, 50.0)),
+                &TestRenderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut output),
+                &Rectangle::with_size(size),
+            );
+            assert_eq!(output, vec![expected]);
+        }
+    }
+
+    #[test]
     fn unavailable_levitating_clipped_and_half_open_edges_never_zoom() {
         let viewport = Rectangle::with_size(Size::new(100.0, 100.0));
         for cursor in [
