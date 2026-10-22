@@ -6,6 +6,10 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    # Font measurement must track Iced's shaping engine. Upgrade as one stack.
+    ignore:
+      - dependency-name: cosmic-text
+        versions: [">=0.20"]
     groups:
       rust-dependencies:
         patterns:

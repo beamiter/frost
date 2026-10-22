@@ -1934,7 +1934,7 @@ fn measure_mono_ascii_advance(font: iced::Font, font_size: f32) -> Option<f32> {
 
     with_metrics_font_system(|font_system| {
         let mut buffer = Buffer::new(font_system, TextMetrics::new(font_size, font_size));
-        buffer.set_size(font_system, Some(4096.0), Some(font_size * 2.0));
+        buffer.set_size(Some(4096.0), Some(font_size * 2.0));
         let attrs = Attrs::new()
             .family(family)
             .weight(Weight(weight))
@@ -1944,7 +1944,7 @@ fn measure_mono_ascii_advance(font: iced::Font, font_size: f32) -> Option<f32> {
         // hmtx advances (no kerning or ligatures), identical to what iced's
         // Basic shaper produces for the same run.
         const PROBE: &str = "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
-        buffer.set_text(font_system, PROBE, &attrs, Shaping::Basic, None);
+        buffer.set_text(PROBE, &attrs, Shaping::Basic, None);
         buffer.shape_until_scroll(font_system, false);
         let mut advance: Option<f32> = None;
         let mut glyphs = 0usize;
@@ -3266,17 +3266,16 @@ mod tests {
                     let mut buffer =
                         Buffer::new(&mut font_system, TextMetrics::new(size, size * 1.2));
                     buffer.set_size(
-                        &mut font_system,
                         Some(run_layout_width(cw, run.chars().count()) * scale),
                         Some(size * 1.2),
                     );
                     buffer.set_text(
-                        &mut font_system,
                         run,
                         &Attrs::new().family(Family::Monospace),
                         Shaping::Basic,
                         None,
                     );
+                    buffer.shape_until_scroll(&mut font_system, false);
                     assert_eq!(
                         buffer.layout_runs().count(),
                         1,
@@ -3323,8 +3322,9 @@ mod tests {
                         iced::font::Style::Normal => Style::Normal,
                     });
                 let mut buffer = Buffer::new(&mut system, TextMetrics::new(20.0, 25.0));
-                buffer.set_size(&mut system, Some(f32::INFINITY), Some(25.0));
-                buffer.set_text(&mut system, "中文界", &attrs, Shaping::Advanced, None);
+                buffer.set_size(Some(f32::INFINITY), Some(25.0));
+                buffer.set_text("中文界", &attrs, Shaping::Advanced, None);
+                buffer.shape_until_scroll(&mut system, false);
                 let runs: Vec<_> = buffer.layout_runs().collect();
                 assert_eq!(runs.len(), 1);
                 assert_eq!(runs[0].glyphs.len(), 3);
@@ -3361,14 +3361,14 @@ mod tests {
         // finite glyph positions, however narrow the pane is.
         let mut font_system = FontSystem::new();
         let mut buffer = Buffer::new(&mut font_system, TextMetrics::new(18.9, 25.2));
-        buffer.set_size(&mut font_system, Some(f32::INFINITY), Some(25.2));
+        buffer.set_size(Some(f32::INFINITY), Some(25.2));
         buffer.set_text(
-            &mut font_system,
             "▸ 1234 output rows hidden — click to expand",
             &Attrs::new().family(Family::Monospace),
             Shaping::Advanced,
             None,
         );
+        buffer.shape_until_scroll(&mut font_system, false);
         let runs: Vec<_> = buffer.layout_runs().collect();
         assert!(runs.len() <= 1);
         for run in runs {

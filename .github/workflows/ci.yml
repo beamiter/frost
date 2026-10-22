@@ -60,6 +60,9 @@ jobs:
       - name: Check Files follow callback races
         run: python3 scripts/test-files-follow.py
 
+      - name: Check measurement and rendering font stack
+        run: python3 scripts/check-font-stack.py
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -204,6 +207,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             pkg-config \
+            fonts-dejavu-core \
+            fonts-noto-cjk \
             libfontconfig1-dev \
             libwayland-dev \
             libx11-dev \
