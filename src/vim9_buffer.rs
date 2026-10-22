@@ -16,7 +16,7 @@ use iced::{
 use jterm_core::vim9::{
     Vim9BufferPosition, Vim9Command, Vim9CursorBlink, Vim9PixelRect, Vim9PixelScroll,
     Vim9PointerPhase, Vim9ProjectedRun, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect,
-    Vim9RenderStyle, Vim9Viewport,
+    Vim9RenderRun, Vim9RenderStyle, Vim9Viewport,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -223,7 +223,7 @@ impl ScrollState {
         wheel: NativeWheel,
     ) {
         if self.pointer.is_some()
-            || frame.completion.is_some()
+            || frame.has_overlays()
             || !matches!(frame.mode.as_str(), "n" | "i")
         {
             return;
@@ -279,7 +279,7 @@ impl ScrollState {
             self.clear();
             return;
         };
-        if frame.completion.is_some() {
+        if frame.has_overlays() {
             self.clear();
             return;
         }
@@ -319,7 +319,7 @@ impl ScrollState {
         window: i64,
         metrics: Vim9RenderMetrics,
     ) -> f32 {
-        if frame.completion.is_some() {
+        if frame.has_overlays() {
             return 0.0;
         }
         self.pixels
@@ -548,9 +548,9 @@ impl ScrollState {
         if matches!(input, MouseInput::Press { .. }) {
             self.cursor_blink.reset();
         }
-        // Completion owns screen-cell mouse semantics, including selection
-        // and cancellation. Never translate its overlay to a buffer position.
-        if frame.completion.is_some() {
+        // Vim owns popup/completion screen-cell mouse semantics, including
+        // closing and selection. Never translate an overlay to source text.
+        if frame.has_overlays() {
             return self
                 .compatibility_mouse_with(input, false)
                 .map_or(NativeInput::Handled, NativeInput::Compatibility);
@@ -693,7 +693,7 @@ fn wheel_at(
     position: Point,
     delta: mouse::ScrollDelta,
 ) -> Option<NativeWheel> {
-    if frame.completion.is_some() || !matches!(frame.mode.as_str(), "n" | "i") {
+    if frame.has_overlays() || !matches!(frame.mode.as_str(), "n" | "i") {
         return None;
     }
     let (row, column) = geometry.cell_at(position.x, position.y)?;
@@ -756,12 +756,14 @@ fn quad(bounds: Rectangle) -> Quad {
 }
 
 /// Keep decoration outside Vim's content geometry and inside the editor.
-/// The final border overlays the original rectangle, including when clipped.
-fn paint_completion_surface<Renderer: renderer::Renderer>(
+/// Completion adds an outline at its original rectangle, even when clipped;
+/// ordinary popup borders come from Vim's runs and need no second outline.
+fn paint_overlay_surface<Renderer: renderer::Renderer>(
     renderer: &mut Renderer,
     view: Rectangle,
     editor_clip: Rectangle,
     foreground: Color,
+    outline: bool,
     paint_content: impl FnOnce(&mut Renderer, Rectangle),
 ) {
     let Some(clip) = view.intersection(&editor_clip) else {
@@ -784,21 +786,23 @@ fn paint_completion_surface<Renderer: renderer::Renderer>(
         }
         renderer.with_layer(clip, |renderer| {
             paint_content(renderer, clip);
-            renderer.fill_quad(
-                Quad {
-                    bounds: view,
-                    border: iced::Border {
-                        color: Color {
-                            a: foreground.a * 0.20,
-                            ..foreground
+            if outline {
+                renderer.fill_quad(
+                    Quad {
+                        bounds: view,
+                        border: iced::Border {
+                            color: Color {
+                                a: foreground.a * 0.20,
+                                ..foreground
+                            },
+                            width: 1.0,
+                            ..Default::default()
                         },
-                        width: 1.0,
-                        ..Default::default()
+                        ..Quad::default()
                     },
-                    ..Quad::default()
-                },
-                Background::Color(Color::TRANSPARENT),
-            );
+                    Background::Color(Color::TRANSPARENT),
+                );
+            }
         });
     });
 }
@@ -1170,7 +1174,7 @@ where
         }
         if self.focused
             && self.frame.is_some_and(|frame| {
-                matches!(frame.mode.as_str(), "n" | "i") && frame.completion.is_none()
+                matches!(frame.mode.as_str(), "n" | "i") && !frame.has_overlays()
             })
             && !self.modifiers.control()
             && !self.modifiers.shift()
@@ -1291,7 +1295,7 @@ where
         }
         // Popup geometry belongs to the full editor grid. Draw it after all
         // splits and cursors so it can cover a neighboring split or separator.
-        self.paint_completion(renderer, frame, geometry, clip);
+        self.paint_overlays(renderer, frame, geometry, clip);
         if let Some(state) = self.scroll {
             state.borrow_mut().record_presentation(
                 frame,
@@ -1409,7 +1413,7 @@ impl<Message> NativeBuffer<'_, Message> {
         }
     }
 
-    fn paint_completion<Renderer>(
+    fn paint_overlays<Renderer>(
         &self,
         renderer: &mut Renderer,
         frame: &Vim9RenderFrame,
@@ -1418,44 +1422,101 @@ impl<Message> NativeBuffer<'_, Message> {
     ) where
         Renderer: text::Renderer<Font = Font>,
     {
-        let Some(menu) = frame.completion.as_ref() else {
+        // Vim reserves zindex 100 for the completion menu. The producer
+        // supplies stable popup order; all surfaces stay outside source paint.
+        for popup in frame.popups.iter().filter(|popup| popup.zindex < 100) {
+            self.paint_overlay(
+                renderer,
+                frame,
+                metrics,
+                editor_clip,
+                &popup.view,
+                &popup.default_style,
+                &popup.runs,
+                false,
+            );
+        }
+        if let Some(menu) = &frame.completion {
+            self.paint_overlay(
+                renderer,
+                frame,
+                metrics,
+                editor_clip,
+                &menu.view,
+                &menu.default_style,
+                &menu.runs,
+                true,
+            );
+        }
+        for popup in frame.popups.iter().filter(|popup| popup.zindex >= 100) {
+            self.paint_overlay(
+                renderer,
+                frame,
+                metrics,
+                editor_clip,
+                &popup.view,
+                &popup.default_style,
+                &popup.runs,
+                false,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_overlay<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        frame: &Vim9RenderFrame,
+        metrics: Vim9RenderMetrics,
+        editor_clip: Rectangle,
+        bounds: &Vim9RenderRect,
+        normal: &Vim9RenderStyle,
+        runs: &[Vim9RenderRun],
+        outline: bool,
+    ) where
+        Renderer: text::Renderer<Font = Font>,
+    {
+        let Some(view) = metrics.rect(bounds).map(rectangle) else {
             return;
         };
-        let Some(view) = metrics.rect(&menu.view).map(rectangle) else {
-            return;
-        };
-        let (foreground, background, _) = colors(&menu.default_style, &frame.default_style);
-        paint_completion_surface(renderer, view, editor_clip, foreground, |renderer, clip| {
-            renderer.fill_quad(quad(view), Background::Color(background));
-            let runs: Vec<_> = menu
-                .runs
-                .iter()
-                .filter_map(|run| {
-                    Some(Vim9ProjectedRun {
-                        run,
-                        rect: metrics.cell_rect(run.row, run.column, run.cells)?,
-                        clip: Vim9PixelRect {
-                            x: clip.x,
-                            y: clip.y,
-                            width: clip.width,
-                            height: clip.height,
-                        },
+        let (foreground, background, _) = colors(normal, &frame.default_style);
+        paint_overlay_surface(
+            renderer,
+            view,
+            editor_clip,
+            foreground,
+            outline,
+            |renderer, clip| {
+                renderer.fill_quad(quad(view), Background::Color(background));
+                let runs: Vec<_> = runs
+                    .iter()
+                    .filter_map(|run| {
+                        Some(Vim9ProjectedRun {
+                            run,
+                            rect: metrics.cell_rect(run.row, run.column, run.cells)?,
+                            clip: Vim9PixelRect {
+                                x: clip.x,
+                                y: clip.y,
+                                width: clip.width,
+                                height: clip.height,
+                            },
+                        })
                     })
-                })
-                .collect();
-            // Paint every row's full background before glyphs, preserving
-            // padding and italic overhang exactly as the supplied GUI runs.
-            for projected in &runs {
-                let (_, background, _) = colors(&projected.run.style, &menu.default_style);
-                renderer.fill_quad(
-                    quad(rectangle(projected.rect)),
-                    Background::Color(background),
-                );
-            }
-            for projected in &runs {
-                self.paint_ink(renderer, &menu.default_style, projected, clip, None);
-            }
-        });
+                    .collect();
+                // Paint every row's full background before glyphs, preserving
+                // padding and italic overhang exactly as the supplied GUI runs.
+                for projected in &runs {
+                    let (_, background, _) = colors(&projected.run.style, normal);
+                    renderer.fill_quad(
+                        quad(rectangle(projected.rect)),
+                        Background::Color(background),
+                    );
+                }
+                for projected in &runs {
+                    self.paint_ink(renderer, normal, projected, clip, None);
+                }
+            },
+        );
     }
 
     fn paint_native_view<Renderer>(
@@ -1585,6 +1646,43 @@ mod tests {
     struct CompletionRecorder {
         clips: Vec<Rectangle>,
         quads: Vec<(Quad, Background, Rectangle)>,
+        text: Vec<(String, Point, Color, Rectangle)>,
+    }
+
+    impl text::Renderer for CompletionRecorder {
+        type Font = Font;
+        type Paragraph = iced::advanced::graphics::text::Paragraph;
+        type Editor = iced::advanced::graphics::text::Editor;
+        const ICON_FONT: Font = Font::MONOSPACE;
+        const CHECKMARK_ICON: char = 'x';
+        const ARROW_DOWN_ICON: char = 'v';
+        const SCROLL_UP_ICON: char = '^';
+        const SCROLL_DOWN_ICON: char = 'v';
+        const SCROLL_LEFT_ICON: char = '<';
+        const SCROLL_RIGHT_ICON: char = '>';
+        const ICED_LOGO: char = 'i';
+
+        fn default_font(&self) -> Font {
+            Font::MONOSPACE
+        }
+        fn default_size(&self) -> Pixels {
+            Pixels(14.0)
+        }
+        fn fill_paragraph(&mut self, _: &Self::Paragraph, _: Point, _: Color, _: Rectangle) {
+            panic!("native runs must use fill_text");
+        }
+        fn fill_editor(&mut self, _: &Self::Editor, _: Point, _: Color, _: Rectangle) {
+            panic!("native runs must use fill_text");
+        }
+        fn fill_text(
+            &mut self,
+            text: Text<String, Font>,
+            position: Point,
+            color: Color,
+            clip: Rectangle,
+        ) {
+            self.text.push((text.content, position, color, clip));
+        }
     }
 
     impl renderer::Renderer for CompletionRecorder {
@@ -2040,6 +2138,38 @@ mod tests {
         );
         // The overlay can extend from one split across the separator. Its
         // appearance immediately cancels stale source-bound wheel motion.
+        assert_eq!(state.offset(&frame, 20, metrics), 0.0);
+        assert!(wheel_at(
+            &frame,
+            metrics,
+            Point::new(340.0, 35.0),
+            mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }
+        )
+        .is_none());
+        state.observe(Some(&frame), metrics, true, |_| false);
+        assert!(state.pixels.is_empty());
+        state.wheel(&frame, metrics, wheel(1.0));
+        assert!(state.scroll_commands().is_empty());
+        assert!(matches!(
+            state.route_mouse(&frame, metrics, keyboard::Modifiers::default(), press(1)),
+            NativeInput::Compatibility(_)
+        ));
+    }
+
+    #[test]
+    fn vim_popups_reset_motion_without_capturing_vim_mouse_input() {
+        let mut frame = direct_frame();
+        let metrics = geometry();
+        let mut state = ScrollState::default();
+        state.wheel(&frame, metrics, wheel(0.5));
+        assert_eq!(state.offset(&frame, 20, metrics), -10.0);
+        frame.popups = serde_json::from_value(serde_json::json!([
+            {"id":1001,"zindex":50,
+             "view":{"row":2,"column":38,"rows":2,"columns":16},
+             "default_style":{"background":0x123456},
+             "runs":[{"row":2,"column":38,"text":"文档","cells":4}]}
+        ]))
+        .unwrap();
         assert_eq!(state.offset(&frame, 20, metrics), 0.0);
         assert!(wheel_at(
             &frame,
@@ -3506,6 +3636,125 @@ mod tests {
     }
 
     #[test]
+    fn vim_popup_surfaces_cover_splits_and_preserve_zorder_rgb_and_unicode() {
+        let mut frame = direct_frame();
+        frame.mode = "i".into();
+        frame.popups = serde_json::from_value(serde_json::json!([
+            {"id":1003,"zindex":50,
+             "view":{"row":2,"column":38,"rows":2,"columns":16},
+             "default_style":{"background":0x352413},"runs":[]},
+            {"id":1001,"zindex":50,
+             "view":{"row":2,"column":38,"rows":2,"columns":16},
+             "default_style":{"foreground":0xeeddaa,"background":0x294761},
+             "runs":[{"row":2,"column":38,"text":"文档","cells":4,
+                      "style":{"foreground":0x19c3a7,"background":0x8351a7}}]},
+            {"id":1002,"zindex":150,
+             "view":{"row":2,"column":38,"rows":2,"columns":16},
+             "default_style":{"background":0x135724},
+             "runs":[{"row":3,"column":38,"text":"e\u{301}","cells":1}]}
+        ]))
+        .unwrap();
+        frame.completion = Some(
+            serde_json::from_value(serde_json::json!({
+                "view":{"row":2,"column":38,"rows":2,"columns":16},
+                "default_style":{"background":0x246813},"runs":[]
+            }))
+            .unwrap(),
+        );
+        let mut terminal = crate::terminal::TerminalState::new(80, 20);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = crate::Theme::default();
+        let mut metrics = Metrics::new(14.0, 1.0, 0.0, false);
+        metrics.cell_w = 8.0;
+        metrics.cell_h = 20.0;
+        let input: TermWidget<'_, ()> = TermWidget::new(
+            projection.cells(),
+            (2, 42),
+            true,
+            crate::terminal::CursorShape::Block,
+            true,
+            &theme,
+            metrics,
+            Font::MONOSPACE,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            0,
+            0,
+        );
+        let widget = NativeBuffer::new(input, None, metrics, Font::MONOSPACE, true, true);
+        let editor = Rectangle::with_size(Size::new(640.0, 400.0));
+        let geometry = render_metrics(editor, metrics);
+        let view = rectangle(geometry.rect(&frame.popups[0].view).unwrap());
+        let mut recorder = CompletionRecorder::default();
+        widget.paint_overlays(&mut recorder, &frame, geometry, editor);
+        assert!(recorder.clips.is_empty());
+        let surfaces: Vec<_> = recorder
+            .quads
+            .iter()
+            .filter_map(|(quad, color, clip)| {
+                if quad.bounds == view
+                    && [
+                        Background::Color(rgb(0x352413)),
+                        Background::Color(rgb(0x294761)),
+                        Background::Color(rgb(0x246813)),
+                        Background::Color(rgb(0x135724)),
+                    ]
+                    .contains(color)
+                {
+                    assert_eq!(*clip, view);
+                    Some(*color)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            surfaces,
+            vec![
+                Background::Color(rgb(0x352413)),
+                Background::Color(rgb(0x294761)),
+                Background::Color(rgb(0x246813)),
+                Background::Color(rgb(0x135724))
+            ],
+            "equal-zindex older popups stay above newer popups, before completion"
+        );
+        assert!(
+            recorder.quads.iter().any(|(quad, color, clip)| {
+                *color == Background::Color(rgb(0x8351a7))
+                    && quad.bounds.width == 32.0
+                    && *clip == view
+            }),
+            "CJK popup text must retain its four display cells across the separator"
+        );
+        let (_, at, color, clip) = recorder
+            .text
+            .iter()
+            .find(|(text, ..)| text == "文档")
+            .unwrap();
+        assert_eq!(*at, Point::new(view.x, view.y + metrics.cell_h / 2.0));
+        assert_eq!(*color, rgb(0x19c3a7));
+        assert!(clip.intersection(&view).is_some());
+        assert!(recorder.text.iter().any(|(text, ..)| text == "e\u{301}"));
+        assert_eq!(
+            recorder
+                .quads
+                .iter()
+                .filter(|(quad, ..)| quad.border.width > 0.0)
+                .count(),
+            1,
+            "Vim supplies popup borders; only completion adds its native outline"
+        );
+        frame.completion = None;
+        frame.popups.clear();
+        let mut closed = CompletionRecorder::default();
+        widget.paint_overlays(&mut closed, &frame, geometry, editor);
+        assert!(closed.quads.is_empty() && closed.text.is_empty());
+    }
+
+    #[test]
     fn completion_elevation_preserves_vim_bounds_colors_and_paint_order() {
         use renderer::Renderer as _;
 
@@ -3533,11 +3782,12 @@ mod tests {
         ] {
             let mut recorder = CompletionRecorder::default();
             let content_clip = view.intersection(&editor_clip).unwrap();
-            paint_completion_surface(
+            paint_overlay_surface(
                 &mut recorder,
                 view,
                 editor_clip,
                 foreground,
+                true,
                 |renderer, clip| {
                     assert_eq!(clip, content_clip);
                     renderer.fill_quad(quad(view), Background::Color(background));
@@ -3590,11 +3840,12 @@ mod tests {
             assert_eq!(clip, content_clip);
         }
         let mut recorder = CompletionRecorder::default();
-        paint_completion_surface(
+        paint_overlay_surface(
             &mut recorder,
             view,
             Rectangle::with_size(Size::new(4.0, 4.0)),
             foreground,
+            true,
             |_, _| panic!("offscreen completion must not paint"),
         );
         assert!(recorder.quads.is_empty());
