@@ -611,6 +611,11 @@ enum Shortcut {
     FontReset,
 }
 
+fn diagnostic_shortcuts_enabled(visible: bool, mode: &str) -> bool {
+    // Terminal job/normal mode owns F8, including SimpleTerminal's popup.
+    visible && mode != "t" && !mode.starts_with("nt")
+}
+
 fn native_shortcut(
     key: &keyboard::Key,
     modifiers: keyboard::Modifiers,
@@ -1820,7 +1825,11 @@ impl Ide {
         if !self.input_active() {
             return Task::none();
         }
-        if let Some(shortcut) = native_shortcut(&key, modifiers, self.dock_open) {
+        if let Some(shortcut) = native_shortcut(
+            &key,
+            modifiers,
+            diagnostic_shortcuts_enabled(self.dock_open, &self.snapshot.mode),
+        ) {
             return self.shortcut(shortcut);
         }
         if modifiers.control() && modifiers.shift() && !modifiers.alt() && !modifiers.logo() {
@@ -3471,6 +3480,27 @@ mod tests {
             })
         ));
         assert!(vim9::vim9_palette_query("./>literal.rs").is_none());
+    }
+    #[test]
+    fn terminal_modes_keep_diagnostic_function_keys_with_vim() {
+        for visible in [false, true] {
+            for mode in ["t", "nt", "ntT"] {
+                for modifiers in [keyboard::Modifiers::empty(), keyboard::Modifiers::SHIFT] {
+                    assert_eq!(
+                        native_shortcut(
+                            &keyboard::Key::Named(keyboard::key::Named::F8),
+                            modifiers,
+                            diagnostic_shortcuts_enabled(visible, mode)
+                        ),
+                        None
+                    );
+                }
+            }
+        }
+        for mode in ["n", "i", "v", "no"] {
+            assert!(diagnostic_shortcuts_enabled(true, mode));
+            assert!(!diagnostic_shortcuts_enabled(false, mode));
+        }
     }
     #[test]
     fn startup_and_closing_do_not_own_shell_persistence_or_force_editor_exit() {
