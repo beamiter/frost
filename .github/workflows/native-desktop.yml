@@ -118,7 +118,7 @@ jobs:
         run: python3 scripts/native-recovery-report.py --runner scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend wayland --pointer "$RUNNER_TEMP/frost-clipboard/native-pointer" --output native-smoke-artifacts/wayland-recovery-report
       - name: Preserve screenshots and PTY evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: frost-native-desktop-${{ github.sha }}
           path: native-smoke-artifacts
