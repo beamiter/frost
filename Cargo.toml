@@ -22,7 +22,7 @@ cosmic-text = "0.15"
 iced_winit = { version = "=0.14.0", default-features = false }
 libc = "0.2"
 # Pin the shared shell GUI entry and precise scrolling contract.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "357787dec4482fe172310f12ec54cfc040abdeef" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "58d1c2c9802ca958c14f4d7758d5cdef2f7d56d5" }
 tokio = { version = "1", features = ["rt"] }
 anyhow = "1.0"
 log = "0.4"
@@ -71,4 +71,4 @@ wayland-client = { path = "vendor/wayland-client" }
 
 
 [dev-dependencies]
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "357787dec4482fe172310f12ec54cfc040abdeef", features = ["session-parity-tests"] }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "58d1c2c9802ca958c14f4d7758d5cdef2f7d56d5", features = ["session-parity-tests"] }

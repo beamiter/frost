@@ -83,7 +83,7 @@ def main():
         "endfunction\n"
         "inoremap <silent> <F8> <Cmd>call NativeFixtureComplete()<CR>\n"
         "function! NativeFixtureState(timer) abort\n"
-        f"call writefile([json_encode({{'termguicolors': &termguicolors, 'mode': mode(), 'pumvisible': pumvisible(), 'selected': get(complete_info(['selected']), 'selected', -1), 'windows': winnr('$'), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'topline': line('w0'), 'text': getline('.'), 'completion_line': getline(2), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
+        f"call writefile([json_encode({{'termguicolors': &termguicolors, 'mode': mode(), 'pumvisible': pumvisible(), 'selected': get(complete_info(['selected']), 'selected', -1), 'windows': winnr('$'), 'quickfix_size': len(getqflist()), 'quickfix_title': get(getqflist({{'title': 1}}), 'title', ''), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'topline': line('w0'), 'text': getline('.'), 'completion_line': getline(2), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
         f"call rename({quoted(str(state_file) + '.tmp')}, {quoted(state_file)})\n"
         "endfunction\n"
         "call timer_start(60, function('NativeFixtureState'), {'repeat': -1})\n",
@@ -183,6 +183,61 @@ def main():
             wait_for(lambda: state().get("render", {}).get("supported")
                      and color_count("plugin-" + kind + "-removed", plugin_rgb) == 0,
                      "removed plugin " + kind + " paint", app)
+        # The fixture has no language service: Enter on >format must retain
+        # the modal. Replacing its query and immediately confirming a real
+        # split proves both unavailable ownership and latest-query dispatch.
+        xdo("key", "ctrl+shift+p")
+        xdo("type", "--clearmodifiers", "--delay", "0", ">format")
+        xdo("key", "Return")
+        time.sleep(0.15)
+        capture("palette-unavailable-format")
+        xdo("key", "ctrl+a")
+        xdo("type", "--clearmodifiers", "--delay", "0", ">vertical split")
+        xdo("key", "Return")
+        wait_for(lambda: state().get("windows") == 2, "typed command palette vertical split", app)
+        assert state().get("modified") == 0
+        assert source.read_text(encoding="utf-8") == original
+        report["command_palette_unavailable_and_same_batch_filter"] = "passed"
+        wait_for(lambda: native_splits("palette-split-focus", 2, 1),
+                 "native split focus after palette command", app)
+        command("only")
+        wait_for(lambda: state().get("windows") == 1, "return from command palette split", app)
+        xdo("key", "ctrl+shift+p")
+        xdo("type", "--clearmodifiers", "--delay", "0", ">save")
+        xdo("key", "Escape")
+        xdo("key", "g", "g", "0", "i")
+        xdo("type", "--clearmodifiers", "--delay", "0", "palette-focus:")
+        xdo("key", "Escape")
+        wait_for(lambda: state().get("text") == "palette-focus:" + original.splitlines()[0],
+                 "palette Escape returns keyboard ownership to Vim", app)
+        command("undo")
+        wait_for(lambda: state().get("text") == original.splitlines()[0] and state().get("modified") == 0,
+                 "palette focus probe undo", app)
+        report["command_palette_escape_focus"] = "passed"
+        if args.app == "frost":
+            # Use real quickfix data to exercise severity, relative paths and
+            # the ownership-checked no-results state in the native tool dock.
+            command("call setqflist([], 'r', {'title': 'Native diagnostic fixture', 'context': {'source': 'build'}, 'items': [{'filename': expand('%:p'), 'lnum': 1, 'col': 2, 'type': 'E', 'text': 'Error detail: check this source expression'}, {'filename': expand('%:p'), 'lnum': 2, 'col': 1, 'type': 'W', 'text': 'Warning detail: review this statement'}, {'filename': expand('%:p'), 'lnum': 3, 'col': 1, 'type': 'I', 'text': 'Information detail: Unicode source is preserved'}]})")
+            wait_for(lambda: state().get("quickfix_size") == 3, "diagnostic fixture published", app)
+            xdo("key", "ctrl+shift+j")
+            severity_pixels = {}
+            for severity, rgb in (("error", (226, 129, 114)), ("warning", (225, 190, 106)),
+                                  ("information", (133, 183, 231))):
+                severity_pixels[severity] = wait_for(
+                    lambda rgb=rgb: color_count("diagnostics-severity", rgb) > 10
+                    and color_count("diagnostics-severity", rgb), "colored " + severity + " label", app)
+            report["diagnostic_severity_pixels"] = severity_pixels
+            no_query = "__native_fixture_no_matching_source_7491__"
+            xdo("key", "ctrl+shift+f")
+            xdo("type", "--clearmodifiers", "--delay", "0", no_query)
+            xdo("key", "Return")
+            wait_for(lambda: state().get("quickfix_title") == "Search: " + no_query
+                     and state().get("quickfix_size") == 0, "empty search owns current quickfix", app)
+            time.sleep(0.2)
+            capture("search-empty")
+            report["empty_project_search"] = "passed"
+            command("call setqflist([], 'r', {'title': '', 'items': []})")
+            xdo("key", "ctrl+shift+j")
         # Trace a real wheel notch through window pixels in a disposable Vim
         # buffer. A distinctive source line supplies the visual position oracle.
         command("enew | call setline(1, map(range(1,200), {_, n -> printf('WHEEL_%03d native scroll', n)})) | setlocal nowrap scrolloff=0")

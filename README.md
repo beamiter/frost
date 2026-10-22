@@ -10,6 +10,8 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 
 启动方式、操作、可选语言服务及测试命令见 [Vim9 IDE 文档](docs/VIM9_IDE.md)。
 
+按 Ctrl+Shift+P 后输入 `>` 可筛选编辑器命令，例如 `>vertical split`、`>format` 或 `>保存`。列表显示快捷键及暂不可用的原因，执行前会重新检查当前 Vim 状态；普通文件查询、`path:line:column` 和 `:line:column` 保持原用法。文件名以 `>` 开头时加 `./` 前缀。
+
 编辑区正文通过独立 GUI buffer 协议交给 iced 直接绘制：使用 Vim 的
 `guifg`、`guibg`、`guisp` 真彩色样式、粗体/斜体、下划线/波浪线和选区，
 不从终端 ANSI 色号取色。状态栏显示 **GUI buffer · RGB**；复杂 Vim 视图

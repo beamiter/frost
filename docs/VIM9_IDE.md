@@ -74,8 +74,9 @@ offscreen text. Separators, status rows and peer splits stay fixed. The mouse
 uses an immutable snapshot of the frame and offsets actually drawn, including
 when a newer acknowledgement has arrived but has not yet been painted.
 Keyboard input, preedit, source/layout changes, zoom, focus loss and compatible
-rendering retire pending gestures. `smooth_scroll = false` uses the existing
-Vim wheel-reporting path.
+rendering retire pending gestures. `smooth_scroll = false` disables the
+animation added to discrete wheel notches; raw pixel and fractional-line
+gestures retain their precise offsets.
 
 A plain primary click during a presented fractional scroll captures source
 UTF-8 bytes; its character drag and release stay in the same buffer generation.
@@ -208,6 +209,22 @@ containing colons takes precedence over location syntax, so `notes:42` can
 still open that literal file. Enter and clicking a result use the same validated
 location. Vim's jump list and unsaved-buffer checks continue to apply.
 
+Start a Quick Open query with `>` to search editor commands, for example
+`>vertical split`, `>format`, or `>保存`. Commands show their shortcuts and
+the reason when unavailable. Enter and row clicks check the current Vim state
+again; an unavailable command keeps the picker open with an explanation.
+Up/Down and Page Up/Page Down select a command, and Escape returns focus to
+Vim. Ordinary file and location queries retain their existing behavior; use
+`./>name` for a filename whose first character is `>`.
+
+When Vim has several native splits, a subtle inner outline identifies the
+active buffer and dims when the editor loses focus. It stays inside the buffer
+area, leaving Vim's separators and status rows intact. Problem rows show an
+E/W/I severity label and color, project-relative paths for files inside the
+project, and the complete path and message on hover. An empty search reports
+“No matches” only while its own empty quickfix list is current; other
+diagnostics remain visible.
+
 **Go to…** (`Ctrl+Shift+G`) accepts a positive `line` or `line:column`. It moves
 within the current buffer, including unnamed buffers, and uses Vim's byte
 column convention. Invalid coordinates keep the form open with an explanation.
@@ -286,7 +303,7 @@ editor font size for this process without rewriting configuration.
 
 | Shortcut | Native action |
 | --- | --- |
-| Ctrl+Shift+P | Quick Open project filename picker |
+| Ctrl+Shift+P | Quick Open files, locations, or `>` editor commands |
 | Ctrl+Shift+G | Go to line or line:column |
 | Ctrl+Shift+E | Toggle project sidebar |
 | Ctrl+Shift+J | Toggle problems/build-output dock |

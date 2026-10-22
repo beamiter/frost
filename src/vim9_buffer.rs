@@ -697,6 +697,7 @@ fn render_metrics(bounds: Rectangle, metrics: Metrics) -> Vim9RenderMetrics {
 
 struct PaintView<'a> {
     clip: Rectangle,
+    active: bool,
     runs: Vec<Vim9ProjectedRun<'a>>,
     cursor: Option<Rectangle>,
 }
@@ -721,6 +722,7 @@ fn paint_views(
                 .filter(|r| r.area() > 0.0)?;
             Some(PaintView {
                 clip: visible,
+                active: window.window == frame.window,
                 runs: viewport.runs().collect(),
                 cursor: (window.window == frame.window)
                     .then(|| viewport.cursor_rect())
@@ -730,6 +732,64 @@ fn paint_views(
             })
         })
         .collect()
+}
+
+/// Paint strictly inside the existing buffer clip: separators and Vim's
+/// status rows continue to belong to the compatibility surface.
+fn paint_split_focus<Renderer: renderer::Renderer>(
+    renderer: &mut Renderer,
+    frame: &Vim9RenderFrame,
+    prepared: &PaintView<'_>,
+    focused: bool,
+) {
+    if frame.windows.len() <= 1 || !prepared.active {
+        return;
+    }
+    let view = prepared.clip;
+    let width = 1.0_f32.min(view.width / 2.0).min(view.height / 2.0);
+    let mut accent = frame.cursor.appearance.as_ref().map_or_else(
+        || frame.default_style.foreground.unwrap_or(0xd7dce2),
+        |appearance| {
+            appearance
+                .colors(&frame.default_style, &frame.default_style)
+                .1
+        },
+    );
+    if rgb(accent) == colors(&frame.default_style, &frame.default_style).1 {
+        accent = frame.default_style.foreground.unwrap_or(0xd7dce2);
+    }
+    let color = Color {
+        a: if focused { 0.42 } else { 0.16 },
+        ..rgb(accent)
+    };
+    let edges = [
+        Rectangle {
+            height: width,
+            ..view
+        },
+        Rectangle {
+            y: view.y + view.height - width,
+            height: width,
+            ..view
+        },
+        Rectangle {
+            y: view.y + width,
+            width,
+            height: view.height - 2.0 * width,
+            ..view
+        },
+        Rectangle {
+            x: view.x + view.width - width,
+            y: view.y + width,
+            width,
+            height: view.height - 2.0 * width,
+        },
+    ];
+    renderer.with_layer(view, |renderer| {
+        for edge in edges.into_iter().filter(|edge| edge.area() > 0.0) {
+            renderer.fill_quad(quad(edge), Background::Color(color));
+        }
+    });
 }
 
 /// Subtract one contained rectangle without overlapping the remaining bands.
@@ -1033,6 +1093,7 @@ where
         };
         for prepared in views {
             self.paint_native_view(renderer, frame, &prepared, cursor_on);
+            paint_split_focus(renderer, frame, &prepared, self.focused);
         }
         // Popup geometry belongs to the full editor grid. Draw it after all
         // splits and cursors so it can cover a neighboring split or separator.
@@ -2573,6 +2634,8 @@ mod tests {
         let bounds = Rectangle::with_size(Size::new(1000.0, 700.0));
         let views = paint_views(&frame, render_metrics(bounds, metrics), bounds, |_| 0.0);
         assert_eq!(views.len(), 2);
+        assert!(views[0].active);
+        assert!(!views[1].active);
         assert_eq!(
             views[0]
                 .runs
@@ -2589,6 +2652,58 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["peer"]
         );
+    }
+
+    #[test]
+    fn active_split_outline_stays_inside_its_view_and_dims_on_focus_loss() {
+        let mut frame = split_frame();
+        frame.default_style.foreground = Some(0x123456);
+        frame.default_style.background = Some(0x102030);
+        frame.cursor.appearance = Some(jterm_core::vim9::Vim9CursorAppearance {
+            style: Vim9RenderStyle {
+                background: Some(0x102030),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let bounds = Rectangle::with_size(Size::new(800.0, 600.0));
+        let draw = |frame: &Vim9RenderFrame, focused| {
+            let mut recorder = CompletionRecorder::default();
+            for view in paint_views(frame, geometry(), bounds, |_| 0.0) {
+                paint_split_focus(&mut recorder, frame, &view, focused);
+            }
+            recorder.quads
+        };
+        let focused = draw(&frame, true);
+        assert_eq!(focused.len(), 4);
+        assert_eq!(
+            focused[0].1,
+            Background::Color(Color {
+                a: 0.42,
+                ..rgb(0x123456)
+            })
+        );
+        let active = paint_views(&frame, geometry(), bounds, |_| 0.0)[0].clip;
+        for (quad, _, clip) in &focused {
+            assert_eq!(*clip, active);
+            assert_eq!(quad.bounds.intersection(&active), Some(quad.bounds));
+            assert!(quad.bounds.width == 1.0 || quad.bounds.height == 1.0);
+        }
+        let area: f32 = focused.iter().map(|(quad, _, _)| quad.bounds.area()).sum();
+        assert_eq!(area, active.width * 2.0 + (active.height - 2.0) * 2.0);
+        let dimmed = draw(&frame, false);
+        for ((_, bright, _), (_, dim, _)) in focused.iter().zip(&dimmed) {
+            let (Background::Color(bright), Background::Color(dim)) = (bright, dim) else {
+                panic!("split outlines use a solid accent");
+            };
+            assert!(dim.a < bright.a);
+            assert_eq!((dim.r, dim.g, dim.b), (bright.r, bright.g, bright.b));
+        }
+        frame.window = 20;
+        let peer = paint_views(&frame, geometry(), bounds, |_| 0.0)[1].clip;
+        assert!(draw(&frame, true).iter().all(|(_, _, clip)| *clip == peer));
+        frame.windows.remove(0);
+        assert!(draw(&frame, true).is_empty());
     }
 
     #[test]

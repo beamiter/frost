@@ -18,8 +18,8 @@ use iced::{keyboard, Element, Length, Size, Subscription, Task};
 use jterm_core::pty_input::{self, PasteModes, PastePolicy, UnbracketedMultiline};
 use jterm_core::vim9::{
     self, parse_vim9_location as goto_position, ProjectEntry, Vim9Command, Vim9EntryRequest,
-    Vim9ProjectFile, Vim9ProjectIndex, Vim9ProjectSnapshot, Vim9SearchCase, Vim9SearchOptions,
-    Vim9Session, Vim9Snapshot,
+    Vim9PaletteCommand, Vim9ProjectFile, Vim9ProjectIndex, Vim9ProjectSnapshot, Vim9SearchCase,
+    Vim9SearchOptions, Vim9Session, Vim9Snapshot,
 };
 
 use super::{config, native_enter, terminal, terminal_ime, terminal_view};
@@ -278,7 +278,7 @@ impl FormKind {
     }
     fn help(self) -> &'static str {
         match self {
-            Self::QuickOpen => "Find file[:line[:column]], or :line[:column] in the current buffer. Columns are Vim byte columns. ↑ / ↓ selects; Enter opens; Esc returns to Vim.",
+            Self::QuickOpen => "Find file[:line[:column]], :line[:column] in the current buffer, or >command. Columns are Vim byte columns. ↑ / ↓ selects; Enter confirms; Esc returns to Vim.",
             Self::Goto => "Enter a line or line:column. The column is a Vim byte column. The current buffer stays open.",
             Self::Open => "Enter a local filename. New files require an existing parent directory. Vim retains its normal unsaved-buffer checks.",
             Self::Search => "Search project text using ripgrep. Choose literal or regular expression matching and an optional file glob. Results replace Vim's quickfix list.",
@@ -328,6 +328,10 @@ pub(super) enum Message {
     RefreshIndex,
     QuickOpenFile {
         path: PathBuf,
+        query: String,
+    },
+    QuickPaletteCommand {
+        command: Vim9PaletteCommand,
         query: String,
     },
     MoveQuickSelection(isize),
@@ -430,8 +434,12 @@ fn chrome(
 }
 
 fn visible_label(value: &str) -> String {
+    safe_label(value, Some(240))
+}
+
+fn safe_label(value: &str, limit: Option<usize>) -> String {
     let mut result = String::new();
-    for character in value.chars().take(240) {
+    for character in value.chars().take(limit.unwrap_or(usize::MAX)) {
         if character.is_control()
             || matches!(character, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
         {
@@ -440,10 +448,50 @@ fn visible_label(value: &str) -> String {
             result.push(character);
         }
     }
-    if value.chars().count() > 240 {
+    if limit.is_some_and(|limit| value.chars().count() > limit) {
         result.push('…');
     }
     result
+}
+
+fn diagnostic_kind(kind: &str) -> (&'static str, iced::Color) {
+    let (label, rgb) = match kind.chars().next().map(|ch| ch.to_ascii_uppercase()) {
+        Some('E') => ("E · Error", [226, 129, 114]),
+        Some('W') => ("W · Warning", [225, 190, 106]),
+        Some('I' | 'N') => ("I · Information", [133, 183, 231]),
+        _ => ("• Problem", [174, 185, 199]),
+    };
+    (label, iced::Color::from_rgb8(rgb[0], rgb[1], rgb[2]))
+}
+
+fn diagnostic_path(path: &str, root: &Path) -> String {
+    let path = Path::new(path);
+    visible_label(&path.strip_prefix(root).unwrap_or(path).to_string_lossy())
+}
+
+fn diagnostic_detail(issue: &vim9::Vim9Diagnostic) -> String {
+    format!(
+        "{}:{}:{}\n{}",
+        safe_label(&issue.filename, None),
+        issue.line,
+        issue.column,
+        safe_label(&issue.text, None)
+    )
+}
+
+/// The diagnostics list can merge quickfix, location-list and LSP entries.
+/// Report an empty project search only for the list that search published.
+fn search_has_no_matches(snapshot: &Vim9Snapshot) -> bool {
+    let search = &snapshot.search;
+    let quickfix = &snapshot.quickfix;
+    !search.query.is_empty()
+        && !search.running
+        && !search.cancelled
+        && search.exit_code == 1
+        && search.count == 0
+        && quickfix.source == "search"
+        && quickfix.count == 0
+        && quickfix.title == format!("Search: {}", search.query)
 }
 
 fn bounded_input(value: String) -> String {
@@ -508,6 +556,34 @@ fn quick_open_command(
         .iter()
         .find(|file| Some(file.path.as_path()) == selected_path);
     query.command(file)
+}
+
+/// Resolve against the current filter and editor state. Neither a stale row
+/// identity nor a previously available capability may acquire a new action.
+fn quick_palette_command(
+    value: &str,
+    selected: usize,
+    clicked: Option<Vim9PaletteCommand>,
+    snapshot: &Vim9Snapshot,
+) -> Result<Vim9Command, &'static str> {
+    let query = vim9::vim9_palette_query(value).ok_or("Type > to search editor commands")?;
+    let matches = vim9::vim9_palette_matches(query, QUICK_MATCH_LIMIT);
+    let command = match clicked {
+        Some(command) => matches.into_iter().find(|candidate| *candidate == command),
+        None => matches.get(selected).copied(),
+    }
+    .ok_or("Choose a matching editor command")?;
+    command.command(snapshot)
+}
+
+fn quick_palette_click(
+    form: &Form,
+    query: &str,
+    command: Vim9PaletteCommand,
+    snapshot: &Vim9Snapshot,
+) -> Option<Result<Vim9Command, &'static str>> {
+    (form.kind == FormKind::QuickOpen && form.value == query)
+        .then(|| quick_palette_command(&form.value, form.selected, Some(command), snapshot))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -834,6 +910,9 @@ impl Ide {
         }
     }
     fn send(&mut self, command: Vim9Command) {
+        let _ = self.try_send(command);
+    }
+    fn try_send(&mut self, command: Vim9Command) -> Result<(), String> {
         self.scroll.borrow_mut().clear();
         self.invalidate_input();
         self.error = None;
@@ -842,9 +921,8 @@ impl Ide {
             .as_ref()
             .ok_or_else(|| "Vim did not start".to_string())
             .and_then(|editor| editor.send(command).map(|_| ()).map_err(|e| e.to_string()));
-        if let Err(error) = result {
-            self.error = Some(error);
-        }
+        self.error = result.as_ref().err().cloned();
+        result
     }
     fn native_frame(&self) -> Option<&vim9::Vim9RenderFrame> {
         let session = self.session.as_ref()?;
@@ -976,12 +1054,27 @@ impl Ide {
             .is_some_and(|form| form.kind == FormKind::Search)
     }
     fn submit(&mut self) {
-        let Some(form) = self.form.take() else {
+        let Some(mut form) = self.form.take() else {
             return;
         };
         // Ownership is physical, not a timer or an artificial Escape sequence.
         self.native_enter.lock().claim_pressed();
         self.invalidate_input();
+        if form.kind == FormKind::QuickOpen && vim9::vim9_palette_query(&form.value).is_some() {
+            self.snapshot = self
+                .editor
+                .as_ref()
+                .map(Vim9Session::snapshot)
+                .unwrap_or_else(|| self.snapshot.clone());
+            let result = quick_palette_command(&form.value, form.selected, None, &self.snapshot)
+                .map_err(str::to_owned)
+                .and_then(|command| self.try_send(command));
+            if let Err(error) = result {
+                form.error = Some(error);
+                self.form = Some(form);
+            }
+            return;
+        }
         let action = match form.kind {
             FormKind::QuickOpen => {
                 let selected = self
@@ -1078,6 +1171,14 @@ impl Ide {
         else {
             return;
         };
+        if vim9::vim9_palette_query(&form.value).is_some() {
+            self.quick_matches.clear();
+            if !preserve_selection {
+                form.selected = 0;
+                form.error = None;
+            }
+            return;
+        }
         let selected_path = preserve_selection
             .then(|| {
                 self.quick_matches
@@ -1110,12 +1211,18 @@ impl Ide {
             .as_mut()
             .filter(|form| form.kind == FormKind::QuickOpen)
         {
-            form.selected = moved_selection(form.selected, delta, self.quick_matches.len());
-            form.error = self
-                .project
-                .quick_open_query(&form.value)
-                .err()
-                .map(str::to_owned);
+            if let Some(query) = vim9::vim9_palette_query(&form.value) {
+                let count = vim9::vim9_palette_matches(query, QUICK_MATCH_LIMIT).len();
+                form.selected = moved_selection(form.selected, delta, count);
+                form.error = None;
+            } else {
+                form.selected = moved_selection(form.selected, delta, self.quick_matches.len());
+                form.error = self
+                    .project
+                    .quick_open_query(&form.value)
+                    .err()
+                    .map(str::to_owned);
+            }
         }
     }
 
@@ -1403,11 +1510,11 @@ impl Ide {
             Message::QuickOpenFile { path, query } => {
                 // Bind a pointer row to its displayed query as well as its path:
                 // a delayed click cannot acquire newly typed coordinates.
-                if let Some(form) = self
-                    .form
-                    .as_ref()
-                    .filter(|form| form.kind == FormKind::QuickOpen && form.value == query)
-                {
+                if let Some(form) = self.form.as_ref().filter(|form| {
+                    form.kind == FormKind::QuickOpen
+                        && form.value == query
+                        && vim9::vim9_palette_query(&form.value).is_none()
+                }) {
                     match quick_open_command(&self.project, &form.value, Some(&path)) {
                         Ok(command) => {
                             self.form = None;
@@ -1418,6 +1525,33 @@ impl Ide {
                         Err(error) => {
                             if let Some(form) = &mut self.form {
                                 form.error = Some(error.into());
+                            }
+                        }
+                    }
+                }
+            }
+            Message::QuickPaletteCommand { command, query } => {
+                self.snapshot = self
+                    .editor
+                    .as_ref()
+                    .map(Vim9Session::snapshot)
+                    .unwrap_or_else(|| self.snapshot.clone());
+                if let Some(action) = self
+                    .form
+                    .as_ref()
+                    .and_then(|form| quick_palette_click(form, &query, command, &self.snapshot))
+                {
+                    let result = action.map_err(str::to_owned).and_then(|command| {
+                        self.native_enter.lock().claim_pressed();
+                        self.try_send(command)
+                    });
+                    match result {
+                        Ok(()) => {
+                            self.form = None;
+                        }
+                        Err(error) => {
+                            if let Some(form) = &mut self.form {
+                                form.error = Some(error);
                             }
                         }
                     }
@@ -2165,11 +2299,21 @@ impl Ide {
                     .size(12),
                 );
             }
+            let no_search_matches = search_has_no_matches(&self.snapshot);
+            if no_search_matches {
+                contents = contents.push(
+                    text(format!(
+                        "No matches for “{}”.",
+                        visible_label(&search.query)
+                    ))
+                    .size(12),
+                );
+            }
             for issue in &self.snapshot.diagnostics {
+                let (kind, color) = diagnostic_kind(&issue.kind);
                 let title = format!(
-                    "{} {}:{}:{}  {}",
-                    issue.kind,
-                    visible_label(&issue.filename),
+                    "{}:{}:{}  {}",
+                    diagnostic_path(&issue.filename, &self.root),
                     issue.line,
                     issue.column,
                     visible_label(&issue.text)
@@ -2180,17 +2324,19 @@ impl Ide {
                         line: Some(issue.line.max(1)),
                         column: Some(issue.column.max(1)),
                     }));
-                contents = contents.push(
-                    button(text(title).size(12))
+                contents = contents.push(tooltip(
+                    button(row![text(kind).size(12).color(color), text(title).size(12)].spacing(8))
                         .padding([3, 5])
                         .style(button::text)
                         .on_press_maybe(action),
-                );
+                    container(text(diagnostic_detail(issue)).size(12)).max_width(760),
+                    tooltip::Position::Bottom,
+                ));
             }
             for error in &self.snapshot.search.errors {
                 contents = contents.push(text(visible_label(error)).size(12));
             }
-            if self.snapshot.diagnostics.is_empty() {
+            if self.snapshot.diagnostics.is_empty() && !no_search_matches {
                 contents = contents.push(
                     text("No diagnostics. Build or search to populate Vim quickfix.").size(12),
                 );
@@ -2423,15 +2569,36 @@ impl Ide {
         let Some(form) = &self.form else {
             return base;
         };
-        let field = text_input(form.kind.label(), &form.value)
-            .id(INPUT_ID)
-            .on_input(Message::FormInput)
-            .on_submit(Message::SubmitForm)
-            .size(15)
-            .padding(8);
+        let quick = form.kind == FormKind::QuickOpen;
+        let palette_query = quick
+            .then(|| vim9::vim9_palette_query(&form.value))
+            .flatten();
+        let command_mode = palette_query.is_some();
+        // Match identities depend only on the query. Availability always uses
+        // this render's snapshot, including changes while the picker is idle.
+        let palette_matches = palette_query
+            .map(|query| vim9::vim9_palette_matches(query, QUICK_MATCH_LIMIT))
+            .unwrap_or_default();
+        let field = text_input(
+            if command_mode {
+                "Search commands"
+            } else {
+                form.kind.label()
+            },
+            &form.value,
+        )
+        .id(INPUT_ID)
+        .on_input(Message::FormInput)
+        .on_submit(Message::SubmitForm)
+        .size(15)
+        .padding(8);
         let mut dialog_body = column![
-            text(form.kind.label()).size(20),
-            text(form.kind.help()).size(13),
+            text(if command_mode { "Commands" } else { form.kind.label() }).size(20),
+            text(if command_mode {
+                "↑ / ↓ selects; Enter runs; Esc returns to Vim. Unavailable commands show their reason."
+            } else {
+                form.kind.help()
+            }).size(13),
             field,
         ]
         .spacing(10);
@@ -2442,12 +2609,12 @@ impl Ide {
                     .color(iced::Color::from_rgb8(226, 129, 114)),
             );
         }
-        let quick = form.kind == FormKind::QuickOpen;
-        let quick_query = quick.then(|| self.project.quick_open_query(&form.value));
+        let quick_query =
+            (quick && !command_mode).then(|| self.project.quick_open_query(&form.value));
         let current_buffer = quick_query
             .as_ref()
             .is_some_and(|query| query.as_ref().is_ok_and(|query| query.current_buffer));
-        let quick_valid = quick_query.as_ref().is_some_and(Result::is_ok);
+        let quick_valid = command_mode || quick_query.as_ref().is_some_and(Result::is_ok);
         if let Some(Ok(query)) = &quick_query {
             if let Some((line, column)) = query.location {
                 let target = if query.current_buffer {
@@ -2512,7 +2679,53 @@ impl Ide {
                         .size(12),
                 );
         }
-        if quick && !current_buffer && quick_valid {
+        if command_mode {
+            dialog_body = dialog_body.push(
+                text(format!(
+                    "{} matching commands · remove > to find files",
+                    palette_matches.len()
+                ))
+                .size(12),
+            );
+            let rows = (((self.size.height - 280.0).max(44.0) / 44.0) as usize)
+                .clamp(1, QUICK_VISIBLE_ROWS);
+            for index in quick_window(form.selected, palette_matches.len(), rows) {
+                let command = palette_matches[index];
+                let reason = command.unavailable_reason(&self.snapshot);
+                let mut heading = row![
+                    text(command.title()).size(14),
+                    Space::new().width(Length::Fill),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center);
+                if !command.shortcut().is_empty() {
+                    heading = heading.push(text(command.shortcut()).size(12));
+                }
+                let mut details = column![heading].spacing(2);
+                if let Some(reason) = reason {
+                    details = details.push(text(reason).size(12));
+                }
+                dialog_body = dialog_body.push(
+                    button(details)
+                        .width(Length::Fill)
+                        .padding([5, 8])
+                        .style(if index == form.selected {
+                            button::primary
+                        } else {
+                            button::text
+                        })
+                        .on_press_maybe(reason.is_none().then_some(Message::QuickPaletteCommand {
+                            command,
+                            query: form.value.clone(),
+                        })),
+                );
+            }
+            if palette_matches.is_empty() {
+                dialog_body =
+                    dialog_body.push(text("No matching commands. Try fewer letters.").size(13));
+            }
+        }
+        if quick && !command_mode && !current_buffer && quick_valid {
             let index_state = if self.project.scanning {
                 "Indexing project files…".to_string()
             } else {
@@ -2582,7 +2795,9 @@ impl Ide {
             }
         }
         let mut actions = row![
-            button(if current_buffer {
+            button(if command_mode {
+                "Run"
+            } else if current_buffer {
                 "Go"
             } else if quick {
                 "Open"
@@ -2590,8 +2805,15 @@ impl Ide {
                 "Apply"
             })
             .on_press_maybe(
-                (!quick || (quick_valid && (current_buffer || !self.quick_matches.is_empty())))
-                    .then_some(Message::SubmitForm)
+                (!quick
+                    || if command_mode {
+                        palette_matches.get(form.selected).is_some_and(|command| {
+                            command.unavailable_reason(&self.snapshot).is_none()
+                        })
+                    } else {
+                        quick_valid && (current_buffer || !self.quick_matches.is_empty())
+                    })
+                .then_some(Message::SubmitForm)
             ),
             button("Cancel").on_press(Message::CancelForm),
         ]
@@ -2607,6 +2829,11 @@ impl Ide {
             );
         }
         if quick && !current_buffer && quick_valid {
+            let count = if command_mode {
+                palette_matches.len()
+            } else {
+                self.quick_matches.len()
+            };
             actions = actions
                 .push(Space::new().width(Length::Fill))
                 .push(button("↑").on_press(Message::MoveQuickSelection(-1)))
@@ -2614,12 +2841,8 @@ impl Ide {
                 .push(
                     text(format!(
                         "{} / {}",
-                        if self.quick_matches.is_empty() {
-                            0
-                        } else {
-                            form.selected + 1
-                        },
-                        self.quick_matches.len()
+                        if count == 0 { 0 } else { form.selected + 1 },
+                        count
                     ))
                     .size(12),
                 );
@@ -2737,6 +2960,62 @@ mod tests {
         let text = bounded_input("界".repeat(MAX_INPUT));
         assert!(text.len() <= MAX_INPUT);
         assert!(text.ends_with('界'));
+    }
+    #[test]
+    fn diagnostic_labels_preserve_severity_paths_and_complete_details() {
+        let root = Path::new("/project");
+        assert_eq!(diagnostic_path("/project/src/main.rs", root), "src/main.rs");
+        assert_eq!(
+            diagnostic_path("/project-peer/main.rs", root),
+            "/project-peer/main.rs"
+        );
+        assert_eq!(diagnostic_path("relative.rs", root), "relative.rs");
+        assert_eq!(diagnostic_kind("e").0, "E · Error");
+        assert_eq!(diagnostic_kind("W").0, "W · Warning");
+        assert_eq!(diagnostic_kind("I").0, "I · Information");
+        assert_eq!(diagnostic_kind("").0, "• Problem");
+        assert_ne!(diagnostic_kind("E").1, diagnostic_kind("W").1);
+        let issue = vim9::Vim9Diagnostic {
+            filename: "/project/src/main.rs".into(),
+            line: 42,
+            column: 8,
+            text: format!("{}\x1b\u{202e}end", "界".repeat(300)),
+            kind: "E".into(),
+        };
+        assert!(visible_label(&issue.text).ends_with('…'));
+        let detail = diagnostic_detail(&issue);
+        assert!(detail.starts_with("/project/src/main.rs:42:8\n"));
+        assert!(detail.ends_with("\\u{1b}\\u{202e}end"));
+        assert_eq!(detail.matches('界').count(), 300);
+    }
+    #[test]
+    fn empty_search_feedback_tracks_only_its_current_quickfix() {
+        let mut snapshot = Vim9Snapshot::default();
+        snapshot.search.query = "missing symbol".into();
+        snapshot.search.exit_code = 1;
+        snapshot.quickfix.source = "search".into();
+        snapshot.quickfix.title = "Search: missing symbol".into();
+        assert!(search_has_no_matches(&snapshot));
+        // A location-list/LSP problem may coexist with this empty quickfix.
+        snapshot.diagnostics.push(vim9::Vim9Diagnostic {
+            filename: "main.rs".into(),
+            line: 3,
+            column: 1,
+            text: "still visible".into(),
+            kind: "W".into(),
+        });
+        assert!(search_has_no_matches(&snapshot));
+        snapshot.quickfix.source = "build".into();
+        assert!(!search_has_no_matches(&snapshot));
+        snapshot.quickfix.source = "search".into();
+        snapshot.quickfix.title = "Search: older query".into();
+        assert!(!search_has_no_matches(&snapshot));
+        snapshot.quickfix.title = "Search: missing symbol".into();
+        snapshot.search.cancelled = true;
+        assert!(!search_has_no_matches(&snapshot));
+        snapshot.search.cancelled = false;
+        snapshot.search.running = true;
+        assert!(!search_has_no_matches(&snapshot));
     }
     #[test]
     fn goto_validates_coordinates_and_never_accepts_ex_commands() {
@@ -2943,6 +3222,75 @@ mod tests {
             ),
             "a valid Unicode path must not truncate the destination by UTF-8 byte count"
         );
+    }
+
+    #[test]
+    fn palette_activation_uses_the_current_filter_and_editor_capabilities() {
+        let mut snapshot = Vim9Snapshot {
+            connected: true,
+            mode: "n".into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            quick_palette_command(">vertical split", 0, None, &snapshot),
+            Ok(Vim9Command::Split { vertical: true })
+        ));
+        // Filtering in the same event batch must replace the selected action,
+        // even when Enter arrives before the new list has been painted.
+        assert!(quick_palette_command(">format", 0, None, &snapshot).is_err());
+        snapshot.capabilities.push("format".into());
+        assert!(matches!(
+            quick_palette_command(">format", 0, None, &snapshot),
+            Ok(Vim9Command::Format)
+        ));
+        snapshot.capabilities.clear();
+        assert!(quick_palette_command(">format", 0, None, &snapshot).is_err());
+        assert!(quick_palette_command(">:!touch /tmp/palette", 0, None, &snapshot).is_err());
+        assert!(quick_palette_command("main:42", 0, None, &snapshot).is_err());
+    }
+
+    #[test]
+    fn palette_click_binds_query_and_identity_without_requiring_a_file_index() {
+        let snapshot = Vim9Snapshot {
+            connected: true,
+            mode: "n".into(),
+            ..Default::default()
+        };
+        let form = Form {
+            kind: FormKind::QuickOpen,
+            value: ">save all".into(),
+            selected: 0,
+            error: None,
+        };
+        assert!(
+            quick_palette_click(&form, ">save", Vim9PaletteCommand::SaveAll, &snapshot).is_none(),
+            "a stale row must not acquire a newly typed filter"
+        );
+        assert!(matches!(
+            quick_palette_click(&form, ">save all", Vim9PaletteCommand::SaveAll, &snapshot),
+            Some(Ok(Vim9Command::SaveAll))
+        ));
+        assert!(quick_palette_click(
+            &form,
+            ">save all",
+            Vim9PaletteCommand::SplitVertical,
+            &snapshot
+        )
+        .unwrap()
+        .is_err());
+        let project = Vim9ProjectSnapshot {
+            scanning: true,
+            error: Some("index unavailable".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            quick_open_command(&project, ":19:3", None),
+            Ok(Vim9Command::Goto {
+                line: 19,
+                column: Some(3)
+            })
+        ));
+        assert!(vim9::vim9_palette_query("./>literal.rs").is_none());
     }
     #[test]
     fn startup_and_closing_do_not_own_shell_persistence_or_force_editor_exit() {
