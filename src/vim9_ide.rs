@@ -17,8 +17,9 @@ use iced::widget::{
 use iced::{keyboard, Element, Length, Size, Subscription, Task};
 use jterm_core::pty_input::{self, PasteModes, PastePolicy, UnbracketedMultiline};
 use jterm_core::vim9::{
-    self, ProjectEntry, Vim9Command, Vim9EntryRequest, Vim9ProjectFile, Vim9ProjectIndex,
-    Vim9ProjectSnapshot, Vim9SearchCase, Vim9SearchOptions, Vim9Session, Vim9Snapshot,
+    self, parse_vim9_location as goto_position, ProjectEntry, Vim9Command, Vim9EntryRequest,
+    Vim9ProjectFile, Vim9ProjectIndex, Vim9ProjectSnapshot, Vim9SearchCase, Vim9SearchOptions,
+    Vim9Session, Vim9Snapshot,
 };
 
 use super::{config, native_enter, terminal, terminal_ime, terminal_view};
@@ -277,7 +278,7 @@ impl FormKind {
     }
     fn help(self) -> &'static str {
         match self {
-            Self::QuickOpen => "Search project filenames. ↑ / ↓ selects, Enter opens, Esc returns to Vim. Ignore rules are respected.",
+            Self::QuickOpen => "Find file[:line[:column]], or :line[:column] in the current buffer. Columns are Vim byte columns. ↑ / ↓ selects; Enter opens; Esc returns to Vim.",
             Self::Goto => "Enter a line or line:column. The column is a Vim byte column. The current buffer stays open.",
             Self::Open => "Enter a local filename. New files require an existing parent directory. Vim retains its normal unsaved-buffer checks.",
             Self::Search => "Search project text using ripgrep. Choose literal or regular expression matching and an optional file glob. Results replace Vim's quickfix list.",
@@ -325,7 +326,10 @@ pub(super) enum Message {
     SubmitForm,
     CancelForm,
     RefreshIndex,
-    QuickOpenFile(PathBuf),
+    QuickOpenFile {
+        path: PathBuf,
+        query: String,
+    },
     MoveQuickSelection(isize),
     Browse(PathBuf),
     Directory(u64, Result<(PathBuf, Vec<ProjectEntry>), String>),
@@ -446,6 +450,15 @@ fn bounded_input(value: String) -> String {
     bounded_text(value, MAX_INPUT)
 }
 
+/// Quick Open shares the four-terminal character limit, independently of
+/// the byte budget used by command/search forms.
+fn bounded_quick_query(mut value: String) -> String {
+    if let Some((end, _)) = value.char_indices().nth(MAX_QUICK_QUERY) {
+        value.truncate(end);
+    }
+    value
+}
+
 fn search_options_summary(options: &Vim9SearchOptions) -> String {
     let matching = if options.regex { "Regex" } else { "Literal" };
     let case = match options.case {
@@ -479,24 +492,22 @@ fn bounded_text(mut value: String, limit: usize) -> String {
     value
 }
 
-/// Reject ambiguous/truncated coordinates instead of sending arbitrary Ex text.
-fn goto_position(value: &str) -> Result<(u64, Option<u64>), &'static str> {
-    let mut parts = value.trim().split(':');
-    let positive = |part: &str| {
-        let part = part.trim();
-        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        part.parse::<u64>()
-            .ok()
-            .filter(|value| *value > 0 && *value <= i32::MAX as u64)
-    };
-    let line = parts.next().and_then(positive);
-    let column = parts.next().map(positive);
-    if parts.next().is_some() || line.is_none() || column == Some(None) {
-        return Err("Use a positive line or line:column, for example 42 or 42:8");
+/// Revalidate the current query and selected path before either keyboard or
+/// pointer confirmation. A previous list must never supply a stale target.
+fn quick_open_command(
+    project: &Vim9ProjectSnapshot,
+    value: &str,
+    selected_path: Option<&Path>,
+) -> Result<Vim9Command, &'static str> {
+    let query = project.quick_open_query(value)?;
+    if query.current_buffer {
+        return query.command(None);
     }
-    Ok((line.unwrap(), column.flatten()))
+    let matches = project.matches(&query.file_query, QUICK_MATCH_LIMIT);
+    let file = matches
+        .iter()
+        .find(|file| Some(file.path.as_path()) == selected_path);
+    query.command(file)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -970,20 +981,18 @@ impl Ide {
         self.invalidate_input();
         let action = match form.kind {
             FormKind::QuickOpen => {
-                let Some(file) = self.quick_matches.get(form.selected) else {
-                    let mut form = form;
-                    form.error = Some(if self.project.scanning {
-                        "Still indexing project files…".into()
-                    } else {
-                        "No matching file. Use Open… to enter a new or external path.".into()
-                    });
-                    self.form = Some(form);
-                    return;
-                };
-                Vim9Command::Open {
-                    path: file.path.to_string_lossy().into_owned(),
-                    line: None,
-                    column: None,
+                let selected = self
+                    .quick_matches
+                    .get(form.selected)
+                    .map(|file| file.path.as_path());
+                match quick_open_command(&self.project, &form.value, selected) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        let mut form = form;
+                        form.error = Some(error.into());
+                        self.form = Some(form);
+                        return;
+                    }
                 }
             }
             FormKind::Goto => match goto_position(&form.value) {
@@ -1073,8 +1082,20 @@ impl Ide {
                     .map(|file| file.path.clone())
             })
             .flatten();
-        self.quick_matches = self.project.matches(&form.value, QUICK_MATCH_LIMIT);
-        form.error = None;
+        match self.project.quick_open_query(&form.value) {
+            Ok(query) => {
+                self.quick_matches = if query.current_buffer {
+                    Vec::new()
+                } else {
+                    self.project.matches(&query.file_query, QUICK_MATCH_LIMIT)
+                };
+                form.error = None;
+            }
+            Err(error) => {
+                self.quick_matches.clear();
+                form.error = Some(error.into());
+            }
+        }
         form.selected = selected_path
             .and_then(|path| self.quick_matches.iter().position(|file| file.path == path))
             .unwrap_or(0);
@@ -1087,7 +1108,11 @@ impl Ide {
             .filter(|form| form.kind == FormKind::QuickOpen)
         {
             form.selected = moved_selection(form.selected, delta, self.quick_matches.len());
-            form.error = None;
+            form.error = self
+                .project
+                .quick_open_query(&form.value)
+                .err()
+                .map(str::to_owned);
         }
     }
 
@@ -1333,7 +1358,7 @@ impl Ide {
             Message::FormInput(value) => {
                 if let Some(form) = &mut self.form {
                     form.value = if form.kind == FormKind::QuickOpen {
-                        bounded_text(value, MAX_QUICK_QUERY)
+                        bounded_quick_query(value)
                     } else {
                         bounded_input(value)
                     };
@@ -1364,22 +1389,27 @@ impl Ide {
             }
             Message::SubmitForm => self.submit(),
             Message::RefreshIndex => self.refresh_index(),
-            Message::QuickOpenFile(path) => {
-                // A click always opens the file from the displayed row, never a
-                // new result which happens to occupy the same numeric index.
-                if self
+            Message::QuickOpenFile { path, query } => {
+                // Bind a pointer row to its displayed query as well as its path:
+                // a delayed click cannot acquire newly typed coordinates.
+                if let Some(form) = self
                     .form
                     .as_ref()
-                    .is_some_and(|form| form.kind == FormKind::QuickOpen)
-                    && self.quick_matches.iter().any(|file| file.path == path)
+                    .filter(|form| form.kind == FormKind::QuickOpen && form.value == query)
                 {
-                    self.form = None;
-                    self.native_enter.lock().claim_pressed();
-                    self.send(Vim9Command::Open {
-                        path: path.to_string_lossy().into_owned(),
-                        line: None,
-                        column: None,
-                    });
+                    match quick_open_command(&self.project, &form.value, Some(&path)) {
+                        Ok(command) => {
+                            self.form = None;
+                            self.native_enter.lock().claim_pressed();
+                            self.invalidate_input();
+                            self.send(command);
+                        }
+                        Err(error) => {
+                            if let Some(form) = &mut self.form {
+                                form.error = Some(error.into());
+                            }
+                        }
+                    }
                 }
             }
             Message::MoveQuickSelection(delta) => self.move_quick_selection(delta),
@@ -1785,7 +1815,7 @@ impl Ide {
             subscriptions.push(events);
         }
         if self.config.vim9.native_buffer {
-            if self.focused && self.scroll.borrow().animating() {
+            if self.focused && self.scroll.borrow().needs_frame() {
                 subscriptions.push(iced::window::frames().map(|_| Message::ScrollFrame));
             }
             if let (Some(editor), Some(session)) = (&self.editor, &self.session) {
@@ -2402,6 +2432,29 @@ impl Ide {
             );
         }
         let quick = form.kind == FormKind::QuickOpen;
+        let quick_query = quick.then(|| self.project.quick_open_query(&form.value));
+        let current_buffer = quick_query
+            .as_ref()
+            .is_some_and(|query| query.as_ref().is_ok_and(|query| query.current_buffer));
+        let quick_valid = quick_query.as_ref().is_some_and(Result::is_ok);
+        if let Some(Ok(query)) = &quick_query {
+            if let Some((line, column)) = query.location {
+                let target = if query.current_buffer {
+                    "Current buffer"
+                } else {
+                    "Selected file"
+                };
+                dialog_body = dialog_body.push(
+                    text(format!(
+                        "{target} · line {line}{}",
+                        column
+                            .map(|column| format!(" · byte column {column}"))
+                            .unwrap_or_default()
+                    ))
+                    .size(13),
+                );
+            }
+        }
         if form.kind == FormKind::Search {
             let mut cases = row![text("Case:").size(13)]
                 .spacing(6)
@@ -2448,7 +2501,7 @@ impl Ide {
                         .size(12),
                 );
         }
-        if quick {
+        if quick && !current_buffer && quick_valid {
             let index_state = if self.project.scanning {
                 "Indexing project files…".to_string()
             } else {
@@ -2504,7 +2557,10 @@ impl Ide {
                     } else {
                         button::text
                     })
-                    .on_press(Message::QuickOpenFile(file.path.clone())),
+                    .on_press(Message::QuickOpenFile {
+                        path: file.path.clone(),
+                        query: form.value.clone(),
+                    }),
                 );
             }
             if self.quick_matches.is_empty() && !self.project.scanning {
@@ -2515,8 +2571,16 @@ impl Ide {
             }
         }
         let mut actions = row![
-            button(if quick { "Open" } else { "Apply" }).on_press_maybe(
-                (!quick || !self.quick_matches.is_empty()).then_some(Message::SubmitForm)
+            button(if current_buffer {
+                "Go"
+            } else if quick {
+                "Open"
+            } else {
+                "Apply"
+            })
+            .on_press_maybe(
+                (!quick || (quick_valid && (current_buffer || !self.quick_matches.is_empty())))
+                    .then_some(Message::SubmitForm)
             ),
             button("Cancel").on_press(Message::CancelForm),
         ]
@@ -2531,7 +2595,7 @@ impl Ide {
                 ),
             );
         }
-        if quick {
+        if quick && !current_buffer && quick_valid {
             actions = actions
                 .push(Space::new().width(Length::Fill))
                 .push(button("↑").on_press(Message::MoveQuickSelection(-1)))
@@ -2788,6 +2852,47 @@ mod tests {
     }
 
     #[test]
+    fn quick_open_locations_validate_pointer_targets_and_current_buffer_navigation() {
+        let project = Vim9ProjectSnapshot {
+            files: std::sync::Arc::new(
+                ["src/main.rs", "src/other.rs", "notes:42"]
+                    .into_iter()
+                    .map(|relative| Vim9ProjectFile {
+                        path: PathBuf::from("/project").join(relative),
+                        relative: relative.to_owned(),
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let main = Path::new("/project/src/main.rs");
+        assert!(
+            matches!(quick_open_command(&project, "main:42:8", Some(main)), Ok(Vim9Command::Open { path, line: Some(42), column: Some(8) }) if path == main.to_str().unwrap())
+        );
+        assert!(
+            quick_open_command(&project, "other:7", Some(main)).is_err(),
+            "a stale clicked row opened after the query changed"
+        );
+        assert!(quick_open_command(&project, "main:0", Some(main)).is_err());
+        assert!(
+            matches!(quick_open_command(&project, "notes:42", Some(Path::new("/project/notes:42"))), Ok(Vim9Command::Open { path, line: None, column: None }) if path == "/project/notes:42")
+        );
+        let unavailable_index = Vim9ProjectSnapshot {
+            scanning: true,
+            error: Some("index unavailable".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            quick_open_command(&unavailable_index, ":19:3", None),
+            Ok(Vim9Command::Goto {
+                line: 19,
+                column: Some(3)
+            })
+        ));
+        assert!(quick_open_command(&unavailable_index, "main:19", Some(main)).is_err());
+    }
+
+    #[test]
     fn quick_open_navigation_stays_visible_and_empty_lists_are_safe() {
         assert_eq!(moved_selection(0, -1, 0), 0);
         assert_eq!(moved_selection(0, -1, 80), 0);
@@ -2804,9 +2909,29 @@ mod tests {
             }
         }
         assert!(quick_window(0, 0, 8).is_empty());
-        let query = bounded_text("界".repeat(MAX_QUICK_QUERY), MAX_QUICK_QUERY);
-        assert!(query.len() <= MAX_QUICK_QUERY);
-        assert!(query.ends_with('界'));
+        let query = bounded_quick_query("界".repeat(MAX_QUICK_QUERY + 1));
+        assert_eq!(query.chars().count(), MAX_QUICK_QUERY);
+        assert_eq!(query, "界".repeat(MAX_QUICK_QUERY));
+        let name = format!("{}文件.rs", "目录/".repeat(30));
+        let project = Vim9ProjectSnapshot {
+            files: std::sync::Arc::new(vec![Vim9ProjectFile {
+                path: PathBuf::from("/project").join(&name),
+                relative: name.clone(),
+            }]),
+            ..Default::default()
+        };
+        let location = bounded_quick_query(format!("{name}:42:8"));
+        assert!(
+            matches!(
+                quick_open_command(&project, &location, Some(&project.files[0].path)),
+                Ok(Vim9Command::Open {
+                    line: Some(42),
+                    column: Some(8),
+                    ..
+                })
+            ),
+            "a valid Unicode path must not truncate the destination by UTF-8 byte count"
+        );
     }
     #[test]
     fn startup_and_closing_do_not_own_shell_persistence_or_force_editor_exit() {

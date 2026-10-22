@@ -192,6 +192,16 @@ impl ScrollState {
         self.pixels.values().any(Vim9PixelScroll::is_animating)
     }
 
+    /// Sample pending viewport acknowledgements on Iced's display frame clock
+    /// even when the current source margins cannot expose any more pixels.
+    pub(crate) fn needs_frame(&self) -> bool {
+        self.animating()
+            || self
+                .pixels
+                .values()
+                .any(|scroll| scroll.request_id().is_some())
+    }
+
     pub(crate) fn observe(
         &mut self,
         frame: Option<&Vim9RenderFrame>,
@@ -1561,14 +1571,150 @@ mod tests {
         acknowledged.windows[1].topline += 1;
         acknowledged.windows[1].scroll_ack = 41;
         state.observe(Some(&acknowledged), metrics, true, |_| false);
-        assert_eq!(state.offset(&acknowledged, 20, metrics), -10.0);
-        assert!(state.scroll_commands().is_empty());
-        state.observe(Some(&acknowledged), metrics, true, |_| false);
         assert_eq!(
             state.offset(&acknowledged, 20, metrics),
-            -10.0,
-            "a repeated frame cannot double-rebase"
+            0.0,
+            "ack must not reveal the ten pixels stalled behind missing margin rows"
         );
+        assert!(state.scroll_commands().is_empty());
+        assert!(
+            state.animating(),
+            "remaining pixels must enable Iced's frame subscription"
+        );
+    }
+
+    #[test]
+    fn successive_raw_pixels_keep_text_caret_and_ime_continuous_across_ack() {
+        let mut frame = direct_frame();
+        // Keep one source line and its cursor visible on both sides of a
+        // whole-row Vim acknowledgement, with two genuine rows of coverage.
+        frame.windows[1].cursor.row = 3;
+        frame.windows[1].cursor.line = 10;
+        frame.windows[1].line_lengths[1] = 0;
+        frame.windows[1].line_lengths[2] = 4;
+        frame.cursor = frame.windows[1].cursor.clone();
+        frame
+            .runs
+            .iter_mut()
+            .find(|run| run.window == 20 && run.line == 9)
+            .map(|run| {
+                run.row = 3;
+                run.line = 10;
+            })
+            .unwrap();
+        let mut edge = frame.windows[1].overscan[0].clone();
+        edge.row += 1;
+        edge.line += 1;
+        frame.windows[1].overscan.push(edge);
+        let metrics = geometry();
+        let bounds = Rectangle::with_size(Size::new(640.0, 400.0));
+        let mut state = ScrollState::default();
+        let sample = |frame: &Vim9RenderFrame, state: &ScrollState| {
+            let views = paint_views(frame, metrics, bounds, |window| {
+                state.offset(frame, window, metrics)
+            });
+            let view = &views[1];
+            let text = view
+                .runs
+                .iter()
+                .find(|run| run.run.line == 10)
+                .unwrap()
+                .rect
+                .y;
+            let caret = view.cursor.unwrap();
+            let projection = state.projection(&Arc::new(frame.clone()), metrics, metrics, bounds);
+            assert_eq!(
+                projection.caret(),
+                Some(caret),
+                "IME and drawn cursor must use identical pixel geometry"
+            );
+            (text, caret.y)
+        };
+        let start = sample(&frame, &state);
+        let mut pixels = 0.0;
+        let mut submitted = false;
+        for delta in [1.0, 0.25].into_iter().cycle().take(34) {
+            let event = wheel_at(
+                &frame,
+                metrics,
+                Point::new(340.0, 55.0),
+                mouse::ScrollDelta::Pixels { x: 0.0, y: -delta },
+            )
+            .unwrap();
+            assert!(!event.discrete);
+            state.wheel(&frame, metrics, event);
+            pixels += delta;
+            let position = sample(&frame, &state);
+            assert!(
+                (position.0 - (start.0 - pixels)).abs() < 0.001,
+                "text quantized after {pixels}px"
+            );
+            assert!(
+                (position.1 - (start.1 - pixels)).abs() < 0.001,
+                "caret quantized after {pixels}px"
+            );
+            assert_eq!(state.offset(&frame, 10, metrics), 0.0);
+            if !submitted && !state.scroll_commands().is_empty() {
+                state.scroll_submitted(20, 73);
+                submitted = true;
+            }
+        }
+        assert!(submitted);
+        let before_ack = sample(&frame, &state);
+        frame.windows[1].topline += 1;
+        frame.windows[1].botline += 1;
+        frame.windows[1].scroll_ack = 73;
+        frame.windows[1].cursor.row -= 1;
+        frame.windows[1].line_lengths.rotate_left(1);
+        for edge in &mut frame.windows[1].overscan {
+            edge.line += 1;
+            for run in &mut edge.runs {
+                run.line += 1;
+            }
+        }
+        frame.cursor = frame.windows[1].cursor.clone();
+        frame.runs.retain(|run| run.window != 20 || run.line >= 9);
+        for run in frame.runs.iter_mut().filter(|run| run.window == 20) {
+            run.row = run.row.saturating_sub(1);
+        }
+        state.observe(Some(&frame), metrics, true, |_| false);
+        let after_ack = sample(&frame, &state);
+        assert!((after_ack.0 - before_ack.0).abs() < 0.001);
+        assert!((after_ack.1 - before_ack.1).abs() < 0.001);
+        assert!(
+            !state.animating(),
+            "raw pixels must not acquire duplicate touchpad momentum"
+        );
+    }
+
+    #[test]
+    fn pending_precision_ack_keeps_display_frames_until_settled_or_cancelled() {
+        let frame = direct_frame();
+        let metrics = geometry();
+        let mut state = ScrollState::default();
+        state.wheel(&frame, metrics, wheel(1.0));
+        state.scroll_submitted(20, 76);
+        assert!(
+            !state.animating(),
+            "sampled margin is already fully exposed"
+        );
+        assert!(
+            state.needs_frame(),
+            "pending ack must be polled on every display frame"
+        );
+        let mut acknowledged = frame.clone();
+        acknowledged.windows[1].topline += 1;
+        acknowledged.windows[1].scroll_ack = 76;
+        state.observe(Some(&acknowledged), metrics, true, |_| false);
+        assert!(
+            !state.needs_frame(),
+            "idle editor must stop requesting display frames"
+        );
+        state.wheel(&acknowledged, metrics, wheel(1.0));
+        state.scroll_submitted(20, 77);
+        assert!(state.needs_frame());
+        state.clear();
+        assert!(!state.needs_frame());
     }
 
     #[test]

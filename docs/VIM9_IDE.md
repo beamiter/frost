@@ -59,6 +59,14 @@ and view identity, so a queued wheel cannot scroll a replacement buffer. The
 bridge frame and request completion are observed together to avoid retiring a
 valid gesture between its acknowledgement and response.
 
+Small trackpad deltas move content by pixels, including fractional pixels in
+layout, without waiting for a whole line. When input reaches the prefetched
+row limit, an acknowledgement preserves the position already shown and the
+remaining movement catches up on display frames. Pending acknowledgements also
+use the display frame clock, so high-refresh displays are not limited by the
+16 ms background snapshot poll. This frame loop stops after the request and
+remaining motion settle or are cancelled; it adds no second touchpad momentum.
+
 `Vim9Viewport` projects visible text, up to two supplied margin rows, the caret,
 source hits and the IME candidate rectangle through the same pixel transform.
 Missing margin coverage bounds the visible movement rather than inventing
@@ -190,6 +198,15 @@ index retains at most 20,000 files and the picker shows the best 80 matches,
 with the current selection kept visible. Refresh rebuilds the index; indexing,
 errors and truncation are shown in the picker. Use Open… for a new filename or
 an explicit external path.
+
+Quick Open also accepts `main.rs:42` or `src/main.rs:42:8` to open the
+selected fuzzy match at a line and optional Vim byte column. Use `:42` or
+`:42:8` to jump in the current buffer, even while indexing is unavailable.
+The picker shows the destination before confirmation; invalid or zero
+coordinates keep it open with an explanation. An exact indexed filename
+containing colons takes precedence over location syntax, so `notes:42` can
+still open that literal file. Enter and clicking a result use the same validated
+location. Vim's jump list and unsaved-buffer checks continue to apply.
 
 **Go to…** (`Ctrl+Shift+G`) accepts a positive `line` or `line:column`. It moves
 within the current buffer, including unnamed buffers, and uses Vim's byte
