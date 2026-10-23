@@ -513,6 +513,35 @@ fn bounded_quick_query(mut value: String) -> String {
     value
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchFeedbackState {
+    Running,
+    Cancelled,
+    Failed,
+    Completed,
+}
+
+fn search_feedback_state(search: &vim9::Vim9Search) -> SearchFeedbackState {
+    if search.running {
+        SearchFeedbackState::Running
+    } else if search.cancelled {
+        SearchFeedbackState::Cancelled
+    } else if !search.errors.is_empty() || !(0..=1).contains(&search.exit_code) {
+        SearchFeedbackState::Failed
+    } else {
+        SearchFeedbackState::Completed
+    }
+}
+
+// Successful ripgrep exits publish collected results even when the reader reports errors.
+fn search_failure_detail(exit_code: i32) -> &'static str {
+    if (0..=1).contains(&exit_code) {
+        "reported errors; results may be incomplete"
+    } else {
+        "failed; previous quickfix kept"
+    }
+}
+
 fn search_options_summary(options: &Vim9SearchOptions) -> String {
     let matching = if options.regex { "Regex" } else { "Literal" };
     let case = match options.case {
@@ -2365,7 +2394,8 @@ impl Ide {
             }
         } else {
             let search = &self.snapshot.search;
-            if search.running {
+            let search_state = search_feedback_state(search);
+            if search_state == SearchFeedbackState::Running {
                 contents = contents.push(
                     row![
                         text(if search.cancelled {
@@ -2385,12 +2415,12 @@ impl Ide {
                 contents = contents.push(
                     text(format!(
                         "Last project search{}: {} · {} collected, {} omitted",
-                        if search.cancelled {
-                            " (cancelled; previous quickfix kept)"
-                        } else if !(0..=1).contains(&search.exit_code) {
-                            " (failed; previous quickfix kept)"
+                        if search_state == SearchFeedbackState::Cancelled {
+                            " (cancelled; previous quickfix kept)".to_owned()
+                        } else if search_state == SearchFeedbackState::Failed {
+                            format!(" ({})", search_failure_detail(search.exit_code))
                         } else {
-                            ""
+                            String::new()
                         },
                         visible_label(&search.query),
                         search.count,
@@ -3128,6 +3158,52 @@ mod tests {
         assert!(detail.ends_with("\\u{1b}\\u{202e}end"));
         assert_eq!(detail.matches('界').count(), 300);
     }
+    #[test]
+    fn search_errors_with_successful_exit_do_not_claim_previous_results_were_kept() {
+        for exit_code in [0, 1] {
+            assert_eq!(
+                search_failure_detail(exit_code),
+                "reported errors; results may be incomplete"
+            );
+        }
+        for exit_code in [-1, 2] {
+            assert_eq!(
+                search_failure_detail(exit_code),
+                "failed; previous quickfix kept"
+            );
+        }
+    }
+
+    #[test]
+    fn search_feedback_prioritizes_running_cancelled_and_reported_errors() {
+        let mut search = vim9::Vim9Search::default();
+        for exit_code in [0, 1] {
+            search.exit_code = exit_code;
+            assert_eq!(
+                search_feedback_state(&search),
+                SearchFeedbackState::Completed
+            );
+            search
+                .errors
+                .push("ripgrep output could not be read".into());
+            assert_eq!(search_feedback_state(&search), SearchFeedbackState::Failed);
+            search.cancelled = true;
+            assert_eq!(
+                search_feedback_state(&search),
+                SearchFeedbackState::Cancelled
+            );
+            search.running = true;
+            assert_eq!(search_feedback_state(&search), SearchFeedbackState::Running);
+            search.running = false;
+            search.cancelled = false;
+            search.errors.clear();
+        }
+        for exit_code in [-1, 2] {
+            search.exit_code = exit_code;
+            assert_eq!(search_feedback_state(&search), SearchFeedbackState::Failed);
+        }
+    }
+
     #[test]
     fn empty_search_feedback_tracks_only_its_current_quickfix() {
         let mut snapshot = Vim9Snapshot::default();
