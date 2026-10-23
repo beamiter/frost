@@ -7,17 +7,41 @@ use iced::advanced::{layout, mouse, overlay, renderer, Clipboard, Layout, Shell,
 use iced::{Element, Event, Length, Rectangle, Size, Vector};
 use std::sync::Arc;
 
-struct Scope<'a, Message, Theme, Renderer> {
-    identity: Arc<()>,
+struct Scope<'a, Message, Theme, Renderer, Key> {
+    identity: Key,
     content: Element<'a, Message, Theme, Renderer>,
 }
 
-struct State {
-    identity: Arc<()>,
+struct State<Key> {
+    identity: Key,
+}
+
+#[derive(Clone)]
+struct Epoch(Arc<()>);
+
+impl PartialEq for Epoch {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 pub(crate) fn scope<'a, Message: 'a, Theme: 'a, Renderer: renderer::Renderer + 'a>(
     identity: Arc<()>,
+    content: impl Into<Element<'a, Message, Theme, Renderer>>,
+) -> Element<'a, Message, Theme, Renderer> {
+    scope_key(Epoch(identity), content)
+}
+
+/// Reset retained input when a stable domain identity or action meaning changes.
+/// Unlike a hash or a row position, the full key cannot alias another target.
+pub(crate) fn scope_key<
+    'a,
+    Message: 'a,
+    Theme: 'a,
+    Renderer: renderer::Renderer + 'a,
+    Key: Clone + PartialEq + 'static,
+>(
+    identity: Key,
     content: impl Into<Element<'a, Message, Theme, Renderer>>,
 ) -> Element<'a, Message, Theme, Renderer> {
     Element::new(Scope {
@@ -26,11 +50,11 @@ pub(crate) fn scope<'a, Message: 'a, Theme: 'a, Renderer: renderer::Renderer + '
     })
 }
 
-impl<Message, Theme, Renderer: renderer::Renderer> Widget<Message, Theme, Renderer>
-    for Scope<'_, Message, Theme, Renderer>
+impl<Message, Theme, Renderer: renderer::Renderer, Key: Clone + PartialEq + 'static>
+    Widget<Message, Theme, Renderer> for Scope<'_, Message, Theme, Renderer, Key>
 {
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<State>()
+        tree::Tag::of::<State<Key>>()
     }
 
     fn state(&self) -> tree::State {
@@ -44,8 +68,8 @@ impl<Message, Theme, Renderer: renderer::Renderer> Widget<Message, Theme, Render
     }
 
     fn diff(&self, tree: &mut Tree) {
-        let state = tree.state.downcast_mut::<State>();
-        if Arc::ptr_eq(&state.identity, &self.identity) {
+        let state = tree.state.downcast_mut::<State<Key>>();
+        if state.identity == self.identity {
             tree.children[0].diff(self.content.as_widget());
         } else {
             state.identity = self.identity.clone();
@@ -1038,5 +1062,51 @@ mod tests {
             ),
             [7]
         );
+    }
+
+    #[test]
+    fn session_action_press_cannot_transfer_to_replacement_or_changed_action() {
+        let key = ("codex".to_owned(), "session-a".to_owned(), false, false);
+        let content = |message| button(Space::new().width(40).height(30)).on_press(message);
+        for replacement in [
+            ("codex".to_owned(), "session-b".to_owned(), false, false),
+            ("claude".to_owned(), "session-a".to_owned(), false, false),
+            ("codex".to_owned(), "session-a".to_owned(), true, false),
+            ("codex".to_owned(), "session-a".to_owned(), false, true),
+        ] {
+            let mut old: Element<'_, u8, iced::Theme, TestRenderer> =
+                scope_key(key.clone(), content(1));
+            let mut tree = Tree::new(old.as_widget());
+            assert!(send(
+                &mut old,
+                &mut tree,
+                mouse::Event::ButtonPressed(mouse::Button::Left)
+            )
+            .is_empty());
+            let mut next = scope_key(replacement.clone(), content(2));
+            tree.diff(next.as_widget());
+            assert!(send(
+                &mut next,
+                &mut tree,
+                mouse::Event::ButtonReleased(mouse::Button::Left)
+            )
+            .is_empty());
+            assert!(send(
+                &mut next,
+                &mut tree,
+                mouse::Event::ButtonPressed(mouse::Button::Left)
+            )
+            .is_empty());
+            let mut redraw = scope_key(replacement, content(2));
+            tree.diff(redraw.as_widget());
+            assert_eq!(
+                send(
+                    &mut redraw,
+                    &mut tree,
+                    mouse::Event::ButtonReleased(mouse::Button::Left)
+                ),
+                [2]
+            );
+        }
     }
 }

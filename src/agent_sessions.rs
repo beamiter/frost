@@ -1,8 +1,8 @@
 //! Native session-library state. Discovery and resume validation live in core.
 use jterm_core::agent_sessions::{
-    AgentSession, SessionCatalog, SessionLaunch, SessionLibraryFilter, SessionLibraryStore,
-    SessionPreflight, SessionPreflightState, SessionProvider, SessionQuery, SessionScanner,
-    SessionSearchIndex, SessionSort, SessionStatus,
+    AgentSession, SessionArchiveFilter, SessionCatalog, SessionLaunch, SessionLibraryFilter,
+    SessionLibraryStore, SessionPreflight, SessionPreflightState, SessionProjectSummary,
+    SessionProvider, SessionQuery, SessionScanner, SessionSearchIndex, SessionSort, SessionStatus,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -11,6 +11,23 @@ pub(crate) const PAGE_SIZE: usize = 80;
 use std::time::{Duration, Instant};
 
 pub(crate) type SessionKey = (SessionProvider, String);
+
+/// Every organization callback belongs to one explicit editor opening, even
+/// when the same session is opened again after cancelling an earlier draft.
+#[derive(Clone, Debug)]
+pub(crate) struct OrganizationRef {
+    key: SessionKey,
+    epoch: std::sync::Arc<()>,
+}
+
+struct OrganizationEditor {
+    reference: OrganizationRef,
+    title: String,
+    alias: String,
+    tags: String,
+    notice: Option<String>,
+    saving: bool,
+}
 
 pub(crate) struct SessionLibrary {
     pub open: bool,
@@ -22,17 +39,23 @@ pub(crate) struct SessionLibrary {
     pub live_only: bool,
     pub pinned_only: bool,
     pub recent_only: bool,
+    pub archive: SessionArchiveFilter,
     pub store: SessionLibraryStore,
     pub preflight: SessionPreflight,
     pending_confirm: Option<SessionKey>,
     pub project: Option<PathBuf>,
     pub project_only: bool,
+    pub project_selection: Option<PathBuf>,
+    pub show_projects: bool,
     pub sort: SessionSort,
     search_index: SessionSearchIndex,
     visible: Vec<usize>,
     page: usize,
     codex_count: usize,
     observed_count: usize,
+    projects: Vec<SessionProjectSummary>,
+    query_error: Option<String>,
+    editor: Option<OrganizationEditor>,
     pub selected: Option<SessionKey>,
     pub notice: Option<String>,
     pub bindings: HashMap<SessionKey, usize>,
@@ -56,17 +79,23 @@ impl SessionLibrary {
             live_only: false,
             pinned_only: false,
             recent_only: false,
+            archive: SessionArchiveFilter::default(),
             store,
             preflight: SessionPreflight::new(),
             pending_confirm: None,
             project: None,
             project_only: false,
+            project_selection: None,
+            show_projects: false,
             sort: SessionSort::default(),
             search_index: SessionSearchIndex::default(),
             visible: Vec::new(),
             page: 0,
             codex_count: 0,
             observed_count: 0,
+            projects: Vec::new(),
+            query_error: None,
+            editor: None,
             selected: None,
             notice: None,
             bindings: HashMap::new(),
@@ -90,6 +119,16 @@ impl SessionLibrary {
         }
         if self.store.poll() {
             self.reconcile();
+        }
+        if self.editor.as_ref().is_some_and(|editor| editor.saving) && !self.store.is_busy() {
+            if let Some(error) = self.store.error() {
+                if let Some(editor) = &mut self.editor {
+                    editor.saving = false;
+                    editor.notice = Some(error.to_owned());
+                }
+            } else {
+                self.editor = None;
+            }
         }
         self.sync_preflight();
         self.preflight.poll();
@@ -143,16 +182,19 @@ impl SessionLibrary {
     }
 
     pub fn reconcile(&mut self) {
+        self.query_error = SessionSearchIndex::query_error(&self.query);
+        self.projects = self.search_index.projects(self.store.snapshot());
         self.visible = self.search_index.query_with_library(
             &SessionQuery {
                 text: &self.query,
                 provider: self.provider,
                 status: self.status,
                 live_only: self.live_only,
-                project: self
-                    .project_only
-                    .then_some(self.project.as_deref())
-                    .flatten(),
+                project: self.project_selection.as_deref().or_else(|| {
+                    self.project_only
+                        .then_some(self.project.as_deref())
+                        .flatten()
+                }),
                 sort: self.sort,
             },
             self.store.snapshot(),
@@ -160,6 +202,7 @@ impl SessionLibrary {
                 pinned_only: self.pinned_only,
                 recent_only: self.recent_only,
                 pinned_first: true,
+                archive: self.archive,
             },
         );
         if self.selected_session().is_none() {
@@ -179,7 +222,101 @@ impl SessionLibrary {
     pub fn close(&mut self) {
         self.open = false;
         self.pending_confirm = None;
+        self.editor = None;
         self.preflight.select(None);
+    }
+
+    pub(crate) fn editing(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    pub(crate) fn begin_organization(&mut self, key: &SessionKey) {
+        if !self.open || self.editing() {
+            return;
+        }
+        let Some(session) = self
+            .selected_session()
+            .filter(|session| session.provider == key.0 && session.id == key.1)
+        else {
+            return;
+        };
+        let title = session.title.clone();
+        let snapshot = self.store.snapshot();
+        let alias = snapshot.alias(key.0, &key.1).unwrap_or_default().to_owned();
+        let tags = snapshot.tags(key.0, &key.1).join(", ");
+        self.cancel_confirmation();
+        self.editor = Some(OrganizationEditor {
+            reference: OrganizationRef {
+                key: key.clone(),
+                epoch: std::sync::Arc::new(()),
+            },
+            title,
+            alias,
+            tags,
+            notice: None,
+            saving: false,
+        });
+    }
+
+    fn editor_for(&mut self, reference: &OrganizationRef) -> Option<&mut OrganizationEditor> {
+        self.open.then_some(())?;
+        self.editor.as_mut().filter(|editor| {
+            editor.reference.key == reference.key
+                && std::sync::Arc::ptr_eq(&editor.reference.epoch, &reference.epoch)
+                && !editor.saving
+        })
+    }
+
+    pub(crate) fn organization_alias(&mut self, reference: &OrganizationRef, value: String) {
+        if let Some(editor) = self.editor_for(reference) {
+            // Keep the actual input for validation; never silently rewrite a
+            // pasted control character into a different stored title.
+            editor.alias = value.chars().take(512).collect();
+            editor.notice = None;
+        }
+    }
+
+    pub(crate) fn organization_tags(&mut self, reference: &OrganizationRef, value: String) {
+        if let Some(editor) = self.editor_for(reference) {
+            editor.tags = value.chars().take(1024).collect();
+            editor.notice = None;
+        }
+    }
+
+    pub(crate) fn save_organization(&mut self, reference: &OrganizationRef) {
+        let Some(editor) = self.editor_for(reference) else {
+            return;
+        };
+        let alias = editor.alias.clone();
+        let tags = editor.tags.clone();
+        match self
+            .store
+            .set_details(reference.key.0, &reference.key.1, &alias, &tags)
+        {
+            Ok(()) => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.saving = true;
+                    editor.notice = None;
+                }
+            }
+            Err(error) => {
+                if let Some(editor) = self.editor_for(reference) {
+                    editor.notice = Some(error);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn cancel_organization(&mut self, reference: &OrganizationRef) {
+        if self.editor_for(reference).is_some() {
+            self.editor = None;
+        }
+    }
+
+    pub(crate) fn cancel_current_organization(&mut self) {
+        if let Some(reference) = self.editor.as_ref().map(|editor| editor.reference.clone()) {
+            self.cancel_organization(&reference);
+        }
     }
 
     pub fn sync_preflight(&mut self) {
@@ -232,7 +369,10 @@ impl SessionLibrary {
         self.live_only = false;
         self.pinned_only = false;
         self.recent_only = false;
+        self.archive = SessionArchiveFilter::default();
         self.project_only = false;
+        self.project_selection = None;
+        self.show_projects = false;
         self.sort = SessionSort::Relevance;
         self.selected = None;
         self.notice = None;
@@ -256,7 +396,7 @@ pub(crate) fn age(timestamp_ms: u64) -> String {
 
 impl super::Frost {
     pub(crate) fn resume_agent_session(&mut self) {
-        if !self.agent_sessions.open {
+        if !self.agent_sessions.open || self.agent_sessions.editing() {
             return;
         }
         let Some(session) = self.agent_sessions.selected_session().cloned() else {
@@ -292,7 +432,7 @@ impl super::Frost {
     }
 
     pub(crate) fn finish_pending_agent_resume(&mut self) {
-        if !self.agent_sessions.open {
+        if !self.agent_sessions.open || self.agent_sessions.editing() {
             self.agent_sessions.pending_confirm = None;
             return;
         }
@@ -364,8 +504,15 @@ impl super::Frost {
                 super::apply_theme_colors(&mut self.sessions[insert].terminal, &self.theme);
                 self.reindex_tabs_after_insert(insert);
                 self.open_tab_with(insert);
-                self.tabs[self.active_tab].title =
-                    Some(format!("{} · {}", session.provider.label(), session.title));
+                self.tabs[self.active_tab].title = Some(format!(
+                    "{} · {}",
+                    session.provider.label(),
+                    self.agent_sessions.store.snapshot().display_title(
+                        session.provider,
+                        &session.id,
+                        &session.title,
+                    ),
+                ));
                 self.agent_sessions.close();
                 self.agent_sessions.notice = None;
                 self.relayout();
@@ -413,12 +560,108 @@ impl super::Frost {
         use iced::{Element, Length};
         let state = &self.agent_sessions;
         let size = self.chrome_font_size();
+        if let Some(editor) = &state.editor {
+            let reference = editor.reference.clone();
+            let mut alias = text_input("Optional name for this conversation", &editor.alias)
+                .id(super::AGENT_SESSIONS_ALIAS_ID.clone())
+                .size(size)
+                .padding(9);
+            let mut tags = text_input("e.g. release, renderer, review", &editor.tags)
+                .size(size)
+                .padding(9);
+            if !editor.saving {
+                let alias_ref = reference.clone();
+                alias =
+                    alias.on_input(move |value| M::AgentSessionsAlias(alias_ref.clone(), value));
+                let tags_ref = reference.clone();
+                tags = tags.on_input(move |value| M::AgentSessionsTags(tags_ref.clone(), value));
+            }
+            let writable = state.store.is_loaded()
+                && !state.store.is_busy()
+                && state.store.error().is_none()
+                && !editor.saving;
+            let mut form = column![
+                text("Organize conversation").size(size + 5.0),
+                text(format!("{} · {}", reference.key.0.label(), editor.title))
+                    .size(size).style(text::secondary),
+                text("Display name").size(size),
+                alias,
+                text("Leave blank to use the provider's title. Up to 160 bytes.")
+                    .size(size - 2.0).style(text::secondary),
+                text("Tags").size(size),
+                tags,
+                text("Separate tags with commas. Up to 12 tags, 32 bytes each.")
+                    .size(size - 2.0).style(text::secondary),
+                text("Names and tags are shared across the four terminals. The original conversation stays unchanged.")
+                    .size(size - 1.0).style(text::secondary),
+            ].spacing(10);
+            if let Some(error) = editor.notice.as_deref().or_else(|| state.store.error()) {
+                form = form.push(text(error).size(size).style(text::danger));
+            }
+            form = form.push(
+                row![
+                    button(
+                        text(if editor.saving {
+                            "Saving…"
+                        } else {
+                            "Save details"
+                        })
+                        .size(size)
+                    )
+                    .on_press_maybe(
+                        writable.then_some(M::AgentSessionsSaveOrganization(reference.clone()))
+                    )
+                    .style(button::primary),
+                    button(text("Cancel").size(size))
+                        .on_press_maybe(
+                            (!editor.saving)
+                                .then_some(M::AgentSessionsCancelOrganization(reference.clone()))
+                        )
+                        .style(button::secondary),
+                ]
+                .spacing(8),
+            );
+            let panel = container(crate::widget_identity_scope::scope(
+                reference.epoch.clone(),
+                scrollable(form),
+            ))
+            .padding(22)
+            .width(Length::Fixed(
+                (self.win_size.width - 32.0).clamp(1.0, 640.0),
+            ))
+            .max_height((self.win_size.height - 40.0).max(1.0))
+            .style(self.popup_style());
+            // Consume clicks outside the editor without closing it or touching
+            // the terminal behind the session manager.
+            let backdrop = mouse_area(
+                container(Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .on_press(M::AgentSessionsOrganize(reference.key));
+            return stack![
+                Element::from(backdrop),
+                Element::from(
+                    container(panel)
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fill)
+                )
+            ]
+            .into();
+        }
         let mut heading = row![
             text("Agent Sessions").size(size + 6.0),
             Space::new().width(Length::Fill)
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center);
+        if self.config.experimental_task_sidebar {
+            heading = heading.push(
+                button(text("Tasks").size(size))
+                    .on_press(M::AgentSessionsShowTasks)
+                    .style(button::secondary),
+            );
+        }
         heading = heading.push(
             button(
                 text(if state.scanner.is_scanning() {
@@ -440,7 +683,7 @@ impl super::Frost {
         let claude = state.catalog.sessions.len() - codex;
         let observed = state.observed_count;
         let query = text_input(
-            "Search title, project, branch, recent content, session ID…",
+            "Search names, tags, projects…  provider:codex tag:review -is:live",
             &state.query,
         )
         .id(super::AGENT_SESSIONS_INPUT_ID.clone())
@@ -464,6 +707,17 @@ impl super::Frost {
                     }),
             );
         }
+        for archive in SessionArchiveFilter::ALL {
+            filters = filters.push(
+                button(text(archive.label()).size(size - 1.0))
+                    .on_press(M::AgentSessionsArchiveFilter(archive))
+                    .style(if state.archive == archive {
+                        button::primary
+                    } else {
+                        button::secondary
+                    }),
+            );
+        }
         let mut statuses = row![].spacing(4);
         for (label, status) in [
             ("All activity", None),
@@ -471,7 +725,7 @@ impl super::Frost {
             ("Working", Some(SessionStatus::Working)),
             ("Waiting", Some(SessionStatus::Waiting)),
             ("Unknown", Some(SessionStatus::Unknown)),
-            ("Archived", Some(SessionStatus::Archived)),
+            ("Provider archived", Some(SessionStatus::Archived)),
         ] {
             statuses = statuses.push(
                 button(text(label).size(size - 1.0))
@@ -510,16 +764,19 @@ impl super::Frost {
                     }
                 )
                 .size(size - 1.0),
-                text(session.title.clone()).size(size),
+                text(state.store.snapshot().display_title(
+                    session.provider,
+                    &session.id,
+                    &session.title
+                ))
+                .size(size),
                 Space::new().width(Length::Fill),
                 text(age(session.updated_at_ms)).size(size - 2.0)
             ]
             .spacing(8);
-            let content = column![
+            let mut content = column![
                 title,
-                text(session.cwd.to_string_lossy().into_owned())
-                    .size(size - 2.0)
-                    .style(text::secondary),
+                text(session.cwd.to_string_lossy().into_owned()).size(size - 2.0),
                 text(if here {
                     "Open in this window".to_owned()
                 } else {
@@ -531,9 +788,27 @@ impl super::Frost {
                     }
                 })
                 .size(size - 2.0)
-                .style(text::secondary)
             ]
             .spacing(3);
+            let tags = state.store.snapshot().tags(session.provider, &session.id);
+            if !tags.is_empty() {
+                content = content.push(
+                    text(
+                        tags.iter()
+                            .map(|tag| format!("#{tag}"))
+                            .collect::<Vec<_>>()
+                            .join("  "),
+                    )
+                    .size(size - 2.0),
+                );
+            }
+            if state
+                .store
+                .snapshot()
+                .is_archived(session.provider, &session.id)
+            {
+                content = content.push(text("Archived in library").size(size - 2.0));
+            }
             list = list.push(
                 button(content)
                     .on_press(M::AgentSessionsSelect(key))
@@ -601,8 +876,40 @@ impl super::Frost {
         .into();
         let mut detail = column![].spacing(10);
         let mut actions = column![].spacing(6);
+        let mut action_identity = None;
         if let Some(session) = state.selected_session() {
-            detail = detail.push(text(session.title.clone()).size(size + 2.0));
+            detail = detail.push(
+                text(state.store.snapshot().display_title(
+                    session.provider,
+                    &session.id,
+                    &session.title,
+                ))
+                .size(size + 2.0),
+            );
+            if state
+                .store
+                .snapshot()
+                .alias(session.provider, &session.id)
+                .is_some()
+            {
+                detail = detail.push(
+                    text(format!("Original title: {}", session.title))
+                        .size(size - 2.0)
+                        .style(text::secondary),
+                );
+            }
+            let tags = state.store.snapshot().tags(session.provider, &session.id);
+            if !tags.is_empty() {
+                detail = detail.push(
+                    text(
+                        tags.iter()
+                            .map(|tag| format!("#{tag}"))
+                            .collect::<Vec<_>>()
+                            .join("  "),
+                    )
+                    .size(size),
+                );
+            }
             detail = detail.push(
                 text(format!(
                     "{}  ·  {}",
@@ -727,12 +1034,41 @@ impl super::Frost {
                         (state.store.is_loaded()
                             && !state.store.is_busy()
                             && state.store.error().is_none())
-                        .then_some(M::AgentSessionsPin(key))
+                        .then_some(M::AgentSessionsPin(key.clone()))
                     )
                     .style(button::secondary),
                     button(text("Copy resume command").size(size - 1.0))
                         .on_press_maybe(ready.then_some(M::AgentSessionsCopy))
                         .style(button::text),
+                ]
+                .spacing(8)
+                .wrap(),
+            );
+            let writable =
+                state.store.is_loaded() && !state.store.is_busy() && state.store.error().is_none();
+            let archived = state
+                .store
+                .snapshot()
+                .is_archived(session.provider, &session.id);
+            // Iced buttons retain a press until release. A refresh may replace
+            // the selected conversation or change an action while held, so the
+            // complete identity must retire the old subtree's pressed state.
+            action_identity = Some((key.clone(), pinned, archived, bound, ready, checking));
+            actions = actions.push(
+                row![
+                    button(text("Name and tags…").size(size - 1.0))
+                        .on_press_maybe(writable.then_some(M::AgentSessionsOrganize(key.clone())))
+                        .style(button::secondary),
+                    button(
+                        text(if archived {
+                            "Restore to library"
+                        } else {
+                            "Archive in library"
+                        })
+                        .size(size - 1.0)
+                    )
+                    .on_press_maybe(writable.then_some(M::AgentSessionsArchive(key)))
+                    .style(button::text),
                 ]
                 .spacing(8)
                 .wrap(),
@@ -746,11 +1082,21 @@ impl super::Frost {
                 actions = actions.push(text(notice.clone()).size(size - 1.0).style(text::danger));
             }
         }
+        let actions = crate::widget_identity_scope::scope_key(action_identity, actions);
         let details: Element<'_, M> = column![scrollable(detail).height(Length::Fill), actions]
             .spacing(10)
             .height(Length::Fill)
             .into();
         let wide = self.win_size.width >= 780.0;
+        // At compact sizes the filter controls and action bar can exceed the
+        // available height. Give the results a useful minimum and let the
+        // whole manager scroll, keeping every action reachable.
+        let compact = !wide || self.win_size.height < 720.0;
+        let content_height = if compact {
+            Length::Fixed(if wide { 380.0 } else { 540.0 })
+        } else {
+            Length::Fill
+        };
         let content: Element<'_, M> = if wide {
             row![
                 container(list)
@@ -762,7 +1108,7 @@ impl super::Frost {
                     .padding(8)
             ]
             .spacing(14)
-            .height(Length::Fill)
+            .height(content_height)
             .into()
         } else {
             column![
@@ -770,12 +1116,91 @@ impl super::Frost {
                 container(details).height(Length::FillPortion(1))
             ]
             .spacing(8)
-            .height(Length::Fill)
+            .height(content_height)
             .into()
+        };
+        let mut project_controls = column![row![
+            button(text(format!("Projects · {}", state.projects.len())).size(size - 1.0))
+                .on_press(M::AgentSessionsProjectsToggle)
+                .style(if state.show_projects {
+                    button::primary
+                } else {
+                    button::secondary
+                }),
+            text(
+                state
+                    .project_selection
+                    .as_deref()
+                    .map(|path| jterm_core::review_input::safe_inline_display(
+                        &path.to_string_lossy(),
+                        1024
+                    ))
+                    .unwrap_or_else(|| "Choose a project to focus its conversations".into())
+            )
+            .size(size - 2.0)
+            .style(text::secondary),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center)
+        .wrap()]
+        .spacing(6);
+        if state.show_projects {
+            let mut projects = column![].spacing(4);
+            for project in &state.projects {
+                projects = projects.push(
+                    button(
+                        row![
+                            text(jterm_core::review_input::safe_inline_display(
+                                &project.root.to_string_lossy(),
+                                1024
+                            ))
+                            .size(size - 1.0),
+                            Space::new().width(Length::Fill),
+                            text(format!(
+                                "{} active · {} live · {} waiting · {} pinned · {} archived",
+                                project.total,
+                                project.live,
+                                project.waiting,
+                                project.pinned,
+                                project.archived
+                            ))
+                            .size(size - 2.0),
+                        ]
+                        .spacing(8)
+                        .wrap(),
+                    )
+                    .width(Length::Fill)
+                    .padding(7)
+                    .on_press(M::AgentSessionsProject(project.root.clone()))
+                    .style(
+                        if state.project_selection.as_ref() == Some(&project.root) {
+                            button::primary
+                        } else {
+                            button::secondary
+                        },
+                    ),
+                );
+            }
+            project_controls =
+                project_controls.push(scrollable(projects).height(Length::Fixed(124.0)));
+        }
+        let search_help = text(state.query_error.as_deref().unwrap_or(
+            "Search: tag:review provider:codex project:\"my project\" is:pinned -is:live",
+        ))
+        .size(size - 2.0);
+        let search_help = if state.query_error.is_some() {
+            search_help.style(text::danger)
+        } else {
+            search_help.style(text::secondary)
+        };
+        let heading: Element<'_, M> = if self.win_size.width < 600.0 {
+            heading.wrap().into()
+        } else {
+            heading.into()
         };
         let mut body = column![heading,
             text(format!("{} conversations   ·   {codex} Codex   ·   {claude} Claude   ·   {observed} observed live", state.catalog.sessions.len())).size(size).style(text::secondary),
-            query, filters, statuses.wrap(),
+            query, search_help, filters.wrap(), statuses.wrap(),
             row![
                 checkbox(state.live_only).label("Observed live only").on_toggle(M::AgentSessionsLive).size(size),
                 checkbox(state.project_only).label("This folder")
@@ -791,8 +1216,9 @@ impl super::Frost {
             row![
                 checkbox(state.pinned_only).label("Pinned only").on_toggle(M::AgentSessionsPinned).size(size),
                 checkbox(state.recent_only).label("Previously resumed").on_toggle(M::AgentSessionsRecent).size(size),
-                text(if !state.store.is_loaded() { "Loading saved library…" } else if state.store.is_busy() { "Saving library…" } else { "Pins and recent sessions are shared across terminals" }).size(size - 2.0).style(text::secondary),
+                text(if !state.store.is_loaded() { "Loading saved library…" } else if state.store.is_busy() { "Saving library…" } else { "Names, tags, pins and archive are shared across terminals" }).size(size - 2.0).style(text::secondary),
             ].spacing(12).align_y(iced::Alignment::Center).wrap(),
+            project_controls,
             text("Activity reflects the last saved event. Live badges require an observed matching process.").size(size - 2.0).style(text::secondary),
             content,
         ].spacing(9);
@@ -823,6 +1249,11 @@ impl super::Frost {
                 .size(size - 2.0)
                 .style(text::secondary),
         );
+        let body: Element<'_, M> = if compact {
+            scrollable(body).height(Length::Fill).into()
+        } else {
+            body.into()
+        };
         let panel = container(body)
             .padding(18)
             .width(Length::Fixed(
@@ -836,7 +1267,7 @@ impl super::Frost {
                 .height(Length::Fill),
         )
         .on_press(M::AgentSessionsClose);
-        let centered = container(panel)
+        let centered = container(mouse_area(panel).on_press(M::AgentSessionsSurface))
             .center_x(Length::Fill)
             .center_y(Length::Fill);
         stack![Element::from(dismiss), Element::from(centered)].into()
@@ -1092,5 +1523,155 @@ mod tests {
             crate::keybindings::KeyBindings::default_bindings().get_command("ctrl+shift+alt+g"),
             Some(crate::keybindings::Command::AgentSessions)
         );
+    }
+
+    #[test]
+    fn organization_callbacks_belong_to_the_explicit_editor_opening() {
+        let mut library = library();
+        let id = "11111111-1111-4111-8111-111111111111";
+        let key = (SessionProvider::Codex, id.to_owned());
+        library.replace_catalog(catalog(vec![session(
+            SessionProvider::Codex,
+            id,
+            "Original",
+        )]));
+        // A callback retained after close cannot open an editor or queue a save.
+        library.begin_organization(&key);
+        assert!(!library.editing());
+        library.open = true;
+        library.pending_confirm = Some(key.clone());
+        library.begin_organization(&key);
+        assert!(library.pending_confirm.is_none());
+        let old = library.editor.as_ref().unwrap().reference.clone();
+        library.organization_alias(&old, "First draft".into());
+        library.cancel_organization(&old);
+        library.begin_organization(&key);
+        let current = library.editor.as_ref().unwrap().reference.clone();
+        library.organization_alias(&current, "Current draft".into());
+        library.organization_alias(&old, "Stale replacement".into());
+        library.organization_tags(&old, "stale".into());
+        library.cancel_organization(&old);
+        library.save_organization(&old);
+        let editor = library.editor.as_ref().unwrap();
+        assert_eq!(editor.alias, "Current draft");
+        assert!(editor.tags.is_empty());
+        assert!(!editor.saving);
+        library.close();
+        library.save_organization(&current);
+        assert!(!library.editing());
+    }
+
+    #[test]
+    fn organizer_save_archive_search_and_project_views_share_durable_identity() {
+        let root = std::env::temp_dir().join(format!("frost-organizer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = root.join("library.json");
+        let mut library = SessionLibrary::with_store(SessionLibraryStore::with_path(path.clone()));
+        let first = "11111111-1111-4111-8111-111111111111";
+        let second = "22222222-2222-4222-8222-222222222222";
+        let mut a = session(SessionProvider::Codex, first, "Untitled conversation");
+        a.cwd = "/work/repo/src".into();
+        a.updated_at_ms = 100;
+        let mut b = session(SessionProvider::Claude, second, "Another conversation");
+        b.cwd = "/work/repo-other".into();
+        library.replace_catalog(catalog(vec![a, b]));
+        until_library(&mut library, |state| {
+            state.store.is_loaded() && !state.store.is_busy()
+        });
+        library.open = true;
+        library.begin_organization(&(SessionProvider::Codex, first.into()));
+        let reference = library.editor.as_ref().unwrap().reference.clone();
+        library.organization_alias(&reference, "\u{202e}hidden".into());
+        library.save_organization(&reference);
+        assert!(library.editor.as_ref().unwrap().notice.is_some());
+        assert!(!library.editor.as_ref().unwrap().saving);
+        assert!(library
+            .store
+            .snapshot()
+            .alias(SessionProvider::Codex, first)
+            .is_none());
+        library.organization_alias(&reference, "Renderer release".into());
+        library.organization_tags(&reference, "release, review".into());
+        library.save_organization(&reference);
+        assert!(library.editor.as_ref().unwrap().saving);
+        // An edit racing the accepted save cannot relabel the committed transaction.
+        library.organization_alias(&reference, "Late mutation".into());
+        until_library(&mut library, |state| {
+            !state.editing() && !state.store.is_busy()
+        });
+        assert_eq!(
+            library
+                .store
+                .snapshot()
+                .alias(SessionProvider::Codex, first),
+            Some("Renderer release")
+        );
+        library.query = "tag:review provider:codex \"Renderer release\"".into();
+        library.reconcile();
+        assert_eq!(
+            library
+                .filtered()
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first]
+        );
+        assert_eq!(library.filtered()[0].title, "Untitled conversation");
+        library
+            .store
+            .set_archived(SessionProvider::Codex, first, true)
+            .unwrap();
+        until_library(&mut library, |state| {
+            state
+                .store
+                .snapshot()
+                .is_archived(SessionProvider::Codex, first)
+        });
+        assert!(library.filtered().is_empty());
+        assert!(library.selected_session().is_none());
+        library.archive = SessionArchiveFilter::Archived;
+        library.reconcile();
+        assert_eq!(library.filtered()[0].id, first);
+        library.clear_filters();
+        library.archive = SessionArchiveFilter::All;
+        library.project_selection = Some("/work/repo".into());
+        library.reconcile();
+        assert_eq!(library.filtered().len(), 1);
+        assert_eq!(library.filtered()[0].id, first);
+        library.query = "is:unknown".into();
+        library.reconcile();
+        assert!(library.query_error.is_some());
+        assert!(library.filtered().is_empty());
+        library.close();
+        drop(library);
+        let mut reloaded = SessionLibrary::with_store(SessionLibraryStore::with_path(path));
+        until_library(&mut reloaded, |state| {
+            state.store.is_loaded() && !state.store.is_busy()
+        });
+        assert_eq!(
+            reloaded
+                .store
+                .snapshot()
+                .alias(SessionProvider::Codex, first),
+            Some("Renderer release")
+        );
+        assert_eq!(
+            reloaded
+                .store
+                .snapshot()
+                .tags(SessionProvider::Codex, first),
+            &["release", "review"]
+        );
+        assert!(reloaded
+            .store
+            .snapshot()
+            .is_archived(SessionProvider::Codex, first));
+        drop(reloaded);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

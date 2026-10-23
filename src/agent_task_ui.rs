@@ -428,10 +428,28 @@ pub(crate) struct TaskFollowUpRef {
     selection: Arc<()>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TaskRepositoryChoice(pub(crate) Option<PathBuf>);
+
+impl std::fmt::Display for TaskRepositoryChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(path) => formatter.write_str(&jterm_core::review_input::safe_inline_display(
+                &path.to_string_lossy(),
+                256,
+            )),
+            None => formatter.write_str("All projects"),
+        }
+    }
+}
+
 pub(crate) struct TaskPanel {
     pub(crate) selected: Option<TaskId>,
     pub(crate) dashboard_query: String,
     pub(crate) dashboard_view: crate::agent_task::DashboardView,
+    pub(crate) dashboard_provider: Option<AgentProvider>,
+    pub(crate) dashboard_repo: Option<PathBuf>,
+    pub(crate) dashboard_sort: crate::agent_task::DashboardSort,
     /// Draft review feedback for the selected task's next native turn.
     pub(crate) follow_up: String,
     follow_up_epoch: Arc<()>,
@@ -454,6 +472,9 @@ impl TaskPanel {
             selected: None,
             dashboard_query: String::new(),
             dashboard_view: crate::agent_task::DashboardView::All,
+            dashboard_provider: None,
+            dashboard_repo: None,
+            dashboard_sort: crate::agent_task::DashboardSort::default(),
             follow_up: String::new(),
             follow_up_epoch: Arc::new(()),
             follow_up_notice: None,
@@ -476,6 +497,35 @@ impl TaskPanel {
                 self.select(Some(row.id));
             }
         }
+    }
+
+    pub(crate) fn step_dashboard(
+        &mut self,
+        dashboard: &crate::agent_task::DashboardSnapshot,
+        forward: bool,
+    ) {
+        if let Some(next) = dashboard.step_selection(self.selected, forward) {
+            if self.selected != Some(next) {
+                self.select(Some(next));
+            }
+        }
+    }
+
+    pub(crate) fn next_attention(&mut self, dashboard: &crate::agent_task::DashboardSnapshot) {
+        if let Some(next) = dashboard.next_attention(self.selected) {
+            if self.selected != Some(next) {
+                self.select(Some(next));
+            }
+        }
+    }
+
+    pub(crate) fn clear_dashboard_filters(&mut self) {
+        self.retire_panel_callbacks();
+        self.dashboard_query.clear();
+        self.dashboard_view = crate::agent_task::DashboardView::All;
+        self.dashboard_provider = None;
+        self.dashboard_repo = None;
+        self.dashboard_sort = crate::agent_task::DashboardSort::default();
     }
 
     pub(crate) fn select(&mut self, task_id: Option<TaskId>) {
@@ -1094,6 +1144,58 @@ mod tests {
                 .collect::<Vec<_>>(),
             before
         );
+    }
+
+    #[test]
+    fn dashboard_navigation_preserves_drafts_and_never_changes_task_lifecycle() {
+        use crate::agent_task::{
+            DashboardFilter, DashboardSnapshot, DashboardSort, NewTask, TaskManager, TaskStatus,
+        };
+        let mut manager = TaskManager::new();
+        for title in ["Alpha", "Beta", "Gamma"] {
+            manager
+                .create(NewTask {
+                    title: title.into(),
+                    provider: AgentProvider::Codex,
+                    repo_root: "/fixture".into(),
+                    worktree_path: "/fixture/worktree".into(),
+                    branch: "test/dashboard".into(),
+                    base_commit: "a".repeat(40),
+                    source_context: None,
+                })
+                .unwrap();
+        }
+        let mut tasks = manager.tasks().to_vec();
+        tasks[1].status = TaskStatus::WaitingForHuman;
+        let mut dashboard =
+            DashboardSnapshot::project(&tasks, |_| Default::default(), DashboardFilter::default());
+        dashboard.sort_rows(DashboardSort::Title);
+        let first = dashboard.rows[0].id;
+        let second = dashboard.rows[1].id;
+        let mut panel = TaskPanel::new();
+        panel.step_dashboard(&dashboard, true);
+        assert_eq!(panel.selected, Some(first));
+        panel.set_follow_up("Keep my review feedback");
+        panel.step_dashboard(&dashboard, true);
+        assert_eq!(panel.selected, Some(second));
+        assert!(panel.follow_up.is_empty());
+        panel.step_dashboard(&dashboard, false);
+        assert_eq!(panel.selected, Some(first));
+        assert_eq!(panel.follow_up, "Keep my review feedback");
+        panel.next_attention(&dashboard);
+        assert_eq!(panel.selected, Some(second));
+        panel.dashboard_provider = Some(AgentProvider::Claude);
+        panel.dashboard_repo = Some("/another-project".into());
+        panel.dashboard_sort = DashboardSort::Recent;
+        panel.clear_dashboard_filters();
+        assert_eq!(panel.selected, Some(second));
+        assert!(panel.dashboard_provider.is_none());
+        assert!(panel.dashboard_repo.is_none());
+        assert_eq!(panel.dashboard_sort, DashboardSort::Attention);
+        assert!(manager
+            .tasks()
+            .iter()
+            .all(|task| task.status == TaskStatus::Created));
     }
 
     #[test]

@@ -1218,3 +1218,39 @@ background. Confirming performs a fresh check before opening; changing selection
 or closing the picker cancels a pending confirmation. The primary action stays
 visible while the conversation preview scrolls. Existing live tabs remain
 switchable even if their original CLI executable has since disappeared.
+
+### Organize conversations and projects
+
+Choose **Name and tags…** to give a session a recognizable local name and up to
+12 comma-separated tags. **Save details** writes both together; cancelling leaves
+the saved organization unchanged. The editor owns keyboard input, so Enter while
+editing cannot accidentally resume a conversation. Names, tags, pins, archive
+state and resume history are shared with Anvil, Forge and Ember.
+
+**Archive in library** moves a conversation out of the default active view.
+Choose **Archived here** to find it and **Restore to library** to bring it
+back. This is reversible organization of the shared library; provider histories,
+worktrees and running processes remain intact. **Provider archived** in the
+activity filters still refers to the provider's own saved state.
+
+Search also supports `provider:codex`, `project:"my project"`, `tag:review`,
+`status:waiting`, `is:pinned`, `is:live`, `is:archived`, quoted phrases and negative
+terms such as `-tag:done`. Invalid filters show an explanation. The **Projects**
+browser lists every discovered project with conversation, live, waiting, pinned
+and archived counts; select a project to scope the library to its directory and
+subdirectories. **Clear filters** returns to the active library.
+
+### Task management workspace
+
+With **Experimental Tasks dashboard** enabled in Settings, **Tasks** opens the
+task workspace from the session library; **Saved sessions** returns to saved
+conversations. Task controls combine provider, project, text and lifecycle
+filters, with **Needs you first**, **Recently updated**, **Oldest update**,
+**Task name** and **Project**
+ordering. Rows show project, branch, last update, validation state and observed
+session attachment. Project ordering groups rows under their repository.
+
+**Previous**, **Next** and **Next needs you** move through the filtered tasks.
+Navigation keeps review drafts attached to their task identities and does not
+start, stop or approve an agent. Existing native start, review, diff, validation
+and approval controls remain on the selected task's detail card.

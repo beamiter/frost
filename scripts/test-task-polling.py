@@ -18,7 +18,9 @@ def run():
     parser.add_argument("--check-regression", action="store_true")
     args = parser.parse_args()
     source = (ROOT / "src/main.rs").read_text()
-    branch = source.split("        let tasks_open =", 1)[1].split("        // The blink tick", 1)[0]
+    # Session-library discovery and durable organization have their own pump.
+    # Extract only the Tasks branch represented by the runtime fixtures below.
+    branch = source.split("        let tasks_open =", 1)[1].split("        if self.agent_sessions.open", 1)[0]
     branch = "        let tasks_open =" + branch
     fixture = r'''
 #![allow(dead_code)]

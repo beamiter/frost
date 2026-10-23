@@ -1500,6 +1500,8 @@ static AGENT_SESSIONS_LIST_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-agent-sessions-list"));
 static AGENT_SESSIONS_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-agent-sessions-input"));
+static AGENT_SESSIONS_ALIAS_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-agent-session-name"));
 static AGENT_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-agent-input"));
 static AGENT_EDIT_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
@@ -4717,6 +4719,11 @@ enum Message {
     TaskPanelToggle,
     TaskDashboardQuery(String),
     TaskDashboardView(agent_task::DashboardView),
+    TaskDashboardProvider(Option<agent_task::AgentProvider>),
+    TaskDashboardRepository(Option<std::path::PathBuf>),
+    TaskDashboardSort(agent_task::DashboardSort),
+    TaskDashboardStep(bool),
+    TaskDashboardNextAttention,
     TaskDashboardClear,
     TaskDashboardOpenResult,
     TaskSelect(agent_task::TaskId),
@@ -4742,6 +4749,7 @@ enum Message {
     /// Open a coding-agent CLI in a new tab at the active pane cwd.
     AgentLaunch(agent_task::AgentProvider),
     AgentSessionsToggle,
+    AgentSessionsSurface,
     AgentSessionsClose,
     AgentSessionsRefresh,
     AgentSessionsTick,
@@ -4750,6 +4758,16 @@ enum Message {
     AgentSessionsPinned(bool),
     AgentSessionsRecent(bool),
     AgentSessionsPin(agent_sessions::SessionKey),
+    AgentSessionsArchiveFilter(jterm_core::agent_sessions::SessionArchiveFilter),
+    AgentSessionsArchive(agent_sessions::SessionKey),
+    AgentSessionsOrganize(agent_sessions::SessionKey),
+    AgentSessionsAlias(agent_sessions::OrganizationRef, String),
+    AgentSessionsTags(agent_sessions::OrganizationRef, String),
+    AgentSessionsSaveOrganization(agent_sessions::OrganizationRef),
+    AgentSessionsCancelOrganization(agent_sessions::OrganizationRef),
+    AgentSessionsProject(std::path::PathBuf),
+    AgentSessionsProjectsToggle,
+    AgentSessionsShowTasks,
     AgentSessionsCheck,
     AgentSessionsScope(bool),
     AgentSessionsSort(jterm_core::agent_sessions::SessionSort),
@@ -17076,30 +17094,11 @@ impl Frost {
                 self.toggle_task_panel();
             }
             Message::TaskDashboardOpenResult => {
-                let dashboard = agent_task::DashboardSnapshot::project(
-                    self.task_manager
-                        .tasks()
-                        .iter()
-                        .filter(|task| task.status != agent_task::TaskStatus::Archived),
-                    |id| agent_task::DashboardActivity {
-                        has_active_agent_stream: self
-                            .task_manager
-                            .has_active_agent_event_stream(id),
-                        native_preparing: self.agent_runtime.has_preparing(id),
-                        ..Default::default()
-                    },
-                    agent_task::DashboardFilter {
-                        text: &self.task_panel.dashboard_query,
-                        view: self.task_panel.dashboard_view,
-                        ..Default::default()
-                    },
-                );
+                let dashboard = self.task_dashboard();
                 self.task_panel.open_dashboard_result(&dashboard);
             }
             Message::TaskDashboardClear => {
-                self.task_panel.retire_panel_callbacks();
-                self.task_panel.dashboard_query.clear();
-                self.task_panel.dashboard_view = agent_task::DashboardView::All;
+                self.task_panel.clear_dashboard_filters();
             }
             Message::TaskDashboardQuery(query) => {
                 self.task_panel.retire_panel_callbacks();
@@ -17109,8 +17108,36 @@ impl Frost {
                 self.task_panel.retire_panel_callbacks();
                 self.task_panel.dashboard_view = view;
             }
+            Message::TaskDashboardProvider(provider) => {
+                self.task_panel.retire_panel_callbacks();
+                self.task_panel.dashboard_provider = provider;
+            }
+            Message::TaskDashboardRepository(repo) => {
+                self.task_panel.retire_panel_callbacks();
+                self.task_panel.dashboard_repo = repo;
+            }
+            Message::TaskDashboardSort(sort) => {
+                self.task_panel.retire_panel_callbacks();
+                self.task_panel.dashboard_sort = sort;
+            }
+            Message::TaskDashboardStep(forward) => {
+                let dashboard = self.task_dashboard();
+                self.task_panel.step_dashboard(&dashboard, forward);
+            }
+            Message::TaskDashboardNextAttention => {
+                let dashboard = self.task_dashboard();
+                self.task_panel.next_attention(&dashboard);
+            }
             Message::TaskSelect(task_id) => {
-                self.task_panel.select(Some(task_id));
+                if self.sidebar_open
+                    && self.sidebar_panel == SidebarPanel::Tasks
+                    && self
+                        .task_dashboard()
+                        .selected_index(Some(task_id))
+                        .is_some()
+                {
+                    self.task_panel.select(Some(task_id));
+                }
             }
             Message::TaskHide(task_id) => {
                 if let Err(error) = self.task_manager.archive(task_id) {
@@ -17177,6 +17204,7 @@ impl Frost {
                     return iced::widget::operation::focus(AGENT_SESSIONS_INPUT_ID.clone());
                 }
             }
+            Message::AgentSessionsSurface => {}
             Message::AgentSessionsClose => self.agent_sessions.close(),
             Message::AgentSessionsRefresh => {
                 self.agent_sessions.cancel_confirmation();
@@ -17199,6 +17227,12 @@ impl Frost {
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsPin((provider, id)) => {
+                if !self.agent_sessions.open
+                    || self.agent_sessions.editing()
+                    || self.agent_sessions.selected.as_ref() != Some(&(provider, id.clone()))
+                {
+                    return Task::none();
+                }
                 self.agent_sessions.cancel_confirmation();
                 let pinned = !self
                     .agent_sessions
@@ -17209,6 +17243,75 @@ impl Frost {
                     self.agent_sessions.notice = Some(error);
                 }
             }
+            Message::AgentSessionsArchiveFilter(archive) => {
+                self.agent_sessions.cancel_confirmation();
+                self.agent_sessions.archive = archive;
+                self.agent_sessions.selected = None;
+                self.agent_sessions.reconcile();
+                return self.agent_sessions_scroll_task();
+            }
+            Message::AgentSessionsArchive((provider, id)) => {
+                if !self.agent_sessions.open
+                    || self.agent_sessions.editing()
+                    || self.agent_sessions.selected.as_ref() != Some(&(provider, id.clone()))
+                {
+                    return Task::none();
+                }
+                self.agent_sessions.cancel_confirmation();
+                let archived = !self
+                    .agent_sessions
+                    .store
+                    .snapshot()
+                    .is_archived(provider, &id);
+                if let Err(error) = self
+                    .agent_sessions
+                    .store
+                    .set_archived(provider, &id, archived)
+                {
+                    self.agent_sessions.notice = Some(error);
+                }
+            }
+            Message::AgentSessionsOrganize(key) => {
+                let was_editing = self.agent_sessions.editing();
+                self.agent_sessions.begin_organization(&key);
+                if !was_editing && self.agent_sessions.editing() {
+                    return iced::widget::operation::focus(AGENT_SESSIONS_ALIAS_ID.clone());
+                }
+            }
+            Message::AgentSessionsAlias(reference, value) => {
+                self.agent_sessions.organization_alias(&reference, value);
+            }
+            Message::AgentSessionsTags(reference, value) => {
+                self.agent_sessions.organization_tags(&reference, value);
+            }
+            Message::AgentSessionsSaveOrganization(reference) => {
+                self.agent_sessions.save_organization(&reference);
+            }
+            Message::AgentSessionsCancelOrganization(reference) => {
+                let was_editing = self.agent_sessions.editing();
+                self.agent_sessions.cancel_organization(&reference);
+                if was_editing && !self.agent_sessions.editing() {
+                    return iced::widget::operation::focus(AGENT_SESSIONS_INPUT_ID.clone());
+                }
+            }
+            Message::AgentSessionsProject(project) => {
+                self.agent_sessions.cancel_confirmation();
+                self.agent_sessions.project_selection = Some(project);
+                self.agent_sessions.project_only = false;
+                self.agent_sessions.show_projects = false;
+                self.agent_sessions.selected = None;
+                self.agent_sessions.reconcile();
+                return self.agent_sessions_scroll_task();
+            }
+            Message::AgentSessionsProjectsToggle => {
+                self.agent_sessions.show_projects = !self.agent_sessions.show_projects;
+            }
+            Message::AgentSessionsShowTasks => {
+                if self.config.experimental_task_sidebar && !self.agent_sessions.editing() {
+                    self.agent_sessions.close();
+                    self.set_task_panel_open(true);
+                }
+            }
             Message::AgentSessionsCheck => {
                 self.agent_sessions.cancel_confirmation();
                 self.agent_sessions.sync_preflight();
@@ -17217,6 +17320,7 @@ impl Frost {
             }
             Message::AgentSessionsTick => {
                 let old_error = self.agent_sessions.store.error().map(str::to_owned);
+                let was_editing = self.agent_sessions.editing();
                 let scroll = self.agent_sessions.poll();
                 self.finish_pending_agent_resume();
                 if !self.agent_sessions.open
@@ -17229,17 +17333,24 @@ impl Frost {
                         );
                     }
                 }
+                if was_editing && !self.agent_sessions.editing() && self.agent_sessions.open {
+                    return Task::batch([
+                        self.agent_sessions_scroll_task(),
+                        iced::widget::operation::focus(AGENT_SESSIONS_INPUT_ID.clone()),
+                    ]);
+                }
                 if scroll {
                     return self.agent_sessions_scroll_task();
                 }
             }
             Message::AgentSessionsCapturedNavigation(event) => {
-                if self.agent_sessions.open {
+                if self.agent_sessions.open && !self.agent_sessions.editing() {
                     return self.update(Message::Key(event));
                 }
             }
             Message::AgentSessionsScope(enabled) => {
                 self.agent_sessions.cancel_confirmation();
+                self.agent_sessions.project_selection = None;
                 self.agent_sessions.project_only = enabled && self.agent_sessions.project.is_some();
                 self.agent_sessions.selected = None;
                 self.agent_sessions.reconcile();
@@ -17797,6 +17908,19 @@ impl Frost {
                 {
                     if self.agent_sessions.open {
                         use keyboard::{key::Named, Key};
+                        // An organization editor owns its keys; Enter must
+                        // never resume the conversation behind the form.
+                        if self.agent_sessions.editing() {
+                            if matches!(key, Key::Named(Named::Escape)) {
+                                self.agent_sessions.cancel_current_organization();
+                                if !self.agent_sessions.editing() {
+                                    return iced::widget::operation::focus(
+                                        AGENT_SESSIONS_INPUT_ID.clone(),
+                                    );
+                                }
+                            }
+                            return Task::none();
+                        }
                         if modifiers.control()
                             && matches!(&key, Key::Character(value) if value.eq_ignore_ascii_case("l"))
                         {
@@ -30127,6 +30251,36 @@ impl Frost {
         );
     }
 
+    /// One shared projection for the list, filter badges and navigation. These
+    /// operations only move view state; runtime actions stay on their gates.
+    fn task_dashboard(&self) -> agent_task::DashboardSnapshot {
+        let mut dashboard = agent_task::DashboardSnapshot::project(
+            self.task_manager
+                .tasks()
+                .iter()
+                .filter(|task| task.status != agent_task::TaskStatus::Archived),
+            |id| agent_task::DashboardActivity {
+                has_agent_terminal: self
+                    .task_terminal_index(id, agent_task::TaskTerminalRole::Agent)
+                    .is_some(),
+                has_validation_terminal: self
+                    .task_terminal_index(id, agent_task::TaskTerminalRole::Validation)
+                    .is_some(),
+                has_active_agent_stream: self.task_manager.has_active_agent_event_stream(id),
+                native_preparing: self.agent_runtime.has_preparing(id),
+            },
+            agent_task::DashboardFilter {
+                text: &self.task_panel.dashboard_query,
+                view: self.task_panel.dashboard_view,
+                provider: self.task_panel.dashboard_provider,
+                repo_root: self.task_panel.dashboard_repo.as_deref(),
+                ..Default::default()
+            },
+        );
+        dashboard.sort_rows(self.task_panel.dashboard_sort);
+        dashboard
+    }
+
     /// The Tasks dashboard dock panel: task list plus the selected task card.
     fn sidebar_tasks_view(&self) -> Element<'_, Message> {
         if !self.config.experimental_task_sidebar {
@@ -30135,7 +30289,17 @@ impl Frost {
                 .style(text::secondary)
                 .into();
         }
-        let mut body = column![].spacing(6);
+        let mut body = column![row![
+            text("Agent workspace").size(self.chrome_font_size() + 2.0),
+            Space::new().width(Length::Fill),
+            button(text("Saved sessions").size(self.chrome_font_size()))
+                .style(button::text)
+                .on_press(Message::AgentSessionsToggle),
+        ]
+        .align_y(iced::Alignment::Center)
+        .spacing(6)
+        .wrap()]
+        .spacing(7);
         if let Some(picker) = self.task_panel.provider_picker.as_ref() {
             let context = &picker.context;
             let reference = picker.reference();
@@ -30200,21 +30364,57 @@ impl Frost {
             .on_submit(Message::TaskDashboardOpenResult)
             .size(self.chrome_font_size()),
         );
-        let dashboard = agent_task::DashboardSnapshot::project(
-            self.task_manager
-                .tasks()
-                .iter()
-                .filter(|task| task.status != agent_task::TaskStatus::Archived),
-            |id| agent_task::DashboardActivity {
-                has_active_agent_stream: self.task_manager.has_active_agent_event_stream(id),
-                native_preparing: self.agent_runtime.has_preparing(id),
-                ..Default::default()
-            },
-            agent_task::DashboardFilter {
-                text: &self.task_panel.dashboard_query,
-                view: self.task_panel.dashboard_view,
-                ..Default::default()
-            },
+        let dashboard = self.task_dashboard();
+        let mut providers = row![button(text("All agents").size(self.chrome_font_size()))
+            .style(self.tab_btn_style(self.task_panel.dashboard_provider.is_none()))
+            .on_press(Message::TaskDashboardProvider(None))]
+        .spacing(4);
+        for provider in agent_task::AgentProvider::ALL {
+            providers = providers.push(
+                button(text(provider.display_name()).size(self.chrome_font_size()))
+                    .style(self.tab_btn_style(self.task_panel.dashboard_provider == Some(provider)))
+                    .on_press(Message::TaskDashboardProvider(Some(provider))),
+            );
+        }
+        body = body.push(providers.wrap());
+        let roots: std::collections::BTreeSet<_> = self
+            .task_manager
+            .tasks()
+            .iter()
+            .filter(|task| task.status != agent_task::TaskStatus::Archived)
+            .map(|task| task.repo_root.clone())
+            .collect();
+        let projects: Vec<_> = std::iter::once(agent_task_ui::TaskRepositoryChoice(None))
+            .chain(
+                roots
+                    .into_iter()
+                    .map(|root| agent_task_ui::TaskRepositoryChoice(Some(root))),
+            )
+            .collect();
+        body = body.push(
+            pick_list(
+                projects,
+                Some(agent_task_ui::TaskRepositoryChoice(
+                    self.task_panel.dashboard_repo.clone(),
+                )),
+                |project| Message::TaskDashboardRepository(project.0),
+            )
+            .text_size(self.chrome_font_size())
+            .width(Length::Fill),
+        );
+        body = body.push(
+            row![
+                text("Sort").size(self.chrome_font_size()),
+                pick_list(
+                    agent_task::DashboardSort::ALL,
+                    Some(self.task_panel.dashboard_sort),
+                    Message::TaskDashboardSort
+                )
+                .text_size(self.chrome_font_size())
+                .width(Length::Fill),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
         );
         let mut filters = row![].spacing(4);
         for view in [
@@ -30251,12 +30451,38 @@ impl Frost {
         );
         if !self.task_panel.dashboard_query.is_empty()
             || self.task_panel.dashboard_view != agent_task::DashboardView::All
+            || self.task_panel.dashboard_provider.is_some()
+            || self.task_panel.dashboard_repo.is_some()
+            || self.task_panel.dashboard_sort != agent_task::DashboardSort::default()
         {
             body = body.push(
                 button(text("Clear filters").size(self.chrome_font_size()))
                     .on_press(Message::TaskDashboardClear),
             );
         }
+        body = body.push(
+            row![
+                button(text("Previous").size(self.chrome_font_size()))
+                    .on_press_maybe(
+                        (!dashboard.rows.is_empty()).then_some(Message::TaskDashboardStep(false))
+                    )
+                    .style(button::secondary),
+                button(text("Next").size(self.chrome_font_size()))
+                    .on_press_maybe(
+                        (!dashboard.rows.is_empty()).then_some(Message::TaskDashboardStep(true))
+                    )
+                    .style(button::secondary),
+                button(text("Next needs you").size(self.chrome_font_size()))
+                    .on_press_maybe(
+                        dashboard
+                            .next_attention(self.task_panel.selected)
+                            .map(|_| Message::TaskDashboardNextAttention)
+                    )
+                    .style(button::primary),
+            ]
+            .spacing(5)
+            .wrap(),
+        );
         if self.task_panel.saved_draft_count() > 0 {
             if let Some(confirmation) = self.task_panel.draft_discard_confirmation() {
                 body = body.push(
@@ -30329,7 +30555,24 @@ impl Frost {
                     .style(text::secondary),
             );
         }
-        for task in &tasks {
+        let mut previous_project: Option<&str> = None;
+        for summary in &dashboard.rows {
+            let Some(task) = self.task_manager.get(summary.id) else {
+                continue;
+            };
+            if self.task_panel.dashboard_sort == agent_task::DashboardSort::Project
+                && previous_project != Some(summary.repo_label.as_str())
+            {
+                body = body.push(
+                    container(
+                        text(summary.repo_label.clone())
+                            .size(self.chrome_font_size())
+                            .style(text::secondary),
+                    )
+                    .padding([6, 0]),
+                );
+                previous_project = Some(&summary.repo_label);
+            }
             let mut label = crate::review_text::visible_bounded(
                 &task.title,
                 agent_task_ui::MAX_TASK_TITLE_DISPLAY_BYTES,
@@ -30337,21 +30580,35 @@ impl Frost {
             if self.task_manager.task_needs_attention(task.id) {
                 label = format!("● {label}");
             }
-            let row_button = button(text(label).size(self.chrome_font_size()))
-                .on_press(Message::TaskSelect(task.id))
-                .padding([2, 6])
-                .style(self.tab_btn_style(self.task_panel.selected == Some(task.id)));
-            let mut task_row = column![
-                row_button,
+            let mut row_content = column![
+                text(label).size(self.chrome_font_size()),
                 text(format!(
-                    "{} · {}",
+                    "{} · {} · {}",
                     crate::review_text::bound_provider_label(task.provider.display_name()),
-                    task.status.label()
+                    summary.status_line(),
+                    agent_sessions::age(task.updated_at_ms),
                 ))
-                .size(self.chrome_font_size())
-                .style(text::secondary),
+                .size((self.chrome_font_size() - 1.0).max(9.0)),
+                text(format!("{} · {}", summary.repo_label, summary.branch))
+                    .size((self.chrome_font_size() - 2.0).max(9.0)),
             ]
-            .spacing(1);
+            .spacing(3);
+            if summary.activity.has_active_agent_stream || summary.activity.has_agent_terminal {
+                row_content = row_content.push(
+                    text(if summary.activity.has_active_agent_stream {
+                        "Native session connected"
+                    } else {
+                        "Agent terminal attached"
+                    })
+                    .size((self.chrome_font_size() - 2.0).max(9.0)),
+                );
+            }
+            let row_button = button(row_content)
+                .on_press(Message::TaskSelect(task.id))
+                .width(Length::Fill)
+                .padding([7, 8])
+                .style(self.tab_btn_style(self.task_panel.selected == Some(task.id)));
+            let mut task_row = column![row_button].spacing(3);
             if let Some(reason) = agent_task_ui::task_reason(
                 task.status,
                 task.validation.status,
