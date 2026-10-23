@@ -1174,3 +1174,28 @@ to an existing selection in an idle primary-screen terminal whose shell still ow
 the foreground process group, outside IME preedit;
 in Chat/Normal mode or without that context the key continues through normal terminal input. Files keeps
 its own focused `Shift+F10` menu behavior.
+
+## Agent session library
+
+Open **Agents** in the tab bar, choose **Agent Sessions: Resume Codex / Claude**
+from the command palette, or press **Ctrl+Alt+Shift+G** (`agent:sessions`,
+configurable in keybindings).
+
+The library discovers existing Codex and Claude conversations across projects,
+including compressed Codex history. Search titles, project paths, branches,
+session IDs and recent conversation text; filter by provider or last recorded
+activity. Select a row to inspect its directory, branch and recent conversation,
+then press **Enter** or **Resume in new tab**. The native PTY starts the provider
+with an exact session ID and original working directory. Reopening a session
+already resumed in this window focuses its tab. **F5** refreshes; **Escape** closes.
+
+Discovery runs on a bounded background worker and refreshes while the library is
+open. It honors `CODEX_HOME` and `CLAUDE_CONFIG_DIR`. Transcript activity is
+explicitly historical: it does not claim a stale conversation is still running.
+Missing project directories or session files are reported before resume, and
+archived Codex conversations must be unarchived with Codex first. The library
+reads local history without modifying it or calling a model service.
+
+All four terminals share this session catalog through the sibling `jterm_core`
+checkout. These development manifests use `../jterm_core` so the new core API and
+native adapters build together.

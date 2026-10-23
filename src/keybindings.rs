@@ -130,6 +130,7 @@ pub enum Command {
     /// things in different windows.
     AiChatToggle,
     /// Open a coding-agent CLI in a new tab at the active pane cwd.
+    AgentSessions,
     AgentLaunchCodex,
     AgentLaunchClaude,
     AgentLaunchOpenCode,
@@ -231,6 +232,7 @@ impl std::fmt::Display for Command {
             Command::SidebarToggle => write!(f, "sidebar:toggle"),
             Command::AgentToggle => write!(f, "agent:toggle"),
             Command::AiChatToggle => write!(f, "ai_chat:toggle"),
+            Command::AgentSessions => write!(f, "agent:sessions"),
             Command::AgentLaunchCodex => write!(f, "agent:launch:codex"),
             Command::AgentLaunchClaude => write!(f, "agent:launch:claude"),
             Command::AgentLaunchOpenCode => write!(f, "agent:launch:opencode"),
@@ -324,6 +326,7 @@ impl std::str::FromStr for Command {
             "sidebar:toggle" => Ok(Command::SidebarToggle),
             "agent:toggle" => Ok(Command::AgentToggle),
             "ai_chat:toggle" => Ok(Command::AiChatToggle),
+            "agent:sessions" => Ok(Command::AgentSessions),
             "agent:launch:codex" => Ok(Command::AgentLaunchCodex),
             "agent:launch:claude" => Ok(Command::AgentLaunchClaude),
             "agent:launch:opencode" => Ok(Command::AgentLaunchOpenCode),
@@ -574,6 +577,10 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+shift+alt+a".to_string(), "ai_chat:toggle".to_string());
+
+        bindings
+            .bindings
+            .insert("ctrl+shift+alt+g".to_string(), "agent:sessions".to_string());
 
         // 终端操作
         bindings

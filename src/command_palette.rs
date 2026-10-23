@@ -66,6 +66,7 @@ pub enum PaletteAction {
     ToggleAiChats,
     AskAiGenerate,
     ToggleTasks,
+    AgentSessions,
     OpenSettings,
     QuickTabSwitch,
     OpenHelp,
@@ -360,6 +361,13 @@ impl PaletteState {
                 binding: None,
                 shortcut: "",
                 action: PaletteAction::AskAiGenerate,
+            },
+            PaletteItem {
+                name: "Agent Sessions: Resume Codex / Claude",
+                description: "Search all projects, inspect recent activity, and resume a session in a new tab",
+                binding: Some("agent:sessions"),
+                shortcut: "",
+                action: PaletteAction::AgentSessions,
             },
             PaletteItem {
                 name: "Toggle Tasks Dashboard",

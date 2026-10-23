@@ -7,6 +7,7 @@ use jterm_core::pane_layout::{
 };
 use jterm_core::pty_input::{self, PasteModes, PastePolicy, UnbracketedMultiline};
 mod agent;
+mod agent_sessions;
 mod agent_task;
 mod agent_task_ui;
 mod ai_chat_store;
@@ -1495,6 +1496,8 @@ static PALETTE_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-palette-input"));
 static PALETTE_LIST_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-palette-list"));
+static AGENT_SESSIONS_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-agent-sessions-input"));
 static AGENT_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-agent-input"));
 static AGENT_EDIT_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
@@ -4736,6 +4739,17 @@ enum Message {
     TaskFocusValidation(agent_task::TaskId),
     /// Open a coding-agent CLI in a new tab at the active pane cwd.
     AgentLaunch(agent_task::AgentProvider),
+    AgentSessionsToggle,
+    AgentSessionsClose,
+    AgentSessionsRefresh,
+    AgentSessionsTick,
+    AgentSessionsQuery(String),
+    AgentSessionsLive(bool),
+    AgentSessionsProvider(Option<jterm_core::agent_sessions::SessionProvider>),
+    AgentSessionsStatus(Option<jterm_core::agent_sessions::SessionStatus>),
+    AgentSessionsSelect(agent_sessions::SessionKey),
+    AgentSessionsResume,
+    AgentSessionsCopy,
     /// Periodic reducer/driver poll while the dashboard is open or a provider
     /// session is active.
     TaskTick,
@@ -6767,6 +6781,7 @@ struct Frost {
     osc52_write_window_started: std::time::Instant,
     osc52_writes_in_window: usize,
     agent: agent::AgentUi,
+    agent_sessions: agent_sessions::SessionLibrary,
     /// Review-first command-correction requests and presented cards, keyed by
     /// stable terminal-session id (per-pane, generation-guarded).
     command_corrections: command_correction::CorrectionRegistry,
@@ -7151,6 +7166,7 @@ impl Frost {
             osc52_write_window_started: std::time::Instant::now(),
             osc52_writes_in_window: 0,
             agent: agent::AgentUi::new(),
+            agent_sessions: agent_sessions::SessionLibrary::default(),
             command_corrections: command_correction::CorrectionRegistry::default(),
             ai_chats: ai_chats::AiChatsUi::new(is_first_instance),
             ai_ask: None,
@@ -7783,6 +7799,7 @@ impl Frost {
             .is_some_and(|s| self.vim9_tabs.contains_key(&s.id))
             && !self.search.is_open
             && !self.search_replace.is_open
+            && !self.agent_sessions.open
             && !self.palette.is_open
             && !self.ai_chats.is_open
             && self.ai_ask.is_none()
@@ -7824,6 +7841,7 @@ impl Frost {
     /// overlays block pointer actions from reaching panes underneath them.
     fn terminal_mouse_active(&self) -> bool {
         !self.search_replace.is_open
+            && !self.agent_sessions.open
             && !self.palette.is_open
             && !self.ai_chats.is_open
             && self.ai_ask.is_none()
@@ -11342,6 +11360,7 @@ impl Frost {
                 }
             }
             C::AiChatToggle => self.toggle_ai_chats(),
+            C::AgentSessions => Task::done(Message::AgentSessionsToggle),
             C::AgentLaunchCodex => {
                 Task::done(Message::AgentLaunch(agent_task::AgentProvider::Codex))
             }
@@ -11680,6 +11699,7 @@ impl Frost {
             || self.tab_menu.is_some()
             || self.tab_switcher.is_some()
             || self.remote_picker.is_some()
+            || self.agent_sessions.open
             || self.history_picker.is_some()
             || self.workflow_overlay.is_some()
             || self.block_search.is_some()
@@ -14646,6 +14666,7 @@ impl Frost {
                 self.install_or_update_jsh();
                 Task::none()
             }
+            PaletteAction::AgentSessions => Task::done(Message::AgentSessionsToggle),
             PaletteAction::LaunchCodex => {
                 Task::done(Message::AgentLaunch(agent_task::AgentProvider::Codex))
             }
@@ -17126,6 +17147,44 @@ impl Frost {
                 }
             }
             Message::AgentLaunch(provider) => self.agent_launch_in_tab(provider),
+            Message::AgentSessionsToggle => {
+                self.agent_sessions.open = !self.agent_sessions.open;
+                if self.agent_sessions.open {
+                    self.native_enter_ownership.lock().claim_held();
+                    self.agent_sessions.refresh();
+                    return iced::widget::operation::focus(AGENT_SESSIONS_INPUT_ID.clone());
+                }
+            }
+            Message::AgentSessionsClose => self.agent_sessions.open = false,
+            Message::AgentSessionsRefresh => self.agent_sessions.refresh(),
+            Message::AgentSessionsTick => self.agent_sessions.poll(),
+            Message::AgentSessionsLive(live_only) => {
+                self.agent_sessions.live_only = live_only;
+                self.agent_sessions.reconcile();
+            }
+            Message::AgentSessionsQuery(query) => {
+                self.agent_sessions.query = crate::review_text::visible_bounded(&query, 512);
+                self.agent_sessions.reconcile();
+            }
+            Message::AgentSessionsProvider(provider) => {
+                self.agent_sessions.provider = provider;
+                self.agent_sessions.reconcile();
+            }
+            Message::AgentSessionsStatus(status) => {
+                self.agent_sessions.status = status;
+                self.agent_sessions.reconcile();
+            }
+            Message::AgentSessionsSelect(key) => self.agent_sessions.selected = Some(key),
+            Message::AgentSessionsResume => self.resume_agent_session(),
+            Message::AgentSessionsCopy => {
+                if let Some(launch) = self
+                    .agent_sessions
+                    .selected_session()
+                    .and_then(|s| s.resume_launch().ok())
+                {
+                    return iced::clipboard::write(launch.display_command());
+                }
+            }
             Message::TaskRequestDiscardSavedDrafts(reference) => {
                 self.task_panel.request_discard_saved_drafts(&reference);
             }
@@ -17561,7 +17620,8 @@ impl Frost {
                 // These surfaces confirm/open reviewed commands. Search-only
                 // Enter navigation remains unchanged; all physical presses are
                 // still tracked for a later explicit recall transaction.
-                let recall_surface_open = self.history_picker.is_some()
+                let recall_surface_open = self.agent_sessions.open
+                    || self.history_picker.is_some()
                     || self.palette.is_open
                     || self.workflow_overlay.is_some()
                     || self.block_review.is_some()
@@ -17611,6 +17671,18 @@ impl Frost {
                     ..
                 } = event
                 {
+                    if self.agent_sessions.open {
+                        use keyboard::{key::Named, Key};
+                        match key {
+                            Key::Named(Named::Escape) => self.agent_sessions.open = false,
+                            Key::Named(Named::ArrowDown) => self.agent_sessions.step(1),
+                            Key::Named(Named::ArrowUp) => self.agent_sessions.step(-1),
+                            Key::Named(Named::Enter) if !repeat => self.resume_agent_session(),
+                            Key::Named(Named::F5) => self.agent_sessions.refresh(),
+                            _ => {}
+                        }
+                        return Task::none();
+                    }
                     // The destructive block confirmation is the top-most modal.
                     // Enter confirms, Esc cancels, and every other key is swallowed.
                     if self.block_clear_confirm.is_some() {
@@ -20851,8 +20923,17 @@ impl Frost {
             .style(self.popup_style()),
             tooltip::Position::Bottom,
         );
+        let sessions = tooltip(
+            button(text("Agents").size(font_size))
+                .on_press(Message::AgentSessionsToggle)
+                .padding([2, 6])
+                .height(Length::Fixed(height))
+                .style(button::secondary),
+            "Agent Sessions · Ctrl+Alt+Shift+G",
+            tooltip::Position::Bottom,
+        );
         container(
-            row![vim9, blocks]
+            row![sessions, vim9, blocks]
                 .spacing(6)
                 .align_y(iced::Alignment::Center),
         )
@@ -26837,6 +26918,11 @@ impl Frost {
                 chrome.push(self.font_zoom_region(font_zoom::Group::Content, self.status_bar()));
         }
         let root: Element<'_, Message> = chrome.width(Length::Fill).height(Length::Fill).into();
+        let root: Element<'_, Message> = if self.agent_sessions.open {
+            stack![root, self.agent_sessions_view()].into()
+        } else {
+            root
+        };
         // Tab context menu, tab switcher, history picker, and toasts float
         // above everything so they remain accessible regardless of which
         // other panel is open.
@@ -28385,6 +28471,10 @@ impl Frost {
             kb("Right-click folder → Open Folder", "Enter that directory"),
             kb("Ctrl+Shift+P", "Command palette"),
             bound("config:toggle", "Settings"),
+            bound(
+                "agent:sessions",
+                "Agent session library / resume in new tab"
+            ),
             kb(
                 "Ctrl+Shift+P → Open Codex/Claude/OpenCode/Kimi",
                 "Launch agent CLI in a new tab"
@@ -31557,7 +31647,8 @@ impl Frost {
     fn subscription(&self) -> Subscription<Message> {
         // An already-held key belongs to the currently visible recall surface,
         // including a positive focus snapshot that produced no Iced key event.
-        if self.history_picker.is_some()
+        if self.agent_sessions.open
+            || self.history_picker.is_some()
             || self.palette.is_open
             || self.workflow_overlay.is_some()
             || self.block_review.is_some()
@@ -31864,6 +31955,17 @@ impl Frost {
                 std::time::Duration::from_millis(500)
             };
             subs.push(iced::time::every(interval).map(|_| Message::TaskTick));
+        }
+        if self.agent_sessions.open || self.agent_sessions.scanner.is_scanning() {
+            let interval = if self.agent_sessions.scanner.is_scanning() {
+                100
+            } else {
+                1000
+            };
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(interval))
+                    .map(|_| Message::AgentSessionsTick),
+            );
         }
         // The blink tick redraws and re-shapes the whole grid every 530ms purely
         // to animate blinking cells. Run it only while focused AND when a visible

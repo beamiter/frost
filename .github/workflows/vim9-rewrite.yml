@@ -22,6 +22,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
