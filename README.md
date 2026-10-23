@@ -8,6 +8,8 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 
 运行 `frost --ide [项目目录或文件]`，或点击终端工具栏的 **Vim9 IDE**，打开基于真实 Vim 9 的独立 iced/WGPU 编辑窗口。默认只显示现代 GUI buffer：工具栏、GUI buffer 标签、附加状态栏、项目侧栏和构建/诊断面板均默认关闭，可在配置的 `[vim9]` 下逐项开启。`native_buffer = true` 独立保持 GUI 文本、RGB 高亮和光标渲染。模糊快速打开（Ctrl+Shift+P）、行列跳转（Ctrl+Shift+G）、位置后退/前进（Alt+Left/Right）、保存及 Vim 原生命令继续可用；Ctrl+Shift+E/J 可临时开关项目/工具面板。关闭窗口会请求 Vim 正常退出，未保存的修改会阻止退出。需要安装 Vim 9，项目搜索需要 ripgrep。普通终端继续使用原有会话、分屏、快捷键和恢复路径。
 
+SimpleCC 的行内类型／参数提示在支持的 `nowrap` Normal、Insert、Replace 视图中使用原生绘制；行尾 CodeLens 和诊断文字可同时显示。提示按 Vim 提供的显示列排布，源码仍保留原 UTF-8 字节位置，提示不会写入文件或撤销历史。字体缩放、分屏裁剪、光标和输入法候选框使用同一坐标；提示增删无须编辑源码即可刷新。含行内提示的分屏由 Vim 处理普通鼠标点击，支持的精细滚动仍可用。换行、Visual 选区、above/below/right 排列及无法准确表达的裁剪继续使用兼容视图。使用 `:SimpleCCInlayHints` 切换提示，`:VimrcWorkbench` 查看独立的 Inline hints 能力状态。
+
 启动方式、操作、可选语言服务及测试命令见 [Vim9 IDE 文档](docs/VIM9_IDE.md)。
 
 按 Ctrl+Shift+P 后输入 `>` 可筛选编辑器命令，例如 `>vertical split`、`>format` 或 `>保存`。列表显示快捷键及暂不可用的原因，执行前会重新检查当前 Vim 状态；普通文件查询、`path:line:column` 和 `:line:column` 保持原用法。文件名以 `>` 开头时加 `./` 前缀。

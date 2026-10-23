@@ -3729,6 +3729,159 @@ mod tests {
     }
 
     #[test]
+    fn inline_hints_shift_source_caret_and_ime_then_clear_at_each_zoom() {
+        let mut frame = direct_frame();
+        frame.window = 10;
+        frame.buffer = 3;
+        frame.view = frame.windows[0].view.clone();
+        frame.windows[0].native_pointer = false;
+        frame.windows[0].line_lengths[0] = 4;
+        frame.runs.retain(|run| !(run.window == 10 && run.row == 1));
+        for (column, text, cells, line, byte_start, byte_end) in [
+            (2, "ab", 2, 1, 0, 2),
+            (4, "参", 2, 0, 0, 0),
+            (6, "e\u{301}", 1, 0, 0, 0),
+            (7, "cd", 2, 1, 2, 4),
+        ] {
+            frame.runs.push(Vim9RenderRun {
+                window: 10,
+                row: 1,
+                column,
+                text: text.into(),
+                cells,
+                line,
+                byte_start,
+                byte_end,
+                style: Vim9RenderStyle {
+                    foreground: Some(if line == 0 { 0x19c3a7 } else { 0xddeeff }),
+                    background: (line == 0).then_some(0x563412),
+                    ..Default::default()
+                },
+            });
+        }
+        frame.cursor.row = 1;
+        frame.cursor.column = 7;
+        frame.cursor.line = 1;
+        frame.cursor.byte_column = 2;
+        frame.windows[0].cursor = frame.cursor.clone();
+        let source_bytes: Vec<_> = frame
+            .runs
+            .iter()
+            .filter(|r| r.line > 0)
+            .map(|r| (r.window, r.line, r.byte_start, r.byte_end, r.text.clone()))
+            .collect();
+        assert!(frame.anchor_at_cell(1, 4).is_none());
+        assert_eq!(frame.anchor_at_cell(1, 7).unwrap().byte_start, 2);
+        let labeled = frame;
+        for (cell_width, line_height) in [(8.0, 20.0), (10.5, 23.0)] {
+            let mut terminal = crate::terminal::TerminalState::new(80, 20);
+            let projection = terminal.get_projected_viewport(false);
+            let theme = crate::Theme::default();
+            let mut metrics = Metrics::new(14.0, 1.0, 0.0, false);
+            metrics.cell_w = cell_width;
+            metrics.cell_h = line_height;
+            let input: TermWidget<'_, ()> = TermWidget::new(
+                projection.cells(),
+                (1, 7),
+                true,
+                crate::terminal::CursorShape::Block,
+                true,
+                &theme,
+                metrics,
+                Font::MONOSPACE,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                0,
+                0,
+            );
+            let widget = NativeBuffer::new(input, None, metrics, Font::MONOSPACE, true, true);
+            let editor = Rectangle::with_size(Size::new(80.0 * cell_width, 20.0 * line_height));
+            let geometry = render_metrics(editor, metrics);
+            let draw = |frame: &Vim9RenderFrame| {
+                let mut recorder = CompletionRecorder::default();
+                for prepared in paint_views(frame, geometry, editor, |_| 0.0) {
+                    widget.paint_native_view(&mut recorder, frame, &prepared, true);
+                }
+                assert!(recorder.clips.is_empty());
+                recorder
+            };
+            let rendered = draw(&labeled);
+            // A fallback face may paint ASCII as individual fixed-cell glyphs.
+            for (text, column) in [("a", 2), ("参", 4), ("e\u{301}", 6), ("c", 7)] {
+                assert!(
+                    rendered
+                        .text
+                        .iter()
+                        .any(|(value, position, _, _)| value.starts_with(text)
+                            && position.x == column as f32 * cell_width),
+                    "missing {text} at its Vim column"
+                );
+            }
+            assert!(rendered
+                .text
+                .iter()
+                .any(|(text, _, color, clip)| text == "参"
+                    && *color == rgb(0x19c3a7)
+                    && clip.x + clip.width <= 39.0 * cell_width));
+            assert!(rendered
+                .text
+                .iter()
+                .any(|(text, position, _, _)| text.starts_with('p')
+                    && position.x == 42.0 * cell_width));
+            let views = paint_views(&labeled, geometry, editor, |_| 0.0);
+            let caret = views.iter().find(|v| v.active).unwrap().cursor.unwrap();
+            let presented = PresentedFrame {
+                frame: Arc::new(labeled.clone()),
+                metrics: geometry,
+                local_metrics: geometry,
+                offsets: BTreeMap::new(),
+                clip: editor,
+            };
+            assert_eq!(presented.caret(), Some(caret));
+            assert_eq!(caret.x, 7.0 * cell_width);
+
+            let mut cleared = labeled.clone();
+            cleared.runs.retain(|run| run.line != 0);
+            cleared
+                .runs
+                .iter_mut()
+                .find(|run| run.window == 10 && run.text == "cd")
+                .unwrap()
+                .column = 4;
+            cleared.cursor.column = 4;
+            cleared.windows[0].cursor = cleared.cursor.clone();
+            cleared.revision += 1;
+            assert_eq!(cleared.changedtick, labeled.changedtick);
+            assert_eq!(
+                cleared
+                    .runs
+                    .iter()
+                    .filter(|r| r.line > 0)
+                    .map(|r| (r.window, r.line, r.byte_start, r.byte_end, r.text.clone()))
+                    .collect::<Vec<_>>(),
+                source_bytes
+            );
+            let rendered = draw(&cleared);
+            assert!(!rendered
+                .text
+                .iter()
+                .any(|(text, ..)| ["参", "e\u{301}"].contains(&text.as_str())));
+            assert!(!rendered
+                .quads
+                .iter()
+                .any(|(_, color, _)| *color == Background::Color(rgb(0x563412))));
+            assert!(rendered
+                .text
+                .iter()
+                .any(|(text, position, _, _)| text.starts_with('c')
+                    && position.x == 4.0 * cell_width));
+        }
+    }
+
+    #[test]
     fn vim_popup_surfaces_cover_splits_and_preserve_zorder_rgb_and_unicode() {
         let mut frame = direct_frame();
         frame.mode = "i".into();
