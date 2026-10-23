@@ -39,6 +39,10 @@ const MAX_QUICK_QUERY: usize = 256;
 const QUICK_MATCH_LIMIT: usize = 80;
 const QUICK_VISIBLE_ROWS: usize = 8;
 
+fn quick_page_rows(height: f32) -> usize {
+    (((height - 280.0).max(44.0) / 44.0) as usize).clamp(1, QUICK_VISIBLE_ROWS)
+}
+
 struct RenderSubscription {
     session_id: usize,
     interval_ms: u64,
@@ -278,12 +282,24 @@ impl FormKind {
     }
     fn help(self) -> &'static str {
         match self {
-            Self::QuickOpen => "Find file[:line[:column]], :line[:column] in the current buffer, or >command. Columns are Vim byte columns. ↑ / ↓ selects; Enter confirms; Esc returns to Vim.",
-            Self::Goto => "Enter a line or line:column. The column is a Vim byte column. The current buffer stays open.",
-            Self::Open => "Enter a local filename. New files require an existing parent directory. Vim retains its normal unsaved-buffer checks.",
-            Self::Search => "Search project text using ripgrep. Choose literal or regular expression matching and an optional file glob. Results replace Vim's quickfix list.",
-            Self::Build => "Review this shell command before running it. Empty uses Vim's makeprg. Nothing is saved or executed automatically.",
-            Self::SaveAndBuild => "Save all buffers, then run this reviewed build command. If saving fails, the build will not start.",
+            Self::QuickOpen => {
+                "Find file[:line[:column]], :line[:column] in the current buffer, or >command. Columns are Vim byte columns. ↑ / ↓ selects; Enter confirms; Esc returns to Vim."
+            }
+            Self::Goto => {
+                "Enter a line or line:column. The column is a Vim byte column. The current buffer stays open."
+            }
+            Self::Open => {
+                "Enter a local filename. New files require an existing parent directory. Vim retains its normal unsaved-buffer checks."
+            }
+            Self::Search => {
+                "Search project text using ripgrep. Choose literal or regular expression matching and an optional file glob. Results replace Vim's quickfix list."
+            }
+            Self::Build => {
+                "Review this shell command before running it. Empty uses Vim's makeprg. Nothing is saved or executed automatically."
+            }
+            Self::SaveAndBuild => {
+                "Save all buffers, then run this reviewed build command. If saving fails, the build will not start."
+            }
             Self::Rename => "Requires a configured Vim9 LSP provider. Enter the new symbol name.",
         }
     }
@@ -396,6 +412,10 @@ pub(super) struct Ide {
     blink_on: bool,
     child_exited: bool,
     shell_status: Option<std::sync::Arc<std::sync::atomic::AtomicI32>>,
+    workspace_store: vim9::Vim9WorkspaceStateStore,
+    workspace_focus_pending: Option<vim9::Vim9WorkbenchFocus>,
+    project_width: f32,
+    output_height: f32,
 }
 
 fn accepts_render_entry(active: Option<uuid::Uuid>, incoming: uuid::Uuid, exited: bool) -> bool {
@@ -404,25 +424,38 @@ fn accepts_render_entry(active: Option<uuid::Uuid>, incoming: uuid::Uuid, exited
 
 impl Drop for Ide {
     fn drop(&mut self) {
+        let _ = self.workspace_store.flush();
         if let Some(editor) = &self.editor {
             editor.revoke();
         }
     }
 }
 
+#[cfg(test)]
 fn chrome(
     size: Size,
     presentation: &vim9::Vim9UiConfig,
     files_open: bool,
     dock_open: bool,
 ) -> (f32, f32) {
+    chrome_with_sizes(size, presentation, files_open, dock_open, SIDEBAR, DOCK)
+}
+
+fn chrome_with_sizes(
+    size: Size,
+    presentation: &vim9::Vim9UiConfig,
+    files_open: bool,
+    dock_open: bool,
+    project_width: f32,
+    output_height: f32,
+) -> (f32, f32) {
     let sidebar = if files_open && size.width >= 820.0 {
-        SIDEBAR
+        project_width.min((size.width - 400.0).max(120.0))
     } else {
         0.0
     };
     let dock = if dock_open && size.height >= 580.0 {
-        DOCK
+        output_height.min((size.height - 320.0).max(80.0))
     } else {
         0.0
     };
@@ -437,6 +470,44 @@ fn chrome(
     } + if presentation.status_bar { STATUS } else { 0.0 }
         + dock;
     (sidebar, vertical)
+}
+
+fn restored_workspace_form(
+    focus: vim9::Vim9WorkbenchFocus,
+    tools: bool,
+    files: bool,
+) -> Option<FormKind> {
+    match focus {
+        vim9::Vim9WorkbenchFocus::Search if tools => Some(FormKind::Search),
+        vim9::Vim9WorkbenchFocus::Build if tools => Some(FormKind::Build),
+        vim9::Vim9WorkbenchFocus::Files if files => Some(FormKind::QuickOpen),
+        _ => None,
+    }
+}
+
+#[test]
+fn workspace_layout_and_focus_restore_respect_available_space() {
+    let config = vim9::Vim9UiConfig::default();
+    let normal = chrome_with_sizes(Size::new(1200.0, 900.0), &config, true, true, 360.0, 280.0);
+    let bounded = chrome_with_sizes(Size::new(900.0, 600.0), &config, true, true, 1200.0, 1200.0);
+    assert_eq!(normal.0, 360.0);
+    assert_eq!(bounded.0, 500.0);
+    assert_eq!(normal.1, bounded.1); // both reserve 280px output plus identical chrome
+    use vim9::Vim9WorkbenchFocus::*;
+    assert_eq!(
+        restored_workspace_form(Search, true, true),
+        Some(FormKind::Search)
+    );
+    assert_eq!(
+        restored_workspace_form(Build, true, true),
+        Some(FormKind::Build)
+    );
+    assert_eq!(
+        restored_workspace_form(Files, true, true),
+        Some(FormKind::QuickOpen)
+    );
+    assert_eq!(restored_workspace_form(Search, false, true), None);
+    assert_eq!(restored_workspace_form(Output, true, true), None);
 }
 
 fn visible_label(value: &str) -> String {
@@ -860,8 +931,12 @@ impl Ide {
         } else {
             String::new()
         };
-        let files_open = config.vim9.project_panel;
-        let dock_open = config.vim9.tool_panel;
+        let mut workspace_store = vim9::Vim9WorkspaceStateStore::new(&root, "frost");
+        let workspace = workspace_store.restore(vim9::Vim9WorkspaceState::for_config(&config.vim9));
+        let files_open = workspace.files_visible;
+        let dock_open = workspace.output_visible;
+        let mut config = config;
+        config.vim9.tool_panel = workspace.tools_visible;
         let mut state = Self {
             embedded: false,
             completion: None,
@@ -887,14 +962,14 @@ impl Ide {
             queued_scan: None,
             files_open,
             dock_open,
-            output_tab: false,
+            output_tab: workspace.output_tab,
             form: None,
             project_index: None,
             project: Vim9ProjectSnapshot::default(),
             quick_matches: Vec::new(),
             build_command,
-            search_query: String::new(),
-            search_options: Vim9SearchOptions::default(),
+            search_query: workspace.search_query,
+            search_options: workspace.search_options,
             error,
             size,
             focused: true,
@@ -907,6 +982,10 @@ impl Ide {
             blink_on: true,
             child_exited: false,
             shell_status,
+            workspace_store,
+            workspace_focus_pending: Some(workspace.focus),
+            project_width: f32::from(workspace.project_width.unwrap_or(SIDEBAR as u16)),
+            output_height: f32::from(workspace.output_height.unwrap_or(DOCK as u16)),
         };
         state.resize();
         state.sync_ime();
@@ -976,11 +1055,13 @@ impl Ide {
     fn resize(&mut self) {
         self.scroll.borrow_mut().clear();
         self.retire_gestures();
-        let (sidebar, vertical) = chrome(
+        let (sidebar, vertical) = chrome_with_sizes(
             self.size,
             &self.config.vim9,
             self.files_open,
             self.dock_open,
+            self.project_width,
+            self.output_height,
         );
         let (cols, rows) = self.metrics.grid_size(
             (self.size.width - sidebar - terminal_view::SCROLLBAR_WIDTH).max(1.0),
@@ -1410,6 +1491,33 @@ impl Ide {
         self.sync_ime();
         let task = self.reduce(message);
         self.sync_ime();
+        if self.workspace_focus_pending.is_none() {
+            let focus = self
+                .form
+                .as_ref()
+                .map_or(vim9::Vim9WorkbenchFocus::Editor, |form| match form.kind {
+                    FormKind::Search => vim9::Vim9WorkbenchFocus::Search,
+                    FormKind::Build | FormKind::SaveAndBuild => vim9::Vim9WorkbenchFocus::Build,
+                    FormKind::QuickOpen | FormKind::Open => vim9::Vim9WorkbenchFocus::Files,
+                    _ => vim9::Vim9WorkbenchFocus::Editor,
+                });
+            let query = self
+                .form
+                .as_ref()
+                .filter(|form| form.kind == FormKind::Search)
+                .map_or_else(|| self.search_query.clone(), |form| form.value.clone());
+            self.workspace_store.remember(vim9::Vim9WorkspaceState {
+                search_query: query,
+                search_options: self.search_options.clone(),
+                files_visible: self.files_open,
+                tools_visible: self.config.vim9.tool_panel,
+                output_visible: self.dock_open,
+                output_tab: self.output_tab,
+                project_width: Some(self.project_width as u16),
+                output_height: Some(self.output_height as u16),
+                focus,
+            });
+        }
         task
     }
     fn reduce(&mut self, message: Message) -> Task<Message> {
@@ -1450,6 +1558,22 @@ impl Ide {
                 }
                 self.flush_native_input();
                 self.blink_on = (self.blink_started.elapsed().as_millis() / 500).is_multiple_of(2);
+                if self.snapshot.connected
+                    && self.snapshot.buffer > 0
+                    && self.snapshot.window > 0
+                    && !self.snapshot.mode.is_empty()
+                {
+                    if let Some(focus) = self.workspace_focus_pending.take() {
+                        let form = restored_workspace_form(
+                            focus,
+                            self.config.vim9.tool_panel,
+                            self.files_open,
+                        );
+                        if let Some(form) = form {
+                            return self.form(form);
+                        }
+                    }
+                }
             }
             Message::Drain => {
                 if let Some(s) = &mut self.session {
@@ -1515,7 +1639,9 @@ impl Ide {
                     if status == 0 || self.shell_status.is_some() {
                         return iced::exit();
                     }
-                    self.error = Some(format!("Vim exited with status {status}. The final screen is retained; Close now dismisses the workbench."));
+                    self.error = Some(format!(
+                        "Vim exited with status {status}. The final screen is retained; Close now dismisses the workbench."
+                    ));
                 }
                 _ => {}
             },
@@ -1792,15 +1918,19 @@ impl Ide {
             .is_some_and(|form| form.kind == FormKind::QuickOpen)
         {
             if let keyboard::Event::KeyPressed { key, modifiers, .. } = &event {
-                if !modifiers.control() && !modifiers.alt() && !modifiers.logo() {
+                if !modifiers.control()
+                    && !modifiers.alt()
+                    && !modifiers.logo()
+                    && !modifiers.shift()
+                {
                     let movement = match key {
                         keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some(-1),
                         keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Some(1),
                         keyboard::Key::Named(keyboard::key::Named::PageUp) => {
-                            Some(-(QUICK_VISIBLE_ROWS as isize))
+                            Some(-(quick_page_rows(self.size.height) as isize))
                         }
                         keyboard::Key::Named(keyboard::key::Named::PageDown) => {
-                            Some(QUICK_VISIBLE_ROWS as isize)
+                            Some(quick_page_rows(self.size.height) as isize)
                         }
                         _ => None,
                     };
@@ -2326,7 +2456,9 @@ impl Ide {
         }
         container(scrollable(listing))
             .padding(8)
-            .width(Length::Fixed(SIDEBAR))
+            .width(Length::Fixed(
+                self.project_width.min((self.size.width - 400.0).max(120.0)),
+            ))
             .height(Length::Fill)
             .into()
     }
@@ -2496,7 +2628,9 @@ impl Ide {
         }
         container(column![tabs, scrollable(contents).height(Length::Fill)].spacing(5))
             .padding([5, 8])
-            .height(Length::Fixed(DOCK))
+            .height(Length::Fixed(
+                self.output_height.min((self.size.height - 320.0).max(80.0)),
+            ))
             .width(Length::Fill)
             .into()
     }
@@ -2621,11 +2755,13 @@ impl Ide {
             }
             body = body.push(self.strip(buffers.into(), BUFFERS));
         }
-        let (side, _) = chrome(
+        let (side, _) = chrome_with_sizes(
             self.size,
             &self.config.vim9,
             self.files_open,
             self.dock_open,
+            self.project_width,
+            self.output_height,
         );
         let mut middle = row![];
         if side > 0.0 {
@@ -2665,23 +2801,23 @@ impl Ide {
                     .unwrap_or_else(|| "Connecting GUI buffer".to_owned())
             };
             let status = format!(
-            "{state} | {render_state} | {} | {}{} | {}:{} / {} | {} · {} | {} split(s) | {} pending{}",
-            visible_label(&self.snapshot.mode),
-            visible_label(&self.snapshot.file),
-            if self.snapshot.modified { " *" } else { "" },
-            self.snapshot.line,
-            self.snapshot.column,
-            self.snapshot.line_count,
-            visible_label(&self.snapshot.filetype),
-            visible_label(&self.snapshot.encoding),
-            self.snapshot.window_count,
-            self.snapshot.pending,
-            if self.error.is_some() || self.snapshot.error.is_some() {
-                " | Error: open Problems / output"
-            } else {
-                ""
-            }
-        );
+                "{state} | {render_state} | {} | {}{} | {}:{} / {} | {} · {} | {} split(s) | {} pending{}",
+                visible_label(&self.snapshot.mode),
+                visible_label(&self.snapshot.file),
+                if self.snapshot.modified { " *" } else { "" },
+                self.snapshot.line,
+                self.snapshot.column,
+                self.snapshot.line_count,
+                visible_label(&self.snapshot.filetype),
+                visible_label(&self.snapshot.encoding),
+                self.snapshot.window_count,
+                self.snapshot.pending,
+                if self.error.is_some() || self.snapshot.error.is_some() {
+                    " | Error: open Problems / output"
+                } else {
+                    ""
+                }
+            );
             let workbench = self.snapshot.workbench.status_text();
             let status = if workbench.is_empty() {
                 status
@@ -2857,8 +2993,7 @@ impl Ide {
                 ))
                 .size(12),
             );
-            let rows = (((self.size.height - 280.0).max(44.0) / 44.0) as usize)
-                .clamp(1, QUICK_VISIBLE_ROWS);
+            let rows = quick_page_rows(self.size.height);
             for index in quick_window(form.selected, palette_matches.len(), rows) {
                 let command = palette_matches[index];
                 let reason = command.unavailable_reason(&self.snapshot);
@@ -2923,8 +3058,7 @@ impl Ide {
             if let Some(error) = &self.project.error {
                 dialog_body = dialog_body.push(text(visible_label(error)).size(12));
             }
-            let rows = (((self.size.height - 280.0).max(44.0) / 44.0) as usize)
-                .clamp(1, QUICK_VISIBLE_ROWS);
+            let rows = quick_page_rows(self.size.height);
             for index in quick_window(form.selected, self.quick_matches.len(), rows) {
                 let file = &self.quick_matches[index];
                 let name = file
@@ -3445,6 +3579,14 @@ mod tests {
             })
         ));
         assert!(quick_open_command(&unavailable_index, "main:19", Some(main)).is_err());
+    }
+
+    #[test]
+    fn quick_page_step_matches_the_visible_result_window() {
+        assert_eq!(quick_page_rows(320.0), 1);
+        assert_eq!(quick_page_rows(500.0), 5);
+        assert_eq!(quick_page_rows(1000.0), 8);
+        assert_eq!(quick_page_rows(0.0), 1);
     }
 
     #[test]
