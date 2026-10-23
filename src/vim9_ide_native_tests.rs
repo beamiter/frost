@@ -346,15 +346,12 @@ fn embedded_body_first_focus_and_active_clicks_preserve_modified_vim_mouse_gestu
                     .is_ok_and(|text| text.lines().count() >= expected_lines)
             },
         );
-        assert_eq!(
-            editors[target]
-                .session
-                .as_ref()
-                .unwrap()
-                .terminal
-                .has_text_selection(),
-            false
-        );
+        assert!(!editors[target]
+            .session
+            .as_ref()
+            .unwrap()
+            .terminal
+            .has_text_selection());
         assert!(editors[target].gestures[MouseButton::Left.slot()].is_none());
         assert!(
             !logs[0].exists(),

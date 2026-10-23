@@ -757,13 +757,15 @@ fn quad(bounds: Rectangle) -> Quad {
 
 /// Keep decoration outside Vim's content geometry and inside the editor.
 /// Completion adds an outline at its original rectangle, even when clipped;
-/// ordinary popup borders come from Vim's runs and need no second outline.
+/// ordinary popup borders come from Vim's runs; tagged documentation cards
+/// use a native shell inside the same authoritative rectangle.
 fn paint_overlay_surface<Renderer: renderer::Renderer>(
     renderer: &mut Renderer,
     view: Rectangle,
     editor_clip: Rectangle,
     foreground: Color,
     outline: bool,
+    card: bool,
     paint_content: impl FnOnce(&mut Renderer, Rectangle),
 ) {
     let Some(clip) = view.intersection(&editor_clip) else {
@@ -772,12 +774,18 @@ fn paint_overlay_surface<Renderer: renderer::Renderer>(
     renderer.with_layer(editor_clip, |renderer| {
         for (spread, alpha) in [(4.0, 4.0), (3.0, 5.0), (2.0, 7.0), (1.0, 10.0)] {
             renderer.fill_quad(
-                quad(Rectangle {
-                    x: view.x - spread,
-                    y: view.y - spread,
-                    width: view.width + spread * 2.0,
-                    height: view.height + spread * 2.0,
-                }),
+                Quad {
+                    border: iced::Border {
+                        radius: (if card { 6.0 + spread } else { 0.0 }).into(),
+                        ..Default::default()
+                    },
+                    ..quad(Rectangle {
+                        x: view.x - spread,
+                        y: view.y - spread,
+                        width: view.width + spread * 2.0,
+                        height: view.height + spread * 2.0,
+                    })
+                },
                 Background::Color(Color {
                     a: alpha / 255.0,
                     ..Color::BLACK
@@ -786,7 +794,7 @@ fn paint_overlay_surface<Renderer: renderer::Renderer>(
         }
         renderer.with_layer(clip, |renderer| {
             paint_content(renderer, clip);
-            if outline {
+            if outline || card {
                 renderer.fill_quad(
                     Quad {
                         bounds: view,
@@ -796,7 +804,7 @@ fn paint_overlay_surface<Renderer: renderer::Renderer>(
                                 ..foreground
                             },
                             width: 1.0,
-                            ..Default::default()
+                            radius: (if card { 6.0 } else { 0.0 }).into(),
                         },
                         ..Quad::default()
                     },
@@ -1434,6 +1442,7 @@ impl<Message> NativeBuffer<'_, Message> {
                 &popup.default_style,
                 &popup.runs,
                 false,
+                popup.is_documentation_card(),
             );
         }
         if let Some(menu) = &frame.completion {
@@ -1446,6 +1455,7 @@ impl<Message> NativeBuffer<'_, Message> {
                 &menu.default_style,
                 &menu.runs,
                 true,
+                false,
             );
         }
         for popup in frame.popups.iter().filter(|popup| popup.zindex >= 100) {
@@ -1458,6 +1468,7 @@ impl<Message> NativeBuffer<'_, Message> {
                 &popup.default_style,
                 &popup.runs,
                 false,
+                popup.is_documentation_card(),
             );
         }
     }
@@ -1473,6 +1484,7 @@ impl<Message> NativeBuffer<'_, Message> {
         normal: &Vim9RenderStyle,
         runs: &[Vim9RenderRun],
         outline: bool,
+        card: bool,
     ) where
         Renderer: text::Renderer<Font = Font>,
     {
@@ -1486,8 +1498,18 @@ impl<Message> NativeBuffer<'_, Message> {
             editor_clip,
             foreground,
             outline,
+            card,
             |renderer, clip| {
-                renderer.fill_quad(quad(view), Background::Color(background));
+                renderer.fill_quad(
+                    Quad {
+                        border: iced::Border {
+                            radius: (if card { 6.0 } else { 0.0 }).into(),
+                            ..Default::default()
+                        },
+                        ..quad(view)
+                    },
+                    Background::Color(background),
+                );
                 let runs: Vec<_> = runs
                     .iter()
                     .filter_map(|run| {
@@ -1503,13 +1525,17 @@ impl<Message> NativeBuffer<'_, Message> {
                         })
                     })
                     .collect();
-                // Paint every row's full background before glyphs, preserving
-                // padding and italic overhang exactly as the supplied GUI runs.
+                // Tagged providers reserve a padding cell on every edge.
+                // Default row fills must leave the rounded shell intact; actual
+                // highlighted backgrounds and all glyph coordinates stay Vim-owned.
                 for projected in &runs {
-                    let (_, background, _) = colors(&projected.run.style, normal);
+                    let (_, run_background, _) = colors(&projected.run.style, normal);
+                    if card && run_background == background {
+                        continue;
+                    }
                     renderer.fill_quad(
                         quad(rectangle(projected.rect)),
-                        Background::Color(background),
+                        Background::Color(run_background),
                     );
                 }
                 for projected in &runs {
@@ -2443,8 +2469,10 @@ mod tests {
         let metrics = geometry();
         let bounds = Rectangle::with_size(Size::new(640.0, 400.0));
         for change in 0..3 {
-            let mut state = ScrollState::default();
-            state.position = Some(Point::new(340.0, 35.0));
+            let mut state = ScrollState {
+                position: Some(Point::new(340.0, 35.0)),
+                ..Default::default()
+            };
             state.record_presentation(&old, metrics, metrics, bounds);
             let snapshot = state.capture_body_mouse();
             let mut current = (*old).clone();
@@ -4034,6 +4062,7 @@ mod tests {
                 editor_clip,
                 foreground,
                 true,
+                false,
                 |renderer, clip| {
                     assert_eq!(clip, content_clip);
                     renderer.fill_quad(quad(view), Background::Color(background));
@@ -4092,10 +4121,54 @@ mod tests {
             Rectangle::with_size(Size::new(4.0, 4.0)),
             foreground,
             true,
+            false,
             |_, _| panic!("offscreen completion must not paint"),
         );
         assert!(recorder.quads.is_empty());
     }
+    #[test]
+    fn documentation_card_shell_keeps_geometry_clip_and_rounds_only_cards() {
+        let view = Rectangle {
+            x: 20.0,
+            y: 20.0,
+            width: 80.0,
+            height: 60.0,
+        };
+        let editor = Rectangle::with_size(Size::new(200.0, 120.0));
+        for card in [false, true] {
+            let mut recorder = CompletionRecorder::default();
+            paint_overlay_surface(
+                &mut recorder,
+                view,
+                editor,
+                Color::WHITE,
+                false,
+                card,
+                |renderer, clip| {
+                    assert_eq!(clip, view);
+                    iced::advanced::Renderer::fill_quad(
+                        renderer,
+                        quad(view),
+                        Background::Color(Color::BLACK),
+                    );
+                },
+            );
+            assert!(recorder.clips.is_empty());
+            assert_eq!(recorder.quads[4].0.bounds, view);
+            assert_eq!(
+                recorder.quads[0].0.border.radius.top_left,
+                if card { 10.0 } else { 0.0 }
+            );
+            assert_eq!(recorder.quads.len(), if card { 6 } else { 5 });
+            if card {
+                let border = recorder.quads.last().unwrap();
+                assert_eq!(border.0.bounds, view);
+                assert_eq!(border.0.border.radius.top_left, 6.0);
+                assert_eq!(border.2, view);
+            }
+        }
+    }
+
     #[test]
     fn terminal_bands_never_cover_native_buffer() {
         let bounds = Rectangle {
