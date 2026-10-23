@@ -1,8 +1,12 @@
 //! Native session-library state. Discovery and resume validation live in core.
 use jterm_core::agent_sessions::{
-    AgentSession, SessionCatalog, SessionProvider, SessionScanner, SessionStatus,
+    AgentSession, SessionCatalog, SessionProvider, SessionQuery, SessionScanner,
+    SessionSearchIndex, SessionSort, SessionStatus,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
+pub(crate) const PAGE_SIZE: usize = 80;
 use std::time::{Duration, Instant};
 
 pub(crate) type SessionKey = (SessionProvider, String);
@@ -15,6 +19,14 @@ pub(crate) struct SessionLibrary {
     pub provider: Option<SessionProvider>,
     pub status: Option<SessionStatus>,
     pub live_only: bool,
+    pub project: Option<PathBuf>,
+    pub project_only: bool,
+    pub sort: SessionSort,
+    search_index: SessionSearchIndex,
+    visible: Vec<usize>,
+    page: usize,
+    codex_count: usize,
+    observed_count: usize,
     pub selected: Option<SessionKey>,
     pub notice: Option<String>,
     pub bindings: HashMap<SessionKey, usize>,
@@ -31,6 +43,14 @@ impl Default for SessionLibrary {
             provider: None,
             status: None,
             live_only: false,
+            project: None,
+            project_only: false,
+            sort: SessionSort::default(),
+            search_index: SessionSearchIndex::default(),
+            visible: Vec::new(),
+            page: 0,
+            codex_count: 0,
+            observed_count: 0,
             selected: None,
             notice: None,
             bindings: HashMap::new(),
@@ -46,59 +66,122 @@ impl SessionLibrary {
         }
     }
 
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self) -> bool {
+        let old_page = self.page;
         if let Some(catalog) = self.scanner.poll() {
-            self.catalog = catalog;
-            self.reconcile();
+            self.replace_catalog(catalog);
         }
         if self.open && self.last_refresh.elapsed() >= Duration::from_secs(5) {
             self.refresh();
         }
+        old_page != self.page
+    }
+
+    pub fn replace_catalog(&mut self, catalog: SessionCatalog) -> bool {
+        if self.catalog == catalog {
+            return false;
+        }
+        self.catalog = catalog;
+        self.search_index = SessionSearchIndex::new(&self.catalog);
+        self.codex_count = self
+            .catalog
+            .sessions
+            .iter()
+            .filter(|s| s.provider == SessionProvider::Codex)
+            .count();
+        let live: HashSet<_> = self
+            .catalog
+            .live_processes
+            .iter()
+            .map(|p| (p.provider, p.id.as_str()))
+            .collect();
+        self.observed_count = self
+            .catalog
+            .sessions
+            .iter()
+            .filter(|s| live.contains(&(s.provider, s.id.as_str())))
+            .count();
+        self.reconcile();
+        true
     }
 
     pub fn filtered(&self) -> Vec<&AgentSession> {
-        self.catalog
-            .sessions
+        self.visible
             .iter()
-            .filter(|s| {
-                self.provider.is_none_or(|p| s.provider == p)
-                    && self.status.is_none_or(|status| s.status == status)
-                    && (!self.live_only || !self.catalog.live_pids(s).is_empty())
-                    && s.matches_query(&self.query)
-            })
+            .filter_map(|index| self.catalog.sessions.get(*index))
             .collect()
     }
 
     pub fn selected_session(&self) -> Option<&AgentSession> {
         let key = self.selected.as_ref()?;
-        self.filtered()
-            .into_iter()
-            .find(|s| s.provider == key.0 && s.id == key.1)
+        self.visible
+            .iter()
+            .filter_map(|index| self.catalog.sessions.get(*index))
+            .find(|session| session.provider == key.0 && session.id == key.1)
     }
 
     pub fn reconcile(&mut self) {
+        self.visible = self.search_index.query(&SessionQuery {
+            text: &self.query,
+            provider: self.provider,
+            status: self.status,
+            live_only: self.live_only,
+            project: self
+                .project_only
+                .then_some(self.project.as_deref())
+                .flatten(),
+            sort: self.sort,
+        });
         if self.selected_session().is_none() {
-            self.selected = self.filtered().first().map(|s| (s.provider, s.id.clone()));
+            self.selected = self.visible.first().map(|index| {
+                let session = &self.catalog.sessions[*index];
+                (session.provider, session.id.clone())
+            });
         }
+        self.page = self.selected_position().unwrap_or(0) / PAGE_SIZE;
+    }
+
+    pub fn selected_position(&self) -> Option<usize> {
+        let key = self.selected.as_ref()?;
+        self.visible.iter().position(|index| {
+            let session = &self.catalog.sessions[*index];
+            session.provider == key.0 && session.id == key.1
+        })
     }
 
     pub fn step(&mut self, delta: isize) {
-        let filtered = self.filtered();
-        if filtered.is_empty() {
+        if self.visible.is_empty() {
             self.selected = None;
+            self.page = 0;
             return;
         }
-        let index = self
-            .selected
-            .as_ref()
-            .and_then(|key| {
-                filtered
-                    .iter()
-                    .position(|s| s.provider == key.0 && s.id == key.1)
-            })
-            .unwrap_or(0);
-        let next = (index as isize + delta).clamp(0, filtered.len() as isize - 1) as usize;
-        self.selected = Some((filtered[next].provider, filtered[next].id.clone()));
+        let index = self.selected_position().unwrap_or(0);
+        let next = (index as isize)
+            .saturating_add(delta)
+            .clamp(0, self.visible.len() as isize - 1) as usize;
+        let session = &self.catalog.sessions[self.visible[next]];
+        self.selected = Some((session.provider, session.id.clone()));
+        self.page = next / PAGE_SIZE;
+    }
+
+    pub fn next_sort(&self) -> SessionSort {
+        match self.sort {
+            SessionSort::Relevance => SessionSort::Recent,
+            SessionSort::Recent => SessionSort::LiveFirst,
+            SessionSort::LiveFirst => SessionSort::Relevance,
+        }
+    }
+
+    pub fn clear_filters(&mut self) {
+        self.query.clear();
+        self.provider = None;
+        self.status = None;
+        self.live_only = false;
+        self.project_only = false;
+        self.sort = SessionSort::Relevance;
+        self.selected = None;
+        self.notice = None;
+        self.reconcile();
     }
 }
 
@@ -194,11 +277,30 @@ impl super::Frost {
         }
     }
 
+    pub(crate) fn agent_sessions_scroll_task(&self) -> iced::Task<super::Message> {
+        let state = &self.agent_sessions;
+        let local = state.selected_position().unwrap_or(0) % PAGE_SIZE;
+        let count = state
+            .visible
+            .len()
+            .saturating_sub(state.page * PAGE_SIZE)
+            .min(PAGE_SIZE);
+        let y = if count <= 1 {
+            0.0
+        } else {
+            local as f32 / (count - 1) as f32
+        };
+        iced::widget::operation::snap_to(
+            super::AGENT_SESSIONS_LIST_ID.clone(),
+            iced::widget::operation::RelativeOffset { x: 0.0, y },
+        )
+    }
+
     pub(crate) fn agent_sessions_view(&self) -> iced::Element<'_, super::Message> {
         use super::Message as M;
         use iced::widget::{
             button, checkbox, column, container, mouse_area, row, scrollable, stack, text,
-            text_input, Space,
+            text_input, tooltip, Space,
         };
         use iced::{Element, Length};
         let state = &self.agent_sessions;
@@ -226,19 +328,9 @@ impl super::Frost {
                 .on_press(M::AgentSessionsClose)
                 .style(button::text),
         );
-        let codex = state
-            .catalog
-            .sessions
-            .iter()
-            .filter(|s| s.provider == SessionProvider::Codex)
-            .count();
+        let codex = state.codex_count;
         let claude = state.catalog.sessions.len() - codex;
-        let observed = state
-            .catalog
-            .sessions
-            .iter()
-            .filter(|s| !state.catalog.live_pids(s).is_empty())
-            .count();
+        let observed = state.observed_count;
         let query = text_input(
             "Search title, project, branch, recent content, session ID…",
             &state.query,
@@ -288,17 +380,8 @@ impl super::Frost {
         }
         let filtered = state.filtered();
         let mut list = column![].spacing(5);
-        let selected_position = state
-            .selected
-            .as_ref()
-            .and_then(|key| {
-                filtered
-                    .iter()
-                    .position(|s| s.provider == key.0 && s.id == key.1)
-            })
-            .unwrap_or(0);
-        let start = selected_position.saturating_sub(70);
-        for session in filtered.iter().skip(start).take(180) {
+        let start = state.page * PAGE_SIZE;
+        for session in filtered.iter().skip(start).take(PAGE_SIZE) {
             let key = (session.provider, session.id.clone());
             let selected = state.selected.as_ref() == Some(&key);
             let here = state
@@ -356,11 +439,43 @@ impl super::Frost {
                 .size(size),
             );
         }
+        let end = (start + PAGE_SIZE).min(filtered.len());
+        let pages = filtered.len().div_ceil(PAGE_SIZE).max(1);
+        let page_controls = row![
+            button(text("Previous").size(size - 1.0))
+                .on_press_maybe(
+                    (state.page > 0).then_some(M::AgentSessionsStep(-(PAGE_SIZE as isize)))
+                )
+                .style(button::secondary),
+            text(format!(
+                "{}–{} of {} · page {}/{}",
+                if filtered.is_empty() { 0 } else { start + 1 },
+                end,
+                filtered.len(),
+                state.page + 1,
+                pages
+            ))
+            .size(size - 1.0),
+            button(text("Next").size(size - 1.0))
+                .on_press_maybe(
+                    (end < filtered.len()).then_some(M::AgentSessionsStep(PAGE_SIZE as isize))
+                )
+                .style(button::secondary),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
         let list: Element<'_, M> = column![
-            text(format!("{} matching · newest first", filtered.len()))
-                .size(size - 1.0)
-                .style(text::secondary),
-            scrollable(list).height(Length::Fill)
+            text(format!(
+                "{} matching · {}",
+                filtered.len(),
+                state.sort.label()
+            ))
+            .size(size - 1.0)
+            .style(text::secondary),
+            scrollable(list)
+                .id(super::AGENT_SESSIONS_LIST_ID.clone())
+                .height(Length::Fill),
+            page_controls,
         ]
         .spacing(7)
         .height(Length::Fill)
@@ -480,15 +595,38 @@ impl super::Frost {
         let mut body = column![heading,
             text(format!("{} conversations   ·   {codex} Codex   ·   {claude} Claude   ·   {observed} observed live", state.catalog.sessions.len())).size(size).style(text::secondary),
             query, filters, statuses.wrap(),
-            checkbox(state.live_only).label("Observed live only").on_toggle(M::AgentSessionsLive).size(size),
+            row![
+                checkbox(state.live_only).label("Observed live only").on_toggle(M::AgentSessionsLive).size(size),
+                checkbox(state.project_only).label("This folder")
+                    .on_toggle_maybe(state.project.as_ref().map(|_| M::AgentSessionsScope as fn(bool) -> M)).size(size),
+                tooltip(
+                    button(text(format!("Sort: {} ↻", state.sort.label())).size(size))
+                        .on_press(M::AgentSessionsSort(state.next_sort())).style(button::secondary),
+                    text("Cycle Best match / Recent / Live first · Ctrl+S").size(size - 1.0),
+                    tooltip::Position::Bottom,
+                ),
+                button(text("Clear filters").size(size - 1.0)).on_press(M::AgentSessionsClear).style(button::text),
+            ].spacing(12).align_y(iced::Alignment::Center).wrap(),
             text("Activity reflects the last saved event. Live badges require an observed matching process.").size(size - 2.0).style(text::secondary),
             content,
         ].spacing(9);
+        if state.project_only {
+            if let Some(project) = &state.project {
+                body = body.push(
+                    text(format!(
+                        "Folder scope: {} (including subfolders)",
+                        project.display()
+                    ))
+                    .size(size - 2.0)
+                    .style(text::secondary),
+                );
+            }
+        }
         for warning in state.catalog.warnings.iter().take(2) {
             body = body.push(text(warning.clone()).size(size - 2.0).style(text::warning));
         }
         body = body.push(
-            text("↑ ↓ select    Enter resume    F5 refresh    Esc close")
+            text("↑ ↓ select · PgUp/PgDn page · Home/End list edges · Ctrl+L search · Ctrl+S sort · Enter resume · F5 refresh · Esc close")
                 .size(size - 2.0)
                 .style(text::secondary),
         );
@@ -529,17 +667,23 @@ mod tests {
             archived: false,
         }
     }
+    fn catalog(sessions: Vec<AgentSession>) -> SessionCatalog {
+        SessionCatalog {
+            sessions,
+            ..Default::default()
+        }
+    }
     #[test]
     fn refresh_preserves_provider_and_session_identity_after_reorder() {
         let mut library = SessionLibrary::default();
-        library.catalog.sessions = vec![
+        library.replace_catalog(catalog(vec![
             session(SessionProvider::Codex, "one", "First"),
             session(SessionProvider::Claude, "two", "Second"),
-        ];
-        library.reconcile();
+        ]));
         library.step(1);
-        library.catalog.sessions.reverse();
-        library.reconcile();
+        let mut next = library.catalog.clone();
+        next.sessions.reverse();
+        library.replace_catalog(next);
         assert_eq!(library.selected_session().unwrap().id, "two");
         library.provider = Some(SessionProvider::Codex);
         library.reconcile();
@@ -548,44 +692,91 @@ mod tests {
     #[test]
     fn hidden_selection_cannot_resume_and_filters_reconcile() {
         let mut library = SessionLibrary::default();
-        library.catalog.sessions = vec![
+        library.replace_catalog(catalog(vec![
             session(SessionProvider::Codex, "one", "Repair parser"),
             session(SessionProvider::Claude, "two", "Fix renderer"),
-        ];
-        library.reconcile();
+        ]));
         library.query = "renderer claude".into();
-        assert!(library.selected_session().is_none());
         library.reconcile();
         assert_eq!(library.selected_session().unwrap().id, "two");
         library.query = "no matches".into();
         library.reconcile();
-        assert!(library.selected.is_none());
+        assert!(library.selected_session().is_none());
         library.step(1);
         assert!(library.selected.is_none());
     }
     #[test]
     fn live_filter_uses_process_evidence_independent_of_historical_activity() {
         let mut library = SessionLibrary::default();
-        library.catalog.sessions = vec![
+        let mut snapshot = catalog(vec![
             session(SessionProvider::Codex, "one", "Done"),
             session(SessionProvider::Claude, "two", "Old working event"),
-        ];
-        library.catalog.sessions[1].status = SessionStatus::Working;
-        library
-            .catalog
+        ]);
+        snapshot.sessions[1].status = SessionStatus::Working;
+        snapshot
             .live_processes
             .push(jterm_core::agent_sessions::LiveSessionProcess {
                 provider: SessionProvider::Codex,
                 id: "one".into(),
                 pid: 42,
             });
+        library.replace_catalog(snapshot);
         library.live_only = true;
         library.reconcile();
         assert_eq!(library.filtered().len(), 1);
         assert_eq!(library.selected_session().unwrap().id, "one");
-        library.catalog.live_processes.clear();
-        library.reconcile();
+        let mut next = library.catalog.clone();
+        next.live_processes.clear();
+        library.replace_catalog(next);
         assert!(library.selected.is_none());
+    }
+    #[test]
+    fn pages_reach_every_session_and_unchanged_refresh_preserves_navigation() {
+        let mut library = SessionLibrary::default();
+        let sessions = (0..205)
+            .map(|i| {
+                let mut s = session(SessionProvider::Codex, &format!("session-{i:03}"), "Task");
+                s.updated_at_ms = i;
+                s
+            })
+            .collect();
+        library.replace_catalog(catalog(sessions));
+        assert_eq!(library.filtered().len(), 205);
+        library.step(PAGE_SIZE as isize);
+        assert_eq!(library.page, 1);
+        assert_eq!(library.selected_position(), Some(80));
+        let key = library.selected.clone();
+        assert!(!library.replace_catalog(library.catalog.clone()));
+        assert_eq!(library.selected, key);
+        assert_eq!(library.page, 1);
+        library.step(isize::MAX);
+        assert_eq!(library.selected_position(), Some(204));
+        assert_eq!(library.page, 2);
+        library.step(isize::MIN);
+        assert_eq!(library.selected_position(), Some(0));
+        assert_eq!(library.page, 0);
+    }
+    #[test]
+    fn ranked_search_and_directory_scope_compose_and_reset() {
+        let mut library = SessionLibrary::default();
+        let mut title = session(SessionProvider::Codex, "title", "Fix renderer");
+        title.cwd = "/work/repo/src".into();
+        let mut incidental = session(SessionProvider::Codex, "preview", "Other task");
+        incidental.preview = "renderer".into();
+        incidental.cwd = "/work/repo-other".into();
+        incidental.updated_at_ms = 999;
+        library.replace_catalog(catalog(vec![incidental, title]));
+        library.query = "renderer".into();
+        library.selected = None;
+        library.reconcile();
+        assert_eq!(library.selected_session().unwrap().id, "title");
+        library.project = Some("/work/repo".into());
+        library.project_only = true;
+        library.reconcile();
+        assert_eq!(library.filtered().len(), 1);
+        library.clear_filters();
+        assert_eq!(library.filtered().len(), 2);
+        assert_eq!(library.selected_session().unwrap().id, "preview");
     }
     #[test]
     fn manager_shortcut_and_palette_use_the_same_command() {

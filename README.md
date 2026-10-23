@@ -1199,3 +1199,10 @@ reads local history without modifying it or calling a model service.
 All four terminals share this session catalog through the sibling `jterm_core`
 checkout. These development manifests use `../jterm_core` so the new core API and
 native adapters build together.
+
+The session library ranks exact IDs and titles ahead of incidental preview matches.
+Choose **This folder** to include the captured terminal directory and its subfolders,
+or cycle **Best match / Recent / Live first** with the sort button or **Ctrl+S**.
+Results use explicit 80-row pages; **Page Up/Down**, **Home/End**, and **Ctrl+L**
+provide keyboard navigation. Automatic unchanged refreshes preserve selection and
+scroll position, and **Clear filters** restores the full library.

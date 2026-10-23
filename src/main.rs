@@ -1496,6 +1496,8 @@ static PALETTE_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-palette-input"));
 static PALETTE_LIST_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-palette-list"));
+static AGENT_SESSIONS_LIST_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-agent-sessions-list"));
 static AGENT_SESSIONS_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-agent-sessions-input"));
 static AGENT_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
@@ -4745,6 +4747,11 @@ enum Message {
     AgentSessionsTick,
     AgentSessionsQuery(String),
     AgentSessionsLive(bool),
+    AgentSessionsScope(bool),
+    AgentSessionsSort(jterm_core::agent_sessions::SessionSort),
+    AgentSessionsClear,
+    AgentSessionsStep(isize),
+    AgentSessionsCapturedNavigation(keyboard::Event),
     AgentSessionsProvider(Option<jterm_core::agent_sessions::SessionProvider>),
     AgentSessionsStatus(Option<jterm_core::agent_sessions::SessionStatus>),
     AgentSessionsSelect(agent_sessions::SessionKey),
@@ -17151,28 +17158,80 @@ impl Frost {
                 self.agent_sessions.open = !self.agent_sessions.open;
                 if self.agent_sessions.open {
                     self.native_enter_ownership.lock().claim_held();
+                    self.agent_sessions.project = self
+                        .sessions
+                        .get(self.active)
+                        .and_then(|session| session.cwd())
+                        .map(std::path::PathBuf::from);
+                    if self.agent_sessions.project.is_none() {
+                        self.agent_sessions.project_only = false;
+                    }
+                    self.agent_sessions.reconcile();
                     self.agent_sessions.refresh();
                     return iced::widget::operation::focus(AGENT_SESSIONS_INPUT_ID.clone());
                 }
             }
             Message::AgentSessionsClose => self.agent_sessions.open = false,
             Message::AgentSessionsRefresh => self.agent_sessions.refresh(),
-            Message::AgentSessionsTick => self.agent_sessions.poll(),
+            Message::AgentSessionsTick => {
+                if self.agent_sessions.poll() {
+                    return self.agent_sessions_scroll_task();
+                }
+            }
+            Message::AgentSessionsCapturedNavigation(event) => {
+                if self.agent_sessions.open {
+                    return self.update(Message::Key(event));
+                }
+            }
+            Message::AgentSessionsScope(enabled) => {
+                self.agent_sessions.project_only = enabled && self.agent_sessions.project.is_some();
+                self.agent_sessions.selected = None;
+                self.agent_sessions.reconcile();
+                return self.agent_sessions_scroll_task();
+            }
+            Message::AgentSessionsSort(sort) => {
+                self.agent_sessions.sort = sort;
+                self.agent_sessions.selected = None;
+                self.agent_sessions.reconcile();
+                return self.agent_sessions_scroll_task();
+            }
+            Message::AgentSessionsClear => {
+                self.agent_sessions.clear_filters();
+                return Task::batch([
+                    self.agent_sessions_scroll_task(),
+                    iced::widget::operation::focus(AGENT_SESSIONS_INPUT_ID.clone()),
+                ]);
+            }
+            Message::AgentSessionsStep(delta) => {
+                self.agent_sessions.step(delta);
+                return self.agent_sessions_scroll_task();
+            }
             Message::AgentSessionsLive(live_only) => {
                 self.agent_sessions.live_only = live_only;
+                self.agent_sessions.selected = None;
                 self.agent_sessions.reconcile();
+                return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsQuery(query) => {
-                self.agent_sessions.query = crate::review_text::visible_bounded(&query, 512);
+                let query = crate::review_text::visible_bounded(&query, 512);
+                if self.agent_sessions.query != query {
+                    self.agent_sessions.selected = None;
+                }
+                self.agent_sessions.query = query;
                 self.agent_sessions.reconcile();
+                return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsProvider(provider) => {
                 self.agent_sessions.provider = provider;
+                self.agent_sessions.selected = None;
                 self.agent_sessions.reconcile();
+                return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsStatus(status) => {
                 self.agent_sessions.status = status;
+                self.agent_sessions.selected = None;
                 self.agent_sessions.reconcile();
+                return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsSelect(key) => self.agent_sessions.selected = Some(key),
             Message::AgentSessionsResume => self.resume_agent_session(),
@@ -17673,10 +17732,45 @@ impl Frost {
                 {
                     if self.agent_sessions.open {
                         use keyboard::{key::Named, Key};
+                        if modifiers.control()
+                            && matches!(&key, Key::Character(value) if value.eq_ignore_ascii_case("l"))
+                        {
+                            return iced::widget::operation::focus(AGENT_SESSIONS_INPUT_ID.clone());
+                        }
+                        if modifiers.control()
+                            && matches!(&key, Key::Character(value) if value.eq_ignore_ascii_case("s"))
+                        {
+                            return self.update(Message::AgentSessionsSort(
+                                self.agent_sessions.next_sort(),
+                            ));
+                        }
                         match key {
                             Key::Named(Named::Escape) => self.agent_sessions.open = false,
-                            Key::Named(Named::ArrowDown) => self.agent_sessions.step(1),
-                            Key::Named(Named::ArrowUp) => self.agent_sessions.step(-1),
+                            Key::Named(Named::ArrowDown) => {
+                                self.agent_sessions.step(1);
+                                return self.agent_sessions_scroll_task();
+                            }
+                            Key::Named(Named::ArrowUp) => {
+                                self.agent_sessions.step(-1);
+                                return self.agent_sessions_scroll_task();
+                            }
+                            Key::Named(Named::PageDown) => {
+                                self.agent_sessions.step(agent_sessions::PAGE_SIZE as isize);
+                                return self.agent_sessions_scroll_task();
+                            }
+                            Key::Named(Named::PageUp) => {
+                                self.agent_sessions
+                                    .step(-(agent_sessions::PAGE_SIZE as isize));
+                                return self.agent_sessions_scroll_task();
+                            }
+                            Key::Named(Named::Home) => {
+                                self.agent_sessions.step(isize::MIN);
+                                return self.agent_sessions_scroll_task();
+                            }
+                            Key::Named(Named::End) => {
+                                self.agent_sessions.step(isize::MAX);
+                                return self.agent_sessions_scroll_task();
+                            }
                             Key::Named(Named::Enter) if !repeat => self.resume_agent_session(),
                             Key::Named(Named::F5) => self.agent_sessions.refresh(),
                             _ => {}
@@ -31705,6 +31799,20 @@ impl Frost {
                 } = &event
                 {
                     Some(Message::CapturedEnterPress(id, event))
+                } else if matches!(
+                    &event,
+                    keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(
+                            keyboard::key::Named::Home | keyboard::key::Named::End
+                        ),
+                        ..
+                    }
+                ) || matches!(&event, keyboard::Event::KeyPressed { key: keyboard::Key::Character(value), modifiers, .. } if modifiers.control() && value.eq_ignore_ascii_case("l"))
+                {
+                    // A session picker owns list-edge navigation even when its
+                    // search field also handles the caret key. Other surfaces
+                    // retain the widget's captured behavior without redispatch.
+                    Some(Message::AgentSessionsCapturedNavigation(event))
                 } else if captured_key_is_enter_release(&event)
                     || matches!(
                         &event,
