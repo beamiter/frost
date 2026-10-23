@@ -1,6 +1,7 @@
 //! Native session-library state. Discovery and resume validation live in core.
 use jterm_core::agent_sessions::{
-    AgentSession, SessionCatalog, SessionProvider, SessionQuery, SessionScanner,
+    AgentSession, SessionCatalog, SessionLaunch, SessionLibraryFilter, SessionLibraryStore,
+    SessionPreflight, SessionPreflightState, SessionProvider, SessionQuery, SessionScanner,
     SessionSearchIndex, SessionSort, SessionStatus,
 };
 use std::collections::{HashMap, HashSet};
@@ -19,6 +20,11 @@ pub(crate) struct SessionLibrary {
     pub provider: Option<SessionProvider>,
     pub status: Option<SessionStatus>,
     pub live_only: bool,
+    pub pinned_only: bool,
+    pub recent_only: bool,
+    pub store: SessionLibraryStore,
+    pub preflight: SessionPreflight,
+    pending_confirm: Option<SessionKey>,
     pub project: Option<PathBuf>,
     pub project_only: bool,
     pub sort: SessionSort,
@@ -35,6 +41,11 @@ pub(crate) struct SessionLibrary {
 
 impl Default for SessionLibrary {
     fn default() -> Self {
+        Self::with_store(SessionLibraryStore::new())
+    }
+}
+impl SessionLibrary {
+    fn with_store(store: SessionLibraryStore) -> Self {
         Self {
             open: false,
             catalog: SessionCatalog::default(),
@@ -43,6 +54,11 @@ impl Default for SessionLibrary {
             provider: None,
             status: None,
             live_only: false,
+            pinned_only: false,
+            recent_only: false,
+            store,
+            preflight: SessionPreflight::new(),
+            pending_confirm: None,
             project: None,
             project_only: false,
             sort: SessionSort::default(),
@@ -64,6 +80,7 @@ impl SessionLibrary {
         if self.scanner.refresh() {
             self.last_refresh = Instant::now();
         }
+        self.store.refresh();
     }
 
     pub fn poll(&mut self) -> bool {
@@ -71,6 +88,11 @@ impl SessionLibrary {
         if let Some(catalog) = self.scanner.poll() {
             self.replace_catalog(catalog);
         }
+        if self.store.poll() {
+            self.reconcile();
+        }
+        self.sync_preflight();
+        self.preflight.poll();
         if self.open && self.last_refresh.elapsed() >= Duration::from_secs(5) {
             self.refresh();
         }
@@ -121,17 +143,25 @@ impl SessionLibrary {
     }
 
     pub fn reconcile(&mut self) {
-        self.visible = self.search_index.query(&SessionQuery {
-            text: &self.query,
-            provider: self.provider,
-            status: self.status,
-            live_only: self.live_only,
-            project: self
-                .project_only
-                .then_some(self.project.as_deref())
-                .flatten(),
-            sort: self.sort,
-        });
+        self.visible = self.search_index.query_with_library(
+            &SessionQuery {
+                text: &self.query,
+                provider: self.provider,
+                status: self.status,
+                live_only: self.live_only,
+                project: self
+                    .project_only
+                    .then_some(self.project.as_deref())
+                    .flatten(),
+                sort: self.sort,
+            },
+            self.store.snapshot(),
+            SessionLibraryFilter {
+                pinned_only: self.pinned_only,
+                recent_only: self.recent_only,
+                pinned_first: true,
+            },
+        );
         if self.selected_session().is_none() {
             self.selected = self.visible.first().map(|index| {
                 let session = &self.catalog.sessions[*index];
@@ -139,6 +169,25 @@ impl SessionLibrary {
             });
         }
         self.page = self.selected_position().unwrap_or(0) / PAGE_SIZE;
+        self.sync_preflight();
+    }
+
+    pub fn cancel_confirmation(&mut self) {
+        self.pending_confirm = None;
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+        self.pending_confirm = None;
+        self.preflight.select(None);
+    }
+
+    pub fn sync_preflight(&mut self) {
+        let selected = self.selected_session().cloned();
+        if self.preflight.select(selected.as_ref()) {
+            self.pending_confirm = None;
+            self.notice = None;
+        }
     }
 
     pub fn selected_position(&self) -> Option<usize> {
@@ -150,6 +199,7 @@ impl SessionLibrary {
     }
 
     pub fn step(&mut self, delta: isize) {
+        self.cancel_confirmation();
         if self.visible.is_empty() {
             self.selected = None;
             self.page = 0;
@@ -162,21 +212,26 @@ impl SessionLibrary {
         let session = &self.catalog.sessions[self.visible[next]];
         self.selected = Some((session.provider, session.id.clone()));
         self.page = next / PAGE_SIZE;
+        self.sync_preflight();
     }
 
     pub fn next_sort(&self) -> SessionSort {
         match self.sort {
             SessionSort::Relevance => SessionSort::Recent,
             SessionSort::Recent => SessionSort::LiveFirst,
-            SessionSort::LiveFirst => SessionSort::Relevance,
+            SessionSort::LiveFirst => SessionSort::RecentlyResumed,
+            SessionSort::RecentlyResumed => SessionSort::Relevance,
         }
     }
 
     pub fn clear_filters(&mut self) {
+        self.cancel_confirmation();
         self.query.clear();
         self.provider = None;
         self.status = None;
         self.live_only = false;
+        self.pinned_only = false;
+        self.recent_only = false;
         self.project_only = false;
         self.sort = SessionSort::Relevance;
         self.selected = None;
@@ -217,23 +272,75 @@ impl super::Frost {
             .and_then(|id| self.session_index_by_id(id))
             .filter(|index| !self.sessions[*index].hold_after_exit)
         {
-            self.agent_sessions.open = false;
             self.pane_zoomed = false;
-            self.focus_session(index);
+            if !self.focus_session(index) {
+                self.agent_sessions.open = true;
+                self.agent_sessions.notice =
+                    Some("The open terminal is no longer available".into());
+                return;
+            }
+            self.record_resumed_agent_session(session.provider, &session.id);
+            self.agent_sessions.close();
             self.relayout();
             self.refresh_active_context();
             return;
         }
-        let launch = match session
-            .resume_launch()
-            .and_then(|launch| launch.resolve_for_spawn())
-        {
-            Ok(launch) => launch,
-            Err(error) => {
-                self.agent_sessions.notice = Some(error);
-                return;
-            }
+        self.agent_sessions.sync_preflight();
+        self.agent_sessions.pending_confirm = Some(key);
+        self.agent_sessions.notice = None;
+        self.agent_sessions.preflight.refresh();
+    }
+
+    pub(crate) fn finish_pending_agent_resume(&mut self) {
+        if !self.agent_sessions.open {
+            self.agent_sessions.pending_confirm = None;
+            return;
+        }
+        let Some(key) = self.agent_sessions.pending_confirm.clone() else {
+            return;
         };
+        let Some(session) = self
+            .agent_sessions
+            .selected_session()
+            .cloned()
+            .filter(|session| (session.provider, session.id.clone()) == key)
+        else {
+            self.agent_sessions.pending_confirm = None;
+            return;
+        };
+        if let SessionPreflightState::Unavailable(error) = self.agent_sessions.preflight.state() {
+            self.agent_sessions.notice = Some(error.clone());
+            self.agent_sessions.pending_confirm = None;
+            return;
+        }
+        let Some(launch) = self
+            .agent_sessions
+            .preflight
+            .ready_launch(&session)
+            .cloned()
+        else {
+            return;
+        };
+        self.agent_sessions.pending_confirm = None;
+        self.native_enter_ownership.lock().claim_held();
+        self.launch_checked_agent_session(session, key, launch);
+    }
+
+    fn record_resumed_agent_session(&mut self, provider: SessionProvider, id: &str) {
+        if let Err(error) = self.agent_sessions.store.record_resumed(provider, id) {
+            self.push_toast(
+                format!("Could not save recent-session history: {error}"),
+                super::ToastKind::Warning,
+            );
+        }
+    }
+
+    fn launch_checked_agent_session(
+        &mut self,
+        session: AgentSession,
+        key: SessionKey,
+        launch: SessionLaunch,
+    ) {
         let Some(cwd) = launch.cwd.to_str() else {
             self.agent_sessions.notice = Some("The session directory is not valid UTF-8".into());
             return;
@@ -249,6 +356,7 @@ impl super::Frost {
         ) {
             Ok(terminal) => {
                 self.agent_sessions.bindings.insert(key, terminal.id);
+                self.record_resumed_agent_session(session.provider, &session.id);
                 self.session_diagnostic = None;
                 self.next_id += 1;
                 let insert = (self.active + 1).min(self.sessions.len());
@@ -258,7 +366,7 @@ impl super::Frost {
                 self.open_tab_with(insert);
                 self.tabs[self.active_tab].title =
                     Some(format!("{} · {}", session.provider.label(), session.title));
-                self.agent_sessions.open = false;
+                self.agent_sessions.close();
                 self.agent_sessions.notice = None;
                 self.relayout();
                 self.refresh_active_context();
@@ -390,7 +498,18 @@ impl super::Frost {
                 .and_then(|id| self.session_index_by_id(*id))
                 .is_some();
             let title = row![
-                text(session.provider.label()).size(size - 1.0),
+                text(
+                    if state
+                        .store
+                        .snapshot()
+                        .is_pinned(session.provider, &session.id)
+                    {
+                        format!("★ {}", session.provider.label())
+                    } else {
+                        session.provider.label().into()
+                    }
+                )
+                .size(size - 1.0),
                 text(session.title.clone()).size(size),
                 Space::new().width(Length::Fill),
                 text(age(session.updated_at_ms)).size(size - 2.0)
@@ -481,6 +600,7 @@ impl super::Frost {
         .height(Length::Fill)
         .into();
         let mut detail = column![].spacing(10);
+        let mut actions = column![].spacing(6);
         if let Some(session) = state.selected_session() {
             detail = detail.push(text(session.title.clone()).size(size + 2.0));
             detail = detail.push(
@@ -524,58 +644,119 @@ impl super::Frost {
                 })
                 .size(size),
             );
-            let launch = session.resume_launch();
-            if let Ok(launch) = &launch {
+            let key = (session.provider, session.id.clone());
+            let pinned = state
+                .store
+                .snapshot()
+                .is_pinned(session.provider, &session.id);
+            if let Some(timestamp) = state
+                .store
+                .snapshot()
+                .last_resumed(session.provider, &session.id)
+            {
                 detail = detail.push(
-                    container(
-                        text(launch.display_command())
-                            .size(size - 1.0)
-                            .font(iced::Font::MONOSPACE),
-                    )
-                    .padding(9)
-                    .style(container::rounded_box),
+                    text(format!("Last resumed {}", age(timestamp)))
+                        .size(size - 1.0)
+                        .style(text::secondary),
                 );
             }
             let bound = state
                 .bindings
                 .get(&(session.provider, session.id.clone()))
                 .and_then(|id| self.session_index_by_id(*id))
+                .filter(|index| !self.sessions[*index].hold_after_exit)
                 .is_some();
-            detail = detail.push(
+            let ready = state.preflight.ready_launch(session).is_some();
+            let checking = state.pending_confirm.is_some();
+            if bound {
+                actions = actions.push(
+                    text("Open in this window")
+                        .size(size - 1.0)
+                        .style(text::secondary),
+                );
+            } else {
+                let (message, unavailable) = match state.preflight.state() {
+                    SessionPreflightState::Idle => ("Select a session to check".to_owned(), false),
+                    SessionPreflightState::Checking => {
+                        ("Checking project and agent installation…".to_owned(), false)
+                    }
+                    SessionPreflightState::Ready(_) => ("Ready to resume".to_owned(), false),
+                    SessionPreflightState::Unavailable(error) => (error.clone(), true),
+                };
+                let status = text(message).size(size - 1.0);
+                actions = actions.push(if unavailable {
+                    status.style(text::danger)
+                } else {
+                    status.style(text::secondary)
+                });
+                if unavailable {
+                    actions = actions.push(
+                        button(text("Check again").size(size - 1.0))
+                            .on_press(M::AgentSessionsCheck)
+                            .style(button::text),
+                    );
+                }
+            }
+            actions = actions.push(
                 button(
                     text(if bound {
                         "Switch to open tab"
+                    } else if checking {
+                        "Checking before opening…"
                     } else {
                         "Resume in new tab"
                     })
                     .size(size),
                 )
-                .on_press_maybe((launch.is_ok() || bound).then_some(M::AgentSessionsResume))
+                .on_press_maybe(((bound || ready) && !checking).then_some(M::AgentSessionsResume))
                 .padding([8, 14])
+                .width(Length::Fill)
                 .style(button::primary),
             );
-            if let Err(error) = launch {
-                detail = detail.push(text(error).size(size - 1.0).style(text::danger));
-            } else {
-                detail = detail.push(
+            actions = actions.push(
+                row![
+                    button(
+                        text(if pinned {
+                            "★ Unpin"
+                        } else {
+                            "☆ Pin session"
+                        })
+                        .size(size - 1.0)
+                    )
+                    .on_press_maybe(
+                        (state.store.is_loaded()
+                            && !state.store.is_busy()
+                            && state.store.error().is_none())
+                        .then_some(M::AgentSessionsPin(key))
+                    )
+                    .style(button::secondary),
                     button(text("Copy resume command").size(size - 1.0))
-                        .on_press(M::AgentSessionsCopy)
+                        .on_press_maybe(ready.then_some(M::AgentSessionsCopy))
                         .style(button::text),
-                );
-            }
+                ]
+                .spacing(8)
+                .wrap(),
+            );
         } else {
             detail = detail.push(text("Select a conversation to preview and resume.").size(size));
         }
         if let Some(notice) = &state.notice {
-            detail = detail.push(text(notice.clone()).size(size).style(text::danger));
+            let duplicate = matches!(state.preflight.state(), SessionPreflightState::Unavailable(error) if error == notice);
+            if !duplicate {
+                actions = actions.push(text(notice.clone()).size(size - 1.0).style(text::danger));
+            }
         }
+        let details: Element<'_, M> = column![scrollable(detail).height(Length::Fill), actions]
+            .spacing(10)
+            .height(Length::Fill)
+            .into();
         let wide = self.win_size.width >= 780.0;
         let content: Element<'_, M> = if wide {
             row![
                 container(list)
                     .width(Length::FillPortion(5))
                     .height(Length::Fill),
-                container(scrollable(detail))
+                container(details)
                     .width(Length::FillPortion(4))
                     .height(Length::Fill)
                     .padding(8)
@@ -586,7 +767,7 @@ impl super::Frost {
         } else {
             column![
                 container(list).height(Length::FillPortion(1)),
-                container(scrollable(detail)).height(Length::FillPortion(1))
+                container(details).height(Length::FillPortion(1))
             ]
             .spacing(8)
             .height(Length::Fill)
@@ -602,10 +783,15 @@ impl super::Frost {
                 tooltip(
                     button(text(format!("Sort: {} ↻", state.sort.label())).size(size))
                         .on_press(M::AgentSessionsSort(state.next_sort())).style(button::secondary),
-                    text("Cycle Best match / Recent / Live first · Ctrl+S").size(size - 1.0),
+                    text("Cycle Best match / Recent / Live first / Recently resumed · Ctrl+S").size(size - 1.0),
                     tooltip::Position::Bottom,
                 ),
                 button(text("Clear filters").size(size - 1.0)).on_press(M::AgentSessionsClear).style(button::text),
+            ].spacing(12).align_y(iced::Alignment::Center).wrap(),
+            row![
+                checkbox(state.pinned_only).label("Pinned only").on_toggle(M::AgentSessionsPinned).size(size),
+                checkbox(state.recent_only).label("Previously resumed").on_toggle(M::AgentSessionsRecent).size(size),
+                text(if !state.store.is_loaded() { "Loading saved library…" } else if state.store.is_busy() { "Saving library…" } else { "Pins and recent sessions are shared across terminals" }).size(size - 2.0).style(text::secondary),
             ].spacing(12).align_y(iced::Alignment::Center).wrap(),
             text("Activity reflects the last saved event. Live badges require an observed matching process.").size(size - 2.0).style(text::secondary),
             content,
@@ -621,6 +807,13 @@ impl super::Frost {
                     .style(text::secondary),
                 );
             }
+        }
+        if let Some(error) = state.store.error() {
+            body = body.push(
+                text(format!("Saved library: {error}"))
+                    .size(size - 2.0)
+                    .style(text::danger),
+            );
         }
         for warning in state.catalog.warnings.iter().take(2) {
             body = body.push(text(warning.clone()).size(size - 2.0).style(text::warning));
@@ -673,9 +866,19 @@ mod tests {
             ..Default::default()
         }
     }
+    fn library() -> SessionLibrary {
+        SessionLibrary::with_store(SessionLibraryStore::with_path(
+            std::env::temp_dir()
+                .join(format!(
+                    "frost-session-library-test-{}",
+                    uuid::Uuid::new_v4()
+                ))
+                .join("library.json"),
+        ))
+    }
     #[test]
     fn refresh_preserves_provider_and_session_identity_after_reorder() {
-        let mut library = SessionLibrary::default();
+        let mut library = library();
         library.replace_catalog(catalog(vec![
             session(SessionProvider::Codex, "one", "First"),
             session(SessionProvider::Claude, "two", "Second"),
@@ -691,7 +894,7 @@ mod tests {
     }
     #[test]
     fn hidden_selection_cannot_resume_and_filters_reconcile() {
-        let mut library = SessionLibrary::default();
+        let mut library = library();
         library.replace_catalog(catalog(vec![
             session(SessionProvider::Codex, "one", "Repair parser"),
             session(SessionProvider::Claude, "two", "Fix renderer"),
@@ -707,7 +910,7 @@ mod tests {
     }
     #[test]
     fn live_filter_uses_process_evidence_independent_of_historical_activity() {
-        let mut library = SessionLibrary::default();
+        let mut library = library();
         let mut snapshot = catalog(vec![
             session(SessionProvider::Codex, "one", "Done"),
             session(SessionProvider::Claude, "two", "Old working event"),
@@ -732,7 +935,7 @@ mod tests {
     }
     #[test]
     fn pages_reach_every_session_and_unchanged_refresh_preserves_navigation() {
-        let mut library = SessionLibrary::default();
+        let mut library = library();
         let sessions = (0..205)
             .map(|i| {
                 let mut s = session(SessionProvider::Codex, &format!("session-{i:03}"), "Task");
@@ -758,7 +961,7 @@ mod tests {
     }
     #[test]
     fn ranked_search_and_directory_scope_compose_and_reset() {
-        let mut library = SessionLibrary::default();
+        let mut library = library();
         let mut title = session(SessionProvider::Codex, "title", "Fix renderer");
         title.cwd = "/work/repo/src".into();
         let mut incidental = session(SessionProvider::Codex, "preview", "Other task");
@@ -777,6 +980,105 @@ mod tests {
         library.clear_filters();
         assert_eq!(library.filtered().len(), 2);
         assert_eq!(library.selected_session().unwrap().id, "preview");
+    }
+    fn until_library(library: &mut SessionLibrary, ready: impl Fn(&SessionLibrary) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            library.poll();
+            if ready(library) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "library worker did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    #[test]
+    fn durable_metadata_reprojects_pins_recent_receipts_and_reload() {
+        let root =
+            std::env::temp_dir().join(format!("frost-library-projection-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = root.join("library.json");
+        let mut library = SessionLibrary::with_store(SessionLibraryStore::with_path(path.clone()));
+        let first = "11111111-1111-4111-8111-111111111111";
+        let second = "22222222-2222-4222-8222-222222222222";
+        let mut a = session(SessionProvider::Codex, first, "Pinned task");
+        a.updated_at_ms = 1;
+        let mut b = session(SessionProvider::Claude, second, "Newest task");
+        b.updated_at_ms = 999;
+        library.replace_catalog(catalog(vec![a, b]));
+        until_library(&mut library, |s| s.store.is_loaded() && !s.store.is_busy());
+        assert_eq!(library.filtered()[0].id, second);
+        library
+            .store
+            .set_pinned(SessionProvider::Codex, first, true)
+            .unwrap();
+        until_library(&mut library, |s| {
+            s.store.snapshot().is_pinned(SessionProvider::Codex, first)
+        });
+        assert_eq!(library.filtered()[0].id, first);
+        library.pinned_only = true;
+        library.reconcile();
+        assert_eq!(library.filtered().len(), 1);
+        library
+            .store
+            .record_resumed(SessionProvider::Claude, second)
+            .unwrap();
+        until_library(&mut library, |s| {
+            s.store
+                .snapshot()
+                .last_resumed(SessionProvider::Claude, second)
+                .is_some()
+        });
+        library
+            .store
+            .set_pinned(SessionProvider::Codex, first, false)
+            .unwrap();
+        until_library(&mut library, |s| {
+            !s.store.snapshot().is_pinned(SessionProvider::Codex, first)
+        });
+        assert!(library.filtered().is_empty());
+        assert!(library.selected_session().is_none());
+        library.pinned_only = false;
+        library.recent_only = true;
+        library.sort = SessionSort::RecentlyResumed;
+        library.reconcile();
+        assert_eq!(library.filtered()[0].id, second);
+        let mut reloaded = SessionLibrary::with_store(SessionLibraryStore::with_path(path));
+        until_library(&mut reloaded, |s| s.store.is_loaded() && !s.store.is_busy());
+        assert!(!reloaded
+            .store
+            .snapshot()
+            .is_pinned(SessionProvider::Codex, first));
+        assert!(reloaded
+            .store
+            .snapshot()
+            .last_resumed(SessionProvider::Claude, second)
+            .is_some());
+        drop(reloaded);
+        drop(library);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn explicit_navigation_and_close_cancel_queued_confirmation() {
+        let mut library = library();
+        library.replace_catalog(catalog(vec![session(
+            SessionProvider::Codex,
+            "one",
+            "First",
+        )]));
+        library.pending_confirm = library.selected.clone();
+        library.step(0);
+        assert!(library.pending_confirm.is_none());
+        library.pending_confirm = library.selected.clone();
+        library.close();
+        library.open = true;
+        library.reconcile();
+        assert!(library.pending_confirm.is_none());
     }
     #[test]
     fn manager_shortcut_and_palette_use_the_same_command() {

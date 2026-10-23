@@ -1206,3 +1206,15 @@ or cycle **Best match / Recent / Live first** with the sort button or **Ctrl+S**
 Results use explicit 80-row pages; **Page Up/Down**, **Home/End**, and **Ctrl+L**
 provide keyboard navigation. Automatic unchanged refreshes preserve selection and
 scroll position, and **Clear filters** restores the full library.
+
+Use **Pin session** to keep a conversation in the default empty-search view,
+**Pinned only** to narrow the library, and **Previously resumed** or the
+**Recently resumed** sort to return to work you actually opened. Pins and resume
+receipts are shared with the other native terminals through a private user-state
+file and survive restarting the app. Provider transcripts are never changed.
+
+Selecting a session checks its directory and agent installation in the
+background. Confirming performs a fresh check before opening; changing selection
+or closing the picker cancels a pending confirmation. The primary action stays
+visible while the conversation preview scrolls. Existing live tabs remain
+switchable even if their original CLI executable has since disappeared.

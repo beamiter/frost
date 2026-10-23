@@ -4747,6 +4747,10 @@ enum Message {
     AgentSessionsTick,
     AgentSessionsQuery(String),
     AgentSessionsLive(bool),
+    AgentSessionsPinned(bool),
+    AgentSessionsRecent(bool),
+    AgentSessionsPin(agent_sessions::SessionKey),
+    AgentSessionsCheck,
     AgentSessionsScope(bool),
     AgentSessionsSort(jterm_core::agent_sessions::SessionSort),
     AgentSessionsClear,
@@ -17155,8 +17159,10 @@ impl Frost {
             }
             Message::AgentLaunch(provider) => self.agent_launch_in_tab(provider),
             Message::AgentSessionsToggle => {
-                self.agent_sessions.open = !self.agent_sessions.open;
                 if self.agent_sessions.open {
+                    self.agent_sessions.close();
+                } else {
+                    self.agent_sessions.open = true;
                     self.native_enter_ownership.lock().claim_held();
                     self.agent_sessions.project = self
                         .sessions
@@ -17171,10 +17177,59 @@ impl Frost {
                     return iced::widget::operation::focus(AGENT_SESSIONS_INPUT_ID.clone());
                 }
             }
-            Message::AgentSessionsClose => self.agent_sessions.open = false,
-            Message::AgentSessionsRefresh => self.agent_sessions.refresh(),
+            Message::AgentSessionsClose => self.agent_sessions.close(),
+            Message::AgentSessionsRefresh => {
+                self.agent_sessions.cancel_confirmation();
+                self.agent_sessions.refresh();
+                self.agent_sessions.sync_preflight();
+                self.agent_sessions.preflight.refresh();
+            }
+            Message::AgentSessionsPinned(enabled) => {
+                self.agent_sessions.cancel_confirmation();
+                self.agent_sessions.pinned_only = enabled;
+                self.agent_sessions.selected = None;
+                self.agent_sessions.reconcile();
+                return self.agent_sessions_scroll_task();
+            }
+            Message::AgentSessionsRecent(enabled) => {
+                self.agent_sessions.cancel_confirmation();
+                self.agent_sessions.recent_only = enabled;
+                self.agent_sessions.selected = None;
+                self.agent_sessions.reconcile();
+                return self.agent_sessions_scroll_task();
+            }
+            Message::AgentSessionsPin((provider, id)) => {
+                self.agent_sessions.cancel_confirmation();
+                let pinned = !self
+                    .agent_sessions
+                    .store
+                    .snapshot()
+                    .is_pinned(provider, &id);
+                if let Err(error) = self.agent_sessions.store.set_pinned(provider, &id, pinned) {
+                    self.agent_sessions.notice = Some(error);
+                }
+            }
+            Message::AgentSessionsCheck => {
+                self.agent_sessions.cancel_confirmation();
+                self.agent_sessions.sync_preflight();
+                self.agent_sessions.preflight.refresh();
+                self.agent_sessions.notice = None;
+            }
             Message::AgentSessionsTick => {
-                if self.agent_sessions.poll() {
+                let old_error = self.agent_sessions.store.error().map(str::to_owned);
+                let scroll = self.agent_sessions.poll();
+                self.finish_pending_agent_resume();
+                if !self.agent_sessions.open
+                    && self.agent_sessions.store.error() != old_error.as_deref()
+                {
+                    if let Some(error) = self.agent_sessions.store.error().map(str::to_owned) {
+                        self.push_toast(
+                            format!("Saved session library: {error}"),
+                            ToastKind::Warning,
+                        );
+                    }
+                }
+                if scroll {
                     return self.agent_sessions_scroll_task();
                 }
             }
@@ -17184,12 +17239,14 @@ impl Frost {
                 }
             }
             Message::AgentSessionsScope(enabled) => {
+                self.agent_sessions.cancel_confirmation();
                 self.agent_sessions.project_only = enabled && self.agent_sessions.project.is_some();
                 self.agent_sessions.selected = None;
                 self.agent_sessions.reconcile();
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsSort(sort) => {
+                self.agent_sessions.cancel_confirmation();
                 self.agent_sessions.sort = sort;
                 self.agent_sessions.selected = None;
                 self.agent_sessions.reconcile();
@@ -17207,12 +17264,14 @@ impl Frost {
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsLive(live_only) => {
+                self.agent_sessions.cancel_confirmation();
                 self.agent_sessions.live_only = live_only;
                 self.agent_sessions.selected = None;
                 self.agent_sessions.reconcile();
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsQuery(query) => {
+                self.agent_sessions.cancel_confirmation();
                 let query = crate::review_text::visible_bounded(&query, 512);
                 if self.agent_sessions.query != query {
                     self.agent_sessions.selected = None;
@@ -17222,24 +17281,30 @@ impl Frost {
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsProvider(provider) => {
+                self.agent_sessions.cancel_confirmation();
                 self.agent_sessions.provider = provider;
                 self.agent_sessions.selected = None;
                 self.agent_sessions.reconcile();
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsStatus(status) => {
+                self.agent_sessions.cancel_confirmation();
                 self.agent_sessions.status = status;
                 self.agent_sessions.selected = None;
                 self.agent_sessions.reconcile();
                 return self.agent_sessions_scroll_task();
             }
-            Message::AgentSessionsSelect(key) => self.agent_sessions.selected = Some(key),
+            Message::AgentSessionsSelect(key) => {
+                self.agent_sessions.cancel_confirmation();
+                self.agent_sessions.selected = Some(key);
+                self.agent_sessions.sync_preflight();
+            }
             Message::AgentSessionsResume => self.resume_agent_session(),
             Message::AgentSessionsCopy => {
                 if let Some(launch) = self
                     .agent_sessions
                     .selected_session()
-                    .and_then(|s| s.resume_launch().ok())
+                    .and_then(|s| self.agent_sessions.preflight.ready_launch(s))
                 {
                     return iced::clipboard::write(launch.display_command());
                 }
@@ -17745,7 +17810,7 @@ impl Frost {
                             ));
                         }
                         match key {
-                            Key::Named(Named::Escape) => self.agent_sessions.open = false,
+                            Key::Named(Named::Escape) => self.agent_sessions.close(),
                             Key::Named(Named::ArrowDown) => {
                                 self.agent_sessions.step(1);
                                 return self.agent_sessions_scroll_task();
@@ -32064,8 +32129,17 @@ impl Frost {
             };
             subs.push(iced::time::every(interval).map(|_| Message::TaskTick));
         }
-        if self.agent_sessions.open || self.agent_sessions.scanner.is_scanning() {
-            let interval = if self.agent_sessions.scanner.is_scanning() {
+        if self.agent_sessions.open
+            || self.agent_sessions.scanner.is_scanning()
+            || self.agent_sessions.preflight.is_busy()
+            || self.agent_sessions.store.is_busy()
+            || !self.agent_sessions.store.is_loaded()
+        {
+            let interval = if self.agent_sessions.scanner.is_scanning()
+                || self.agent_sessions.preflight.is_busy()
+                || self.agent_sessions.store.is_busy()
+                || !self.agent_sessions.store.is_loaded()
+            {
                 100
             } else {
                 1000
