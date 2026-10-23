@@ -1,8 +1,9 @@
 //! Native session-library state. Discovery and resume validation live in core.
 use jterm_core::agent_sessions::{
-    AgentSession, SessionArchiveFilter, SessionCatalog, SessionLaunch, SessionLibraryFilter,
-    SessionLibraryStore, SessionPreflight, SessionPreflightState, SessionProjectSummary,
-    SessionProvider, SessionQuery, SessionScanner, SessionSearchIndex, SessionSort, SessionStatus,
+    AgentSession, SessionArchiveFilter, SessionBatchAction, SessionCatalog, SessionLaunch,
+    SessionLibraryFilter, SessionLibraryStore, SessionPreflight, SessionPreflightState,
+    SessionProjectSummary, SessionProvider, SessionQuery, SessionScanner, SessionSearchIndex,
+    SessionSort, SessionStatus, SESSION_BATCH_LIMIT,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -11,6 +12,13 @@ pub(crate) const PAGE_SIZE: usize = 80;
 use std::time::{Duration, Instant};
 
 pub(crate) type SessionKey = (SessionProvider, String);
+
+/// A frozen selection and the exact opening that rendered its actions.
+#[derive(Clone, Debug)]
+pub(crate) struct BatchRef {
+    epoch: std::sync::Arc<()>,
+    keys: std::sync::Arc<[SessionKey]>,
+}
 
 /// Every organization callback belongs to one explicit editor opening, even
 /// when the same session is opened again after cancelling an earlier draft.
@@ -56,6 +64,13 @@ pub(crate) struct SessionLibrary {
     projects: Vec<SessionProjectSummary>,
     query_error: Option<String>,
     editor: Option<OrganizationEditor>,
+    bulk_mode: bool,
+    checked: HashSet<SessionKey>,
+    bulk_epoch: std::sync::Arc<()>,
+    bulk_tag: String,
+    bulk_notice: Option<String>,
+    bulk_saving: bool,
+    bulk_saved_count: usize,
     pub selected: Option<SessionKey>,
     pub notice: Option<String>,
     pub bindings: HashMap<SessionKey, usize>,
@@ -96,6 +111,13 @@ impl SessionLibrary {
             projects: Vec::new(),
             query_error: None,
             editor: None,
+            bulk_mode: false,
+            checked: HashSet::new(),
+            bulk_epoch: std::sync::Arc::new(()),
+            bulk_tag: String::new(),
+            bulk_notice: None,
+            bulk_saving: false,
+            bulk_saved_count: 0,
             selected: None,
             notice: None,
             bindings: HashMap::new(),
@@ -119,6 +141,13 @@ impl SessionLibrary {
         }
         if self.store.poll() {
             self.reconcile();
+        }
+        if self.bulk_saving && !self.store.is_busy() {
+            self.bulk_saving = false;
+            self.bulk_notice = Some(self.store.error().map(str::to_owned).unwrap_or_else(|| {
+                format!("Saved changes for {} conversations.", self.bulk_saved_count)
+            }));
+            self.retire_bulk();
         }
         if self.editor.as_ref().is_some_and(|editor| editor.saving) && !self.store.is_busy() {
             if let Some(error) = self.store.error() {
@@ -223,11 +252,141 @@ impl SessionLibrary {
         self.open = false;
         self.pending_confirm = None;
         self.editor = None;
+        self.bulk_mode = false;
+        self.retire_bulk();
         self.preflight.select(None);
     }
 
     pub(crate) fn editing(&self) -> bool {
-        self.editor.is_some()
+        self.editor.is_some() || self.bulk_mode
+    }
+
+    fn retire_bulk(&mut self) {
+        self.bulk_epoch = std::sync::Arc::new(());
+    }
+
+    fn accepts_bulk(&self, reference: &BatchRef) -> bool {
+        self.open
+            && self.bulk_mode
+            && !self.bulk_saving
+            && self.editor.is_none()
+            && std::sync::Arc::ptr_eq(&self.bulk_epoch, &reference.epoch)
+    }
+
+    fn batch_reference(&self) -> BatchRef {
+        let mut keys: Vec<_> = self.checked.iter().cloned().collect();
+        keys.sort_by(|a, b| (a.0.label(), &a.1).cmp(&(b.0.label(), &b.1)));
+        BatchRef {
+            epoch: self.bulk_epoch.clone(),
+            keys: keys.into(),
+        }
+    }
+
+    fn page_keys(&self) -> Vec<SessionKey> {
+        self.filtered()
+            .into_iter()
+            .skip(self.page * PAGE_SIZE)
+            .take(PAGE_SIZE)
+            .map(|session| (session.provider, session.id.clone()))
+            .collect()
+    }
+
+    fn page_reference(&self) -> BatchRef {
+        BatchRef {
+            epoch: self.bulk_epoch.clone(),
+            keys: self.page_keys().into(),
+        }
+    }
+
+    pub(crate) fn toggle_bulk(&mut self) {
+        if !self.open || self.editor.is_some() || self.bulk_saving {
+            return;
+        }
+        self.bulk_mode = !self.bulk_mode;
+        self.cancel_confirmation();
+        self.retire_bulk();
+    }
+
+    pub(crate) fn check_session(&mut self, reference: &BatchRef, key: SessionKey, checked: bool) {
+        if !self.accepts_bulk(reference) || !self.page_keys().contains(&key) {
+            return;
+        }
+        if checked && !self.checked.contains(&key) && self.checked.len() >= SESSION_BATCH_LIMIT {
+            self.bulk_notice = Some(format!(
+                "Select at most {SESSION_BATCH_LIMIT} conversations per batch."
+            ));
+            return;
+        }
+        if checked {
+            self.checked.insert(key);
+        } else {
+            self.checked.remove(&key);
+        }
+        self.bulk_notice = None;
+        self.retire_bulk();
+    }
+
+    pub(crate) fn select_visible(&mut self, reference: &BatchRef) {
+        if !self.accepts_bulk(reference) || self.page_keys().as_slice() != reference.keys.as_ref() {
+            return;
+        }
+        let additional = reference
+            .keys
+            .iter()
+            .filter(|key| !self.checked.contains(*key))
+            .count();
+        if self.checked.len() + additional > SESSION_BATCH_LIMIT {
+            self.bulk_notice = Some(format!("This page would exceed the {SESSION_BATCH_LIMIT}-conversation limit. Clear the selection or choose individual rows."));
+            return;
+        }
+        self.checked.extend(reference.keys.iter().cloned());
+        self.bulk_notice = None;
+        self.retire_bulk();
+    }
+
+    pub(crate) fn clear_checked(&mut self, reference: &BatchRef) {
+        if !self.accepts_bulk(reference) {
+            return;
+        }
+        self.checked.clear();
+        self.bulk_notice = None;
+        self.retire_bulk();
+    }
+
+    pub(crate) fn edit_bulk_tag(&mut self, reference: &BatchRef, value: String) {
+        if !self.accepts_bulk(reference) {
+            return;
+        }
+        if value.len() > 128 {
+            self.bulk_notice =
+                Some("The tag exceeds the input limit. Your existing draft was kept.".into());
+            return;
+        }
+        self.bulk_tag = value;
+        self.bulk_notice = None;
+    }
+
+    pub(crate) fn apply_batch(&mut self, reference: &BatchRef, action: SessionBatchAction) {
+        if !self.accepts_bulk(reference)
+            || reference.keys.is_empty()
+            || reference.keys.len() != self.checked.len()
+            || !reference.keys.iter().all(|key| self.checked.contains(key))
+        {
+            return;
+        }
+        if matches!(&action, SessionBatchAction::AddTag(tag) | SessionBatchAction::RemoveTag(tag) if tag != &self.bulk_tag)
+        {
+            return;
+        }
+        match self.store.apply_batch(&reference.keys, action) {
+            Ok(count) => {
+                self.bulk_saved_count = count;
+                self.bulk_saving = true;
+                self.bulk_notice = Some(format!("Saving {count} conversations…"));
+                self.retire_bulk();
+            }
+            Err(error) => self.bulk_notice = Some(error),
+        }
     }
 
     pub(crate) fn begin_organization(&mut self, key: &SessionKey) {
@@ -314,6 +473,10 @@ impl SessionLibrary {
     }
 
     pub(crate) fn cancel_current_organization(&mut self) {
+        if self.bulk_mode && !self.bulk_saving {
+            self.bulk_mode = false;
+            self.retire_bulk();
+        }
         if let Some(reference) = self.editor.as_ref().map(|editor| editor.reference.clone()) {
             self.cancel_organization(&reference);
         }
@@ -741,6 +904,7 @@ impl super::Frost {
             );
         }
         let filtered = state.filtered();
+        let batch_reference = state.batch_reference();
         let mut list = column![].spacing(5);
         let start = state.page * PAGE_SIZE;
         for session in filtered.iter().skip(start).take(PAGE_SIZE) {
@@ -809,17 +973,38 @@ impl super::Frost {
             {
                 content = content.push(text("Archived in library").size(size - 2.0));
             }
-            list = list.push(
-                button(content)
-                    .on_press(M::AgentSessionsSelect(key))
-                    .width(Length::Fill)
-                    .padding(9)
-                    .style(if selected {
-                        button::primary
-                    } else {
-                        button::secondary
-                    }),
-            );
+            let session_button = button(content)
+                .on_press(M::AgentSessionsSelect(key.clone()))
+                .width(Length::Fill)
+                .padding(9)
+                .style(if selected {
+                    button::primary
+                } else {
+                    button::secondary
+                });
+            let row: Element<'_, M> = if state.bulk_mode {
+                let reference = batch_reference.clone();
+                let checked_key = key.clone();
+                row![
+                    checkbox(state.checked.contains(&key)).on_toggle_maybe(
+                        (!state.bulk_saving).then_some(move |checked| M::AgentSessionsChecked(
+                            reference.clone(),
+                            checked_key.clone(),
+                            checked
+                        ))
+                    ),
+                    session_button
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center)
+                .into()
+            } else {
+                session_button.into()
+            };
+            list = list.push(crate::widget_identity_scope::scope_key(
+                (key, state.bulk_mode),
+                row,
+            ));
         }
         if filtered.is_empty() {
             list = list.push(
@@ -1082,7 +1267,15 @@ impl super::Frost {
                 actions = actions.push(text(notice.clone()).size(size - 1.0).style(text::danger));
             }
         }
-        let actions = crate::widget_identity_scope::scope_key(action_identity, actions);
+        if state.bulk_mode {
+            actions = column![text(
+                "Bulk selection is active. Finish organizing to resume a conversation."
+            )
+            .size(size - 1.0)
+            .style(text::secondary)];
+        }
+        let actions =
+            crate::widget_identity_scope::scope_key((action_identity, state.bulk_mode), actions);
         let details: Element<'_, M> = column![scrollable(detail).height(Length::Fill), actions]
             .spacing(10)
             .height(Length::Fill)
@@ -1198,6 +1391,126 @@ impl super::Frost {
         } else {
             heading.into()
         };
+        let bulk_controls: Element<'_, M> = if state.bulk_mode {
+            let checked_keys: HashSet<_> = state
+                .checked
+                .iter()
+                .map(|(provider, id)| (*provider, id.as_str()))
+                .collect();
+            let visible_selected = filtered
+                .iter()
+                .filter(|session| checked_keys.contains(&(session.provider, session.id.as_str())))
+                .count();
+            let hidden = state.checked.len().saturating_sub(visible_selected);
+            let writable = state.store.is_loaded()
+                && !state.store.is_busy()
+                && !state.bulk_saving
+                && !state.checked.is_empty();
+            let mut controls = column![
+                row![
+                    text(format!(
+                        "{} selected · {} hidden by filters",
+                        state.checked.len(),
+                        hidden
+                    ))
+                    .size(size),
+                    button(text("Finish organizing").size(size - 1.0))
+                        .style(button::secondary)
+                        .on_press_maybe((!state.bulk_saving).then_some(M::AgentSessionsBulkToggle)),
+                ]
+                .spacing(8)
+                .wrap(),
+                crate::widget_identity_scope::scope(
+                    state.bulk_epoch.clone(),
+                    crate::widget_identity_scope::scope_key(
+                        state.page_keys(),
+                        row![
+                            button(text("Select visible page").size(size - 1.0))
+                                .style(button::secondary)
+                                .on_press_maybe((!state.bulk_saving).then(|| {
+                                    M::AgentSessionsSelectVisible(state.page_reference())
+                                })),
+                            button(text("Clear selection").size(size - 1.0))
+                                .style(button::text)
+                                .on_press_maybe((!state.bulk_saving).then(|| {
+                                    M::AgentSessionsClearChecked(batch_reference.clone())
+                                })),
+                        ]
+                        .spacing(8)
+                        .wrap()
+                    )
+                ),
+            ]
+            .spacing(6);
+            let mut actions = row![].spacing(6);
+            for (label, action) in [
+                ("Pin", SessionBatchAction::Pin(true)),
+                ("Unpin", SessionBatchAction::Pin(false)),
+                ("Archive", SessionBatchAction::Archive(true)),
+                ("Restore", SessionBatchAction::Archive(false)),
+            ] {
+                actions = actions.push(
+                    button(text(label).size(size - 1.0))
+                        .style(button::secondary)
+                        .on_press_maybe(
+                            writable
+                                .then(|| M::AgentSessionsBatch(batch_reference.clone(), action)),
+                        ),
+                );
+            }
+            let reference = batch_reference.clone();
+            controls = controls.push(
+                text_input("One tag to add or remove", &state.bulk_tag)
+                    .size(size)
+                    .on_input_maybe((!state.bulk_saving).then_some({
+                        move |value| M::AgentSessionsBulkTag(reference.clone(), value)
+                    })),
+            );
+            for (label, action) in [
+                (
+                    "Add tag",
+                    SessionBatchAction::AddTag(state.bulk_tag.clone()),
+                ),
+                (
+                    "Remove tag",
+                    SessionBatchAction::RemoveTag(state.bulk_tag.clone()),
+                ),
+            ] {
+                actions = actions.push(
+                    button(text(label).size(size - 1.0))
+                        .style(button::secondary)
+                        .on_press_maybe(
+                            (writable && !state.bulk_tag.trim().is_empty())
+                                .then(|| M::AgentSessionsBatch(batch_reference.clone(), action)),
+                        ),
+                );
+            }
+            controls = controls.push(crate::widget_identity_scope::scope(
+                state.bulk_epoch.clone(),
+                crate::widget_identity_scope::scope_key(state.bulk_tag.clone(), actions.wrap()),
+            ));
+            if let Some(notice) = &state.bulk_notice {
+                controls = controls.push(text(notice).size(size - 1.0));
+            }
+            controls = controls.push(text("Actions apply to the complete checked selection, including hidden conversations. Provider transcripts stay intact.")
+                .size(size - 2.0).style(text::secondary));
+            container(controls)
+                .padding(8)
+                .style(container::bordered_box)
+                .into()
+        } else {
+            button(
+                text(if state.checked.is_empty() {
+                    "Bulk organize…".to_owned()
+                } else {
+                    format!("Bulk organize… ({} checked)", state.checked.len())
+                })
+                .size(size - 1.0),
+            )
+            .on_press(M::AgentSessionsBulkToggle)
+            .style(button::secondary)
+            .into()
+        };
         let mut body = column![heading,
             text(format!("{} conversations   ·   {codex} Codex   ·   {claude} Claude   ·   {observed} observed live", state.catalog.sessions.len())).size(size).style(text::secondary),
             query, search_help, filters.wrap(), statuses.wrap(),
@@ -1219,6 +1532,7 @@ impl super::Frost {
                 text(if !state.store.is_loaded() { "Loading saved library…" } else if state.store.is_busy() { "Saving library…" } else { "Names, tags, pins and archive are shared across terminals" }).size(size - 2.0).style(text::secondary),
             ].spacing(12).align_y(iced::Alignment::Center).wrap(),
             project_controls,
+            bulk_controls,
             text("Activity reflects the last saved event. Live badges require an observed matching process.").size(size - 2.0).style(text::secondary),
             content,
         ].spacing(9);
@@ -1245,7 +1559,7 @@ impl super::Frost {
             body = body.push(text(warning.clone()).size(size - 2.0).style(text::warning));
         }
         body = body.push(
-            text("↑ ↓ select · PgUp/PgDn page · Home/End list edges · Ctrl+L search · Ctrl+S sort · Enter resume · F5 refresh · Esc close")
+            text(if state.bulk_mode { "Bulk mode · checked conversations stay selected across filters · Esc finishes organizing" } else { "↑ ↓ select · PgUp/PgDn page · Home/End list edges · Ctrl+L search · Ctrl+S sort · Enter resume · F5 refresh · Esc close" })
                 .size(size - 2.0)
                 .style(text::secondary),
         );
@@ -1306,6 +1620,135 @@ mod tests {
                 ))
                 .join("library.json"),
         ))
+    }
+    fn batch_library() -> SessionLibrary {
+        let mut library = library();
+        library.replace_catalog(catalog(vec![
+            session(
+                SessionProvider::Codex,
+                "11111111-1111-4111-8111-111111111111",
+                "First task",
+            ),
+            session(
+                SessionProvider::Claude,
+                "22222222-2222-4222-8222-222222222222",
+                "Second task",
+            ),
+        ]));
+        library.open = true;
+        library.toggle_bulk();
+        settle_library(&mut library);
+        library
+    }
+    fn settle_library(library: &mut SessionLibrary) {
+        let until = Instant::now() + Duration::from_secs(3);
+        while !library.store.is_loaded() || library.store.is_busy() || library.bulk_saving {
+            library.poll();
+            assert!(Instant::now() < until, "library worker did not settle");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn bulk_checked_identities_survive_filters_and_archive_exactly_that_selection() {
+        let mut library = batch_library();
+        library.select_visible(&library.page_reference());
+        let selected = library.checked.clone();
+        library.query = "Second".into();
+        library.reconcile();
+        assert_eq!(library.filtered().len(), 1);
+        assert_eq!(library.checked, selected);
+        let reference = library.batch_reference();
+        library.apply_batch(&reference, SessionBatchAction::Archive(true));
+        assert!(library.bulk_saving);
+        library.clear_checked(&library.batch_reference());
+        assert_eq!(
+            library.checked, selected,
+            "saving cannot relabel its selection"
+        );
+        settle_library(&mut library);
+        for (provider, id) in &selected {
+            assert!(library.store.snapshot().is_archived(*provider, id));
+        }
+        assert_eq!(library.checked, selected);
+        assert!(library.filtered().is_empty());
+    }
+
+    #[test]
+    fn retained_batch_callback_cannot_apply_after_selection_or_opening_changes() {
+        let mut library = batch_library();
+        let keys = library.page_keys();
+        library.check_session(&library.batch_reference(), keys[0].clone(), true);
+        let old = library.batch_reference();
+        library.check_session(&library.batch_reference(), keys[1].clone(), true);
+        library.apply_batch(&old, SessionBatchAction::Pin(true));
+        assert!(!library.store.is_busy());
+        let old = library.batch_reference();
+        library.close();
+        library.open = true;
+        library.toggle_bulk();
+        library.apply_batch(&old, SessionBatchAction::Pin(true));
+        assert!(!library.store.is_busy());
+        assert_eq!(library.store.snapshot().pinned_count(), 0);
+        assert_eq!(library.checked.len(), 2);
+    }
+
+    #[test]
+    fn rejected_batch_keeps_selection_and_tag_draft_and_cannot_use_an_old_tag() {
+        let mut library = batch_library();
+        library.select_visible(&library.page_reference());
+        library.edit_bulk_tag(&library.batch_reference(), "old".into());
+        let reference = library.batch_reference();
+        library.edit_bulk_tag(&reference, "new".into());
+        library.apply_batch(&reference, SessionBatchAction::AddTag("old".into()));
+        assert!(!library.store.is_busy());
+        library.edit_bulk_tag(&library.batch_reference(), "bad,tag".into());
+        library.apply_batch(
+            &library.batch_reference(),
+            SessionBatchAction::AddTag("bad,tag".into()),
+        );
+        assert!(!library.store.is_busy());
+        assert_eq!(library.checked.len(), 2);
+        assert_eq!(library.bulk_tag, "bad,tag");
+        assert!(library.bulk_notice.is_some());
+        assert!(
+            library.editing(),
+            "bulk tag input must own Enter rather than resume"
+        );
+        library.cancel_current_organization();
+        assert!(!library.editing());
+        assert_eq!(library.bulk_tag, "bad,tag");
+    }
+
+    #[test]
+    fn select_visible_page_is_atomic_at_the_batch_limit_and_rejects_a_changed_page() {
+        let mut library = batch_library();
+        let sessions: Vec<_> = (0..300)
+            .map(|index| {
+                session(
+                    SessionProvider::Codex,
+                    &uuid::Uuid::from_u128(index + 1).to_string(),
+                    &format!("Task {index:03}"),
+                )
+            })
+            .collect();
+        library.replace_catalog(catalog(sessions));
+        library.checked = library
+            .catalog
+            .sessions
+            .iter()
+            .take(250)
+            .map(|session| (session.provider, session.id.clone()))
+            .collect();
+        library.page = 3;
+        let page = library.page_reference();
+        library.select_visible(&page);
+        assert_eq!(library.checked.len(), 250);
+        assert!(library.bulk_notice.is_some());
+        library.checked.clear();
+        library.page = 0;
+        library.select_visible(&page);
+        assert!(library.checked.is_empty());
     }
     #[test]
     fn refresh_preserves_provider_and_session_identity_after_reorder() {

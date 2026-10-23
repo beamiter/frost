@@ -795,6 +795,19 @@ preferred_agent_provider = "codex"
 frost 打开 Tasks 侧栏让你选择 **Codex / Claude / OpenCode / Kimi**，再为该命令创建独立的
 Git worktree（位于 `~/.local/share/frost/agent-tasks/`）并登记任务卡片。
 
+也可以直接在 **Agent workspace → New task** 输入目标、项目目录和 provider，
+无需先制造失败命令。目标支持多行，最多 16 KiB；可选任务名称，以及单行验证命令和
+明确的绝对 shell 路径。**Create task** 只创建独立 worktree 和未启动任务，所有 provider
+都需要再明确点击 **Start …** 或 **Open …**。创建失败会保留草稿，**Close draft** 后可用
+**Continue draft** 继续编辑。输入目标时 Enter 换行，不创建任务或向终端提交命令。
+
+这种任务在 worktree 的项目根目录运行。配置了验证命令时，**Run validation** 显式运行
+该命令，通过后仍需 **Mark complete**；没有验证命令时，审阅 diff 后使用
+**Accept reviewed work** 明确接受工作。运行中的 Agent、活动原生事件流或验证任务不能
+借此跳过现有完成条件。目标和草稿只保留在当前 Frost 进程；重启后需要重新输入。
+显式 **Open …** 会在已有 AI 与上下文共享授权下写入任务 brief，并显示路径，供用户让 CLI
+读取；不会自动向终端注入输入。共享关闭时保留未启动任务并说明如何开启授权。
+
 面板分别显示当前可见数与搜索匹配数，各状态按钮也显示当前搜索下的任务数量；在搜索框按 **Enter** 打开首个匹配任务。
 **Clear filters** 清除搜索和状态筛选；
 当前任务被筛选隐藏时，**Show selected task** 恢复详情并保留原选择。
@@ -1254,3 +1267,51 @@ session attachment. Project ordering groups rows under their repository.
 Navigation keeps review drafts attached to their task identities and does not
 start, stop or approve an agent. Existing native start, review, diff, validation
 and approval controls remain on the selected task's detail card.
+
+#### Create work from a goal
+
+**New task** opens a multiline goal composer with a local Git project path,
+provider, optional name and optional validation command. Goals are bounded to
+16 KiB. A validation recipe requires an explicit absolute shell path and a
+single-line command. Both Agent work and authored validation use the project
+root inside the isolated worktree.
+
+**Create task** prepares the worktree in the background and leaves every
+provider in **Created**. Review the task and explicitly choose **Start …** or
+**Open …**. Invalid inputs and creation errors retain the draft. **Close draft**
+hides it; **Continue draft** restores it. Enter in the goal field adds a line.
+Task goals and unfinished drafts remain in this running window and need to be
+entered again after restarting Frost.
+
+Authored tasks without a validation recipe expose **Accept reviewed work**
+after the Agent has stopped and the task is ready for review. Tasks with a
+recipe keep **Run validation → Mark complete**. These actions use the shared
+lifecycle and live-stream checks. Opening an authored task in a CLI requires
+the existing AI/context-sharing consent and prepares an on-disk task brief;
+the launch notice gives its path so the user can ask the CLI to read it. No
+input is injected into the terminal.
+
+#### Inspect the actual work
+
+**Task details** shows the shared task inspector, including the goal and
+validation information. Native tasks show current file changes, retained
+earlier turns, user feedback, command summaries, affected files and available
+exit details. Shortened responses and omitted history are labelled. These
+views use the runtime's retained records; approval controls stay with the
+current task and keep their existing restrictions.
+
+#### Organize multiple conversations
+
+The saved-session library's **Bulk organize…** mode provides independent
+checkbox selection. **Select visible page** adds the current page; **Clear
+selection** clears all checked identities. The header reports the complete
+selection and how many conversations are hidden by the active filters.
+Filtering, sorting and refreshing preserve checked identities.
+
+Pin, unpin, archive, restore, add one tag or remove one tag for up to **256**
+conversations in one atomic batch. Actions include the hidden checked
+conversations. Aliases, other tags and resume history are preserved. Errors
+retain the selection and tag draft. **Finish organizing** returns to normal
+conversation actions; Enter in bulk mode never resumes a conversation.
+Archive and restore affect the shared local library and preserve provider
+transcripts.

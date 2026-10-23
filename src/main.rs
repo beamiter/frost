@@ -10,6 +10,7 @@ mod agent;
 mod agent_sessions;
 mod agent_task;
 mod agent_task_ui;
+mod agent_task_workspace;
 mod ai_chat_store;
 mod ai_chats;
 mod ai_command;
@@ -4717,6 +4718,10 @@ enum Message {
     AiSuggestionDismiss(u64),
     // Experimental Tasks dashboard (native Codex/Claude runtime + isolated worktrees).
     TaskPanelToggle,
+    TaskComposerOpen,
+    TaskComposerEdit(std::sync::Arc<()>, agent_task_workspace::ComposerEdit),
+    TaskComposerCreate(std::sync::Arc<()>),
+    TaskComposerClose(std::sync::Arc<()>),
     TaskDashboardQuery(String),
     TaskDashboardView(agent_task::DashboardView),
     TaskDashboardProvider(Option<agent_task::AgentProvider>),
@@ -4743,6 +4748,7 @@ enum Message {
     TaskDiffClose(std::sync::Arc<()>),
     TaskValidationStart(agent_task::TaskId),
     TaskMarkComplete(agent_task::TaskId),
+    TaskAcceptReviewed(agent_task::TaskId, std::sync::Arc<()>),
     TaskTerminalOpen(agent_task::TaskId),
     TaskFocusTerminal(agent_task::TaskId),
     TaskFocusValidation(agent_task::TaskId),
@@ -4761,6 +4767,15 @@ enum Message {
     AgentSessionsArchiveFilter(jterm_core::agent_sessions::SessionArchiveFilter),
     AgentSessionsArchive(agent_sessions::SessionKey),
     AgentSessionsOrganize(agent_sessions::SessionKey),
+    AgentSessionsBulkToggle,
+    AgentSessionsChecked(agent_sessions::BatchRef, agent_sessions::SessionKey, bool),
+    AgentSessionsSelectVisible(agent_sessions::BatchRef),
+    AgentSessionsClearChecked(agent_sessions::BatchRef),
+    AgentSessionsBulkTag(agent_sessions::BatchRef, String),
+    AgentSessionsBatch(
+        agent_sessions::BatchRef,
+        jterm_core::agent_sessions::SessionBatchAction,
+    ),
     AgentSessionsAlias(agent_sessions::OrganizationRef, String),
     AgentSessionsTags(agent_sessions::OrganizationRef, String),
     AgentSessionsSaveOrganization(agent_sessions::OrganizationRef),
@@ -17093,6 +17108,27 @@ impl Frost {
             Message::TaskPanelToggle => {
                 self.toggle_task_panel();
             }
+            Message::TaskComposerOpen => self.task_composer_open(),
+            Message::TaskComposerEdit(reference, edit) => {
+                if self.task_composer_visible() {
+                    if let Some(composer) = self.task_panel.composer.as_mut() {
+                        composer.edit(&reference, edit);
+                    }
+                }
+            }
+            Message::TaskComposerCreate(reference) => self.task_composer_create(reference),
+            Message::TaskComposerClose(reference) => {
+                if self.task_composer_visible()
+                    && self
+                        .task_panel
+                        .composer
+                        .as_ref()
+                        .is_some_and(|composer| composer.accepts(&reference))
+                {
+                    self.task_panel.composer_open = false;
+                    self.task_panel.retire_panel_callbacks();
+                }
+            }
             Message::TaskDashboardOpenResult => {
                 let dashboard = self.task_dashboard();
                 self.task_panel.open_dashboard_result(&dashboard);
@@ -17277,6 +17313,22 @@ impl Frost {
                 if !was_editing && self.agent_sessions.editing() {
                     return iced::widget::operation::focus(AGENT_SESSIONS_ALIAS_ID.clone());
                 }
+            }
+            Message::AgentSessionsBulkToggle => self.agent_sessions.toggle_bulk(),
+            Message::AgentSessionsChecked(reference, key, checked) => {
+                self.agent_sessions.check_session(&reference, key, checked)
+            }
+            Message::AgentSessionsSelectVisible(reference) => {
+                self.agent_sessions.select_visible(&reference)
+            }
+            Message::AgentSessionsClearChecked(reference) => {
+                self.agent_sessions.clear_checked(&reference)
+            }
+            Message::AgentSessionsBulkTag(reference, value) => {
+                self.agent_sessions.edit_bulk_tag(&reference, value)
+            }
+            Message::AgentSessionsBatch(reference, action) => {
+                self.agent_sessions.apply_batch(&reference, action)
             }
             Message::AgentSessionsAlias(reference, value) => {
                 self.agent_sessions.organization_alias(&reference, value);
@@ -17501,6 +17553,18 @@ impl Frost {
                 match self.task_manager.complete_after_validation(task_id) {
                     Ok(()) => self.push_toast("Task marked complete", ToastKind::Success),
                     Err(error) => self.push_toast(error.to_string(), ToastKind::Warning),
+                }
+            }
+            Message::TaskAcceptReviewed(task_id, reference) => {
+                if self.config.experimental_task_sidebar
+                    && self.dock_open()
+                    && self.sidebar_panel == SidebarPanel::Tasks
+                    && self.task_panel.accepts_review(task_id, &reference)
+                {
+                    match self.task_manager.complete_after_manual_review(task_id) {
+                        Ok(()) => self.push_toast("Reviewed work accepted", ToastKind::Success),
+                        Err(error) => self.push_toast(error.to_string(), ToastKind::Warning),
+                    }
                 }
             }
             Message::TaskTerminalOpen(task_id) => self.task_open_terminal(task_id),
@@ -17906,6 +17970,21 @@ impl Frost {
                     ..
                 } = event
                 {
+                    if self.task_composer_visible() {
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                            && self
+                                .task_panel
+                                .composer
+                                .as_ref()
+                                .is_some_and(|composer| !composer.busy)
+                        {
+                            self.task_panel.composer_open = false;
+                            self.task_panel.retire_panel_callbacks();
+                        }
+                        // The multiline goal editor owns Enter; task creation
+                        // is an explicit button and never submits a terminal.
+                        return Task::none();
+                    }
                     if self.agent_sessions.open {
                         use keyboard::{key::Named, Key};
                         // An organization editor owns its keys; Enter must
@@ -29717,6 +29796,7 @@ impl Frost {
         if !self.config.experimental_task_sidebar
             || !self.dock_open()
             || self.sidebar_panel != SidebarPanel::Tasks
+            || self.task_panel.composer_open
         {
             return;
         }
@@ -29886,6 +29966,9 @@ impl Frost {
             None | Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {}
             Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
                 self.task_panel.pending_creation = None;
+                self.task_composer_failed(
+                    "Task worktree worker stopped unexpectedly. Your draft was kept.",
+                );
                 self.push_toast(
                     "Task worktree worker stopped unexpectedly",
                     ToastKind::Warning,
@@ -29893,6 +29976,7 @@ impl Frost {
             }
             Some(Ok(Err(error))) => {
                 self.task_panel.pending_creation = None;
+                self.task_composer_failed(&error);
                 self.push_toast(
                     format!("Could not create task worktree: {error}"),
                     ToastKind::Warning,
@@ -29900,6 +29984,7 @@ impl Frost {
             }
             Some(Ok(Ok(prepared))) => {
                 self.task_panel.pending_creation = None;
+                let authored = prepared.brief.is_some();
                 let provider_name =
                     crate::review_text::bound_provider_label(prepared.provider.display_name());
                 let worktree = prepared.worktree;
@@ -29910,44 +29995,66 @@ impl Frost {
                     worktree_path: worktree.path,
                     branch: worktree.branch,
                     base_commit: worktree.head,
-                    source_context: Some(prepared.context),
+                    source_context: prepared.context,
                 };
-                match self.task_manager.create(new_task) {
+                let registered = match prepared.brief {
+                    Some(brief) => self.task_manager.create_with_brief(new_task, brief),
+                    None => self.task_manager.create(new_task),
+                };
+                match registered {
                     Ok(task_id) => {
+                        if authored {
+                            self.task_panel.composer = None;
+                            self.task_panel.composer_open = false;
+                            self.task_panel.clear_dashboard_filters();
+                        }
                         self.task_panel.select(Some(task_id));
-                        match prepared.provider {
-                            agent_task::AgentProvider::Codex => {
-                                self.push_toast(
+                        if authored {
+                            let action = if prepared.provider.supports_native_driver() {
+                                "Start"
+                            } else {
+                                "Open"
+                            };
+                            self.push_toast(format!("Task created. Review the goal, then choose {action} {provider_name}."), ToastKind::Success);
+                        } else {
+                            match prepared.provider {
+                                agent_task::AgentProvider::Codex => {
+                                    self.push_toast(
                                     format!(
                                         "Created an isolated {provider_name} task; choose Start {provider_name}"
                                     ),
                                     ToastKind::Success,
                                 );
-                            }
-                            agent_task::AgentProvider::Claude | agent_task::AgentProvider::Kimi => {
-                                self.push_toast(
+                                }
+                                agent_task::AgentProvider::Claude
+                                | agent_task::AgentProvider::Kimi => {
+                                    self.push_toast(
                                     format!(
                                         "Created an isolated {provider_name} task; starting native {provider_name}…"
                                     ),
                                     ToastKind::Success,
                                 );
-                                self.task_start_native(task_id);
-                            }
-                            agent_task::AgentProvider::OpenCode => {
-                                self.push_toast(
+                                    self.task_start_native(task_id);
+                                }
+                                agent_task::AgentProvider::OpenCode => {
+                                    self.push_toast(
                                     format!(
                                         "Created an isolated {provider_name} task; starting {provider_name}…"
                                     ),
                                     ToastKind::Success,
                                 );
-                                self.task_open_terminal(task_id);
+                                    self.task_open_terminal(task_id);
+                                }
                             }
                         }
                     }
-                    Err(error) => self.push_toast(
-                        format!("Worktree was preserved, but task registration failed: {error}"),
-                        ToastKind::Warning,
-                    ),
+                    Err(error) => {
+                        let message = format!(
+                            "Worktree was preserved, but task registration failed: {error}"
+                        );
+                        self.task_composer_failed(&message);
+                        self.push_toast(message, ToastKind::Warning);
+                    }
                 }
             }
         }
@@ -30088,6 +30195,29 @@ impl Frost {
                 return;
             }
         };
+        let brief_path = if let Some(task) = self
+            .task_manager
+            .get(task_id)
+            .filter(|task| task.brief.is_some())
+        {
+            match agent_task::write_pty_task_brief(task, agent_task_ui::prompt_policy(&self.config))
+            {
+                Ok(Some(path)) => Some(path),
+                Ok(None) => {
+                    self.push_toast("Enable AI and command-context sharing in Settings before sharing this task goal with a provider.", ToastKind::Warning);
+                    return;
+                }
+                Err(error) => {
+                    self.push_toast(
+                        format!("Could not prepare the task goal: {error}"),
+                        ToastKind::Warning,
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if failed_terminal_retry.is_none() && !native_recovery {
             let _ =
                 self.task_manager
@@ -30162,10 +30292,17 @@ impl Frost {
         self.refresh_active_context();
         self.save_session_snapshot();
         self.push_toast(
-            format!(
-                "Opened {} in an isolated task terminal; task context stays in Frost",
-                crate::review_text::bound_provider_label(provider.display_name())
-            ),
+            match brief_path {
+                Some(path) => format!(
+                    "Opened {}. Ask the Agent to read {} for your task goal.",
+                    provider.display_name(),
+                    path.display()
+                ),
+                None => format!(
+                    "Opened {} in an isolated task terminal; task context stays in Frost",
+                    crate::review_text::bound_provider_label(provider.display_name())
+                ),
+            },
             ToastKind::Success,
         );
     }
@@ -30246,7 +30383,7 @@ impl Frost {
         self.refresh_active_context();
         self.save_session_snapshot();
         self.push_toast(
-            "Running the exact source command in a validation terminal",
+            "Running the task validation command in a separate terminal",
             ToastKind::Info,
         );
     }
@@ -30292,6 +30429,16 @@ impl Frost {
         let mut body = column![row![
             text("Agent workspace").size(self.chrome_font_size() + 2.0),
             Space::new().width(Length::Fill),
+            button(
+                text(if self.task_panel.composer.is_some() {
+                    "Continue draft"
+                } else {
+                    "New task"
+                })
+                .size(self.chrome_font_size())
+            )
+            .style(button::primary)
+            .on_press(Message::TaskComposerOpen),
             button(text("Saved sessions").size(self.chrome_font_size()))
                 .style(button::text)
                 .on_press(Message::AgentSessionsToggle),
@@ -30300,6 +30447,16 @@ impl Frost {
         .spacing(6)
         .wrap()]
         .spacing(7);
+        if self.task_panel.composer_open {
+            if let Some(composer) = &self.task_panel.composer {
+                return scrollable(body.push(agent_task_workspace::composer_view(
+                    composer,
+                    self.chrome_font_size(),
+                )))
+                .height(Length::Fill)
+                .into();
+            }
+        }
         if let Some(picker) = self.task_panel.provider_picker.as_ref() {
             let context = &picker.context;
             let reference = picker.reference();
@@ -30550,7 +30707,7 @@ impl Frost {
         {
             body = body.push(text("No Agent tasks yet").size(self.chrome_font_size()));
             body = body.push(
-                text("Create one from a failed command block's menu (Create task). Pick Codex, Claude, OpenCode, or Kimi; each task gets its own Git worktree.")
+                text("Choose New task to describe a project goal, or Create task from a failed command block's menu. Pick Codex, Claude, OpenCode, or Kimi; each task gets its own Git worktree.")
                     .size(self.chrome_font_size())
                     .style(text::secondary),
             );
@@ -30695,6 +30852,10 @@ impl Frost {
         let preparing = self.agent_runtime.has_preparing(task.id);
         let running = self.agent_runtime.has_running(task.id);
         let stream_active = self.task_manager.has_active_agent_event_stream(task.id);
+        card = card.push(agent_task_workspace::inspector_view(
+            task,
+            self.chrome_font_size(),
+        ));
 
         // Native session projection: current/latest turn plus pending
         // approvals (display-and-deny) and bounded completed-turn history.
@@ -30786,15 +30947,29 @@ impl Frost {
                         .style(container::bordered_box),
                 );
             }
-            if !snapshot.turn_history.is_empty() {
+            card = card.push(agent_task_workspace::history_view(
+                &snapshot,
+                self.chrome_font_size(),
+            ));
+        }
+        if let Some(report) = self.agent_runtime.exit_report(task.id) {
+            card = card.push(
+                text(format!(
+                    "Provider exit: {:?} · code {}",
+                    report.cause,
+                    report
+                        .process
+                        .code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "unavailable".into())
+                ))
+                .size(self.chrome_font_size() - 1.0)
+                .style(text::secondary),
+            );
+            if let Some(detail) = &report.detail {
                 card = card.push(
-                    text(format!(
-                        "Completed turns: {} ({} in history)",
-                        snapshot.completed_turns,
-                        snapshot.turn_history.len()
-                    ))
-                    .size(self.chrome_font_size())
-                    .style(text::secondary),
+                    text(crate::review_text::visible_bounded(detail, 2048))
+                        .size(self.chrome_font_size() - 1.0),
                 );
             }
         }
@@ -30852,17 +31027,15 @@ impl Frost {
         } else if task.status == TaskStatus::Created
             && task.runtime_kind == TaskRuntimeKind::Unassigned
         {
-            let start_label = format!("Start {provider_name}");
-            let mut start =
-                button(text(start_label).size(self.chrome_font_size())).style(button::primary);
             if task.provider.supports_native_driver() {
+                let start_label = format!("Start {provider_name}");
+                let mut start =
+                    button(text(start_label).size(self.chrome_font_size())).style(button::primary);
                 if share_context {
                     start = start.on_press(Message::TaskStartNative(task.id));
                 }
-            } else {
-                start = start.on_press(Message::TaskTerminalOpen(task.id));
+                actions = actions.push(start);
             }
-            actions = actions.push(start);
             actions = actions.push(
                 button(text(format!("Open {provider_name}")).size(self.chrome_font_size()))
                     .style(button::secondary)
@@ -30892,9 +31065,15 @@ impl Frost {
             && !share_context
         {
             card = card.push(
-                text(format!(
-                    "Start {provider_name} needs AI enabled and command-context sharing in Settings. Open {provider_name} still works in a terminal."
-                ))
+                text(if task.brief.is_some() {
+                    format!(
+                        "Start or Open {provider_name} needs AI enabled and command-context sharing in Settings to share this task goal."
+                    )
+                } else {
+                    format!(
+                        "Start {provider_name} needs AI enabled and command-context sharing in Settings. Open {provider_name} still works in a terminal."
+                    )
+                })
                 .size(self.chrome_font_size())
                 .style(text::secondary),
             );
@@ -30945,16 +31124,32 @@ impl Frost {
                     .style(button::secondary)
                     .on_press(Message::TaskDiffOpen(task.id)),
             );
-            if task.validation.status != TaskValidationStatus::Running {
+            if task.validation.status != TaskValidationStatus::Running
+                && task.validation_command().is_some()
+            {
                 review = review.push(
                     button(text("Run validation").size(self.chrome_font_size()))
                         .style(button::secondary)
                         .on_press(Message::TaskValidationStart(task.id)),
                 );
             }
-            let mut complete =
-                button(text("Mark complete").size(self.chrome_font_size())).style(button::primary);
-            if task.validation.status == TaskValidationStatus::Passed {
+            let mut complete = button(
+                text(if task.requires_manual_review() {
+                    "Accept reviewed work"
+                } else {
+                    "Mark complete"
+                })
+                .size(self.chrome_font_size()),
+            )
+            .style(button::primary);
+            if task.requires_manual_review()
+                && task.validation.status == TaskValidationStatus::NotRun
+            {
+                complete = complete.on_press(Message::TaskAcceptReviewed(
+                    task.id,
+                    self.task_panel.review_reference(),
+                ));
+            } else if task.validation.status == TaskValidationStatus::Passed {
                 complete = complete.on_press(Message::TaskMarkComplete(task.id));
             }
             review = review.push(complete);
@@ -31072,10 +31267,21 @@ impl Frost {
             card = card.push(diff_card);
         }
 
-        container(card)
-            .padding(8)
-            .style(container::bordered_box)
-            .into()
+        let card = container(card).padding(8).style(container::bordered_box);
+        crate::widget_identity_scope::scope(
+            self.task_panel.review_reference(),
+            crate::widget_identity_scope::scope_key(
+                (
+                    task.id,
+                    task.status,
+                    task.runtime_kind,
+                    task.validation.status,
+                    stream_active,
+                    preparing,
+                ),
+                card,
+            ),
+        )
     }
 
     /// Overlay panel for Agent mode: transcript, per-command approval cards,

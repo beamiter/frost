@@ -215,7 +215,8 @@ pub(crate) fn bound_follow_up(text: impl Into<String>) -> String {
 /// Fully prepared task registration produced by the background worktree
 /// worker. The UI thread only registers it with the task manager.
 pub(crate) struct PreparedTask {
-    pub(crate) context: SemanticCommandContext,
+    pub(crate) context: Option<SemanticCommandContext>,
+    pub(crate) brief: Option<crate::agent_task::TaskBrief>,
     pub(crate) title: String,
     pub(crate) provider: AgentProvider,
     pub(crate) worktree: ManagedWorktree,
@@ -252,10 +253,6 @@ pub(crate) fn begin_worktree_creation(
     context: SemanticCommandContext,
     provider: AgentProvider,
 ) -> Result<PendingTaskCreation, String> {
-    let worktree_root = dirs::data_local_dir()
-        .ok_or_else(|| "cannot locate the per-user data directory".to_string())?
-        .join("frost")
-        .join("agent-tasks");
     let cwd = context
         .cwd
         .as_deref()
@@ -267,6 +264,33 @@ pub(crate) fn begin_worktree_creation(
         "Fix {}",
         visible_bounded(command, MAX_TASK_TITLE_DISPLAY_BYTES)
     );
+    begin_task_worktree(cwd, title, provider, Some(context), None)
+}
+
+/// Authored work remains unstarted after registration for every provider.
+pub(crate) fn begin_authored_creation(
+    task: crate::agent_task_workspace::AuthoredTask,
+) -> Result<PendingTaskCreation, String> {
+    begin_task_worktree(
+        task.project,
+        task.title,
+        task.provider,
+        None,
+        Some(task.brief),
+    )
+}
+
+fn begin_task_worktree(
+    cwd: PathBuf,
+    title: String,
+    provider: AgentProvider,
+    context: Option<SemanticCommandContext>,
+    brief: Option<crate::agent_task::TaskBrief>,
+) -> Result<PendingTaskCreation, String> {
+    let worktree_root = dirs::data_local_dir()
+        .ok_or_else(|| "cannot locate the per-user data directory".to_string())?
+        .join("frost")
+        .join("agent-tasks");
     let token = uuid::Uuid::new_v4().simple().to_string();
     let task_name = format!("task-{token}");
     let branch = format!("frost/{task_name}");
@@ -291,6 +315,7 @@ pub(crate) fn begin_worktree_creation(
                     .map_err(|error| error.to_string())?;
                 Ok(PreparedTask {
                     context,
+                    brief,
                     title,
                     provider,
                     worktree,
@@ -459,6 +484,8 @@ pub(crate) struct TaskPanel {
     pub(crate) pending_creation: Option<PendingTaskCreation>,
     /// Failed-block context waiting for an explicit provider choice.
     pub(crate) provider_picker: Option<TaskProviderPicker>,
+    pub(crate) composer: Option<crate::agent_task_workspace::TaskComposer>,
+    pub(crate) composer_open: bool,
     /// Bounded read-only `git status`/`git diff` surface for the selected
     /// task's worktree (worker-owned; polled from the iced tick).
     pub(crate) diff: crate::agent_task::AgentDiffPanel,
@@ -482,6 +509,8 @@ impl TaskPanel {
             follow_up_drafts: std::collections::HashMap::new(),
             pending_creation: None,
             provider_picker: None,
+            composer: None,
+            composer_open: false,
             diff: crate::agent_task::AgentDiffPanel::new(),
             diff_task: None,
             diff_epoch: Arc::new(()),
@@ -603,6 +632,17 @@ impl TaskPanel {
         if let Some(picker) = self.provider_picker.as_mut() {
             picker.retire_reference();
         }
+        if let Some(composer) = self.composer.as_mut() {
+            composer.retire_reference();
+        }
+    }
+
+    pub(crate) fn review_reference(&self) -> Arc<()> {
+        self.follow_up_epoch.clone()
+    }
+
+    pub(crate) fn accepts_review(&self, task_id: TaskId, reference: &Arc<()>) -> bool {
+        self.selected == Some(task_id) && Arc::ptr_eq(&self.follow_up_epoch, reference)
     }
 
     /// Hiding the composer revokes callbacks but keeps its editable draft.
