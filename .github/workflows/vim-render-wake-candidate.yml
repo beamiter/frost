@@ -5,8 +5,36 @@ on:
     paths: [.github/workflows/vim-render-wake-candidate.yml, .ci/vim-render-wake.patch.b64]
 permissions:
   contents: write
+  actions: write
+concurrency:
+  group: vim-render-wake-candidate
+  cancel-in-progress: true
 jobs:
+  stop-stalled-attempt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Cancel only this task's stalled prerequisite attempt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json,os,urllib.request
+          api='https://api.github.com/repos/beamiter/frost/actions/runs/40105428214'
+          headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'}
+          with urllib.request.urlopen(urllib.request.Request(api,headers=headers),timeout=20) as response:
+              run=json.load(response)
+          assert run['head_sha']=='0e7bc162e44c389d33953ce44464e8ff9766bf94'
+          assert run['head_branch']=='codex/vim-render-wake-20261024'
+          assert run['event']=='push'
+          print('Previous task-specific attempt:',run['status'])
+          if run['status']!='completed':
+              request=urllib.request.Request(api+'/cancel',data=b'',headers=headers,method='POST')
+              with urllib.request.urlopen(request,timeout=20) as response:
+                  print('Cancellation accepted:',response.status)
+          PY
   validate:
+    needs: stop-stalled-attempt
     uses: beamiter/jterm_core/.github/workflows/vim-render-wake-frontends.yml@7ffde581f91958ca13613efb0b85024198dd9877
     with:
       base: 7e3189d9caa9810212a25b7f79bb9948a19bee2e
