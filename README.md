@@ -1268,6 +1268,36 @@ Navigation keeps review drafts attached to their task identities and does not
 start, stop or approve an agent. Existing native start, review, diff, validation
 and approval controls remain on the selected task's detail card.
 
+#### Focus on the tasks that need you
+
+The **Needs your attention** inbox separates approval requests, questions,
+validation problems, work ready for review and failed runs. Counts follow the
+current search, provider and project scope. Choosing a category preserves your
+search and project; choosing a normal lifecycle view clears the category.
+**Clear filters** resets both. **Next needs you** visits only visible matches.
+
+Task search accepts fields such as `provider:codex`, `status:review`,
+`validation:failed`, `runtime:native`, `project:"my project"`, `branch:fix`,
+`id:...`, `is:running` and `attention:approval`. Use quoted phrases, negative
+terms such as `-status:done`, and comma-separated alternatives such as
+`provider:codex,claude`. **Search syntax** explains the grammar. Invalid queries
+show an explanation and no matches, while preserving the selected task and its
+draft.
+
+Opening a task now goes straight to its inspector. In a narrow dock, **Tasks**
+and **Selected task** switch between the list and inspector. A wide dock shows
+them side by side with independent scrolling, and larger text returns to the
+single-column view. The selected task's controls no longer sit below every
+other task in the workspace. Previous/next navigation stays visible above the
+inspector.
+
+Each row and inspector explains the **Next step**, with current blocking or
+failure details when available. Lifecycle, validation and observed runtime
+activity remain separate. Approvals, start/recovery, review and validation
+controls appear before the retained transcript and earlier turns. Switching
+back to the list, hiding the inspector or filtering the task out retires its
+old UI actions while keeping its feedback draft.
+
 #### Create work from a goal
 
 **New task** opens a multiline goal composer with a local Git project path,

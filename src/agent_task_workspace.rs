@@ -352,6 +352,11 @@ pub(crate) fn inspector_view(task: &AgentTask, size: f32) -> Element<'static, Me
     let inspector = crate::agent_task::TaskInspector::from_task(task);
     let mut body = column![text("Task details").size(size + 1.0)].spacing(4);
     for field in inspector.fields {
+        // The workspace shows a runtime-aware TaskGuidance card above its
+        // actions. The inspector's legacy static hint would duplicate it.
+        if field.label == "Next step" {
+            continue;
+        }
         body = body.push(text(format!("{}: {}", field.label, field.value)).size(size - 1.0));
     }
     if let Some(goal) = inspector.goal {
@@ -362,6 +367,27 @@ pub(crate) fn inspector_view(task: &AgentTask, size: f32) -> Element<'static, Me
     container(body)
         .padding(7)
         .style(container::bordered_box)
+        .into()
+}
+
+pub(crate) fn guidance_view(
+    task: &AgentTask,
+    activity: crate::agent_task::DashboardActivity,
+    size: f32,
+) -> Element<'static, Message> {
+    let guidance = crate::agent_task::TaskGuidance::from_task(task, activity);
+    let mut body = column![
+        text(format!("Next step · {}", guidance.title)).size(size + 1.0),
+        text(guidance.detail).size(size).style(text::secondary),
+    ]
+    .spacing(4);
+    if let Some(reason) = guidance.reason {
+        body = body.push(text(reason).size(size).style(text::danger));
+    }
+    container(body)
+        .padding(8)
+        .style(container::bordered_box)
+        .width(Length::Fill)
         .into()
 }
 

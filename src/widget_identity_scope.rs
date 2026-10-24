@@ -7,6 +7,16 @@ use iced::advanced::{layout, mouse, overlay, renderer, Clipboard, Layout, Shell,
 use iced::{Element, Event, Length, Rectangle, Size, Vector};
 use std::sync::Arc;
 
+/// Keep the content's parent stable while a transient overlay appears or expires.
+/// Switching between a bare content widget and a Stack would discard the
+/// content's retained focus, cursor and scroll state.
+pub(crate) fn transient_overlay<'a, Message: 'a, Theme: 'a, Renderer: renderer::Renderer + 'a>(
+    content: Element<'a, Message, Theme, Renderer>,
+    overlay: Option<Element<'a, Message, Theme, Renderer>>,
+) -> Element<'a, Message, Theme, Renderer> {
+    iced::widget::Stack::with_children(std::iter::once(content).chain(overlay)).into()
+}
+
 struct Scope<'a, Message, Theme, Renderer, Key> {
     identity: Key,
     content: Element<'a, Message, Theme, Renderer>,
@@ -191,6 +201,117 @@ impl<Message, Theme, Renderer: renderer::Renderer, Key: Clone + PartialEq + 'sta
 mod tests {
     use super::*;
     use iced::widget::{button, Space};
+
+    #[test]
+    fn toast_overlay_preserves_complete_query_and_replacement_input() {
+        use iced::advanced::text;
+        use iced::keyboard::{self, key::Code, key::Physical, Key, Location, Modifiers};
+        use iced::widget::{scrollable, text as label, text_input};
+        type InputState = text_input::State<<() as text::Renderer>::Paragraph>;
+
+        fn input(tree: &mut Tree) -> &mut InputState {
+            fn find(tree: &mut Tree) -> Option<&mut InputState> {
+                if tree.tag == tree::Tag::of::<InputState>() {
+                    Some(tree.state.downcast_mut::<InputState>())
+                } else {
+                    tree.children.iter_mut().find_map(find)
+                }
+            }
+            find(tree).unwrap()
+        }
+        fn view(query: &str, toast: bool) -> Element<'_, String, iced::Theme, ()> {
+            let search = text_input("Search tasks", query).on_input(std::convert::identity);
+            transient_overlay(
+                scrollable(search).width(220).height(120).into(),
+                toast.then(|| label("Task created").into()),
+            )
+        }
+        fn press(
+            tree: &mut Tree,
+            query: &str,
+            toast: bool,
+            character: char,
+            modifiers: Modifiers,
+        ) -> Vec<String> {
+            let mut element = view(query, toast);
+            tree.diff(element.as_widget());
+            assert!(input(tree).is_focused());
+            let viewport = Rectangle::with_size(Size::new(300.0, 160.0));
+            let node = element.as_widget_mut().layout(
+                tree,
+                &(),
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            let key = Key::Character(character.to_string().into());
+            let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: Physical::Code(Code::KeyA),
+                location: Location::Standard,
+                modifiers,
+                text: modifiers.is_empty().then(|| character.to_string().into()),
+                repeat: false,
+            });
+            let mut modifier_messages = Vec::new();
+            element.as_widget_mut().update(
+                tree,
+                &Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &(),
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut modifier_messages),
+                &viewport,
+            );
+            assert!(modifier_messages.is_empty());
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &(),
+                &mut iced::advanced::clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            assert!(
+                shell.is_event_captured(),
+                "query key must not reach the terminal"
+            );
+            messages
+        }
+
+        let mut query = String::new();
+        let mut tree = Tree::new(view(&query, true).as_widget());
+        input(&mut tree).focus();
+        for (index, character) in "provider:missing".chars().enumerate() {
+            query = press(
+                &mut tree,
+                &query,
+                !(4..=9).contains(&index),
+                character,
+                Modifiers::empty(),
+            )
+            .pop()
+            .unwrap();
+        }
+        assert_eq!(query, "provider:missing");
+        assert!(press(&mut tree, &query, false, 'a', Modifiers::CTRL).is_empty());
+        for (index, character) in "provider:codex status:created".chars().enumerate() {
+            query = press(
+                &mut tree,
+                &query,
+                (3..8).contains(&index),
+                character,
+                Modifiers::empty(),
+            )
+            .pop()
+            .unwrap();
+        }
+        assert_eq!(query, "provider:codex status:created");
+    }
 
     // Independent of iced_core's debug-only () renderer; never draws or loads assets.
     struct TestRenderer;

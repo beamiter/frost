@@ -67,34 +67,6 @@ pub(crate) fn reason_preview(detail: &str, columns: usize) -> String {
     preview
 }
 
-/// A display-only reason, selected from authoritative task/validation details.
-pub(crate) fn task_reason(
-    status: crate::agent_task::TaskStatus,
-    validation: crate::agent_task::TaskValidationStatus,
-    status_detail: Option<&str>,
-    validation_detail: Option<&str>,
-) -> Option<String> {
-    use crate::agent_task::{TaskStatus, TaskValidationStatus};
-    let nonempty = |text: &&str| !text.trim().is_empty();
-    let validation_reason = matches!(
-        validation,
-        TaskValidationStatus::Failed | TaskValidationStatus::Inconclusive
-    )
-    .then_some(validation_detail)
-    .flatten()
-    .filter(nonempty);
-    let task_reason = matches!(
-        status,
-        TaskStatus::Failed | TaskStatus::WaitingForHuman | TaskStatus::WaitingForApproval
-    )
-    .then_some(status_detail)
-    .flatten()
-    .filter(nonempty);
-    validation_reason
-        .or(task_reason)
-        .map(|text| jterm_core::review_input::safe_inline_display(text.trim(), 1024))
-}
-
 use crate::agent_task::{
     AgentProvider, ManagedWorktree, NativePromptPolicy, SemanticCommandContext, TaskId,
     WorktreeService, CODEX_APP_SERVER_LIVE_TURN_MAX, NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
@@ -111,6 +83,39 @@ use std::thread::JoinHandle;
 pub(crate) const MAX_TASK_TITLE_DISPLAY_BYTES: usize = 112;
 /// Display bound for branch names, status details, and validation details.
 pub(crate) const MAX_TASK_DETAIL_DISPLAY_BYTES: usize = 256;
+
+/// Keep both panes readable at large text sizes. The ordinary narrow dock
+/// switches between list and inspector instead of squeezing either column.
+pub(crate) fn task_workspace_has_columns(width: f32, font_size: f32) -> bool {
+    width >= 480.0 * (font_size / 14.0).max(1.0)
+}
+
+/// Keep the search widget under the same parents as wide-layout results change.
+/// Replacing the row with a bare list on no matches loses input focus, sending
+/// the rest of a typed query into the terminal instead.
+pub(crate) fn task_workspace_layout<'a>(
+    list: iced::Element<'a, crate::Message>,
+    inspector: iced::Element<'a, crate::Message>,
+    has_columns: bool,
+    show_inspector: bool,
+) -> iced::Element<'a, crate::Message> {
+    use iced::widget::{container, row};
+    use iced::Length;
+
+    if has_columns {
+        row![
+            container(list).width(Length::FillPortion(2)),
+            container(inspector).width(Length::FillPortion(3)),
+        ]
+        .spacing(8)
+        .height(Length::Fill)
+        .into()
+    } else if show_inspector {
+        inspector
+    } else {
+        list
+    }
+}
 
 /// Counts describe current search matches before the selected quick view.
 pub(crate) fn dashboard_filter_label(
@@ -470,8 +475,15 @@ impl std::fmt::Display for TaskRepositoryChoice {
 
 pub(crate) struct TaskPanel {
     pub(crate) selected: Option<TaskId>,
+    /// Narrow docks show either the list or inspector; wide docks show both.
+    /// The selected identity and its draft remain independent of this view.
+    pub(crate) inspector_open: bool,
     pub(crate) dashboard_query: String,
+    pub(crate) dashboard_query_notice: Option<&'static str>,
     pub(crate) dashboard_view: crate::agent_task::DashboardView,
+    pub(crate) dashboard_attention: Option<crate::agent_task::DashboardAttentionKind>,
+    pub(crate) dashboard_search_help: bool,
+    pub(crate) dashboard_filters_open: bool,
     pub(crate) dashboard_provider: Option<AgentProvider>,
     pub(crate) dashboard_repo: Option<PathBuf>,
     pub(crate) dashboard_sort: crate::agent_task::DashboardSort,
@@ -497,8 +509,13 @@ impl TaskPanel {
     pub(crate) fn new() -> Self {
         Self {
             selected: None,
+            inspector_open: false,
             dashboard_query: String::new(),
+            dashboard_query_notice: None,
             dashboard_view: crate::agent_task::DashboardView::All,
+            dashboard_attention: None,
+            dashboard_search_help: false,
+            dashboard_filters_open: false,
             dashboard_provider: None,
             dashboard_repo: None,
             dashboard_sort: crate::agent_task::DashboardSort::default(),
@@ -521,10 +538,14 @@ impl TaskPanel {
         &mut self,
         dashboard: &crate::agent_task::DashboardSnapshot,
     ) {
+        if self.dashboard_query_notice.is_some() {
+            return;
+        }
         if let Some(row) = dashboard.rows.first() {
             if self.selected != Some(row.id) {
                 self.select(Some(row.id));
             }
+            self.inspector_open = true;
         }
     }
 
@@ -537,6 +558,7 @@ impl TaskPanel {
             if self.selected != Some(next) {
                 self.select(Some(next));
             }
+            self.inspector_open = true;
         }
     }
 
@@ -545,16 +567,65 @@ impl TaskPanel {
             if self.selected != Some(next) {
                 self.select(Some(next));
             }
+            self.inspector_open = true;
         }
     }
 
     pub(crate) fn clear_dashboard_filters(&mut self) {
         self.retire_panel_callbacks();
         self.dashboard_query.clear();
+        self.dashboard_query_notice = None;
         self.dashboard_view = crate::agent_task::DashboardView::All;
+        self.dashboard_attention = None;
         self.dashboard_provider = None;
         self.dashboard_repo = None;
         self.dashboard_sort = crate::agent_task::DashboardSort::default();
+    }
+
+    pub(crate) fn set_dashboard_view(&mut self, view: crate::agent_task::DashboardView) {
+        self.retire_panel_callbacks();
+        self.dashboard_view = view;
+        self.dashboard_attention = None;
+    }
+
+    pub(crate) fn set_dashboard_query(&mut self, query: String) {
+        self.retire_panel_callbacks();
+        // Keep the complete grammar for the shared parser. Truncating before
+        // parsing could silently drop an exclusion and broaden the results.
+        if query.len() > 4096 {
+            self.dashboard_query_notice = Some(
+                "Search paste exceeds 4 KiB. Previous query kept; edit it before pressing Enter.",
+            );
+            return;
+        }
+        self.dashboard_query = query;
+        self.dashboard_query_notice = None;
+    }
+
+    pub(crate) fn set_dashboard_attention(
+        &mut self,
+        kind: crate::agent_task::DashboardAttentionKind,
+    ) {
+        self.retire_panel_callbacks();
+        self.dashboard_view = crate::agent_task::DashboardView::All;
+        self.dashboard_attention = Some(kind);
+    }
+
+    /// Quick views and attention categories narrow the same searched scope.
+    /// The caller retains that full scope for count badges and project filters.
+    pub(crate) fn dashboard_from_scope(
+        &self,
+        scope: &crate::agent_task::DashboardSnapshot,
+    ) -> crate::agent_task::DashboardSnapshot {
+        let mut dashboard =
+            crate::agent_task::DashboardSnapshot::filter_rows(&scope.rows, "", self.dashboard_view);
+        if let Some(kind) = self.dashboard_attention {
+            dashboard
+                .rows
+                .retain(|row| row.attention_kind() == Some(kind));
+        }
+        dashboard.sort_rows(self.dashboard_sort);
+        dashboard
     }
 
     pub(crate) fn select(&mut self, task_id: Option<TaskId>) {
@@ -579,7 +650,29 @@ impl TaskPanel {
             self.follow_up_notice = notice;
         }
         self.selected = task_id;
+        self.inspector_open = task_id.is_some();
         self.retire_follow_up();
+    }
+
+    pub(crate) fn show_task_list(&mut self) {
+        self.inspector_open = false;
+        self.retire_panel_callbacks();
+    }
+
+    pub(crate) fn show_task_inspector(&mut self) {
+        self.inspector_open = self.selected.is_some();
+        self.retire_panel_callbacks();
+    }
+
+    pub(crate) fn inspector_is_visible(
+        &self,
+        task_id: TaskId,
+        has_columns: bool,
+        dashboard: &crate::agent_task::DashboardSnapshot,
+    ) -> bool {
+        self.selected == Some(task_id)
+            && (self.inspector_open || has_columns)
+            && dashboard.selected_index(Some(task_id)).is_some()
     }
 
     /// Hiding a diff never drops its receiver: an old worker retains the
@@ -629,6 +722,7 @@ impl TaskPanel {
     /// preserving the current draft/context for the next visible opening.
     pub(crate) fn retire_panel_callbacks(&mut self) {
         self.retire_follow_up();
+        self.diff_epoch = Arc::new(());
         if let Some(picker) = self.provider_picker.as_mut() {
             picker.retire_reference();
         }
@@ -812,69 +906,182 @@ impl TaskPanel {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn task_workspace_inspector_preserves_drafts_and_retires_hidden_actions() {
+        let mut panel = super::TaskPanel::new();
+        let id = super::TaskId::new();
+        panel.select(Some(id));
+        panel.set_follow_up("Keep this exact review feedback");
+        let old_review = panel.review_reference();
+        let old_send = panel.follow_up_reference(id, 2);
+        panel.diff_task = Some(id);
+        panel.diff.is_open = true;
+        let old_close = panel.diff_reference();
+        assert!(panel.inspector_open);
+
+        panel.show_task_list();
+        assert!(!panel.inspector_open);
+        assert_eq!(panel.selected, Some(id));
+        assert_eq!(panel.follow_up, "Keep this exact review feedback");
+        assert!(!panel.accepts_review(id, &old_review));
+        assert!(!panel.accepts_follow_up(&old_send, 2));
+        panel.close_current_diff(&old_close);
+        assert!(
+            panel.owns_visible_diff(id),
+            "navigation preserves the diff and rejects its old close callback"
+        );
+
+        panel.show_task_inspector();
+        assert!(panel.inspector_open);
+        assert_eq!(panel.selected, Some(id));
+        assert_eq!(panel.follow_up, "Keep this exact review feedback");
+        assert!(!panel.accepts_review(id, &old_review));
+        panel.select(None);
+        panel.show_task_inspector();
+        assert!(!panel.inspector_open);
+    }
+
+    #[test]
+    fn attention_filters_preserve_query_scope_and_never_select_hidden_tasks() {
+        use crate::agent_task::{
+            DashboardAttentionKind, DashboardFilter, DashboardSnapshot, DashboardView, NewTask,
+            TaskManager, TaskStatus,
+        };
+        let mut manager = TaskManager::new();
+        for _ in 0..3 {
+            manager
+                .create(NewTask {
+                    title: "Same name".into(),
+                    provider: super::AgentProvider::Codex,
+                    repo_root: "/fixture".into(),
+                    worktree_path: "/fixture/worktree".into(),
+                    branch: "test/workspace".into(),
+                    base_commit: "a".repeat(40),
+                    source_context: None,
+                })
+                .unwrap();
+        }
+        let mut tasks = manager.tasks().to_vec();
+        tasks[0].status = TaskStatus::WaitingForApproval;
+        tasks[1].status = TaskStatus::WaitingForHuman;
+        tasks[2].status = TaskStatus::Failed;
+        let scope =
+            DashboardSnapshot::project(&tasks, |_| Default::default(), DashboardFilter::default());
+        let mut panel = super::TaskPanel::new();
+        panel.dashboard_query = "provider:codex \"Same name\"".into();
+        panel.dashboard_provider = Some(super::AgentProvider::Codex);
+        panel.dashboard_repo = Some("/fixture".into());
+        panel.select(Some(tasks[0].id));
+        panel.set_follow_up("feedback owned by the approval task");
+        panel.set_dashboard_attention(DashboardAttentionKind::Input);
+        let visible = panel.dashboard_from_scope(&scope);
+        assert_eq!(visible.rows.len(), 1);
+        assert_eq!(visible.rows[0].id, tasks[1].id);
+        assert_eq!(visible.counts.total, 3);
+        assert_eq!(panel.selected, Some(tasks[0].id));
+        assert!(visible.selected_index(panel.selected).is_none());
+        assert!(!panel.inspector_is_visible(tasks[0].id, true, &visible));
+        assert_eq!(panel.dashboard_query, "provider:codex \"Same name\"");
+        assert_eq!(panel.dashboard_provider, Some(super::AgentProvider::Codex));
+        assert_eq!(
+            panel.dashboard_repo.as_deref(),
+            Some(std::path::Path::new("/fixture"))
+        );
+        panel.next_attention(&visible);
+        assert_eq!(panel.selected, Some(tasks[1].id));
+        assert!(panel.inspector_is_visible(tasks[1].id, false, &visible));
+        panel.show_task_list();
+        assert!(!panel.inspector_is_visible(tasks[1].id, false, &visible));
+        assert!(panel.inspector_is_visible(tasks[1].id, true, &visible));
+        assert!(!panel.inspector_is_visible(tasks[0].id, true, &visible));
+        panel.set_dashboard_query("x".repeat(4097));
+        panel.open_dashboard_result(&visible);
+        assert!(
+            !panel.inspector_open,
+            "rejected paste must not turn Enter into opening an older query"
+        );
+        panel.set_dashboard_query("Same name".into());
+        panel.open_dashboard_result(&visible);
+        assert!(panel.inspector_open);
+        panel.select(Some(tasks[0].id));
+        assert_eq!(panel.follow_up, "feedback owned by the approval task");
+        panel.set_dashboard_view(DashboardView::Running);
+        assert!(panel.dashboard_attention.is_none());
+        panel.set_dashboard_attention(DashboardAttentionKind::Approval);
+        assert_eq!(panel.dashboard_view, DashboardView::All);
+        panel.clear_dashboard_filters();
+        assert!(panel.dashboard_attention.is_none());
+        assert!(panel.dashboard_query.is_empty());
+        assert!(manager
+            .tasks()
+            .iter()
+            .all(|task| task.status == TaskStatus::Created));
+    }
+
+    #[test]
+    fn task_workspace_columns_respect_readable_width_and_font_scale() {
+        assert!(!super::task_workspace_has_columns(220.0, 14.0));
+        assert!(!super::task_workspace_has_columns(450.0, 14.0));
+        assert!(super::task_workspace_has_columns(500.0, 14.0));
+        assert!(!super::task_workspace_has_columns(500.0, 20.0));
+    }
+
+    #[test]
+    fn task_workspace_search_keeps_focus_when_inspector_disappears_and_returns() {
+        use iced::advanced::{text, widget::tree, widget::Tree};
+        use iced::widget::{scrollable, text as label, text_input};
+        type InputState = text_input::State<<iced::Renderer as text::Renderer>::Paragraph>;
+
+        fn input(tree: &mut Tree) -> Option<&mut InputState> {
+            if tree.tag == tree::Tag::of::<InputState>() {
+                Some(tree.state.downcast_mut::<InputState>())
+            } else {
+                tree.children.iter_mut().find_map(input)
+            }
+        }
+        fn workspace(has_selection: bool) -> iced::Element<'static, crate::Message> {
+            let search = text_input("Search tasks", "provider:")
+                .on_input(crate::Message::TaskDashboardQuery);
+            let inspector = if has_selection {
+                crate::widget_identity_scope::scope_key(1_u8, scrollable(label("Task inspector")))
+            } else {
+                label("Selected task is hidden by filters").into()
+            };
+            super::task_workspace_layout(scrollable(search).into(), inspector, true, has_selection)
+        }
+
+        let first = workspace(true);
+        let mut tree = Tree::new(first.as_widget());
+        input(&mut tree).unwrap().focus();
+        for has_selection in [false, true, false] {
+            let next = workspace(has_selection);
+            tree.diff(next.as_widget());
+            assert!(input(&mut tree).unwrap().is_focused());
+        }
+    }
+
+    #[test]
+    fn task_search_never_silently_truncates_an_exclusion() {
+        let mut panel = super::TaskPanel::new();
+        let query = format!("{} -provider:codex", "review ".repeat(45));
+        panel.set_dashboard_query(query.clone());
+        assert_eq!(panel.dashboard_query, query);
+        assert!(crate::agent_task::dashboard_query_error(&panel.dashboard_query).is_some());
+        panel.set_dashboard_query("x".repeat(4097));
+        assert_eq!(panel.dashboard_query, query);
+        assert!(panel.dashboard_query_notice.is_some());
+        panel.set_dashboard_query("project:\"my project\" -provider:claude".into());
+        assert!(panel.dashboard_query_notice.is_none());
+        assert!(crate::agent_task::dashboard_query_error(&panel.dashboard_query).is_none());
+        panel.clear_dashboard_filters();
+        assert!(panel.dashboard_query_notice.is_none());
+    }
+
+    #[test]
     fn task_reason_preview_fits_single_line_cells() {
         assert_eq!(super::reason_preview("界界界", 5), "界界…");
         assert_eq!(super::reason_preview("abcdef", 4), "abc…");
         assert_eq!(super::reason_preview("abc", 4), "abc");
         assert_eq!(super::reason_preview("abc", 0), "");
-    }
-
-    #[test]
-    fn task_reason_prefers_validation_and_drops_stale_or_empty_detail() {
-        use crate::agent_task::{TaskStatus as S, TaskValidationStatus as V};
-        assert_eq!(
-            super::task_reason(
-                S::Failed,
-                V::Failed,
-                Some("task failed"),
-                Some("tests failed")
-            )
-            .as_deref(),
-            Some("tests failed")
-        );
-        assert_eq!(
-            super::task_reason(
-                S::Failed,
-                V::Inconclusive,
-                Some("task failed"),
-                Some("no exit status")
-            )
-            .as_deref(),
-            Some("no exit status")
-        );
-        assert_eq!(
-            super::task_reason(S::Failed, V::Failed, Some("task failed"), Some("  ")).as_deref(),
-            Some("task failed")
-        );
-        for status in [S::WaitingForHuman, S::WaitingForApproval] {
-            assert_eq!(
-                super::task_reason(status, V::NotRun, Some("needs a decision"), None).as_deref(),
-                Some("needs a decision")
-            );
-        }
-        assert_eq!(
-            super::task_reason(
-                S::Completed,
-                V::Passed,
-                Some("old failure"),
-                Some("old tests")
-            ),
-            None
-        );
-        assert_eq!(
-            super::task_reason(S::Failed, V::NotRun, Some(" \n\t "), None),
-            None
-        );
-        assert_eq!(super::task_reason(S::Failed, V::NotRun, None, None), None);
-        let unsafe_detail = format!("bad\u{1b}\n\u{202e}{}", "界".repeat(800));
-        let reason = super::task_reason(S::Failed, V::NotRun, Some(&unsafe_detail), None).unwrap();
-        assert!(reason.len() <= 1024);
-        assert!(!reason.chars().any(char::is_control));
-        assert!(!reason.contains('\u{202e}'));
-        assert_eq!(
-            super::task_reason(S::Failed, V::NotRun, Some("updated"), None).as_deref(),
-            Some("updated")
-        );
     }
 
     #[test]
@@ -1281,8 +1488,7 @@ mod tests {
             .next()
             .unwrap();
         assert!(
-            open.find("self.task_panel.selected != Some(task_id)")
-                .unwrap()
+            open.find("!self.task_inspector_visible(task_id)").unwrap()
                 < open.find("request_diff(").unwrap()
         );
         let pump = source
