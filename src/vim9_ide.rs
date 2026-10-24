@@ -356,6 +356,10 @@ pub(super) enum Message {
         command: Vim9PaletteCommand,
         query: String,
     },
+    QuickWorkbenchSection {
+        query: String,
+        previous_query: String,
+    },
     MoveQuickSelection(isize),
     Browse(PathBuf),
     Directory(u64, Result<(PathBuf, Vec<ProjectEntry>), String>),
@@ -690,6 +694,28 @@ fn quick_palette_click(
 ) -> Option<Result<Vim9Command, &'static str>> {
     (form.kind == FormKind::QuickOpen && form.value == query)
         .then(|| quick_palette_command(&form.value, form.selected, Some(command), snapshot))
+}
+
+fn select_workbench_section(
+    form: &mut Form,
+    previous_query: &str,
+    query: &str,
+    snapshot: &Vim9Snapshot,
+) -> bool {
+    if form.kind != FormKind::QuickOpen
+        || form.value != previous_query
+        || !snapshot
+            .workbench
+            .sections()
+            .iter()
+            .any(|section| section.query == query)
+    {
+        return false;
+    }
+    form.value = query.to_owned();
+    form.selected = 0;
+    form.error = None;
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1760,6 +1786,19 @@ impl Ide {
                     form.selected = 0;
                 }
                 self.refresh_quick_matches(false);
+            }
+            Message::QuickWorkbenchSection {
+                query,
+                previous_query,
+            } => {
+                let selected = self.form.as_mut().is_some_and(|form| {
+                    select_workbench_section(form, &previous_query, &query, &self.snapshot)
+                });
+                if selected {
+                    // A section is a search filter, never an editor command.
+                    self.refresh_quick_matches(false);
+                    return widget::operate(operation::focusable::focus(Id::new(INPUT_ID)));
+                }
             }
             Message::SearchCase(value) => {
                 if self.search_form_open() {
@@ -2901,13 +2940,49 @@ impl Ide {
             }).size(13),
         ]
         .spacing(10);
+        // Keep the input at a stable widget-tree position while provider
+        // metadata, selected-section details and command results change.
+        // Otherwise typing away a provider prefix recreates the field and
+        // loses focus after its first character.
+        dialog_body = dialog_body.push(field);
         if quick {
             let context = self.snapshot.workbench.status_text();
             if !context.is_empty() {
                 dialog_body = dialog_body.push(text(visible_label(&context)).size(12));
             }
+            let sections = self.snapshot.workbench.sections();
+            if !sections.is_empty() {
+                let mut filters = row![].spacing(6);
+                let mut detail = None;
+                for section in sections {
+                    let active = section.matches_query(&form.value);
+                    if active {
+                        detail = Some(visible_label(&section.summary));
+                    }
+                    filters = filters.push(tooltip(
+                        button(text(section.title).size(13))
+                            .padding([5, 10])
+                            .style(if active {
+                                button::primary
+                            } else {
+                                button::secondary
+                            })
+                            .on_press(Message::QuickWorkbenchSection {
+                                query: section.query.to_owned(),
+                                previous_query: form.value.clone(),
+                            }),
+                        container(text(visible_label(&section.summary)).size(12))
+                            .padding(8)
+                            .style(container::rounded_box),
+                        tooltip::Position::Bottom,
+                    ));
+                }
+                dialog_body = dialog_body.push(filters.wrap());
+                if let Some(detail) = detail {
+                    dialog_body = dialog_body.push(text(detail).size(12));
+                }
+            }
         }
-        dialog_body = dialog_body.push(field);
         if let Some(error) = &form.error {
             dialog_body = dialog_body.push(
                 text(visible_label(error))
@@ -3699,6 +3774,79 @@ mod tests {
         ));
         assert!(vim9::vim9_palette_query("./>literal.rs").is_none());
     }
+
+    #[test]
+    fn workbench_sections_only_filter_live_pickers_and_keep_source_bound_actions() {
+        let mut snapshot = Vim9Snapshot {
+            connected: true,
+            mode: "n".into(),
+            buffer: 3,
+            window: 1001,
+            changedtick: 7,
+            line: 4,
+            column: 8,
+            capabilities: vec!["simple_git_status".into()],
+            ..Default::default()
+        };
+        snapshot.workbench.provider = "simple".into();
+        let mut form = Form {
+            kind: FormKind::QuickOpen,
+            value: ">save".into(),
+            selected: 9,
+            error: Some("old feedback".into()),
+        };
+        assert!(!select_workbench_section(
+            &mut form,
+            ">old",
+            ">simplegit",
+            &snapshot
+        ));
+        assert_eq!(form.value, ">save");
+        assert!(!select_workbench_section(
+            &mut form,
+            ">save",
+            ">:!arbitrary",
+            &snapshot
+        ));
+        assert!(select_workbench_section(
+            &mut form,
+            ">save",
+            ">simplegit",
+            &snapshot
+        ));
+        assert_eq!(form.selected, 0);
+        assert!(form.error.is_none());
+        let command = Vim9PaletteCommand::Workbench(vim9::Vim9WorkbenchAction::SimpleGitStatus);
+        assert!(quick_palette_click(&form, ">save", command, &snapshot).is_none());
+        assert_eq!(
+            serde_json::to_value(
+                quick_palette_click(&form, ">simplegit", command, &snapshot)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::json!({"action":"workbench", "command":"simple_git_status", "buffer":3, "window":1001, "changedtick":7, "line":4, "column":8})
+        );
+        snapshot.capabilities.clear();
+        assert!(quick_palette_click(&form, ">simplegit", command, &snapshot)
+            .unwrap()
+            .is_err());
+        snapshot.workbench.provider.clear();
+        assert!(!select_workbench_section(
+            &mut form,
+            ">simplegit",
+            ">simplecc",
+            &snapshot
+        ));
+        snapshot.workbench.provider = "simple".into();
+        form.kind = FormKind::Goto;
+        assert!(!select_workbench_section(
+            &mut form,
+            ">simplegit",
+            ">simplecc",
+            &snapshot
+        ));
+    }
     #[test]
     fn terminal_modes_keep_diagnostic_function_keys_with_vim() {
         for visible in [false, true] {
@@ -3723,7 +3871,9 @@ mod tests {
     #[test]
     fn startup_and_closing_do_not_own_shell_persistence_or_force_editor_exit() {
         let source = include_str!("vim9_ide.rs")
-            .split("#[cfg(test)]")
+            // Small test-only helpers can precede production methods. Stop
+            // at this test module, rather than truncating at those helpers.
+            .split("\n#[cfg(test)]\nmod tests {")
             .next()
             .unwrap();
         assert!(!source.contains("save_session_snapshot("));
