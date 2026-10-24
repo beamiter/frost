@@ -45,7 +45,6 @@ fn quick_page_rows(height: f32) -> usize {
 
 struct RenderSubscription {
     session_id: usize,
-    interval_ms: u64,
     editor: Vim9Session,
 }
 
@@ -53,35 +52,43 @@ impl std::hash::Hash for RenderSubscription {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::hash::Hash::hash(&self.session_id, state);
         std::hash::Hash::hash(&self.editor.entry_id(), state);
-        std::hash::Hash::hash(&self.interval_ms, state);
     }
 }
 
 fn render_stream(key: &RenderSubscription) -> impl iced::futures::Stream<Item = Message> + use<> {
     use iced::futures::SinkExt;
-    let editor = key.editor.clone();
-    let interval = Duration::from_millis(key.interval_ms);
+    let entry_id = key.editor.entry_id();
+    let updates = key.editor.watch_render();
     iced::stream::channel(
         1,
         move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
-            let mut previous = None;
-            loop {
-                let frame = editor.render_snapshot();
-                let revision = frame.as_ref().map(|frame| frame.revision);
-                if revision != previous {
-                    previous = revision;
-                    if output
+            let mut updates = match updates {
+                Ok(updates) => updates,
+                Err(error) => {
+                    log::warn!("Vim render subscription unavailable: {error}");
+                    // Do not leave an obsolete native frame visible on failure.
+                    let _ = output
                         .send(Message::RenderFrame {
-                            entry_id: editor.entry_id(),
-                            frame,
+                            entry_id,
+                            frame: None,
                         })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
+                        .await;
+                    return;
                 }
-                tokio::time::sleep(interval).await;
+            };
+            // This is an executor waker, not a timer or blocking task. Slow UI
+            // consumers coalesce publications instead of queuing old frames.
+            while let Some(update) = updates.changed().await {
+                if output
+                    .send(Message::RenderFrame {
+                        entry_id,
+                        frame: update.frame,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
         },
     )
@@ -2300,7 +2307,6 @@ impl Ide {
                 subscriptions.push(Subscription::run_with(
                     RenderSubscription {
                         session_id: session.id,
-                        interval_ms: if self.focused { 16 } else { 100 },
                         editor: editor.clone(),
                     },
                     render_stream,
