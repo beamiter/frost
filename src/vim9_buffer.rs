@@ -1452,7 +1452,7 @@ impl<Message> NativeBuffer<'_, Message> {
             // parity. GPU clipping alone still constructs every hidden quad.
             let start = ((run_clip.x - area.x) / step).floor().max(0.0) as usize;
             let mut x = area.x + start as f32 * step;
-            let mut up = start % 2 == 0;
+            let mut up = start.is_multiple_of(2);
             let end = (area.x + area.width).min(run_clip.x + run_clip.width);
             while x < end {
                 renderer.fill_quad(
@@ -3652,7 +3652,12 @@ mod tests {
         let baseline = rect.y + rect.height - thickness * 1.5;
         assert_eq!(
             recorder.quads[0].0.bounds.y,
-            baseline - if start % 2 == 0 { thickness } else { 0.0 }
+            baseline
+                - if start.is_multiple_of(2) {
+                    thickness
+                } else {
+                    0.0
+                }
         );
         assert!(recorder
             .text
