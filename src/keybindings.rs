@@ -131,6 +131,11 @@ pub enum Command {
     AiChatToggle,
     /// Open a coding-agent CLI in a new tab at the active pane cwd.
     AgentSessions,
+    /// Show or hide the experimental Tasks dock (the palette's "Toggle Tasks
+    /// Dashboard"). Ctrl+Alt+Shift+T by default, the chord anvil and forge use
+    /// for their Tasks panel; with the dashboard disabled it explains how to
+    /// enable it instead.
+    TaskToggle,
     AgentLaunchCodex,
     AgentLaunchClaude,
     AgentLaunchOpenCode,
@@ -233,6 +238,7 @@ impl std::fmt::Display for Command {
             Command::AgentToggle => write!(f, "agent:toggle"),
             Command::AiChatToggle => write!(f, "ai_chat:toggle"),
             Command::AgentSessions => write!(f, "agent:sessions"),
+            Command::TaskToggle => write!(f, "task:toggle"),
             Command::AgentLaunchCodex => write!(f, "agent:launch:codex"),
             Command::AgentLaunchClaude => write!(f, "agent:launch:claude"),
             Command::AgentLaunchOpenCode => write!(f, "agent:launch:opencode"),
@@ -327,6 +333,7 @@ impl std::str::FromStr for Command {
             "agent:toggle" => Ok(Command::AgentToggle),
             "ai_chat:toggle" => Ok(Command::AiChatToggle),
             "agent:sessions" => Ok(Command::AgentSessions),
+            "task:toggle" => Ok(Command::TaskToggle),
             "agent:launch:codex" => Ok(Command::AgentLaunchCodex),
             "agent:launch:claude" => Ok(Command::AgentLaunchClaude),
             "agent:launch:opencode" => Ok(Command::AgentLaunchOpenCode),
@@ -581,6 +588,12 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+shift+alt+g".to_string(), "agent:sessions".to_string());
+        // The Tasks dock, on anvil/forge's Ctrl+Alt+Shift+T. The letter is free
+        // in the ctrl+shift+alt trio; its Alt-less base (session:new) is not
+        // edit:copy, so the Alt-copy fallback cannot shadow it.
+        bindings
+            .bindings
+            .insert("ctrl+shift+alt+t".to_string(), "task:toggle".to_string());
 
         // 终端操作
         bindings
@@ -932,6 +945,56 @@ mod tests {
         assert_eq!(cmd, Command::AiChatToggle);
         assert_eq!(cmd.to_string(), "ai_chat:toggle");
         assert!("ai_chats:toggle".parse::<Command>().is_err());
+
+        let cmd: Command = "task:toggle".parse().unwrap();
+        assert_eq!(cmd, Command::TaskToggle);
+        assert_eq!(cmd.to_string(), "task:toggle");
+    }
+
+    /// The Tasks dock toggle ships on anvil/forge's chord without displacing
+    /// any existing default.
+    #[test]
+    fn task_toggle_ships_on_the_family_chord_without_conflicts() {
+        let defaults = KeyBindings::default_bindings();
+        let chord = KeyBinding::canonical("ctrl+alt+shift+t").unwrap();
+        // The table stores canonical keys, so one stored spelling means no
+        // other default resolves this chord.
+        let spellings = defaults
+            .bindings
+            .keys()
+            .filter(|key| KeyBinding::canonical(key).as_deref() == Some(chord.as_str()))
+            .count();
+        assert_eq!(spellings, 1);
+        // A second insert of the same key would silently replace an earlier
+        // default: the chord is inserted exactly once, so it was unbound.
+        let source = include_str!("keybindings.rs");
+        let defaults_body = source
+            .split("    pub fn default_bindings() -> Self {")
+            .nth(1)
+            .unwrap()
+            .split("\n    }\n")
+            .next()
+            .unwrap();
+        assert_eq!(
+            defaults_body
+                .matches(&format!(".insert(\"{chord}\".to_string()"))
+                .count(),
+            1,
+            "the chord was previously unbound"
+        );
+        for chord in ["ctrl+alt+shift+t", "shift+alt+ctrl+T"] {
+            assert_eq!(
+                defaults.get_command(chord),
+                Some(Command::TaskToggle),
+                "{chord}"
+            );
+        }
+        assert_eq!(defaults.chords_for("task:toggle").len(), 1);
+        assert_eq!(
+            defaults.get_command("ctrl+shift+t"),
+            Some(Command::SessionNew),
+            "the Alt-less base keeps its own command"
+        );
     }
 
     #[test]
@@ -1040,6 +1103,7 @@ mod tests {
             ("ctrl+shift+i", Command::BlockReinputSelectedCommands),
             ("ctrl+alt+g", Command::AgentToggle),
             ("ctrl+shift+alt+a", Command::AiChatToggle),
+            ("ctrl+alt+shift+t", Command::TaskToggle),
             ("ctrl+alt+r", Command::SearchReplaceToggle),
             ("ctrl+shift+x", Command::PaneSwap),
             ("ctrl+d", Command::TerminalSendEof),

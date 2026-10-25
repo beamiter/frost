@@ -372,7 +372,7 @@ impl PaletteState {
             PaletteItem {
                 name: "Toggle Tasks Dashboard",
                 description: "Show or hide the experimental agent tasks panel",
-                binding: None,
+                binding: Some("task:toggle"),
                 shortcut: "",
                 action: PaletteAction::ToggleTasks,
             },
@@ -1095,6 +1095,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(item.shortcut_label(&loaded.bindings).as_deref(), Some("F8"));
+    }
+
+    /// "Toggle Tasks Dashboard" runs the bindable `task:toggle`, so the row
+    /// shows the live chord (and nothing once the user unbinds it).
+    #[test]
+    fn tasks_toggle_row_reads_its_live_chord() {
+        let palette = PaletteState::new();
+        let tasks = palette
+            .all
+            .iter()
+            .find(|item| item.action == PaletteAction::ToggleTasks)
+            .expect("the palette offers the Tasks toggle");
+        assert_eq!(tasks.binding, Some("task:toggle"));
+        let defaults = crate::keybindings::KeyBindings::default_bindings();
+        assert_eq!(
+            tasks.shortcut_label(&defaults).as_deref(),
+            Some("Ctrl+Shift+Alt+T")
+        );
+        let mut unbound = defaults.clone();
+        unbound.bindings.remove("ctrl+shift+alt+t");
+        assert_eq!(tasks.shortcut_label(&unbound), None);
     }
 
     /// Every configurable item names a command the binding table can actually

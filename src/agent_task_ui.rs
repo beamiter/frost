@@ -127,6 +127,235 @@ pub(crate) fn task_workspace_layout<'a>(
     }
 }
 
+/// The active workspace never lists hidden (archived) tasks; the Hidden view
+/// lists only them, so `is:archived` and Restore have something to act on.
+pub(crate) fn task_in_dashboard_scope(
+    task: &crate::agent_task::AgentTask,
+    show_hidden: bool,
+) -> bool {
+    (task.status == crate::agent_task::TaskStatus::Archived) == show_hidden
+}
+
+/// Badge text and tooltip for tasks needing the user, shown outside the
+/// dock. `None` when nothing waits, so quiet workspaces stay unbadged.
+pub(crate) fn attention_badge(
+    counts: crate::agent_task::DashboardAttentionCounts,
+) -> Option<(usize, String)> {
+    Some((counts.total(), counts.summary()?))
+}
+
+/// Why Hide is unavailable, phrased as the step that makes it available.
+pub(crate) fn hide_blocked_reason(error: &crate::agent_task::TaskError) -> String {
+    match error {
+        crate::agent_task::TaskError::CannotArchiveRunning(_) => {
+            "Hide becomes available after the Agent, its native session and any validation stop."
+                .to_owned()
+        }
+        error => visible_bounded(&error.to_string(), MAX_TASK_DETAIL_DISPLAY_BYTES),
+    }
+}
+
+/// How long one user action keeps the runtime on the fast poll cadence.
+pub(crate) const PROMPT_POLL_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Report whether any text field inside the Tasks dock holds keyboard focus.
+///
+/// Iced text inputs leave keys they do not consume (arrows, Tab, Enter
+/// without a submit action, most Ctrl chords) uncaptured, so the app must
+/// know a dock field is focused to keep those keys away from the terminal.
+/// After every interaction and redraw the wrapper compares the live focus
+/// state with the app's flag (`reported`) and publishes `on_change` only when
+/// they differ, which also clears the flag after a focused field disappears.
+pub(crate) fn report_input_focus<'a, Message: 'a, Theme: 'a, Renderer>(
+    content: impl Into<iced::Element<'a, Message, Theme, Renderer>>,
+    reported: bool,
+    on_change: fn(bool) -> Message,
+) -> iced::Element<'a, Message, Theme, Renderer>
+where
+    Renderer: iced::advanced::renderer::Renderer + 'a,
+{
+    iced::Element::new(FocusReport {
+        content: content.into(),
+        reported,
+        on_change,
+    })
+}
+
+struct FocusReport<'a, Message, Theme, Renderer> {
+    content: iced::Element<'a, Message, Theme, Renderer>,
+    reported: bool,
+    on_change: fn(bool) -> Message,
+}
+
+/// Visits focusable widgets only, stopping at the first focused one.
+struct FocusProbe(bool);
+
+impl iced::advanced::widget::Operation for FocusProbe {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation)) {
+        if !self.0 {
+            operate(self);
+        }
+    }
+
+    fn focusable(
+        &mut self,
+        _id: Option<&iced::advanced::widget::Id>,
+        _bounds: iced::Rectangle,
+        state: &mut dyn iced::advanced::widget::operation::Focusable,
+    ) {
+        self.0 |= state.is_focused();
+    }
+}
+
+/// Focus moves on clicks, touches, keys and IME events, and a focused field
+/// can vanish with a rebuilt view; cursor movement alone never changes it.
+fn focus_may_have_changed(event: &iced::Event) -> bool {
+    use iced::{mouse, Event};
+    matches!(
+        event,
+        Event::Keyboard(_)
+            | Event::Touch(_)
+            | Event::InputMethod(_)
+            | Event::Mouse(mouse::Event::ButtonPressed(_) | mouse::Event::ButtonReleased(_))
+            | Event::Window(iced::window::Event::RedrawRequested(_))
+    )
+}
+
+impl<Message, Theme, Renderer> iced::advanced::Widget<Message, Theme, Renderer>
+    for FocusReport<'_, Message, Theme, Renderer>
+where
+    Renderer: iced::advanced::renderer::Renderer,
+{
+    fn children(&self) -> Vec<iced::advanced::widget::Tree> {
+        vec![iced::advanced::widget::Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut iced::advanced::widget::Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> iced::Size<iced::Length> {
+        self.content.as_widget().size()
+    }
+
+    fn size_hint(&self) -> iced::Size<iced::Length> {
+        self.content.as_widget().size_hint()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &Renderer,
+        limits: &iced::advanced::layout::Limits,
+    ) -> iced::advanced::layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn draw(
+        &self,
+        tree: &iced::advanced::widget::Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &iced::advanced::renderer::Style,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        layout: iced::advanced::Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn iced::advanced::widget::Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        event: &iced::Event,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn iced::advanced::Clipboard,
+        shell: &mut iced::advanced::Shell<'_, Message>,
+        viewport: &iced::Rectangle,
+    ) {
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+        if !focus_may_have_changed(event) {
+            return;
+        }
+        let mut probe = FocusProbe(false);
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, &mut probe);
+        if probe.0 != self.reported {
+            // Publish one change per rebuilt view, not one per event.
+            self.reported = probe.0;
+            shell.publish((self.on_change)(probe.0));
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &iced::advanced::widget::Tree,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+        renderer: &Renderer,
+    ) -> iced::mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut iced::advanced::widget::Tree,
+        layout: iced::advanced::Layout<'b>,
+        renderer: &Renderer,
+        viewport: &iced::Rectangle,
+        translation: iced::Vector,
+    ) -> Option<iced::advanced::overlay::Element<'b, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+
 /// Counts describe current search matches before the selected quick view.
 pub(crate) fn dashboard_filter_label(
     view: crate::agent_task::DashboardView,
@@ -488,7 +717,19 @@ pub(crate) struct TaskPanel {
     /// Narrow docks show either the list or inspector; wide docks show both.
     /// The selected identity and its draft remain independent of this view.
     pub(crate) inspector_open: bool,
+    /// List hidden (archived) tasks instead of the active workspace. The
+    /// only lifecycle action offered there is Restore.
+    pub(crate) show_hidden: bool,
+    /// A text field in the visible Tasks dock has keyboard focus, as last
+    /// reported by [`report_input_focus`]. It owns typing until it blurs.
+    pub(crate) input_focused: bool,
+    /// The user's own deny, reply, finish or cancel requests a short burst
+    /// of fast runtime polls (see [`TaskPanel::request_prompt_poll`]).
+    prompt_poll_until: Option<std::time::Instant>,
     pub(crate) dashboard_query: String,
+    /// Shared-parser explanation for `dashboard_query`, kept with it so a
+    /// frame does not parse the query again just to show the error.
+    dashboard_query_error: Option<String>,
     pub(crate) dashboard_query_notice: Option<&'static str>,
     pub(crate) dashboard_view: crate::agent_task::DashboardView,
     pub(crate) dashboard_attention: Option<crate::agent_task::DashboardAttentionKind>,
@@ -520,7 +761,11 @@ impl TaskPanel {
         Self {
             selected: None,
             inspector_open: false,
+            show_hidden: false,
+            input_focused: false,
+            prompt_poll_until: None,
             dashboard_query: String::new(),
+            dashboard_query_error: None,
             dashboard_query_notice: None,
             dashboard_view: crate::agent_task::DashboardView::All,
             dashboard_attention: None,
@@ -589,15 +834,35 @@ impl TaskPanel {
         }
     }
 
+    /// Clear the filters that narrow the current list. The Hidden view uses
+    /// only the search, provider, project and sort, so there it leaves the
+    /// workspace's quick view and attention reason untouched (see
+    /// [`TaskPanel::set_show_hidden`]).
     pub(crate) fn clear_dashboard_filters(&mut self) {
         self.retire_panel_callbacks();
         self.dashboard_query.clear();
+        self.dashboard_query_error = None;
         self.dashboard_query_notice = None;
-        self.dashboard_view = crate::agent_task::DashboardView::All;
-        self.dashboard_attention = None;
+        if !self.show_hidden {
+            self.dashboard_view = crate::agent_task::DashboardView::All;
+            self.dashboard_attention = None;
+        }
         self.dashboard_provider = None;
         self.dashboard_repo = None;
         self.dashboard_sort = crate::agent_task::DashboardSort::default();
+    }
+
+    /// Whether any filter narrows the current list, which is when Clear
+    /// filters is offered. Quick views and attention reasons do not apply
+    /// to the Hidden view and do not count there.
+    pub(crate) fn has_dashboard_filters(&self) -> bool {
+        !self.dashboard_query.is_empty()
+            || self.dashboard_provider.is_some()
+            || self.dashboard_repo.is_some()
+            || self.dashboard_sort != crate::agent_task::DashboardSort::default()
+            || (!self.show_hidden
+                && (self.dashboard_view != crate::agent_task::DashboardView::All
+                    || self.dashboard_attention.is_some()))
     }
 
     pub(crate) fn set_dashboard_view(&mut self, view: crate::agent_task::DashboardView) {
@@ -610,14 +875,45 @@ impl TaskPanel {
         self.retire_panel_callbacks();
         // Keep the complete grammar for the shared parser. Truncating before
         // parsing could silently drop an exclusion and broaden the results.
+        // Text over core's 256-byte limit is kept and explained by core with
+        // zero matches; only an implausible paste is refused whole.
         if query.len() > 4096 {
             self.dashboard_query_notice = Some(
                 "Search paste exceeds 4 KiB. Previous query kept; edit it before pressing Enter.",
             );
             return;
         }
+        self.dashboard_query_error = crate::agent_task::dashboard_query_error(&query);
         self.dashboard_query = query;
         self.dashboard_query_notice = None;
+    }
+
+    /// Core's explanation for the current search text, parsed once per edit.
+    pub(crate) fn dashboard_query_error(&self) -> Option<&str> {
+        self.dashboard_query_error.as_deref()
+    }
+
+    /// Switch between the active workspace and hidden (archived) tasks. The
+    /// search, provider, project and sort stay; quick views and attention
+    /// reasons apply only to the active workspace and are left untouched.
+    pub(crate) fn set_show_hidden(&mut self, show: bool) {
+        if self.show_hidden != show {
+            self.retire_panel_callbacks();
+            self.show_hidden = show;
+        }
+    }
+
+    /// The user's own deny, reply, finish or cancel is handled by a runtime
+    /// worker. Core no longer asks for fast polling while a native task waits
+    /// for an approval or a reply, so poll quickly for a short window to show
+    /// the outcome promptly instead of waiting for the slow lifecycle tick.
+    pub(crate) fn request_prompt_poll(&mut self) {
+        self.prompt_poll_until = Some(std::time::Instant::now() + PROMPT_POLL_WINDOW);
+    }
+
+    pub(crate) fn prompt_poll_active(&self) -> bool {
+        self.prompt_poll_until
+            .is_some_and(|until| std::time::Instant::now() < until)
     }
 
     pub(crate) fn set_dashboard_attention(
@@ -635,6 +931,15 @@ impl TaskPanel {
         &self,
         scope: &crate::agent_task::DashboardSnapshot,
     ) -> crate::agent_task::DashboardSnapshot {
+        if self.show_hidden {
+            // Hidden tasks never match a lifecycle quick view or attention
+            // reason; list every searched hidden task in the chosen order.
+            return scope.view(
+                crate::agent_task::DashboardView::All,
+                None,
+                self.dashboard_sort,
+            );
+        }
         scope.view(
             self.dashboard_view,
             self.dashboard_attention,
@@ -1904,6 +2209,509 @@ mod tests {
         assert!(validation_command_argv(None, "cargo test").is_err());
         assert!(validation_command_argv(Some(""), "cargo test").is_err());
         assert!(validation_command_argv(Some("/nonexistent-shell"), "cargo test").is_err());
+    }
+
+    fn fixture_task(manager: &mut crate::agent_task::TaskManager, title: &str) -> TaskId {
+        manager
+            .create(crate::agent_task::NewTask {
+                title: title.into(),
+                provider: AgentProvider::Codex,
+                repo_root: "/fixture".into(),
+                worktree_path: "/fixture/worktree".into(),
+                branch: "test/hidden".into(),
+                base_commit: "a".repeat(40),
+                source_context: None,
+            })
+            .unwrap()
+    }
+
+    fn project_scope(
+        manager: &crate::agent_task::TaskManager,
+        panel: &TaskPanel,
+    ) -> crate::agent_task::DashboardSnapshot {
+        let scope = crate::agent_task::DashboardSnapshot::project_unsorted(
+            manager
+                .tasks()
+                .iter()
+                .filter(|task| task_in_dashboard_scope(task, panel.show_hidden)),
+            |_| Default::default(),
+            crate::agent_task::DashboardFilter {
+                text: &panel.dashboard_query,
+                ..Default::default()
+            },
+        );
+        panel.dashboard_from_scope(&scope)
+    }
+
+    #[test]
+    fn hidden_view_lists_only_hidden_tasks_and_restore_returns_them() {
+        use crate::agent_task::{DashboardAttentionKind, DashboardView, TaskManager, TaskStatus};
+        let mut manager = TaskManager::new();
+        let visible = fixture_task(&mut manager, "Visible work");
+        let hidden = fixture_task(&mut manager, "Hidden work");
+        manager
+            .update_status(hidden, TaskStatus::ReadyForReview, None)
+            .unwrap();
+        assert_eq!(manager.can_archive(hidden), Ok(()));
+        manager.archive(hidden).unwrap();
+        assert_eq!(manager.archived_count(), 1);
+
+        let mut panel = TaskPanel::new();
+        panel.set_dashboard_attention(DashboardAttentionKind::Review);
+        let active = project_scope(&manager, &panel);
+        assert!(active.selected_index(Some(hidden)).is_none());
+
+        // The Hidden view ignores lifecycle quick views and attention reasons
+        // (hidden tasks match none of them) but keeps the user's search.
+        panel.set_dashboard_query("is:archived".into());
+        panel.set_show_hidden(true);
+        let listed = project_scope(&manager, &panel);
+        assert_eq!(listed.rows.len(), 1);
+        assert_eq!(listed.rows[0].id, hidden);
+        assert_eq!(panel.dashboard_query, "is:archived");
+        assert_eq!(
+            panel.dashboard_attention,
+            Some(DashboardAttentionKind::Review)
+        );
+        panel.select(Some(hidden));
+        assert!(panel.inspector_is_visible(hidden, false, &listed));
+
+        manager.restore(hidden).unwrap();
+        assert_eq!(
+            manager.get(hidden).unwrap().status,
+            TaskStatus::ReadyForReview
+        );
+        assert_eq!(manager.archived_count(), 0);
+        assert!(project_scope(&manager, &panel).rows.is_empty());
+        panel.set_show_hidden(false);
+        panel.set_dashboard_view(DashboardView::All);
+        panel.clear_dashboard_filters();
+        let back = project_scope(&manager, &panel);
+        assert!(back.selected_index(Some(hidden)).is_some());
+        assert!(back.selected_index(Some(visible)).is_some());
+        assert_eq!(
+            panel.selected,
+            Some(hidden),
+            "the restored task stays selected"
+        );
+    }
+
+    #[test]
+    fn hidden_view_clear_filters_keeps_the_workspace_quick_view() {
+        use crate::agent_task::{DashboardAttentionKind, DashboardView};
+        let mut panel = TaskPanel::new();
+        panel.set_dashboard_view(DashboardView::Running);
+        panel.set_dashboard_attention(DashboardAttentionKind::Approval);
+        panel.set_show_hidden(true);
+        // Quick views and attention reasons do not narrow the Hidden view,
+        // so they neither offer Clear filters there nor get cleared by it.
+        assert!(!panel.has_dashboard_filters());
+        panel.set_dashboard_query("release".into());
+        assert!(panel.has_dashboard_filters());
+        panel.clear_dashboard_filters();
+        assert!(panel.dashboard_query.is_empty());
+        assert!(!panel.has_dashboard_filters());
+        assert_eq!(
+            panel.dashboard_attention,
+            Some(DashboardAttentionKind::Approval)
+        );
+        // In the workspace they are filters again, and Clear filters clears
+        // them.
+        panel.set_show_hidden(false);
+        assert!(panel.has_dashboard_filters());
+        panel.clear_dashboard_filters();
+        assert_eq!(panel.dashboard_view, DashboardView::All);
+        assert_eq!(panel.dashboard_attention, None);
+        assert!(!panel.has_dashboard_filters());
+    }
+
+    #[test]
+    fn every_way_of_showing_tasks_or_creating_one_leaves_the_hidden_view() {
+        let source = include_str!("main.rs");
+        let body = |start: &str, end: &str| {
+            source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("{start}"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("{end}"))
+                .0
+                .to_owned()
+        };
+        for (start, end) in [
+            // Toggle, the library's Tasks button, composer and block "Create
+            // task" all open the dock through this setter.
+            (
+                "    fn set_task_panel_open(",
+                "    /// Show or hide the Tasks dock panel",
+            ),
+            (
+                "    fn toggle_sidebar(",
+                "        self.sidebar_open = !self.sidebar_open;",
+            ),
+            (
+                "            Message::SetSidebarPanel(panel) => {",
+                "                self.sidebar_panel = panel;",
+            ),
+            // A registered task is selected in the workspace.
+            (
+                "                    Ok(task_id) => {",
+                "                        self.task_panel.select(Some(task_id));",
+            ),
+            // Restore shows the restored task in the workspace.
+            (
+                "            Message::TaskRestore(task_id) => {",
+                "            Message::TaskInputFocus(",
+            ),
+        ] {
+            assert!(
+                body(start, end).contains("self.task_panel.set_show_hidden(false);"),
+                "{start}"
+            );
+        }
+        // Nothing hidden remains: the view (and its toggle) closes itself.
+        let tick = body(
+            "    fn tasks_tick(&mut self) {",
+            "    fn task_terminal_index(",
+        );
+        assert!(tick.contains(
+            "if self.task_panel.show_hidden && self.task_manager.archived_count() == 0 {"
+        ));
+        // Clear filters is offered only for filters that narrow this list.
+        assert!(source.contains("if self.task_panel.has_dashboard_filters() {"));
+    }
+
+    #[test]
+    fn focused_task_fields_pass_app_commands_but_never_terminal_bindings() {
+        use crate::keybindings::Command as C;
+        for command in [
+            C::TerminalSendSigint,
+            C::TerminalSendEof,
+            C::TerminalClear,
+            C::TerminalScrollUp,
+            C::EditPaste,
+            C::EditCopy,
+            C::BlockSelectNext,
+            C::BlockReinputSelectedCommands,
+            C::BlockRetryFailed,
+            C::TerminalPromptPrev,
+        ] {
+            assert!(crate::command_targets_terminal(&command), "{command}");
+        }
+        for command in [
+            C::SessionNew,
+            C::SessionClose,
+            C::SessionNext,
+            C::TaskToggle,
+            C::SidebarToggle,
+            C::AgentSessions,
+            C::FontZoomIn,
+            C::FontZoomReset,
+            C::PaneFocusNext,
+            C::SearchOpen,
+            C::ConfigToggle,
+        ] {
+            assert!(!crate::command_targets_terminal(&command), "{command}");
+        }
+    }
+
+    #[test]
+    fn hide_is_offered_only_when_the_manager_accepts_it() {
+        use crate::agent_task::{TaskError, TaskManager};
+        let mut manager = TaskManager::new();
+        let id = fixture_task(&mut manager, "Busy");
+        manager
+            .bind_terminal_session(id, "busy-terminal".into())
+            .unwrap();
+        let refused = manager.can_archive(id).unwrap_err();
+        assert_eq!(refused, TaskError::CannotArchiveRunning(id));
+        assert!(hide_blocked_reason(&refused).contains("after the Agent"));
+        assert!(manager.archive(id).is_err());
+        manager.handle_terminal_session_exit("busy-terminal", Some(0));
+        assert_eq!(manager.can_archive(id), Ok(()));
+        let unknown = TaskId::new();
+        let reason = hide_blocked_reason(&manager.can_archive(unknown).unwrap_err());
+        assert!(!reason.is_empty() && reason.len() <= MAX_TASK_DETAIL_DISPLAY_BYTES);
+    }
+
+    #[test]
+    fn attention_badge_counts_and_explains_tasks_needing_the_user() {
+        use crate::agent_task::{TaskManager, TaskStatus};
+        let mut manager = TaskManager::new();
+        assert_eq!(attention_badge(manager.attention_counts()), None);
+        let approval = fixture_task(&mut manager, "Approval");
+        let reply = fixture_task(&mut manager, "Reply");
+        let quiet = fixture_task(&mut manager, "Quiet");
+        manager
+            .update_status(approval, TaskStatus::WaitingForApproval, None)
+            .unwrap();
+        manager
+            .update_status(reply, TaskStatus::WaitingForHuman, None)
+            .unwrap();
+        assert_eq!(
+            attention_badge(manager.attention_counts()),
+            Some((2, "2 tasks need you: 1 approval, 1 reply".to_owned()))
+        );
+        manager.archive(quiet).unwrap();
+        assert_eq!(attention_badge(manager.attention_counts()).unwrap().0, 2);
+    }
+
+    #[test]
+    fn user_runtime_actions_request_a_bounded_fast_poll_burst() {
+        let mut panel = TaskPanel::new();
+        assert!(!panel.prompt_poll_active());
+        panel.request_prompt_poll();
+        assert!(panel.prompt_poll_active());
+        panel.prompt_poll_until =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        assert!(!panel.prompt_poll_active(), "the burst expires on its own");
+        let source = include_str!("main.rs");
+        let pump = source
+            .split("let tasks_open =")
+            .nth(1)
+            .unwrap()
+            .split("if self.agent_sessions.open")
+            .next()
+            .unwrap();
+        assert!(pump.contains("|| self.task_panel.prompt_poll_active()"));
+        for (start, end) in [
+            (
+                "Message::TaskCancelNative(task_id) => {",
+                "Message::TaskFinishNative",
+            ),
+            (
+                "Message::TaskFinishNative(task_id) => {",
+                "Message::AgentLaunch",
+            ),
+            (
+                "Message::TaskFollowUpSend(reference) => {",
+                "Message::TaskApprovalDeny",
+            ),
+            (
+                "Message::TaskApprovalDeny(task_id, approval_id) => {",
+                "Message::TaskDiffOpen",
+            ),
+        ] {
+            let body = source
+                .split(start)
+                .nth(1)
+                .unwrap()
+                .split(end)
+                .next()
+                .unwrap();
+            assert!(
+                body.contains("self.task_panel.request_prompt_poll();"),
+                "{start} must poll promptly after the user's own action"
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_query_error_is_parsed_once_per_edit() {
+        let mut panel = TaskPanel::new();
+        panel.set_dashboard_query("status:nonsense".into());
+        assert_eq!(
+            panel.dashboard_query_error().map(str::to_owned),
+            crate::agent_task::dashboard_query_error("status:nonsense")
+        );
+        // Over core's 256-byte limit: kept whole and explained, not truncated.
+        let long = format!("{} -provider:codex", "x".repeat(300));
+        panel.set_dashboard_query(long.clone());
+        assert_eq!(panel.dashboard_query, long);
+        assert!(panel.dashboard_query_error().is_some());
+        panel.clear_dashboard_filters();
+        assert!(panel.dashboard_query_error().is_none());
+        let view = include_str!("main.rs")
+            .split("    fn sidebar_tasks_view(")
+            .nth(1)
+            .unwrap()
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(!view.contains("agent_task::dashboard_query_error("));
+        assert!(!view.contains("let tasks: Vec<_>"));
+    }
+
+    #[test]
+    fn focus_report_publishes_changes_and_clears_after_the_field_disappears() {
+        use iced::advanced::widget::{operation, Id, Tree};
+        use iced::advanced::{layout, Layout, Shell};
+        use iced::widget::{button, column, text_input};
+        use iced::{Element, Rectangle, Size};
+
+        #[derive(Clone, Debug, PartialEq)]
+        enum Msg {
+            Input(String),
+            Focus(bool),
+            Press,
+        }
+        let id = Id::new("task-search-test");
+        let view = |reported: bool, with_input: bool| -> Element<'static, Msg, iced::Theme, ()> {
+            let mut content = column![button("Next").on_press(Msg::Press)];
+            if with_input {
+                content = content.push(
+                    text_input("Search", "query")
+                        .id(id.clone())
+                        .on_input(Msg::Input),
+                );
+            }
+            report_input_focus(content, reported, Msg::Focus)
+        };
+        let viewport = Rectangle::with_size(Size::new(400.0, 200.0));
+        let redraw = iced::Event::Window(iced::window::Event::RedrawRequested(
+            std::time::Instant::now(),
+        ));
+        let mut element = view(false, true);
+        let mut tree = Tree::new(element.as_widget());
+        let mut node = element.as_widget_mut().layout(
+            &mut tree,
+            &(),
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let mut messages = Vec::new();
+        let update = |element: &mut Element<'static, Msg, iced::Theme, ()>,
+                      tree: &mut Tree,
+                      node: &layout::Node,
+                      event: &iced::Event,
+                      messages: &mut Vec<Msg>| {
+            element.as_widget_mut().update(
+                tree,
+                event,
+                Layout::new(node),
+                iced::mouse::Cursor::Unavailable,
+                &(),
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(messages),
+                &viewport,
+            );
+        };
+        update(&mut element, &mut tree, &node, &redraw, &mut messages);
+        assert!(messages.is_empty(), "nothing is focused yet");
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &(),
+            &mut operation::focusable::focus(id.clone()),
+        );
+        update(&mut element, &mut tree, &node, &redraw, &mut messages);
+        update(&mut element, &mut tree, &node, &redraw, &mut messages);
+        assert_eq!(messages, [Msg::Focus(true)], "one report per change");
+
+        // The app adopted the report; an unchanged state stays quiet.
+        let mut element = view(true, true);
+        tree.diff(element.as_widget());
+        node = element.as_widget_mut().layout(
+            &mut tree,
+            &(),
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        messages.clear();
+        update(&mut element, &mut tree, &node, &redraw, &mut messages);
+        assert!(messages.is_empty());
+        // A cursor move cannot change focus and does not probe.
+        update(
+            &mut element,
+            &mut tree,
+            &node,
+            &iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+                position: iced::Point::ORIGIN,
+            }),
+            &mut messages,
+        );
+        assert!(messages.is_empty());
+
+        // The focused field disappears with its card: the stale flag clears.
+        let mut element = view(true, false);
+        tree.diff(element.as_widget());
+        node = element.as_widget_mut().layout(
+            &mut tree,
+            &(),
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        update(&mut element, &mut tree, &node, &redraw, &mut messages);
+        assert_eq!(messages, [Msg::Focus(false)]);
+    }
+
+    #[test]
+    fn focused_task_fields_keep_unconsumed_keys_from_the_terminal() {
+        let source = include_str!("main.rs");
+        let input = source
+            .split("    fn terminal_input_active(")
+            .nth(1)
+            .unwrap()
+            .split("    fn chat_input_ready(")
+            .next()
+            .unwrap();
+        assert!(input.contains("&& !self.task_input_owns_keys()"));
+        let keys = source
+            .split("            Message::Key(event) => {")
+            .nth(1)
+            .unwrap()
+            .split("            Message::MousePane(")
+            .next()
+            .unwrap();
+        // A terminal-targeting binding is dropped before any handler runs;
+        // block selection is skipped; app commands, chrome shortcuts and
+        // scrolling run as usual; and a hard stop precedes the PTY write.
+        let owner = keys
+            .find("let task_input = self.task_input_owns_keys();")
+            .unwrap();
+        let dropped = keys
+            .find(".is_some_and(|command| command_targets_terminal(&command))")
+            .unwrap();
+        let blocks = keys.find(".filter(|_| !task_input)").unwrap();
+        let block_context = keys.find("let block_key_context = self").unwrap();
+        let binding = keys
+            .find("if let Some(task) = self.handle_keybinding(&key, modifiers, retreat_before_key)")
+            .unwrap();
+        let chrome = keys
+            .find("self.handle_tab_shortcut(&key, modifiers, retreat_before_key)")
+            .unwrap();
+        let scroll = keys
+            .find("if self.handle_scroll_shortcut(&key, modifiers) {")
+            .unwrap();
+        let stop = keys
+            .find("if task_input {\n                        return Task::none();\n                    }")
+            .unwrap();
+        let pty = keys
+            .find("encode_key(&key, location, modifiers, text.as_deref(), app_cursor, enh)")
+            .unwrap();
+        assert!(owner < dropped && dropped < block_context && block_context < blocks);
+        assert!(
+            blocks
+                < keys
+                    .find("let selection_owns_keys = block_key_context")
+                    .unwrap()
+        );
+        assert!(blocks < binding && binding < chrome && chrome < scroll);
+        assert!(scroll < stop && stop < pty);
+        // The composer owns typing too, but its documented toggles work.
+        let composer = keys
+            .split("if self.task_composer_visible() {")
+            .nth(1)
+            .unwrap()
+            .split("if self.agent_sessions.open {")
+            .next()
+            .unwrap();
+        assert!(composer.contains("keybindings::Command::TaskToggle"));
+        assert!(composer.contains("if let Some(task) = self.dispatch_command(command) {"));
+        let owner = source
+            .split("    fn task_input_owns_keys(")
+            .nth(1)
+            .unwrap()
+            .split("\n    }\n")
+            .next()
+            .unwrap();
+        for required in [
+            "self.task_panel.input_focused",
+            "self.sidebar_panel == SidebarPanel::Tasks",
+            "self.dock_open()",
+        ] {
+            assert!(owner.contains(required), "{required}");
+        }
+        assert!(source.contains(
+            "agent_task_ui::report_input_focus(\n                self.sidebar_tasks_view(),"
+        ));
     }
 }
 

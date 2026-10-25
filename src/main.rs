@@ -1366,6 +1366,25 @@ fn clear_stale_hidden_match_diagnostic(error: &mut Option<String>) {
 /// block history is hidden/unsafe (Block Mode off or alternate screen). This
 /// preflight is keybinding-only; palette/menu actions still explain refusal
 /// with a toast through `ensure_block_action_available`.
+/// Bindings that write to the active terminal or act on its selection or
+/// block selection. While a Tasks-dock field owns typing, keys it did not
+/// consume never trigger these; every other binding is an app command.
+fn command_targets_terminal(command: &keybindings::Command) -> bool {
+    use keybindings::Command as C;
+    command_requires_block_context(command)
+        || matches!(
+            command,
+            C::TerminalSendSigint
+                | C::TerminalSendEof
+                | C::TerminalClear
+                | C::TerminalScrollUp
+                | C::TerminalScrollDown
+                | C::EditPaste
+                | C::EditCopy
+                | C::EditCopyBlockOutput
+        )
+}
+
 fn command_requires_block_context(command: &keybindings::Command) -> bool {
     use keybindings::Command as C;
     matches!(
@@ -4739,6 +4758,12 @@ enum Message {
     TaskDashboardShowInspector,
     TaskSelect(agent_task::TaskId),
     TaskHide(agent_task::TaskId),
+    /// Show hidden (archived) tasks instead of the active workspace.
+    TaskDashboardHidden(bool),
+    /// Return a hidden task to the lifecycle state it had when hidden.
+    TaskRestore(agent_task::TaskId),
+    /// A Tasks-dock text field gained or lost keyboard focus.
+    TaskInputFocus(bool),
     TaskCreateWithProvider(std::sync::Arc<()>, agent_task::AgentProvider),
     TaskCreateProviderCancel(std::sync::Arc<()>),
     TaskStartNative(agent_task::TaskId),
@@ -4798,8 +4823,10 @@ enum Message {
     AgentSessionsProvider(Option<jterm_core::agent_sessions::SessionProvider>),
     AgentSessionsStatus(Option<jterm_core::agent_sessions::SessionStatus>),
     AgentSessionsSelect(agent_sessions::SessionKey),
-    AgentSessionsResume,
-    AgentSessionsCopy,
+    /// Resume or switch to exactly the conversation the action was rendered
+    /// for; a stale press after the selection changed does nothing.
+    AgentSessionsResume(agent_sessions::SessionKey),
+    AgentSessionsCopy(agent_sessions::SessionKey),
     /// Periodic reducer/driver poll while the dashboard is open or a provider
     /// session is active.
     TaskTick,
@@ -7871,6 +7898,7 @@ impl Frost {
             && self.sidebar_dialog.is_none()
             && self.sidebar_delete_confirm.is_none()
             && !self.sidebar_files_focused
+            && !self.task_input_owns_keys()
     }
 
     fn chat_input_ready(&self, session_id: usize) -> bool {
@@ -8518,6 +8546,9 @@ impl Frost {
     /// palette behave identically.
     fn toggle_sidebar(&mut self) -> Task<Message> {
         self.task_panel.retire_panel_callbacks();
+        self.task_panel.input_focused = false;
+        // Hiding or showing the dock ends the Hidden tasks browsing mode.
+        self.task_panel.set_show_hidden(false);
         self.invalidate_sidebar_remote_follow_intent();
         self.sidebar_open = !self.sidebar_open;
         self.sidebar_files_focused = self.sidebar_open && self.sidebar_panel == SidebarPanel::Files;
@@ -11411,6 +11442,9 @@ impl Frost {
             }
             C::AiChatToggle => self.toggle_ai_chats(),
             C::AgentSessions => Task::done(Message::AgentSessionsToggle),
+            // Same path as the palette's Toggle Tasks Dashboard, including the
+            // explanation toast while the dashboard is disabled.
+            C::TaskToggle => Task::done(Message::TaskPanelToggle),
             C::AgentLaunchCodex => {
                 Task::done(Message::AgentLaunch(agent_task::AgentProvider::Codex))
             }
@@ -17195,15 +17229,44 @@ impl Frost {
                 }
             }
             Message::TaskHide(task_id) => {
-                if !self.task_inspector_visible(task_id) {
+                // The Hidden view offers Restore only.
+                if self.task_panel.show_hidden || !self.task_inspector_visible(task_id) {
                     return Task::none();
                 }
                 if let Err(error) = self.task_manager.archive(task_id) {
                     self.push_toast(error.to_string(), ToastKind::Warning);
-                } else if self.task_panel.selected == Some(task_id) {
-                    self.task_panel.select(None);
+                } else {
+                    if self.task_panel.selected == Some(task_id) {
+                        self.task_panel.select(None);
+                    }
+                    self.push_toast("Task hidden · Restore it from Hidden", ToastKind::Info);
                 }
             }
+            Message::TaskDashboardHidden(show) => {
+                self.task_panel
+                    .set_show_hidden(show && self.config.experimental_task_sidebar);
+            }
+            Message::TaskRestore(task_id) => {
+                if !self.task_panel.show_hidden || !self.task_inspector_visible(task_id) {
+                    return Task::none();
+                }
+                // Restoring returns the recorded lifecycle state only; it never
+                // starts an Agent, reruns validation or accepts work.
+                match self.task_manager.restore(task_id) {
+                    Ok(()) => {
+                        let status = self
+                            .task_manager
+                            .get(task_id)
+                            .map_or("Restored", |task| task.status.label());
+                        // Back to the workspace with the restored task still
+                        // selected, where its normal actions apply again.
+                        self.task_panel.set_show_hidden(false);
+                        self.push_toast(format!("Task restored · {status}"), ToastKind::Success);
+                    }
+                    Err(error) => self.push_toast(error.to_string(), ToastKind::Warning),
+                }
+            }
+            Message::TaskInputFocus(focused) => self.task_panel.input_focused = focused,
             Message::TaskCreateWithProvider(reference, provider) => {
                 self.task_create_with_provider(reference, provider);
             }
@@ -17233,6 +17296,7 @@ impl Frost {
                         ToastKind::Warning,
                     );
                 } else {
+                    self.task_panel.request_prompt_poll();
                     self.push_toast("Cancelling native Agent session…", ToastKind::Info);
                 }
             }
@@ -17250,6 +17314,8 @@ impl Frost {
                         ),
                         ToastKind::Warning,
                     );
+                } else {
+                    self.task_panel.request_prompt_poll();
                 }
             }
             Message::AgentLaunch(provider) => self.agent_launch_in_tab(provider),
@@ -17267,37 +17333,30 @@ impl Frost {
                     if self.agent_sessions.project.is_none() {
                         self.agent_sessions.project_only = false;
                     }
-                    self.agent_sessions.reconcile();
-                    self.agent_sessions.refresh();
+                    // A selection the current filters no longer list is
+                    // replaced by the first match, then one full refresh.
+                    self.agent_sessions.open_view();
                     return iced::widget::operation::focus(AGENT_SESSIONS_INPUT_ID.clone());
                 }
             }
             Message::AgentSessionsSurface => {}
             Message::AgentSessionsClose => self.agent_sessions.close(),
-            Message::AgentSessionsRefresh => {
-                self.agent_sessions.cancel_confirmation();
-                self.agent_sessions.refresh();
-                self.agent_sessions.sync_preflight();
-                self.agent_sessions.preflight.refresh();
-            }
+            // F5 calls the same method: rescan, reload the library, re-check.
+            Message::AgentSessionsRefresh => self.agent_sessions.refresh(),
             Message::AgentSessionsPinned(enabled) => {
-                self.agent_sessions.cancel_confirmation();
                 self.agent_sessions.pinned_only = enabled;
-                self.agent_sessions.selected = None;
-                self.agent_sessions.reconcile();
+                self.agent_sessions.apply_filters();
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsRecent(enabled) => {
-                self.agent_sessions.cancel_confirmation();
                 self.agent_sessions.recent_only = enabled;
-                self.agent_sessions.selected = None;
-                self.agent_sessions.reconcile();
+                self.agent_sessions.apply_filters();
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsPin((provider, id)) => {
                 if !self.agent_sessions.open
                     || self.agent_sessions.editing()
-                    || self.agent_sessions.selected.as_ref() != Some(&(provider, id.clone()))
+                    || self.agent_sessions.selected_key().as_ref() != Some(&(provider, id.clone()))
                 {
                     return Task::none();
                 }
@@ -17307,21 +17366,25 @@ impl Frost {
                     .store
                     .snapshot()
                     .is_pinned(provider, &id);
-                if let Err(error) = self.agent_sessions.store.set_pinned(provider, &id, pinned) {
-                    self.agent_sessions.notice = Some(error);
+                match self.agent_sessions.store.set_pinned(provider, &id, pinned) {
+                    // Unpinning can take it out of Pinned only (or an
+                    // `is:pinned` search); say so if it does.
+                    Ok(()) if !pinned => self
+                        .agent_sessions
+                        .note_own_change((provider, id), agent_sessions::OwnChange::Unpinned),
+                    Ok(()) => {}
+                    Err(error) => self.agent_sessions.notice = Some(error),
                 }
             }
             Message::AgentSessionsArchiveFilter(archive) => {
-                self.agent_sessions.cancel_confirmation();
                 self.agent_sessions.archive = archive;
-                self.agent_sessions.selected = None;
-                self.agent_sessions.reconcile();
+                self.agent_sessions.apply_filters();
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsArchive((provider, id)) => {
                 if !self.agent_sessions.open
                     || self.agent_sessions.editing()
-                    || self.agent_sessions.selected.as_ref() != Some(&(provider, id.clone()))
+                    || self.agent_sessions.selected_key().as_ref() != Some(&(provider, id.clone()))
                 {
                     return Task::none();
                 }
@@ -17331,12 +17394,20 @@ impl Frost {
                     .store
                     .snapshot()
                     .is_archived(provider, &id);
-                if let Err(error) = self
+                match self
                     .agent_sessions
                     .store
                     .set_archived(provider, &id, archived)
                 {
-                    self.agent_sessions.notice = Some(error);
+                    Ok(()) => self.agent_sessions.note_own_change(
+                        (provider, id),
+                        if archived {
+                            agent_sessions::OwnChange::Archived
+                        } else {
+                            agent_sessions::OwnChange::Restored
+                        },
+                    ),
+                    Err(error) => self.agent_sessions.notice = Some(error),
                 }
             }
             Message::AgentSessionsOrganize(key) => {
@@ -17379,12 +17450,10 @@ impl Frost {
                 }
             }
             Message::AgentSessionsProject(project) => {
-                self.agent_sessions.cancel_confirmation();
                 self.agent_sessions.project_selection = Some(project);
                 self.agent_sessions.project_only = false;
                 self.agent_sessions.show_projects = false;
-                self.agent_sessions.selected = None;
-                self.agent_sessions.reconcile();
+                self.agent_sessions.apply_filters();
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsProjectsToggle => {
@@ -17398,8 +17467,10 @@ impl Frost {
             }
             Message::AgentSessionsCheck => {
                 self.agent_sessions.cancel_confirmation();
-                self.agent_sessions.sync_preflight();
-                self.agent_sessions.preflight.refresh();
+                // A changed target already started its own check.
+                if !self.agent_sessions.sync_preflight() {
+                    self.agent_sessions.preflight.refresh();
+                }
                 self.agent_sessions.notice = None;
             }
             Message::AgentSessionsTick => {
@@ -17433,18 +17504,14 @@ impl Frost {
                 }
             }
             Message::AgentSessionsScope(enabled) => {
-                self.agent_sessions.cancel_confirmation();
                 self.agent_sessions.project_selection = None;
                 self.agent_sessions.project_only = enabled && self.agent_sessions.project.is_some();
-                self.agent_sessions.selected = None;
-                self.agent_sessions.reconcile();
+                self.agent_sessions.apply_filters();
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsSort(sort) => {
-                self.agent_sessions.cancel_confirmation();
                 self.agent_sessions.sort = sort;
-                self.agent_sessions.selected = None;
-                self.agent_sessions.reconcile();
+                self.agent_sessions.apply_filters();
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsClear => {
@@ -17459,34 +17526,27 @@ impl Frost {
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsLive(live_only) => {
-                self.agent_sessions.cancel_confirmation();
                 self.agent_sessions.live_only = live_only;
-                self.agent_sessions.selected = None;
-                self.agent_sessions.reconcile();
+                self.agent_sessions.apply_filters();
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsQuery(query) => {
-                self.agent_sessions.cancel_confirmation();
-                let query = crate::review_text::visible_bounded(&query, 512);
-                if self.agent_sessions.query != query {
-                    self.agent_sessions.selected = None;
-                }
-                self.agent_sessions.query = query;
-                self.agent_sessions.reconcile();
+                // Keep the complete text for the shared parser. Truncating it
+                // could drop a trailing exclusion such as `-tag:done` and
+                // silently widen the results; over-limit or unsafe input gets
+                // core's explanation and no matches instead. Only an
+                // implausible paste is refused, keeping the previous search.
+                self.agent_sessions.set_query(query);
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsProvider(provider) => {
-                self.agent_sessions.cancel_confirmation();
                 self.agent_sessions.provider = provider;
-                self.agent_sessions.selected = None;
-                self.agent_sessions.reconcile();
+                self.agent_sessions.apply_filters();
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsStatus(status) => {
-                self.agent_sessions.cancel_confirmation();
                 self.agent_sessions.status = status;
-                self.agent_sessions.selected = None;
-                self.agent_sessions.reconcile();
+                self.agent_sessions.apply_filters();
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsSelect(key) => {
@@ -17494,16 +17554,8 @@ impl Frost {
                 self.agent_sessions.selected = Some(key);
                 self.agent_sessions.sync_preflight();
             }
-            Message::AgentSessionsResume => self.resume_agent_session(),
-            Message::AgentSessionsCopy => {
-                if let Some(launch) = self
-                    .agent_sessions
-                    .selected_session()
-                    .and_then(|s| self.agent_sessions.preflight.ready_launch(s))
-                {
-                    return iced::clipboard::write(launch.display_command());
-                }
-            }
+            Message::AgentSessionsResume(key) => self.resume_agent_session(&key),
+            Message::AgentSessionsCopy(key) => return self.copy_agent_session_command(&key),
             Message::TaskRequestDiscardSavedDrafts(reference) => {
                 self.task_panel.request_discard_saved_drafts(&reference);
             }
@@ -17540,6 +17592,9 @@ impl Frost {
                     Ok(()) => self.task_panel.clear_follow_up(),
                     Err(error) => self.push_toast(error.to_string(), ToastKind::Warning),
                 }
+                // The parked Ready phase does not ask for fast polling; show
+                // the new turn starting without waiting for the slow tick.
+                self.task_panel.request_prompt_poll();
             }
             Message::TaskApprovalDeny(task_id, approval_id) => {
                 if !self.task_inspector_visible(task_id) {
@@ -17555,6 +17610,9 @@ impl Frost {
                         ToastKind::Warning,
                     );
                 } else {
+                    // Approval waits poll slowly; observe the provider's
+                    // response to this denial promptly.
+                    self.task_panel.request_prompt_poll();
                     self.push_toast(
                         "Denied managed approval request (accepting stays disabled)",
                         ToastKind::Info,
@@ -18024,6 +18082,16 @@ impl Frost {
                         {
                             self.task_panel.composer_open = false;
                             self.task_panel.retire_panel_callbacks();
+                        } else if let Some(
+                            command @ (keybindings::Command::TaskToggle
+                            | keybindings::Command::SidebarToggle),
+                        ) = resolve_keybinding_command(&self.keybindings, &key, modifiers)
+                        {
+                            // The documented Tasks and dock toggles still
+                            // work; neither reaches the terminal.
+                            if let Some(task) = self.dispatch_command(command) {
+                                return task;
+                            }
                         }
                         // The multiline goal editor owns Enter; task creation
                         // is an explicit button and never submits a terminal.
@@ -18057,7 +18125,13 @@ impl Frost {
                             ));
                         }
                         match key {
-                            Key::Named(Named::Escape) => self.agent_sessions.close(),
+                            // Escape first withdraws a live-session warning,
+                            // then closes the manager.
+                            Key::Named(Named::Escape) => {
+                                if !self.agent_sessions.cancel_resume_warning() {
+                                    self.agent_sessions.close();
+                                }
+                            }
                             Key::Named(Named::ArrowDown) => {
                                 self.agent_sessions.step(1);
                                 return self.agent_sessions_scroll_task();
@@ -18083,7 +18157,11 @@ impl Frost {
                                 self.agent_sessions.step(isize::MAX);
                                 return self.agent_sessions_scroll_task();
                             }
-                            Key::Named(Named::Enter) if !repeat => self.resume_agent_session(),
+                            Key::Named(Named::Enter) if !repeat => {
+                                if let Some(key) = self.agent_sessions.selected_key() {
+                                    self.resume_agent_session(&key);
+                                }
+                            }
                             Key::Named(Named::F5) => self.agent_sessions.refresh(),
                             _ => {}
                         }
@@ -18316,6 +18394,22 @@ impl Frost {
                     if let Some(task) = self.handle_sidebar_files_key(&key, modifiers, repeat) {
                         return task;
                     }
+                    // A focused Tasks-dock field (search, review feedback)
+                    // owns typing. Keys it did not consume — arrows, Tab,
+                    // Enter in the feedback field, a stray Ctrl letter —
+                    // never move a block selection, reach the PTY or run a
+                    // binding that writes to or acts on the terminal. App
+                    // commands (palette, tab switcher, help, tabs, panes,
+                    // zoom, scrolling, the Tasks and dock toggles) still
+                    // work. Escape (consumed by the field) or a click
+                    // elsewhere returns the keyboard.
+                    let task_input = self.task_input_owns_keys();
+                    if task_input
+                        && resolve_keybinding_command(&self.keybindings, &key, modifiers)
+                            .is_some_and(|command| command_targets_terminal(&command))
+                    {
+                        return Task::none();
+                    }
                     // Escape dismisses a visible block selection locally. It
                     // must not also reach the PTY: that would both clear the
                     // UI state and send an unrelated cancel key to the child.
@@ -18327,24 +18421,29 @@ impl Frost {
                     // Reconcile a non-empty selection before deciding whether
                     // block mode owns this key, so an asynchronously evicted
                     // stale-only selection cannot swallow one Enter/Down.
-                    let block_key_context = self.sessions.get_mut(self.active).map(|sess| {
-                        let has_selection = if sess.block_selection.is_empty() {
-                            false
-                        } else {
-                            let ids: Vec<u64> = sess
-                                .terminal
-                                .command_zones
-                                .iter()
-                                .map(|zone| zone.id)
-                                .collect();
-                            sess.block_selection.retain(&ids)
-                        };
-                        (
-                            has_selection,
-                            sess.terminal.is_alt_buffer_active(),
-                            sess.terminal.is_command_running(),
-                        )
-                    });
+                    // A focused Tasks field leaves block selection alone.
+                    let block_key_context = self
+                        .sessions
+                        .get_mut(self.active)
+                        .filter(|_| !task_input)
+                        .map(|sess| {
+                            let has_selection = if sess.block_selection.is_empty() {
+                                false
+                            } else {
+                                let ids: Vec<u64> = sess
+                                    .terminal
+                                    .command_zones
+                                    .iter()
+                                    .map(|zone| zone.id)
+                                    .collect();
+                                sess.block_selection.retain(&ids)
+                            };
+                            (
+                                has_selection,
+                                sess.terminal.is_alt_buffer_active(),
+                                sess.terminal.is_command_running(),
+                            )
+                        });
                     if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
                         && block_key_context.is_some_and(
                             |(has_selection, alt_screen, command_running)| {
@@ -18472,6 +18571,11 @@ impl Frost {
                         return task;
                     }
                     if self.handle_scroll_shortcut(&key, modifiers) {
+                        return Task::none();
+                    }
+                    // The hard stop for a focused Tasks field: nothing it did
+                    // not consume reaches the PTY.
+                    if task_input {
                         return Task::none();
                     }
                     if self.sidebar_files_focused
@@ -18635,6 +18739,7 @@ impl Frost {
             Message::MousePane(session_id, input) => {
                 if matches!(input, MouseInput::Press { .. }) {
                     self.sidebar_files_focused = false;
+                    self.task_panel.input_focused = false;
                 }
                 if !self.terminal_mouse_active() {
                     // Only an app-owned release may cross modal ownership, and
@@ -19117,6 +19222,10 @@ impl Frost {
             Message::SetSidebarPanel(panel) => {
                 if self.sidebar_panel != panel {
                     self.task_panel.retire_panel_callbacks();
+                    self.task_panel.input_focused = false;
+                    // Switching panels ends the Hidden tasks browsing mode, so
+                    // the Tasks switcher's attention count leads to its tasks.
+                    self.task_panel.set_show_hidden(false);
                     self.invalidate_sidebar_remote_follow_intent();
                 }
                 self.sidebar_panel = panel;
@@ -21329,13 +21438,24 @@ impl Frost {
             .style(self.popup_style()),
             tooltip::Position::Bottom,
         );
+        // Nothing else outside the dock says that a task waits for the user.
+        let attention = self.task_attention_badge();
         let sessions = tooltip(
-            button(text("Agents").size(font_size))
-                .on_press(Message::AgentSessionsToggle)
-                .padding([2, 6])
-                .height(Length::Fixed(height))
-                .style(button::secondary),
-            "Agent Sessions · Ctrl+Alt+Shift+G",
+            button(
+                text(match &attention {
+                    Some((total, _)) => format!("Agents · {total}"),
+                    None => "Agents".to_owned(),
+                })
+                .size(font_size),
+            )
+            .on_press(Message::AgentSessionsToggle)
+            .padding([2, 6])
+            .height(Length::Fixed(height))
+            .style(button::secondary),
+            text(match attention {
+                Some((_, summary)) => format!("Agent Sessions · Ctrl+Alt+Shift+G\n{summary}"),
+                None => "Agent Sessions · Ctrl+Alt+Shift+G".to_owned(),
+            }),
             tooltip::Position::Bottom,
         );
         container(
@@ -25853,10 +25973,21 @@ impl Frost {
         // The experimental Tasks dashboard joins the switcher only when the
         // feature flag is on; with the flag off no task UI is reachable.
         let header = if self.config.experimental_task_sidebar {
+            // Tasks needing approval, a reply, review or recovery are counted
+            // on the switcher so they are visible from any panel.
+            let tasks: Element<'_, Message> = match self.task_attention_badge() {
+                Some((total, summary)) => tooltip(
+                    panel_btn(&format!("Tasks · {total}"), SidebarPanel::Tasks),
+                    text(summary).size(self.chrome_font_size()),
+                    tooltip::Position::Bottom,
+                )
+                .into(),
+                None => panel_btn("Tasks", SidebarPanel::Tasks).into(),
+            };
             row![
                 panel_btn("Tabs", SidebarPanel::Tabs),
                 panel_btn("Files", SidebarPanel::Files),
-                panel_btn("Tasks", SidebarPanel::Tasks),
+                tasks,
                 Space::new().width(Length::Fill),
             ]
             .spacing(4)
@@ -25869,7 +26000,13 @@ impl Frost {
         let panel: Element<'_, Message> = match self.sidebar_panel {
             SidebarPanel::Tabs => self.sidebar_tabs_view(),
             SidebarPanel::Files => self.sidebar_files_view(),
-            SidebarPanel::Tasks => self.sidebar_tasks_view(),
+            // Iced leaves arrows, Tab and Enter without a submit action
+            // uncaptured; the reported focus keeps them from the terminal.
+            SidebarPanel::Tasks => agent_task_ui::report_input_focus(
+                self.sidebar_tasks_view(),
+                self.task_panel.input_focused,
+                Message::TaskInputFocus,
+            ),
         };
 
         container(column![header, panel].spacing(2))
@@ -28880,6 +29017,7 @@ impl Frost {
                 "agent:sessions",
                 "Agent session library / resume in new tab"
             ),
+            bound("task:toggle", "Tasks dashboard (experimental)"),
             kb(
                 "Ctrl+Shift+P → Open Codex/Claude/OpenCode/Kimi",
                 "Launch agent CLI in a new tab"
@@ -29673,6 +29811,26 @@ impl Frost {
 
     // ===== Experimental Tasks dashboard (agent_task) =====
 
+    /// A focused text field in the visible Tasks dock (search, review
+    /// feedback, composer) owns the keyboard: keys it does not consume never
+    /// reach the active terminal, block selection or terminal bindings.
+    fn task_input_owns_keys(&self) -> bool {
+        self.task_panel.input_focused
+            && self.config.experimental_task_sidebar
+            && self.dock_open()
+            && self.sidebar_panel == SidebarPanel::Tasks
+            && !self.agent_sessions.open
+    }
+
+    /// Count and explanation of tasks needing the user, for badges outside
+    /// the dock. Only with the Tasks dashboard enabled and something waiting.
+    fn task_attention_badge(&self) -> Option<(usize, String)> {
+        self.config
+            .experimental_task_sidebar
+            .then(|| agent_task_ui::attention_badge(self.task_manager.attention_counts()))
+            .flatten()
+    }
+
     /// UI callbacks only act on the inspector currently shown to the user.
     /// A filtered-out selection or list-only narrow dock retains its draft,
     /// but cannot authorize a delayed action from the previous card.
@@ -29698,7 +29856,9 @@ impl Frost {
         let Some(task) = self.task_manager.get(reference.task_id) else {
             return false;
         };
-        let Some(snapshot) = self.agent_runtime.snapshot(reference.task_id) else {
+        // Shared until the provider view changes: no copy of agent text,
+        // command output or diffs just to read a turn counter.
+        let Some(snapshot) = self.agent_runtime.shared_snapshot(reference.task_id) else {
             return false;
         };
         self.task_panel
@@ -29715,7 +29875,12 @@ impl Frost {
     fn set_task_panel_open(&mut self, open: bool) {
         if self.sidebar_open != open || self.sidebar_panel != SidebarPanel::Tasks {
             self.task_panel.retire_panel_callbacks();
+            self.task_panel.input_focused = false;
         }
+        // Hidden tasks are a browsing mode of the open dashboard. Every way
+        // of showing it (toggle, the library's Tasks button, task creation)
+        // starts in the workspace, where tasks that need the user are listed.
+        self.task_panel.set_show_hidden(false);
         self.invalidate_sidebar_remote_follow_intent();
         self.sidebar_open = open;
         if open {
@@ -30059,6 +30224,10 @@ impl Frost {
                 };
                 match registered {
                     Ok(task_id) => {
+                        // A new task is never hidden: show the workspace so it
+                        // and its next action are visible, even if the user
+                        // opened Hidden tasks while its worktree was prepared.
+                        self.task_panel.set_show_hidden(false);
                         if authored {
                             self.task_panel.composer = None;
                             self.task_panel.composer_open = false;
@@ -30142,6 +30311,11 @@ impl Frost {
         }
 
         self.task_panel.diff.poll();
+        // Leave the Hidden view once nothing hidden remains; its toggle
+        // disappears with the last hidden task.
+        if self.task_panel.show_hidden && self.task_manager.archived_count() == 0 {
+            self.task_panel.set_show_hidden(false);
+        }
     }
 
     fn task_terminal_index(
@@ -30454,11 +30628,12 @@ impl Frost {
             .filter(|(index, _)| self.tab_of_session(*index).is_some())
             .map(|(_, session)| agent_task_ui::terminal_session_id(session.id))
             .collect::<std::collections::HashSet<_>>();
+        let show_hidden = self.task_panel.show_hidden;
         agent_task::DashboardSnapshot::project_unsorted(
             self.task_manager
                 .tasks()
                 .iter()
-                .filter(|task| task.status != agent_task::TaskStatus::Archived),
+                .filter(|task| agent_task_ui::task_in_dashboard_scope(task, show_hidden)),
             |id| {
                 let task = self.task_manager.get(id);
                 agent_task::DashboardActivity {
@@ -30617,7 +30792,9 @@ impl Frost {
                     .style(text::danger),
             );
         }
-        if let Some(error) = agent_task::dashboard_query_error(&self.task_panel.dashboard_query) {
+        // Parsed once per edit; over-limit text shows core's explanation with
+        // zero matches instead of being truncated into a broader query.
+        if let Some(error) = self.task_panel.dashboard_query_error() {
             body = body.push(
                 text(error)
                     .size(self.chrome_font_size())
@@ -30625,6 +30802,8 @@ impl Frost {
                     .style(text::danger),
             );
         }
+        let hidden_mode = self.task_panel.show_hidden;
+        let hidden_count = self.task_manager.archived_count();
         body = body.push(
             button(
                 text(if self.task_panel.dashboard_search_help {
@@ -30645,31 +30824,42 @@ impl Frost {
                     .style(text::secondary),
             );
         }
-        let mut attention = row![].spacing(4);
-        let attention_counts = scope.attention_counts();
-        for kind in agent_task::DashboardAttentionKind::ALL {
-            use agent_task::DashboardAttentionKind;
+        if hidden_mode {
+            body = body.push(
+                text("Hidden tasks keep their worktrees and evidence. Restore returns a task to the state it had when hidden; it never starts or accepts work.")
+                    .size(self.chrome_font_size() - 1.0)
+                    .wrapping(text::Wrapping::WordOrGlyph)
+                    .style(text::secondary),
+            );
+        } else {
+            let mut attention = row![].spacing(4);
+            let attention_counts = scope.attention_counts();
+            for kind in agent_task::DashboardAttentionKind::ALL {
+                use agent_task::DashboardAttentionKind;
 
-            let label = match kind {
-                DashboardAttentionKind::Approval => "Approval",
-                DashboardAttentionKind::Input => "Input",
-                DashboardAttentionKind::Validation => "Validation",
-                DashboardAttentionKind::Review => "Review",
-                DashboardAttentionKind::Failed => "Failed",
-            };
-            let count = attention_counts.get(kind);
-            attention = attention.push(tooltip(
-                button(text(format!("{label} {count}")).size(self.chrome_font_size() - 1.0))
-                    .padding([3, 5])
-                    .style(self.tab_btn_style(self.task_panel.dashboard_attention == Some(kind)))
-                    .on_press(Message::TaskDashboardAttention(kind)),
-                text(kind.label()).size(self.chrome_font_size()),
-                tooltip::Position::Bottom,
-            ));
+                let label = match kind {
+                    DashboardAttentionKind::Approval => "Approval",
+                    DashboardAttentionKind::Input => "Input",
+                    DashboardAttentionKind::Validation => "Validation",
+                    DashboardAttentionKind::Review => "Review",
+                    DashboardAttentionKind::Failed => "Failed",
+                };
+                let count = attention_counts.get(kind);
+                attention = attention.push(tooltip(
+                    button(text(format!("{label} {count}")).size(self.chrome_font_size() - 1.0))
+                        .padding([3, 5])
+                        .style(
+                            self.tab_btn_style(self.task_panel.dashboard_attention == Some(kind)),
+                        )
+                        .on_press(Message::TaskDashboardAttention(kind)),
+                    text(kind.label()).size(self.chrome_font_size()),
+                    tooltip::Position::Bottom,
+                ));
+            }
+            body = body
+                .push(text("Needs your attention").size(self.chrome_font_size()))
+                .push(attention.wrap());
         }
-        body = body
-            .push(text("Needs your attention").size(self.chrome_font_size()))
-            .push(attention.wrap());
         let selected_scopes = usize::from(self.task_panel.dashboard_provider.is_some())
             + usize::from(self.task_panel.dashboard_repo.is_some())
             + usize::from(self.task_panel.dashboard_sort != agent_task::DashboardSort::default());
@@ -30707,7 +30897,7 @@ impl Frost {
                 .task_manager
                 .tasks()
                 .iter()
-                .filter(|task| task.status != agent_task::TaskStatus::Archived)
+                .filter(|task| agent_task_ui::task_in_dashboard_scope(task, hidden_mode))
                 .map(|task| task.repo_root.clone())
                 .collect();
             let projects: Vec<_> = std::iter::once(agent_task_ui::TaskRepositoryChoice(None))
@@ -30744,48 +30934,61 @@ impl Frost {
             );
         }
         let mut filters = row![].spacing(4);
-        for view in [
-            agent_task::DashboardView::All,
-            agent_task::DashboardView::NeedsAttention,
-            agent_task::DashboardView::Running,
-            agent_task::DashboardView::NotStarted,
-            agent_task::DashboardView::Review,
-            agent_task::DashboardView::Finished,
-        ] {
-            filters = filters.push(
-                button(
-                    text(agent_task_ui::dashboard_filter_label(
-                        view,
-                        &dashboard.counts,
+        if !hidden_mode {
+            for view in [
+                agent_task::DashboardView::All,
+                agent_task::DashboardView::NeedsAttention,
+                agent_task::DashboardView::Running,
+                agent_task::DashboardView::NotStarted,
+                agent_task::DashboardView::Review,
+                agent_task::DashboardView::Finished,
+            ] {
+                filters = filters.push(
+                    button(
+                        text(agent_task_ui::dashboard_filter_label(
+                            view,
+                            &dashboard.counts,
+                        ))
+                        .size(self.chrome_font_size()),
+                    )
+                    .style(self.tab_btn_style(
+                        self.task_panel.dashboard_view == view
+                            && self.task_panel.dashboard_attention.is_none(),
                     ))
-                    .size(self.chrome_font_size()),
-                )
-                .style(self.tab_btn_style(
-                    self.task_panel.dashboard_view == view
-                        && self.task_panel.dashboard_attention.is_none(),
-                ))
-                .on_press(Message::TaskDashboardView(view)),
+                    .on_press(Message::TaskDashboardView(view)),
+                );
+            }
+        }
+        // Hidden tasks stay reachable: without this view an archived task
+        // could never be found (`is:archived`) or restored again.
+        if hidden_count > 0 || hidden_mode {
+            filters = filters.push(
+                button(text(format!("Hidden ({hidden_count})")).size(self.chrome_font_size()))
+                    .style(self.tab_btn_style(hidden_mode))
+                    .on_press(Message::TaskDashboardHidden(!hidden_mode)),
             );
         }
         body = body.push(filters.wrap());
         body = body.push(
-            text(format!(
-                "{} shown · {} matches\n{} need you · {} approvals",
-                dashboard.rows.len(),
-                dashboard.counts.total,
-                dashboard.counts.attention,
-                dashboard.counts.pending_approval,
-            ))
+            text(if hidden_mode {
+                format!(
+                    "{} hidden shown · {} matches",
+                    dashboard.rows.len(),
+                    dashboard.counts.total,
+                )
+            } else {
+                format!(
+                    "{} shown · {} matches\n{} need you · {} approvals",
+                    dashboard.rows.len(),
+                    dashboard.counts.total,
+                    dashboard.counts.attention,
+                    dashboard.counts.pending_approval,
+                )
+            })
             .size(self.chrome_font_size())
             .style(text::secondary),
         );
-        if !self.task_panel.dashboard_query.is_empty()
-            || self.task_panel.dashboard_view != agent_task::DashboardView::All
-            || self.task_panel.dashboard_attention.is_some()
-            || self.task_panel.dashboard_provider.is_some()
-            || self.task_panel.dashboard_repo.is_some()
-            || self.task_panel.dashboard_sort != agent_task::DashboardSort::default()
-        {
+        if self.task_panel.has_dashboard_filters() {
             body = body.push(
                 button(text("Clear filters").size(self.chrome_font_size()))
                     .on_press(Message::TaskDashboardClear),
@@ -30869,7 +31072,7 @@ impl Frost {
         let selected_hidden = self.task_panel.selected.is_some_and(|id| {
             self.task_manager
                 .get(id)
-                .is_some_and(|task| task.status != agent_task::TaskStatus::Archived)
+                .is_some_and(|task| agent_task_ui::task_in_dashboard_scope(task, hidden_mode))
                 && dashboard.selected_index(Some(id)).is_none()
         });
         if selected_hidden {
@@ -30880,21 +31083,28 @@ impl Frost {
                     .on_press(Message::TaskDashboardClear),
             );
         }
-        let tasks: Vec<_> = dashboard
-            .rows
-            .iter()
-            .filter_map(|row| self.task_manager.get(row.id))
-            .collect();
-        let has_tasks = self
-            .task_manager
-            .tasks()
-            .iter()
-            .any(|task| task.status != agent_task::TaskStatus::Archived);
-        if tasks.is_empty() && has_tasks {
-            body = body.push(text("No tasks match these filters.").size(self.chrome_font_size()));
+        // Rows come from the task manager, so an empty projection is enough.
+        let has_tasks = if hidden_mode {
+            hidden_count > 0
+        } else {
+            self.task_manager.tasks().len() > hidden_count
+        };
+        if dashboard.rows.is_empty() && has_tasks {
+            body = body.push(
+                text(if hidden_mode {
+                    "No hidden tasks match these filters."
+                } else {
+                    "No tasks match these filters."
+                })
+                .size(self.chrome_font_size()),
+            );
         }
-        if tasks.is_empty()
+        if hidden_mode && !has_tasks {
+            body = body.push(text("No hidden tasks.").size(self.chrome_font_size()));
+        }
+        if dashboard.rows.is_empty()
             && !has_tasks
+            && !hidden_mode
             && self.task_panel.pending_creation.is_none()
             && self.task_panel.provider_picker.is_none()
         {
@@ -31149,17 +31359,20 @@ impl Frost {
             task,
             self.chrome_font_size(),
         ));
+        // A hidden task offers Restore and read-only evidence, never another
+        // lifecycle action from the Hidden view.
+        let hidden = task.status == TaskStatus::Archived;
 
         // Native session projection: current/latest turn plus pending
         // approvals (display-and-deny) and bounded completed-turn history.
-        if let Some(snapshot) = self.agent_runtime.snapshot(task.id) {
+        // The shared snapshot is reused until the provider view changes, so
+        // rendering does not copy agent text, command output and diffs.
+        let snapshot = self.agent_runtime.shared_snapshot(task.id);
+        if let Some(snapshot) = snapshot.as_deref() {
             evidence = evidence.push(
-                text(crate::review_text::bound_toast_text(format!(
-                    "Native session: {:?}",
-                    snapshot.phase
-                )))
-                .size(self.chrome_font_size())
-                .style(text::secondary),
+                text(format!("Native session: {}", snapshot.phase.label()))
+                    .size(self.chrome_font_size())
+                    .style(text::secondary),
             );
             if !snapshot.agent_text.is_empty() {
                 let truncated = if snapshot.agent_text_truncated {
@@ -31198,13 +31411,13 @@ impl Frost {
                     .style(text::secondary),
                 );
             }
-            for approval in &snapshot.pending_approvals {
+            for approval in snapshot.pending_approvals.iter().filter(|_| !hidden) {
                 let mut approval_card = column![].spacing(4);
                 approval_card = approval_card.push(
-                    text(crate::review_text::bound_toast_text(format!(
-                        "Managed approval request ({:?}); accepting is disabled",
-                        approval.kind
-                    )))
+                    text(format!(
+                        "Managed approval request ({}); accepting is disabled",
+                        approval.kind.label()
+                    ))
                     .size(self.chrome_font_size())
                     .style(text::danger),
                 );
@@ -31241,15 +31454,15 @@ impl Frost {
                 );
             }
             evidence = evidence.push(agent_task_workspace::history_view(
-                &snapshot,
+                snapshot,
                 self.chrome_font_size(),
             ));
         }
         if let Some(report) = self.agent_runtime.exit_report(task.id) {
             evidence = evidence.push(
                 text(format!(
-                    "Provider exit: {:?} · code {}",
-                    report.cause,
+                    "Provider exit: {} · code {}",
+                    report.cause.label(),
                     report
                         .process
                         .code
@@ -31293,11 +31506,14 @@ impl Frost {
         {
             validation_output = validation_output.on_press(Message::TaskFocusValidation(task.id));
         }
-        card = card.push(row![agent_terminal, validation_output].spacing(6).wrap());
+        if !hidden {
+            card = card.push(row![agent_terminal, validation_output].spacing(6).wrap());
+        }
 
         // Action rows.
         let provider_name = crate::review_text::bound_provider_label(task.provider.display_name());
-        if let Some(notice) = agent_task_ui::native_start_notice(task.provider) {
+        if let Some(notice) = agent_task_ui::native_start_notice(task.provider).filter(|_| !hidden)
+        {
             card = card.push(
                 text(notice)
                     .size(self.chrome_font_size())
@@ -31388,9 +31604,8 @@ impl Frost {
             && task.runtime_kind == TaskRuntimeKind::Native
             && matches!(task.provider, agent_task::AgentProvider::Codex)
         {
-            let completed_turns = self
-                .agent_runtime
-                .snapshot(task.id)
+            let completed_turns = snapshot
+                .as_deref()
                 .map(|snapshot| snapshot.completed_turns)
                 .unwrap_or(0);
             let reference = self
@@ -31506,12 +31721,41 @@ impl Frost {
             }
         }
 
-        if !task.status.is_running() && task.validation.status != TaskValidationStatus::Running {
+        if hidden {
+            // The one lifecycle action of the Hidden view. It returns the
+            // recorded earlier state; it never starts or accepts anything.
+            let restorable = task.archived_from.is_some();
+            card = card.push(
+                button(text("Restore").size(self.chrome_font_size()))
+                    .style(button::primary)
+                    .on_press_maybe(restorable.then_some(Message::TaskRestore(task.id))),
+            );
+            card = card.push(
+                text(match task.archived_from {
+                    Some(status) => format!(
+                        "Restore returns this task to its earlier state: {}.",
+                        status.label()
+                    ),
+                    None => "This task was hidden before its state was recorded, so it cannot be restored. Create a new task for its worktree.".to_owned(),
+                })
+                .size(self.chrome_font_size() - 1.0)
+                .style(text::secondary),
+            );
+        } else {
+            // Offer Hide only as the manager will accept it, and say why not.
+            let hide = self.task_manager.can_archive(task.id);
             card = card.push(
                 button(text("Hide task").size(self.chrome_font_size()))
                     .style(button::secondary)
-                    .on_press(Message::TaskHide(task.id)),
+                    .on_press_maybe(hide.is_ok().then_some(Message::TaskHide(task.id))),
             );
+            if let Err(error) = hide {
+                card = card.push(
+                    text(agent_task_ui::hide_blocked_reason(&error))
+                        .size(self.chrome_font_size() - 1.0)
+                        .style(text::secondary),
+                );
+            }
         }
 
         // Bounded worktree diff surface (status + tracked diff against the
@@ -32892,7 +33136,10 @@ impl Frost {
             || self.task_panel.diff.state().loading
             || tasks_open
         {
+            // Approval and review waits poll slowly; the user's own deny,
+            // reply, finish or cancel requests a short fast burst.
             let interval = if self.agent_runtime.needs_fast_poll()
+                || self.task_panel.prompt_poll_active()
                 || self.task_panel.pending_creation.is_some()
                 || self.task_panel.diff.state().loading
             {

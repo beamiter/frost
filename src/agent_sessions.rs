@@ -1,9 +1,11 @@
 //! Native session-library state. Discovery and resume validation live in core.
 use jterm_core::agent_sessions::{
-    AgentSession, SessionArchiveFilter, SessionBatchAction, SessionCatalog, SessionLaunch,
-    SessionLibraryFilter, SessionLibraryStore, SessionPreflight, SessionPreflightState,
-    SessionProjectSummary, SessionProvider, SessionQuery, SessionScanner, SessionSearchIndex,
-    SessionSort, SessionStatus, SESSION_BATCH_LIMIT,
+    validate_session_batch_tag, validate_session_details, AgentSession, SessionArchiveFilter,
+    SessionBatchAction, SessionCatalog, SessionLaunch, SessionLibraryFilter, SessionLibraryStore,
+    SessionPreflight, SessionPreflightState, SessionProjectSummary, SessionProvider, SessionQuery,
+    SessionScanner, SessionSearchIndex, SessionSort, SessionStatus, SESSION_ALIAS_MAX_BYTES,
+    SESSION_BATCH_LIMIT, SESSION_QUERY_MAX_BYTES, SESSION_RESUME_ANYWAY_DELAY, SESSION_TAG_LIMIT,
+    SESSION_TAG_MAX_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -11,7 +13,73 @@ use std::path::PathBuf;
 pub(crate) const PAGE_SIZE: usize = 80;
 use std::time::{Duration, Instant};
 
+/// Background rescans are measured from the end of the previous scan, so a
+/// slow scan never starts back-to-back work or re-reads the library per tick.
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Paste guards for the name/tag editor. A draft over the shared byte limits
+/// stays visible with core's explanation (and Save disabled); only an
+/// implausibly large paste is refused whole, keeping the previous draft.
+const ALIAS_INPUT_LIMIT: usize = SESSION_ALIAS_MAX_BYTES * 4;
+const TAGS_INPUT_LIMIT: usize = (SESSION_TAG_MAX_BYTES + 2) * SESSION_TAG_LIMIT * 4;
+const BULK_TAG_INPUT_LIMIT: usize = SESSION_TAG_MAX_BYTES * 4;
+/// A search between core's limit and this stays visible with core's
+/// explanation; only an implausible paste is refused whole.
+const QUERY_INPUT_LIMIT: usize = SESSION_QUERY_MAX_BYTES * 4;
+
+/// The batch tag's problem, checked live with the rules `apply_batch`
+/// enforces. An empty field only disables Add/Remove tag.
+fn batch_tag_problem(tag: &str) -> Option<String> {
+    if tag.trim().is_empty() {
+        None
+    } else {
+        validate_session_batch_tag(tag).err()
+    }
+}
+
 pub(crate) type SessionKey = (SessionProvider, String);
+
+pub(crate) fn session_key(session: &AgentSession) -> SessionKey {
+    (session.provider, session.id.clone())
+}
+
+/// The latest scan observed another CLI holding this exact conversation.
+/// Shown after the first resume request; a second explicit request for the
+/// same identity, at least `SESSION_RESUME_ANYWAY_DELAY` later, proceeds.
+/// Selection changes, Escape, a refresh that drops the identity or no longer
+/// observes the process, and an attempt that ends without a spawn all retire
+/// it, so the next Resume warns again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResumeWarning {
+    pub(crate) key: SessionKey,
+    pub(crate) text: String,
+    /// When the warning was first shown; refreshing its text keeps this.
+    pub(crate) shown_at: Instant,
+}
+
+/// The user's own organization change to the selected conversation that
+/// may take it out of the current view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnChange {
+    Archived,
+    Restored,
+    Unpinned,
+    Organized,
+    Batch,
+}
+
+impl OwnChange {
+    /// Why the selected row left the view and which view finds it again.
+    fn left_view(self) -> &'static str {
+        match self {
+            Self::Archived => "You archived this conversation, so it left this view. Choose Archived here or All conversations to find or restore it.",
+            Self::Restored => "You restored this conversation to the library, so it left this view. Choose Active library or All conversations to find it.",
+            Self::Unpinned => "You unpinned this conversation, so it no longer matches this view. Turn off Pinned only or clear filters to find it.",
+            Self::Organized => "Its new name or tags no longer match this search or filter, so it left this view. Clear filters to find it.",
+            Self::Batch => "Your batch change moved this conversation out of this view. Clear filters or choose All conversations to find it.",
+        }
+    }
+}
 
 /// A frozen selection and the exact opening that rendered its actions.
 #[derive(Clone, Debug)]
@@ -34,7 +102,16 @@ struct OrganizationEditor {
     alias: String,
     tags: String,
     notice: Option<String>,
+    /// Live result of core's `validate_session_details` for the draft; Save
+    /// stays disabled while it explains a problem.
+    invalid: Option<String>,
     saving: bool,
+}
+
+impl OrganizationEditor {
+    fn revalidate(&mut self) {
+        self.invalid = validate_session_details(&self.alias, &self.tags).err();
+    }
 }
 
 pub(crate) struct SessionLibrary {
@@ -51,6 +128,7 @@ pub(crate) struct SessionLibrary {
     pub store: SessionLibraryStore,
     pub preflight: SessionPreflight,
     pending_confirm: Option<SessionKey>,
+    resume_warning: Option<ResumeWarning>,
     pub project: Option<PathBuf>,
     pub project_only: bool,
     pub project_selection: Option<PathBuf>,
@@ -63,6 +141,13 @@ pub(crate) struct SessionLibrary {
     observed_count: usize,
     projects: Vec<SessionProjectSummary>,
     query_error: Option<String>,
+    /// A refused, implausibly large search paste; the previous search stays.
+    query_notice: Option<String>,
+    /// The user's own change awaiting its write, with the identity it changed.
+    own_change: Option<(SessionKey, OwnChange)>,
+    /// Why the detached selection left the view, when the user's own change
+    /// moved it; the generic explanation is shown otherwise.
+    left_view: Option<&'static str>,
     editor: Option<OrganizationEditor>,
     bulk_mode: bool,
     checked: HashSet<SessionKey>,
@@ -71,10 +156,14 @@ pub(crate) struct SessionLibrary {
     bulk_notice: Option<String>,
     bulk_saving: bool,
     bulk_saved_count: usize,
+    /// The user's chosen identity. It may be hidden by a refresh or filter;
+    /// a background refresh never replaces it with another conversation.
     pub selected: Option<SessionKey>,
     pub notice: Option<String>,
     pub bindings: HashMap<SessionKey, usize>,
-    last_refresh: Instant,
+    /// Periodic background refresh continues the explicit refresh made when
+    /// the manager opens; it stops when the manager closes.
+    auto_refresh: bool,
 }
 
 impl Default for SessionLibrary {
@@ -98,6 +187,7 @@ impl SessionLibrary {
             store,
             preflight: SessionPreflight::new(),
             pending_confirm: None,
+            resume_warning: None,
             project: None,
             project_only: false,
             project_selection: None,
@@ -110,6 +200,9 @@ impl SessionLibrary {
             observed_count: 0,
             projects: Vec::new(),
             query_error: None,
+            query_notice: None,
+            own_change: None,
+            left_view: None,
             editor: None,
             bulk_mode: false,
             checked: HashSet::new(),
@@ -121,17 +214,73 @@ impl SessionLibrary {
             selected: None,
             notice: None,
             bindings: HashMap::new(),
-            last_refresh: Instant::now(),
+            auto_refresh: false,
         }
     }
 }
 
 impl SessionLibrary {
+    /// Opening, the Refresh button and F5 all do exactly this: rescan the
+    /// provider histories, reload the shared library and re-check the
+    /// selected conversation. A queued resume or live-session warning is
+    /// withdrawn so it is confirmed again against the fresh evidence.
     pub fn refresh(&mut self) {
-        if self.scanner.refresh() {
-            self.last_refresh = Instant::now();
-        }
+        self.cancel_confirmation();
+        self.auto_refresh = true;
+        self.scanner.refresh();
         self.store.refresh();
+        // A newly selected target starts its own check; only an unchanged
+        // one needs a fresh check, so opening never checks twice.
+        if !self.sync_preflight() {
+            self.preflight.refresh();
+        }
+    }
+
+    /// Opening is the user's own action. The selection kept from an earlier
+    /// opening stays only while the current filters still list it (the
+    /// captured folder may differ, or a live-only CLI may have exited);
+    /// otherwise the first match is selected instead of opening on a
+    /// detached conversation. Then the same full refresh as Refresh and F5.
+    pub(crate) fn open_view(&mut self) {
+        self.adopt_listed_selection();
+        self.refresh();
+    }
+
+    fn adopt_listed_selection(&mut self) {
+        self.project_query();
+        if self.selected_position().is_none() {
+            self.selected = self.first_visible_key();
+        }
+        self.left_view = None;
+        self.sync_page();
+    }
+
+    /// The user's own search edit. The complete text goes to the shared
+    /// parser: truncating could drop a trailing `-tag:` exclusion and widen
+    /// the results, so text over core's limit stays visible with core's
+    /// explanation and no matches. Only an implausible paste is refused,
+    /// keeping the previous search. Returns whether the search changed.
+    pub(crate) fn set_query(&mut self, query: String) -> bool {
+        if query.len() > QUERY_INPUT_LIMIT {
+            self.query_notice = Some(format!(
+                "That search is far over the {SESSION_QUERY_MAX_BYTES}-byte limit. Your previous search was kept."
+            ));
+            return false;
+        }
+        self.query_notice = None;
+        if self.query == query {
+            return false;
+        }
+        self.query = query;
+        self.apply_filters();
+        true
+    }
+
+    /// Remember the user's own change to `key` until its write settles; if
+    /// it then took the selected conversation out of the view, the detached
+    /// selection says why instead of blaming another window.
+    pub(crate) fn note_own_change(&mut self, key: SessionKey, change: OwnChange) {
+        self.own_change = Some((key, change));
     }
 
     pub fn poll(&mut self) -> bool {
@@ -142,14 +291,26 @@ impl SessionLibrary {
         if self.store.poll() {
             self.reconcile();
         }
-        if self.bulk_saving && !self.store.is_busy() {
+        // The user's own change settled. The selection is never retargeted;
+        // if the change took it out of the view, say so and where it went.
+        if let Some((key, change)) = self.own_change.take_if(|_| !self.store.is_saving()) {
+            if self.store.error().is_none()
+                && self.selected.as_ref() == Some(&key)
+                && self.selected_position().is_none()
+            {
+                self.left_view = Some(change.left_view());
+            }
+        }
+        // `is_saving` covers only this window's own writes until `poll`
+        // acknowledges them; the periodic read-only reload never counts.
+        if self.bulk_saving && !self.store.is_saving() {
             self.bulk_saving = false;
             self.bulk_notice = Some(self.store.error().map(str::to_owned).unwrap_or_else(|| {
                 format!("Saved changes for {} conversations.", self.bulk_saved_count)
             }));
             self.retire_bulk();
         }
-        if self.editor.as_ref().is_some_and(|editor| editor.saving) && !self.store.is_busy() {
+        if self.editor.as_ref().is_some_and(|editor| editor.saving) && !self.store.is_saving() {
             if let Some(error) = self.store.error() {
                 if let Some(editor) = &mut self.editor {
                     editor.saving = false;
@@ -161,8 +322,12 @@ impl SessionLibrary {
         }
         self.sync_preflight();
         self.preflight.poll();
-        if self.open && self.last_refresh.elapsed() >= Duration::from_secs(5) {
-            self.refresh();
+        // Measured from the end of the previous scan: a scan slower than the
+        // interval never triggers back-to-back rescans, and the library file
+        // is reloaded only alongside a scan that actually starts.
+        if self.open && self.auto_refresh && self.scanner.refresh_if_idle_for(AUTO_REFRESH_INTERVAL)
+        {
+            self.store.refresh();
         }
         old_page != self.page
     }
@@ -195,22 +360,86 @@ impl SessionLibrary {
         true
     }
 
+    #[cfg(test)]
     pub fn filtered(&self) -> Vec<&AgentSession> {
-        self.visible
-            .iter()
-            .filter_map(|index| self.catalog.sessions.get(*index))
-            .collect()
+        self.visible_sessions(0..self.visible.len()).collect()
     }
 
-    pub fn selected_session(&self) -> Option<&AgentSession> {
-        let key = self.selected.as_ref()?;
-        self.visible
+    /// Listed conversations in display order, without collecting the list.
+    fn visible_sessions(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> impl Iterator<Item = &AgentSession> + '_ {
+        self.visible[range]
             .iter()
             .filter_map(|index| self.catalog.sessions.get(*index))
+    }
+
+    fn first_visible_key(&self) -> Option<SessionKey> {
+        let first = self.visible_sessions(0..self.visible.len()).next();
+        first.map(session_key)
+    }
+
+    /// The display positions of the current page.
+    fn page_range(&self) -> std::ops::Range<usize> {
+        let start = (self.page * PAGE_SIZE).min(self.visible.len());
+        start..(start + PAGE_SIZE).min(self.visible.len())
+    }
+
+    /// The selected conversation while it is listed. A hidden selection
+    /// returns `None`, which disables resume, copy and organization.
+    pub fn selected_session(&self) -> Option<&AgentSession> {
+        let key = self.selected.as_ref()?;
+        self.visible_sessions(0..self.visible.len())
             .find(|session| session.provider == key.0 && session.id == key.1)
     }
 
+    /// The listed selection's identity, for keyboard-initiated actions.
+    pub(crate) fn selected_key(&self) -> Option<SessionKey> {
+        self.selected_session().map(session_key)
+    }
+
+    /// A selection that a refresh or filter removed from the list. It stays
+    /// selected (never silently replaced) until the user chooses again.
+    pub(crate) fn selection_hidden(&self) -> bool {
+        self.selected.is_some() && self.selected_position().is_none()
+    }
+
+    /// Re-project after a catalog, library or background change. A refresh
+    /// never retargets the selection: a selected identity that left the list
+    /// stays selected but hidden, and its armed resume is withdrawn by
+    /// `sync_preflight`. Only an empty selection adopts the first row.
     pub fn reconcile(&mut self) {
+        self.project_query();
+        if self.selected.is_none() {
+            self.selected = self.first_visible_key();
+        }
+        self.sync_page();
+        self.sync_preflight();
+    }
+
+    /// The user's own search, filter, scope, sort or Clear filters. The best
+    /// match is selected, as in the other terminals: the user just chose a
+    /// different list, so type-then-Enter resumes its top hit. Only a
+    /// background refresh keeps a selection (see `reconcile`).
+    pub(crate) fn apply_filters(&mut self) {
+        self.cancel_confirmation();
+        self.project_query();
+        self.selected = self.first_visible_key();
+        self.sync_page();
+        self.sync_preflight();
+    }
+
+    fn sync_page(&mut self) {
+        let last = self.visible.len().saturating_sub(1) / PAGE_SIZE;
+        self.page = match self.selected_position() {
+            Some(position) => position / PAGE_SIZE,
+            // A hidden selection keeps the page the user was reading.
+            None => self.page.min(last),
+        };
+    }
+
+    fn project_query(&mut self) {
         self.query_error = SessionSearchIndex::query_error(&self.query);
         self.projects = self.search_index.projects(self.store.snapshot());
         self.visible = self.search_index.query_with_library(
@@ -234,23 +463,80 @@ impl SessionLibrary {
                 archive: self.archive,
             },
         );
-        if self.selected_session().is_none() {
-            self.selected = self.visible.first().map(|index| {
-                let session = &self.catalog.sessions[*index];
-                (session.provider, session.id.clone())
-            });
-        }
-        self.page = self.selected_position().unwrap_or(0) / PAGE_SIZE;
-        self.sync_preflight();
     }
 
+    /// Withdraw an armed resume and any live-session warning. Every explicit
+    /// navigation, filter, refresh or organization action goes through here.
     pub fn cancel_confirmation(&mut self) {
         self.pending_confirm = None;
+        self.resume_warning = None;
+    }
+
+    /// Escape first withdraws a live-session warning (and the resume it
+    /// guarded) before it closes the manager. Returns whether it did.
+    pub(crate) fn cancel_resume_warning(&mut self) -> bool {
+        if self.resume_warning.take().is_none() {
+            return false;
+        }
+        self.pending_confirm = None;
+        self.notice = Some("Resume cancelled.".into());
+        true
+    }
+
+    /// The live-session warning for the listed selection, if one is showing.
+    pub(crate) fn resume_warning(&self) -> Option<&ResumeWarning> {
+        let warning = self.resume_warning.as_ref()?;
+        self.selected_session()
+            .is_some_and(|session| session.provider == warning.key.0 && session.id == warning.key.1)
+            .then_some(warning)
+    }
+
+    /// Gate one resume request. A conversation that the latest scan observed
+    /// running in another CLI first only shows the warning; a second explicit
+    /// request for that exact identity (Resume anyway) is admitted. Returns
+    /// whether the resume may be armed.
+    pub(crate) fn admit_resume(&mut self, session: &AgentSession) -> bool {
+        let key = session_key(session);
+        let Some(text) = self.catalog.resume_conflict(session) else {
+            self.resume_warning = None;
+            return true;
+        };
+        if let Some(warning) = self
+            .resume_warning
+            .as_mut()
+            .filter(|warning| warning.key == key)
+        {
+            warning.text = text;
+            // A repeat this soon is the rest of a double-click or a quick
+            // double Enter, not a decision about the warning it just raised.
+            return warning.shown_at.elapsed() >= SESSION_RESUME_ANYWAY_DELAY;
+        }
+        self.pending_confirm = None;
+        self.notice = None;
+        self.resume_warning = Some(ResumeWarning {
+            key,
+            text,
+            shown_at: Instant::now(),
+        });
+        false
+    }
+
+    /// The pending attempt ended without a spawn (its check failed, the
+    /// launch failed, or its conversation is no longer the listed
+    /// selection). A "Resume anyway" covers only the attempt it started, so
+    /// both are withdrawn and the next Resume warns again.
+    pub(crate) fn abandon_resume(&mut self, notice: Option<String>) {
+        self.pending_confirm = None;
+        self.resume_warning = None;
+        if notice.is_some() {
+            self.notice = notice;
+        }
     }
 
     pub fn close(&mut self) {
         self.open = false;
-        self.pending_confirm = None;
+        self.auto_refresh = false;
+        self.cancel_confirmation();
         self.editor = None;
         self.bulk_mode = false;
         self.retire_bulk();
@@ -283,18 +569,20 @@ impl SessionLibrary {
     }
 
     fn page_keys(&self) -> Vec<SessionKey> {
-        self.filtered()
-            .into_iter()
-            .skip(self.page * PAGE_SIZE)
-            .take(PAGE_SIZE)
-            .map(|session| (session.provider, session.id.clone()))
+        self.visible_sessions(self.page_range())
+            .map(session_key)
             .collect()
     }
 
+    #[cfg(test)]
     fn page_reference(&self) -> BatchRef {
+        self.page_reference_for(self.page_keys())
+    }
+
+    fn page_reference_for(&self, keys: Vec<SessionKey>) -> BatchRef {
         BatchRef {
             epoch: self.bulk_epoch.clone(),
-            keys: self.page_keys().into(),
+            keys: keys.into(),
         }
     }
 
@@ -357,7 +645,7 @@ impl SessionLibrary {
         if !self.accepts_bulk(reference) {
             return;
         }
-        if value.len() > 128 {
+        if value.len() > BULK_TAG_INPUT_LIMIT {
             self.bulk_notice =
                 Some("The tag exceeds the input limit. Your existing draft was kept.".into());
             return;
@@ -380,6 +668,13 @@ impl SessionLibrary {
         }
         match self.store.apply_batch(&reference.keys, action) {
             Ok(count) => {
+                if let Some(selected) = self
+                    .selected
+                    .clone()
+                    .filter(|selected| reference.keys.contains(selected))
+                {
+                    self.note_own_change(selected, OwnChange::Batch);
+                }
                 self.bulk_saved_count = count;
                 self.bulk_saving = true;
                 self.bulk_notice = Some(format!("Saving {count} conversations…"));
@@ -400,11 +695,11 @@ impl SessionLibrary {
             return;
         };
         let title = session.title.clone();
-        let snapshot = self.store.snapshot();
-        let alias = snapshot.alias(key.0, &key.1).unwrap_or_default().to_owned();
-        let tags = snapshot.tags(key.0, &key.1).join(", ");
+        let facts = self.store.snapshot().facts(key.0, &key.1);
+        let alias = facts.alias.unwrap_or_default().to_owned();
+        let tags = facts.tags.join(", ");
         self.cancel_confirmation();
-        self.editor = Some(OrganizationEditor {
+        let mut editor = OrganizationEditor {
             reference: OrganizationRef {
                 key: key.clone(),
                 epoch: std::sync::Arc::new(()),
@@ -413,8 +708,11 @@ impl SessionLibrary {
             alias,
             tags,
             notice: None,
+            invalid: None,
             saving: false,
-        });
+        };
+        editor.revalidate();
+        self.editor = Some(editor);
     }
 
     fn editor_for(&mut self, reference: &OrganizationRef) -> Option<&mut OrganizationEditor> {
@@ -429,16 +727,30 @@ impl SessionLibrary {
     pub(crate) fn organization_alias(&mut self, reference: &OrganizationRef, value: String) {
         if let Some(editor) = self.editor_for(reference) {
             // Keep the actual input for validation; never silently rewrite a
-            // pasted control character into a different stored title.
-            editor.alias = value.chars().take(512).collect();
+            // pasted control character into a different stored title, nor
+            // cut a draft at a character count that disagrees with the bytes
+            // the shared library admits.
+            if value.len() > ALIAS_INPUT_LIMIT {
+                editor.notice =
+                    Some("That name is far over the limit. Your existing draft was kept.".into());
+                return;
+            }
+            editor.alias = value;
             editor.notice = None;
+            editor.revalidate();
         }
     }
 
     pub(crate) fn organization_tags(&mut self, reference: &OrganizationRef, value: String) {
         if let Some(editor) = self.editor_for(reference) {
-            editor.tags = value.chars().take(1024).collect();
+            if value.len() > TAGS_INPUT_LIMIT {
+                editor.notice =
+                    Some("Those tags are far over the limit. Your existing draft was kept.".into());
+                return;
+            }
+            editor.tags = value;
             editor.notice = None;
+            editor.revalidate();
         }
     }
 
@@ -446,6 +758,10 @@ impl SessionLibrary {
         let Some(editor) = self.editor_for(reference) else {
             return;
         };
+        if let Some(invalid) = editor.invalid.clone() {
+            editor.notice = Some(invalid);
+            return;
+        }
         let alias = editor.alias.clone();
         let tags = editor.tags.clone();
         match self
@@ -457,6 +773,7 @@ impl SessionLibrary {
                     editor.saving = true;
                     editor.notice = None;
                 }
+                self.note_own_change(reference.key.clone(), OwnChange::Organized);
             }
             Err(error) => {
                 if let Some(editor) = self.editor_for(reference) {
@@ -482,12 +799,34 @@ impl SessionLibrary {
         }
     }
 
-    pub fn sync_preflight(&mut self) {
+    /// Bind the installation check to the listed selection. Returns whether
+    /// its target changed (which starts a new check).
+    pub fn sync_preflight(&mut self) -> bool {
         let selected = self.selected_session().cloned();
-        if self.preflight.select(selected.as_ref()) {
+        let changed = self.preflight.select(selected.as_ref());
+        if changed {
             self.pending_confirm = None;
             self.notice = None;
+            if selected.is_some() {
+                // A listed selection: any earlier "left this view" is over.
+                self.left_view = None;
+            }
         }
+        // A live-session warning belongs to one listed identity and to the
+        // scan evidence behind it. Selecting elsewhere, losing the row, or a
+        // scan that no longer observes the process retires it, so a later
+        // conflict needs a new explicit confirmation. (Losing the row also
+        // changed the preflight target above, which withdrew an armed resume.)
+        if let Some(mut warning) = self.resume_warning.take() {
+            let text = selected
+                .filter(|session| session_key(session) == warning.key)
+                .and_then(|session| self.catalog.resume_conflict(&session));
+            self.resume_warning = text.map(|text| {
+                warning.text = text;
+                warning
+            });
+        }
+        changed
     }
 
     pub fn selected_position(&self) -> Option<usize> {
@@ -505,23 +844,36 @@ impl SessionLibrary {
             self.page = 0;
             return;
         }
-        let index = self.selected_position().unwrap_or(0);
-        let next = (index as isize)
-            .saturating_add(delta)
-            .clamp(0, self.visible.len() as isize - 1) as usize;
+        let last = self.visible.len() as isize - 1;
+        let next = match self.selected_position() {
+            Some(index) => (index as isize).saturating_add(delta),
+            // A hidden selection has no row. A single step enters the page
+            // being read at the edge it points to; page and edge moves count
+            // from that page instead of from an arbitrary first row.
+            None => {
+                let page_start = (self.page * PAGE_SIZE) as isize;
+                let page_end = page_start.saturating_add(PAGE_SIZE as isize - 1).min(last);
+                match delta {
+                    0 | 1 => page_start,
+                    -1 => page_end,
+                    delta if delta > 0 => page_start.saturating_add(delta),
+                    delta => page_end.saturating_add(delta),
+                }
+            }
+        }
+        .clamp(0, last) as usize;
         let session = &self.catalog.sessions[self.visible[next]];
-        self.selected = Some((session.provider, session.id.clone()));
+        self.selected = Some(session_key(session));
         self.page = next / PAGE_SIZE;
         self.sync_preflight();
     }
 
     pub fn next_sort(&self) -> SessionSort {
-        match self.sort {
-            SessionSort::Relevance => SessionSort::Recent,
-            SessionSort::Recent => SessionSort::LiveFirst,
-            SessionSort::LiveFirst => SessionSort::RecentlyResumed,
-            SessionSort::RecentlyResumed => SessionSort::Relevance,
-        }
+        let current = SessionSort::ALL
+            .iter()
+            .position(|sort| *sort == self.sort)
+            .unwrap_or(0);
+        SessionSort::ALL[(current + 1) % SessionSort::ALL.len()]
     }
 
     pub fn clear_filters(&mut self) {
@@ -537,9 +889,11 @@ impl SessionLibrary {
         self.project_selection = None;
         self.show_projects = false;
         self.sort = SessionSort::Relevance;
-        self.selected = None;
         self.notice = None;
-        self.reconcile();
+        self.query_notice = None;
+        // Clearing is the user's own change: like any filter edit it selects
+        // the first match of the full library.
+        self.apply_filters();
     }
 }
 
@@ -557,24 +911,41 @@ pub(crate) fn age(timestamp_ms: u64) -> String {
     }
 }
 
+fn hashtags(tags: &[String]) -> String {
+    tags.iter()
+        .map(|tag| format!("#{tag}"))
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
 impl super::Frost {
-    pub(crate) fn resume_agent_session(&mut self) {
-        if !self.agent_sessions.open || self.agent_sessions.editing() {
-            return;
-        }
-        let Some(session) = self.agent_sessions.selected_session().cloned() else {
-            return;
-        };
-        let key = (session.provider, session.id.clone());
-        self.native_enter_ownership.lock().claim_pressed();
-        if let Some(index) = self
-            .agent_sessions
+    /// The live tab this window already resumed for one conversation.
+    fn agent_session_tab(&self, key: &SessionKey) -> Option<usize> {
+        self.agent_sessions
             .bindings
-            .get(&key)
+            .get(key)
             .copied()
             .and_then(|id| self.session_index_by_id(id))
             .filter(|index| !self.sessions[*index].hold_after_exit)
-        {
+    }
+
+    /// Resume (or switch to) the conversation an action was rendered for.
+    /// A stale request for another or hidden identity does nothing.
+    pub(crate) fn resume_agent_session(&mut self, key: &SessionKey) {
+        if !self.agent_sessions.open || self.agent_sessions.editing() {
+            return;
+        }
+        let Some(session) = self
+            .agent_sessions
+            .selected_session()
+            .filter(|session| session_key(session) == *key)
+            .cloned()
+        else {
+            return;
+        };
+        let key = session_key(&session);
+        self.native_enter_ownership.lock().claim_pressed();
+        if let Some(index) = self.agent_session_tab(&key) {
             self.pane_zoomed = false;
             if !self.focus_session(index) {
                 self.agent_sessions.open = true;
@@ -586,6 +957,12 @@ impl super::Frost {
             self.agent_sessions.close();
             self.relayout();
             self.refresh_active_context();
+            return;
+        }
+        // Not open here: a CLI observed holding this conversation first only
+        // explains the conflict; the next explicit request (Resume anyway)
+        // for this exact identity proceeds.
+        if !self.agent_sessions.admit_resume(&session) {
             return;
         }
         self.agent_sessions.sync_preflight();
@@ -606,14 +983,15 @@ impl super::Frost {
             .agent_sessions
             .selected_session()
             .cloned()
-            .filter(|session| (session.provider, session.id.clone()) == key)
+            .filter(|session| session_key(session) == key)
         else {
-            self.agent_sessions.pending_confirm = None;
+            self.agent_sessions.abandon_resume(None);
             return;
         };
         if let SessionPreflightState::Unavailable(error) = self.agent_sessions.preflight.state() {
-            self.agent_sessions.notice = Some(error.clone());
-            self.agent_sessions.pending_confirm = None;
+            // The attempt ends here: a later Resume must warn again.
+            let error = error.clone();
+            self.agent_sessions.abandon_resume(Some(error));
             return;
         }
         let Some(launch) = self
@@ -624,9 +1002,51 @@ impl super::Frost {
         else {
             return;
         };
+        // A scan that finished while the check ran may have just observed
+        // another CLI on this conversation: that needs the same explicit
+        // confirmation as a conflict known before arming.
+        if !self.agent_sessions.admit_resume(&session) {
+            return;
+        }
         self.agent_sessions.pending_confirm = None;
         self.native_enter_ownership.lock().claim_held();
         self.launch_checked_agent_session(session, key, launch);
+    }
+
+    /// Copy the exact user-facing resume command for the conversation the
+    /// button was rendered for, including an `env CODEX_HOME=…` prefix when
+    /// the history lives in another provider home. It is never the resolved
+    /// spawn argv with an absolute PATH. The background check computed it, so
+    /// copying never touches the project directory or history file here.
+    pub(crate) fn copy_agent_session_command(
+        &mut self,
+        key: &SessionKey,
+    ) -> iced::Task<super::Message> {
+        if !self.agent_sessions.open || self.agent_sessions.editing() {
+            return iced::Task::none();
+        }
+        let state = &self.agent_sessions;
+        let Some(session) = state
+            .selected_session()
+            .filter(|session| session_key(session) == *key)
+        else {
+            return iced::Task::none();
+        };
+        let command = state.preflight.command(session).map(str::to_owned);
+        match command {
+            Some(command) => {
+                self.push_toast("Copied resume command", super::ToastKind::Success);
+                iced::clipboard::write(command)
+            }
+            None => {
+                let notice = match state.preflight.state() {
+                    SessionPreflightState::Unavailable(error) => error.clone(),
+                    _ => "The resume command is still being checked.".to_owned(),
+                };
+                self.agent_sessions.notice = Some(notice);
+                iced::Task::none()
+            }
+        }
     }
 
     fn record_resumed_agent_session(&mut self, provider: SessionProvider, id: &str) {
@@ -645,7 +1065,8 @@ impl super::Frost {
         launch: SessionLaunch,
     ) {
         let Some(cwd) = launch.cwd.to_str() else {
-            self.agent_sessions.notice = Some("The session directory is not valid UTF-8".into());
+            self.agent_sessions
+                .abandon_resume(Some("The session directory is not valid UTF-8".into()));
             return;
         };
         let argv: Vec<_> = std::iter::once(launch.program).chain(launch.args).collect();
@@ -686,12 +1107,12 @@ impl super::Frost {
                     super::ToastKind::Success,
                 );
             }
-            Err(error) => {
-                self.agent_sessions.notice = Some(format!(
-                    "Could not resume {}: {error}",
-                    session.provider.label()
-                ))
-            }
+            // The attempt ends without a CLI: a confirmed live-session
+            // warning does not carry over to the next Resume.
+            Err(error) => self.agent_sessions.abandon_resume(Some(format!(
+                "Could not resume {}: {error}",
+                session.provider.label()
+            ))),
         }
     }
 
@@ -739,26 +1160,39 @@ impl super::Frost {
                 let tags_ref = reference.clone();
                 tags = tags.on_input(move |value| M::AgentSessionsTags(tags_ref.clone(), value));
             }
+            // Only this window's own pending writes disable Save; the periodic
+            // read-only reload of other terminals' changes never flickers it.
             let writable = state.store.is_loaded()
-                && !state.store.is_busy()
+                && !state.store.is_saving()
                 && state.store.error().is_none()
-                && !editor.saving;
+                && !editor.saving
+                && editor.invalid.is_none();
             let mut form = column![
                 text("Organize conversation").size(size + 5.0),
                 text(format!("{} · {}", reference.key.0.label(), editor.title))
                     .size(size).style(text::secondary),
                 text("Display name").size(size),
                 alias,
-                text("Leave blank to use the provider's title. Up to 160 bytes.")
-                    .size(size - 2.0).style(text::secondary),
+                text(format!(
+                    "Leave blank to use the provider's title. {} / {SESSION_ALIAS_MAX_BYTES} bytes.",
+                    editor.alias.len()
+                ))
+                .size(size - 2.0).style(text::secondary),
                 text("Tags").size(size),
                 tags,
-                text("Separate tags with commas. Up to 12 tags, 32 bytes each.")
-                    .size(size - 2.0).style(text::secondary),
+                text(format!(
+                    "Separate tags with commas. Up to {SESSION_TAG_LIMIT} tags, {SESSION_TAG_MAX_BYTES} bytes each."
+                ))
+                .size(size - 2.0).style(text::secondary),
                 text("Names and tags are shared across the four terminals. The original conversation stays unchanged.")
                     .size(size - 1.0).style(text::secondary),
             ].spacing(10);
-            if let Some(error) = editor.notice.as_deref().or_else(|| state.store.error()) {
+            if let Some(error) = editor
+                .notice
+                .as_deref()
+                .or(editor.invalid.as_deref())
+                .or_else(|| state.store.error())
+            {
                 form = form.push(text(error).size(size).style(text::danger));
             }
             form = form.push(
@@ -819,11 +1253,24 @@ impl super::Frost {
         .spacing(8)
         .align_y(iced::Alignment::Center);
         if self.config.experimental_task_sidebar {
-            heading = heading.push(
-                button(text("Tasks").size(size))
-                    .on_press(M::AgentSessionsShowTasks)
-                    .style(button::secondary),
-            );
+            let badge = self.task_attention_badge();
+            let tasks = button(
+                text(match &badge {
+                    Some((total, _)) => format!("Tasks · {total}"),
+                    None => "Tasks".to_owned(),
+                })
+                .size(size),
+            )
+            .on_press(M::AgentSessionsShowTasks)
+            .style(button::secondary);
+            heading = heading.push(match badge {
+                Some((_, summary)) => Element::from(tooltip(
+                    tasks,
+                    text(summary).size(size - 1.0),
+                    tooltip::Position::Bottom,
+                )),
+                None => tasks.into(),
+            });
         }
         heading = heading.push(
             button(
@@ -903,37 +1350,30 @@ impl super::Frost {
                     }),
             );
         }
-        let filtered = state.filtered();
+        let library = state.store.snapshot();
+        let matching = state.visible.len();
         let batch_reference = state.batch_reference();
         let mut list = column![].spacing(5);
-        let start = state.page * PAGE_SIZE;
-        for session in filtered.iter().skip(start).take(PAGE_SIZE) {
-            let key = (session.provider, session.id.clone());
+        let page = state.page_range();
+        let start = page.start;
+        for session in state.visible_sessions(page) {
+            let key = session_key(session);
             let selected = state.selected.as_ref() == Some(&key);
             let here = state
                 .bindings
                 .get(&key)
                 .and_then(|id| self.session_index_by_id(*id))
                 .is_some();
+            // One identity lookup for every personal fact on this row.
+            let facts = library.facts(session.provider, &session.id);
             let title = row![
-                text(
-                    if state
-                        .store
-                        .snapshot()
-                        .is_pinned(session.provider, &session.id)
-                    {
-                        format!("★ {}", session.provider.label())
-                    } else {
-                        session.provider.label().into()
-                    }
-                )
+                text(if facts.pinned {
+                    format!("★ {}", session.provider.label())
+                } else {
+                    session.provider.label().into()
+                })
                 .size(size - 1.0),
-                text(state.store.snapshot().display_title(
-                    session.provider,
-                    &session.id,
-                    &session.title
-                ))
-                .size(size),
+                text(facts.display_title(&session.title)).size(size),
                 Space::new().width(Length::Fill),
                 text(age(session.updated_at_ms)).size(size - 2.0)
             ]
@@ -954,23 +1394,10 @@ impl super::Frost {
                 .size(size - 2.0)
             ]
             .spacing(3);
-            let tags = state.store.snapshot().tags(session.provider, &session.id);
-            if !tags.is_empty() {
-                content = content.push(
-                    text(
-                        tags.iter()
-                            .map(|tag| format!("#{tag}"))
-                            .collect::<Vec<_>>()
-                            .join("  "),
-                    )
-                    .size(size - 2.0),
-                );
+            if !facts.tags.is_empty() {
+                content = content.push(text(hashtags(facts.tags)).size(size - 2.0));
             }
-            if state
-                .store
-                .snapshot()
-                .is_archived(session.provider, &session.id)
-            {
+            if facts.archived {
                 content = content.push(text("Archived in library").size(size - 2.0));
             }
             let session_button = button(content)
@@ -1006,7 +1433,7 @@ impl super::Frost {
                 row,
             ));
         }
-        if filtered.is_empty() {
+        if matching == 0 {
             list = list.push(
                 text(if state.scanner.is_scanning() {
                     "Looking for your Codex and Claude sessions…"
@@ -1018,8 +1445,8 @@ impl super::Frost {
                 .size(size),
             );
         }
-        let end = (start + PAGE_SIZE).min(filtered.len());
-        let pages = filtered.len().div_ceil(PAGE_SIZE).max(1);
+        let end = (start + PAGE_SIZE).min(matching);
+        let pages = matching.div_ceil(PAGE_SIZE).max(1);
         let page_controls = row![
             button(text("Previous").size(size - 1.0))
                 .on_press_maybe(
@@ -1028,29 +1455,25 @@ impl super::Frost {
                 .style(button::secondary),
             text(format!(
                 "{}–{} of {} · page {}/{}",
-                if filtered.is_empty() { 0 } else { start + 1 },
+                if matching == 0 { 0 } else { start + 1 },
                 end,
-                filtered.len(),
+                matching,
                 state.page + 1,
                 pages
             ))
             .size(size - 1.0),
             button(text("Next").size(size - 1.0))
                 .on_press_maybe(
-                    (end < filtered.len()).then_some(M::AgentSessionsStep(PAGE_SIZE as isize))
+                    (end < matching).then_some(M::AgentSessionsStep(PAGE_SIZE as isize))
                 )
                 .style(button::secondary),
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center);
         let list: Element<'_, M> = column![
-            text(format!(
-                "{} matching · {}",
-                filtered.len(),
-                state.sort.label()
-            ))
-            .size(size - 1.0)
-            .style(text::secondary),
+            text(format!("{matching} matching · {}", state.sort.label()))
+                .size(size - 1.0)
+                .style(text::secondary),
             scrollable(list)
                 .id(super::AGENT_SESSIONS_LIST_ID.clone())
                 .height(Length::Fill),
@@ -1063,37 +1486,17 @@ impl super::Frost {
         let mut actions = column![].spacing(6);
         let mut action_identity = None;
         if let Some(session) = state.selected_session() {
-            detail = detail.push(
-                text(state.store.snapshot().display_title(
-                    session.provider,
-                    &session.id,
-                    &session.title,
-                ))
-                .size(size + 2.0),
-            );
-            if state
-                .store
-                .snapshot()
-                .alias(session.provider, &session.id)
-                .is_some()
-            {
+            let facts = library.facts(session.provider, &session.id);
+            detail = detail.push(text(facts.display_title(&session.title)).size(size + 2.0));
+            if facts.alias.is_some() {
                 detail = detail.push(
                     text(format!("Original title: {}", session.title))
                         .size(size - 2.0)
                         .style(text::secondary),
                 );
             }
-            let tags = state.store.snapshot().tags(session.provider, &session.id);
-            if !tags.is_empty() {
-                detail = detail.push(
-                    text(
-                        tags.iter()
-                            .map(|tag| format!("#{tag}"))
-                            .collect::<Vec<_>>()
-                            .join("  "),
-                    )
-                    .size(size),
-                );
+            if !facts.tags.is_empty() {
+                detail = detail.push(text(hashtags(facts.tags)).size(size));
             }
             detail = detail.push(
                 text(format!(
@@ -1127,6 +1530,16 @@ impl super::Frost {
                     .size(size - 1.0)
                     .style(text::secondary),
             );
+            // Computed by the background check; never derived here, where it
+            // would touch the project directory and history file.
+            let command = state.preflight.command(session);
+            if let Some(command) = command {
+                detail = detail.push(
+                    text(format!("Resume command  {command}"))
+                        .size(size - 1.0)
+                        .style(text::secondary),
+                );
+            }
             detail = detail.push(text("Recent conversation").size(size));
             detail = detail.push(
                 text(if session.preview.is_empty() {
@@ -1136,30 +1549,30 @@ impl super::Frost {
                 })
                 .size(size),
             );
-            let key = (session.provider, session.id.clone());
-            let pinned = state
-                .store
-                .snapshot()
-                .is_pinned(session.provider, &session.id);
-            if let Some(timestamp) = state
-                .store
-                .snapshot()
-                .last_resumed(session.provider, &session.id)
-            {
+            let key = session_key(session);
+            let pinned = facts.pinned;
+            if let Some(timestamp) = facts.last_resumed_ms {
                 detail = detail.push(
                     text(format!("Last resumed {}", age(timestamp)))
                         .size(size - 1.0)
                         .style(text::secondary),
                 );
             }
-            let bound = state
-                .bindings
-                .get(&(session.provider, session.id.clone()))
-                .and_then(|id| self.session_index_by_id(*id))
-                .filter(|index| !self.sessions[*index].hold_after_exit)
-                .is_some();
+            let bound = self.agent_session_tab(&key).is_some();
             let ready = state.preflight.ready_launch(session).is_some();
             let checking = state.pending_confirm.is_some();
+            // Switching to this window's own tab never starts a second CLI.
+            let warning = state.resume_warning().filter(|_| !bound);
+            if let Some(warning) = warning {
+                actions = actions.push(
+                    text(format!(
+                        "⚠ {} Choose Resume anyway to start another CLI, or press Esc to cancel.",
+                        warning.text
+                    ))
+                    .size(size - 1.0)
+                    .style(text::warning),
+                );
+            }
             if bound {
                 actions = actions.push(
                     text("Open in this window")
@@ -1195,16 +1608,29 @@ impl super::Frost {
                         "Switch to open tab"
                     } else if checking {
                         "Checking before opening…"
+                    } else if warning.is_some() {
+                        "Resume anyway"
                     } else {
                         "Resume in new tab"
                     })
                     .size(size),
                 )
-                .on_press_maybe(((bound || ready) && !checking).then_some(M::AgentSessionsResume))
+                .on_press_maybe(
+                    ((bound || ready) && !checking).then(|| M::AgentSessionsResume(key.clone())),
+                )
                 .padding([8, 14])
                 .width(Length::Fill)
-                .style(button::primary),
+                .style(if warning.is_some() {
+                    button::danger
+                } else {
+                    button::primary
+                }),
             );
+            // Only this window's own pending writes disable organization; the
+            // periodic reload of other terminals' changes never does.
+            let writable = state.store.is_loaded()
+                && !state.store.is_saving()
+                && state.store.error().is_none();
             actions = actions.push(
                 row![
                     button(
@@ -1215,30 +1641,31 @@ impl super::Frost {
                         })
                         .size(size - 1.0)
                     )
-                    .on_press_maybe(
-                        (state.store.is_loaded()
-                            && !state.store.is_busy()
-                            && state.store.error().is_none())
-                        .then_some(M::AgentSessionsPin(key.clone()))
-                    )
+                    .on_press_maybe(writable.then(|| M::AgentSessionsPin(key.clone())))
                     .style(button::secondary),
                     button(text("Copy resume command").size(size - 1.0))
-                        .on_press_maybe(ready.then_some(M::AgentSessionsCopy))
+                        .on_press_maybe(
+                            command.is_some().then(|| M::AgentSessionsCopy(key.clone())),
+                        )
                         .style(button::text),
                 ]
                 .spacing(8)
                 .wrap(),
             );
-            let writable =
-                state.store.is_loaded() && !state.store.is_busy() && state.store.error().is_none();
-            let archived = state
-                .store
-                .snapshot()
-                .is_archived(session.provider, &session.id);
+            let archived = facts.archived;
             // Iced buttons retain a press until release. A refresh may replace
             // the selected conversation or change an action while held, so the
             // complete identity must retire the old subtree's pressed state.
-            action_identity = Some((key.clone(), pinned, archived, bound, ready, checking));
+            action_identity = Some((
+                key.clone(),
+                pinned,
+                archived,
+                bound,
+                ready,
+                checking,
+                warning.is_some(),
+                command.is_some(),
+            ));
             actions = actions.push(
                 row![
                     button(text("Name and tags…").size(size - 1.0))
@@ -1257,6 +1684,17 @@ impl super::Frost {
                 ]
                 .spacing(8)
                 .wrap(),
+            );
+        } else if state.selection_hidden() {
+            // A refresh or filter removed the chosen conversation. It is never
+            // replaced by whichever row moved into its place. When the user's
+            // own change moved it, say so and which view finds it.
+            detail = detail.push(
+                text(state.left_view.unwrap_or(
+                    "The selected conversation is no longer listed here. Its actions are paused until you select a conversation.",
+                ))
+                .size(size)
+                .style(text::warning),
             );
         } else {
             detail = detail.push(text("Select a conversation to preview and resume.").size(size));
@@ -1377,11 +1815,15 @@ impl super::Frost {
             project_controls =
                 project_controls.push(scrollable(projects).height(Length::Fixed(124.0)));
         }
-        let search_help = text(state.query_error.as_deref().unwrap_or(
+        let search_problem = state
+            .query_notice
+            .as_deref()
+            .or(state.query_error.as_deref());
+        let search_help = text(search_problem.unwrap_or(
             "Search: tag:review provider:codex project:\"my project\" is:pinned -is:live",
         ))
         .size(size - 2.0);
-        let search_help = if state.query_error.is_some() {
+        let search_help = if search_problem.is_some() {
             search_help.style(text::danger)
         } else {
             search_help.style(text::secondary)
@@ -1397,15 +1839,19 @@ impl super::Frost {
                 .iter()
                 .map(|(provider, id)| (*provider, id.as_str()))
                 .collect();
-            let visible_selected = filtered
-                .iter()
+            let visible_selected = state
+                .visible_sessions(0..matching)
                 .filter(|session| checked_keys.contains(&(session.provider, session.id.as_str())))
                 .count();
             let hidden = state.checked.len().saturating_sub(visible_selected);
             let writable = state.store.is_loaded()
-                && !state.store.is_busy()
+                && !state.store.is_saving()
                 && !state.bulk_saving
                 && !state.checked.is_empty();
+            // One projection of the page serves both the widget identity and
+            // the frozen reference its "Select visible page" action carries.
+            let page_keys = state.page_keys();
+            let page_reference = state.page_reference_for(page_keys.clone());
             let mut controls = column![
                 row![
                     text(format!(
@@ -1423,13 +1869,14 @@ impl super::Frost {
                 crate::widget_identity_scope::scope(
                     state.bulk_epoch.clone(),
                     crate::widget_identity_scope::scope_key(
-                        state.page_keys(),
+                        page_keys,
                         row![
                             button(text("Select visible page").size(size - 1.0))
                                 .style(button::secondary)
-                                .on_press_maybe((!state.bulk_saving).then(|| {
-                                    M::AgentSessionsSelectVisible(state.page_reference())
-                                })),
+                                .on_press_maybe(
+                                    (!state.bulk_saving)
+                                        .then_some(M::AgentSessionsSelectVisible(page_reference))
+                                ),
                             button(text("Clear selection").size(size - 1.0))
                                 .style(button::text)
                                 .on_press_maybe((!state.bulk_saving).then(|| {
@@ -1459,6 +1906,7 @@ impl super::Frost {
                 );
             }
             let reference = batch_reference.clone();
+            let tag_problem = batch_tag_problem(&state.bulk_tag);
             controls = controls.push(
                 text_input("One tag to add or remove", &state.bulk_tag)
                     .size(size)
@@ -1466,6 +1914,10 @@ impl super::Frost {
                         move |value| M::AgentSessionsBulkTag(reference.clone(), value)
                     })),
             );
+            if let Some(problem) = &tag_problem {
+                controls =
+                    controls.push(text(problem.clone()).size(size - 1.0).style(text::danger));
+            }
             for (label, action) in [
                 (
                     "Add tag",
@@ -1480,8 +1932,10 @@ impl super::Frost {
                     button(text(label).size(size - 1.0))
                         .style(button::secondary)
                         .on_press_maybe(
-                            (writable && !state.bulk_tag.trim().is_empty())
-                                .then(|| M::AgentSessionsBatch(batch_reference.clone(), action)),
+                            (writable
+                                && !state.bulk_tag.trim().is_empty()
+                                && tag_problem.is_none())
+                            .then(|| M::AgentSessionsBatch(batch_reference.clone(), action)),
                         ),
                 );
             }
@@ -1521,7 +1975,11 @@ impl super::Frost {
                 tooltip(
                     button(text(format!("Sort: {} ↻", state.sort.label())).size(size))
                         .on_press(M::AgentSessionsSort(state.next_sort())).style(button::secondary),
-                    text("Cycle Best match / Recent / Live first / Recently resumed · Ctrl+S").size(size - 1.0),
+                    text(format!(
+                        "Cycle {} · Ctrl+S",
+                        SessionSort::ALL.map(SessionSort::label).join(" / ")
+                    ))
+                    .size(size - 1.0),
                     tooltip::Position::Bottom,
                 ),
                 button(text("Clear filters").size(size - 1.0)).on_press(M::AgentSessionsClear).style(button::text),
@@ -1529,7 +1987,7 @@ impl super::Frost {
             row![
                 checkbox(state.pinned_only).label("Pinned only").on_toggle(M::AgentSessionsPinned).size(size),
                 checkbox(state.recent_only).label("Previously resumed").on_toggle(M::AgentSessionsRecent).size(size),
-                text(if !state.store.is_loaded() { "Loading saved library…" } else if state.store.is_busy() { "Saving library…" } else { "Names, tags, pins and archive are shared across terminals" }).size(size - 2.0).style(text::secondary),
+                text(if !state.store.is_loaded() { "Loading saved library…" } else if state.store.is_saving() { "Saving library…" } else { "Names, tags, pins and archive are shared across terminals" }).size(size - 2.0).style(text::secondary),
             ].spacing(12).align_y(iced::Alignment::Center).wrap(),
             project_controls,
             bulk_controls,
@@ -1591,6 +2049,7 @@ impl super::Frost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
     fn session(provider: SessionProvider, id: &str, title: &str) -> AgentSession {
         AgentSession {
             provider,
@@ -1694,6 +2153,21 @@ mod tests {
     }
 
     #[test]
+    fn batch_tag_is_checked_live_with_the_shared_batch_rules() {
+        assert_eq!(batch_tag_problem(""), None);
+        assert_eq!(batch_tag_problem("   "), None);
+        assert_eq!(batch_tag_problem(" Review "), None);
+        assert_eq!(
+            batch_tag_problem("review,release").as_deref(),
+            Some("A batch adds or removes one tag; remove the comma.")
+        );
+        assert!(batch_tag_problem(&"t".repeat(SESSION_TAG_MAX_BYTES + 1)).is_some());
+        assert!(batch_tag_problem("bad\u{202e}tag").is_some());
+        let at_limit = "t".repeat(SESSION_TAG_MAX_BYTES);
+        assert_eq!(batch_tag_problem(&at_limit), None);
+    }
+
+    #[test]
     fn rejected_batch_keeps_selection_and_tag_draft_and_cannot_use_an_old_tag() {
         let mut library = batch_library();
         library.select_visible(&library.page_reference());
@@ -1762,8 +2236,10 @@ mod tests {
         next.sessions.reverse();
         library.replace_catalog(next);
         assert_eq!(library.selected_session().unwrap().id, "two");
+        // The user's own filter change moves to the first match when the
+        // chosen conversation is no longer listed.
         library.provider = Some(SessionProvider::Codex);
-        library.reconcile();
+        library.apply_filters();
         assert_eq!(library.selected_session().unwrap().id, "one");
     }
     #[test]
@@ -1774,10 +2250,10 @@ mod tests {
             session(SessionProvider::Claude, "two", "Fix renderer"),
         ]));
         library.query = "renderer claude".into();
-        library.reconcile();
+        library.apply_filters();
         assert_eq!(library.selected_session().unwrap().id, "two");
         library.query = "no matches".into();
-        library.reconcile();
+        library.apply_filters();
         assert!(library.selected_session().is_none());
         library.step(1);
         assert!(library.selected.is_none());
@@ -1799,13 +2275,16 @@ mod tests {
             });
         library.replace_catalog(snapshot);
         library.live_only = true;
-        library.reconcile();
+        library.apply_filters();
         assert_eq!(library.filtered().len(), 1);
         assert_eq!(library.selected_session().unwrap().id, "one");
         let mut next = library.catalog.clone();
         next.live_processes.clear();
         library.replace_catalog(next);
-        assert!(library.selected.is_none());
+        // The refresh hid the selection; it is kept, not replaced.
+        assert!(library.selected_session().is_none());
+        assert_eq!(library.selected.as_ref().unwrap().1, "one");
+        assert!(library.selection_hidden());
     }
     #[test]
     fn pages_reach_every_session_and_unchanged_refresh_preserves_navigation() {
@@ -1845,14 +2324,17 @@ mod tests {
         library.replace_catalog(catalog(vec![incidental, title]));
         library.query = "renderer".into();
         library.selected = None;
-        library.reconcile();
+        library.apply_filters();
         assert_eq!(library.selected_session().unwrap().id, "title");
         library.project = Some("/work/repo".into());
         library.project_only = true;
-        library.reconcile();
+        library.apply_filters();
         assert_eq!(library.filtered().len(), 1);
         library.clear_filters();
         assert_eq!(library.filtered().len(), 2);
+        // Clearing is the user's own edit: the top hit of the full library
+        // ("preview" is now the most recent) is selected, as everywhere.
+        assert_eq!(library.filtered()[0].id, "preview");
         assert_eq!(library.selected_session().unwrap().id, "preview");
     }
     fn until_library(library: &mut SessionLibrary, ready: impl Fn(&SessionLibrary) -> bool) {
@@ -2116,5 +2598,536 @@ mod tests {
             .is_archived(SessionProvider::Codex, first));
         drop(reloaded);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn live(
+        provider: SessionProvider,
+        id: &str,
+        pid: u32,
+    ) -> jterm_core::agent_sessions::LiveSessionProcess {
+        jterm_core::agent_sessions::LiveSessionProcess {
+            provider,
+            id: id.into(),
+            pid,
+        }
+    }
+
+    /// Let the shown warning reach the age at which "Resume anyway" counts.
+    fn age_resume_warning(library: &mut SessionLibrary) {
+        let warning = library.resume_warning.as_mut().expect("a warning is shown");
+        warning.shown_at = Instant::now()
+            .checked_sub(SESSION_RESUME_ANYWAY_DELAY)
+            .expect("the monotonic clock is past the delay");
+    }
+
+    #[test]
+    fn a_resume_anyway_covers_only_the_attempt_it_started() {
+        let mut library = library();
+        library.open = true;
+        let mut snapshot = catalog(vec![session(SessionProvider::Codex, "busy", "Shared")]);
+        snapshot
+            .live_processes
+            .push(live(SessionProvider::Codex, "busy", 4242));
+        library.replace_catalog(snapshot);
+        library.selected = Some((SessionProvider::Codex, "busy".into()));
+        library.sync_preflight();
+        let busy = library.selected_session().unwrap().clone();
+        assert!(!library.admit_resume(&busy), "the first request warns");
+        age_resume_warning(&mut library);
+        assert!(library.admit_resume(&busy), "Resume anyway");
+        library.pending_confirm = Some(session_key(&busy));
+        // Its readiness check fails, for example because the CLI is missing.
+        library.abandon_resume(Some("codex was not found".into()));
+        assert!(library.pending_confirm.is_none());
+        assert_eq!(library.notice.as_deref(), Some("codex was not found"));
+        assert!(library.resume_warning().is_none());
+        assert!(
+            !library.admit_resume(&busy),
+            "after fixing it, the next Resume warns again instead of launching"
+        );
+        // Every way an armed attempt ends without a CLI withdraws it.
+        let source = include_str!("agent_sessions.rs");
+        let body = |start: &str| {
+            source
+                .split(start)
+                .nth(1)
+                .unwrap()
+                .split("\n    }\n")
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+        let finish = body("pub(crate) fn finish_pending_agent_resume(");
+        assert!(finish.contains("self.agent_sessions.abandon_resume(None);"));
+        assert!(finish.contains("self.agent_sessions.abandon_resume(Some(error));"));
+        let launch = body("fn launch_checked_agent_session(");
+        assert_eq!(launch.matches("abandon_resume(Some(").count(), 2);
+    }
+
+    #[test]
+    fn opening_replaces_a_selection_the_current_filters_no_longer_list() {
+        let mut library = library();
+        library.replace_catalog(catalog(vec![
+            session(SessionProvider::Codex, "one", "First"),
+            session(SessionProvider::Claude, "two", "Second"),
+        ]));
+        library.selected = Some((SessionProvider::Claude, "two".into()));
+        library.sync_preflight();
+        // A filter kept from the previous opening no longer lists it.
+        library.provider = Some(SessionProvider::Codex);
+        library.open = true;
+        library.adopt_listed_selection();
+        assert_eq!(library.selected_session().unwrap().id, "one");
+        assert!(!library.selection_hidden());
+        // A selection the filters still list survives reopening.
+        library.provider = None;
+        library.selected = Some((SessionProvider::Claude, "two".into()));
+        library.adopt_listed_selection();
+        assert_eq!(library.selected_session().unwrap().id, "two");
+        // A background refresh still never replaces a selection.
+        library.provider = Some(SessionProvider::Codex);
+        library.reconcile();
+        assert!(library.selection_hidden());
+        // Opening runs one installation check, not a second refresh of it.
+        let source = include_str!("agent_sessions.rs");
+        let refresh = source
+            .split("    pub fn refresh(&mut self) {")
+            .nth(1)
+            .unwrap()
+            .split("\n    }\n")
+            .next()
+            .unwrap();
+        assert!(refresh.contains("if !self.sync_preflight() {"));
+        let main = include_str!("main.rs");
+        let toggle = main
+            .split("Message::AgentSessionsToggle => {")
+            .nth(1)
+            .unwrap()
+            .split("Message::AgentSessionsSurface")
+            .next()
+            .unwrap();
+        assert!(toggle.contains("self.agent_sessions.open_view();"));
+        assert!(!toggle.contains("reconcile()"));
+    }
+
+    #[test]
+    fn the_users_own_search_and_filter_edits_select_the_best_match() {
+        let mut library = library();
+        library.replace_catalog(catalog(vec![
+            session(SessionProvider::Codex, "one", "Renderer review"),
+            session(SessionProvider::Claude, "two", "Renderer fix"),
+        ]));
+        assert!(library.set_query("renderer".into()));
+        let order: Vec<_> = library
+            .filtered()
+            .iter()
+            .map(|session| session_key(session))
+            .collect();
+        assert_eq!(order.len(), 2);
+        assert_eq!(library.selected.as_ref(), Some(&order[0]));
+        // The second hit is chosen, then the user edits the filters while it
+        // is still listed: type-then-Enter must resume the new top hit.
+        library.selected = Some(order[1].clone());
+        library.sync_preflight();
+        library.sort = SessionSort::Relevance;
+        library.apply_filters();
+        assert_eq!(library.selected.as_ref(), Some(&order[0]));
+        library.selected = Some(order[1].clone());
+        library.clear_filters();
+        assert_eq!(
+            library.selected_session().map(session_key),
+            library
+                .filtered()
+                .first()
+                .map(|session| session_key(session))
+        );
+
+        // An implausible paste is refused whole and the search is kept.
+        let before = library.query.clone();
+        assert!(!library.set_query("x".repeat(QUERY_INPUT_LIMIT + 1)));
+        assert_eq!(library.query, before);
+        assert!(library
+            .query_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("4096-byte limit")));
+        // Over core's limit but plausible: kept whole, explained, no matches.
+        let long = format!("{} -tag:done", "x".repeat(SESSION_QUERY_MAX_BYTES));
+        assert!(library.set_query(long));
+        assert!(library.query.ends_with("-tag:done"));
+        assert!(library.query_notice.is_none());
+        assert!(library.query_error.is_some());
+        assert!(library.filtered().is_empty());
+        let main = include_str!("main.rs");
+        let query = main
+            .split("Message::AgentSessionsQuery(query) => {")
+            .nth(1)
+            .unwrap()
+            .split("Message::AgentSessionsProvider(")
+            .next()
+            .unwrap();
+        assert!(query.contains("self.agent_sessions.set_query(query);"));
+    }
+
+    #[test]
+    fn the_users_own_archive_explains_why_the_selection_left_the_view() {
+        const ONE: &str = "11111111-1111-4111-8111-111111111111";
+        const TWO: &str = "22222222-2222-4222-8222-222222222222";
+        let mut library = library();
+        library.open = true;
+        library.replace_catalog(catalog(vec![
+            session(SessionProvider::Codex, ONE, "First"),
+            session(SessionProvider::Codex, TWO, "Second"),
+        ]));
+        settle_library(&mut library);
+        library.selected = Some((SessionProvider::Codex, ONE.into()));
+        library.sync_preflight();
+        let key = (SessionProvider::Codex, ONE.to_string());
+        library
+            .store
+            .set_archived(SessionProvider::Codex, ONE, true)
+            .unwrap();
+        library.note_own_change(key.clone(), OwnChange::Archived);
+        settle_library(&mut library);
+        // Never retargeted: the archived conversation stays selected but
+        // detached, and the manager says the user's own change moved it.
+        assert_eq!(library.selected.as_ref(), Some(&key));
+        assert!(library.selection_hidden());
+        assert_eq!(library.left_view, Some(OwnChange::Archived.left_view()));
+        assert!(library.own_change.is_none());
+        // Choosing a conversation ends the explanation.
+        library.step(1);
+        assert!(library.selected_session().is_some());
+        assert!(library.left_view.is_none());
+
+        // A change that keeps the row listed explains nothing.
+        library.archive = SessionArchiveFilter::All;
+        library.apply_filters();
+        let listed = library.selected.clone().unwrap();
+        library.store.set_pinned(listed.0, &listed.1, true).unwrap();
+        library.note_own_change(listed, OwnChange::Unpinned);
+        settle_library(&mut library);
+        assert!(library.own_change.is_none());
+        assert!(library.left_view.is_none());
+        let main = include_str!("main.rs");
+        for (handler, change) in [
+            (
+                "Message::AgentSessionsPin((provider, id)) => {",
+                "OwnChange::Unpinned",
+            ),
+            (
+                "Message::AgentSessionsArchive((provider, id)) => {",
+                "OwnChange::Archived",
+            ),
+        ] {
+            let body = main
+                .split(handler)
+                .nth(1)
+                .unwrap()
+                .split("            Message::")
+                .next()
+                .unwrap();
+            assert!(body.contains(change), "{handler}");
+        }
+    }
+
+    #[test]
+    fn background_refresh_keeps_a_hidden_selection_and_never_auto_launches_another() {
+        let mut library = library();
+        library.open = true;
+        library.replace_catalog(catalog(vec![
+            session(SessionProvider::Codex, "one", "First"),
+            session(SessionProvider::Claude, "two", "Second"),
+            session(SessionProvider::Codex, "three", "Third"),
+        ]));
+        library.selected = Some((SessionProvider::Claude, "two".into()));
+        library.sync_preflight();
+        // An armed resume waits for its own identity's readiness check.
+        library.pending_confirm = library.selected.clone();
+        let mut refreshed = library.catalog.clone();
+        refreshed.sessions.retain(|session| session.id != "two");
+        assert!(library.replace_catalog(refreshed));
+        assert_eq!(
+            library.selected,
+            Some((SessionProvider::Claude, "two".into())),
+            "a refresh must not retarget the selection to the row that moved up"
+        );
+        assert!(library.selection_hidden());
+        assert!(library.selected_session().is_none());
+        assert_eq!(library.selected_key(), None, "resume and organize pause");
+        assert!(
+            library.pending_confirm.is_none(),
+            "the armed resume is withdrawn"
+        );
+        assert!(matches!(
+            library.preflight.state(),
+            SessionPreflightState::Idle
+        ));
+        // When the identity returns it is selected again, but nothing launches
+        // until the user confirms anew.
+        let mut restored = library.catalog.clone();
+        restored
+            .sessions
+            .push(session(SessionProvider::Claude, "two", "Second"));
+        assert!(library.replace_catalog(restored));
+        assert_eq!(library.selected_session().unwrap().id, "two");
+        assert!(library.pending_confirm.is_none());
+        // From a hidden selection, explicit navigation enters the list at the
+        // edge it points to instead of skipping the first match.
+        library.selected = Some((SessionProvider::Codex, "gone".into()));
+        library.step(1);
+        assert_eq!(library.selected_position(), Some(0));
+        library.selected = Some((SessionProvider::Codex, "gone".into()));
+        library.step(-1);
+        assert_eq!(library.selected_position(), Some(library.visible.len() - 1));
+    }
+
+    #[test]
+    fn user_filter_changes_select_the_first_match() {
+        let mut library = library();
+        library.replace_catalog(catalog(vec![
+            session(SessionProvider::Codex, "alpha", "Alpha renderer"),
+            session(SessionProvider::Claude, "beta", "Beta renderer"),
+            session(SessionProvider::Codex, "gamma", "Gamma parser"),
+        ]));
+        library.selected = Some((SessionProvider::Claude, "beta".into()));
+        library.query = "renderer".into();
+        library.apply_filters();
+        let top = |library: &SessionLibrary| library.filtered()[0].id.clone();
+        assert_eq!(library.selected_session().unwrap().id, top(&library));
+        library.selected = Some((SessionProvider::Claude, "beta".into()));
+        library.sort = library.next_sort();
+        library.apply_filters();
+        assert_eq!(
+            library.selected_session().unwrap().id,
+            top(&library),
+            "a still-listed selection also yields to the new top hit"
+        );
+        library.query = "parser".into();
+        library.apply_filters();
+        assert_eq!(library.selected_session().unwrap().id, "gamma");
+    }
+
+    #[test]
+    fn live_conflict_requires_a_second_request_for_that_exact_identity() {
+        let mut library = library();
+        library.open = true;
+        let mut snapshot = catalog(vec![
+            session(SessionProvider::Codex, "busy", "Running elsewhere"),
+            session(SessionProvider::Codex, "free", "Quiet"),
+        ]);
+        snapshot
+            .live_processes
+            .push(live(SessionProvider::Codex, "busy", 4242));
+        library.replace_catalog(snapshot);
+        library.selected = Some((SessionProvider::Codex, "busy".into()));
+        library.sync_preflight();
+        let busy = library.selected_session().unwrap().clone();
+        assert!(!library.admit_resume(&busy), "the first request only warns");
+        let warning = library.resume_warning().unwrap().clone();
+        assert_eq!(warning.key, (SessionProvider::Codex, "busy".to_string()));
+        assert!(warning.text.contains("PID 4242"), "{}", warning.text);
+        assert!(library.pending_confirm.is_none());
+        // The second click of a double-click (or a quick second Enter) lands
+        // on "Resume anyway" before anyone could read the warning.
+        assert!(
+            !library.admit_resume(&busy),
+            "an immediate repeat cannot confirm the warning it raised"
+        );
+        assert_eq!(
+            library.resume_warning().unwrap().shown_at,
+            warning.shown_at,
+            "an early repeat neither confirms nor restarts the delay"
+        );
+        age_resume_warning(&mut library);
+        assert!(library.admit_resume(&busy), "Resume anyway admits it");
+
+        // Escape withdraws the warning first and keeps the manager open.
+        assert!(library.cancel_resume_warning());
+        assert_eq!(library.notice.as_deref(), Some("Resume cancelled."));
+        assert!(!library.cancel_resume_warning());
+        assert!(!library.admit_resume(&busy), "a new request warns again");
+
+        // Selecting another conversation retires the warning, and a
+        // conversation without a live CLI is admitted at once.
+        library.selected = Some((SessionProvider::Codex, "free".into()));
+        library.sync_preflight();
+        assert_eq!(library.selected_session().unwrap().id, "free");
+        assert!(library.resume_warning.is_none());
+        let free = library.selected_session().unwrap().clone();
+        assert!(library.admit_resume(&free));
+
+        // A refresh that no longer observes the process retires a warning,
+        // and one that drops the identity hides it without confirming.
+        library.selected = Some((SessionProvider::Codex, "busy".into()));
+        library.sync_preflight();
+        assert!(!library.admit_resume(&busy));
+        let mut quiet = library.catalog.clone();
+        quiet.live_processes.clear();
+        library.replace_catalog(quiet);
+        assert!(library.resume_warning.is_none());
+        assert!(library.admit_resume(&busy));
+        let mut busy_again = library.catalog.clone();
+        busy_again
+            .live_processes
+            .push(live(SessionProvider::Codex, "busy", 7));
+        library.replace_catalog(busy_again);
+        assert!(!library.admit_resume(&busy));
+        let mut removed = library.catalog.clone();
+        removed.sessions.retain(|session| session.id != "busy");
+        library.replace_catalog(removed);
+        assert!(library.resume_warning.is_none());
+        assert!(library.resume_warning().is_none());
+    }
+
+    #[test]
+    fn resume_and_copy_actions_are_bound_to_the_rendered_identity() {
+        let main = include_str!("main.rs");
+        assert!(main.contains("AgentSessionsResume(agent_sessions::SessionKey),"));
+        assert!(main.contains("AgentSessionsCopy(agent_sessions::SessionKey),"));
+        assert!(
+            main.contains("Message::AgentSessionsResume(key) => self.resume_agent_session(&key),")
+        );
+        assert!(main.contains(
+            "Message::AgentSessionsCopy(key) => return self.copy_agent_session_command(&key),"
+        ));
+        let source = include_str!("agent_sessions.rs");
+        for start in [
+            "pub(crate) fn resume_agent_session(",
+            "pub(crate) fn copy_agent_session_command(",
+        ] {
+            let body = source
+                .split(start)
+                .nth(1)
+                .unwrap()
+                .split("\n    }\n")
+                .next()
+                .unwrap();
+            assert!(
+                body.contains(".filter(|session| session_key(session) == *key)"),
+                "{start} must refuse a stale identity"
+            );
+        }
+        let copy = source
+            .split("pub(crate) fn copy_agent_session_command(")
+            .nth(1)
+            .unwrap()
+            .split("\n    }\n")
+            .next()
+            .unwrap();
+        // The background check computed the command: copying never checks
+        // the project directory or history file on the UI thread.
+        assert!(copy.contains("state.preflight.command(session)"));
+        assert!(!copy.contains("resume_launch"));
+        assert!(copy.contains("\"Copied resume command\""));
+        assert!(
+            !copy.contains("ready_launch"),
+            "never the resolved spawn argv"
+        );
+        // The search keeps the user's complete text.
+        let query = main
+            .split("Message::AgentSessionsQuery(query) => {")
+            .nth(1)
+            .unwrap()
+            .split("Message::AgentSessionsProvider(")
+            .next()
+            .unwrap();
+        assert!(!query.contains("visible_bounded"));
+    }
+
+    #[test]
+    fn hidden_or_moved_selection_has_no_actionable_key() {
+        let mut library = library();
+        library.replace_catalog(catalog(vec![
+            session(SessionProvider::Codex, "one", "First"),
+            session(SessionProvider::Claude, "two", "Second"),
+        ]));
+        library.selected = Some((SessionProvider::Claude, "two".into()));
+        assert_eq!(
+            library.selected_key(),
+            Some((SessionProvider::Claude, "two".into()))
+        );
+        library.query = "First".into();
+        library.reconcile();
+        assert_eq!(library.selected_key(), None);
+        assert!(library.selection_hidden());
+    }
+
+    #[test]
+    fn long_queries_are_kept_whole_and_explained_by_core() {
+        let mut library = library();
+        library.replace_catalog(catalog(vec![session(
+            SessionProvider::Codex,
+            "one",
+            "Renderer",
+        )]));
+        // A long query keeps its trailing exclusion instead of being cut.
+        let long = format!("title:\"{}\" -tag:done", "renderer ".repeat(70).trim_end());
+        assert!(long.len() > 512);
+        library.query = long.clone();
+        library.apply_filters();
+        assert_eq!(library.query, long);
+        assert!(library.query_error.is_none());
+        library.query = "x".repeat(4097);
+        library.apply_filters();
+        assert!(library.query_error.is_some());
+        assert!(library.filtered().is_empty());
+    }
+
+    #[test]
+    fn editor_validates_live_against_core_byte_limits() {
+        let mut library = library();
+        let id = "11111111-1111-4111-8111-111111111111";
+        let key = (SessionProvider::Codex, id.to_owned());
+        library.replace_catalog(catalog(vec![session(SessionProvider::Codex, id, "Title")]));
+        library.open = true;
+        library.begin_organization(&key);
+        let reference = library.editor.as_ref().unwrap().reference.clone();
+        assert!(library.editor.as_ref().unwrap().invalid.is_none());
+        // 54 three-byte characters exceed the 160-byte name limit while
+        // staying far below the old 512-character cut.
+        let over = "名".repeat(SESSION_ALIAS_MAX_BYTES / 3 + 1);
+        library.organization_alias(&reference, over.clone());
+        let editor = library.editor.as_ref().unwrap();
+        assert_eq!(editor.alias, over, "the draft is kept, not truncated");
+        assert_eq!(
+            editor.invalid,
+            validate_session_details(&over, "").err(),
+            "the editor shows core's own explanation"
+        );
+        library.save_organization(&reference);
+        assert!(!library.editor.as_ref().unwrap().saving);
+        assert!(!library.store.is_saving(), "an invalid draft never queues");
+        let tags = (0..=SESSION_TAG_LIMIT)
+            .map(|index| format!("t{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        library.organization_alias(&reference, "Renderer".into());
+        library.organization_tags(&reference, tags);
+        assert!(library.editor.as_ref().unwrap().invalid.is_some());
+        library.organization_tags(&reference, "release, review".into());
+        assert!(library.editor.as_ref().unwrap().invalid.is_none());
+        // Only an implausible paste is refused whole, keeping the draft.
+        library.organization_alias(&reference, "x".repeat(ALIAS_INPUT_LIMIT + 1));
+        let editor = library.editor.as_ref().unwrap();
+        assert_eq!(editor.alias, "Renderer");
+        assert!(editor.notice.is_some());
+    }
+
+    #[test]
+    fn periodic_refresh_follows_an_explicit_open_and_sort_cycles_core_order() {
+        let mut library = library();
+        library.open = true;
+        library.poll();
+        assert!(
+            !library.scanner.is_scanning(),
+            "only the explicit opening refresh arms periodic rescans"
+        );
+        let mut seen = Vec::new();
+        for _ in 0..SessionSort::ALL.len() {
+            seen.push(library.sort);
+            library.sort = library.next_sort();
+        }
+        assert_eq!(seen, SessionSort::ALL);
+        assert_eq!(library.sort, SessionSort::ALL[0]);
     }
 }

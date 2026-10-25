@@ -856,7 +856,11 @@ Git 注册与分支；通过打开的目录描述符 + fchdir 传递 cwd，shell
 **Mark complete** 才算接受任务。**Review diff** 显示相对任务基准提交的有界
 `git status --short` 与已跟踪文件的 `git diff HEAD`（未跟踪文件只列出路径）。
 原生会话失败或退出不成功时，可以用 **Open Codex**（或其他 provider 的 Open …）在终端中显式继续。
-任务元数据仅存在于运行时；**Hide task** 只隐藏元数据，不会删除 worktree。
+任务元数据仅存在于运行时；**Hide task** 只隐藏元数据，不会删除 worktree，且仅在任务可隐藏时可用
+（否则卡片说明需先停止什么）。**Hidden (N)** 列出已隐藏任务，**Restore** 让任务回到隐藏前的状态，
+不会启动 Agent、重跑验证或接受工作。有任务需要处理时，侧栏 **Tasks** 切换按钮与标签栏 **Agents**
+按钮显示计数；**Ctrl+Alt+Shift+T**（`task:toggle`）显示/隐藏 Tasks 面板。Tasks 搜索框或评审反馈框
+获得焦点时，方向键、Tab、Enter 等不再落入终端；按 Esc 或点击终端返回。
 任务终端（Agent 或验证）的子进程退出后标签页会保留为只读副本供回看：标题带 "(exited)" 后缀、
 pane 头部显示 `■ exited`，键盘与粘贴输入不再写入已死的 PTY，只会弹出一条节流提示；任务终端
 也不会进入会话快照，重启后不会恢复成恰好落在任务 worktree 里的普通 shell。
@@ -1200,10 +1204,16 @@ session IDs and recent conversation text; filter by provider or last recorded
 activity. Select a row to inspect its directory, branch and recent conversation,
 then press **Enter** or **Resume in new tab**. The native PTY starts the provider
 with an exact session ID and original working directory. Reopening a session
-already resumed in this window focuses its tab. **F5** refreshes; **Escape** closes.
+already resumed in this window focuses its tab. **F5** refreshes. **Escape** first
+cancels the name/tag editor or leaves bulk organizing, then withdraws a
+live-session warning, and otherwise closes the library.
 
-Discovery runs on a bounded background worker and refreshes while the library is
-open. It honors `CODEX_HOME` and `CLAUDE_CONFIG_DIR`. Transcript activity is
+Discovery runs on a bounded background worker. While the library is open it
+rescans five seconds after the previous scan *finished* (a slow scan never
+triggers back-to-back rescans) and reloads the shared library only together with
+a scan. Opening the library, **Refresh** and **F5** all do the same full refresh:
+rescan, reload names/tags/pins, and re-check the selected conversation. It honors
+`CODEX_HOME` and `CLAUDE_CONFIG_DIR`. Transcript activity is
 explicitly historical: it does not claim a stale conversation is still running.
 Missing project directories or session files are reported before resume, and
 archived Codex conversations must be unarchived with Codex first. The library
@@ -1217,8 +1227,19 @@ The session library ranks exact IDs and titles ahead of incidental preview match
 Choose **This folder** to include the captured terminal directory and its subfolders,
 or cycle **Best match / Recent / Live first** with the sort button or **Ctrl+S**.
 Results use explicit 80-row pages; **Page Up/Down**, **Home/End**, and **Ctrl+L**
-provide keyboard navigation. Automatic unchanged refreshes preserve selection and
-scroll position, and **Clear filters** restores the full library.
+provide keyboard navigation. A background refresh never changes the selected
+conversation: if a refresh removes it from the list, it stays selected but hidden,
+its actions pause and any queued resume is withdrawn until you select again. Your
+own search, filter, scope, sort and **Clear filters** select the first match, as in
+Anvil, Forge and Ember, so typing a search and pressing Enter resumes its top hit.
+Opening the library keeps the previous selection only while the current filters
+still list it; otherwise it starts on the first match. When your own archive,
+restore, unpin, name/tag or batch change moves the selected conversation out of
+the view, it stays selected (never replaced) and the details say which view
+finds it again. Long searches are kept whole; an over-limit search shows an
+explanation instead of being cut short (which could drop a `-tag:` exclusion), and
+only an implausibly large paste (over four times the 4,096-byte limit) is refused,
+keeping the previous search.
 
 Use **Pin session** to keep a conversation in the default empty-search view,
 **Pinned only** to narrow the library, and **Previously resumed** or the
@@ -1227,7 +1248,20 @@ receipts are shared with the other native terminals through a private user-state
 file and survive restarting the app. Provider transcripts are never changed.
 
 Selecting a session checks its directory and agent installation in the
-background. Confirming performs a fresh check before opening; changing selection
+background. When the latest scan observed another Codex/Claude process already
+running the selected conversation (and it is not a tab of this window), the first
+**Resume**/Enter only shows that warning; choose **Resume anyway** (or press Enter
+again) to start a second CLI on the same history. A repeat within 0.6 seconds of
+the warning appearing is ignored, so a double-click or a quick double Enter cannot
+confirm it unread. Selecting another conversation, a refresh that no longer lists
+it, or **Esc** cancels the warning, and a confirmation covers only the attempt it
+started: if that readiness check or launch fails, the next Resume warns again.
+The details show the exact resume command once the background check has computed
+it, and **Copy resume command** copies it, including an
+`env CODEX_HOME=…`/`CLAUDE_CONFIG_DIR=…` prefix when the history lives in another
+provider home, and confirms with a toast; neither touches the project directory
+or history file on the UI thread. Confirming performs a fresh check
+before opening; changing selection
 or closing the picker cancels a pending confirmation. The primary action stays
 visible while the conversation preview scrolls. Existing live tabs remain
 switchable even if their original CLI executable has since disappeared.
@@ -1235,7 +1269,12 @@ switchable even if their original CLI executable has since disappeared.
 ### Organize conversations and projects
 
 Choose **Name and tags…** to give a session a recognizable local name and up to
-12 comma-separated tags. **Save details** writes both together; cancelling leaves
+12 comma-separated tags. The editor checks the shared limits as you type (names
+up to 160 bytes, tags up to 32 bytes each) and disables **Save details** with an
+explanation while a draft is over them. **Saving library…** and disabled pin,
+archive and organize controls reflect only this window's own pending writes, not
+the periodic reload of other terminals' changes. **Save details** writes both
+together; cancelling leaves
 the saved organization unchanged. The editor owns keyboard input, so Enter while
 editing cannot accidentally resume a conversation. Names, tags, pins, archive
 state and resume history are shared with Anvil, Forge and Ember.
@@ -1267,6 +1306,19 @@ session attachment. Project ordering groups rows under their repository.
 Navigation keeps review drafts attached to their task identities and does not
 start, stop or approve an agent. Existing native start, review, diff, validation
 and approval controls remain on the selected task's detail card.
+
+**Ctrl+Alt+Shift+T** (`task:toggle`, also the palette's **Toggle Tasks
+Dashboard**) shows or hides the Tasks dock; with the dashboard disabled it explains
+how to enable it. When tasks need you, the **Tasks** switcher, the session
+library's **Tasks** button and the tab bar's **Agents** button show the count;
+hover for a breakdown such as "2 tasks need you: 1 approval, 1 reply". While a
+Tasks field (search or review feedback) has keyboard focus it owns typing: keys it
+does not use (arrows, Tab, Enter in the feedback field, stray Ctrl letters) never
+reach the terminal, move a block selection or run a terminal binding such as
+paste, copy, Ctrl+C/D or a block command. App shortcuts still work: the command
+palette, tab switcher, help, tab and pane commands, font zoom, scrolling and the
+Tasks and dock toggles. The toggles also work while the **New task** composer is
+open. Press **Esc** or click the terminal to return.
 
 #### Focus on the tasks that need you
 
@@ -1321,6 +1373,26 @@ the existing AI/context-sharing consent and prepares an on-disk task brief;
 the launch notice gives its path so the user can ask the CLI to read it. No
 input is injected into the terminal.
 
+#### Hide and restore tasks
+
+**Hide task** is enabled only when the task can be hidden; otherwise the card
+says what must stop first (the Agent, its native session or a validation). Hiding
+confirms with a toast and keeps the worktree and evidence. **Hidden (N)** lists
+hidden tasks (searches such as `is:archived` work there) with read-only details
+and a single action, **Restore**, which returns the task to the lifecycle state it
+had when hidden and shows it in the workspace again, with its native transcript
+and evidence. Restoring never starts an Agent, reruns validation or accepts
+work. The Hidden view is a browsing mode of the open dashboard: opening or
+toggling the dock, switching panels and creating a task return to the
+workspace, and the view closes itself once nothing hidden remains. There,
+**Clear filters** resets only the search, provider, project and sort; the
+workspace's quick view and attention filter are kept for when you return.
+
+Native sessions parked at an approval or a review point poll slowly. Your own
+**Deny**, review reply, **Finish** or **Cancel** briefly switches to fast polling
+so the outcome appears promptly. Native phases, approval kinds and exit reasons
+use readable labels.
+
 #### Inspect the actual work
 
 **Task details** shows the shared task inspector, including the goal and
@@ -1340,7 +1412,10 @@ Filtering, sorting and refreshing preserve checked identities.
 
 Pin, unpin, archive, restore, add one tag or remove one tag for up to **256**
 conversations in one atomic batch. Actions include the hidden checked
-conversations. Aliases, other tags and resume history are preserved. Errors
+conversations. Aliases, other tags and resume history are preserved. The batch
+tag is checked as you type with the same rules the save applies (one tag, at
+most 32 bytes, no commas or control characters); **Add tag** and **Remove tag**
+stay disabled with the reason shown until it is valid. Errors
 retain the selection and tag draft. **Finish organizing** returns to normal
 conversation actions; Enter in bulk mode never resumes a conversation.
 Archive and restore affect the shared local library and preserve provider
