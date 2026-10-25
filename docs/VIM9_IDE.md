@@ -96,6 +96,17 @@ overlay if the added status bar is hidden.
 
 ## GUI buffer rendering
 
+Clipped native text limits per-cell ASCII fallback submissions and diagnostic
+wave geometry to the visible span. Neighboring cells remain candidates for
+italic overhang; Unicode and combining text retain whole-run shaping.
+Fractional scroll baselines, Vim source columns and GUI colors are preserved.
+
+Bold and italic ASCII runs can use one native text submission when their
+resolved face has the exact measured advance of the current Vim grid. Style,
+family and size have separate bounded measurements; proportional or missing
+faces retain per-cell placement. Unicode shaping keeps its existing path.
+
+
 Wheel and trackpad events target the Vim split under the pointer without
 changing the active window. Discrete wheel notches request three lines;
 trackpad pixels move the displayed text immediately using the measured line

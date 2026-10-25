@@ -1882,6 +1882,57 @@ pub(crate) fn native_editor_glyph_font(
     }
 }
 
+/// Font metrics are logical pixels, just like Vim's authoritative grid.
+/// Match every font attribute and the current logical size; compare with the
+/// current cell width after lookup so zoom/scale geometry cannot reuse a
+/// previous decision. The font database is the same process-local database
+/// used by primary metrics and native editor fallback resolution.
+pub(crate) fn native_editor_font_matches_grid(font: iced::Font, metrics: Metrics) -> bool {
+    if !metrics.mono_advance_exact || !(metrics.font_size.is_finite() && metrics.font_size > 0.0) {
+        return false;
+    }
+    NATIVE_ADVANCES.with(|cache| {
+        cache
+            .borrow_mut()
+            .get(font, metrics.font_size, || {
+                measure_mono_ascii_advance(font, metrics.font_size)
+            })
+            .is_some_and(|advance| advance == metrics.cell_w)
+    })
+}
+
+#[derive(Default)]
+struct NativeAdvanceCache {
+    entries: std::collections::HashMap<(iced::Font, u32), Option<f32>>,
+}
+
+impl NativeAdvanceCache {
+    fn get(
+        &mut self,
+        font: iced::Font,
+        size: f32,
+        measure: impl FnOnce() -> Option<f32>,
+    ) -> Option<f32> {
+        let key = (font, size.to_bits());
+        if let Some(advance) = self.entries.get(&key) {
+            return *advance;
+        }
+        let advance = measure();
+        // Bound style/font/zoom combinations, including failed probes. A
+        // miss always performs the same conservative full ASCII measurement.
+        if self.entries.len() >= 256 {
+            self.entries.clear();
+        }
+        self.entries.insert(key, advance);
+        advance
+    }
+}
+
+thread_local! {
+    static NATIVE_ADVANCES: std::cell::RefCell<NativeAdvanceCache> =
+        std::cell::RefCell::new(NativeAdvanceCache::default());
+}
+
 /// The primary font's advance width for printable ASCII at `font_size`,
 /// measured through cosmic-text — the same library and version iced's
 /// renderers shape with. Returns `None` when the font cannot be resolved or
@@ -2098,6 +2149,89 @@ mod tests {
         BLOCK_CARD_INSET, BLOCK_CARD_RADIUS, BLOCK_GUTTER_WIDTH,
     };
     use iced::{Color, Point, Rectangle};
+
+    #[test]
+    fn native_style_advance_cache_binds_every_font_attribute_size_and_failure() {
+        let mut cache = super::NativeAdvanceCache::default();
+        let font = iced::Font::MONOSPACE;
+        assert_eq!(cache.get(font, 14.0, || Some(8.0)), Some(8.0));
+        assert_eq!(
+            cache.get(font, 14.0, || panic!("warm style must not remeasure")),
+            Some(8.0)
+        );
+        for alternate in [
+            iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..font
+            },
+            iced::Font {
+                style: iced::font::Style::Italic,
+                ..font
+            },
+            iced::Font {
+                stretch: iced::font::Stretch::Expanded,
+                ..font
+            },
+            iced::Font {
+                family: iced::font::Family::SansSerif,
+                ..font
+            },
+        ] {
+            assert_eq!(cache.get(alternate, 14.0, || None), None);
+            assert_eq!(
+                cache.get(alternate, 14.0, || panic!("failed probes also stay warm")),
+                None
+            );
+        }
+        assert_eq!(cache.get(font, 15.0, || Some(9.0)), Some(9.0));
+        for size in 1..300 {
+            cache.get(font, size as f32, || None);
+        }
+        assert!(cache.entries.len() <= 256);
+    }
+
+    #[test]
+    fn native_style_batching_requires_the_current_measured_grid() {
+        let font = super::resolve_native_editor_font(iced::Font::MONOSPACE);
+        for size in [12.0, 14.0, 18.9, 28.0] {
+            let metrics = super::Metrics::with_font(font, size, 1.0, 0.0, false);
+            for bold in [false, true] {
+                for italic in [false, true] {
+                    let style = super::native_editor_glyph_font(font, "ASCII", bold, italic);
+                    let advance = super::measure_mono_ascii_advance(style, size);
+                    assert_eq!(
+                        super::native_editor_font_matches_grid(style, metrics),
+                        metrics.mono_advance_exact && advance == Some(metrics.cell_w)
+                    );
+                    assert!(!super::native_editor_font_matches_grid(
+                        style,
+                        super::Metrics {
+                            cell_w: metrics.cell_w + 0.25,
+                            ..metrics
+                        }
+                    ));
+                    assert!(!super::native_editor_font_matches_grid(
+                        style,
+                        super::Metrics {
+                            mono_advance_exact: false,
+                            ..metrics
+                        }
+                    ));
+                }
+            }
+        }
+        let metrics = super::Metrics::with_font(font, 14.0, 1.0, 0.0, false);
+        assert!(
+            !super::native_editor_font_matches_grid(
+                iced::Font {
+                    family: iced::font::Family::SansSerif,
+                    ..font
+                },
+                metrics
+            ),
+            "a proportional fallback must keep authoritative per-cell placement"
+        );
+    }
 
     #[test]
     fn missing_editor_font_resolves_a_real_monospace_family_before_bold_paint() {

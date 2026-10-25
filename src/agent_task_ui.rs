@@ -21,6 +21,16 @@ pub(crate) fn task_terminal_binding(
     }
 }
 
+/// Read-only activity membership against one frame's live terminal inventory.
+/// Kept separate from focus resolution, which must still recheck its owner.
+pub(crate) fn task_terminal_is_live(
+    task: &crate::agent_task::AgentTask,
+    role: crate::agent_task::TaskTerminalRole,
+    live: &std::collections::HashSet<String>,
+) -> bool {
+    task_terminal_binding(task, role).is_some_and(|binding| live.contains(binding))
+}
+
 /// Resolve against live identities, never against an old tab or pane index.
 pub(crate) fn resolve_task_terminal<T>(
     binding: Option<&str>,
@@ -563,7 +573,15 @@ impl TaskPanel {
     }
 
     pub(crate) fn next_attention(&mut self, dashboard: &crate::agent_task::DashboardSnapshot) {
-        if let Some(next) = dashboard.next_attention(self.selected) {
+        self.step_attention(dashboard, true);
+    }
+
+    pub(crate) fn previous_attention(&mut self, dashboard: &crate::agent_task::DashboardSnapshot) {
+        self.step_attention(dashboard, false);
+    }
+
+    fn step_attention(&mut self, dashboard: &crate::agent_task::DashboardSnapshot, forward: bool) {
+        if let Some(next) = dashboard.step_attention(self.selected, forward) {
             if self.selected != Some(next) {
                 self.select(Some(next));
             }
@@ -617,15 +635,11 @@ impl TaskPanel {
         &self,
         scope: &crate::agent_task::DashboardSnapshot,
     ) -> crate::agent_task::DashboardSnapshot {
-        let mut dashboard =
-            crate::agent_task::DashboardSnapshot::filter_rows(&scope.rows, "", self.dashboard_view);
-        if let Some(kind) = self.dashboard_attention {
-            dashboard
-                .rows
-                .retain(|row| row.attention_kind() == Some(kind));
-        }
-        dashboard.sort_rows(self.dashboard_sort);
-        dashboard
+        scope.view(
+            self.dashboard_view,
+            self.dashboard_attention,
+            self.dashboard_sort,
+        )
     }
 
     pub(crate) fn select(&mut self, task_id: Option<TaskId>) {
@@ -1156,6 +1170,39 @@ mod tests {
             Some(33),
             "finished validation output stays focusable"
         );
+        let task = manager.get(ids[1]).unwrap();
+        let mut live = std::collections::HashSet::from([
+            "terminal-second".to_string(),
+            "validation-second".to_string(),
+        ]);
+        assert!(super::task_terminal_is_live(
+            task,
+            TaskTerminalRole::Agent,
+            &live
+        ));
+        assert!(super::task_terminal_is_live(
+            task,
+            TaskTerminalRole::Validation,
+            &live
+        ));
+        live.remove("terminal-second");
+        live.insert("replacement".into());
+        assert!(!super::task_terminal_is_live(
+            task,
+            TaskTerminalRole::Agent,
+            &live
+        ));
+        assert!(super::task_terminal_is_live(
+            task,
+            TaskTerminalRole::Validation,
+            &live
+        ));
+        live.clear();
+        assert!(!super::task_terminal_is_live(
+            task,
+            TaskTerminalRole::Validation,
+            &live
+        ));
         assert!(super::task_focus_allowed(true, Some(ids[1]), ids[1]));
         assert!(!super::task_focus_allowed(false, Some(ids[1]), ids[1]));
         assert!(!super::task_focus_allowed(true, Some(ids[0]), ids[1]));
@@ -1430,6 +1477,13 @@ mod tests {
         assert_eq!(panel.selected, Some(first));
         assert_eq!(panel.follow_up, "Keep my review feedback");
         panel.next_attention(&dashboard);
+        assert_eq!(panel.selected, Some(second));
+        panel.step_dashboard(&dashboard, true);
+        panel.previous_attention(&dashboard);
+        assert_eq!(panel.selected, Some(second));
+        panel.select(Some(first));
+        assert_eq!(panel.follow_up, "Keep my review feedback");
+        panel.previous_attention(&dashboard);
         assert_eq!(panel.selected, Some(second));
         panel.dashboard_provider = Some(AgentProvider::Claude);
         panel.dashboard_repo = Some("/another-project".into());

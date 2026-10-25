@@ -4732,6 +4732,7 @@ enum Message {
     TaskDashboardSort(agent_task::DashboardSort),
     TaskDashboardStep(bool),
     TaskDashboardNextAttention,
+    TaskDashboardPreviousAttention,
     TaskDashboardClear,
     TaskDashboardOpenResult,
     TaskDashboardShowList,
@@ -17173,6 +17174,10 @@ impl Frost {
             Message::TaskDashboardStep(forward) => {
                 let dashboard = self.task_dashboard();
                 self.task_panel.step_dashboard(&dashboard, forward);
+            }
+            Message::TaskDashboardPreviousAttention => {
+                let dashboard = self.task_dashboard();
+                self.task_panel.previous_attention(&dashboard);
             }
             Message::TaskDashboardNextAttention => {
                 let dashboard = self.task_dashboard();
@@ -30442,20 +30447,38 @@ impl Frost {
     /// One shared projection for the list, filter badges and navigation. These
     /// operations only move view state; runtime actions stay on their gates.
     fn task_dashboard_scope(&self) -> agent_task::DashboardSnapshot {
-        agent_task::DashboardSnapshot::project(
+        let live_terminals = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.tab_of_session(*index).is_some())
+            .map(|(_, session)| agent_task_ui::terminal_session_id(session.id))
+            .collect::<std::collections::HashSet<_>>();
+        agent_task::DashboardSnapshot::project_unsorted(
             self.task_manager
                 .tasks()
                 .iter()
                 .filter(|task| task.status != agent_task::TaskStatus::Archived),
-            |id| agent_task::DashboardActivity {
-                has_agent_terminal: self
-                    .task_terminal_index(id, agent_task::TaskTerminalRole::Agent)
-                    .is_some(),
-                has_validation_terminal: self
-                    .task_terminal_index(id, agent_task::TaskTerminalRole::Validation)
-                    .is_some(),
-                has_active_agent_stream: self.task_manager.has_active_agent_event_stream(id),
-                native_preparing: self.agent_runtime.has_preparing(id),
+            |id| {
+                let task = self.task_manager.get(id);
+                agent_task::DashboardActivity {
+                    has_agent_terminal: task.is_some_and(|task| {
+                        agent_task_ui::task_terminal_is_live(
+                            task,
+                            agent_task::TaskTerminalRole::Agent,
+                            &live_terminals,
+                        )
+                    }),
+                    has_validation_terminal: task.is_some_and(|task| {
+                        agent_task_ui::task_terminal_is_live(
+                            task,
+                            agent_task::TaskTerminalRole::Validation,
+                            &live_terminals,
+                        )
+                    }),
+                    has_active_agent_stream: self.task_manager.has_active_agent_event_stream(id),
+                    native_preparing: self.agent_runtime.has_preparing(id),
+                }
             },
             agent_task::DashboardFilter {
                 text: &self.task_panel.dashboard_query,
@@ -30576,8 +30599,8 @@ impl Frost {
             .on_submit(Message::TaskDashboardOpenResult)
             .size(self.chrome_font_size()),
         );
-        let dashboard = self.task_dashboard();
         let scope = self.task_dashboard_scope();
+        let dashboard = self.task_panel.dashboard_from_scope(&scope);
         let split =
             agent_task_ui::task_workspace_has_columns(self.dock_width, self.chrome_font_size());
         let selected_task = self
@@ -30623,6 +30646,7 @@ impl Frost {
             );
         }
         let mut attention = row![].spacing(4);
+        let attention_counts = scope.attention_counts();
         for kind in agent_task::DashboardAttentionKind::ALL {
             use agent_task::DashboardAttentionKind;
 
@@ -30633,11 +30657,7 @@ impl Frost {
                 DashboardAttentionKind::Review => "Review",
                 DashboardAttentionKind::Failed => "Failed",
             };
-            let count = scope
-                .rows
-                .iter()
-                .filter(|row| row.attention_kind() == Some(kind))
-                .count();
+            let count = attention_counts.get(kind);
             attention = attention.push(tooltip(
                 button(text(format!("{label} {count}")).size(self.chrome_font_size() - 1.0))
                     .padding([3, 5])
@@ -30786,6 +30806,13 @@ impl Frost {
                                 .then_some(Message::TaskDashboardStep(true))
                         )
                         .style(button::secondary),
+                    button(text("Previous needs you").size(self.chrome_font_size()))
+                        .on_press_maybe(
+                            dashboard
+                                .previous_attention(self.task_panel.selected)
+                                .map(|_| Message::TaskDashboardPreviousAttention)
+                        )
+                        .style(button::secondary),
                     button(text("Next needs you").size(self.chrome_font_size()))
                         .on_press_maybe(
                             dashboard
@@ -30798,6 +30825,14 @@ impl Frost {
                 .wrap(),
             );
         }
+        body = body.push(
+            button(text("Selected project").size(self.chrome_font_size()))
+                .on_press_maybe(
+                    selected_task
+                        .map(|task| Message::TaskDashboardRepository(Some(task.repo_root.clone()))),
+                )
+                .style(button::secondary),
+        );
         if self.task_panel.saved_draft_count() > 0 {
             if let Some(confirmation) = self.task_panel.draft_discard_confirmation() {
                 body = body.push(
@@ -30999,6 +31034,13 @@ impl Frost {
                         .style(button::secondary),
                     button(text("Next").size(self.chrome_font_size()))
                         .on_press(Message::TaskDashboardStep(true))
+                        .style(button::secondary),
+                    button(text("Previous needs you").size(self.chrome_font_size()))
+                        .on_press_maybe(
+                            dashboard
+                                .previous_attention(self.task_panel.selected)
+                                .map(|_| Message::TaskDashboardPreviousAttention)
+                        )
                         .style(button::secondary),
                     button(text("Next needs you").size(self.chrome_font_size()))
                         .on_press_maybe(

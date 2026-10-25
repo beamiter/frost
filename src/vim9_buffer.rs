@@ -731,6 +731,22 @@ pub(crate) fn usable(frame: &Vim9RenderFrame, rows: usize, columns: usize) -> bo
         })
 }
 
+/// The fallback is used only for ASCII with one byte per authoritative Vim
+/// cell. The ink clip includes italic overhang; source/Unicode shaping stays
+/// intact on the normal whole-run path.
+fn visible_ascii_columns(
+    rect: Rectangle,
+    clip: Rectangle,
+    cell_width: f32,
+    cells: usize,
+) -> std::ops::Range<usize> {
+    let start = ((clip.x - rect.x) / cell_width).floor().max(0.0) as usize;
+    let end = ((clip.x + clip.width - rect.x) / cell_width)
+        .ceil()
+        .max(0.0) as usize;
+    start.min(cells)..end.min(cells)
+}
+
 fn rgb(value: u32) -> Color {
     Color::from_rgb8((value >> 16) as u8, (value >> 8) as u8, value as u8)
 }
@@ -1360,7 +1376,10 @@ impl<Message> NativeBuffer<'_, Message> {
             width: area.width + m.font_size * 0.5,
             ..area
         };
-        let Some(run_clip) = text_area.intersection(&view) else {
+        let Some(run_clip) = text_area
+            .intersection(&view)
+            .filter(|clip| clip.area() > 0.0)
+        else {
             return;
         };
         let (fg, _, special) = colors(&run.style, normal);
@@ -1401,9 +1420,24 @@ impl<Message> NativeBuffer<'_, Message> {
             // glyphs/colors but place ASCII at Vim's authoritative columns.
             if run.text.is_ascii()
                 && run.text.len() == run.cells
-                && (!m.mono_advance_exact || font != self.font)
+                && (!m.mono_advance_exact
+                    || (font != self.font
+                        && !crate::terminal_view::native_editor_font_matches_grid(font, m)))
             {
-                for (column, ch) in run.text.chars().enumerate() {
+                // Clipped splits and cursor inversion can expose only one
+                // cell of a long run. Do not submit every hidden ASCII glyph.
+                let columns = visible_ascii_columns(
+                    area,
+                    Rectangle {
+                        x: run_clip.x - m.font_size * 0.25,
+                        width: run_clip.width + m.font_size * 0.5,
+                        ..run_clip
+                    },
+                    m.cell_w,
+                    run.cells,
+                );
+                for (offset, ch) in run.text[columns.clone()].chars().enumerate() {
+                    let column = columns.start + offset;
                     draw_text(ch.to_string(), area.x + column as f32 * m.cell_w);
                 }
             } else {
@@ -1414,14 +1448,18 @@ impl<Message> NativeBuffer<'_, Message> {
         let underline_y = area.y + area.height - thickness * 1.5;
         if run.style.undercurl {
             let step = (m.font_size / 5.0).max(2.0);
-            let mut x = area.x;
-            let mut up = true;
-            while x < area.x + area.width {
+            // Begin at the first visible segment, retaining its original
+            // parity. GPU clipping alone still constructs every hidden quad.
+            let start = ((run_clip.x - area.x) / step).floor().max(0.0) as usize;
+            let mut x = area.x + start as f32 * step;
+            let mut up = start % 2 == 0;
+            let end = (area.x + area.width).min(run_clip.x + run_clip.width);
+            while x < end {
                 renderer.fill_quad(
                     quad(Rectangle {
                         x,
                         y: underline_y - if up { thickness } else { 0.0 },
-                        width: step.min(area.x + area.width - x),
+                        width: step.min(end - x),
                         height: thickness,
                     }),
                     Background::Color(special),
@@ -3404,6 +3442,311 @@ mod tests {
         assert!(
             matches!(output[2], Some(MouseInput::Press { .. })),
             "the actually drawn fallback must restore ordinary Vim mouse input"
+        );
+    }
+
+    #[test]
+    fn measured_monospace_styles_batch_native_runs_without_changing_grid_positions() {
+        let font = crate::terminal_view::resolve_native_editor_font(Font::MONOSPACE);
+        let mut checked = 0;
+        let mut styled_batches = 0;
+        for size in [14.0, 18.9] {
+            let metrics = Metrics::with_font(font, size, 1.0, 0.0, false);
+            if !metrics.mono_advance_exact {
+                continue;
+            }
+            let mut terminal = crate::terminal::TerminalState::new(80, 20);
+            let projection = terminal.get_projected_viewport(false);
+            let theme = crate::Theme::default();
+            let input: TermWidget<'_, ()> = TermWidget::new(
+                projection.cells(),
+                (2, 42),
+                true,
+                crate::terminal::CursorShape::Block,
+                true,
+                &theme,
+                metrics,
+                font,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                0,
+                0,
+            );
+            let widget = NativeBuffer::new(input, None, metrics, font, true, true);
+            let view = Rectangle::with_size(Size::new(2000.0, 200.0));
+            for bold in [false, true] {
+                for italic in [false, true] {
+                    let text = "let value = foo != 0; // ASCII";
+                    let run = Vim9RenderRun {
+                        text: text.into(),
+                        cells: text.len(),
+                        style: Vim9RenderStyle {
+                            bold,
+                            italic,
+                            foreground: Some(0x12abef),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let projected = Vim9ProjectedRun {
+                        run: &run,
+                        rect: Vim9PixelRect {
+                            x: 10.0,
+                            y: 5.0,
+                            width: run.cells as f32 * metrics.cell_w,
+                            height: metrics.cell_h,
+                        },
+                        clip: Vim9PixelRect {
+                            x: view.x,
+                            y: view.y,
+                            width: view.width,
+                            height: view.height,
+                        },
+                    };
+                    let resolved =
+                        crate::terminal_view::native_editor_glyph_font(font, text, bold, italic);
+                    let batch = resolved == font
+                        || crate::terminal_view::native_editor_font_matches_grid(resolved, metrics);
+                    let mut recorder = CompletionRecorder::default();
+                    renderer::Renderer::start_layer(&mut recorder, view);
+                    widget.paint_ink(
+                        &mut recorder,
+                        &Vim9RenderStyle::default(),
+                        &projected,
+                        view,
+                        None,
+                    );
+                    assert_eq!(
+                        recorder.text.len(),
+                        if batch { 1 } else { text.len() },
+                        "bold={bold} italic={italic} size={size}"
+                    );
+                    assert_eq!(
+                        recorder
+                            .text
+                            .iter()
+                            .map(|(text, _, _, _)| text.as_str())
+                            .collect::<String>(),
+                        text
+                    );
+                    for (index, (_, position, color, _)) in recorder.text.iter().enumerate() {
+                        assert_eq!(position.x, 10.0 + index as f32 * metrics.cell_w);
+                        assert_eq!(*color, rgb(0x12abef));
+                    }
+                    if batch && (bold || italic) {
+                        styled_batches += 1;
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        eprintln!(
+            "verified {checked} native font styles, {styled_batches} styled whole-run batches"
+        );
+    }
+
+    #[test]
+    fn clipped_long_runs_submit_only_visible_fallback_glyphs_and_curl_segments() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 20);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = crate::Theme::default();
+        let mut metrics = Metrics::new(14.0, 1.0, 0.0, false);
+        metrics.cell_w = 10.0;
+        metrics.cell_h = 20.0;
+        metrics.mono_advance_exact = false;
+        let input: TermWidget<'_, ()> = TermWidget::new(
+            projection.cells(),
+            (2, 42),
+            true,
+            crate::terminal::CursorShape::Block,
+            true,
+            &theme,
+            metrics,
+            Font::MONOSPACE,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            0,
+            0,
+        );
+        let widget = NativeBuffer::new(input, None, metrics, Font::MONOSPACE, true, true);
+        let view = Rectangle {
+            x: 10.25,
+            y: 0.0,
+            width: 80.0,
+            height: 10.0,
+        };
+        let run = Vim9RenderRun {
+            text: "x".repeat(20000),
+            cells: 20000,
+            style: Vim9RenderStyle {
+                undercurl: true,
+                italic: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rect = Vim9PixelRect {
+            x: -100000.25,
+            y: -7.5,
+            width: 200000.0,
+            height: 20.0,
+        };
+        let projected = Vim9ProjectedRun {
+            run: &run,
+            rect,
+            clip: Vim9PixelRect {
+                x: view.x,
+                y: view.y,
+                width: view.width,
+                height: view.height,
+            },
+        };
+        let mut recorder = CompletionRecorder::default();
+        renderer::Renderer::start_layer(&mut recorder, view);
+        widget.paint_ink(
+            &mut recorder,
+            &Vim9RenderStyle::default(),
+            &projected,
+            view,
+            None,
+        );
+        assert_eq!(
+            recorder.text.len(),
+            10,
+            "only visible columns and neighboring overhang candidates submit glyphs"
+        );
+        assert!(
+            recorder.quads.len() <= 31,
+            "hidden curl segments must not submit quads"
+        );
+        let cell = Rectangle {
+            x: 20.0,
+            y: 0.0,
+            width: 10.0,
+            height: 20.0,
+        };
+        let whole = Rectangle::with_size(Size::new(100.0, 20.0));
+        assert_eq!(
+            visible_ascii_columns(
+                whole,
+                Rectangle {
+                    x: cell.x - 3.5,
+                    width: cell.width + 7.0,
+                    ..cell
+                },
+                10.0,
+                10
+            ),
+            1..4,
+            "adjacent italic glyphs may overhang into a boundary-aligned clip"
+        );
+        let step = (metrics.font_size / 5.0).max(2.0);
+        let start = ((view.x - rect.x) / step).floor() as usize;
+        let thickness = (metrics.font_size / 14.0).clamp(1.0, 2.0);
+        let baseline = rect.y + rect.height - thickness * 1.5;
+        assert_eq!(
+            recorder.quads[0].0.bounds.y,
+            baseline - if start % 2 == 0 { thickness } else { 0.0 }
+        );
+        assert!(recorder
+            .text
+            .iter()
+            .all(|(text, _, _, clip)| text == "x" && *clip == view));
+        let hidden = Rectangle {
+            x: 300000.0,
+            ..view
+        };
+        let counts = (recorder.text.len(), recorder.quads.len());
+        widget.paint_ink(
+            &mut recorder,
+            &Vim9RenderStyle::default(),
+            &projected,
+            hidden,
+            None,
+        );
+        assert_eq!((recorder.text.len(), recorder.quads.len()), counts);
+        let unicode = Vim9RenderRun {
+            text: "界e\u{301}".into(),
+            cells: 3,
+            ..Default::default()
+        };
+        let projected = Vim9ProjectedRun {
+            run: &unicode,
+            rect: Vim9PixelRect {
+                x: 0.0,
+                y: 0.0,
+                width: 30.0,
+                height: 20.0,
+            },
+            ..projected
+        };
+        widget.paint_ink(
+            &mut recorder,
+            &Vim9RenderStyle::default(),
+            &projected,
+            view,
+            None,
+        );
+        assert_eq!(
+            recorder.text.last().unwrap().0,
+            unicode.text,
+            "Unicode/combining text must retain whole-run shaping"
+        );
+        let ascii = Vim9RenderRun {
+            text: "abcdefghij".into(),
+            cells: 10,
+            style: Vim9RenderStyle {
+                italic: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let projected = Vim9ProjectedRun {
+            run: &ascii,
+            rect: Vim9PixelRect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 20.0,
+            },
+            ..projected
+        };
+        let clip = Rectangle {
+            x: 20.0,
+            y: 0.0,
+            width: 10.0,
+            height: 20.0,
+        };
+        recorder.text.clear();
+        widget.paint_ink(
+            &mut recorder,
+            &Vim9RenderStyle::default(),
+            &projected,
+            clip,
+            None,
+        );
+        assert_eq!(
+            recorder
+                .text
+                .iter()
+                .map(|(text, _, _, _)| text.as_str())
+                .collect::<String>(),
+            "bcd",
+            "both italic neighbors must be submitted at a cell-aligned clip"
+        );
+        assert_eq!(
+            recorder
+                .text
+                .iter()
+                .map(|(_, pos, _, _)| pos.x)
+                .collect::<Vec<_>>(),
+            vec![10.0, 20.0, 30.0]
         );
     }
 
