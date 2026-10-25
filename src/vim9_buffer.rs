@@ -19,7 +19,7 @@ use jterm_core::vim9::{
     Vim9RenderRun, Vim9RenderStyle, Vim9Viewport,
 };
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use crate::terminal_view::{Metrics, MouseButton, MouseInput, TermWidget};
@@ -1027,6 +1027,32 @@ fn compatibility_bands(bounds: Rectangle, views: &[Rectangle]) -> Vec<Rectangle>
     bands
 }
 
+/// Elide fills already supplied by the window backdrop. Once a row contains
+/// another color, preserve all later fills: a Normal run may erase a guide or
+/// selection beneath it. Empty sets allocate nothing for ordinary source text.
+struct BackgroundRows<C> {
+    normal: C,
+    changed: HashSet<usize>,
+}
+
+impl<C: Copy + PartialEq> BackgroundRows<C> {
+    fn new(normal: C) -> Self {
+        Self {
+            normal,
+            changed: HashSet::new(),
+        }
+    }
+
+    fn needs_fill(&mut self, row: usize, background: C) -> bool {
+        if background != self.normal {
+            self.changed.insert(row);
+            true
+        } else {
+            self.changed.contains(&row)
+        }
+    }
+}
+
 pub(crate) struct NativeBuffer<'a, Message> {
     input: TermWidget<'a, Message>,
     frame: Option<&'a Arc<Vim9RenderFrame>>,
@@ -1340,45 +1366,49 @@ impl<Message> NativeBuffer<'_, Message> {
         let (fg, _, special) = colors(&run.style, normal);
         let fg = override_color.unwrap_or(fg);
         let special = override_color.unwrap_or(special);
-        let font = crate::terminal_view::native_editor_glyph_font(
-            self.font,
-            &run.text,
-            run.style.bold,
-            run.style.italic,
-        );
-        let mut draw_text = |content: String, x: f32| {
-            renderer.fill_text(
-                Text {
-                    content,
-                    // iced 0.14's text cache can wrap despite Wrapping::None
-                    // at a finite rounded grid width. Clipping belongs to
-                    // the native run/view, never to the shaping bounds.
-                    bounds: Size::new(f32::INFINITY, m.cell_h),
-                    size: Pixels(m.font_size),
-                    line_height: text::LineHeight::Absolute(Pixels(m.cell_h)),
-                    font,
-                    align_x: text::Alignment::Left,
-                    align_y: iced::alignment::Vertical::Center,
-                    shaping: text::Shaping::Advanced,
-                    wrapping: text::Wrapping::None,
-                },
-                Point::new(x, area.center_y()),
-                fg,
-                run_clip,
+        // Backgrounds are already painted separately. Empty and ASCII-space
+        // runs have no glyph ink, but their decorations must still be drawn.
+        if run.text.bytes().any(|byte| byte != b' ') {
+            let font = crate::terminal_view::native_editor_glyph_font(
+                self.font,
+                &run.text,
+                run.style.bold,
+                run.style.italic,
             );
-        };
-        // A legal configured face or its bold/italic fallback need
-        // not have the measured primary advance. Preserve native GUI
-        // glyphs/colors but place ASCII at Vim's authoritative columns.
-        if run.text.is_ascii()
-            && run.text.len() == run.cells
-            && (!m.mono_advance_exact || font != self.font)
-        {
-            for (column, ch) in run.text.chars().enumerate() {
-                draw_text(ch.to_string(), area.x + column as f32 * m.cell_w);
+            let mut draw_text = |content: String, x: f32| {
+                renderer.fill_text(
+                    Text {
+                        content,
+                        // iced 0.14's text cache can wrap despite Wrapping::None
+                        // at a finite rounded grid width. Clipping belongs to
+                        // the native run/view, never to the shaping bounds.
+                        bounds: Size::new(f32::INFINITY, m.cell_h),
+                        size: Pixels(m.font_size),
+                        line_height: text::LineHeight::Absolute(Pixels(m.cell_h)),
+                        font,
+                        align_x: text::Alignment::Left,
+                        align_y: iced::alignment::Vertical::Center,
+                        shaping: text::Shaping::Advanced,
+                        wrapping: text::Wrapping::None,
+                    },
+                    Point::new(x, area.center_y()),
+                    fg,
+                    run_clip,
+                );
+            };
+            // A legal configured face or its bold/italic fallback need
+            // not have the measured primary advance. Preserve native GUI
+            // glyphs/colors but place ASCII at Vim's authoritative columns.
+            if run.text.is_ascii()
+                && run.text.len() == run.cells
+                && (!m.mono_advance_exact || font != self.font)
+            {
+                for (column, ch) in run.text.chars().enumerate() {
+                    draw_text(ch.to_string(), area.x + column as f32 * m.cell_w);
+                }
+            } else {
+                draw_text(run.text.clone(), area.x);
             }
-        } else {
-            draw_text(run.text.clone(), area.x);
         }
         let thickness = (m.font_size / 14.0).clamp(1.0, 2.0);
         let underline_y = area.y + area.height - thickness * 1.5;
@@ -1561,11 +1591,15 @@ impl<Message> NativeBuffer<'_, Message> {
         renderer.with_layer(view, |renderer| {
             renderer.fill_quad(quad(view), Background::Color(normal_bg));
             // Keep italic overhang intact across adjacent highlight runs.
+            let mut backgrounds = BackgroundRows::new(normal_bg);
             for projected in &prepared.runs {
                 let run = projected.run;
                 let area = rectangle(projected.rect);
                 let (_, bg, _) = colors(&run.style, normal);
-                renderer.fill_quad(quad(area), Background::Color(bg));
+                // Pixel Y also identifies sampled rows outside the viewport.
+                if backgrounds.needs_fill(projected.rect.y.to_bits() as usize, bg) {
+                    renderer.fill_quad(quad(area), Background::Color(bg));
+                }
             }
             for projected in &prepared.runs {
                 self.paint_ink(renderer, normal, projected, view, None);
@@ -1667,6 +1701,44 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_elision_preserves_overlapping_layers_and_row_isolation() {
+        let normal = 0x102030;
+        let mut backgrounds = BackgroundRows::new(normal);
+        let mut full = [[normal; 12]; 4];
+        let mut reduced = full;
+        let mut state = 41_u32;
+        // Normal text, overlapping guides/selection, and a subsequent Normal
+        // layer exercise restoration as well as the no-fill common case.
+        for i in 0..300 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let row = (state as usize >> 8) % 4;
+            let start = (state as usize >> 16) % 10;
+            let end = (start + 1 + i % 4).min(12);
+            let color = if i % 7 < 5 { normal } else { state & 0xffffff };
+            full[row][start..end].fill(color);
+            if backgrounds.needs_fill(row, color) {
+                reduced[row][start..end].fill(color);
+            }
+            assert_eq!(full, reduced, "paint order changed at run {i}");
+        }
+        let mut backgrounds = BackgroundRows::new(normal);
+        assert!(!backgrounds.needs_fill(0, normal));
+        assert!(backgrounds.needs_fill(0, 0xabcdef));
+        assert!(backgrounds.needs_fill(0, normal));
+        assert!(!backgrounds.needs_fill(1, normal));
+    }
+
+    #[test]
+    fn background_elision_removes_plain_syntax_fills_without_allocating() {
+        let mut backgrounds = BackgroundRows::new(0x102030);
+        let fills = (0..10000)
+            .filter(|index| backgrounds.needs_fill(index / 100, 0x102030))
+            .count();
+        assert_eq!(fills, 0);
+        assert_eq!(backgrounds.changed.capacity(), 0);
+    }
 
     #[derive(Default)]
     struct CompletionRecorder {
@@ -3333,6 +3405,73 @@ mod tests {
             matches!(output[2], Some(MouseInput::Press { .. })),
             "the actually drawn fallback must restore ordinary Vim mouse input"
         );
+    }
+
+    #[test]
+    fn space_only_runs_skip_glyphs_but_keep_backgrounds_and_decorations() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 20);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = crate::Theme::default();
+        let mut metrics = Metrics::new(14.0, 1.0, 0.0, false);
+        metrics.cell_w = 8.0;
+        metrics.cell_h = 20.0;
+        let input: TermWidget<'_, ()> = TermWidget::new(
+            projection.cells(),
+            (2, 42),
+            true,
+            crate::terminal::CursorShape::Block,
+            true,
+            &theme,
+            metrics,
+            Font::MONOSPACE,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            0,
+            0,
+        );
+        let widget = NativeBuffer::new(input, None, metrics, Font::MONOSPACE, true, true);
+        let editor = Rectangle::with_size(Size::new(640.0, 400.0));
+        for text in ["", "        ", "   x   ", "·", "\u{a0}", "界", "e\u{301}"] {
+            for decoration in 0..4 {
+                let mut frame = direct_frame();
+                frame.runs.truncate(1);
+                frame.runs[0].text = text.into();
+                frame.runs[0].cells = 8;
+                frame.runs[0].style = Vim9RenderStyle {
+                    background: Some(0x123456),
+                    underline: decoration == 1,
+                    undercurl: decoration == 2,
+                    strikethrough: decoration == 3,
+                    ..Default::default()
+                };
+                for window in &mut frame.windows {
+                    window.overscan.clear();
+                }
+                let mut recorder = CompletionRecorder::default();
+                for prepared in
+                    paint_views(&frame, render_metrics(editor, metrics), editor, |_| 0.0)
+                {
+                    widget.paint_native_view(&mut recorder, &frame, &prepared, false);
+                }
+                assert_eq!(
+                    !recorder.text.is_empty(),
+                    !text.is_empty() && text != "        ",
+                    "glyph submission for {text:?} with decoration {decoration}"
+                );
+                assert!(recorder
+                    .quads
+                    .iter()
+                    .any(|(_, background, _)| *background == Background::Color(rgb(0x123456))));
+                let decorated = recorder
+                    .quads
+                    .iter()
+                    .any(|(quad, _, _)| quad.bounds.height < 5.0);
+                assert_eq!(decorated, decoration != 0);
+            }
+        }
     }
 
     #[test]
