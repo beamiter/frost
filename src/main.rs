@@ -5703,7 +5703,6 @@ impl Session {
         command_argv: Option<&[String]>,
         extra_env: &[(&str, &str)],
     ) -> anyhow::Result<Session> {
-        let session_id = jsh_session_id(id, command_argv);
         // Make plain `vim` a native editor in user-owned interactive shells.
         // Validation/helper argv and explicit child environments keep their
         // original PATH, and the bridge itself always launches absolute Vim.
@@ -5730,6 +5729,7 @@ impl Session {
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .chain(extra_env.iter().copied())
             .collect();
+        let session_id = jsh_session_id(id, command_argv);
         let pty = Pty::new_with_cwd_env(
             cols,
             rows,
@@ -40482,7 +40482,8 @@ mod tests {
                 panel,
                 TAB_BAR_H,
             ),
-            iced::Point::new(6.0, 36.0)
+            // The top floor (below the tab bar) plus the overlay gap.
+            iced::Point::new(6.0, TAB_BAR_H + 6.0)
         );
     }
 
@@ -40747,10 +40748,12 @@ mod tests {
         // The terminal and chrome use one configured size in production.
         // Keep exact grid expectations at small, default and enlarged fonts so
         // a stale fixed-height reservation cannot silently return extra rows.
+        // Chrome is the 40 px-minimum tab bar (20 px padding) plus the status
+        // bar: 62, 63, 88 and 212 px of the 400 px logical height.
         for (font_size, expected_grid) in [
-            (10.0, (98, 29)),
+            (10.0, (98, 28)),
             (14.0, (70, 20)),
-            (24.0, (40, 11)),
+            (24.0, (40, 10)),
             (72.0, (13, 2)),
         ] {
             let metrics = Metrics::new(font_size, 1.0, 0.0, false);
