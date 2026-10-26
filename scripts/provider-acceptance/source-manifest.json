@@ -199,7 +199,7 @@
     },
     {
       "path": "vendor/smithay-clipboard/src/state.rs",
-      "sha256": "a063b4350c6059aea1b0d31019d321479c8567a9e123cdd5aff71930a184624d"
+      "sha256": "7852a21743ec4e15fb257e9e9aabf380e009a5437e2b4c86d74e2b43803fdcc3"
     },
     {
       "path": "vendor/smithay-clipboard/src/worker.rs",

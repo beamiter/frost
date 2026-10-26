@@ -477,9 +477,8 @@ impl SeatHandler for State {
             Capability::Keyboard => {
                 seat_state.keyboard = Some(seat.get_keyboard(qh, seat.id()));
 
-                // Selection sources are tied to the keyboard, so add/remove decives
-                // when we gain/loss capability.
-
+                // Selection devices are created with the first keyboard and
+                // then live as long as the seat (see `remove_capability`).
                 if seat_state.data_device.is_none() && self.data_device_manager_state.is_some() {
                     seat_state.data_device = self
                         .data_device_manager_state
@@ -513,9 +512,14 @@ impl SeatHandler for State {
         let seat_state = self.seats.get_mut(&seat.id()).unwrap();
         match capability {
             Capability::Keyboard => {
-                seat_state.data_device = None;
-                seat_state.primary_device = None;
-
+                // Keep the data and primary selection devices: they belong to
+                // the seat, not to the keyboard. Destroying them when a
+                // keyboard is unplugged (a virtual keyboard, KVM or remote
+                // desktop) races with offers the compositor already sent to
+                // them. libwayland discards events for a destroyed device
+                // without reserving the offer ids they create, so the next
+                // offer fails with "not a valid new object id" and kills the
+                // display connection shared with the host window.
                 if let Some(keyboard) = seat_state.keyboard.take() {
                     if keyboard.version() >= 3 {
                         keyboard.release()
@@ -774,4 +778,232 @@ fn set_non_blocking(raw_fd: RawFd) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod keyboard_capability_tests {
+    use super::*;
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use sctk::reexports::calloop::EventLoop;
+    use sctk::reexports::client::globals::registry_queue_init;
+
+    const KEYBOARD: u32 = 2;
+    const OFFER_MIME: &str = "text/plain;charset=utf-8";
+
+    enum Arg<'a> {
+        Uint(u32),
+        Str(&'a str),
+    }
+
+    /// Minimal Wayland wire codec for a scripted compositor endpoint.
+    struct Wire(UnixStream);
+
+    impl Wire {
+        fn request(&mut self) -> Result<Option<(u32, u16, Vec<u8>)>> {
+            let mut header = [0; 8];
+            match self.0.read_exact(&mut header) {
+                Ok(()) => {},
+                Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            let object = u32::from_ne_bytes(header[..4].try_into().unwrap());
+            let word = u32::from_ne_bytes(header[4..].try_into().unwrap());
+            let mut body = vec![0; (word >> 16) as usize - header.len()];
+            self.0.read_exact(&mut body)?;
+            Ok(Some((object, word as u16, body)))
+        }
+
+        fn event(&mut self, object: u32, opcode: u16, args: &[Arg<'_>]) -> Result<()> {
+            let mut body = Vec::new();
+            for arg in args {
+                match arg {
+                    Arg::Uint(value) => body.extend_from_slice(&value.to_ne_bytes()),
+                    Arg::Str(text) => {
+                        body.extend_from_slice(&(text.len() as u32 + 1).to_ne_bytes());
+                        body.extend_from_slice(text.as_bytes());
+                        body.push(0);
+                        body.resize(body.len().next_multiple_of(4), 0);
+                    },
+                }
+            }
+            let size = (body.len() + 8) as u32;
+            let mut message = Vec::with_capacity(size as usize);
+            message.extend_from_slice(&object.to_ne_bytes());
+            message.extend_from_slice(&((size << 16) | u32::from(opcode)).to_ne_bytes());
+            message.extend_from_slice(&body);
+            self.0.write_all(&message)
+        }
+    }
+
+    fn word(body: &[u8], index: usize) -> u32 {
+        u32::from_ne_bytes(body[index * 4..index * 4 + 4].try_into().unwrap())
+    }
+
+    #[derive(PartialEq)]
+    enum Phase {
+        WithKeyboard,
+        KeyboardRemoved,
+        KeyboardRestored,
+        Finished,
+    }
+
+    /// Compositor script: the seat's keyboard is unplugged and plugged back,
+    /// as a virtual keyboard (wtype, remote desktop, KVM) does. A selection
+    /// offer for the seat's data device is already in flight when the client
+    /// handles the removal: it is written after the client's requests for the
+    /// capability change but before the compositor handles them, exactly like
+    /// events crossing those requests on a real socket.
+    fn compositor(stream: UnixStream, finished: &AtomicBool) -> Result<()> {
+        let mut wire = Wire(stream);
+        let mut interfaces = HashMap::from([(1, "wl_display")]);
+        let mut seat = 0;
+        let mut keyboards = 0;
+        let mut devices = Vec::new();
+        let mut released = Vec::new();
+        let mut next_offer = 0xff00_0000;
+        let mut phase = Phase::WithKeyboard;
+        let mut offer_selection = |wire: &mut Wire, interfaces: &mut HashMap<u32, &str>, device| {
+            let offer = next_offer;
+            next_offer += 1;
+            interfaces.insert(offer, "wl_data_offer");
+            wire.event(device, 0, &[Arg::Uint(offer)])?;
+            wire.event(offer, 0, &[Arg::Str(OFFER_MIME)])?;
+            wire.event(device, 5, &[Arg::Uint(offer)])
+        };
+        while let Some((object, opcode, body)) = wire.request()? {
+            match (interfaces.get(&object).copied(), opcode) {
+                (Some("wl_display"), 0) => {
+                    let callback = word(&body, 0);
+                    if phase == Phase::KeyboardRestored && keyboards == 2 {
+                        // The selection is offered to the device the client
+                        // currently uses for the seat.
+                        offer_selection(&mut wire, &mut interfaces, *devices.last().unwrap())?;
+                        phase = Phase::Finished;
+                        finished.store(true, Ordering::SeqCst);
+                    }
+                    wire.event(callback, 0, &[Arg::Uint(0)])?;
+                    wire.event(1, 1, &[Arg::Uint(callback)])?;
+                },
+                (Some("wl_display"), 1) => {
+                    let registry = word(&body, 0);
+                    interfaces.insert(registry, "wl_registry");
+                    wire.event(registry, 0, &[Arg::Uint(1), Arg::Str("wl_seat"), Arg::Uint(7)])?;
+                    wire.event(
+                        registry,
+                        0,
+                        &[Arg::Uint(2), Arg::Str("wl_data_device_manager"), Arg::Uint(3)],
+                    )?;
+                },
+                (Some("wl_registry"), 0) => {
+                    let interface_words = (word(&body, 1) as usize).div_ceil(4);
+                    let id = word(&body, 2 + interface_words + 1);
+                    match word(&body, 0) {
+                        1 => {
+                            seat = id;
+                            interfaces.insert(id, "wl_seat");
+                            wire.event(seat, 0, &[Arg::Uint(KEYBOARD)])?;
+                        },
+                        2 => {
+                            interfaces.insert(id, "wl_data_device_manager");
+                        },
+                        name => return Err(Error::other(format!("bind of unknown global {name}"))),
+                    }
+                },
+                (Some("wl_seat"), 1) => {
+                    interfaces.insert(word(&body, 0), "wl_keyboard");
+                    keyboards += 1;
+                },
+                (Some("wl_data_device_manager"), 1) => {
+                    let device = word(&body, 0);
+                    interfaces.insert(device, "wl_data_device");
+                    devices.push(device);
+                    if phase == Phase::WithKeyboard {
+                        // Unplug the only keyboard of the seat.
+                        wire.event(seat, 0, &[Arg::Uint(0)])?;
+                        phase = Phase::KeyboardRemoved;
+                    }
+                },
+                // wl_data_device.release
+                (Some("wl_data_device"), 2) => released.push(object),
+                // wl_keyboard.release: the client finished handling the removal.
+                (Some("wl_keyboard"), 0) => {
+                    released.push(object);
+                    if phase == Phase::KeyboardRemoved {
+                        offer_selection(&mut wire, &mut interfaces, devices[0])?;
+                        for id in released.drain(..) {
+                            wire.event(1, 1, &[Arg::Uint(id)])?;
+                        }
+                        // Plug a keyboard back in.
+                        wire.event(seat, 0, &[Arg::Uint(KEYBOARD)])?;
+                        phase = Phase::KeyboardRestored;
+                    }
+                },
+                // wl_data_offer.destroy of a server-allocated id.
+                (Some("wl_data_offer"), 2) => {},
+                (interface, opcode) => {
+                    return Err(Error::other(format!(
+                        "unexpected request {interface:?}@{object} opcode {opcode}"
+                    )));
+                },
+            }
+        }
+        Ok(())
+    }
+
+    // Deterministic regression for a fatal client error seen on Sway when a
+    // virtual keyboard was hot-unplugged: destroying the data device on
+    // keyboard loss made libwayland discard the in-flight offer without
+    // reserving its id, so the next offer failed with "not a valid new object
+    // id" and the whole shared display connection died.
+    #[test]
+    #[ignore = "requires native AF_UNIX socket pairs; run on hosted fixture machine"]
+    fn native_keyboard_unplug_keeps_selection_devices_and_connection() {
+        let (client, server) = UnixStream::pair().unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let finished = Arc::new(AtomicBool::new(false));
+        let script = {
+            let finished = finished.clone();
+            std::thread::spawn(move || {
+                let control = server.try_clone().unwrap();
+                let result = compositor(server, &finished);
+                // Never leave the client blocked on a failed script.
+                let _ = control.shutdown(Shutdown::Both);
+                result
+            })
+        };
+
+        let connection = Connection::from_socket(client).unwrap();
+        let (globals, mut queue) = registry_queue_init::<State>(&connection).unwrap();
+        let event_loop = EventLoop::<State>::try_new().unwrap();
+        let (reply_tx, _reply_rx) = std::sync::mpsc::channel();
+        let mut state =
+            State::new(&globals, &queue.handle(), event_loop.handle(), reply_tx).unwrap();
+        for _ in 0..8 {
+            if let Err(error) = queue.roundtrip(&mut state) {
+                panic!("display connection failed after keyboard unplug: {error}");
+            }
+            if finished.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        assert!(finished.load(Ordering::SeqCst), "compositor script did not complete");
+
+        let seat = state.seats.values().next().unwrap();
+        assert!(seat.keyboard.is_some(), "keyboard was not restored");
+        let offer = seat
+            .data_device
+            .as_ref()
+            .and_then(|device| device.data().selection_offer())
+            .expect("selection offered after the keyboard returned is lost");
+        assert!(offer.with_mime_types(|mimes| mimes.iter().any(|mime| mime == OFFER_MIME)));
+        queue.roundtrip(&mut state).unwrap();
+
+        drop((state, queue, globals, event_loop, connection));
+        script.join().unwrap().unwrap();
+    }
 }

@@ -58,7 +58,7 @@ jobs:
           cargo tree --locked --manifest-path scripts/provider-acceptance/Cargo.toml > native-provider-artifacts/cargo-tree.txt
           cargo tree --locked --manifest-path "$RUNNER_TEMP/frost-smithay-tests/Cargo.toml" -e features > native-provider-artifacts/smithay-test-features.txt
           find "$RUNNER_TEMP/frost-smithay-tests/target/debug/deps" -maxdepth 1 -type f -name 'smithay_clipboard-*' -executable -exec sha256sum {} + > native-provider-artifacts/smithay-test-binaries.sha256
-      - name: Run all five ignored native provider tests
+      - name: Run all six ignored native provider tests
         run: |
           set -euo pipefail
           export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
@@ -76,7 +76,7 @@ jobs:
           timeout 90 cargo test --locked --manifest-path scripts/provider-acceptance/Cargo.toml -p clipboard_x11 --lib -- --ignored --test-threads=1 --nocapture 2>&1 | tee native-provider-artifacts/x11-tests.log
           grep -q '3 passed; 0 failed' native-provider-artifacts/x11-tests.log
           timeout 30 cargo test --locked --manifest-path "$RUNNER_TEMP/frost-smithay-tests/Cargo.toml" -p smithay-clipboard --lib -- --ignored --test-threads=1 --nocapture 2>&1 | tee native-provider-artifacts/wayland-tests.log
-          grep -q '2 passed; 0 failed' native-provider-artifacts/wayland-tests.log
+          grep -q '3 passed; 0 failed' native-provider-artifacts/wayland-tests.log
       - name: Exercise real winit host on disposable Sway
         run: |
           timeout 120 python3 scripts/native-provider-acceptance.py --runner scripts/native-desktop-smoke.py --binary scripts/provider-acceptance/target/debug/frost-provider-acceptance --owner "$RUNNER_TEMP/provider-owner/owner" --output native-provider-artifacts/wayland
