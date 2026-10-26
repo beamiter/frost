@@ -29,6 +29,14 @@ for name in ['adjust_font_size', 'reset_font_size']:
     assert 'self.apply_config()' in function(main, name)
 apply = function(main, 'apply_config')
 assert 'self.effective_font_size()' in apply and 'self.relayout()' in apply
+# The window companion no longer reserves a status card in each pane. Keep
+# native command headers, but admit zero organism rows at startup and after
+# every font/config change; this contract is independent of line spacing.
+for name, source in [('spawn_argv_env', function(main, 'spawn_argv_env')),
+                     ('apply_config', apply)]:
+    calls = re.findall(r'\.set_native_chrome\(([^)]*)\)', source)
+    assert [re.sub(r'\s+', '', args) for args in calls] == ['true,0'], name
+assert re.search(r'\.organism_status\(\s*None,', function(main, 'pane_view'))
 assert 'self.pane_header_height()' in function(main, 'relayout')
 for name in ['pane_header', 'status_bar', 'config_panel', 'agent_panel']:
     # Generic functions have lifetimes before their parentheses.
@@ -73,18 +81,53 @@ code += '\nconst SIDEBAR_TREE_ROW_GAP: f32 = 1.0;\nconst SIDEBAR_TREE_OVERSCAN: 
 for name in ['sidebar_tree_window', 'sidebar_tree_reveal_offset']:
     code += '\n' + function(sidebar, name)
 code += '\n#[test]\n' + function(sidebar, 'zoomed_tree_virtualization_and_keyboard_reveal_share_row_geometry')
-code += '\n' + function(main, 'native_status_rows')
+code += '\n' + function(main, 'companion_strip_height')
+# Only the config/input accessors are fixtures. Execute the actual window
+# geometry method, which excludes Block/Chat and sizes Traditional text.
+code += '''
+struct CompanionConfig {
+    card_mode: bool,
+    ascii_organism_enabled: bool,
+    ascii_organism_expanded: bool,
+    bottom_bar: bool,
+}
+impl CompanionConfig {
+    fn is_card_mode(&self) -> bool { self.card_mode }
+}
+struct CompanionGeometry { config: CompanionConfig, font_size: f32 }
+impl CompanionGeometry {
+    fn effective_font_size(&self) -> f32 { self.font_size }
+'''
+code += function(main, 'organism_strip_height') + '\n}\n'
 code += '''
 #[test]
-fn expanded_status_reserves_three_full_size_text_lines() {
+fn companion_geometry_keeps_card_rows_free_and_fits_traditional_text() {
     for font in [8.0, 14.0, 24.0, 36.0, 72.0] {
-        for spacing in [0.8, 1.0, 1.5, 3.0] {
-            let cell_h = font * 1.2 * spacing;
-            let rows = native_status_rows(true, true, cell_h);
-            let available_text_height = (rows as f32 * cell_h - 6.0 - 22.0) / 3.0;
-            assert!(available_text_height >= cell_h - 0.001);
-            assert_eq!(native_status_rows(true, false, cell_h), 1);
-            assert_eq!(native_status_rows(false, true, cell_h), 0);
+        for card_mode in [false, true] {
+            for enabled in [false, true] {
+                for expanded in [false, true] {
+                    for bottom_bar in [false, true] {
+                        let window = CompanionGeometry {
+                            config: CompanionConfig {
+                                card_mode,
+                                ascii_organism_enabled: enabled,
+                                ascii_organism_expanded: expanded,
+                                bottom_bar,
+                            },
+                            font_size: font,
+                        };
+                        let height = window.organism_strip_height();
+                        if card_mode || !enabled || !expanded || !bottom_bar {
+                            assert_eq!(height, 0.0, "no extra pane or hidden companion rows");
+                        } else {
+                            // Three readable lines at Iced's full 1.3 line
+                            // height, plus the real card's vertical padding.
+                            assert!(height >= font * 1.3 * 3.0 + 16.0);
+                            assert!(height >= companion_strip_height(true, true, true));
+                        }
+                    }
+                }
+            }
         }
     }
 }

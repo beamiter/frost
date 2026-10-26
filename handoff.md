@@ -1,5 +1,26 @@
 # Engineering handoff
 
+## 2026-10-26 — align the font CI fixture with the unique companion
+
+- `scripts/test-font-sync.py` still extracted the removed `native_status_rows`
+  helper and failed before running its Rust geometry checks. It now verifies
+  that real session creation and live configuration both keep native command
+  headers with zero organism rows, and that pane rendering supplies no status
+  avatar. No production rendering or geometry was changed.
+- The replacement executes the production `organism_strip_height` method across
+  all supported font samples and enable/expand/footer/mode combinations:
+  Block/Chat reserve no companion height, while the Traditional strip fits
+  three full-size text lines and its actual vertical padding. Existing chrome
+  and sidebar font/row checks remain intact.
+- `python3 scripts/test-font-sync.py` passed **3 tests**. The unchanged
+  `python3 scripts/test-font-groups.py` passed **12 tests**, including real
+  renderer-free Iced event routing, independent font groups, configuration
+  reload and geometry. The latter used the existing Frost target with debug
+  info/incremental compilation disabled; an initial offline attempt lacked the
+  public `iced_graphics` registry entry, and the normal online CI invocation
+  succeeded after fetching the missing test dependencies. `git diff --check`
+  passed. No other script/workflow still references `native_status_rows`.
+
 ## 2026-10-26 — one window-owned ASCII companion
 
 - Frost now has one window-owned life, ambient mind, personality, story cursor
