@@ -15,6 +15,7 @@ import ctypes as C
 import ctypes.util
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -42,6 +43,26 @@ def read(path: Path) -> str:
 
 def snapshot(path: Path) -> dict[str, bytes]:
     return {str(file.relative_to(path)): file.read_bytes() for file in path.rglob('*') if file.is_file()}
+
+
+# The IDE's own bounded, data-only workbench store (jterm_core vim9_workspace):
+# per-project panel layout/search options and palette command IDs. Everything
+# else under XDG_STATE_HOME is terminal state the IDE must never touch.
+IDE_WORKBENCH_STORE = re.compile(r'jterm/vim9/(?:workspace-[0-9a-f]{16}-frost|recent-commands)\.json')
+
+
+def terminal_state(files: dict[str, bytes]) -> dict[str, bytes]:
+    return {name: content for name, content in files.items() if not name.startswith('jterm/vim9/')}
+
+
+def require_workbench_store_only(files: dict[str, bytes], forbidden: list[bytes]) -> None:
+    for name, content in files.items():
+        if not name.startswith('jterm/vim9/'):
+            continue
+        require(IDE_WORKBENCH_STORE.fullmatch(name) is not None, f'IDE wrote outside its workbench store: {name}')
+        json.loads(content)
+        require(not any(fragment in content for fragment in forbidden),
+                f'IDE workbench store {name} is not data-only')
 
 
 def edited_buffer(state_path: Path, expected_file: Path, expected_text: list[str]) -> bool:
@@ -495,7 +516,10 @@ def main() -> None:
                 time.sleep(0.3)
                 wm_delete(window)
                 require(process.wait(timeout=10) == 0, 'Saved editor did not exit gracefully')
-                require(snapshot(state) == before_state, 'IDE changed persistent terminal state')
+                after_state = snapshot(state)
+                require(terminal_state(after_state) == before_state, 'IDE changed persistent terminal state')
+                # No argv, shell command or editor text reaches the store.
+                require_workbench_store_only(after_state, [b'native-build.marker', b'printf', b'original'])
                 require(snapshot(data) == before_data, 'IDE changed persistent terminal data')
                 print('PASS: real XTest edit, native save/open/build, search case/regex/whole-word/glob controls and job cancellation, recursive fuzzy picker and selection, line:column jump and back/forward, native split, buffer navigation/dirty-close refusal, WM dirty-close refusal, graceful exit, unchanged terminal state/data')
             except BaseException as error:

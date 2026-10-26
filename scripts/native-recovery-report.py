@@ -524,7 +524,25 @@ class Case:
                 os.close(fd)
             self.shell_handles.clear()
 
+    def park_pointer(self):
+        """Move the pointer off everything OCR reads before an observation.
+
+        Headless sway composites a software cursor into every capture, and its
+        startup position overlaps the recovery banner below the tab bar (OCR
+        then reads "saved" as "syed"). Parking on the right edge of the empty
+        terminal leaves the arrow almost entirely off-screen, away from the
+        banner, the readiness output, Dismiss and the status bar.
+        """
+        x, y = SCREEN[0] - 1, SCREEN[1] // 2
+        if self.args.backend == 'x11':
+            self.smoke.run(['xdotool', 'mousemove', '--sync', str(x), str(y)])
+        else:
+            self.pointer.stdin.write(f'move {x} {y} {SCREEN[0]} {SCREEN[1]}\n'.encode())
+            self.pointer.stdin.flush()
+            self.pointer_reply('done')
+
     def observe(self, expected, label):
+        self.park_pointer()
         deadline = min(self.deadline, time.monotonic() + 12)
         last_error = None
         while time.monotonic() < deadline:

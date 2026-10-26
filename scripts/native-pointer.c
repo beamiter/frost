@@ -52,6 +52,15 @@ int main(void) {
             puts("done"); fflush(stdout);
             continue;
         }
+        /* Motion only: park the pointer away from text a test is about to read. */
+        if (sscanf(line, "move %u %u %u %u %c", &x, &y, &width, &height, &extra) == 4) {
+            if (!width || !height || x >= width || y >= height) return 2;
+            zwlr_virtual_pointer_v1_motion_absolute(pointer, milliseconds(), x, y, width, height);
+            zwlr_virtual_pointer_v1_frame(pointer);
+            if (wl_display_roundtrip(display) < 0) return 2;
+            puts("done"); fflush(stdout);
+            continue;
+        }
         uint32_t button = 0x110;
         int fields = sscanf(line, "click %u %u %u %u %c", &x, &y, &width, &height, &extra);
         if (fields != 4) {
