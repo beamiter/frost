@@ -1,9 +1,10 @@
 # frost configuration
 # Omitted values use the defaults of the installed binary, so upgrades pick
 # up the current defaults without duplicating them in this template.
-# The installer backs up your previous config.toml before replacing it.
-# Restore selected custom settings from config.toml.backup.* as needed.
-# Use scripts/install.sh --no-config to upgrade without resetting settings.
+# The installer keeps existing values when configuration fields are unchanged.
+# Changed fields trigger a config.toml.backup.* copy before replacement.
+# Restore selected custom settings from that private backup as needed.
+# Use scripts/install.sh --no-config to always keep your existing configuration.
 # Example customizations:
 # font_size = 14.0  # main content (Block / Chat / VTE and split panes)
 # chrome_font_size = 14.0  # top bar + sidebar; omitted legacy values inherit font_size once
