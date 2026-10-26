@@ -164,9 +164,12 @@ separators and status rows remain visible and keep their Vim input behavior.
 The optional GUI status bar shows **GUI buffer · RGB** while a supported frame is present.
 Vim's command/status rows remain in the compatible surface. Horizontal,
 vertical and mixed internal Vim windows use native text in every supported
-window, with a cursor and IME anchor only in the active one. Folds, diff,
-complex/scrolling completion, conceal and unsupported shaping temporarily use
-**Compatible view**, with the runtime's reason shown. Resize,
+window, with a cursor and IME anchor only in the active one. Closed folds are
+native rows (render protocol 8): fold text and filler use Vim's `Folded`
+colors, the filler glyph is placed per cell, and scrolling crosses a fold as
+one row while clicks in a folded split use Vim's own mouse handling. Diff,
+blockwise selections over folds, complex/scrolling completion, conceal and
+unsupported shaping temporarily use **Compatible view**, with the runtime's reason shown. Resize,
 disconnection and a terminal-local Shift selection also use the compatible
 path until a current supported frame is available. Old native frames are never
 kept over a known unsupported state.

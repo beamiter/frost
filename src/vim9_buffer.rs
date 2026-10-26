@@ -1418,7 +1418,23 @@ impl<Message> NativeBuffer<'_, Message> {
             // A legal configured face or its bold/italic fallback need
             // not have the measured primary advance. Preserve native GUI
             // glyphs/colors but place ASCII at Vim's authoritative columns.
-            if run.text.is_ascii()
+            // Closed-fold filler repeats one glyph that a fallback font may
+            // advance differently; it is placed per cell the same way.
+            if let Some(glyph) = run.repeated_glyph().filter(|glyph| !glyph.is_ascii()) {
+                let columns = visible_ascii_columns(
+                    area,
+                    Rectangle {
+                        x: run_clip.x - m.font_size * 0.25,
+                        width: run_clip.width + m.font_size * 0.5,
+                        ..run_clip
+                    },
+                    m.cell_w,
+                    run.cells,
+                );
+                for column in columns {
+                    draw_text(glyph.to_string(), area.x + column as f32 * m.cell_w);
+                }
+            } else if run.text.is_ascii()
                 && run.text.len() == run.cells
                 && (!m.mono_advance_exact
                     || (font != self.font
@@ -1886,6 +1902,7 @@ mod tests {
                 row: window.view.rows as i32,
                 line: window.topline + window.view.rows as u64,
                 byte_length: 4,
+                fold_end: 0,
                 runs: vec![jterm_core::vim9::Vim9RenderRun {
                     window: window.window,
                     column: window.view.column + 2,

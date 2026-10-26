@@ -1,5 +1,20 @@
 # Engineering handoff
 
+## 2026-10-25 — native closed folds (shared core render protocol 8)
+
+- The shared core now negotiates render protocol 8: closed Vim folds are
+  painted as native rows (fold text and filler in `Folded` colors), rows below
+  keep Vim's positions, and source-bound touchpad/wheel scrolling crosses a
+  fold as one row via the bridge's `scroll_rows` acknowledgement. Folded
+  splits route clicks to Vim's own mouse handling. Contract:
+  `jterm_core/docs/vim9-native-folds.md`.
+- `src/vim9_buffer.rs` places repeated non-ASCII filler runs
+  (`Vim9RenderRun::repeated_glyph()`) at every Vim cell, so the fold filler
+  stays on Vim's columns whatever advance a fallback font reports. Frost has
+  no topline-based transition to adjust.
+- `packaging/jterm-core-src.tar.gz` is regenerated from the matching
+  `jterm_core` commit with `scripts/package-shared-core.sh`.
+
 ## 2026-10-19 — complete block browser and asynchronous matching
 
 - Browse / Ctrl+Alt+F now lists one representative row per completed text block
