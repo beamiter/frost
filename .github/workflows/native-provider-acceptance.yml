@@ -82,7 +82,7 @@ jobs:
           timeout 120 python3 scripts/native-provider-acceptance.py --runner scripts/native-desktop-smoke.py --binary scripts/provider-acceptance/target/debug/frost-provider-acceptance --owner "$RUNNER_TEMP/provider-owner/owner" --output native-provider-artifacts/wayland
       - name: Preserve native evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: frost-provider-acceptance-${{ github.sha }}
           path: native-provider-artifacts
