@@ -12,6 +12,8 @@ import shlex
 import subprocess
 import time
 
+from native_clipboard_observation import observe_exact_word
+
 p = argparse.ArgumentParser(description=__doc__)
 for name in ('runner', 'binary', 'owner', 'pointer', 'output'):
     p.add_argument('--' + name, type=Path, required=True)
@@ -180,9 +182,14 @@ try:
     s.key('f', ('ctrl', 'shift'))
     s.key('v', ('ctrl',))
     m.wait_for(lambda: any(e['phase'] == 'complete' for e in events(log)), 'widget clipboard transfer')
-    time.sleep(0.5)
-    found = [w for w in words('widget-pasted') if w['text'] == 'FROSTWIDGET']
-    assert len(found) == 1, found
+    # Observe successive actual frames: the blinking insertion caret can be
+    # recognized as an extra letter. Never replay paste or alter the field to
+    # make OCR pass, and retain every original frame/TSV, including failures.
+    widget_observations = []
+    try:
+        observe_exact_word(words, 'widget-pasted', 'FROSTWIDGET', widget_observations)
+    finally:
+        (out / 'widget-observations.json').write_text(json.dumps(widget_observations, indent=2))
     # Remove the original source before copying: it must not satisfy the idle read.
     stop(proc, control)
     s.key('a', ('ctrl',))

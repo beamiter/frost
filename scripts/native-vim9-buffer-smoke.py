@@ -69,6 +69,8 @@ def main():
         "highlight NativeDecoration guifg=#e9c46a guibg=#101820 guisp=#e83967 gui=italic,undercurl ctermfg=196\n"
         "augroup native_buffer_fixture\n"
         "autocmd!\n"
+        "autocmd CmdlineEnter,CmdlineChanged * let g:native_fixture_cmdline = getcmdline()\n"
+        "autocmd CmdlineLeave * let g:native_fixture_cmdline = ''\n"
         "autocmd BufEnter * syntax match NativeRgb /^GUI_TRUECOLOR.*/\n"
         "autocmd BufEnter * syntax match NativeDecoration /^Styled_underlines/\n"
         "augroup END\n"
@@ -87,7 +89,7 @@ def main():
         "endfunction\n"
         "inoremap <silent> <F8> <Cmd>call NativeFixtureComplete()<CR>\n"
         "function! NativeFixtureState(timer) abort\n"
-        f"call writefile([json_encode({{'termguicolors': &termguicolors, 'mode': mode(), 'pumvisible': pumvisible(), 'selected': get(complete_info(['selected']), 'selected', -1), 'windows': winnr('$'), 'quickfix_size': len(getqflist()), 'quickfix_title': get(getqflist({{'title': 1}}), 'title', ''), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'topline': line('w0'), 'text': getline('.'), 'completion_line': getline(2), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
+        f"call writefile([json_encode({{'termguicolors': &termguicolors, 'mode': mode(), 'cmdline': get(g:, 'native_fixture_cmdline', ''), 'pumvisible': pumvisible(), 'selected': get(complete_info(['selected']), 'selected', -1), 'windows': winnr('$'), 'quickfix_size': len(getqflist()), 'quickfix_title': get(getqflist({{'title': 1}}), 'title', ''), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'topline': line('w0'), 'text': getline('.'), 'completion_line': getline(2), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
         f"call rename({quoted(str(state_file) + '.tmp')}, {quoted(state_file)})\n"
         "endfunction\n"
         "call timer_start(60, function('NativeFixtureState'), {'repeat': -1})\n",
@@ -162,6 +164,13 @@ def main():
     def command(value):
         xdo("key", "Escape")
         xdo("type", "--clearmodifiers", "--delay", "8", ":" + value)
+        # Type once and observe Vim's exact pending command before executing it.
+        # A dropped character must fail here, rather than run a different Ex
+        # command and later masquerade as a wheel/rendering failure.
+        def exact_pending_command():
+            snapshot = state()
+            return snapshot.get("mode") == "c" and snapshot.get("cmdline") == value
+        wait_for(exact_pending_command, "exact pending Ex command: " + value, app)
         xdo("key", "Return")
     report = {}
     try:
@@ -241,7 +250,24 @@ def main():
             capture("search-empty")
             report["empty_project_search"] = "passed"
             command("call setqflist([], 'r', {'title': '', 'items': []})")
+            wait_for(lambda: state().get("quickfix_title") == "", "quickfix fixture cleared", app)
+            before_dock_close = state()
             xdo("key", "ctrl+shift+j")
+            # Closing the tool dock resizes the PTY asynchronously. Do not
+            # inject the wheel fixture's Ex command while Vim handles SIGWINCH.
+            # Both Vim's geometry and its native frame must acknowledge the
+            # enlarged editor; an old, internally consistent frame is not enough.
+            def closed_dock_geometry():
+                snapshot = state()
+                frame = snapshot.get("render", {})
+                return snapshot if (snapshot.get("screen_rows", 0) > before_dock_close["screen_rows"]
+                                    and snapshot.get("screen_columns") == before_dock_close["screen_columns"]
+                                    and frame.get("rows") == snapshot.get("screen_rows")
+                                    and frame.get("columns") == snapshot.get("screen_columns")
+                                    and frame.get("supported")) else None
+            acknowledged = wait_for(closed_dock_geometry, "Vim and native frame acknowledge closed tool dock", app)
+            report["dock_close_geometry"] = {"before": before_dock_close["screen_rows"],
+                                             "after": acknowledged["screen_rows"]}
         # Trace a real wheel notch through window pixels in a disposable Vim
         # buffer. A distinctive source line supplies the visual position oracle.
         command("enew | call setline(1, map(range(1,200), {_, n -> printf('WHEEL_%03d native scroll', n)})) | setlocal nowrap scrolloff=0")

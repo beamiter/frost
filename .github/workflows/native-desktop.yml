@@ -48,6 +48,8 @@ jobs:
         with:
           shared-key: native-desktop-release
           cache-on-failure: true
+      - name: Check exact clipboard observation contracts
+        run: python3 scripts/test-native-clipboard-observation.py
       - name: Build production binary
         run: cargo build --release --locked --bin frost
       - name: Stage installed application
