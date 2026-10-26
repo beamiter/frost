@@ -118,7 +118,7 @@ impl BodyMouseSnapshot {
                         old.leftcol,
                         old.textoff,
                     ) && (presented.offsets.get(&old.window).copied().unwrap_or(0.0) != 0.0
-                        || new.topline == old.topline)
+                        || new.same_first_row(old))
                 })
         })
     }
@@ -1903,6 +1903,8 @@ mod tests {
                 line: window.topline + window.view.rows as u64,
                 byte_length: 4,
                 fold_end: 0,
+                part: 0,
+                parts: 1,
                 runs: vec![jterm_core::vim9::Vim9RenderRun {
                     window: window.window,
                     column: window.view.column + 2,
