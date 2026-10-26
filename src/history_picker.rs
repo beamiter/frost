@@ -2,13 +2,41 @@
 //!
 //! 记录与检索都建立在家族共享的 `jterm_core::command_history` JSONL 索引上
 //! （与 anvil/forge 同名配置键、同文件格式），因此几个兄弟终端可以指向同
-//! 一份历史文件。Enter 只把选中的命令回填到活动 pane 的提示符，从不执行。
+//! 一份历史文件。Enter 只把选中的命令回填到打开选择器的 pane，从不执行。
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use jterm_core::command_history::CommandHistoryRecord;
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+
+// Await admission without consuming a blocking-pool thread. Keep this permit
+// inside the actual reader so even cancellation of its async task cannot admit
+// a second disk read before the first finishes.
+static HISTORY_LOAD_GATE: once_cell::sync::Lazy<Arc<iced::futures::lock::Mutex<()>>> =
+    once_cell::sync::Lazy::new(|| Arc::new(iced::futures::lock::Mutex::new(())));
+
+pub(crate) async fn load_snapshot_async(
+    path: std::path::PathBuf,
+    request: Weak<()>,
+) -> HistorySnapshot {
+    if request.strong_count() == 0 {
+        return HistorySnapshot::default();
+    }
+    let permit = Arc::clone(&HISTORY_LOAD_GATE).lock_owned().await;
+    if request.strong_count() == 0 {
+        return HistorySnapshot::default();
+    }
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if request.strong_count() == 0 {
+            return HistorySnapshot::default();
+        }
+        HistoryPickerState::load_snapshot(&path)
+    })
+    .await
+    .unwrap_or_default()
+}
 
 /// 打开选择器时加载的最大条数。与 forge 的历史面板一致：交互检索只需要
 /// 一个近期工作集，读取同样限制在有界的文件尾部。
@@ -170,6 +198,9 @@ pub enum HistoryFilterAction {
 /// 历史选择器状态。`entries` 最新在前，在打开浮层
 /// 时加载一次；期间新完成的命令会在下一次打开时出现。
 pub struct HistoryPickerState {
+    loading: Option<Arc<()>>,
+    /// The session that opened the picker, never the later active pane.
+    target_session_id: Option<usize>,
     query: String,
     /// 当前过滤结果中的高亮位置。
     pub selected: usize,
@@ -189,15 +220,24 @@ pub struct HistoryPickerState {
     rebuild_count: usize,
 }
 
+/// Sanitized immutable rows prepared by a worker, without copying command text
+/// when Iced clones a completion message.
+#[derive(Debug, Default)]
+pub(crate) struct HistorySnapshot {
+    entries: Vec<Arc<CommandHistoryRecord>>,
+    older_not_loaded: bool,
+}
+
 /// Accept only a retained row from the currently open snapshot, then close
 /// before dispatch. New/open/load always allocates fresh record Arcs. A click
-/// retains its original row across query edits, but not close/reopen. Targeting
-/// remains the active prompt at dispatch, as for keyboard history recall.
+/// retains its original row across query edits, but not close/reopen. The
+/// destination is the opening's stable session, as for keyboard history recall.
 pub(crate) fn accept_clicked_record(
     picker: &mut Option<HistoryPickerState>,
     record: &Arc<CommandHistoryRecord>,
-) -> Option<String> {
+) -> Option<(usize, String)> {
     let state = picker.as_ref()?;
+    let target = state.target_session_id?;
     if !state
         .entries
         .iter()
@@ -207,7 +247,7 @@ pub(crate) fn accept_clicked_record(
     }
     let command = record.command.clone();
     *picker = None;
-    Some(command)
+    Some((target, command))
 }
 
 impl HistoryPickerState {
@@ -229,6 +269,8 @@ impl HistoryPickerState {
             true
         });
         let mut state = Self {
+            loading: None,
+            target_session_id: None,
             query: String::new(),
             selected: 0,
             entries: entries.into_iter().map(Arc::new).collect(),
@@ -248,6 +290,45 @@ impl HistoryPickerState {
         };
         state.rebuild_results();
         state
+    }
+
+    pub(crate) fn begin_load(target_session_id: usize, cwd: Option<String>) -> (Self, Weak<()>) {
+        let mut state = Self::new(Vec::new());
+        state.target_session_id = Some(target_session_id);
+        state.set_current_directory(cwd);
+        let identity = Arc::new(());
+        let request = Arc::downgrade(&identity);
+        state.loading = Some(identity);
+        (state, request)
+    }
+
+    pub(crate) fn load_snapshot(path: &std::path::Path) -> HistorySnapshot {
+        let state = Self::load(path);
+        HistorySnapshot {
+            entries: state.entries,
+            older_not_loaded: state.older_not_loaded,
+        }
+    }
+
+    /// Keep edits made while loading. Only this opening may consume its reply;
+    /// a dismissed picker cannot populate a later opening or reopen itself.
+    pub(crate) fn finish_load(&mut self, request: &Weak<()>, snapshot: &HistorySnapshot) -> bool {
+        if !self
+            .loading
+            .as_ref()
+            .is_some_and(|identity| Weak::ptr_eq(&Arc::downgrade(identity), request))
+        {
+            return false;
+        }
+        self.loading = None;
+        self.entries.clone_from(&snapshot.entries);
+        self.older_not_loaded = snapshot.older_not_loaded;
+        self.rebuild_results();
+        true
+    }
+
+    pub(crate) fn is_loading(&self) -> bool {
+        self.loading.is_some()
     }
 
     /// 从持久化索引加载最近的一段。读取是有界的（文件尾部窗口 + 条数上限），
@@ -464,6 +545,10 @@ impl HistoryPickerState {
             .map(str::to_string)
     }
 
+    pub(crate) fn selected_recall(&self) -> Option<(usize, String)> {
+        Some((self.target_session_id?, self.selected_command()?))
+    }
+
     /// Replace the query; the highlight returns to the first row. Control
     /// characters are dropped and the byte budget is enforced on a char
     /// boundary so iced `text_input` and the raw-key path share one contract.
@@ -518,6 +603,89 @@ mod tests {
             exit_code,
             end_time_ms: None,
         }
+    }
+
+    fn session_picker(target: usize, entries: Vec<CommandHistoryRecord>) -> HistoryPickerState {
+        let mut picker = HistoryPickerState::new(entries);
+        picker.target_session_id = Some(target);
+        picker
+    }
+
+    #[test]
+    fn loading_preserves_new_query_and_filters_until_snapshot_arrives() {
+        let (mut picker, request) = HistoryPickerState::begin_load(41, Some("/project".into()));
+        assert!(picker.is_loading());
+        assert!(picker.selected_command().is_none());
+        picker.set_query("test");
+        picker.apply_filter(HistoryFilterAction::ToggleDirectory);
+        picker.apply_filter(HistoryFilterAction::SetStatus(HistoryStatus::Failed));
+        picker.apply_filter(HistoryFilterAction::ToggleUnique);
+        let snapshot = HistorySnapshot {
+            entries: vec![
+                Arc::new(record("cargo test", Some("/elsewhere"), 1)),
+                Arc::new(record("cargo test", Some("/project"), 0)),
+                Arc::new(record("cargo test", Some("/project"), 1)),
+                Arc::new(record("cargo test", Some("/project"), 1)),
+            ],
+            older_not_loaded: true,
+        };
+        assert!(picker.finish_load(&request, &snapshot));
+        assert!(!picker.is_loading());
+        assert_eq!(picker.query(), "test");
+        assert!(picker.directory_only());
+        assert_eq!(picker.status(), HistoryStatus::Failed);
+        assert!(picker.unique());
+        assert!(picker.older_not_loaded());
+        assert_eq!(picker.match_count(), 1);
+        assert_eq!(picker.selected_command().as_deref(), Some("cargo test"));
+        assert_eq!(picker.selected_recall(), Some((41, "cargo test".into())));
+        assert!(Arc::ptr_eq(
+            &picker.shared_filtered()[0],
+            &snapshot.entries[2]
+        ));
+        assert!(!picker.finish_load(&request, &HistorySnapshot::default()));
+        assert_eq!(
+            picker.match_count(),
+            1,
+            "duplicate reply cannot clear results"
+        );
+    }
+
+    #[test]
+    fn closed_or_reopened_picker_rejects_the_previous_load() {
+        let (old, stale) = HistoryPickerState::begin_load(41, None);
+        drop(old);
+        assert_eq!(
+            stale.strong_count(),
+            0,
+            "queued worker can skip a closed picker"
+        );
+        let (mut current, request) = HistoryPickerState::begin_load(73, None);
+        current.set_query("draft");
+        assert!(!current.finish_load(&stale, &HistorySnapshot::default()));
+        assert!(current.is_loading());
+        assert_eq!(current.query(), "draft");
+        assert!(current.finish_load(&request, &HistorySnapshot::default()));
+        assert!(!current.is_loading());
+    }
+
+    #[test]
+    fn closing_while_waiting_for_read_admission_never_starts_disk_io() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+        let permit = iced::futures::executor::block_on(Arc::clone(&HISTORY_LOAD_GATE).lock_owned());
+        let (picker, request) = HistoryPickerState::begin_load(41, None);
+        let mut load = Box::pin(load_snapshot_async("unused".into(), request));
+        let mut context = Context::from_waker(iced::futures::task::noop_waker_ref());
+        assert!(load.as_mut().poll(&mut context).is_pending());
+        drop(picker);
+        drop(permit);
+        // No Tokio runtime exists in this test: reaching spawn_blocking would
+        // panic, so completion proves the retired waiter skipped the reader.
+        let Poll::Ready(snapshot) = load.as_mut().poll(&mut context) else {
+            panic!("retired load should finish after admission");
+        };
+        assert!(snapshot.entries.is_empty());
     }
 
     #[test]
@@ -626,32 +794,32 @@ mod tests {
 
     #[test]
     fn clicked_history_record_requires_current_open_snapshot_and_is_one_shot() {
-        let state = HistoryPickerState::new(vec![record("cargo test", None, 0)]);
+        let state = session_picker(41, vec![record("cargo test", None, 0)]);
         let clicked = state.shared_filtered().remove(0);
-        let keyboard = state.selected_command();
+        let keyboard = state.selected_recall();
         let mut picker = Some(state);
         assert_eq!(accept_clicked_record(&mut picker, &clicked), keyboard);
         assert!(picker.is_none());
         assert!(accept_clicked_record(&mut picker, &clicked).is_none());
-        picker = Some(HistoryPickerState::new(vec![record("cargo test", None, 0)]));
+        picker = Some(session_picker(73, vec![record("cargo test", None, 0)]));
         assert!(accept_clicked_record(&mut picker, &clicked).is_none());
         assert!(picker.is_some());
         let reopened = picker.as_ref().unwrap().shared_filtered().remove(0);
         assert_eq!(
-            accept_clicked_record(&mut picker, &reopened).as_deref(),
-            Some("cargo test")
+            accept_clicked_record(&mut picker, &reopened),
+            Some((73, "cargo test".into()))
         );
     }
 
     #[test]
     fn clicked_history_record_survives_query_edit_but_not_explicit_close() {
-        let mut picker = Some(HistoryPickerState::new(vec![record("cargo test", None, 0)]));
+        let mut picker = Some(session_picker(41, vec![record("cargo test", None, 0)]));
         let clicked = picker.as_ref().unwrap().shared_filtered().remove(0);
         picker.as_mut().unwrap().set_query("not matching");
         assert!(picker.as_ref().unwrap().filtered().is_empty());
         assert_eq!(
-            accept_clicked_record(&mut picker, &clicked).as_deref(),
-            Some("cargo test")
+            accept_clicked_record(&mut picker, &clicked),
+            Some((41, "cargo test".into()))
         );
         let state = HistoryPickerState::new(vec![record("git status", None, 0)]);
         let closed = state.shared_filtered().remove(0);
@@ -660,7 +828,39 @@ mod tests {
     }
 
     #[test]
-    fn history_callback_closes_snapshot_before_existing_active_prompt_recall() {
+    fn asynchronous_history_recall_keeps_the_opening_session_for_keyboard_and_mouse() {
+        let (mut state, request) = HistoryPickerState::begin_load(41, Some("/work/a".into()));
+        state.set_query("cargo");
+        let snapshot = HistorySnapshot {
+            entries: vec![Arc::new(record("cargo test", Some("/work/a"), 0))],
+            older_not_loaded: false,
+        };
+        assert!(state.finish_load(&request, &snapshot));
+        // The opening pane may have exited and its vector slot may now hold
+        // another session. Neither acceptance route resolves a new active id.
+        let remaining_session_ids = [73];
+        let keyboard = state.selected_recall().unwrap();
+        assert_eq!(keyboard, (41, "cargo test".into()));
+        assert!(!remaining_session_ids.contains(&keyboard.0));
+        let clicked = state.shared_filtered().remove(0);
+        state.set_query("no match");
+        let mut picker = Some(state);
+        assert_eq!(accept_clicked_record(&mut picker, &clicked), Some(keyboard));
+        assert!(picker.is_none());
+    }
+
+    #[test]
+    fn unbound_loader_snapshot_cannot_recall_into_an_arbitrary_session() {
+        let state = HistoryPickerState::new(vec![record("cargo test", None, 0)]);
+        assert!(state.selected_recall().is_none());
+        let clicked = state.shared_filtered().remove(0);
+        let mut picker = Some(state);
+        assert!(accept_clicked_record(&mut picker, &clicked).is_none());
+        assert!(picker.is_some());
+    }
+
+    #[test]
+    fn history_keyboard_and_click_dispatch_the_pinned_session_before_revalidation() {
         let source = include_str!("main.rs");
         let handler = source
             .split_once("            Message::HistoryPickerAccept(record) => {")
@@ -672,13 +872,31 @@ mod tests {
         assert!(
             handler.find("accept_clicked_record(").unwrap()
                 < handler
-                    .find("self.recall_into_active_pane(command)")
+                    .find("self.recall_into_session(id, command)")
                     .unwrap()
         );
         assert!(!handler.contains("record.command"));
-        // Cross-session history targeting is deliberately unchanged: no
-        // opening-session pin or new PTY/prompt implementation is introduced.
+        assert!(!handler.contains("recall_into_active_pane"));
         assert!(handler.contains("None => Task::none()"));
+        let keyboard = source
+            .split_once("    fn handle_history_picker_key(")
+            .unwrap()
+            .1
+            .split_once("    fn history_picker_snap_task(")
+            .unwrap()
+            .0;
+        assert!(keyboard.contains("state.selected_recall()"));
+        assert!(keyboard.contains("self.recall_into_session(id, command)"));
+        assert!(!keyboard.contains("recall_into_active_pane"));
+        let delivery = source
+            .split_once("            Message::PromptRecall(id, command) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::Resized(size)")
+            .unwrap()
+            .0;
+        assert!(delivery.contains("self.session_prompt_replace_ready(id)"));
+        assert!(!delivery.contains("self.active"));
     }
 
     #[test]

@@ -8,11 +8,9 @@
 //! executes: the rendered command goes through the same `PromptRecall` review
 //! boundary as history recall.
 //!
-//! Loading is synchronous at open, bounded by the file and count caps in
-//! [`jterm_core::workflows`] — the same seam as
-//! `history_picker::HistoryPickerState::load`. This replaces anvil's
-//! single-flight background refresh (`workflow_ops.rs`): iced has no palette
-//! tier to prewarm, so the GTK worker/latch machinery would buy nothing here.
+//! Loading uses the shared bounded background refresh service. The opening
+//! identity, query and target survive a refresh, while individual row choices
+//! carry the library revision so delayed clicks cannot select a replacement.
 //!
 //! Iced wiring stays here; both pure state machines do not. The searchable
 //! list is [`jterm_core::workflows::WorkflowPicker`], and the form's value
@@ -21,8 +19,10 @@
 //! what makes the family-wide missing-value guard reachable at all (see
 //! [`crate::workflows`]).
 
-use crate::workflows::{self, ArgsForm, Workflow};
-use jterm_core::workflows::{PickerPolicy, WorkflowPicker};
+#[cfg(test)]
+use crate::workflows;
+use crate::workflows::{ArgsForm, Workflow};
+use jterm_core::workflows::{PickerPolicy, RefreshSnapshot, WorkflowPicker};
 use std::sync::Arc;
 
 /// 一次渲染/导航的最大结果数。键盘选择与绘制共用 `filtered()`，因此上限
@@ -88,6 +88,7 @@ static NEXT_PICKER_SNAPSHOT: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkflowChoice {
     snapshot: u64,
+    library_revision: u64,
     entry: usize,
 }
 
@@ -96,6 +97,11 @@ pub(crate) struct WorkflowPickerState {
     widget_identity: Arc<()>,
     picker: WorkflowPicker,
     snapshot: u64,
+    refresh_revision: u64,
+    library_revision: u64,
+    library_value: Option<Arc<Vec<Workflow>>>,
+    loading: bool,
+    load_error: Option<String>,
 }
 
 impl WorkflowPickerState {
@@ -105,18 +111,79 @@ impl WorkflowPickerState {
             widget_identity: Arc::new(()),
             picker: WorkflowPicker::new(entries, PICKER_POLICY),
             snapshot: NEXT_PICKER_SNAPSHOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            refresh_revision: 0,
+            library_revision: 0,
+            library_value: None,
+            loading: false,
+            load_error: None,
         }
     }
 
-    /// 从全部搜索路径加载。缺失/损坏的文件被 `jterm_core::workflows` 记录并
-    /// 跳过，这里得到的只是更短的列表而不是错误。
-    pub(crate) fn load(target_session_id: usize) -> Self {
-        Self::load_from(target_session_id, &workflows::workflow_dirs())
+    pub(crate) fn from_snapshot(
+        target_session_id: usize,
+        snapshot: RefreshSnapshot<Vec<Workflow>>,
+    ) -> Self {
+        let mut state = Self::new(target_session_id, snapshot.value.as_ref().clone());
+        state.library_revision = snapshot.revision;
+        state.refresh_revision = snapshot.revision;
+        state.library_value = Some(snapshot.value);
+        state.loading = snapshot.loading;
+        state.load_error = snapshot.error;
+        state
+    }
+
+    /// Publish new library contents once per revision without replacing the
+    /// opening's native input state, query, or destination session.
+    pub(crate) fn apply_snapshot(&mut self, snapshot: RefreshSnapshot<Vec<Workflow>>) -> bool {
+        if snapshot.revision < self.refresh_revision {
+            return false;
+        }
+        let changed = snapshot.revision != self.refresh_revision;
+        self.refresh_revision = snapshot.revision;
+        self.loading = snapshot.loading;
+        self.load_error = snapshot.error;
+        if snapshot.loading || !changed {
+            return false;
+        }
+        if self.library_value.as_ref().is_some_and(|value| {
+            Arc::ptr_eq(value, &snapshot.value) || value.as_ref() == snapshot.value.as_ref()
+        }) {
+            self.library_value = Some(snapshot.value);
+            return false;
+        }
+        let selected_path = self
+            .selected_workflow()
+            .and_then(|workflow| workflow.source_path.clone());
+        let query = self.query().to_owned();
+        self.picker = WorkflowPicker::new(snapshot.value.as_ref().clone(), PICKER_POLICY);
+        self.picker.set_query(query);
+        if let Some(path) = selected_path {
+            let selected = self
+                .picker
+                .filtered()
+                .iter()
+                .position(|workflow| workflow.source_path.as_ref() == Some(&path));
+            if let Some(selected) = selected {
+                self.picker.select(selected);
+            }
+        }
+        self.library_revision = snapshot.revision;
+        self.library_value = Some(snapshot.value);
+        true
+    }
+
+    pub(crate) fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    pub(crate) fn load_error(&self) -> Option<&str> {
+        self.load_error.as_deref()
     }
 
     /// Test seam (and any future caller with an explicit search path). 顺序由
     /// `workflows::load_library_from` 钉死为目录优先级顺序——`filtered()` 的
     /// 空查询分支直接暴露它。
+    #[cfg(test)]
     pub(crate) fn load_from(target_session_id: usize, dirs: &[std::path::PathBuf]) -> Self {
         Self::new(target_session_id, workflows::load_library_from(dirs))
     }
@@ -220,13 +287,17 @@ impl WorkflowPickerState {
             .position(|entry| std::ptr::eq(entry, workflow))?;
         Some(WorkflowChoice {
             snapshot: self.snapshot,
+            library_revision: self.library_revision,
             entry,
         })
     }
 
     /// A queued row action may survive a query edit, but not picker replacement.
     pub(crate) fn resolve_choice(&self, choice: WorkflowChoice) -> Option<&Workflow> {
-        if choice.snapshot != self.snapshot || overlay_query_is_unsafe(self.query()) {
+        if choice.snapshot != self.snapshot
+            || choice.library_revision != self.library_revision
+            || overlay_query_is_unsafe(self.query())
+        {
             return None;
         }
         self.picker.entries().get(choice.entry)
@@ -422,6 +493,100 @@ mod tests {
     use super::*;
     use crate::workflows::WorkflowArg;
     use std::path::PathBuf;
+
+    fn library_snapshot(
+        value: Arc<Vec<Workflow>>,
+        revision: u64,
+        loading: bool,
+        error: Option<&str>,
+    ) -> RefreshSnapshot<Vec<Workflow>> {
+        RefreshSnapshot {
+            value,
+            revision,
+            loading,
+            error: error.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn refreshed_library_keeps_opening_query_and_target_but_retires_old_rows() {
+        let cached = Arc::new(vec![workflow("old deploy", "", &[])]);
+        let mut state =
+            WorkflowPickerState::from_snapshot(41, library_snapshot(cached.clone(), 1, true, None));
+        let opening = state.snapshot_identity();
+        let widget = state.widget_identity();
+        let old_choice = state.choice_for(state.filtered()[0]).unwrap();
+        state.set_query("deploy");
+        assert!(state.is_loading());
+        // Admission increments a revision but retains the old value. Polling
+        // must not copy/rebuild that value or interrupt editing.
+        assert!(!state.apply_snapshot(library_snapshot(cached, 2, true, None)));
+        assert!(state.resolve_choice(old_choice).is_some());
+        let loaded = Arc::new(vec![workflow("new deploy", "", &[])]);
+        assert!(state.apply_snapshot(library_snapshot(loaded.clone(), 3, false, None)));
+        assert!(!state.is_loading());
+        assert_eq!(state.snapshot_identity(), opening);
+        assert!(Arc::ptr_eq(&state.widget_identity(), &widget));
+        assert_eq!(state.target_session_id(), 41);
+        assert_eq!(state.query(), "deploy");
+        assert_eq!(state.selected_workflow().unwrap().name, "new deploy");
+        assert!(state.resolve_choice(old_choice).is_none());
+        let new_choice = state.choice_for(state.filtered()[0]).unwrap();
+        assert!(state.resolve_choice(new_choice).is_some());
+        assert!(!state.apply_snapshot(library_snapshot(loaded, 3, false, None)));
+    }
+
+    #[test]
+    fn failed_refresh_keeps_cached_rows_query_and_selection() {
+        let cached = Arc::new(vec![workflow("one", "", &[]), workflow("two", "", &[])]);
+        let mut state =
+            WorkflowPickerState::from_snapshot(9, library_snapshot(cached.clone(), 1, true, None));
+        state.select_next();
+        assert_eq!(state.selected(), 1);
+        assert!(!state.apply_snapshot(library_snapshot(cached, 2, false, Some("Refresh failed"),)));
+        assert!(!state.is_loading());
+        assert_eq!(state.load_error(), Some("Refresh failed"));
+        assert_eq!(state.selected(), 1);
+        assert_eq!(state.selected_workflow().unwrap().name, "two");
+        assert_eq!(state.target_session_id(), 9);
+    }
+
+    #[test]
+    fn identical_reload_keeps_selection_and_changed_reload_follows_source_path() {
+        let mut first = workflow("first", "", &[]);
+        first.source_path = Some("/workflows/first.yaml".into());
+        let mut second = workflow("second", "", &[]);
+        second.source_path = Some("/workflows/second.yaml".into());
+        let cached = Arc::new(vec![first.clone(), second.clone()]);
+        let mut state =
+            WorkflowPickerState::from_snapshot(7, library_snapshot(cached.clone(), 1, true, None));
+        state.select_next();
+        let choice = state.choice_for(state.filtered()[1]).unwrap();
+        // A successful re-read has a fresh Arc even when no file changed.
+        assert!(!state.apply_snapshot(library_snapshot(
+            Arc::new(cached.as_ref().clone()),
+            2,
+            false,
+            None,
+        )));
+        assert_eq!(state.selected(), 1);
+        assert!(state.resolve_choice(choice).is_some());
+        second.command = "echo changed".into();
+        let mut added = workflow("added", "", &[]);
+        added.source_path = Some("/workflows/added.yaml".into());
+        assert!(state.apply_snapshot(library_snapshot(
+            Arc::new(vec![added, first.clone(), second]),
+            3,
+            false,
+            None,
+        )));
+        assert_eq!(state.selected(), 2);
+        assert_eq!(state.selected_workflow().unwrap().name, "second");
+        assert!(state.resolve_choice(choice).is_none());
+        assert!(state.apply_snapshot(library_snapshot(Arc::new(vec![first]), 4, false, None,)));
+        assert_eq!(state.selected(), 0);
+        assert_eq!(state.selected_workflow().unwrap().name, "first");
+    }
 
     fn argument_form(name: &str) -> WorkflowArgsState {
         let mut definition = workflow(name, "", &[]);
@@ -649,6 +814,7 @@ mod tests {
         assert!(first
             .resolve_choice(WorkflowChoice {
                 snapshot: choice.snapshot,
+                library_revision: choice.library_revision,
                 entry: usize::MAX
             })
             .is_none());

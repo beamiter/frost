@@ -5130,14 +5130,17 @@ enum Message {
     TabSwitcherJump(usize),
     /// Filter text changed in the history picker.
     HistoryPickerInput(String),
+    HistoryPickerLoaded(std::sync::Weak<()>, Arc<history_picker::HistorySnapshot>),
     /// Change the persisted-history filters and reset the highlighted row.
     HistoryPickerFilter(history_picker::HistoryFilterAction),
     /// Cancel the history picker overlay.
     HistoryPickerClose,
-    /// Type the clicked command into the active pane's prompt (and close).
+    /// Type the clicked command into the opening pane's prompt (and close).
     HistoryPickerAccept(Arc<jterm_core::command_history::CommandHistoryRecord>),
     /// Filter text changed in the workflow picker.
     WorkflowPickerInput(u64, String),
+    /// Poll only while an open workflow picker is waiting for its library.
+    WorkflowRefreshTick,
     /// Dismiss only the picker opening that produced this backdrop callback.
     WorkflowPickerClose(u64),
     /// Accept the immutable entry represented by a rendered picker row:
@@ -7084,7 +7087,7 @@ struct Frost {
     remote_picker: Option<RemotePickerState>,
     remote_host_editor: remote_host_editor::RemoteHostEditor,
     /// History-picker overlay (Ctrl+Shift+H): fuzzy search over the persisted
-    /// command-history index; Enter types the selection into the active pane.
+    /// command-history index; Enter types the selection into the opening pane.
     history_picker: Option<history_picker::HistoryPickerState>,
     /// Never reset on focus loss: Iced drops synthetic focus-change key events.
     /// If the real release is missed off-window, one extra press/release cycle
@@ -7096,6 +7099,7 @@ struct Frost {
     /// files, then a per-argument form before the rendered command is typed
     /// into the active pane for review (never executed).
     workflow_overlay: Option<workflow_picker::WorkflowOverlay>,
+    workflow_library: jterm_core::workflows::BackgroundRefresh<Vec<workflows::Workflow>>,
     /// Cross-block search picker overlay (`block:search`, Ctrl+Alt+F).
     block_search: Option<BlockSearchState>,
     /// User-controlled preference within this window. TUI auto-hide always takes precedence.
@@ -7346,6 +7350,7 @@ impl Frost {
             native_enter_ownership,
             terminal_ime: terminal_ime::Ownership::default(),
             workflow_overlay: None,
+            workflow_library: jterm_core::workflows::BackgroundRefresh::new(Vec::new()),
             block_search: None,
             block_bar_user_hidden: false,
             block_reading_menu: None,
@@ -11751,14 +11756,20 @@ impl Frost {
             );
             return Task::none();
         };
-        let cwd = self
-            .sessions
-            .get(self.active)
-            .and_then(|session| session.cwd());
-        let mut state = history_picker::HistoryPickerState::load(&path);
-        state.set_current_directory(cwd);
+        let Some(session) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let (state, request) =
+            history_picker::HistoryPickerState::begin_load(session.id, session.cwd());
         self.history_picker = Some(state);
-        iced::widget::operation::focus(HISTORY_PICKER_INPUT_ID.clone())
+        let worker_request = request.clone();
+        Task::batch([
+            iced::widget::operation::focus(HISTORY_PICKER_INPUT_ID.clone()),
+            Task::perform(
+                history_picker::load_snapshot_async(path, worker_request),
+                move |snapshot| Message::HistoryPickerLoaded(request.clone(), Arc::new(snapshot)),
+            ),
+        ])
     }
 
     /// Whether an on-screen overlay claims Escape for itself.
@@ -13280,13 +13291,17 @@ impl Frost {
     /// History recall: replace the prompt's pending line with `command`. Still
     /// never appends Enter — the user submits explicitly.
     fn recall_into_active_pane(&mut self, command: String) -> Task<Message> {
+        let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
+            return Task::none();
+        };
+        self.recall_into_session(id, command)
+    }
+
+    fn recall_into_session(&mut self, id: usize, command: String) -> Task<Message> {
         // Claim any held Enter before asynchronous prompt revalidation, not
         // only after a successful write or a keyboard-based confirmation.
         self.native_enter_ownership.lock().claim_pressed();
         self.prompt_recall_enter_latch.begin_recall();
-        let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
-            return Task::none();
-        };
         Task::done(Message::PromptRecall(id, command))
     }
 
@@ -13399,7 +13414,7 @@ impl Frost {
 
     /// History picker key handling. Mirrors `handle_tab_switcher_key`: typed
     /// text filters, arrows move the selection, Enter types the highlighted
-    /// command into the active pane's prompt, Esc/Ctrl+Shift+H dismisses.
+    /// command into the opening pane's prompt, Esc/Ctrl+Shift+H dismisses.
     fn handle_history_picker_key(
         &mut self,
         key: &keyboard::Key,
@@ -13435,10 +13450,13 @@ impl Frost {
                 return Some(Task::none());
             }
             Key::Named(Named::Enter) => {
-                let command = state.selected_command();
+                if state.is_loading() {
+                    return Some(Task::none());
+                }
+                let recall = state.selected_recall();
                 self.history_picker = None;
-                return Some(match command {
-                    Some(command) => self.recall_into_active_pane(command),
+                return Some(match recall {
+                    Some((id, command)) => self.recall_into_session(id, command),
                     None => Task::none(),
                 });
             }
@@ -13486,14 +13504,19 @@ impl Frost {
     /// Open the workflow picker over the current search path
     /// (`~/.config/frost/workflows/`, `FROST_WORKFLOW_DIR`, XDG data dirs,
     /// then the bundled examples). Shared by Ctrl+Shift+M and the command
-    /// palette so both entry points behave identically. The load is bounded
-    /// and synchronous, the same seam as `open_history_picker`.
+    /// palette so both entry points behave identically. Refresh uses the shared
+    /// bounded worker; opening never waits for directory or file I/O.
     fn open_workflow_picker(&mut self) -> Task<Message> {
         let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
             return Task::none();
         };
+        self.workflow_library
+            .refresh(|| workflows::load_library_from(&workflows::workflow_dirs()));
         self.workflow_overlay = Some(workflow_picker::WorkflowOverlay::Picker(Box::new(
-            workflow_picker::WorkflowPickerState::load(id),
+            workflow_picker::WorkflowPickerState::from_snapshot(
+                id,
+                self.workflow_library.snapshot(),
+            ),
         )));
         iced::widget::operation::focus(WORKFLOW_PICKER_INPUT_ID.clone())
     }
@@ -20850,6 +20873,16 @@ impl Frost {
                     ),
                 }
             }
+            Message::HistoryPickerLoaded(request, snapshot) => {
+                if self
+                    .history_picker
+                    .as_mut()
+                    .is_some_and(|state| state.finish_load(&request, &snapshot))
+                {
+                    return self.history_picker_snap_task();
+                }
+                return Task::none();
+            }
             Message::HistoryPickerInput(q) => {
                 if let Some(s) = self.history_picker.as_mut() {
                     s.set_query(q);
@@ -20866,12 +20899,22 @@ impl Frost {
                 ]);
             }
             Message::HistoryPickerAccept(record) => {
-                let command =
+                let recall =
                     history_picker::accept_clicked_record(&mut self.history_picker, &record);
-                return match command {
-                    Some(command) => self.recall_into_active_pane(command),
+                return match recall {
+                    Some((id, command)) => self.recall_into_session(id, command),
                     None => Task::none(),
                 };
+            }
+            Message::WorkflowRefreshTick => {
+                if let Some(workflow_picker::WorkflowOverlay::Picker(state)) =
+                    self.workflow_overlay.as_mut()
+                {
+                    if state.apply_snapshot(self.workflow_library.snapshot()) {
+                        return workflow_focus::reveal_picker();
+                    }
+                }
+                return Task::none();
             }
             Message::WorkflowPickerInput(snapshot, q) => {
                 let Some(workflow_picker::WorkflowOverlay::Picker(state)) =
@@ -22579,13 +22622,28 @@ impl Frost {
 
         let mut list = column![].spacing(2);
         if filtered.is_empty() {
-            let hint = if state.is_empty() {
+            let hint = if state.is_loading() {
+                "Loading workflows… You can type to filter"
+            } else if state.load_error().is_some() {
+                "Could not refresh workflows — close and reopen to retry"
+            } else if state.is_empty() {
                 "No workflows found (~/.config/frost/workflows/, FROST_WORKFLOW_DIR, or bundled examples)"
             } else {
                 "No workflows match"
             };
             list = list.push(self.popup_text(hint).color(self.c_text_dim()));
         } else {
+            if state.is_loading() {
+                list = list.push(
+                    self.popup_text("Refreshing workflows…")
+                        .color(self.c_text_dim()),
+                );
+            } else if state.load_error().is_some() {
+                list = list.push(
+                    self.popup_text("Refresh failed; showing the previous workflows")
+                        .color(self.c_text_dim()),
+                );
+            }
             for (pos, workflow) in filtered.iter().enumerate() {
                 let selected = pos == state.selected();
                 let mut info = row![self
@@ -22914,7 +22972,9 @@ impl Frost {
 
         let mut list = column![].spacing(2);
         if filtered.is_empty() {
-            let hint = if state.entry_count() == 0 {
+            let hint = if state.is_loading() {
+                "Loading command history… You can type to filter"
+            } else if state.entry_count() == 0 {
                 "No persisted commands yet (recorded via OSC 133 shell integration)"
             } else {
                 "No commands match — adjust the query or reset the filters"
@@ -27767,7 +27827,7 @@ impl Frost {
     fn command_palette(&self) -> Element<'_, Message> {
         let epoch = self.palette.epoch();
         let input_epoch = std::sync::Arc::clone(&epoch);
-        let query = text_input("Type to filter…", &self.palette.query)
+        let query = text_input("Type to filter…", self.palette.query())
             .style(self.popup_input_style())
             .font(self.mono)
             .id(PALETTE_INPUT_ID.clone())
@@ -33124,6 +33184,15 @@ impl Frost {
         subs.push(
             iced::time::every(std::time::Duration::from_millis(1500)).map(|_| Message::ConfigTick),
         );
+        if matches!(
+            self.workflow_overlay.as_ref(),
+            Some(workflow_picker::WorkflowOverlay::Picker(state)) if state.is_loading()
+        ) {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(50))
+                    .map(|_| Message::WorkflowRefreshTick),
+            );
+        }
         // Background work must drain even while hidden. Parked review state
         // only needs display refreshes in the focused, visible Tasks panel;
         // an already loaded diff must not keep a hidden panel polling forever.
@@ -35406,7 +35475,8 @@ mod tests {
             .unwrap()
             .0;
         assert!(opening.contains("self.sessions.get(self.active).map(|session| session.id)"));
-        assert!(opening.contains("WorkflowPickerState::load(id)"));
+        assert!(opening.contains("WorkflowPickerState::from_snapshot("));
+        assert!(opening.contains("self.workflow_library.snapshot()"));
         let accept = source
             .split_once("    fn accept_workflow_choice(")
             .unwrap()

@@ -156,13 +156,17 @@ pub struct PaletteState {
     epoch: std::sync::Arc<()>,
     greeting_target: Option<usize>,
     pub is_open: bool,
-    pub query: String,
+    query: String,
     /// 当前过滤结果中的高亮位置。
     pub selected: usize,
     all: Vec<PaletteItem>,
     // Stable semantic row identities; filtering/navigation never rotates them.
     row_identities: Vec<std::sync::Arc<()>>,
     matcher: SkimMatcherV2,
+    haystacks: Vec<String>,
+    filtered_indices: Vec<usize>,
+    #[cfg(test)]
+    rebuild_count: usize,
     /// Most-recent-first list of actions the user has executed. Drives the
     /// empty-query order so frequent commands surface first. Capped to 16.
     mru: Vec<PaletteAction>,
@@ -721,6 +725,11 @@ impl PaletteState {
             },
         ];
         let row_identities = all.iter().map(|_| std::sync::Arc::new(())).collect();
+        let haystacks = all
+            .iter()
+            .map(|item| format!("{} {}", item.name, item.description))
+            .collect();
+        let filtered_indices = (0..all.len()).collect();
         Self {
             epoch: std::sync::Arc::new(()),
             greeting_target: None,
@@ -730,6 +739,10 @@ impl PaletteState {
             all,
             row_identities,
             matcher: SkimMatcherV2::default(),
+            haystacks,
+            filtered_indices,
+            #[cfg(test)]
+            rebuild_count: 0,
             mru: Vec::new(),
         }
     }
@@ -738,11 +751,17 @@ impl PaletteState {
     /// list next time the palette is opened. Caps at 16 entries; duplicate
     /// inserts are deduplicated to the front.
     pub fn record_use(&mut self, action: PaletteAction) {
+        if self.mru.first() == Some(&action) {
+            return;
+        }
         self.mru.retain(|a| *a != action);
         self.mru.insert(0, action);
         const MRU_CAP: usize = 16;
         if self.mru.len() > MRU_CAP {
             self.mru.truncate(MRU_CAP);
+        }
+        if self.query.is_empty() {
+            self.rebuild_filtered();
         }
     }
 
@@ -750,8 +769,7 @@ impl PaletteState {
         self.epoch = std::sync::Arc::new(());
         self.greeting_target = None;
         self.is_open = true;
-        self.query.clear();
-        self.selected = 0;
+        self.set_query("");
     }
 
     pub fn close(&mut self) {
@@ -780,48 +798,65 @@ impl PaletteState {
     /// 当前过滤结果，元素为 `(all 中的索引, 命令项)`。空查询时按 MRU 排序(最近使用
     /// 优先,其余按声明顺序);否则按模糊匹配分数降序排列,丢弃不匹配项。
     pub fn filtered(&self) -> Vec<(usize, &PaletteItem)> {
+        self.filtered_indices
+            .iter()
+            .map(|&index| (index, &self.all[index]))
+            .collect()
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// Matching belongs to query/MRU changes, never repaint, navigation or
+    /// activation. Names/descriptions are immutable and prepared only once.
+    fn rebuild_filtered(&mut self) {
+        #[cfg(test)]
+        {
+            self.rebuild_count += 1;
+        }
         if self.query.is_empty() {
             // MRU first (preserving recency order), then everything else in
             // declaration order so the list is stable and complete.
-            let mut out: Vec<(usize, &PaletteItem)> = Vec::with_capacity(self.all.len());
+            let mut out = Vec::with_capacity(self.all.len());
             let mut seen = vec![false; self.all.len()];
             for a in &self.mru {
-                if let Some((i, item)) = self.all.iter().enumerate().find(|(_, it)| it.action == *a)
-                {
+                if let Some((i, _)) = self.all.iter().enumerate().find(|(_, it)| it.action == *a) {
                     if !seen[i] {
                         seen[i] = true;
-                        out.push((i, item));
+                        out.push(i);
                     }
                 }
             }
-            for (i, item) in self.all.iter().enumerate() {
-                if !seen[i] {
-                    out.push((i, item));
+            for (i, &present) in seen.iter().enumerate() {
+                if !present {
+                    out.push(i);
                 }
             }
-            return out;
+            self.filtered_indices = out;
+            return;
         }
         if palette_query_is_unsafe(&self.query) {
-            return Vec::new();
+            self.filtered_indices.clear();
+            return;
         }
-        let mut scored: Vec<(i64, usize, &PaletteItem)> = self
-            .all
+        let mut scored: Vec<(i64, usize)> = self
+            .haystacks
             .iter()
             .enumerate()
-            .filter_map(|(i, item)| {
-                let haystack = format!("{} {}", item.name, item.description);
+            .filter_map(|(i, haystack)| {
                 self.matcher
-                    .fuzzy_match(&haystack, &self.query)
-                    .map(|score| (score, i, item))
+                    .fuzzy_match(haystack, &self.query)
+                    .map(|score| (score, i))
             })
             .collect();
         scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-        scored.into_iter().map(|(_, i, item)| (i, item)).collect()
+        self.filtered_indices = scored.into_iter().map(|(_, i)| i).collect();
     }
 
     /// 高亮项下移（在过滤结果中循环）。
     pub fn select_next(&mut self) {
-        let len = self.filtered().len();
+        let len = self.filtered_indices.len();
         if len == 0 {
             self.selected = 0;
         } else {
@@ -831,7 +866,7 @@ impl PaletteState {
 
     /// 高亮项上移（在过滤结果中循环）。
     pub fn select_prev(&mut self) {
-        let len = self.filtered().len();
+        let len = self.filtered_indices.len();
         if len == 0 {
             self.selected = 0;
         } else {
@@ -845,9 +880,9 @@ impl PaletteState {
 
     /// 当前高亮项的动作（按过滤结果中的位置）。
     pub fn selected_action(&self) -> Option<PaletteAction> {
-        self.filtered()
+        self.filtered_indices
             .get(self.selected)
-            .map(|(_, item)| item.action)
+            .map(|&index| self.all[index].action)
     }
 
     /// Identity of this opening, retained by rendered input/row callbacks.
@@ -869,9 +904,9 @@ impl PaletteState {
         if !self.accepts_epoch(epoch) {
             return None;
         }
-        self.filtered()
-            .into_iter()
-            .find_map(|(current, item)| (current == index).then_some(item.action))
+        self.filtered_indices
+            .contains(&index)
+            .then(|| self.all[index].action)
     }
 
     /// Replace the query; the highlight returns to the first row. Control
@@ -882,8 +917,11 @@ impl PaletteState {
         if palette_query_is_unsafe(&query) {
             return;
         }
-        self.query = query;
         self.selected = 0;
+        if self.query != query {
+            self.query = query;
+            self.rebuild_filtered();
+        }
     }
 
     /// Append typed text. Returns whether the stored query changed.
@@ -902,6 +940,7 @@ impl PaletteState {
             return false;
         }
         self.selected = 0;
+        self.rebuild_filtered();
         true
     }
 }
@@ -909,6 +948,82 @@ impl PaletteState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repaint_navigation_and_activation_reuse_one_query_match() {
+        let mut palette = PaletteState::new();
+        palette.open();
+        palette.set_query("pane");
+        let matched = palette.rebuild_count;
+        let expected = palette
+            .filtered()
+            .into_iter()
+            .map(|(index, item)| (index, item.action))
+            .collect::<Vec<_>>();
+        assert!(expected.len() > 1);
+        let epoch = palette.epoch();
+        for _ in 0..100 {
+            assert_eq!(
+                palette
+                    .filtered()
+                    .into_iter()
+                    .map(|(index, item)| (index, item.action))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            palette.select_next();
+            let (index, action) = expected[palette.selected];
+            assert_eq!(palette.selected_action(), Some(action));
+            assert_eq!(palette.action_at(&epoch, index), Some(action));
+            palette.select_prev();
+        }
+        assert_eq!(palette.rebuild_count, matched);
+        palette.set_query("pane");
+        assert_eq!(palette.selected, 0);
+        palette.set_query("pane\u{202e}");
+        assert_eq!(palette.query(), "pane");
+        assert_eq!(palette.rebuild_count, matched);
+        assert!(palette.backspace());
+        assert_eq!(palette.rebuild_count, matched + 1);
+    }
+
+    #[test]
+    fn mru_refreshes_empty_results_and_reopening_applies_updates_from_a_query() {
+        let mut palette = PaletteState::new();
+        palette.open();
+        palette.record_use(PaletteAction::Copy);
+        assert_eq!(palette.selected_action(), Some(PaletteAction::Copy));
+        let matched = palette.rebuild_count;
+        palette.record_use(PaletteAction::Copy);
+        assert_eq!(palette.rebuild_count, matched);
+        palette.set_query("pane");
+        let matched = palette.rebuild_count;
+        palette.record_use(PaletteAction::NewTab);
+        assert_eq!(
+            palette.rebuild_count, matched,
+            "MRU does not alter fuzzy ranking"
+        );
+        let epoch = palette.epoch();
+        palette.close();
+        palette.open();
+        assert_eq!(palette.query(), "");
+        assert_eq!(palette.selected_action(), Some(PaletteAction::NewTab));
+        assert_eq!(palette.filtered()[1].1.action, PaletteAction::Copy);
+        assert!(!palette.accepts_epoch(&epoch));
+        let indices = palette
+            .filtered()
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(indices.len(), palette.all.len());
+        assert_eq!(
+            indices
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            indices.len()
+        );
+    }
 
     #[test]
     fn row_identities_follow_all_items_while_query_and_navigation_preserve_opening() {
