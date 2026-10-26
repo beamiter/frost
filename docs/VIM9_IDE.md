@@ -171,7 +171,7 @@ one row while clicks in a folded split use Vim's own mouse handling.
 Soft-wrapped lines are native rows too (render protocol 9): continuation rows,
 `showbreak`/`breakindent` and `smoothscroll` partial lines keep Vim's exact
 layout, and scrolling moves one wrapped row at a time. Diff, blockwise
-selections over folds, guides or virtual text on wrapped lines, complex/scrolling completion, conceal and
+selections over folds, virtual text on wrapped lines, complex/scrolling completion, conceal and
 unsupported shaping temporarily use **Compatible view**, with the runtime's reason shown. Resize,
 disconnection and a terminal-local Shift selection also use the compatible
 path until a current supported frame is available. Old native frames are never
