@@ -24,12 +24,18 @@ highlight = "all"
 
 [advisories]
 version = 2
-# Both are unmaintained (not vulnerability/unsoundness) notices in the current
+# All are unmaintained (not vulnerability/unsoundness) notices in the current
 # iced/image graph, with no compatible patched release. Keep these exact IDs
 # aligned with .cargo/audit.toml so any different advisory still fails closed.
 ignore = [
   "RUSTSEC-2024-0436", # paste, through image/rav1e and macOS wgpu support
   "RUSTSEC-2026-0192", # ttf-parser, through cosmic-text/fontdb
+  # zvariant, zbus_names and zvariant_derive were folded into zbus 6. zbus 5
+  # stays in the graph through iced_winit -> mundy 0.2.3 (its latest release),
+  # so no safe upgrade exists; revisit when iced/mundy move to zbus 6.
+  "RUSTSEC-2026-0370", # zvariant
+  "RUSTSEC-2026-0371", # zbus_names
+  "RUSTSEC-2026-0372", # zvariant_derive
 ]
 
 [sources]
@@ -37,5 +43,4 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-git = [
   "https://github.com/beamiter/jagent.git?rev=d5492320686879c8b92106d2e31e4293ff125a5a",
-  "https://github.com/beamiter/jterm_core.git?rev=d3b1eb6180ea0e3bd4f6e0d1a09ef129ab3d442b",
 ]
