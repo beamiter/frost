@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Headless production font routing/config tests; no window, PTY, or display server.
 
-Only iced_core + serde/toml are built. Full Frost compilation/native QA are separate.
+Only iced_core, the backend-free iced_widget layout widgets (no wgpu/tiny-skia
+renderer) and serde/toml are built. Full Frost compilation/native QA are separate.
 """
 import json
 import os
@@ -27,10 +28,17 @@ def function(source, name):
 
 # Source contracts complement (not replace) the real Iced event tests.
 view = function(main, 'view')
-assert 'self.font_zoom_region(font_zoom::Group::Content, body)' in view
+# Leaf terminal/editor widgets own the content font: a capturing scope around
+# the whole body would resize the shell behind Vim, and overlays stacked over
+# the body (settings, palette, search) must never zoom terminal content.
+assert 'font_zoom::Group::Content, body' not in view
+assert 'self.font_zoom_region(font_zoom::Group::Content, terminal)' in function(main, 'pane_view')
+assert 'font_zoom::Group::Content' in function(main, 'pane_header')
+assert 'self.font_zoom_region(font_zoom::Group::Content, self.block_reading_bar())' in view
+assert view.index('font_zoom::Group::Content, self.block_reading_bar()') < view.index('if self.config_panel_open')
+assert 'self.font_zoom_region(font_zoom::Group::Content, self.status_bar())' in view
 assert 'self.font_zoom_region(font_zoom::Group::Chrome, self.sidebar_view())' in view
 assert 'self.font_zoom_region(font_zoom::Group::Chrome, self.tab_bar())' in view
-assert view.index('font_zoom::Group::Content, body') < view.index('if self.config_panel_open')
 assert 'self.pane_view(self.active)' in view and 'self.render_tree(self.layout(), &[])' in view
 router = main.split('            Message::FontWheel(group, delta) => {', 1)[1].split('            Message::SummaryActivate', 1)[0]
 assert 'self.active' not in router and 'sidebar_files_focused' not in router
@@ -56,6 +64,8 @@ normalization = function(config, 'normalized').split('        self.line_spacing 
 defaults = re.search(r'            font_size: default_font_size\(\),\n            chrome_font_size: [^\n]+', config).group()
 code = '#![allow(dead_code)]\nextern crate self as iced;\npub use iced_core::*;\n'
 code += 'pub mod advanced { pub use iced_core::{clipboard, image, layout, mouse, overlay, renderer, widget, Clipboard, Layout, Shell, Widget}; }\n'
+# The per-pane routing test composes scopes in the production iced Row.
+code += 'pub mod widget { pub use iced_core::widget::*; pub use iced_widget::Row; }\n'
 for module in ['font_zoom', 'font_zoom_scope', 'ui_typography']:
     code += '#[path = ' + json.dumps(str(ROOT / 'src' / (module + '.rs'))) + '] mod ' + module + ';\n'
 code += 'mod config { use serde::{Serialize, Deserialize};\n#[derive(Debug, Serialize, Deserialize)]\npub struct Config {\n' + fields + '}\n'
@@ -67,21 +77,20 @@ for test in ['legacy_font_groups_split_before_first_edit_and_survive_reload',
              'font_groups_clamp_independently_and_direct_legacy_setter_freezes_fallback']:
     code += '#[test]\n' + function(config, test) + '\n'
 code += '} }\n'
-# The pinned jterm_core bottom_bar::BAR_HEIGHT contract remains 22 px.
-# Check that the manifest and lock agree on an exact core revision; unrelated
-# core upgrades must not require editing a font-routing regression fixture.
-core_revision = re.search(
-    r'^jterm_core = \{[^\n]*rev = "([0-9a-f]{40})"',
-    (ROOT / 'Cargo.toml').read_text(), re.MULTILINE,
+# STATUS_BAR_H is jterm_core::bottom_bar::BAR_HEIGHT. Read it from the core
+# source this build actually uses (the path dependency: the sibling checkout or
+# the bundle CI materializes), so unrelated core upgrades never require editing
+# this font-routing regression fixture and a changed height is still exercised.
+core_path = re.search(
+    r'^jterm_core = \{[^\n]*\bpath = "([^"]+)"', (ROOT / 'Cargo.toml').read_text(), re.MULTILINE,
 )
-assert core_revision is not None, 'jterm_core must use an exact revision'
-core_revision = core_revision.group(1)
-assert (
-    f'git+https://github.com/beamiter/jterm_core.git?rev={core_revision}#{core_revision}'
-    in (ROOT / 'Cargo.lock').read_text()
-), 'jterm_core manifest and lock revisions differ'
-for constant in ['TAB_BAR_H', 'STATUS_BAR_H']:
-    code += re.search(r'const ' + constant + r': f32 = [^;]+;', main).group().replace('jterm_core::bottom_bar::BAR_HEIGHT', '22.0') + '\n'
+assert core_path is not None, 'jterm_core must be a path dependency'
+bottom_bar = (ROOT / core_path.group(1) / 'src/bottom_bar.rs').read_text()
+bar_height = re.search(r'^pub const BAR_HEIGHT: f32 = ([0-9.]+);', bottom_bar, re.MULTILINE)
+assert bar_height is not None, 'jterm_core bottom_bar::BAR_HEIGHT must stay a literal f32'
+for constant in ['TAB_BAR_H', 'TAB_BAR_PADDING', 'STATUS_BAR_H']:
+    code += re.search(r'const ' + constant + r': f32 = [^;]+;', main).group().replace(
+        'jterm_core::bottom_bar::BAR_HEIGHT', bar_height.group(1)) + '\n'
 code += function(main, 'chrome_height') + '\n' + function(main, 'terminal_height_after_chrome')
 code += '''
 #[test]
@@ -92,7 +101,7 @@ fn independent_fonts_reserve_actual_chrome_in_all_content_modes() {
             for bottom in [false, true] {
                 for height in [0.0, 100.0, 800.0] {
                     let actual = terminal_height_after_chrome(height, content, chrome, bottom, 64.0, 88.0);
-                    let top = ui_typography::row_height(chrome, TAB_BAR_H, 14.0);
+                    let top = ui_typography::row_height(chrome, TAB_BAR_H, TAB_BAR_PADDING);
                     let status = if bottom { ui_typography::row_height(content, STATUS_BAR_H, 4.0) } else { 0.0 };
                     assert_eq!(actual, (height - top - status - 64.0 - 88.0).max(0.0));
                 }
@@ -111,6 +120,7 @@ version = "0.0.0"
 edition = "2021"
 [dependencies]
 iced_core = "=0.14.0"
+iced_widget = { version = "=0.14.2", default-features = false }
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
 ''')
