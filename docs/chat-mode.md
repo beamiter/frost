@@ -48,6 +48,12 @@ settings retain their existing meaning; Chat adds no separate history or logs.
 
 ## Continuous transcript canvas
 
+Completed successful Block history shares the underlying canvas instead of
+painting a permanent card fill and border. Hover, selection, failures,
+background jobs and live input keep their existing semantic emphasis, but
+without floating shadows. These are paint-only changes: text insets, row
+heights, pointer regions and Chat's command/composer silhouettes are unchanged.
+
 Block and Chat history retain a session-owned, fractional scroll position.
 Short history starts at the top and grows downward; spare space stays below
 the transcript and above Chat's fixed composer.
@@ -60,6 +66,9 @@ mouse wheels and **Go live** move on the display frame clock. Streaming output
 retargets the existing motion while following live. Scrolling or selecting
 history pauses that following, so later output preserves the same raw or
 synthetic reading anchor and its fractional position.
+Resizing a pane retains that within-row reading position and does not silently
+resume following when the reader is less than one row above the tail. Layout
+changes discard old wheel destinations; panes already following remain live.
 
 The renderer materializes only the viewport plus one real history margin row.
 It changes that materialization only at row boundaries or source updates;

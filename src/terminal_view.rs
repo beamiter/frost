@@ -20,7 +20,7 @@ use iced::advanced::{Clipboard, Shell};
 use iced::mouse;
 use iced::{
     border, Background, Border, Color, Element, Event, Length, Pixels, Point, Rectangle, Shadow,
-    Size, Vector,
+    Size,
 };
 
 /// Same-frame native body identity. It contains no terminal text or policy.
@@ -713,26 +713,13 @@ fn block_card_visual(
             BlockCardKind::Failed => (alpha(stripe, 0.11), alpha(foreground, 0.08), 1.0),
             BlockCardKind::Background => (alpha(accent, 0.07), alpha(accent, 0.24), 1.0),
             BlockCardKind::Active => (alpha(accent, 0.035), alpha(accent, 0.32), 1.0),
-            BlockCardKind::Finished | BlockCardKind::Unknown => {
-                (alpha(foreground, 0.03), alpha(foreground, 0.08), 1.0)
-            }
+            BlockCardKind::Finished => (Color::TRANSPARENT, Color::TRANSPARENT, 0.0),
+            BlockCardKind::Unknown => (alpha(foreground, 0.03), alpha(foreground, 0.08), 1.0),
         }
     };
-    let shadow = if segment.kind == BlockCardKind::Active {
-        Shadow {
-            color: alpha(Color::BLACK, 0.18 * opacity),
-            offset: Vector::new(0.0, 2.0),
-            blur_radius: 8.0,
-        }
-    } else if hovered {
-        Shadow {
-            color: alpha(Color::BLACK, 0.22 * opacity),
-            offset: Vector::new(0.0, 4.0),
-            blur_radius: 14.0,
-        }
-    } else {
-        Shadow::default()
-    };
+    // Live/hover state remains legible through tint and borders, without
+    // floating shadows separating command output from the shared canvas.
+    let shadow = Shadow::default();
     BlockCardVisual {
         background: alpha(background, opacity),
         border,
@@ -3460,7 +3447,7 @@ mod tests {
         active_segment.stripe = Some(accent);
         let active = block_card_visual(active_segment, fg, accent, false, 1.0);
         assert!((active.border.a - 0.32).abs() < f32::EPSILON);
-        assert!(active.shadow.blur_radius > 0.0);
+        assert_eq!(active.shadow.blur_radius, 0.0);
 
         failed_segment.selected = true;
         failed_segment.selection_active = true;
@@ -3472,12 +3459,34 @@ mod tests {
             (accent.r, accent.b)
         );
 
-        assert!(block_card_shadow(segment(true, true), active.shadow).blur_radius > 0.0);
+        assert_eq!(
+            block_card_shadow(segment(true, true), active.shadow).blur_radius,
+            0.0
+        );
         assert_eq!(
             block_card_shadow(segment(false, true), active.shadow).blur_radius,
             0.0,
             "viewport clipping must not manufacture a horizontal shadow cap"
         );
+    }
+
+    #[test]
+    fn completed_history_is_flat_but_interaction_states_remain_visible() {
+        let fg = Color::WHITE;
+        let accent = Color::from_rgb(0.2, 0.5, 0.9);
+        let mut history = segment(true, true);
+        history.kind = BlockCardKind::Finished;
+        let resting = block_card_visual(history, fg, accent, false, 1.0);
+        assert_eq!(resting.background.a, 0.0);
+        assert_eq!(resting.border_width, 0.0);
+        let hovered = block_card_visual(history, fg, accent, true, 1.0);
+        assert!(hovered.background.a > 0.0);
+        assert!(hovered.border_width > 0.0);
+        assert_eq!(hovered.shadow.blur_radius, 0.0);
+        history.selected = true;
+        let selected = block_card_visual(history, fg, accent, false, 1.0);
+        assert!(selected.background.a > 0.0);
+        assert!(selected.border.a > 0.0);
     }
 
     #[test]

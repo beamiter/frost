@@ -69,15 +69,23 @@ impl TranscriptCanvas {
         self.motion
             .set_bounds(0.0, extent.max(self.extent) as f64 * ROW);
         if reset {
-            let retain_fraction =
-                self.parked && !self.following && self.viewport_rows == viewport_rows;
+            // Resize and parked prompt transitions retain the reader's exact
+            // sub-row anchor. A zero whole-row anchor is not proof that the
+            // reader wants to follow: they may be only a fraction above live.
+            let retain_owner = self.enabled || self.parked;
+            let retain_fraction = retain_owner && !self.following;
             let fraction = if retain_fraction {
                 f64::from(self.fraction())
             } else {
                 0.0
             };
-            self.motion.jump_to((anchored_row as f64 + fraction) * ROW);
-            if !retain_fraction {
+            let position = if retain_owner && self.following {
+                0.0
+            } else {
+                anchored_row as f64 + fraction
+            };
+            self.motion.jump_to(position * ROW);
+            if !retain_owner {
                 self.following = anchored_row == 0;
             }
         } else if self.following {
@@ -230,6 +238,45 @@ mod tests {
         assert_eq!(canvas.row(), 0);
         assert_eq!(canvas.fraction(), 0.125);
         assert!(!canvas.following());
+        assert!(!canvas.animating());
+    }
+
+    #[test]
+    fn resize_preserves_subrow_reader_without_reenabling_follow() {
+        let mut canvas = TranscriptCanvas::default();
+        canvas.reconcile(0, 100, 25);
+        canvas.scroll(0.375, true, Instant::now());
+        canvas.applied(0);
+        canvas.reconcile(0, 95, 30);
+        assert_eq!(canvas.position_rows(), 0.375);
+        assert!(!canvas.following());
+        assert!(!canvas.animating());
+        canvas.reconcile(5, 100, 30);
+        assert_eq!(canvas.position_rows(), 5.375);
+    }
+
+    #[test]
+    fn resize_rebases_reader_and_retires_old_wheel_destination() {
+        let mut canvas = TranscriptCanvas::default();
+        canvas.reconcile(7, 100, 25);
+        canvas.scroll(0.375, true, Instant::now());
+        canvas.scroll(3.0, false, Instant::now());
+        assert!(canvas.animating());
+        canvas.reconcile(10, 103, 30);
+        assert_eq!(canvas.position_rows(), 10.375);
+        assert!(!canvas.animating());
+        assert!(!canvas.following());
+    }
+
+    #[test]
+    fn resize_keeps_live_follow_ownership_during_streaming_animation() {
+        let mut canvas = TranscriptCanvas::default();
+        canvas.reconcile(0, 100, 25);
+        canvas.reconcile(0, 105, 25);
+        assert!(canvas.animating());
+        canvas.reconcile(5, 100, 30);
+        assert_eq!(canvas.position_rows(), 0.0);
+        assert!(canvas.following());
         assert!(!canvas.animating());
     }
 
