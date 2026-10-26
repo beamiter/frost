@@ -204,6 +204,7 @@ fn viewport(
     let m = terminal.materialize_projection_plan(plan, offset, rows, plan.cols);
     let (spans, row_index) = TerminalState::projection_indexes(&m.provenance);
     ProjectedViewport {
+        canvas_head: false,
         cells: m.cells.into(),
         row_wrapped: m.row_wrapped.into(),
         row_kinds: m.row_kinds.into(),

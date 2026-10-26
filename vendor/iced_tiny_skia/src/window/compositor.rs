@@ -14,10 +14,7 @@ pub struct Compositor {
 }
 
 pub struct Surface {
-    window: softbuffer::Surface<
-        Box<dyn compositor::Display>,
-        Box<dyn compositor::Window>,
-    >,
+    window: softbuffer::Surface<Box<dyn compositor::Display>, Box<dyn compositor::Window>>,
     clip_mask: tiny_skia::Mask,
     layer_stack: VecDeque<Vec<Layer>>,
     background_color: Color,
@@ -36,9 +33,7 @@ impl crate::graphics::Compositor for Compositor {
         backend: Option<&str>,
     ) -> Result<Self, Error> {
         match backend {
-            None | Some("tiny-skia") | Some("tiny_skia") => {
-                Ok(new(settings.into(), display))
-            }
+            None | Some("tiny-skia") | Some("tiny_skia") => Ok(new(settings.into(), display)),
             Some(backend) => Err(Error::GraphicsAdapterNotFound {
                 backend: "tiny-skia",
                 reason: error::Reason::DidNotMatch {
@@ -49,10 +44,7 @@ impl crate::graphics::Compositor for Compositor {
     }
 
     fn create_renderer(&self) -> Self::Renderer {
-        Renderer::new(
-            self.settings.default_font,
-            self.settings.default_text_size,
-        )
+        Renderer::new(self.settings.default_font, self.settings.default_text_size)
     }
 
     fn create_surface<W: compositor::Window + Clone>(
@@ -61,11 +53,8 @@ impl crate::graphics::Compositor for Compositor {
         width: u32,
         height: u32,
     ) -> Self::Surface {
-        let window = softbuffer::Surface::new(
-            &self.context,
-            Box::new(window.clone()) as _,
-        )
-        .expect("Create softbuffer surface for window");
+        let window = softbuffer::Surface::new(&self.context, Box::new(window.clone()) as _)
+            .expect("Create softbuffer surface for window");
 
         let mut surface = Surface {
             window,
@@ -82,12 +71,7 @@ impl crate::graphics::Compositor for Compositor {
         surface
     }
 
-    fn configure_surface(
-        &mut self,
-        surface: &mut Self::Surface,
-        width: u32,
-        height: u32,
-    ) {
+    fn configure_surface(&mut self, surface: &mut Self::Surface, width: u32, height: u32) {
         surface
             .window
             .resize(
@@ -96,8 +80,7 @@ impl crate::graphics::Compositor for Compositor {
             )
             .expect("Resize surface");
 
-        surface.clip_mask =
-            tiny_skia::Mask::new(width, height).expect("Create clip mask");
+        surface.clip_mask = tiny_skia::Mask::new(width, height).expect("Create clip mask");
         surface.layer_stack.clear();
     }
 
@@ -135,13 +118,10 @@ impl crate::graphics::Compositor for Compositor {
     }
 }
 
-pub fn new(
-    settings: Settings,
-    display: impl compositor::Display,
-) -> Compositor {
+pub fn new(settings: Settings, display: impl compositor::Display) -> Compositor {
     #[allow(unsafe_code)]
-    let context = softbuffer::Context::new(Box::new(display) as _)
-        .expect("Create softbuffer context");
+    let context =
+        softbuffer::Context::new(Box::new(display) as _).expect("Create softbuffer context");
 
     Compositor { context, settings }
 }
@@ -194,10 +174,10 @@ pub fn present(
         surface.layer_stack.push_front(renderer.layers().to_vec());
         surface.background_color = background_color;
 
-        let damage = damage::group(
+        let damage = limit_damage_regions(damage::group(
             damage,
             Rectangle::with_size(viewport.logical_size()),
-        );
+        ));
 
         let mut pixels = tiny_skia::PixmapMut::from_bytes(
             bytemuck::cast_slice_mut(&mut buffer),
@@ -219,6 +199,25 @@ pub fn present(
     buffer.present().map_err(|_| compositor::SurfaceError::Lost)
 }
 
+/// Every damage rectangle replays the intersecting layer stack. Fractional
+/// transcript movement can fragment a small viewport into hundreds of glyph
+/// regions, making partial repaint much slower than one complete canvas pass.
+/// A union is a conservative repaint superset; compositing and clipping stay
+/// identical. Ordinary sparse cursor/editor damage retains its small regions.
+fn limit_damage_regions(damage: Vec<Rectangle>) -> Vec<Rectangle> {
+    // A native partial pass costs several milliseconds even for a small strip:
+    // keep the software frame budget bounded while retaining sparse carets.
+    const MAX_REGIONS: usize = 4;
+    if damage.len() <= MAX_REGIONS {
+        return damage;
+    }
+    damage
+        .into_iter()
+        .reduce(|union, region| union.union(&region))
+        .into_iter()
+        .collect()
+}
+
 pub fn screenshot(
     renderer: &mut Renderer,
     viewport: &Viewport,
@@ -226,11 +225,9 @@ pub fn screenshot(
 ) -> Vec<u8> {
     let size = viewport.physical_size();
 
-    let mut offscreen_buffer: Vec<u32> =
-        vec![0; size.width as usize * size.height as usize];
+    let mut offscreen_buffer: Vec<u32> = vec![0; size.width as usize * size.height as usize];
 
-    let mut clip_mask = tiny_skia::Mask::new(size.width, size.height)
-        .expect("Create clip mask");
+    let mut clip_mask = tiny_skia::Mask::new(size.width, size.height).expect("Create clip mask");
 
     renderer.draw(
         &mut tiny_skia::PixmapMut::from_bytes(
@@ -265,4 +262,127 @@ pub fn screenshot(
             acc
         },
     )
+}
+
+#[cfg(test)]
+mod damage_tests {
+    use super::*;
+    use crate::core::renderer::Quad;
+    use crate::core::{Background, Font, Pixels, Point, Renderer as _};
+
+    #[test]
+    fn excessive_damage_keeps_every_pixel_inside_a_bounded_union() {
+        let bounds = Rectangle::with_size(Size::new(10_000.0, 10_000.0));
+        let input: Vec<_> = (0..5)
+            .map(|index| Rectangle {
+                x: index as f32 * 400.0,
+                y: index as f32 * 400.0,
+                width: 10.0,
+                height: 10.0,
+            })
+            .collect();
+        let grouped = damage::group(input.clone(), bounds);
+        assert!(
+            grouped.len() > 4,
+            "fixture must reproduce fragmented scrolling damage"
+        );
+        let output = limit_damage_regions(grouped);
+        assert_eq!(output.len(), 1);
+        assert!(output[0].is_within(&bounds));
+        assert!(input.iter().all(|region| region.is_within(&output[0])));
+    }
+
+    #[test]
+    fn sparse_cursor_damage_is_unchanged() {
+        let regions = vec![
+            Rectangle::new(Point::new(2.0, 3.0), Size::new(1.0, 16.0)),
+            Rectangle::new(Point::new(900.0, 600.0), Size::new(2.0, 16.0)),
+        ];
+        assert_eq!(limit_damage_regions(regions.clone()), regions);
+        assert!(limit_damage_regions(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn merged_damage_is_pixel_identical_with_layer_clipping_and_alpha() {
+        let size = Size::new(64, 64);
+        let bounds = Rectangle::with_size(Size::new(64.0, 64.0));
+        let viewport = Viewport::with_physical_size(size, 1.0);
+        let background = Color::from_rgb(0.08, 0.12, 0.20);
+        let regions: Vec<_> = (0..25)
+            .map(|index| Rectangle {
+                x: 2.0 + (index % 5) as f32 * 11.0,
+                y: 3.0 + (index / 5) as f32 * 11.0,
+                width: 8.0,
+                height: 8.0,
+            })
+            .collect();
+        let mut renderer = Renderer::new(Font::MONOSPACE, Pixels(14.0));
+        renderer.reset(bounds);
+        let mut base = vec![0; 64 * 64 * 4];
+        let mut mask = tiny_skia::Mask::new(64, 64).unwrap();
+        renderer.draw(
+            &mut tiny_skia::PixmapMut::from_bytes(&mut base, 64, 64).unwrap(),
+            &mut mask,
+            &viewport,
+            &[bounds],
+            background,
+        );
+        // Two independent clips represent a scrolling history and fixed dock.
+        for clip in [
+            Rectangle {
+                height: 32.0,
+                ..bounds
+            },
+            Rectangle {
+                y: 32.0,
+                height: 32.0,
+                ..bounds
+            },
+        ] {
+            renderer.with_layer(clip, |renderer| {
+                for region in &regions {
+                    renderer.fill_quad(
+                        Quad {
+                            bounds: *region,
+                            border: crate::core::Border {
+                                radius: 3.0.into(),
+                                ..crate::core::Border::default()
+                            },
+                            ..Quad::default()
+                        },
+                        Background::Color(Color::from_rgba(0.85, 0.2, 0.7, 0.55)),
+                    );
+                }
+            });
+        }
+        let mut fragmented = base.clone();
+        renderer.draw(
+            &mut tiny_skia::PixmapMut::from_bytes(&mut fragmented, 64, 64).unwrap(),
+            &mut mask,
+            &viewport,
+            &regions,
+            background,
+        );
+        let mut merged = base.clone();
+        renderer.draw(
+            &mut tiny_skia::PixmapMut::from_bytes(&mut merged, 64, 64).unwrap(),
+            &mut mask,
+            &viewport,
+            &limit_damage_regions(regions),
+            background,
+        );
+        assert_eq!(fragmented, merged);
+        let mut complete = base;
+        renderer.draw(
+            &mut tiny_skia::PixmapMut::from_bytes(&mut complete, 64, 64).unwrap(),
+            &mut mask,
+            &viewport,
+            &[bounds],
+            background,
+        );
+        assert_eq!(
+            merged, complete,
+            "conservative partial repaint must equal a full repaint"
+        );
+    }
 }

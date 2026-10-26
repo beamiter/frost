@@ -56,11 +56,29 @@ impl TerminalState {
     }
 
     pub(super) fn chat_plan_key(&self, policy: &ProjectionPolicy) -> Option<ChatPlanKey> {
-        if !policy.chat {
+        if !policy.chat || self.use_alt_buffer {
             return None;
         }
         let surface = self.chat_surface();
-        if !matches!(surface, ChatSurface::Prompt | ChatSurface::Running) {
+        // Paint authority is broader than input authority. A shell may split
+        // D, A and B across reads, and accepted Enter precedes C. Keep its
+        // proven transcript/composer geometry through those ordinary gaps;
+        // chat_surface still independently disables Submit and native input
+        // affordances until their real parser boundary arrives.
+        let completed_start = matches!(self.current_zone_state, ZoneState::Idle)
+            .then(|| self.command_zones.back())
+            .flatten()
+            .filter(|zone| {
+                !zone.rows_evicted
+                    && zone.start_mark_seen
+                    && zone.completion_provenance
+                        == crate::block_mode::CompletionProvenance::ShellReported
+            })
+            .map(|zone| zone.prompt_start);
+        if !matches!(surface, ChatSurface::Prompt | ChatSurface::Running)
+            && self.live_prompt_row().is_none()
+            && completed_start.is_none()
+        {
             return None;
         }
         // Primary-screen TUIs also own the native geometry. Their mouse/image
@@ -77,10 +95,7 @@ impl TerminalState {
             }
         }
         let total = self.scrollback.len() + self.grid.rows();
-        let prompt = surface
-            .composer_docked()
-            .then(|| self.live_prompt_row())
-            .flatten();
+        let prompt = self.live_prompt_row();
         if prompt.is_some_and(|start| {
             self.raw_row_id_at_absolute(start)
                 .is_none_or(|row| !self.spacing_prompt_rows.contains(&row))
@@ -88,7 +103,10 @@ impl TerminalState {
             return None;
         }
 
-        let keep_end = if let Some(start) = prompt.or_else(|| self.running_zone_start()) {
+        let keep_end = if let Some(start) = prompt
+            .or_else(|| self.running_zone_start())
+            .or(completed_start)
+        {
             let occupied = self
                 .grid
                 .iter()
@@ -857,15 +875,14 @@ mod tests {
         terminal.process_batch(b"\r\n\x1b]133;D;0\x07");
         let between = snapshot(&mut terminal, &mut state);
         assert_eq!(terminal.chat_surface(), ChatSurface::Passthrough);
-        assert!(between.chat_rows().is_empty());
+        assert_eq!(between.mode(), ProjectionMode::Transformed);
+        assert!(!between.chat_rows().is_empty());
         assert_eq!(
             first_raw(&between),
             anchor,
-            "D-only fallback must not jump to the live grid"
+            "D-only completion must retain the same rendered transcript"
         );
         let parked_offset = terminal.scroll_offset;
-        assert!(parked_offset > 0);
-        assert!(!terminal.is_cursor_visible());
         let cursor_origin = |terminal: &TerminalState| {
             let (row, col) = terminal.get_cursor_pos();
             terminal
@@ -874,8 +891,10 @@ mod tests {
         };
         assert!(between.raw_to_view(cursor_origin(&terminal)).is_none());
         assert!(!terminal.is_mapped_cursor_visible(&between, false));
-        // Even a supplied mapping cannot override native scrollback visibility.
-        assert!(!terminal.is_mapped_cursor_visible(&between, true));
+        // The actual cursor is absent from this historical viewport. Its
+        // visibility is controlled by the projection, without moving the
+        // native terminal's independent scroll coordinate during a shell gap.
+        assert!(between.scroll_offset() > 0);
 
         prompt(&mut terminal);
         let restored = snapshot(&mut terminal, &mut state);
@@ -883,7 +902,6 @@ mod tests {
         let mapped = restored.raw_to_view(cursor_origin(&terminal)).unwrap();
         assert_eq!(restored.chat_rows()[mapped.row].role, ChatRole::Composer);
         assert_eq!(terminal.scroll_offset, parked_offset);
-        assert!(!terminal.is_cursor_visible(), "native gate remains parked");
         assert!(terminal.is_mapped_cursor_visible(&restored, true));
         assert!(!terminal.is_mapped_cursor_visible(&restored, false));
 

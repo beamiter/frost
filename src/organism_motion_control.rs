@@ -42,20 +42,37 @@ impl MotionControl {
         self.source
     }
 
+    pub fn system_reduced(&self) -> bool {
+        self.observed == SystemMotion::Reduce
+    }
+
     pub fn subscription_epoch(&self) -> Option<u64> {
         self.active.then_some(self.epoch)
     }
 
     /// A configured choice is supplied by the existing config owner. System
     /// events cannot call this method or write that persisted configuration.
+    #[cfg(test)]
     pub fn reconcile(
         &mut self,
         configured: Option<Motion>,
         relevant: bool,
         foreground_resume: bool,
     ) -> Option<Transition> {
+        self.reconcile_with_canvas(configured, relevant, foreground_resume, false)
+    }
+
+    /// The transcript shares the same desktop preference connection, including
+    /// when the companion is hidden or its motion is explicitly configured.
+    pub fn reconcile_with_canvas(
+        &mut self,
+        configured: Option<Motion>,
+        relevant: bool,
+        foreground_resume: bool,
+        canvas: bool,
+    ) -> Option<Transition> {
         let previous = self.resolution().effective;
-        let wanted = configured.is_none() && relevant && !self.exhausted;
+        let wanted = ((configured.is_none() && relevant) || canvas) && !self.exhausted;
         if self.configured != configured || self.active != wanted || (foreground_resume && wanted) {
             self.configured = configured;
             self.sequence = 0;
@@ -101,6 +118,19 @@ impl MotionControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canvas_observes_desktop_motion_with_hidden_or_explicit_companion() {
+        let mut control = MotionControl::default();
+        control.reconcile_with_canvas(Some(Motion::Full), false, false, true);
+        assert!(control.subscription_epoch().is_some());
+        let reduced = event(&control, 1, SystemMotion::Reduce);
+        control.observe(reduced);
+        assert!(control.system_reduced());
+        assert_eq!(control.resolution().effective, Motion::Full);
+        control.reconcile_with_canvas(Some(Motion::Full), false, false, false);
+        assert!(control.subscription_epoch().is_none());
+    }
 
     fn event(control: &MotionControl, sequence: u64, observed: SystemMotion) -> Event {
         Event {

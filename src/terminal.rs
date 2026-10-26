@@ -2315,6 +2315,10 @@ impl ProjectionPolicy {
         true
     }
 
+    pub fn is_chat(&self) -> bool {
+        self.chat
+    }
+
     pub fn set_block_spacing(&mut self, enabled: bool) -> bool {
         if self.block_spacing == enabled {
             return false;
@@ -2424,7 +2428,14 @@ pub struct ProjectedViewport {
     plan_revision: u64,
     chat_rows: std::sync::Arc<Vec<crate::chat_mode::ChatRow>>,
     document_row_map: std::sync::Arc<Vec<Option<usize>>>,
+    /// One retained row above the logical viewport for fractional canvas motion.
+    /// Its provenance is real, but it does not increase the viewport capacity.
+    canvas_head: bool,
 }
+
+#[cfg(test)]
+#[path = "terminal/canvas_tests.rs"]
+mod canvas_tests;
 
 #[allow(dead_code)] // Transformed accessors are consumed by the P1 UI wiring slice.
 impl ProjectedViewport {
@@ -2591,7 +2602,15 @@ impl ProjectedViewport {
     }
 
     pub fn max_scroll_offset(&self) -> usize {
-        self.document_rows.saturating_sub(self.cells.len())
+        self.document_rows.saturating_sub(
+            self.cells
+                .len()
+                .saturating_sub(usize::from(self.canvas_head)),
+        )
+    }
+
+    pub fn has_canvas_head(&self) -> bool {
+        self.canvas_head
     }
 
     pub fn effective_collapsed(&self) -> &BTreeSet<u64> {
@@ -11258,7 +11277,12 @@ impl TerminalState {
                 })
             })
             .collect();
-        if policy.organism_rows > 0 {
+        if policy.organism_rows == 0 {
+            // Reserve the same header while the prompt is being edited and
+            // while its command runs. Completion fills this existing row;
+            // inserting it only at D would move already-painted output down.
+            // The next zone id is not an actionable finished capability until
+            // that exact zone has actually been retained by the terminal.
             if let Some(next) = self
                 .running_zone_start()
                 .or_else(|| self.live_prompt_row())
@@ -11266,10 +11290,22 @@ impl TerminalState {
             {
                 boundaries.push(ChromeBoundary {
                     next,
-                    kind: ChromeKind::Organism,
-                    rows: policy.organism_rows,
+                    kind: ChromeKind::Header {
+                        zone_id: self.next_zone_id,
+                    },
+                    rows: 1,
                 });
             }
+        } else if let Some(next) = self
+            .running_zone_start()
+            .or_else(|| self.live_prompt_row())
+            .and_then(|start| standalone(start, false))
+        {
+            boundaries.push(ChromeBoundary {
+                next,
+                kind: ChromeKind::Organism,
+                rows: policy.organism_rows,
+            });
         }
         // Shared-row lifecycle boundaries are ambiguous; no chrome may claim them.
         let mut counts = BTreeMap::new();
@@ -11929,6 +11965,7 @@ impl TerminalState {
             self.next_projected_view_revision = view_revision.checked_add(1).unwrap_or(0);
         }
         let viewport = std::sync::Arc::new(ProjectedViewport {
+            canvas_head: false,
             chat_rows: std::sync::Arc::new(Vec::new()),
             document_row_map: std::sync::Arc::new(Vec::new()),
             row_kinds: std::sync::Arc::new(vec![ProjectedRowKind::Raw; cells.len()]),
@@ -11969,16 +12006,42 @@ impl TerminalState {
         rows: usize,
         cols: usize,
     ) -> MaterializedProjection {
+        self.materialize_projection_plan_with_margin(
+            plan,
+            requested_scroll_offset,
+            rows,
+            cols,
+            false,
+        )
+    }
+
+    fn materialize_projection_plan_with_margin(
+        &self,
+        plan: &ProjectionPlan,
+        requested_scroll_offset: usize,
+        rows: usize,
+        cols: usize,
+        canvas_head: bool,
+    ) -> MaterializedProjection {
         let scroll_offset = requested_scroll_offset.min(plan.rows.len().saturating_sub(rows));
         let dock_start = plan.chat_dock_start.unwrap_or(plan.rows.len());
         let dock_rows = plan.rows.len().saturating_sub(dock_start).min(rows);
+        let rows = rows.saturating_add(usize::from(canvas_head));
         let history_capacity = rows.saturating_sub(dock_rows);
         let visible_end = dock_start.saturating_sub(scroll_offset);
         let visible_start = visible_end.saturating_sub(history_capacity);
-        let visible_indices: Vec<_> = (visible_start..visible_end)
-            .chain(dock_start..plan.rows.len())
-            .collect();
-        let top_padding = rows.saturating_sub(visible_indices.len());
+        // A short transcript grows down from a stable canvas origin. Free
+        // space belongs after history (before the fixed Chat composer), not
+        // above every completed block. Only the absent overscan row precedes
+        // content when the document is at its beginning.
+        let top_padding = usize::from(canvas_head && visible_end < history_capacity);
+        let gap = rows
+            .saturating_sub(top_padding + visible_end.saturating_sub(visible_start) + dock_rows);
+        let visible_indices = (0..top_padding)
+            .map(|_| None)
+            .chain((visible_start..visible_end).map(Some))
+            .chain((0..gap).map(|_| None))
+            .chain((dock_start..plan.rows.len()).map(Some));
         let mut chat_rows = Vec::with_capacity(rows);
         let mut document_row_map = Vec::with_capacity(rows);
 
@@ -11987,17 +12050,17 @@ impl TerminalState {
         let mut row_kinds = Vec::with_capacity(rows);
         let mut row_sources = Vec::with_capacity(rows);
         let mut origin_spans = Vec::new();
-        for _ in 0..top_padding {
-            chat_rows.push(crate::chat_mode::ChatRow::default());
-            document_row_map.push(None);
-            cells.push(vec![TerminalCell::default(); cols]);
-            row_wrapped.push(false);
-            row_kinds.push(ProjectedRowKind::Padding);
-            row_sources.push(None);
-        }
-
         let mut history_cache: HashMap<usize, Vec<TerminalCell>> = HashMap::new();
         for document_row in visible_indices {
+            let Some(document_row) = document_row else {
+                chat_rows.push(crate::chat_mode::ChatRow::default());
+                document_row_map.push(None);
+                cells.push(vec![TerminalCell::default(); cols]);
+                row_wrapped.push(false);
+                row_kinds.push(ProjectedRowKind::Padding);
+                row_sources.push(None);
+                continue;
+            };
             #[cfg(test)]
             PROJECTION_MATERIALIZED_ROWS.with(|count| count.set(count.get() + 1));
             let planned = &plan.rows[document_row];
@@ -12101,11 +12164,7 @@ impl TerminalState {
             } else {
                 chat_rows
             },
-            document_row_map: if plan.chat_rows.is_empty() {
-                Vec::new()
-            } else {
-                document_row_map
-            },
+            document_row_map,
             cells,
             row_wrapped,
             row_kinds,
@@ -12208,6 +12267,7 @@ impl TerminalState {
             self.next_projected_view_revision = view_revision.checked_add(1).unwrap_or(0);
         }
         let viewport = std::sync::Arc::new(ProjectedViewport {
+            canvas_head: false,
             cells: std::sync::Arc::new(materialized.cells),
             row_wrapped: std::sync::Arc::new(materialized.row_wrapped),
             chat_rows: std::sync::Arc::new(materialized.chat_rows),
@@ -12241,6 +12301,45 @@ impl TerminalState {
         viewport
     }
 
+    /// Retain one real history row above a native Block/Chat viewport. The
+    /// dock and terminal dimensions are unchanged, and every margin cell uses
+    /// the same provenance mapping as ordinary visible rows. The session calls
+    /// this only after a source/whole-row change, never for a fractional frame.
+    pub fn canvas_viewport(
+        &mut self,
+        viewport: &std::sync::Arc<ProjectedViewport>,
+        policy: &ProjectionPolicy,
+    ) -> std::sync::Arc<ProjectedViewport> {
+        if viewport.mode != ProjectionMode::Transformed || viewport.canvas_head {
+            return std::sync::Arc::clone(viewport);
+        }
+        let cols = self.grid.row_len().max(1);
+        let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
+            return std::sync::Arc::clone(viewport);
+        };
+        let materialized = self.materialize_projection_plan_with_margin(
+            &plan,
+            viewport.scroll_offset,
+            self.grid.rows(),
+            cols,
+            true,
+        );
+        let (raw_span_index, raw_row_index) = Self::projection_indexes(&materialized.provenance);
+        let mut canvas = viewport.as_ref().clone();
+        canvas.cells = std::sync::Arc::new(materialized.cells);
+        canvas.row_wrapped = std::sync::Arc::new(materialized.row_wrapped);
+        canvas.row_kinds = std::sync::Arc::new(materialized.row_kinds);
+        canvas.chat_rows = std::sync::Arc::new(materialized.chat_rows);
+        canvas.document_row_map = std::sync::Arc::new(materialized.document_row_map);
+        canvas.provenance = std::sync::Arc::new(materialized.provenance);
+        canvas.raw_span_index = std::sync::Arc::new(raw_span_index);
+        canvas.raw_row_index = std::sync::Arc::new(raw_row_index);
+        canvas.document_start = materialized.document_start;
+        canvas.top_padding = materialized.top_padding;
+        canvas.canvas_head = true;
+        std::sync::Arc::new(canvas)
+    }
+
     /// Enter projected-document coordinates. Raw selections cannot describe
     /// a transformed document. A projected selection survives ordinary cell
     /// updates and viewport scrolling only while its exact plan is retained.
@@ -12257,7 +12356,7 @@ impl TerminalState {
     }
 
     fn projected_top_anchor(viewport: &ProjectedViewport) -> Option<ProjectedTopAnchor> {
-        let view_row = viewport.top_padding;
+        let view_row = viewport.top_padding.max(usize::from(viewport.canvas_head));
         match viewport.row_kinds.get(view_row).copied()? {
             ProjectedRowKind::Padding => None,
             ProjectedRowKind::BlockChrome { boundary, line } => {
@@ -16950,13 +17049,24 @@ mod tests {
         let plan = terminal.identity_projection_plan(6);
         let materialized = terminal.materialize_projection_plan(&plan, 0, 4, 6);
 
-        assert_eq!(materialized.top_padding, 2);
-        for row in &materialized.cells[..materialized.top_padding] {
+        assert_eq!(materialized.top_padding, 0, "short history is top aligned");
+        for row in &materialized.cells[2..] {
             assert!(row.iter().all(|cell| *cell == TerminalCell::default()));
         }
-        assert!(materialized.row_kinds[..materialized.top_padding]
+        assert!(materialized.row_kinds[2..]
             .iter()
             .all(|kind| *kind == super::ProjectedRowKind::Padding));
+        assert!(materialized.document_row_map[2..]
+            .iter()
+            .all(Option::is_none));
+        assert!(materialized.provenance.row_sources[2..]
+            .iter()
+            .all(Option::is_none));
+        assert!(materialized
+            .provenance
+            .origin_spans
+            .iter()
+            .all(|span| span.view_row < 2));
     }
 
     #[test]

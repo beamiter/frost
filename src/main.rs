@@ -67,6 +67,7 @@ mod terminal;
 mod terminal_ime;
 mod terminal_view;
 mod theme;
+mod transcript_canvas;
 mod ui_typography;
 mod vim9_buffer;
 mod vim9_buffer_labels;
@@ -4649,6 +4650,9 @@ fn main() -> iced::Result {
 
 #[derive(Debug, Clone)]
 enum Message {
+    TranscriptPause(usize, u64),
+    TranscriptScroll(usize, u64, f64, bool),
+    TranscriptFrame(usize, u64),
     PollShellVim,
     EmbeddedVim(usize, Box<vim9_ide::Message>),
     OpenVim9Ide,
@@ -5295,6 +5299,7 @@ struct Session {
     /// companion view state owns scrolling only while a transform is active.
     projection_policy: ProjectionPolicy,
     projection_view_state: ProjectionViewState,
+    transcript_canvas: transcript_canvas::TranscriptCanvas,
     cursor: (usize, usize),
     cursor_visible: bool,
     /// Cached working directory, refreshed periodically so the status bar can
@@ -5775,6 +5780,7 @@ impl Session {
             projection_block_mode: config.is_card_mode(),
             projection_policy,
             projection_view_state,
+            transcript_canvas: transcript_canvas::TranscriptCanvas::default(),
             cursor,
             cursor_visible,
             cwd_cache: None,
@@ -5927,8 +5933,19 @@ impl Session {
     }
 
     fn refresh(&mut self) {
-        if self.block_selection.is_empty() {
+        if !self.block_selection.is_empty() || self.terminal.has_text_selection() {
+            self.transcript_canvas.cancel();
+        }
+        if self.transcript_canvas.following() && self.block_selection.is_empty() {
+            self.projection_view_state.scroll_to_bottom();
+        }
+        if self.block_selection.is_empty()
+            && (!self.transcript_canvas.enabled() || self.transcript_canvas.following())
+        {
             self.projection_view_state.release_reading_position();
+        } else if self.transcript_canvas.enabled() && !self.transcript_canvas.following() {
+            self.projection_view_state
+                .hold_reading_position(&self.projection);
         }
         // The identity/P0 hot path must not allocate or scan every retained
         // zone on each PTY batch. Reconcile only after a transform exists.
@@ -5966,9 +5983,42 @@ impl Session {
         }
         if self.projection.scroll_offset() == 0
             && self.block_selection.is_empty()
+            && (!self.transcript_canvas.enabled() || self.transcript_canvas.following())
             && !self.terminal.is_alt_buffer_active()
         {
             self.block_reading.seen_through = self.terminal.command_zones.back().map(|z| z.id);
+        }
+        if self.projection_block_mode
+            && self.projection.mode() == terminal::ProjectionMode::Transformed
+            && !self.terminal.is_alt_buffer_active()
+        {
+            self.transcript_canvas.reconcile(
+                self.projection.scroll_offset(),
+                self.projection.max_scroll_offset(),
+                self.terminal.grid.rows(),
+            );
+            let row = self.transcript_canvas.row();
+            if row != self.projection.scroll_offset() {
+                self.projection_view_state.set_offset(row, &self.projection);
+                self.projection = self.terminal.get_projected_viewport_with_state(
+                    true,
+                    &self.projection_policy,
+                    &mut self.projection_view_state,
+                );
+            }
+            self.transcript_canvas
+                .applied(self.projection.scroll_offset());
+            self.projection = self
+                .terminal
+                .canvas_viewport(&self.projection, &self.projection_policy);
+        } else if self.projection_block_mode
+            && self.projection_policy.is_chat()
+            && !self.terminal.is_alt_buffer_active()
+            && self.terminal.chat_surface() == chat_mode::ChatSurface::Passthrough
+        {
+            self.transcript_canvas.park();
+        } else {
+            self.transcript_canvas.disable();
         }
         let raw_cursor = self.terminal.get_cursor_pos();
         if self.projection.mode() == terminal::ProjectionMode::Transformed {
@@ -5996,6 +6046,12 @@ impl Session {
         } else {
             self.terminal.scroll(lines);
         }
+        let row = if self.projection.mode() == terminal::ProjectionMode::Transformed {
+            self.projection_view_state.offset_from_bottom()
+        } else {
+            self.terminal.scroll_offset
+        };
+        self.transcript_canvas.navigate(row);
         self.refresh();
     }
 
@@ -6007,10 +6063,13 @@ impl Session {
         } else {
             self.terminal.set_scroll_offset(offset);
         }
+        self.transcript_canvas
+            .navigate(offset.min(self.projection.max_scroll_offset()));
         self.refresh();
     }
 
     fn scroll_to_bottom(&mut self) {
+        self.transcript_canvas.navigate(0);
         self.terminal.scroll_to_bottom();
         self.projection_view_state.scroll_to_bottom();
         self.refresh();
@@ -6081,6 +6140,8 @@ impl Session {
                     origin,
                 );
                 if moved {
+                    self.transcript_canvas
+                        .navigate(self.projection_view_state.offset_from_bottom());
                     self.refresh();
                 }
                 moved
@@ -6110,6 +6171,8 @@ impl Session {
                     origin,
                 );
                 if revealed {
+                    self.transcript_canvas
+                        .navigate(self.projection_view_state.offset_from_bottom());
                     self.refresh();
                 }
                 revealed
@@ -7361,11 +7424,12 @@ impl Frost {
         app.sync_organism_motion(false);
         app.sync_organism_attention_owner();
         app.sync_theme_colors();
-        // The startup banner occupies real layout space even for a single pane.
-        if app.startup_recovery.visible() {
-            let term_w = (app.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
-            (app.cols, app.rows) = app.metrics.grid_size(term_w, app.term_height());
-        }
+        // Size the native grid from the real initial window and chrome before
+        // the first frame. A window manager need not send a later resize when
+        // the configured size already matches; keeping the bootstrap 100x30
+        // grid would leave the Chat composer floating above unused tab space.
+        let term_w = (app.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
+        (app.cols, app.rows) = app.metrics.grid_size(term_w, app.term_height());
         app.relayout();
         // The file tree carries a snapshot of the configured remote hosts.
         app.sidebar.set_hosts(app.config.remote_hosts.clone());
@@ -11112,6 +11176,7 @@ impl Frost {
                 // A PTY-bound keystroke dismisses the block selection.
                 sess.block_selection.clear();
                 sess.terminal.scroll_to_bottom();
+                sess.transcript_canvas.navigate(0);
                 sess.projection_view_state.scroll_to_bottom();
                 if sess.write_pty(bytes)
                     && !sess.managed_remote
@@ -13358,6 +13423,7 @@ impl Frost {
                         // Preserve the same selection, scrolling and refresh effects.
                         sess.block_selection.clear();
                         sess.terminal.scroll_to_bottom();
+                        sess.transcript_canvas.navigate(0);
                         sess.projection_view_state.scroll_to_bottom();
                         let written = sess.write_pty(bytes);
                         sess.refresh();
@@ -14368,6 +14434,8 @@ impl Frost {
                         &mut sess.projection_view_state,
                         origin,
                     ) {
+                        sess.transcript_canvas
+                            .navigate(sess.projection_view_state.offset_from_bottom());
                         sess.refresh();
                     }
                 }
@@ -18615,6 +18683,7 @@ impl Frost {
                             // (any PTY-bound key, not Escape specifically).
                             sess.block_selection.clear();
                             sess.terminal.scroll_to_bottom();
+                            sess.transcript_canvas.navigate(0);
                             sess.projection_view_state.scroll_to_bottom();
                             let accepted = sess.write_pty(&bytes);
                             if accepted
@@ -18691,6 +18760,7 @@ impl Frost {
                             // as `encode_key` and the paste paths.
                             sess.block_selection.clear();
                             sess.terminal.scroll_to_bottom();
+                            sess.transcript_canvas.navigate(0);
                             sess.projection_view_state.scroll_to_bottom();
                             if sess.write_pty(text.as_bytes())
                                 && !sess.managed_remote
@@ -18742,7 +18812,79 @@ impl Frost {
                 }
                 return self.handle_summary_activation(session_id, activation);
             }
+            Message::TranscriptPause(session_id, epoch) => {
+                if epoch == self.terminal_interaction_epoch {
+                    if let Some(index) = self.session_index_by_id(session_id) {
+                        self.sessions[index].transcript_canvas.cancel();
+                    }
+                }
+            }
+            Message::TranscriptScroll(session_id, epoch, rows, precise) => {
+                if epoch != self.terminal_interaction_epoch || !self.terminal_mouse_active() {
+                    return Task::none();
+                }
+                let Some(index) = self.session_index_by_id(session_id) else {
+                    return Task::none();
+                };
+                if !self.layout().contains_session(index)
+                    || (self.pane_zoomed && index != self.active)
+                {
+                    return Task::none();
+                }
+                let speed = if precise {
+                    1.0
+                } else {
+                    self.config.scroll_speed as f64
+                };
+                let reduced = self.organism_motion_control.system_reduced();
+                let session = &mut self.sessions[index];
+                let snapped = session.transcript_canvas.set_reduced_motion(reduced);
+                let moved_row = session.transcript_canvas.scroll(
+                    rows * speed,
+                    precise,
+                    std::time::Instant::now(),
+                );
+                if moved_row || snapped {
+                    session.refresh();
+                } else if !session.transcript_canvas.following() {
+                    session
+                        .projection_view_state
+                        .hold_reading_position(&session.projection);
+                }
+                self.click_tracker.cancel();
+                self.organism.retreat();
+            }
+            Message::TranscriptFrame(session_id, epoch) => {
+                if epoch != self.terminal_interaction_epoch {
+                    return Task::none();
+                }
+                let Some(index) = self.session_index_by_id(session_id) else {
+                    return Task::none();
+                };
+                if !self.layout().contains_session(index)
+                    || (self.pane_zoomed && index != self.active)
+                {
+                    return Task::none();
+                }
+                let reduced = self.organism_motion_control.system_reduced();
+                let session = &mut self.sessions[index];
+                let snapped = session.transcript_canvas.set_reduced_motion(reduced);
+                // A software-rendered frame can spend time in the event queue.
+                // Integrate when this paint update actually runs, so queued
+                // timestamps never replay old motion or delay settling.
+                if session.transcript_canvas.advance(std::time::Instant::now()) || snapped {
+                    session.refresh();
+                }
+            }
             Message::MousePane(session_id, input) => {
+                if matches!(
+                    input,
+                    MouseInput::Press { .. } | MouseInput::ScrollTo { .. }
+                ) {
+                    if let Some(index) = self.session_index_by_id(session_id) {
+                        self.sessions[index].transcript_canvas.cancel();
+                    }
+                }
                 if matches!(input, MouseInput::Press { .. }) {
                     self.sidebar_files_focused = false;
                     self.task_panel.input_focused = false;
@@ -20051,6 +20193,7 @@ impl Frost {
                 if token.kind() == chat_mode::ControlKind::Submit {
                     sess.block_selection.clear();
                     sess.terminal.scroll_to_bottom();
+                    sess.transcript_canvas.navigate(0);
                     sess.projection_view_state.scroll_to_bottom();
                 }
                 if !sess.managed_remote
@@ -20831,7 +20974,13 @@ impl Frost {
                 self.block_review = None;
                 if let Some(sess) = self.sessions.get_mut(self.active) {
                     sess.block_selection.clear();
-                    sess.scroll_to_bottom();
+                    if sess.transcript_canvas.enabled() {
+                        sess.transcript_canvas
+                            .follow_live(std::time::Instant::now());
+                        sess.refresh();
+                    } else {
+                        sess.scroll_to_bottom();
+                    }
                 }
             }
             Message::BlockReadingMenuOpened(owner) => {
@@ -23580,7 +23729,11 @@ impl Frost {
         let font_size = self.effective_font_size();
         let compact = self.block_reading_bar_compact();
         let session_id = sess.id;
-        let reading = sess.projection.scroll_offset() > 0 || !sess.block_selection.is_empty();
+        let reading = if sess.transcript_canvas.enabled() {
+            !sess.transcript_canvas.following()
+        } else {
+            sess.projection.scroll_offset() > 0
+        } || !sess.block_selection.is_empty();
         let unseen = sess
             .block_reading
             .unseen(sess.terminal.command_zones.iter().map(|z| z.id));
@@ -24672,22 +24825,32 @@ impl Frost {
             self.organism
                 .motion_changed(Some(change.previous.into()), Some(change.effective.into()));
         }
+        let reduced = self.organism_motion_control.system_reduced();
+        for session in &mut self.sessions {
+            if session.transcript_canvas.set_reduced_motion(reduced) {
+                session.refresh();
+            }
+        }
     }
 
     fn prepare_organism_motion_config(&mut self, configured: Option<organism::Motion>) {
         let relevant = self.config.ascii_organism_enabled || self.organism_preview_visible();
-        let transition =
-            self.organism_motion_control
-                .reconcile(configured.map(Into::into), relevant, false);
+        let transition = self.organism_motion_control.reconcile_with_canvas(
+            configured.map(Into::into),
+            relevant,
+            false,
+            self.config.is_card_mode(),
+        );
         self.apply_organism_motion_transition(transition);
     }
 
     fn sync_organism_motion(&mut self, foreground_resume: bool) {
         let relevant = self.config.ascii_organism_enabled || self.organism_preview_visible();
-        let transition = self.organism_motion_control.reconcile(
+        let transition = self.organism_motion_control.reconcile_with_canvas(
             self.config.ascii_organism_motion.map(Into::into),
             relevant,
             foreground_resume,
+            self.config.is_card_mode(),
         );
         self.apply_organism_motion_transition(transition);
     }
@@ -25262,6 +25425,10 @@ impl Frost {
             sess.projection
                 .view_row_absolute(view_row)
                 .is_some_and(|row| row >= active_start && row < active_end)
+                || matches!(sess.projection.row_kinds().get(view_row),
+                    Some(terminal::ProjectedRowKind::BlockChrome { boundary, line: 0 })
+                        if matches!(boundary.kind, terminal::ChromeKind::Header { .. })
+                            && terminal.raw_row_id_at_absolute(active_start) == Some(boundary.next))
         });
         let view_row = block_mode::first_fitting_badge_row(candidates, |view_row| {
             block_mode::badge_fits(
@@ -25614,19 +25781,28 @@ impl Frost {
         // the current output/cursor row, without changing Frost's PTY or cell
         // geometry.
         if let Some((active_start, active_end)) = Self::active_zone_span(terminal) {
-            let active_top_view = terminal
+            let raw_top_view = terminal
                 .raw_row_id_at_absolute(active_start)
                 .and_then(|row| sess.projection.raw_row_view_bounds(row))
                 .map(|(first, _)| first);
+            let header_top_view = sess.projection.row_kinds().iter().position(|kind| {
+                matches!(kind, terminal::ProjectedRowKind::BlockChrome { boundary, line: 0 }
+                    if matches!(boundary.kind, terminal::ChromeKind::Header { .. })
+                        && terminal.raw_row_id_at_absolute(active_start) == Some(boundary.next))
+            });
+            let active_top_view = header_top_view.or(raw_top_view);
             let active_bottom_view = active_end
                 .checked_sub(1)
                 .and_then(|row| terminal.raw_row_id_at_absolute(row))
                 .and_then(|row| sess.projection.raw_row_view_bounds(row))
                 .map(|(_, last)| last);
             for (view_row, absolute_row) in view_absolute_rows.iter().copied().enumerate() {
-                if absolute_row.is_some_and(|row| row >= active_start && row < active_end) {
+                let header = header_top_view == Some(view_row);
+                if header || absolute_row.is_some_and(|row| row >= active_start && row < active_end)
+                {
                     let row = &mut paint[view_row];
-                    row.app_eligible = true;
+                    row.host_spacer = header;
+                    row.app_eligible = !header;
                     row.stripe = Some(accent);
                     row.card_group = Some(0);
                     row.card_kind = terminal_view::BlockCardKind::Active;
@@ -25943,6 +26119,7 @@ impl Frost {
         let organism_projection = sess.projection.key();
         let organism_block = self.organism_block_key();
         let organism_epoch = self.organism_geometry_epoch;
+        let transcript_epoch = self.terminal_interaction_epoch;
         let organism_body = (self.organism_body_owner() == Some(session_id))
             .then(|| self.organism_block_key())
             .flatten()
@@ -26009,6 +26186,15 @@ impl Frost {
                 .is_chat_mode()
                 .then_some(sess.projection.as_ref()),
             submit_token.map(Message::ChatSubmit),
+        )
+        .transcript_canvas(
+            &sess.transcript_canvas,
+            sess.projection.has_canvas_head(),
+            sess.terminal.is_mouse_enabled(),
+            move |rows, precise| {
+                Message::TranscriptScroll(session_id, transcript_epoch, rows, precise)
+            },
+            move || Message::TranscriptPause(session_id, transcript_epoch),
         )
         .organism_status(
             None,
@@ -29393,6 +29579,7 @@ impl Frost {
             return None;
         }
         sess.terminal.scroll_to_bottom();
+        sess.transcript_canvas.navigate(0);
         sess.projection_view_state.scroll_to_bottom();
         if !sess.write_agent_pty(&paste.bytes) {
             sess.terminal.disarm_agent_execution(approved.generation);
@@ -33070,6 +33257,20 @@ impl Frost {
             _ => None,
         });
         subs.push(events);
+        // Native presented-frame notifications avoid synchronous layout recursion
+        // in Widget::update. Invisible or settled panes own no frame stream.
+        for (index, session) in self.sessions.iter().enumerate() {
+            if self.layout().contains_session(index)
+                && (!self.pane_zoomed || index == self.active)
+                && session.transcript_canvas.animating()
+            {
+                subs.push(
+                    iced::window::frames()
+                        .with((session.id, self.terminal_interaction_epoch))
+                        .map(|((id, epoch), _)| Message::TranscriptFrame(id, epoch)),
+                );
+            }
+        }
         if let Some(epoch) = self.organism_motion_control.subscription_epoch() {
             subs.push(
                 organism_system_motion::subscription(epoch).map(Message::OrganismSystemMotion),

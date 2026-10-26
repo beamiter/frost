@@ -1,5 +1,61 @@
 # Engineering handoff
 
+## 2026-10-26 — continuous Block/Chat canvas
+
+- Native card transcripts keep a fractional scroll state per session. Touchpad
+  pixels move directly; wheel notches, live output growth and explicit Go live
+  use shared `CanvasMotion`. Iced's native frame subscription runs only for
+  visible moving panes, including correct zoomed-split exclusion. Frame handling
+  uses current monotonic time so queued software frames cannot replay old time;
+  a suspended tab settles old motion. Selection/presses pause following, while
+  editing, exact search navigation and scrollbar grabs retire previous motion.
+- Short history starts at a stable top origin and grows downward. Free space
+  follows history and precedes Chat's fixed composer. Block reserves the native
+  header while the command is edited/running, then fills it at completion without
+  moving existing output. Its safe blank-tail reclamation remains. Structural
+  free space uses default cell colors and has no raw/document-row provenance.
+- The projection keeps one real overscan row, with an absent-head placeholder
+  only at the document start. It never changes viewport capacity, scroll range,
+  PTY dimensions or native input. Fractional frames reuse cells/provenance;
+  only source updates and crossed row boundaries rematerialize the bounded
+  viewport. Text, cards, selection, cursor, links, IME and hit testing share one
+  affine map. Content clips at the real grid padding; the background and scrollbar
+  paint once outside that clip. Chat history and composer have independent clips.
+- Reading anchors retain their fraction across output and trimming. Chat retains
+  its real projection through separately received OSC D/A/B and accepted Enter/C
+  gaps, while parser input/submit authority remains unchanged. Alternate screens
+  and primary-screen takeovers keep native behavior. Desktop reduced motion is
+  observed even with a hidden/explicit companion without changing its own policy.
+- The initial grid is calculated from actual window content geometry before
+  first relayout, including existing chrome/banner space. A window that sends no
+  redundant resize now starts with its composer at the tab bottom.
+- Native profiling isolated a software-renderer stall: 58–121 fragmented damage
+  regions replayed the same layer stack and took 0.4–0.9 s; projection/update and
+  primitive emission were below 1 ms. The vendored tiny-skia compositor now joins
+  more than four regions into their conservative bounding union, preserving
+  small cursor damage and exact layer clipping/compositing. Temporary profiling
+  is removed. Regression tests compare merged, fragmented and complete repaint
+  pixel buffers with translucent rounded cards crossing history/dock clips.
+
+- Validation: the full application sweep passed **1,938 tests**, with **3
+  ignored**; the final clock/initial-size/software-renderer refinements then
+  passed **19 focused native canvas/motion tests**, **3 raster coverage/equality
+  tests**, and **3 font synchronization/geometry checks**. `cargo fmt --check`,
+  explicit vendor rustfmt, `git diff --check`, and `cargo clippy --locked
+  --offline --bin frost --no-deps -- -D warnings` passed. Existing vendored
+  clipboard/Iced deprecation warnings remain; no application lint warnings.
+- Final native Xvfb/software probes ran sequentially on the same debug binary
+  `a5349a8e25a577eca1a0e108580b546d1328294b7ee0a52d11b11918abcf2605`
+  using core's `scripts/native-transcript-canvas-smoke.py`: **Block passed with
+  7 distinct wheel positions, Chat with 5**, both stable after settling. The
+  first output stayed at **114→114 px** in Block and **78→78 px** in Chat when
+  adding a second short block. Chat starts at **128×41** for the 1100×760 test
+  window and its composer ends directly above the status bar. The earlier
+  100×30 bootstrap and repeated damage stalls were reproduced and corrected.
+  GPU paths compile; this environment has no Vulkan ICD, so runtime evidence
+  explicitly covers the tiny-skia fallback. No frame threshold was weakened.
+
+
 ## 2026-10-26 — align the font CI fixture with the unique companion
 
 - `scripts/test-font-sync.py` still extracted the removed `native_status_rows`

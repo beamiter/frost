@@ -46,6 +46,39 @@ There is no second text editor, command-execution pipeline, or input transcript.
 Password input is never copied into a command capsule. Existing command-history
 settings retain their existing meaning; Chat adds no separate history or logs.
 
+## Continuous transcript canvas
+
+Block and Chat history retain a session-owned, fractional scroll position.
+Short history starts at the top and grows downward; spare space stays below
+the transcript and above Chat's fixed composer.
+Block reserves its metadata header before the command finishes, so completion
+fills the same space without moving already-visible output. Separate OSC `D`,
+`A` and `B` reads retain Chat cards throughout the shell's normal prompt gap;
+input controls still wait for their real parser authority.
+Touchpad pixels are presented directly, including sub-row movement; discrete
+mouse wheels and **Go live** move on the display frame clock. Streaming output
+retargets the existing motion while following live. Scrolling or selecting
+history pauses that following, so later output preserves the same raw or
+synthetic reading anchor and its fractional position.
+
+The renderer materializes only the viewport plus one real history margin row.
+It changes that materialization only at row boundaries or source updates;
+fractional frames reuse the same text and provenance. Text, cards, selection,
+links, cursor, IME and pointer mapping use the same vertical transform. Chat's
+composer remains docked and separately clipped. Normal/alternate-screen
+terminal input and application mouse reporting keep their existing behavior.
+
+Motion stops scheduling frames when settled. The existing desktop preference
+observer is shared with the canvas even if the companion is hidden; reduced
+motion makes wheel/follow destinations immediate while keeping precise input.
+
+Native Iced frame notifications drive the canvas only while a visible pane is
+moving. Updates use current monotonic time, so queued software frames cannot
+stretch the motion. The software renderer conservatively joins excessive
+damage regions before replaying the same clipped layer stack; small cursor
+updates remain partial. Initial grid dimensions use the actual window content
+area, keeping the composer at the bottom from the first frame.
+
 ## Interactive programs and conservative fallback
 
 A running command owns the real terminal and all its stdin. `sudo`, `read`, `cat`

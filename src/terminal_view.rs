@@ -933,6 +933,12 @@ impl Metrics {
 /// A custom widget that renders a terminal grid snapshot using the advanced
 /// renderer (quads for backgrounds/cursor, real text shaping for glyphs).
 pub struct TermWidget<'a, Message> {
+    canvas: crate::transcript_canvas::CanvasGeometry,
+    canvas_position: Option<f64>,
+    canvas_animating: bool,
+    canvas_app_mouse: bool,
+    on_canvas_scroll: Option<Box<dyn Fn(f64, bool) -> Message + 'a>>,
+    on_canvas_pause: Option<Box<dyn Fn() -> Message + 'a>>,
     mode_epoch: u64,
     terminal_mode: crate::config::TerminalMode,
     grid: &'a [Vec<TerminalCell>],
@@ -1035,6 +1041,12 @@ impl<'a, Message> TermWidget<'a, Message> {
         scrollback_len: usize,
     ) -> Self {
         TermWidget {
+            canvas: crate::transcript_canvas::CanvasGeometry::default(),
+            canvas_position: None,
+            canvas_animating: false,
+            canvas_app_mouse: false,
+            on_canvas_scroll: None,
+            on_canvas_pause: None,
             mode_epoch: 0,
             terminal_mode: crate::config::TerminalMode::Normal,
             grid,
@@ -1186,7 +1198,12 @@ impl<'a, Message> TermWidget<'a, Message> {
             .scrollbar_geometry(bounds)
             .is_none_or(|(_, _, scrollbar_x, _, _)| position.x < scrollbar_x);
         let grid_top = bounds.y + self.metrics.padding;
-        let grid_bottom = grid_top + self.grid.len() as f32 * self.metrics.cell_h;
+        let grid_bottom = grid_top
+            + self
+                .grid
+                .len()
+                .saturating_sub(usize::from(self.canvas.head)) as f32
+                * self.metrics.cell_h;
         let grid_left = bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
         let grid_width = self
             .grid
@@ -1237,7 +1254,9 @@ impl<'a, Message> TermWidget<'a, Message> {
     }
 
     fn card_geometry(&self, bounds: Rectangle, segment: BlockCardSegment) -> BlockCardGeometry {
-        let oy = bounds.y + self.metrics.padding;
+        let oy = bounds.y
+            + self.metrics.padding
+            + self.canvas.offset(segment.start_row, self.metrics.cell_h);
         let right = block_chrome_right(bounds, self.metrics);
         let Some(chat) = self.chat_rows.get(segment.start_row) else {
             return block_card_geometry(
@@ -1251,8 +1270,8 @@ impl<'a, Message> TermWidget<'a, Message> {
         };
         let ox = bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
         let left = (ox + chat.left_col as f32 * self.metrics.cell_w - 7.0).max(bounds.x + 2.0);
-        let top = oy + segment.start_row as f32 * self.metrics.cell_h;
-        let bottom = oy + segment.end_row as f32 * self.metrics.cell_h;
+        let top = self.row_y(bounds, segment.start_row);
+        let bottom = top + (segment.end_row - segment.start_row) as f32 * self.metrics.cell_h;
 
         BlockCardGeometry {
             body: Rectangle {
@@ -1286,7 +1305,7 @@ impl<'a, Message> TermWidget<'a, Message> {
         let size = (self.metrics.cell_h - 2.0).max(1.0);
         Rectangle {
             x: block_chrome_right(bounds, self.metrics) - size - 7.0,
-            y: bounds.y + self.metrics.padding + row as f32 * self.metrics.cell_h + 1.0,
+            y: self.row_y(bounds, row) + 1.0,
             width: size,
             height: size,
         }
@@ -1310,7 +1329,12 @@ impl<'a, Message> TermWidget<'a, Message> {
                 self.scrollbar_geometry(bounds)
                     .map_or(bounds.x + bounds.width, |(_, _, x, _, _)| x),
             );
-        let bottom = top + self.grid.len() as f32 * self.metrics.cell_h;
+        let bottom = top
+            + self
+                .grid
+                .len()
+                .saturating_sub(usize::from(self.canvas.head)) as f32
+                * self.metrics.cell_h;
         if pos.x < left
             || pos.x >= right
             || pos.y < top
@@ -1367,7 +1391,7 @@ impl<'a, Message> TermWidget<'a, Message> {
         {
             return None;
         }
-        let clip = bounds.intersection(viewport)?;
+        let clip = self.canvas_content_bounds(bounds).intersection(viewport)?;
         let mut segment = block_card_segments(&self.blocks)
             .into_iter()
             .find(|segment| segment.kind == BlockCardKind::Active)?;
@@ -1383,7 +1407,7 @@ impl<'a, Message> TermWidget<'a, Message> {
         let (cw, ch) = (self.metrics.cell_w, self.metrics.cell_h);
         let origin = (
             bounds.x + self.metrics.padding + self.metrics.block_gutter_width(),
-            bounds.y + self.metrics.padding,
+            bounds.y + self.metrics.padding + self.canvas.offset(segment.start_row, ch),
         );
         let card = self.card_geometry(bounds, segment).body;
         // A clipped/incomplete card cannot contain the live body. Reject it
@@ -1531,6 +1555,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             y: bounds.y
                 + self.metrics.padding
                 + (row_index as f32 - line as f32) * ch
+                + self.canvas.offset(row_index, ch)
                 + if rows == 1 { 1.0 } else { 3.0 },
             width: (right - bounds.x - 16.0).max(0.0),
             height: rows as f32 * ch - if rows == 1 { 2.0 } else { 6.0 },
@@ -1590,11 +1615,16 @@ impl<'a, Message> TermWidget<'a, Message> {
             return None;
         }
         // Auto mode: only reveal the scrollbar while scrolled up into history.
-        if !self.scrollbar_always && self.scroll_offset == 0 {
+        if !self.scrollbar_always
+            && self.canvas_position.unwrap_or(self.scroll_offset as f64) == 0.0
+        {
             return None;
         }
         let pad = self.metrics.padding;
-        let rows = self.grid.len();
+        let rows = self
+            .grid
+            .len()
+            .saturating_sub(usize::from(self.canvas.head));
         let total = self.scrollback_len + rows;
         if total == 0 {
             return None;
@@ -1605,7 +1635,8 @@ impl<'a, Message> TermWidget<'a, Message> {
         let thumb_h = ((rows as f32 / total as f32) * track_h)
             .clamp(SCROLLBAR_MIN_THUMB.min(track_h), track_h);
         // offset == 0 → thumb at bottom (live view); offset == max → top.
-        let frac = self.scroll_offset as f32 / self.scrollback_len as f32;
+        let frac = self.canvas_position.unwrap_or(self.scroll_offset as f64) as f32
+            / self.scrollback_len as f32;
         let thumb_y = track_top + (track_h - thumb_h) * (1.0 - frac);
         Some((track_top, track_h, x, thumb_y, thumb_h))
     }
@@ -1668,8 +1699,54 @@ impl<'a, Message> TermWidget<'a, Message> {
             .unwrap_or(1)
             .saturating_sub(1);
         let col = ((rel_x / cw) as usize).min(max_col);
-        let row = ((rel_y / ch) as usize).min(max_row);
+        let row = self.canvas.row(rel_y, ch, max_row + 1);
         (col, row)
+    }
+
+    pub(crate) fn transcript_canvas(
+        mut self,
+        canvas: &crate::transcript_canvas::TranscriptCanvas,
+        head: bool,
+        app_mouse: bool,
+        scroll: impl Fn(f64, bool) -> Message + 'a,
+        pause: impl Fn() -> Message + 'a,
+    ) -> Self {
+        if canvas.enabled() && head {
+            self.canvas = crate::transcript_canvas::CanvasGeometry {
+                head,
+                fraction: canvas.fraction(),
+                dock_start: self
+                    .chat_rows
+                    .iter()
+                    .position(|row| row.role == crate::chat_mode::ChatRole::Composer),
+            };
+            self.canvas_position = Some(canvas.position_rows());
+            self.canvas_animating = canvas.animating();
+            self.canvas_app_mouse = app_mouse;
+            self.on_canvas_scroll = Some(Box::new(scroll));
+            self.on_canvas_pause = Some(Box::new(pause));
+        }
+        self
+    }
+
+    fn row_y(&self, bounds: Rectangle, row: usize) -> f32 {
+        self.canvas
+            .y(bounds.y + self.metrics.padding, row, self.metrics.cell_h)
+    }
+
+    /// Overscan exists only inside the grid: its hidden tail must never leak
+    /// into padding where pointer geometry intentionally has no terminal row.
+    fn canvas_content_bounds(&self, bounds: Rectangle) -> Rectangle {
+        if !self.canvas.head {
+            return bounds;
+        }
+        let pad = self.metrics.padding;
+        Rectangle {
+            y: bounds.y + pad,
+            height: (self.grid.len().saturating_sub(1) as f32 * self.metrics.cell_h)
+                .min((bounds.height - pad * 2.0).max(0.0)),
+            ..bounds
+        }
     }
 }
 
@@ -3698,537 +3775,19 @@ mod tests {
     }
 }
 
-impl<Message, Renderer> Widget<Message, iced::Theme, Renderer> for TermWidget<'_, Message>
-where
-    Renderer: text::Renderer<Font = iced::Font>
-        + iced::advanced::image::Renderer<Handle = iced::advanced::image::Handle>,
-{
-    fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<State>()
-    }
-
-    fn state(&self) -> tree::State {
-        tree::State::new(State {
-            terminal_mode: Some(self.terminal_mode),
-            mode_epoch: self.mode_epoch,
-            ..State::default()
-        })
-    }
-
-    fn diff(&self, tree: &mut Tree) {
-        let state = tree.state.downcast_mut::<State>();
-        if state.terminal_mode != Some(self.terminal_mode) || state.mode_epoch != self.mode_epoch {
-            // App ownership has already retired synchronously at its mode or
-            // visible-pane ownership boundary.
-            // This covers retained local controls, including a same-batch mode
-            // round trip that never rendered the intermediate presentation.
-            *state = State {
-                terminal_mode: Some(self.terminal_mode),
-                mode_epoch: self.mode_epoch,
-                ..State::default()
-            };
-        }
-    }
-
-    fn size(&self) -> Size<Length> {
-        Size::new(Length::Fill, Length::Fill)
-    }
-
-    fn layout(
-        &mut self,
-        _tree: &mut Tree,
-        _renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        layout::Node::new(limits.max())
-    }
-
-    fn update(
-        &mut self,
-        tree: &mut Tree,
-        event: &Event,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        _renderer: &Renderer,
-        _clipboard: &mut dyn Clipboard,
-        shell: &mut Shell<'_, Message>,
-        viewport: &Rectangle,
-    ) {
-        // Do not capture focus changes: sibling widgets also need to retire
-        // their gestures. This precedes IME and absent-callback early exits.
-        if tree.state.downcast_mut::<State>().reset_on_unfocused(event) {
-            return;
-        }
-        let bounds = layout.bounds();
-        // Observe the exact geometry used by draw, without capturing the event.
-        // A redraw/layout/projection change revokes a visit, never creates one.
-        if let Some(callback) = self.on_organism.as_ref() {
-            let point = cursor.position().map(|p| (p.x, p.y));
-            let geometry = self.painted_organism_geometry(
-                bounds,
-                viewport,
-                tree.state.downcast_ref::<State>().body_geometry.as_ref(),
-                tree.state.downcast_ref::<State>().body_frame,
-                point,
-            );
-            let walking =
-                self.organism_walking(geometry.as_ref(), tree.state.downcast_ref::<State>(), point);
-            let state = tree.state.downcast_mut::<State>();
-            state.body_frame = self.organism_body.as_ref().map_or(0, |body| body.frame);
-            if state.body_walking != walking {
-                state.body_walking = walking;
-                shell.request_redraw();
-            }
-            if state.body_geometry != geometry {
-                // Iced redraws the complete primitive list, removing the old quad.
-                shell.request_redraw();
-                state.body_geometry = geometry.clone();
-            }
-            let inside = geometry
-                .as_ref()
-                .zip(point)
-                .is_some_and(|(g, p)| g.rect.contains(p));
-            let moved = matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }));
-            if let Some(edge) =
-                state
-                    .organism_pointer
-                    .observe(geometry.clone(), point, inside, moved)
-            {
-                shell.request_redraw();
-                let ticket = match edge {
-                    BodyEdge::Enter => self.organism_offer,
-                    BodyEdge::Exit => self.organism_exit,
-                    BodyEdge::Geometry => None,
-                };
-                shell.publish(callback(OrganismBodyObservation {
-                    geometry,
-                    edge,
-                    ticket,
-                }));
-            }
-        }
-
-        // Keep the input method enabled and positioned at the text cursor while
-        // this pane is focused. The runtime only honors the request during a
-        // RedrawRequested, and renders any supplied pre-edit as an over-the-spot
-        // overlay anchored to `cursor`.
-        if self.focused {
-            if let Event::Window(iced::window::Event::RedrawRequested(_)) = event {
-                let pad = self.metrics.padding;
-                let (row, col) = self.cursor;
-                let cursor_rect = Rectangle::new(
-                    Point::new(
-                        bounds.x
-                            + pad
-                            + self.metrics.block_gutter_width()
-                            + col as f32 * self.metrics.cell_w,
-                        bounds.y + pad + row as f32 * self.metrics.cell_h,
-                    ),
-                    Size::new(self.metrics.cell_w, self.metrics.cell_h),
-                );
-                if let Some(cursor_rect) = self.native_ime_cursor.unwrap_or(Some(cursor_rect)) {
-                    let preedit =
-                        self.preedit
-                            .as_ref()
-                            .map(|(content, selection)| input_method::Preedit {
-                                content: content.as_str(),
-                                selection: selection.clone(),
-                                text_size: Some(Pixels(self.metrics.font_size)),
-                            });
-                    shell.request_input_method(&InputMethod::Enabled {
-                        cursor: cursor_rect,
-                        purpose: input_method::Purpose::Terminal,
-                        preedit,
-                    });
-                }
-            }
-        }
-
-        let Some(on_mouse) = self.on_mouse.as_ref() else {
-            return;
-        };
-        let state = tree.state.downcast_mut::<State>();
-
-        match event {
-            Event::Mouse(mouse::Event::ButtonPressed(btn)) => {
-                let Some(pos) = cursor.position_over(bounds) else {
-                    return;
-                };
-                let (col, row) = self.cell_at(pos, bounds);
-                let button = match btn {
-                    mouse::Button::Left => MouseButton::Left,
-                    mouse::Button::Middle => MouseButton::Middle,
-                    mouse::Button::Right => MouseButton::Right,
-                    _ => return,
-                };
-                if button == MouseButton::Left {
-                    // A second press always supersedes an unfinished summary
-                    // gesture, even if the release was lost outside the pane.
-                    state.summary_press = None;
-                }
-                let (shift, alt, ctrl) = (self.shift, self.alt, self.ctrl);
-                // Grabbing the scrollbar gutter starts a scroll drag, not a
-                // text selection.
-                if button == MouseButton::Left {
-                    if let Some((_, _, sb_x, _, _)) = self.scrollbar_geometry(bounds) {
-                        if pos.x >= sb_x {
-                            state.scrollbar_dragging = true;
-                            state.published_presses[MouseButton::Left.slot()] = false;
-                            let offset = self.offset_from_y(pos.y, bounds);
-                            shell.publish(on_mouse(MouseInput::ScrollTo { offset }));
-                            shell.capture_event();
-                            return;
-                        }
-                    }
-                }
-                if button == MouseButton::Left && self.organism_toggle_at(pos, bounds, viewport) {
-                    if let Some(toggle) = self.on_organism_toggle.as_ref() {
-                        state.consumed_presses[button.slot()] = true;
-                        state.published_presses[button.slot()] = false;
-                        state.dragging = false;
-                        shell.publish(toggle(!self.organism_expanded));
-                        shell.capture_event();
-                        return;
-                    }
-                }
-                if button == MouseButton::Left
-                    && self
-                        .chat_submit_geometry(bounds, viewport)
-                        .is_some_and(|rect| rect.contains(pos))
-                {
-                    if let Some(submit) = &self.on_chat_submit {
-                        state.consume_spacer_press(button, true);
-                        shell.publish(submit());
-                        shell.capture_event();
-                        return;
-                    }
-                }
-                if state.consume_spacer_press(
-                    button,
-                    self.blocks.get(row).is_some_and(|block| {
-                        block.host_spacer
-                            || (block.native_header.is_some() && button == MouseButton::Middle)
-                    }),
-                ) {
-                    shell.capture_event();
-                    return;
-                }
-                // Count every left press before deciding ownership. A first
-                // header click belongs to Block Mode, but a rapid second/third
-                // click on the same cell must fall through to native word/line
-                // selection instead of being trapped as repeated block clicks.
-                let count = if button == MouseButton::Left {
-                    let now = Instant::now();
-                    let same_cell = state
-                        .last_click
-                        .map(|(t, c, r)| {
-                            c == col
-                                && r == row
-                                && now.duration_since(t).as_millis() <= MULTI_CLICK_MS
-                        })
-                        .unwrap_or(false);
-                    state.click_count = if same_cell { state.click_count + 1 } else { 1 };
-                    state.last_click = Some((now, col, row));
-                    state.click_count
-                } else {
-                    1
-                };
-
-                // Finished rows are a static card surface even if a live app
-                // currently has primary-buffer mouse reporting enabled. Only
-                // the active/live rows belong to that app. Exclude the
-                // scrollbar track and vertical padding from card hit testing.
-                let grid_top = bounds.y + self.metrics.padding;
-                let grid_bottom = grid_top + self.grid.len() as f32 * self.metrics.cell_h;
-                let before_scrollbar = self
-                    .scrollbar_geometry(bounds)
-                    .is_none_or(|(_, _, sb_x, _, _)| pos.x < sb_x);
-                let over_grid = pos.y >= grid_top && pos.y < grid_bottom;
-                let grid_left = bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
-                let grid_width = self
-                    .grid
-                    .first()
-                    .map_or(0.0, |cells| cells.len() as f32 * self.metrics.cell_w);
-                let scrollbar_left = self
-                    .scrollbar_geometry(bounds)
-                    .map_or(bounds.x + bounds.width, |(_, _, x, _, _)| x);
-                let grid_right = (grid_left + grid_width).min(scrollbar_left);
-                let over_grid_columns = pos.x >= grid_left && pos.x < grid_right;
-                if !self.chat_terminal_point_allowed(pos, bounds, viewport) {
-                    state.consume_spacer_press(button, true);
-                    shell.capture_event();
-                    return;
-                }
-                let block_row = self.blocks.get(row);
-                let collapsed_summary = (over_grid && before_scrollbar && over_grid_columns)
-                    .then(|| block_row.and_then(|block| block.collapsed_summary))
-                    .flatten();
-                let finalized = over_grid
-                    && before_scrollbar
-                    && block_row.is_some_and(|block| block.selectable);
-                let row_is_header = collapsed_summary.is_none()
-                    && block_row.is_some_and(|block| col < block.header_end_col);
-                let app_eligible = app_mouse_surface_eligible(
-                    over_grid,
-                    over_grid_columns,
-                    self.app_mouse_full_grid,
-                    collapsed_summary.is_none()
-                        && block_row.is_some_and(|block| block.app_eligible),
-                );
-                let link_eligible = collapsed_summary.is_none()
-                    && link_surface_eligible(
-                        over_grid && over_grid_columns,
-                        finalized,
-                        row_is_header,
-                    );
-                // A synthetic summary is a host control, not terminal text.
-                // Left activation completes only after stable release; middle
-                // is deliberately swallowed; right continues into the stable
-                // finalized-card menu path below.
-                if let Some(summary) = collapsed_summary {
-                    if button != MouseButton::Right {
-                        state.consumed_presses[button.slot()] = true;
-                        state.published_presses[button.slot()] = false;
-                        state.dragging = false;
-                        if button == MouseButton::Left && count == 1 {
-                            if let Some(projection_key) = self.projection_key.clone() {
-                                state.summary_press = Some(SummaryPress {
-                                    key: summary.key,
-                                    projection_key,
-                                    point: pos,
-                                    dragged: false,
-                                });
-                            }
-                        }
-                        shell.capture_event();
-                        return;
-                    }
-                }
-                let block = if !self.chat_rows.is_empty() {
-                    chat_card_mouse_action(button, finalized)
-                } else if finalized && block_row.is_some_and(|row| row.native_header.is_some()) {
-                    native_header_action(button, pos.x, bounds, self.metrics, shift, ctrl)
-                } else {
-                    block_mouse_action(button, finalized, row_is_header, shift, ctrl, count)
-                };
-                let block_zone_id = block.and_then(|_| block_row.and_then(|row| row.zone_id));
-                let link = block.is_none()
-                    && ctrl_link_eligible(button, count, ctrl, shift, link_eligible)
-                    && self.link_at(col, row).is_some();
-                let consumed = block.is_some() || link;
-                if consumed {
-                    state.consumed_presses[button.slot()] = true;
-                    state.published_presses[button.slot()] = false;
-                } else {
-                    state.consumed_presses[button.slot()] = false;
-                    state.published_presses[button.slot()] = true;
-                }
-                if button == MouseButton::Left {
-                    state.dragging = !consumed;
-                }
-                shell.publish(on_mouse(MouseInput::Press {
-                    col,
-                    row,
-                    button,
-                    shift,
-                    alt,
-                    ctrl,
-                    count,
-                    finalized,
-                    link_eligible,
-                    app_eligible,
-                    block,
-                    block_zone_id,
-                    link,
-                    link_revision: self.link_revision,
-                    x: pos.x,
-                    y: pos.y,
-                }));
-                shell.capture_event();
-            }
-            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-                let pos = cursor.position().unwrap_or(Point::new(bounds.x, bounds.y));
-                if let Some(press) = state.summary_press.as_mut() {
-                    let dx = pos.x - press.point.x;
-                    let dy = pos.y - press.point.y;
-                    if dx * dx + dy * dy > 9.0 {
-                        press.dragged = true;
-                    }
-                    shell.capture_event();
-                    return;
-                }
-                if state.scrollbar_dragging {
-                    let offset = self.offset_from_y(pos.y, bounds);
-                    shell.publish(on_mouse(MouseInput::ScrollTo { offset }));
-                    return;
-                }
-                if !state.dragging {
-                    return;
-                }
-                let (col, row) = self.cell_at(pos, bounds);
-                shell.publish(on_mouse(MouseInput::Drag {
-                    col,
-                    row,
-                    count: state.click_count,
-                }));
-            }
-            Event::Mouse(mouse::Event::ButtonReleased(btn)) => {
-                let button = match btn {
-                    mouse::Button::Left => MouseButton::Left,
-                    mouse::Button::Middle => MouseButton::Middle,
-                    mouse::Button::Right => MouseButton::Right,
-                    _ => return,
-                };
-                if button == MouseButton::Left {
-                    if let Some(press) = state.summary_press.take() {
-                        state.consumed_presses[button.slot()] = false;
-                        state.published_presses[button.slot()] = false;
-                        state.dragging = false;
-                        let current = cursor.position_over(bounds).and_then(|position| {
-                            let (col, row) = self.cell_at(position, bounds);
-                            let grid_left =
-                                bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
-                            let grid_width = self
-                                .grid
-                                .first()
-                                .map_or(0.0, |cells| cells.len() as f32 * self.metrics.cell_w);
-                            let scrollbar_left = self
-                                .scrollbar_geometry(bounds)
-                                .map_or(bounds.x + bounds.width, |(_, _, x, _, _)| x);
-                            (position.x >= grid_left
-                                && position.x < (grid_left + grid_width).min(scrollbar_left))
-                            .then(|| {
-                                self.blocks
-                                    .get(row)
-                                    .and_then(|block| block.collapsed_summary)
-                                    .map(|summary| (col, summary))
-                            })
-                            .flatten()
-                        });
-                        let activation = stable_summary_activation(
-                            press,
-                            current.map(|(_, summary)| summary),
-                            self.projection_key.as_ref(),
-                        );
-                        if let Some(activation) = activation {
-                            if let Some(on_summary) = self.on_summary.as_ref() {
-                                shell.publish(on_summary(activation));
-                            }
-                        }
-                        shell.capture_event();
-                        return;
-                    }
-                }
-                if state.consumed_presses[button.slot()] {
-                    state.consumed_presses[button.slot()] = false;
-                    shell.capture_event();
-                    return;
-                }
-                // Press ownership, not current hover, routes release. This is
-                // essential for right/middle application-mouse gestures: they
-                // never arm text dragging, but moving outside the pane before
-                // release must still deliver the matching button-up.
-                if !owns_mouse_release(
-                    &state.published_presses,
-                    state.dragging,
-                    state.scrollbar_dragging,
-                    button,
-                ) {
-                    return;
-                }
-                state.published_presses[button.slot()] = false;
-                if button == MouseButton::Left {
-                    if state.scrollbar_dragging {
-                        state.scrollbar_dragging = false;
-                        return;
-                    }
-                    // Only a press that armed the drag pipeline emits a
-                    // Release. A consumed block press never sets `dragging`,
-                    // so no Release (and no selection copy) follows it.
-                    if !state.dragging {
-                        return;
-                    }
-                    state.dragging = false;
-                }
-                let pos = cursor.position().unwrap_or(Point::new(bounds.x, bounds.y));
-                let (col, row) = self.cell_at(pos, bounds);
-                shell.publish(on_mouse(MouseInput::Release { col, row, button }));
-            }
-            Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
-                let Some(pos) = cursor.position_over(bounds) else {
-                    return;
-                };
-                // Normalize both delta kinds to lines: Lines is already in lines;
-                // Pixels is divided by the cell height. Fractions accumulate so a
-                // trackpad's stream of sub-line pixel deltas still scrolls.
-                let dy = match delta {
-                    mouse::ScrollDelta::Lines { y, .. } => *y,
-                    mouse::ScrollDelta::Pixels { y, .. } => *y / self.metrics.cell_h.max(1.0),
-                };
-                if dy == 0.0 {
-                    return;
-                }
-                let state = tree.state.downcast_mut::<State>();
-                // Drop any leftover fraction of the opposite sign on a direction
-                // reversal, otherwise it cancels part of the new delta and the
-                // first reversed tick gets swallowed.
-                if state.scroll_accum != 0.0 && (dy > 0.0) != (state.scroll_accum > 0.0) {
-                    state.scroll_accum = 0.0;
-                }
-                state.scroll_accum += dy;
-                let whole = state.scroll_accum.trunc();
-                if whole == 0.0 {
-                    shell.capture_event();
-                    return;
-                }
-                state.scroll_accum -= whole;
-                let (col, row) = self.cell_at(pos, bounds);
-                let block_row = self.blocks.get(row);
-                let grid_top = bounds.y + self.metrics.padding;
-                let grid_bottom = grid_top + self.grid.len() as f32 * self.metrics.cell_h;
-                let grid_left = bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
-                let grid_width = self
-                    .grid
-                    .first()
-                    .map_or(0.0, |cells| cells.len() as f32 * self.metrics.cell_w);
-                let scrollbar_left = self
-                    .scrollbar_geometry(bounds)
-                    .map_or(bounds.x + bounds.width, |(_, _, x, _, _)| x);
-                let grid_right = (grid_left + grid_width).min(scrollbar_left);
-                let app_eligible = app_mouse_surface_eligible(
-                    pos.y >= grid_top && pos.y < grid_bottom,
-                    pos.x >= grid_left && pos.x < grid_right,
-                    self.app_mouse_full_grid,
-                    block_row.is_some_and(|block| block.app_eligible),
-                );
-                shell.publish(on_mouse(MouseInput::Wheel {
-                    col,
-                    row,
-                    up: whole > 0.0,
-                    ctrl: self.ctrl,
-                    shift: self.shift,
-                    lines: whole.abs() as usize,
-                    app_eligible,
-                }));
-                shell.capture_event();
-            }
-            _ => {}
-        }
-    }
-
-    fn draw(
+impl<Message> TermWidget<'_, Message> {
+    fn paint_canvas_surface<Renderer>(
         &self,
         _tree: &Tree,
         renderer: &mut Renderer,
-        _theme: &iced::Theme,
-        _style: &renderer::Style,
-        layout: Layout<'_>,
+        bounds: Rectangle,
         cursor: mouse::Cursor,
         viewport: &Rectangle,
-    ) {
-        let bounds = layout.bounds();
-        let clip = bounds.intersection(viewport).unwrap_or(bounds);
-
+        clip: Rectangle,
+    ) where
+        Renderer: text::Renderer<Font = iced::Font>
+            + iced::advanced::image::Renderer<Handle = iced::advanced::image::Handle>,
+    {
         // The link currently under the pointer (brightened on hover).
         let hovered: Option<&crate::link::Link> = cursor
             .position_over(bounds)
@@ -4237,7 +3796,11 @@ where
         let cw = self.metrics.cell_w;
         let ch = self.metrics.cell_h;
         let ox = bounds.x + pad + self.metrics.block_gutter_width();
-        let oy = bounds.y + pad;
+        let belongs = |row: usize| {
+            self.canvas.dock_start.is_none_or(|dock| {
+                !self.canvas.head || (row >= dock) == (clip.y >= self.row_y(bounds, dock))
+            })
+        };
         let scrollbar_track_left = block_chrome_right(bounds, self.metrics);
         let default_fg = self
             .dynamic_fg
@@ -4248,42 +3811,30 @@ where
             .map(|(r, g, b)| Color::from_rgb8(r, g, b))
             .unwrap_or_else(|| self.theme.terminal_background());
 
-        // Whole-widget background. At full opacity this is the classic opaque
-        // fill. Below 1.0 the app-level style already clears the surface with
-        // the translucent theme background, so repainting it here would stack
-        // two alpha layers and defeat the transparency; only a per-pane OSC 11
-        // override still needs its own (equally translucent) fill.
-        if self.opacity >= 1.0 {
-            renderer.fill_quad(solid_quad(bounds), Background::Color(default_bg));
-        } else if self.dynamic_bg.is_some() {
-            renderer.fill_quad(
-                solid_quad(bounds),
-                Background::Color(Color {
-                    a: self.opacity,
-                    ..default_bg
-                }),
-            );
-        }
-
         // The app has already projected retained zones onto visible rows.
         // Collapse those rows once into card slices and reuse the result for
         // background, hover and foreground chrome. This stays O(viewport rows)
         // even when scrollback contains thousands of lines.
-        let card_segments = block_card_segments(&self.blocks);
-        let hovered_card = cursor.position_over(bounds).and_then(|position| {
-            let row = self.cell_at(position, bounds).1;
-            let group = self
-                .blocks
-                .get(row)
-                .filter(|row| row.selectable)?
-                .card_group?;
-            let segment = card_segments
-                .iter()
-                .find(|segment| segment.group == group)?;
-            let geometry = self.card_geometry(bounds, *segment);
-            block_card_hover_contains(bounds, geometry.body, position.x, position.y)
-                .then_some(group)
-        });
+        let card_segments: Vec<_> = block_card_segments(&self.blocks)
+            .into_iter()
+            .filter(|segment| belongs(segment.start_row))
+            .collect();
+        let hovered_card = cursor
+            .position_over(self.canvas_content_bounds(bounds))
+            .and_then(|position| {
+                let row = self.cell_at(position, bounds).1;
+                let group = self
+                    .blocks
+                    .get(row)
+                    .filter(|row| row.selectable)?
+                    .card_group?;
+                let segment = card_segments
+                    .iter()
+                    .find(|segment| segment.group == group)?;
+                let geometry = self.card_geometry(bounds, *segment);
+                block_card_hover_contains(bounds, geometry.body, position.x, position.y)
+                    .then_some(group)
+            });
         let block_accent = Theme::rgb_to_color32(self.theme.tabbar.active_border);
 
         // Card backdrops sit below every terminal background, glyph and Kitty
@@ -4341,15 +3892,11 @@ where
             buckets
         };
 
-        let visible_rows = clipped_cell_range(oy, ch, self.grid.len(), clip.y, clip.height);
-        for (row_idx, row) in self
-            .grid
-            .iter()
-            .enumerate()
-            .take(visible_rows.end)
-            .skip(visible_rows.start)
-        {
-            let y = oy + row_idx as f32 * ch;
+        for (row_idx, row) in self.grid.iter().enumerate() {
+            let y = self.row_y(bounds, row_idx);
+            if !belongs(row_idx) || y + ch <= clip.y || y >= clip.y + clip.height {
+                continue;
+            }
             let visible_columns = clipped_cell_range(ox, cw, row.len(), clip.x, clip.width);
 
             // Backgrounds.
@@ -4797,8 +4344,11 @@ where
         // stretched into its cell span. Block UI chrome and the cursor follow,
         // so images cannot hide selection/bookmark affordances or the caret.
         for im in &self.images {
+            if !belongs(im.row) {
+                continue;
+            }
             let x = ox + im.col as f32 * cw;
-            let y = oy + im.row as f32 * ch;
+            let y = self.row_y(bounds, im.row);
             let w = im.cols as f32 * cw;
             let h = im.rows as f32 * ch;
             let rect = Rectangle {
@@ -4901,7 +4451,10 @@ where
         // glyphs/images. The badge only occupies cells verified blank, so its
         // text never collides with terminal text.
         for (row_idx, block) in self.blocks.iter().enumerate() {
-            let y = oy + row_idx as f32 * ch;
+            if !belongs(row_idx) {
+                continue;
+            }
+            let y = self.row_y(bounds, row_idx);
             let text_right = bounds.x + bounds.width - pad - SCROLLBAR_WIDTH;
 
             if block.bookmarked {
@@ -4977,7 +4530,10 @@ where
         // Native header/status chrome has no raw-cell provenance. It is never
         // part of terminal selection, output exports, links, IME, or app reports.
         for (row_index, block) in self.blocks.iter().enumerate() {
-            let y = oy + row_index as f32 * ch;
+            if !belongs(row_index) {
+                continue;
+            }
+            let y = self.row_y(bounds, row_index);
             if let Some(header) = &block.native_header {
                 let area = Rectangle {
                     x: bounds.x + BLOCK_CARD_INSET,
@@ -5309,10 +4865,10 @@ where
         }
 
         // Cursor.
-        if self.cursor_visible {
+        if self.cursor_visible && belongs(self.cursor.0) {
             let (cr, cc) = self.cursor;
             let x = ox + cc as f32 * cw;
-            let y = oy + cr as f32 * ch;
+            let y = self.row_y(bounds, cr);
             let cur = self
                 .dynamic_cursor
                 .map(|(r, g, b)| Color::from_rgb8(r, g, b))
@@ -5401,7 +4957,13 @@ where
                 renderer.fill_quad(solid_quad(shape_bounds), Background::Color(cur));
             }
         }
+    }
 
+    fn paint_scrollbar<Renderer: iced::advanced::Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        bounds: Rectangle,
+    ) {
         // Scrollbar (only when scrollback exists).
         if let Some((track_top, track_h, sb_x, thumb_y, thumb_h)) = self.scrollbar_geometry(bounds)
         {
@@ -5476,6 +5038,631 @@ where
             }
         }
     }
+}
+
+impl<Message, Renderer> Widget<Message, iced::Theme, Renderer> for TermWidget<'_, Message>
+where
+    Renderer: text::Renderer<Font = iced::Font>
+        + iced::advanced::image::Renderer<Handle = iced::advanced::image::Handle>,
+{
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<State>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(State {
+            terminal_mode: Some(self.terminal_mode),
+            mode_epoch: self.mode_epoch,
+            ..State::default()
+        })
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        let state = tree.state.downcast_mut::<State>();
+        if state.terminal_mode != Some(self.terminal_mode) || state.mode_epoch != self.mode_epoch {
+            // App ownership has already retired synchronously at its mode or
+            // visible-pane ownership boundary.
+            // This covers retained local controls, including a same-batch mode
+            // round trip that never rendered the intermediate presentation.
+            *state = State {
+                terminal_mode: Some(self.terminal_mode),
+                mode_epoch: self.mode_epoch,
+                ..State::default()
+            };
+        }
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Fill)
+    }
+
+    fn layout(
+        &mut self,
+        _tree: &mut Tree,
+        _renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        layout::Node::new(limits.max())
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _renderer: &Renderer,
+        _clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        // Do not capture focus changes: sibling widgets also need to retire
+        // their gestures. This precedes IME and absent-callback early exits.
+        if tree.state.downcast_mut::<State>().reset_on_unfocused(event) {
+            return;
+        }
+        let bounds = layout.bounds();
+        if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)))
+            && cursor.position_over(bounds).is_some()
+        {
+            if let Some(pause) = &self.on_canvas_pause {
+                shell.publish(pause());
+            }
+        }
+        if self.canvas_animating
+            && matches!(
+                event,
+                Event::Window(iced::window::Event::RedrawRequested(_))
+            )
+        {
+            // Publish animation updates through window::frames after presentation.
+            // A message here re-enters Iced's layout pass with the same timestamp.
+            shell.request_redraw();
+        }
+        // Observe the exact geometry used by draw, without capturing the event.
+        // A redraw/layout/projection change revokes a visit, never creates one.
+        if let Some(callback) = self.on_organism.as_ref() {
+            let point = cursor.position().map(|p| (p.x, p.y));
+            let geometry = self.painted_organism_geometry(
+                bounds,
+                viewport,
+                tree.state.downcast_ref::<State>().body_geometry.as_ref(),
+                tree.state.downcast_ref::<State>().body_frame,
+                point,
+            );
+            let walking =
+                self.organism_walking(geometry.as_ref(), tree.state.downcast_ref::<State>(), point);
+            let state = tree.state.downcast_mut::<State>();
+            state.body_frame = self.organism_body.as_ref().map_or(0, |body| body.frame);
+            if state.body_walking != walking {
+                state.body_walking = walking;
+                shell.request_redraw();
+            }
+            if state.body_geometry != geometry {
+                // Iced redraws the complete primitive list, removing the old quad.
+                shell.request_redraw();
+                state.body_geometry = geometry.clone();
+            }
+            let inside = geometry
+                .as_ref()
+                .zip(point)
+                .is_some_and(|(g, p)| g.rect.contains(p));
+            let moved = matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }));
+            if let Some(edge) =
+                state
+                    .organism_pointer
+                    .observe(geometry.clone(), point, inside, moved)
+            {
+                shell.request_redraw();
+                let ticket = match edge {
+                    BodyEdge::Enter => self.organism_offer,
+                    BodyEdge::Exit => self.organism_exit,
+                    BodyEdge::Geometry => None,
+                };
+                shell.publish(callback(OrganismBodyObservation {
+                    geometry,
+                    edge,
+                    ticket,
+                }));
+            }
+        }
+
+        // Keep the input method enabled and positioned at the text cursor while
+        // this pane is focused. The runtime only honors the request during a
+        // RedrawRequested, and renders any supplied pre-edit as an over-the-spot
+        // overlay anchored to `cursor`.
+        if self.focused {
+            if let Event::Window(iced::window::Event::RedrawRequested(_)) = event {
+                let pad = self.metrics.padding;
+                let (row, col) = self.cursor;
+                let cursor_rect = Rectangle::new(
+                    Point::new(
+                        bounds.x
+                            + pad
+                            + self.metrics.block_gutter_width()
+                            + col as f32 * self.metrics.cell_w,
+                        self.row_y(bounds, row),
+                    ),
+                    Size::new(self.metrics.cell_w, self.metrics.cell_h),
+                );
+                if let Some(cursor_rect) = self.native_ime_cursor.unwrap_or(Some(cursor_rect)) {
+                    let preedit =
+                        self.preedit
+                            .as_ref()
+                            .map(|(content, selection)| input_method::Preedit {
+                                content: content.as_str(),
+                                selection: selection.clone(),
+                                text_size: Some(Pixels(self.metrics.font_size)),
+                            });
+                    shell.request_input_method(&InputMethod::Enabled {
+                        cursor: cursor_rect,
+                        purpose: input_method::Purpose::Terminal,
+                        preedit,
+                    });
+                }
+            }
+        }
+
+        let Some(on_mouse) = self.on_mouse.as_ref() else {
+            return;
+        };
+        let state = tree.state.downcast_mut::<State>();
+
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(btn)) => {
+                let Some(pos) = cursor.position_over(bounds) else {
+                    return;
+                };
+                let (col, row) = self.cell_at(pos, bounds);
+                let button = match btn {
+                    mouse::Button::Left => MouseButton::Left,
+                    mouse::Button::Middle => MouseButton::Middle,
+                    mouse::Button::Right => MouseButton::Right,
+                    _ => return,
+                };
+                if button == MouseButton::Left {
+                    // A second press always supersedes an unfinished summary
+                    // gesture, even if the release was lost outside the pane.
+                    state.summary_press = None;
+                }
+                let (shift, alt, ctrl) = (self.shift, self.alt, self.ctrl);
+                // Grabbing the scrollbar gutter starts a scroll drag, not a
+                // text selection.
+                if button == MouseButton::Left {
+                    if let Some((_, _, sb_x, _, _)) = self.scrollbar_geometry(bounds) {
+                        if pos.x >= sb_x {
+                            state.scrollbar_dragging = true;
+                            state.published_presses[MouseButton::Left.slot()] = false;
+                            let offset = self.offset_from_y(pos.y, bounds);
+                            shell.publish(on_mouse(MouseInput::ScrollTo { offset }));
+                            shell.capture_event();
+                            return;
+                        }
+                    }
+                }
+                if button == MouseButton::Left && self.organism_toggle_at(pos, bounds, viewport) {
+                    if let Some(toggle) = self.on_organism_toggle.as_ref() {
+                        state.consumed_presses[button.slot()] = true;
+                        state.published_presses[button.slot()] = false;
+                        state.dragging = false;
+                        shell.publish(toggle(!self.organism_expanded));
+                        shell.capture_event();
+                        return;
+                    }
+                }
+                if button == MouseButton::Left
+                    && self
+                        .chat_submit_geometry(bounds, viewport)
+                        .is_some_and(|rect| rect.contains(pos))
+                {
+                    if let Some(submit) = &self.on_chat_submit {
+                        state.consume_spacer_press(button, true);
+                        shell.publish(submit());
+                        shell.capture_event();
+                        return;
+                    }
+                }
+                if state.consume_spacer_press(
+                    button,
+                    self.blocks.get(row).is_some_and(|block| {
+                        block.host_spacer
+                            || (block.native_header.is_some() && button == MouseButton::Middle)
+                    }),
+                ) {
+                    shell.capture_event();
+                    return;
+                }
+                // Count every left press before deciding ownership. A first
+                // header click belongs to Block Mode, but a rapid second/third
+                // click on the same cell must fall through to native word/line
+                // selection instead of being trapped as repeated block clicks.
+                let count = if button == MouseButton::Left {
+                    let now = Instant::now();
+                    let same_cell = state
+                        .last_click
+                        .map(|(t, c, r)| {
+                            c == col
+                                && r == row
+                                && now.duration_since(t).as_millis() <= MULTI_CLICK_MS
+                        })
+                        .unwrap_or(false);
+                    state.click_count = if same_cell { state.click_count + 1 } else { 1 };
+                    state.last_click = Some((now, col, row));
+                    state.click_count
+                } else {
+                    1
+                };
+
+                // Finished rows are a static card surface even if a live app
+                // currently has primary-buffer mouse reporting enabled. Only
+                // the active/live rows belong to that app. Exclude the
+                // scrollbar track and vertical padding from card hit testing.
+                let grid_top = bounds.y + self.metrics.padding;
+                let grid_bottom = grid_top
+                    + self
+                        .grid
+                        .len()
+                        .saturating_sub(usize::from(self.canvas.head)) as f32
+                        * self.metrics.cell_h;
+                let before_scrollbar = self
+                    .scrollbar_geometry(bounds)
+                    .is_none_or(|(_, _, sb_x, _, _)| pos.x < sb_x);
+                let over_grid = pos.y >= grid_top && pos.y < grid_bottom;
+                let grid_left = bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
+                let grid_width = self
+                    .grid
+                    .first()
+                    .map_or(0.0, |cells| cells.len() as f32 * self.metrics.cell_w);
+                let scrollbar_left = self
+                    .scrollbar_geometry(bounds)
+                    .map_or(bounds.x + bounds.width, |(_, _, x, _, _)| x);
+                let grid_right = (grid_left + grid_width).min(scrollbar_left);
+                let over_grid_columns = pos.x >= grid_left && pos.x < grid_right;
+                if !self.chat_terminal_point_allowed(pos, bounds, viewport) {
+                    state.consume_spacer_press(button, true);
+                    shell.capture_event();
+                    return;
+                }
+                let block_row = self.blocks.get(row);
+                let collapsed_summary = (over_grid && before_scrollbar && over_grid_columns)
+                    .then(|| block_row.and_then(|block| block.collapsed_summary))
+                    .flatten();
+                let finalized = over_grid
+                    && before_scrollbar
+                    && block_row.is_some_and(|block| block.selectable);
+                let row_is_header = collapsed_summary.is_none()
+                    && block_row.is_some_and(|block| col < block.header_end_col);
+                let app_eligible = app_mouse_surface_eligible(
+                    over_grid,
+                    over_grid_columns,
+                    self.app_mouse_full_grid,
+                    collapsed_summary.is_none()
+                        && block_row.is_some_and(|block| block.app_eligible),
+                );
+                let link_eligible = collapsed_summary.is_none()
+                    && link_surface_eligible(
+                        over_grid && over_grid_columns,
+                        finalized,
+                        row_is_header,
+                    );
+                // A synthetic summary is a host control, not terminal text.
+                // Left activation completes only after stable release; middle
+                // is deliberately swallowed; right continues into the stable
+                // finalized-card menu path below.
+                if let Some(summary) = collapsed_summary {
+                    if button != MouseButton::Right {
+                        state.consumed_presses[button.slot()] = true;
+                        state.published_presses[button.slot()] = false;
+                        state.dragging = false;
+                        if button == MouseButton::Left && count == 1 {
+                            if let Some(projection_key) = self.projection_key.clone() {
+                                state.summary_press = Some(SummaryPress {
+                                    key: summary.key,
+                                    projection_key,
+                                    point: pos,
+                                    dragged: false,
+                                });
+                            }
+                        }
+                        shell.capture_event();
+                        return;
+                    }
+                }
+                let block = if !self.chat_rows.is_empty() {
+                    chat_card_mouse_action(button, finalized)
+                } else if finalized && block_row.is_some_and(|row| row.native_header.is_some()) {
+                    native_header_action(button, pos.x, bounds, self.metrics, shift, ctrl)
+                } else {
+                    block_mouse_action(button, finalized, row_is_header, shift, ctrl, count)
+                };
+                let block_zone_id = block.and_then(|_| block_row.and_then(|row| row.zone_id));
+                let link = block.is_none()
+                    && ctrl_link_eligible(button, count, ctrl, shift, link_eligible)
+                    && self.link_at(col, row).is_some();
+                let consumed = block.is_some() || link;
+                if consumed {
+                    state.consumed_presses[button.slot()] = true;
+                    state.published_presses[button.slot()] = false;
+                } else {
+                    state.consumed_presses[button.slot()] = false;
+                    state.published_presses[button.slot()] = true;
+                }
+                if button == MouseButton::Left {
+                    state.dragging = !consumed;
+                }
+                shell.publish(on_mouse(MouseInput::Press {
+                    col,
+                    row,
+                    button,
+                    shift,
+                    alt,
+                    ctrl,
+                    count,
+                    finalized,
+                    link_eligible,
+                    app_eligible,
+                    block,
+                    block_zone_id,
+                    link,
+                    link_revision: self.link_revision,
+                    x: pos.x,
+                    y: pos.y,
+                }));
+                shell.capture_event();
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                let pos = cursor.position().unwrap_or(Point::new(bounds.x, bounds.y));
+                if let Some(press) = state.summary_press.as_mut() {
+                    let dx = pos.x - press.point.x;
+                    let dy = pos.y - press.point.y;
+                    if dx * dx + dy * dy > 9.0 {
+                        press.dragged = true;
+                    }
+                    shell.capture_event();
+                    return;
+                }
+                if state.scrollbar_dragging {
+                    let offset = self.offset_from_y(pos.y, bounds);
+                    shell.publish(on_mouse(MouseInput::ScrollTo { offset }));
+                    return;
+                }
+                if !state.dragging {
+                    return;
+                }
+                let (col, row) = self.cell_at(pos, bounds);
+                shell.publish(on_mouse(MouseInput::Drag {
+                    col,
+                    row,
+                    count: state.click_count,
+                }));
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(btn)) => {
+                let button = match btn {
+                    mouse::Button::Left => MouseButton::Left,
+                    mouse::Button::Middle => MouseButton::Middle,
+                    mouse::Button::Right => MouseButton::Right,
+                    _ => return,
+                };
+                if button == MouseButton::Left {
+                    if let Some(press) = state.summary_press.take() {
+                        state.consumed_presses[button.slot()] = false;
+                        state.published_presses[button.slot()] = false;
+                        state.dragging = false;
+                        let current = cursor.position_over(bounds).and_then(|position| {
+                            let (col, row) = self.cell_at(position, bounds);
+                            let grid_left =
+                                bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
+                            let grid_width = self
+                                .grid
+                                .first()
+                                .map_or(0.0, |cells| cells.len() as f32 * self.metrics.cell_w);
+                            let scrollbar_left = self
+                                .scrollbar_geometry(bounds)
+                                .map_or(bounds.x + bounds.width, |(_, _, x, _, _)| x);
+                            (position.x >= grid_left
+                                && position.x < (grid_left + grid_width).min(scrollbar_left))
+                            .then(|| {
+                                self.blocks
+                                    .get(row)
+                                    .and_then(|block| block.collapsed_summary)
+                                    .map(|summary| (col, summary))
+                            })
+                            .flatten()
+                        });
+                        let activation = stable_summary_activation(
+                            press,
+                            current.map(|(_, summary)| summary),
+                            self.projection_key.as_ref(),
+                        );
+                        if let Some(activation) = activation {
+                            if let Some(on_summary) = self.on_summary.as_ref() {
+                                shell.publish(on_summary(activation));
+                            }
+                        }
+                        shell.capture_event();
+                        return;
+                    }
+                }
+                if state.consumed_presses[button.slot()] {
+                    state.consumed_presses[button.slot()] = false;
+                    shell.capture_event();
+                    return;
+                }
+                // Press ownership, not current hover, routes release. This is
+                // essential for right/middle application-mouse gestures: they
+                // never arm text dragging, but moving outside the pane before
+                // release must still deliver the matching button-up.
+                if !owns_mouse_release(
+                    &state.published_presses,
+                    state.dragging,
+                    state.scrollbar_dragging,
+                    button,
+                ) {
+                    return;
+                }
+                state.published_presses[button.slot()] = false;
+                if button == MouseButton::Left {
+                    if state.scrollbar_dragging {
+                        state.scrollbar_dragging = false;
+                        return;
+                    }
+                    // Only a press that armed the drag pipeline emits a
+                    // Release. A consumed block press never sets `dragging`,
+                    // so no Release (and no selection copy) follows it.
+                    if !state.dragging {
+                        return;
+                    }
+                    state.dragging = false;
+                }
+                let pos = cursor.position().unwrap_or(Point::new(bounds.x, bounds.y));
+                let (col, row) = self.cell_at(pos, bounds);
+                shell.publish(on_mouse(MouseInput::Release { col, row, button }));
+            }
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                let Some(pos) = cursor.position_over(bounds) else {
+                    return;
+                };
+                let (dy, precise) = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => (*y, false),
+                    mouse::ScrollDelta::Pixels { y, .. } => {
+                        (*y / self.metrics.cell_h.max(1.0), true)
+                    }
+                };
+                if dy == 0.0 || !dy.is_finite() {
+                    return;
+                }
+                let (col, row) = self.cell_at(pos, bounds);
+                let block_row = self.blocks.get(row);
+                let grid_top = bounds.y + self.metrics.padding;
+                let grid_bottom = grid_top
+                    + self
+                        .grid
+                        .len()
+                        .saturating_sub(usize::from(self.canvas.head)) as f32
+                        * self.metrics.cell_h;
+                let grid_left = bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
+                let grid_width = self
+                    .grid
+                    .first()
+                    .map_or(0.0, |cells| cells.len() as f32 * self.metrics.cell_w);
+                let scrollbar_left = self
+                    .scrollbar_geometry(bounds)
+                    .map_or(bounds.x + bounds.width, |(_, _, x, _, _)| x);
+                let app_eligible = app_mouse_surface_eligible(
+                    pos.y >= grid_top && pos.y < grid_bottom,
+                    pos.x >= grid_left && pos.x < (grid_left + grid_width).min(scrollbar_left),
+                    self.app_mouse_full_grid,
+                    block_row.is_some_and(|block| block.app_eligible),
+                );
+                if !self.ctrl && !(self.canvas_app_mouse && app_eligible && !self.shift) {
+                    if let Some(scroll) = &self.on_canvas_scroll {
+                        tree.state.downcast_mut::<State>().scroll_accum = 0.0;
+                        shell.publish(scroll(f64::from(dy), precise));
+                        shell.request_redraw();
+                        shell.capture_event();
+                        return;
+                    }
+                }
+                // Alternate-screen/mouse-reporting applications keep their
+                // terminal protocol's whole-line wheel reports.
+                let state = tree.state.downcast_mut::<State>();
+                if state.scroll_accum != 0.0 && (dy > 0.0) != (state.scroll_accum > 0.0) {
+                    state.scroll_accum = 0.0;
+                }
+                state.scroll_accum += dy;
+                let whole = state.scroll_accum.trunc();
+                if whole == 0.0 {
+                    shell.capture_event();
+                    return;
+                }
+                state.scroll_accum -= whole;
+                shell.publish(on_mouse(MouseInput::Wheel {
+                    col,
+                    row,
+                    up: whole > 0.0,
+                    ctrl: self.ctrl,
+                    shift: self.shift,
+                    lines: whole.abs() as usize,
+                    app_eligible,
+                }));
+                shell.capture_event();
+            }
+            _ => {}
+        }
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        _theme: &iced::Theme,
+        _style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        let Some(surface_clip) = bounds.intersection(viewport) else {
+            return;
+        };
+        renderer.with_layer(surface_clip, |renderer| {
+            let default_bg = self
+                .dynamic_bg
+                .map(|(r, g, b)| Color::from_rgb8(r, g, b))
+                .unwrap_or_else(|| self.theme.terminal_background());
+            // Whole-widget background. At full opacity this is the classic opaque
+            // fill. Below 1.0 the app-level style already clears the surface with
+            // the translucent theme background, so repainting it here would stack
+            // two alpha layers and defeat the transparency; only a per-pane OSC 11
+            // override still needs its own (equally translucent) fill.
+            if self.opacity >= 1.0 {
+                renderer.fill_quad(solid_quad(bounds), Background::Color(default_bg));
+            } else if self.dynamic_bg.is_some() {
+                renderer.fill_quad(
+                    solid_quad(bounds),
+                    Background::Color(Color {
+                        a: self.opacity,
+                        ..default_bg
+                    }),
+                );
+            }
+        });
+        let Some(clip) = self.canvas_content_bounds(bounds).intersection(viewport) else {
+            return;
+        };
+        // Independent clips preserve the fixed Chat composer. History ink may
+        // move beneath it but can never overpaint its text or submit target.
+        let dock = self
+            .canvas
+            .dock_start
+            .filter(|_| self.canvas.head)
+            .map(|row| self.row_y(bounds, row))
+            .filter(|y| *y > clip.y && *y < clip.y + clip.height);
+        if let Some(y) = dock {
+            for region in [
+                Rectangle {
+                    height: y - clip.y,
+                    ..clip
+                },
+                Rectangle {
+                    y,
+                    height: clip.y + clip.height - y,
+                    ..clip
+                },
+            ] {
+                renderer.with_layer(region, |renderer| {
+                    self.paint_canvas_surface(tree, renderer, bounds, cursor, viewport, region);
+                });
+            }
+        } else {
+            renderer.with_layer(clip, |renderer| {
+                self.paint_canvas_surface(tree, renderer, bounds, cursor, viewport, clip);
+            });
+        }
+        renderer.with_layer(surface_clip, |renderer| {
+            self.paint_scrollbar(renderer, bounds)
+        });
+    }
 
     fn mouse_interaction(
         &self,
@@ -5485,7 +5672,7 @@ where
         viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        if let Some(p) = cursor.position_over(layout.bounds()) {
+        if let Some(p) = cursor.position_over(self.canvas_content_bounds(layout.bounds())) {
             if self.on_chat_submit.is_some()
                 && self
                     .chat_submit_geometry(layout.bounds(), viewport)
@@ -5778,6 +5965,155 @@ mod mode_gesture_tests {
         OwnedMouse(usize, MouseInput),
         Summary,
         Submit,
+        CanvasScroll(f64, bool),
+        CanvasPause,
+    }
+
+    #[test]
+    fn canvas_native_widget_preserves_pixels_and_same_row_pointer_geometry() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = Theme::default();
+        let mut motion = crate::transcript_canvas::TranscriptCanvas::default();
+        motion.reconcile(4, 100, 8);
+        motion.applied(4);
+        motion.scroll(0.375, true, Instant::now());
+        let mut widget = fixture(&projection, &theme, TerminalMode::Block, 0).transcript_canvas(
+            &motion,
+            true,
+            false,
+            Output::CanvasScroll,
+            || Output::CanvasPause,
+        );
+        let mut retained = tree(&widget);
+        let bounds = Rectangle::with_size(Size::new(600.0, 150.0));
+        let point = Point::new(60.0, widget.row_y(bounds, 3) + 1.0);
+        let pixel = send(
+            &mut widget,
+            &mut retained,
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Pixels { x: 0.0, y: 0.25 },
+            }),
+            point,
+        );
+        assert!(
+            matches!(pixel.as_slice(), [Output::CanvasScroll(rows, true)] if (*rows - 0.25 / widget.metrics.cell_h as f64).abs() < 1e-7)
+        );
+        let press = send(&mut widget, &mut retained, press(), point);
+        assert!(matches!(
+            press.as_slice(),
+            [
+                Output::CanvasPause,
+                Output::Mouse(MouseInput::Press { row: 3, .. })
+            ]
+        ));
+        let row_y = widget.row_y(bounds, 3);
+        let segment = BlockCardSegment {
+            group: 1,
+            start_row: 3,
+            end_row: 5,
+            kind: BlockCardKind::Finished,
+            real_top: true,
+            real_bottom: true,
+            selected: false,
+            selection_active: false,
+            stripe: None,
+            stripe_strong: false,
+        };
+        let card = widget.card_geometry(bounds, segment);
+        assert!((card.body.y - (row_y + BLOCK_CARD_EDGE_GAP)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn canvas_native_widget_clips_overscan_to_grid_and_keeps_visible_hit_rows_exact() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = Theme::default();
+        let bounds = Rectangle::new(Point::new(13.0, 17.0), Size::new(600.0, 170.0));
+        for fraction in [0.0, 0.375] {
+            let mut motion = crate::transcript_canvas::TranscriptCanvas::default();
+            motion.reconcile(4, 100, 8);
+            motion.applied(4);
+            motion.scroll(fraction, true, Instant::now());
+            let mut widget = fixture(&projection, &theme, TerminalMode::Block, 0)
+                .transcript_canvas(&motion, true, false, Output::CanvasScroll, || {
+                    Output::CanvasPause
+                });
+            widget.metrics.padding = 8.0;
+            widget.metrics.cell_h = 20.0;
+            let clip = widget.canvas_content_bounds(bounds);
+            assert_eq!(clip.y, bounds.y + 8.0);
+            assert_eq!(clip.height, 7.0 * 20.0);
+            assert!(!clip.contains(Point::new(60.0, clip.y - 0.5)));
+            let head = Rectangle {
+                y: widget.row_y(bounds, 0),
+                height: 20.0,
+                ..clip
+            };
+            if fraction == 0.0 {
+                assert!(head.intersection(&clip).is_none());
+                assert_eq!(widget.cell_at(Point::new(60.0, clip.y + 0.5), bounds).1, 1);
+            } else {
+                let visible = head
+                    .intersection(&clip)
+                    .expect("fractional head is visible");
+                assert!((visible.height - 7.5).abs() < 1e-5);
+                assert_eq!(
+                    widget
+                        .cell_at(Point::new(60.0, visible.center_y()), bounds)
+                        .1,
+                    0
+                );
+            }
+            for row in 1..7 {
+                let p = Point::new(60.0, widget.row_y(bounds, row) + 1.0);
+                assert!(clip.contains(p));
+                assert_eq!(widget.cell_at(p, bounds).1, row);
+            }
+        }
+    }
+
+    #[test]
+    fn canvas_native_widget_requests_frames_only_during_motion() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = Theme::default();
+        let mut motion = crate::transcript_canvas::TranscriptCanvas::default();
+        motion.reconcile(0, 100, 8);
+        let now = Instant::now();
+        motion.scroll(3.0, false, now);
+        let mut widget = fixture(&projection, &theme, TerminalMode::Block, 0).transcript_canvas(
+            &motion,
+            true,
+            false,
+            Output::CanvasScroll,
+            || Output::CanvasPause,
+        );
+        let mut retained = tree(&widget);
+        let event = Event::Window(iced::window::Event::RedrawRequested(now));
+        let (messages, redraw) = send_with_redraw(
+            &mut widget,
+            &mut retained,
+            event.clone(),
+            Point::new(30.0, 20.0),
+        );
+        assert!(
+            messages.is_empty(),
+            "drawing must not synchronously invalidate its own layout"
+        );
+        assert_eq!(redraw, iced::window::RedrawRequest::NextFrame);
+        motion.advance(now + std::time::Duration::from_secs(1));
+        let mut settled = fixture(&projection, &theme, TerminalMode::Block, 0).transcript_canvas(
+            &motion,
+            true,
+            false,
+            Output::CanvasScroll,
+            || Output::CanvasPause,
+        );
+        let (messages, redraw) =
+            send_with_redraw(&mut settled, &mut retained, event, Point::new(30.0, 20.0));
+        assert!(messages.is_empty());
+        assert_eq!(redraw, iced::window::RedrawRequest::Wait);
     }
 
     fn fixture<'a>(
@@ -5827,9 +6163,18 @@ mod mode_gesture_tests {
         event: Event,
         point: Point,
     ) -> Vec<Output> {
+        send_with_redraw(widget, tree, event, point).0
+    }
+    fn send_with_redraw(
+        widget: &mut TermWidget<'_, Output>,
+        tree: &mut Tree,
+        event: Event,
+        point: Point,
+    ) -> (Vec<Output>, iced::window::RedrawRequest) {
         let bounds = Rectangle::with_size(Size::new(600.0, 150.0));
         let node = layout::Node::new(bounds.size());
         let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
         <TermWidget<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
             widget,
             tree,
@@ -5838,10 +6183,11 @@ mod mode_gesture_tests {
             mouse::Cursor::Available(point),
             &(),
             &mut iced::advanced::clipboard::Null,
-            &mut Shell::new(&mut messages),
+            &mut shell,
             &bounds,
         );
-        messages
+        let redraw = shell.redraw_request();
+        (messages, redraw)
     }
     fn press() -> Event {
         Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
