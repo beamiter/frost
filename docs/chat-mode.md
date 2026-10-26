@@ -21,7 +21,8 @@ Chat is a new presentation of the same running shell and PTY:
 - At a proven shell prompt, the original terminal cells are docked at the bottom.
   History scrolls independently while the draft and cursor remain in the dock.
 - The optional ASCII companion remains local and uses the existing state/motion
-  controls. Its status occupies host-owned display rows outside terminal text.
+  controls. One window-owned body follows the active composer in safe blank space;
+  no per-pane companion status rows are inserted and inactive splits draw no copy.
 - The up-arrow sends the existing native Enter encoding once, after checking the
   current parser state, pane, projection, and actual foreground shell. Keyboard Enter,
   Tab, multiline editing, IME, paste, Ctrl-C and EOF still use their normal path.
@@ -60,7 +61,7 @@ Extremely tall drafts and shared-row prompt boundaries retain the native surface
 Chat changes neither PTY row/column counts nor the bytes sent by normal input.
 It applies a reversible display projection. Real cells retain stable raw origins
 for selection, copy, search, links, images and application mouse reports; host
-spacing, the companion and the submit footer have no terminal origin. Source
+spacing and the submit footer have no terminal origin. The companion is paint-only. Source
 indices for the independently scrolled transcript and fixed dock are stored
 separately. Selection stays within the transcript or composer, so dragging
 across their separator cannot silently copy intervening off-screen history,

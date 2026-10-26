@@ -1,6 +1,7 @@
 use crate::theme::ThemeExt as _;
 pub(crate) use jterm_core::char_width;
 use jterm_core::click_cursor;
+use jterm_core::organism_companion::{CompanionIntent, CompanionSurface};
 use jterm_core::pane_layout::{
     self, collect_pane_rects, directional_focus_target, equalize_shares, normalized_shares,
     set_divider_share, split_node_rect, Axis, DividerId, PaneDirection, PaneRect, PaneTree,
@@ -213,21 +214,6 @@ impl OrganismLayout {
     }
 }
 
-/// Preserve the established 220-unit expanded minimum and 640-unit status
-/// threshold. The native card may show details before the crowded status row
-/// fits; its body and collapse control have priority. Iced logical units.
-fn native_status_rows(enabled: bool, expanded: bool, cell_height: f32) -> usize {
-    if !enabled {
-        return 0;
-    }
-    if !expanded {
-        return 1;
-    }
-    ((3.0 * cell_height + 28.0) / cell_height.max(1.0))
-        .ceil()
-        .clamp(3.0, 8.0) as usize
-}
-
 /// Card admission uses the same visible pane width as the terminal renderer.
 fn organism_card_width(
     panes: &[PaneRect],
@@ -269,12 +255,17 @@ fn organism_host_layout(
 }
 
 fn organism_layout(width: f32, enabled: bool, expanded: bool, bottom_bar: bool) -> OrganismLayout {
-    let enabled = enabled && bottom_bar && width.is_finite();
-    let glyph = enabled && width >= ORGANISM_STATUS_MIN_WIDTH;
-    let body =
-        enabled && expanded && width >= COMPANION_BODY_WIDTH + 2.0 * COMPANION_HORIZONTAL_PADDING;
+    let surface = CompanionSurface::choose(
+        enabled,
+        true,
+        bottom_bar && width.is_finite(),
+        false,
+        expanded && width >= COMPANION_BODY_WIDTH + 2.0 * COMPANION_HORIZONTAL_PADDING,
+        width >= ORGANISM_STATUS_MIN_WIDTH,
+    );
+    let body = surface == CompanionSurface::Body;
     OrganismLayout {
-        glyph,
+        glyph: surface == CompanionSurface::Compact,
         body,
         explanation: body && width >= COMPANION_CARD_DETAILS_MIN_WIDTH,
     }
@@ -372,9 +363,6 @@ fn organism_settings_hint(
         return organism::expanded_companion_hint(false);
     }
     let layout = organism_layout(width, enabled, expanded, bottom_bar);
-    if layout.body && !layout.glyph {
-        return "This width shows the companion card with a collapse arrow, but no live hover target or status glyph. When idle, use Greet companion in the command palette. Preview Say hello is separate.";
-    }
     if !layout.presentable() {
         return if organism_layout(width, enabled, true, bottom_bar).body {
             "Use the status-bar arrow to reopen the companion card. This width has no room for the status glyph or live hover target."
@@ -5074,6 +5062,9 @@ enum Message {
     SetOrganismExpanded(bool),
     SetOrganismMotion(organism::MotionChoice),
     SetOrganismPose(organism::Pose),
+    OrganismCompanion(CompanionIntent),
+    SetOrganismCareReminders(bool),
+    OrganismCareSnooze,
     OrganismPreviewAction(organism_preview::PreviewRequest),
     OrganismTick(organism_wake_plan::WakeCause),
     OrganismSystemMotion(organism_system_motion::Event),
@@ -5760,14 +5751,9 @@ impl Session {
         projection_policy.set_chat(config.is_chat_mode());
         // Native metadata headers plus card-edge insets provide separation;
         // a full synthetic terminal row between cards is unnecessary.
-        projection_policy.set_native_chrome(
-            true,
-            native_status_rows(
-                config.ascii_organism_enabled,
-                config.ascii_organism_expanded,
-                Metrics::new(config.font_size, config.line_spacing, config.padding, true).cell_h,
-            ),
-        );
+        // The companion is a window-owned body. A synthetic status card in
+        // every pane would clone it and consume terminal transcript space.
+        projection_policy.set_native_chrome(true, 0);
         let mut projection_view_state = ProjectionViewState::new();
         let projection = terminal.get_projected_viewport_with_state(
             config.is_card_mode(),
@@ -7537,6 +7523,8 @@ impl Frost {
         }
         self.organism
             .set_enabled(self.config.ascii_organism_enabled);
+        self.organism
+            .set_care_reminders(self.config.ascii_organism_care_enabled);
         if self.config.ascii_organism_enabled {
             for sess in &self.sessions {
                 if !sess.managed_remote && !sess.transcript_read_only() {
@@ -7590,14 +7578,7 @@ impl Frost {
                 .set_max_scrollback(self.config.scrollback_lines);
             sess.terminal
                 .set_disable_alt_screen(self.config.disable_alt_screen);
-            let chrome_changed = sess.projection_policy.set_native_chrome(
-                true,
-                native_status_rows(
-                    self.config.ascii_organism_enabled,
-                    self.config.ascii_organism_expanded,
-                    self.metrics.cell_h,
-                ),
-            );
+            let chrome_changed = sess.projection_policy.set_native_chrome(true, 0);
             if projection_mode_changed || chrome_changed {
                 sess.refresh();
             }
@@ -16245,6 +16226,8 @@ impl Frost {
         self.sync_organism_attention_owner();
         self.organism
             .set_enabled(self.config.ascii_organism_enabled);
+        self.organism
+            .set_care_reminders(self.config.ascii_organism_care_enabled);
         if self.organism_observation_owner().is_none() {
             self.organism.pause_clock();
             self.organism_pointer_buttons.clear();
@@ -20127,6 +20110,26 @@ impl Frost {
                 self.config_dirty = true;
             }
             Message::SetOrganismPose(pose) => self.organism.select_pose(pose),
+            Message::OrganismCompanion(intent) => {
+                if self.config.ascii_organism_enabled && self.organism_preview_visible() {
+                    let owner = self.sessions.get(self.active).map(|session| session.id);
+                    let running = self
+                        .sessions
+                        .get(self.active)
+                        .is_some_and(|session| session.terminal.is_command_running());
+                    self.organism.talk(intent, owner, running);
+                }
+            }
+            Message::SetOrganismCareReminders(enabled) => {
+                self.config.ascii_organism_care_enabled = enabled;
+                self.config_dirty = true;
+                self.organism.set_care_reminders(enabled);
+            }
+            Message::OrganismCareSnooze => {
+                if self.organism_preview_visible() {
+                    self.organism.snooze_care();
+                }
+            }
             Message::OrganismPreviewAction(request) => {
                 if self.organism_preview_visible() {
                     self.organism.apply_preview_request(&request);
@@ -20177,9 +20180,8 @@ impl Frost {
             Message::OrganismTick(cause) => {
                 self.organism_wake_counts.record(&cause);
                 if self.config.ascii_organism_enabled {
-                    // Closing a pane removes its life by stable ID. Animation
-                    // needs only the active owner; never rescan/reallocate the
-                    // complete pane set just to retain it on every frame.
+                    // Closing a pane removes only its command context. The
+                    // window's one life and mind follow the active owner.
                     self.organism.observe_work_day(organism_local_day());
                     if let Some(sess) = self.sessions.get(self.active) {
                         if !sess.managed_remote && !sess.transcript_read_only() {
@@ -20212,6 +20214,11 @@ impl Frost {
                 let interaction_owner = self.sessions.get(self.active).map(|session| session.id);
                 let facts = self.organism_attention_facts();
                 self.organism.poll_live_greeting(interaction_owner, facts);
+                let can_offer =
+                    self.organism_care_eligible() && !self.organism.explicit_greeting_active(facts);
+                if let Some(prompt) = self.organism.care_prompt(owner, can_offer) {
+                    self.push_toast(prompt.to_string(), ToastKind::Info);
+                }
             }
             Message::SetBottomBar(show) => {
                 self.config.bottom_bar = show;
@@ -20492,6 +20499,25 @@ impl Frost {
                     sess.cwd_cache = sess.cwd();
                     sess.fg_proc_cache = sess.fg_proc();
                     sess.git_meta_cache = if want_git { sess.git_meta() } else { None };
+                }
+                // The removed per-pane status cards used to keep organism
+                // maintenance alive even while the body was hidden. Reuse
+                // this existing process-cache heartbeat to rediscover the
+                // active local shell after SSH exits, with no new timer and
+                // no background physiology/animation work.
+                if self.config.ascii_organism_enabled && self.focused {
+                    if let Some(sess) = self
+                        .sessions
+                        .get(self.active)
+                        .filter(|sess| !sess.managed_remote && !sess.transcript_read_only())
+                    {
+                        self.organism
+                            .prime_session(sess.id, sess.terminal.is_command_running());
+                        if self.organism.remote_probe_due(sess.id) {
+                            self.organism
+                                .set_remote(sess.id, sess.observed_ssh_command().is_some());
+                        }
+                    }
                 }
                 let remote_follow_task = self.poll_sidebar_remote_follow();
                 self.expire_toasts();
@@ -24620,7 +24646,7 @@ impl Frost {
         self.organism_geometry_epoch = self.organism_geometry_epoch.saturating_add(1);
         let layout = self.organism_layout();
         self.organism.sync_greeting_geometry(
-            !self.config.is_card_mode() && layout.glyph,
+            !self.config.is_card_mode() && layout.presentable(),
             layout.presentable(),
         );
         if !layout.presentable() {
@@ -24773,7 +24799,7 @@ impl Frost {
             hover_available: if self.config.is_card_mode() {
                 self.organism_body_hover_available()
             } else {
-                self.organism_layout().glyph
+                self.organism_layout().presentable()
             },
             activity: self.sessions.get(self.active).map_or(
                 jterm_core::organism_live::LiveActivityKnowledge::Unknown,
@@ -24795,14 +24821,20 @@ impl Frost {
         (if self.config.is_card_mode() {
             self.organism_body_hover_available()
         } else {
-            self.organism_layout().glyph
+            self.organism_layout().presentable()
         }) && self.organism_interaction_eligible()
     }
 
     fn organism_interaction_eligible(&self) -> bool {
+        self.organism_available_for_interaction()
+            && self.organism_effective_motion() != Some(organism::Motion::Static)
+    }
+
+    /// Shared native admission for attention and optional care. Motion only
+    /// controls animation/hover, never whether an explicit text reminder works.
+    fn organism_available_for_interaction(&self) -> bool {
         self.organism_layout().presentable()
             && self.organism_owner().is_some()
-            && self.organism_effective_motion() != Some(organism::Motion::Static)
             && self.organism_pointer_buttons.is_empty()
             && self.dragging_tab.is_none()
             && self.pane_drag.is_none()
@@ -24815,16 +24847,38 @@ impl Frost {
                 .is_some_and(|session| !session.terminal.is_command_running())
     }
 
+    fn organism_care_eligible(&self) -> bool {
+        self.config.ascii_organism_care_enabled
+            && self.organism_available_for_interaction()
+            && (!self.config.is_card_mode() || self.organism_body_hover_available())
+            && self.sessions.get(self.active).is_some_and(|session| {
+                !session.terminal.has_text_selection()
+                    && !session.terminal.is_mouse_enabled()
+                    && session.terminal.preedit_text.is_empty()
+                    && session.terminal.kitty_graphics.get_placements().is_empty()
+                    && matches!(
+                        session.terminal.live_activity_facts().knowledge(),
+                        jterm_core::organism_live::LiveActivityKnowledge::KnownIdle
+                    )
+            })
+    }
+
     fn status_bar(&self) -> Element<'_, Message> {
         let layout = self.organism_layout();
-        let layout = if self.config.is_card_mode() {
-            OrganismLayout {
-                glyph: false,
-                body: false,
-                explanation: false,
-            }
-        } else {
-            layout
+        let surface = CompanionSurface::choose(
+            self.config.ascii_organism_enabled,
+            true,
+            !self.config.is_card_mode()
+                && !self.config_panel_open
+                && self.organism_observation_owner().is_some(),
+            self.organism.is_retreating(),
+            layout.body,
+            layout.glyph,
+        );
+        let layout = OrganismLayout {
+            glyph: surface == CompanionSurface::Compact,
+            body: surface == CompanionSurface::Body,
+            explanation: surface == CompanionSurface::Body && layout.explanation,
         };
         let attention_facts = self.organism_attention_facts();
         let sess = self.sessions.get(self.active);
@@ -24880,8 +24934,7 @@ impl Frost {
                 attention_facts,
             )
         });
-        let presentation =
-            presentation.unwrap_or_else(organism::LivePresentation::passive_presence);
+        let presentation = presentation.unwrap_or_default();
         let companion_color = terminal_view::organism_tone_color(presentation.tone, &self.theme);
         let companion_height = self.organism_strip_height();
         let companion: Element<'_, Message> = if !layout.body || presentation.explanation.is_empty()
@@ -24896,6 +24949,7 @@ impl Frost {
                 .line_height(iced::widget::text::LineHeight::Absolute(16.0.into()))
                 .color(companion_color)
                 .into();
+            let body = self.companion_hover_target(body);
             let detail = layout.explanation.then(|| {
                 let mut header = row![text("ASCII organism")
                     .size(self.effective_font_size())
@@ -24905,9 +24959,9 @@ impl Frost {
                     })]
                 .spacing(8)
                 .align_y(iced::Alignment::Center);
-                // A qualitative life readout stays secondary to real results.
-                // Memory and motion controls remain in the companion settings.
-                if layout.glyph {
+                // The expanded body owns the one surface; its details contain
+                // words only, never a second status-bar avatar.
+                if layout.explanation {
                     header = header.push(Space::new().width(Length::Fill)).push(
                         text(presentation.life)
                             .size(self.effective_font_size())
@@ -24960,11 +25014,10 @@ impl Frost {
             .style(self.chrome_bar_style());
         let mut compact_slot: Option<Element<'_, Message>> = None;
         if layout.glyph {
-            // Keep a still presence in the same slot while live reactions pause.
-            // Typing, focus and pane changes cannot move the status segments.
+            // Compact and expanded surfaces are mutually exclusive. The
+            // tooltip describes this one body without reproducing its sprite.
             let organism::LivePresentation {
                 glyph,
-                sprite,
                 explanation,
                 status,
                 life,
@@ -25004,9 +25057,6 @@ impl Frost {
                 } else {
                     let detail = container(
                         column![
-                            container(text(sprite).font(iced::Font::MONOSPACE).size(13))
-                                .width(Length::Fixed(200.0))
-                                .height(Length::Fixed(72.0)),
                             text(status.into_owned())
                                 .size(self.effective_font_size())
                                 .color(companion_color),
@@ -25024,21 +25074,7 @@ impl Frost {
                     .clip(true);
                     tooltip(slot, detail, tooltip::Position::Top).into()
                 };
-            let slot: Element<'_, Message> = if let Some(id) = self.organism_owner() {
-                // One core offer binds both edges before the next view rebuild.
-                let mut area = mouse_area(slot);
-                if !self.config.is_card_mode() {
-                    if let Some(ticket) = self.organism.live_greeting_offer(id) {
-                        area = area.on_enter(Message::OrganismHoverEnter(id, ticket));
-                    }
-                    if let Some(ticket) = self.organism.live_greeting_exit_reference(id) {
-                        area = area.on_exit(Message::OrganismHoverExit(id, ticket));
-                    }
-                }
-                area.into()
-            } else {
-                slot
-            };
+            let slot = self.companion_hover_target(slot);
             // Separate sibling of the greeting target; never an implicit hello.
             compact_slot = Some(
                 companion_compact_slot(
@@ -25076,6 +25112,25 @@ impl Frost {
             column![companion, bar].into()
         } else {
             bar
+        }
+    }
+
+    /// The selected body or compact glyph shares a single live greeting owner.
+    fn companion_hover_target<'a>(&self, target: Element<'a, Message>) -> Element<'a, Message> {
+        if let Some(id) = self.organism_owner() {
+            // One core offer binds both edges before the next view rebuild.
+            let mut area = mouse_area(target);
+            if !self.config.is_card_mode() {
+                if let Some(ticket) = self.organism.live_greeting_offer(id) {
+                    area = area.on_enter(Message::OrganismHoverEnter(id, ticket));
+                }
+                if let Some(ticket) = self.organism.live_greeting_exit_reference(id) {
+                    area = area.on_exit(Message::OrganismHoverExit(id, ticket));
+                }
+            }
+            area.into()
+        } else {
+            target
         }
     }
 
@@ -25654,10 +25709,9 @@ impl Frost {
     }
 
     /// Drawing can represent Busy/watch while hover still requires shared idle
-    /// admission. There is one body owner and no body in Static/traditional UI.
+    /// admission. Static keeps this same body still, never adds a status clone.
     fn organism_body_owner(&self) -> Option<usize> {
         if !self.config.is_card_mode()
-            || self.organism_effective_motion() == Some(organism::Motion::Static)
             || self.organism_geometry_epoch == u64::MAX
             || !self.organism_pointer_buttons.is_empty()
             || self.dragging_tab.is_some()
@@ -25677,7 +25731,17 @@ impl Frost {
         {
             return None;
         }
-        self.organism_block_key().map(|_| owner)
+        (CompanionSurface::choose(
+            self.config.ascii_organism_enabled,
+            self.sessions
+                .get(self.active)
+                .is_some_and(|s| s.id == owner),
+            self.organism_block_key().is_some(),
+            self.organism.is_retreating(),
+            self.organism_layout().body,
+            false,
+        ) == CompanionSurface::Body)
+            .then_some(owner)
     }
 
     fn organism_body_hover_available(&self) -> bool {
@@ -25903,24 +25967,6 @@ impl Frost {
                     bottom: presentation.bottom,
                 }
             });
-        let status_presentation =
-            (self.config.is_card_mode() && self.config.ascii_organism_enabled).then(|| {
-                if is_active {
-                    self.organism_owner()
-                        .map(|id| {
-                            self.organism.presentation_with_attention(
-                                id,
-                                sess.terminal.is_command_running(),
-                                false,
-                                self.organism_effective_motion(),
-                                self.organism_attention_facts(),
-                            )
-                        })
-                        .unwrap_or_else(organism::LivePresentation::passive_presence)
-                } else {
-                    organism::LivePresentation::passive_presence()
-                }
-            });
         let submit_token = sess.enabled_chat_control(
             chat_mode::ControlKind::Submit,
             self.chat_input_ready(session_id),
@@ -25965,7 +26011,7 @@ impl Frost {
             submit_token.map(Message::ChatSubmit),
         )
         .organism_status(
-            status_presentation,
+            None,
             self.config.ascii_organism_expanded,
             Message::SetOrganismExpanded,
         )
@@ -28003,11 +28049,11 @@ impl Frost {
         column![
             checkbox(self.config.ascii_organism_enabled).text_size(self.effective_font_size()).label("ASCII Organism")
                 .on_toggle(Message::SetAsciiOrganism),
-            text("Local companion. Memory is volatile; it resets when disabled or closed.").size(self.effective_font_size()),
-            checkbox(self.config.ascii_organism_expanded).text_size(self.effective_font_size()).label("Show expanded companion")
+            text("One companion per window. Its personality and life stay with you across panes; closing the window ends this local session.").size(self.effective_font_size()),
+            checkbox(self.config.ascii_organism_expanded).text_size(self.effective_font_size()).label("Expanded companion in Traditional mode")
                 .on_toggle(Message::SetOrganismExpanded),
-            text(if self.config.is_block_mode() && self.config.ascii_organism_enabled {
-                "Block mode keeps the status card between history and current input. Its arrow switches between a full card and one line, independently of the bottom bar. Full wanders in safe blank space; Calm rests; Static shows only this status card."
+            text(if self.config.is_card_mode() && self.config.ascii_organism_enabled {
+                "Block and Chat keep one body in the active card, with no extra status cards in split panes. Full wanders in safe blank space; Calm rests; Static keeps the body still. Typing lets it step out of your way."
             } else { organism_settings_hint(
                 self.win_size.width,
                 self.config.ascii_organism_enabled,
@@ -28022,6 +28068,22 @@ impl Frost {
             text(motion.description()).size(self.effective_font_size()),
             text(motion.interaction_hint()).size(self.effective_font_size()),
             text("Output rhythm reflects observed activity, not command progress.").size(self.effective_font_size()),
+            text("Keep me company").size(self.effective_font_size()),
+            row![
+                button(text("Hello")).on_press_maybe(self.config.ascii_organism_enabled.then_some(Message::OrganismCompanion(CompanionIntent::Hello))),
+                button(text("Company")).on_press_maybe(self.config.ascii_organism_enabled.then_some(Message::OrganismCompanion(CompanionIntent::Company))),
+                button(text("A story")).on_press_maybe(self.config.ascii_organism_enabled.then_some(Message::OrganismCompanion(CompanionIntent::Story))),
+                button(text("A break")).on_press_maybe(self.config.ascii_organism_enabled.then_some(Message::OrganismCompanion(CompanionIntent::Rest))),
+            ].spacing(8).wrap(),
+            text(self.organism.reply()).size(self.effective_font_size()),
+            text(self.organism.temperament_description()).size(self.effective_font_size()).color(self.c_text_dim()),
+            checkbox(self.config.ascii_organism_care_enabled)
+                .text_size(self.effective_font_size()).label("Gentle break reminders")
+                .on_toggle(Message::SetOrganismCareReminders),
+            text("After about 45 minutes of active work, a quiet invitation to drink water, stretch, or look away. Pauses and background panes do not add work time.")
+                .size(self.effective_font_size()),
+            button(text("Remind me later (20 min)"))
+                .on_press_maybe(self.config.ascii_organism_care_enabled.then_some(Message::OrganismCareSnooze)),
             text("Organism Preview").size(self.effective_font_size()),
             text("Pose").size(self.effective_font_size()),
             pick_list(poses, Some(self.organism.pose), Message::SetOrganismPose).text_size(self.effective_font_size()),
@@ -33017,28 +33079,8 @@ impl Frost {
         let live_layout = self.organism_layout();
         let attention_facts = self.organism_attention_facts();
         // Reuse the existing maintenance timer. A scrolled-out/alternate-screen
-        // inline companion owns no cadence when neither status nor body paints.
-        let native_visible = !self.config.is_card_mode()
-            || self.organism_body_hover_available()
-            || self.sessions.get(self.active).is_some_and(|session| {
-                session
-                    .projection
-                    .chat_rows()
-                    .iter()
-                    .any(|row| row.status_line.is_some())
-                    || session.projection.row_kinds().iter().any(|kind| {
-                        matches!(
-                            kind,
-                            terminal::ProjectedRowKind::BlockChrome {
-                                boundary: terminal::ChromeBoundary {
-                                    kind: terminal::ChromeKind::Organism,
-                                    ..
-                                },
-                                ..
-                            }
-                        )
-                    })
-            });
+        // companion owns no cadence while its one body is absent.
+        let native_visible = !self.config.is_card_mode() || self.organism_body_hover_available();
         let live_visible = live_layout.maintenance_eligible(self.focused) && native_visible;
         let effective = self.organism_motion_control.resolution().effective;
         let preview_full = preview_visible
@@ -33093,7 +33135,7 @@ impl Frost {
         }
         if organism_pointer_observation_needed(
             live_visible,
-            live_layout.glyph || (self.config.is_card_mode() && live_layout.presentable()),
+            live_layout.presentable(),
             self.organism.explicit_greeting_active(attention_facts),
             !self.organism_pointer_buttons.is_empty(),
             self.organism_effective_motion(),
@@ -35300,7 +35342,8 @@ mod tests {
             .0;
         assert!(visibility.contains("!self.config.is_card_mode()"));
         assert!(!visibility.contains("self.config.is_chat_mode()"));
-        assert!(visibility.contains("row.status_line.is_some()"));
+        assert!(visibility.contains("self.organism_body_hover_available()"));
+        assert!(!visibility.contains("row.status_line.is_some()"));
         let bytes = encode_key(
             &keyboard::Key::Character("c".into()),
             keyboard::Location::Standard,
@@ -36235,9 +36278,10 @@ mod tests {
         }
         for width in [220.0, 639.99] {
             assert!(organism_settings_hint(width, true, false, true).contains("status-bar arrow"));
-            let body_only = organism_settings_hint(width, true, true, true);
-            assert!(body_only.contains("no live hover target"));
-            assert!(body_only.contains("Preview Say hello is separate"));
+            assert_eq!(
+                organism_settings_hint(width, true, true, true),
+                organism::expanded_companion_hint(true)
+            );
         }
         assert!(organism_settings_hint(640.0, true, false, true).contains("status-bar arrow"));
         assert_eq!(
@@ -36268,7 +36312,7 @@ mod tests {
             assert!(!helper.contains(forbidden));
         }
         let settings = source
-            .split_once("            text(if self.config.is_block_mode()")
+            .split_once("            text(if self.config.is_card_mode()")
             .unwrap()
             .1
             .split_once("            text(\"Organism Motion\")")
@@ -36307,8 +36351,8 @@ mod tests {
             .unwrap()
             .0;
         for gate in [
-            "Some(organism::Motion::Static)",
             "self.organism_owner()?",
+            "CompanionSurface::choose(",
             "has_text_selection()",
             "is_mouse_enabled()",
             "preedit_text",
@@ -36363,7 +36407,7 @@ mod tests {
             .split_once("// One core offer binds both edges")
             .unwrap()
             .1
-            .split_once("                area.into()")
+            .split_once("            area.into()")
             .unwrap()
             .0;
         assert!(status.contains("if !self.config.is_card_mode()"));
@@ -36464,7 +36508,42 @@ mod tests {
     }
 
     #[test]
-    fn inline_organism_mode_expanded_footer_motion_matrix() {
+    fn companion_care_admission_keeps_native_guards_without_excluding_static_motion() {
+        let source = include_str!("main.rs");
+        let shared = source
+            .split_once("    fn organism_available_for_interaction(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_care_eligible(")
+            .unwrap()
+            .0;
+        assert!(shared.contains("self.organism_owner().is_some()"));
+        assert!(shared.contains("self.organism_pointer_buttons.is_empty()"));
+        assert!(shared.contains("!session.terminal.is_command_running()"));
+        assert!(!shared.contains("organism_effective_motion"));
+        let care = source
+            .split_once("    fn organism_care_eligible(")
+            .unwrap()
+            .1
+            .split_once("    fn status_bar(")
+            .unwrap()
+            .0;
+        for guard in [
+            "ascii_organism_care_enabled",
+            "organism_available_for_interaction",
+            "organism_body_hover_available",
+            "has_text_selection",
+            "preedit_text",
+            "KnownIdle",
+        ] {
+            assert!(care.contains(guard), "missing care guard: {guard}");
+        }
+        assert!(!care.contains("organism_effective_motion"));
+        assert!(!care.contains("organism_interaction_eligible"));
+    }
+
+    #[test]
+    fn companion_layout_never_has_two_bodies_in_any_mode_or_motion() {
         for block in [false, true] {
             for expanded in [false, true] {
                 for bottom in [false, true] {
@@ -36475,15 +36554,15 @@ mod tests {
                     ] {
                         let layout = organism_host_layout(900.0, true, expanded, bottom, block);
                         assert_eq!(layout.presentable(), block || bottom);
+                        assert!(!(layout.body && layout.glyph));
                         if block {
                             assert!(!layout.glyph, "Block mode never duplicates the footer slot");
-                            assert_eq!(
-                                native_status_rows(true, expanded, 18.0),
-                                if expanded { 5 } else { 1 }
+                            assert!(
+                                layout.body,
+                                "Static keeps the same body, without a second card"
                             );
                             let moving = motion == organism::Motion::Full;
-                            let body = motion != organism::Motion::Static;
-                            assert!(!moving || body);
+                            assert!(!moving || layout.body);
                         } else {
                             assert_eq!(layout.body, bottom && expanded);
                         }
@@ -36491,8 +36570,34 @@ mod tests {
                 }
             }
         }
-        assert_eq!(native_status_rows(false, true, 18.0), 0);
         assert!(!organism_host_layout(120.0, true, true, false, true).presentable());
+    }
+
+    #[test]
+    fn block_and_chat_companion_do_not_insert_per_pane_status_rows() {
+        for chat in [false, true] {
+            let mut terminal = TerminalState::new(80, 24);
+            terminal.process_input(
+                b"\x1b]133;A\x07$ \x1b]133;B\x07echo one\r\n\x1b]133;C\x07one\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07",
+            );
+            let mut policy = ProjectionPolicy::new();
+            policy.set_chat(chat);
+            policy.set_native_chrome(true, 0);
+            let projection = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+            assert!(!projection.row_kinds().iter().any(|row| matches!(
+                row,
+                terminal::ProjectedRowKind::BlockChrome { boundary, .. }
+                    if boundary.kind == terminal::ChromeKind::Organism
+            )));
+            assert!(projection
+                .chat_rows()
+                .iter()
+                .all(|row| row.status_line.is_none()));
+            assert!(projection
+                .row_kinds()
+                .iter()
+                .any(|row| matches!(row, terminal::ProjectedRowKind::Raw)));
+        }
     }
 
     #[test]
@@ -36515,7 +36620,7 @@ mod tests {
         assert_eq!(
             organism_layout(640.0, true, true, true),
             OrganismLayout {
-                glyph: true,
+                glyph: false,
                 body: true,
                 explanation: true,
             }
@@ -36773,7 +36878,7 @@ mod tests {
             .split_once("    fn organism_effective_motion(")
             .unwrap()
             .0;
-        assert!(sync.contains("!self.config.is_card_mode() && layout.glyph"));
+        assert!(sync.contains("!self.config.is_card_mode() && layout.presentable()"));
         assert!(sync.contains("layout.presentable()"));
         assert!(sync.contains("self.organism_geometry_epoch"));
         assert!(!sync.contains("enter_live_greeting"));
@@ -36873,7 +36978,7 @@ mod tests {
     }
 
     #[test]
-    fn passive_companion_does_not_expand_live_admission_or_add_wakes() {
+    fn unavailable_companion_has_no_passive_clone_or_extra_wakes() {
         let source = include_str!("main.rs");
         let bar = source
             .split_once("    fn status_bar(&self)")
@@ -36882,11 +36987,13 @@ mod tests {
             .split_once("    /// One-line offer")
             .unwrap()
             .0;
-        assert!(bar
-            .contains("presentation.unwrap_or_else(organism::LivePresentation::passive_presence)"));
+        assert!(bar.contains("presentation.unwrap_or_default()"));
+        assert!(!bar.contains("LivePresentation::passive_presence"));
+        assert!(bar.contains("CompanionSurface::choose("));
+        assert!(bar.contains("!self.config_panel_open"));
+        assert!(bar.contains("self.organism_observation_owner().is_some()"));
         assert!(bar.contains("if explanation.is_empty() || !self.terminal_input_active()"));
-        assert!(bar
-            .contains("let slot: Element<'_, Message> = if let Some(id) = self.organism_owner()"));
+        assert!(bar.contains("let slot = self.companion_hover_target(slot)"));
         assert_eq!(
             bar.matches(".on_enter(Message::OrganismHoverEnter(")
                 .count(),
@@ -37005,7 +37112,7 @@ mod tests {
     }
 
     #[test]
-    fn live_sprite_detail_keeps_passive_presence_separate_from_live_owner_gate() {
+    fn live_sprite_detail_describes_the_owner_without_another_sprite() {
         let source = include_str!("main.rs");
         let bar = source.split_once("    fn status_bar(&self)").unwrap().1;
         let slot = bar
@@ -37013,14 +37120,14 @@ mod tests {
             .unwrap()
             .1;
         let slot = slot
-            .split_once("            let slot: Element<'_, Message> = if let Some(id)")
+            .split_once("            let slot = self.companion_hover_target(slot)")
             .unwrap()
             .0;
-        assert!(slot
-            .contains("presentation.unwrap_or_else(organism::LivePresentation::passive_presence)"));
+        assert!(slot.contains("presentation.unwrap_or_default()"));
         assert!(slot.contains("if explanation.is_empty() || !self.terminal_input_active()"));
         assert!(slot.contains("Length::Fixed(64.0)"));
-        assert!(slot.contains("text(sprite).font(iced::Font::MONOSPACE)"));
+        assert!(!slot.contains("text(sprite).font(iced::Font::MONOSPACE)"));
+        assert!(slot.contains("text(status.into_owned())"));
         assert!(slot.contains(".max_height(220.0)"));
         assert!(slot.contains("tooltip(slot, detail, tooltip::Position::Top)"));
         assert!(!slot.contains("on_press"));
@@ -44864,7 +44971,7 @@ mod tests {
             .split_once("// One core offer binds both edges before the next view rebuild.")
             .unwrap()
             .1
-            .split_once("                area.into()")
+            .split_once("            area.into()")
             .unwrap()
             .0;
         assert!(view.contains("live_greeting_offer(id)"));

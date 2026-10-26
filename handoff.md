@@ -1,5 +1,54 @@
 # Engineering handoff
 
+## 2026-10-26 — one window-owned ASCII companion
+
+- Frost now has one window-owned life, ambient mind, personality, story cursor
+  and optional care clock. Pane contexts retain command/repository evidence;
+  selecting or closing a pane moves the same companion. Toggling visibility
+  preserves life and voice while retiring stale command admission. Personality
+  uses a stable hash of the configuration path; no path is retained by the
+  voice. Window closure still ends the volatile life/story session. Cross-GUI,
+  four-terminal and JWM migration remain future work.
+- Block/Chat no longer insert synthetic organism status rows into every pane.
+  Only the active eligible card paints a body. Traditional mode chooses either
+  the expanded body or the compact glyph through the shared surface arbiter;
+  tooltips contain words only. Opening the settings preview withdraws the live
+  body. Static uses this same body with animation and hover greetings disabled.
+  Existing typing, selection, clipping, image, remote, read-only, alternate
+  screen, native input and Vim geometry guards remain in place. The existing
+  process-cache heartbeat rechecks the active shell after SSH exits, so removal
+  of passive status cards cannot strand the companion in a hidden state.
+- Settings offer local Hello / Company / A story / A break replies through the
+  shared core. No shell execution, terminal-output collection or LLM calls are
+  involved. A break clears accrued care time and quiets reminders for 20 minutes.
+  The persistent `ascii_organism_care_enabled` setting defaults to false. Care
+  uses foreground local activity with recent human input and the existing
+  heartbeat, delivers text-only toasts in an eligible idle surface, and supports
+  a 20-minute defer action. Its admission is separate from animation admission,
+  so explicitly enabled reminders also work in Static.
+- Final binary regression: `CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0
+  CARGO_BUILD_JOBS=4 RUSTFLAGS='-C codegen-units=1' cargo test --locked --bin frost
+  --offline -- --quiet` passed: **1920 passed, 0 failed, 3 ignored**, 85.81 seconds.
+  The single-codegen-unit flag works around this environment's Rust 1.99.1
+  proc-macro archive/linker issue; no toolchain or dependency override was added.
+- Final compile check: `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
+  CARGO_BUILD_JOBS=4 cargo check --locked --bin frost --offline` passed in
+  1m 24s. Only the pre-existing vendored `clipboard_x11`/`iced_winit`
+  deprecation warnings were emitted. `cargo fmt --all -- --check` and
+  `git diff --check` passed.
+- Regression coverage includes life/voice continuity across pane closure and
+  visibility toggles, owner-only ambient changes, context-aware read-only talk,
+  shared care time across panes, background/output exclusion, Rest semantics,
+  opt-in TOML roundtrip, the Full/Calm/Static surface matrix, and real terminal
+  Block/Chat projections without organism rows. A four-pane test exercises the
+  CPU-side native Iced `TermWidget::painted_organism_geometry` path and withdrawal
+  of retained old geometry; **it is not an actual GPU/Wayland window test**.
+  No user application was installed, restarted or modified outside this checkout.
+- Shared companion API is supplied by bundled core revision
+  `90eec597ab93450f7d5ef7a2d8ae392552c59c84`. Current-run evidence is under
+  `/workspace/scratch/e18f0e9b4d44/validation/frost-*`; the binary-test log preserves
+  the actual command and final output excerpt, not a full stdout capture.
+
 ## 2026-10-26 — native pointer and guides on wrapped rows (shared core)
 
 - The bundled core keeps `native_pointer` in wrapped splits, so clicks and

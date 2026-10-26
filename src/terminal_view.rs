@@ -2482,6 +2482,34 @@ mod tests {
     }
 
     #[test]
+    fn one_companion_geometry_moves_between_four_panes_without_leaving_a_body() {
+        // Exercise the same geometry path used by native draw, including a
+        // retained old body in a pane that just lost focus. No window or GPU
+        // is needed to prove that the old primitive is withdrawn.
+        for active in [0, 3, 1, 2, 0] {
+            let mut bodies = 0;
+            for pane in 0..4 {
+                with_native_body(|widget, bounds| {
+                    let old = widget.organism_geometry(bounds, &bounds).unwrap();
+                    widget.focused = pane == active;
+                    let visible =
+                        widget.painted_organism_geometry(bounds, &bounds, Some(&old), 0, None);
+                    assert_eq!(visible.is_some(), pane == active);
+                    bodies += usize::from(visible.is_some());
+                });
+            }
+            assert_eq!(bodies, 1);
+        }
+        with_native_body(|widget, bounds| {
+            let old = widget.organism_geometry(bounds, &bounds).unwrap();
+            widget.organism_body = None;
+            assert!(widget
+                .painted_organism_geometry(bounds, &bounds, Some(&old), 0, None)
+                .is_none());
+        });
+    }
+
+    #[test]
     fn native_body_geometry_uses_current_projection_and_real_card() {
         with_native_body(|widget, bounds| {
             let geometry = widget.organism_geometry(bounds, &bounds).unwrap();

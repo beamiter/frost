@@ -20,6 +20,7 @@ use jterm_core::organism::{
     classify_command, sprite_frame_with_context, sticky_glyph_with_context, AmbientMind, Behavior,
     BodyLanguage, CircadianPhase, LifeState, NativeOrganism, RenderContext, RepoVigil, Tone,
 };
+use jterm_core::organism_companion::{CompanionCare, CompanionIntent, CompanionVoice};
 use jterm_core::organism_daily::{GentleInteraction, PreviewPose};
 use serde::{Deserialize, Serialize};
 
@@ -108,7 +109,7 @@ impl MotionChoice {
     pub fn interaction_hint(self) -> &'static str {
         match self {
             Self::Static => "Hover greetings are unavailable in Static.",
-            _ => "While idle, hover over the live body in the active Block (the status-bar glyph outside Block mode) for 600 ms to say hello. Typing or busy work cancels it. One greeting per visit, with an 8-second cooldown.",
+            _ => "While idle, hover over the companion's visible body or compact glyph for 600 ms to say hello. Typing or busy work cancels it. One greeting per visit, with an 8-second cooldown.",
         }
     }
 
@@ -144,9 +145,9 @@ impl fmt::Display for MotionChoice {
 
 pub fn expanded_companion_hint(bottom_bar: bool) -> &'static str {
     if bottom_bar {
-        "In Block mode, the status card sits between history and the active input card. Traditional mode reserves a fixed-height strip above the bottom bar. Narrow windows prioritize the body and collapse arrow. A still companion remains when live reactions pause. Use the inline arrow in Block mode, or the status-bar arrow in traditional mode, to collapse or expand; hover the glyph in a wider window for details. In Block mode, the live body uses only complete empty space inside the focused active card; typing, clipping or insufficient room hides it. Full wanders only while idle/exploring, hover pauses movement, and Calm keeps a still body; Static shows only the status card."
+        "One companion follows the active pane. Block and Chat place its body in safe empty space inside the active card; typing, clipping or insufficient room hides it. Full wanders while idle, Calm rests, and Static keeps the same body still. Traditional mode shows either the expanded body or its compact status glyph. Details and tooltips never add another body."
     } else {
-        "Traditional mode needs Bottom status bar (cwd, git, last command) to show the companion. Block mode keeps its inline status card independently."
+        "Traditional mode needs Bottom status bar (cwd, git, last command) to show the companion. Block and Chat keep one body in the active card independently."
     }
 }
 
@@ -169,13 +170,12 @@ struct CompletionFeedback {
     tone: Tone,
 }
 
-struct SessionLife {
+struct SessionContext {
     native: NativeOrganism,
     /// Volatile command-scoped cwd, bounded independently of terminal history.
     work_context: Option<String>,
     /// Fresh idle-directory evidence matches the command-at-start scope.
     work_context_current: bool,
-    ambient: AmbientMind,
     context: RenderContext,
     /// A command already running when enabled is deliberately not replayed.
     accept_completion: bool,
@@ -187,13 +187,12 @@ struct SessionLife {
     next_remote_probe: Instant,
 }
 
-impl SessionLife {
-    fn new(id: usize, running: bool, now: Instant) -> Self {
+impl SessionContext {
+    fn new(running: bool, now: Instant) -> Self {
         Self {
             native: NativeOrganism::from_persisted_state(LifeState::default()),
             work_context: None,
             work_context_current: false,
-            ambient: AmbientMind::seeded(id as u64),
             context: PreviewPose::Calm.context(),
             accept_completion: !running,
             quarantine_batch: true,
@@ -269,6 +268,7 @@ pub struct LivePresentation {
 impl LivePresentation {
     /// Paint-only fallback for reserved chrome, never evidence of shell idleness.
     /// No owner, live facts, physiology, or animation clock is consulted here.
+    #[cfg(test)]
     pub fn passive_presence() -> Self {
         let context = PreviewPose::Calm.context();
         Self {
@@ -348,9 +348,15 @@ pub struct CommandCompletion<'a> {
 pub struct Organism {
     agent_pulses: AgentPulseTracker,
     enabled: bool,
-    sessions: HashMap<usize, SessionLife>,
+    sessions: HashMap<usize, SessionContext>,
     born: Instant,
     life: WindowLife,
+    /// A pane owns work observations, never a separate mind or personality.
+    ambient: AmbientMind,
+    voice: CompanionVoice,
+    reply: &'static str,
+    care: CompanionCare,
+    last_human_input: Option<Duration>,
     work_day: Option<i64>,
     retreat_until: Instant,
     pub pose: Pose,
@@ -367,12 +373,21 @@ pub struct Organism {
 impl Default for Organism {
     fn default() -> Self {
         let now = Instant::now();
+        let seed = crate::config::Config::config_path().ok().map_or_else(
+            || CompanionVoice::seed_for_key("frost-companion"),
+            |path| CompanionVoice::seed_for_key(&path.to_string_lossy()),
+        );
         Self {
             agent_pulses: Default::default(),
             enabled: false,
             sessions: HashMap::new(),
             born: now,
             life: WindowLife::new_at(Duration::ZERO),
+            ambient: AmbientMind::seeded(seed),
+            voice: CompanionVoice::new(seed),
+            reply: "I'm here. We can work quietly, share a story, or take a little break.",
+            care: CompanionCare::default(),
+            last_human_input: None,
             work_day: None,
             retreat_until: now,
             pose: Pose(PreviewPose::Calm),
@@ -402,8 +417,13 @@ impl Organism {
             self.close_preview();
             self.cancel_live_greeting();
             self.enabled = enabled;
-            self.life = WindowLife::new_at(self.born.elapsed());
+            // Visibility is not birth. Retire transient command admission, but
+            // keep the window's learned physiology, personality and voice.
+            self.life
+                .advance(self.born.elapsed(), false, false, CircadianPhase::Unlearned);
+            self.ambient.interrupt();
             self.work_day = None;
+            self.last_human_input = None;
         }
     }
 
@@ -415,9 +435,9 @@ impl Organism {
             return;
         }
         self.work_day = day;
+        self.ambient.interrupt();
         for life in self.sessions.values_mut() {
             life.set_work_context(None);
-            life.ambient.interrupt();
             if life.context.behavior.is_repo_vigil() {
                 life.context = PreviewPose::Calm.context();
             }
@@ -438,7 +458,9 @@ impl Organism {
                 });
             life.work_context_current = current;
             if !current && life.context.behavior.is_repo_vigil() {
-                life.ambient.interrupt();
+                if self.live_attention.owner() == Some(&id) {
+                    self.ambient.interrupt();
+                }
                 life.context = PreviewPose::Calm.context();
             }
         }
@@ -467,7 +489,7 @@ impl Organism {
         if self.enabled {
             self.sessions
                 .entry(id)
-                .or_insert_with(|| SessionLife::new(id, running, Instant::now()));
+                .or_insert_with(|| SessionContext::new(running, Instant::now()));
         }
     }
 
@@ -581,7 +603,9 @@ impl Organism {
             .native
             .command_finished(classify_command(command), exit, duration);
         self.life.replace_state(life.native.state());
-        life.ambient.interrupt();
+        if self.live_attention.owner() == Some(&id) {
+            self.ambient.interrupt();
+        }
         life.context = RenderContext::new(
             reaction.behavior,
             BodyLanguage::from_state(life.native.state()),
@@ -609,7 +633,9 @@ impl Organism {
                 // the next shell boundary has no trustworthy completion.
                 life.reaction_until = None;
                 life.completion = None;
-                life.ambient.interrupt();
+                if self.live_attention.owner() == Some(&id) {
+                    self.ambient.interrupt();
+                }
                 life.context = RenderContext::new(
                     Behavior::Idle,
                     BodyLanguage::from_state(self.life.state()),
@@ -692,15 +718,20 @@ impl Organism {
     pub fn note_output(&mut self, id: usize) {
         if self.enabled {
             self.life.note_output(self.born.elapsed());
-            if let Some(life) = self.sessions.get_mut(&id) {
-                life.ambient.interrupt();
+            if self.live_attention.owner() == Some(&id) {
+                self.ambient.interrupt();
             }
         }
     }
 
     pub fn accepted_input(&mut self) {
         if self.enabled {
-            self.life.note_input(self.born.elapsed());
+            let now = self.born.elapsed();
+            self.life.note_input(now);
+            self.last_human_input = Some(now);
+            // Accepted human input is an existing event source. Typing can
+            // accrue active time but never surfaces an interruption itself.
+            self.care.observe(now, true, false);
         }
         self.retreat();
     }
@@ -912,6 +943,7 @@ impl Organism {
         self.cancel_live_greeting();
         self.life
             .advance(self.born.elapsed(), false, false, CircadianPhase::Unlearned);
+        self.care.observe(self.born.elapsed(), false, false);
     }
 
     pub fn tick(&mut self, owner: Option<usize>, running: bool, any_running: bool) {
@@ -936,14 +968,14 @@ impl Organism {
         if let Some(life) = owner.and_then(|id| self.sessions.get_mut(&id)) {
             life.native.sync_state(self.life.state());
             if running || retreating {
-                life.ambient.interrupt();
+                self.ambient.interrupt();
             } else if life
                 .reaction_until
                 .is_none_or(|deadline| elapsed >= deadline.saturating_duration_since(self.born))
             {
                 life.reaction_until = None;
                 life.completion = None;
-                let behavior = life.ambient.step(
+                let behavior = self.ambient.step(
                     self.life.state(),
                     self.life.idle_for(elapsed).as_secs_f32(),
                     dt,
@@ -966,6 +998,91 @@ impl Organism {
         if self.live_attention.set_owner(owner) {
             self.live_pointer_inside = false;
         }
+    }
+
+    /// Explicit local conversation. No terminal text, shell command, or network
+    /// request is involved, and switching panes never reseeds this voice.
+    pub fn talk(&mut self, intent: CompanionIntent, owner: Option<usize>, running: bool) {
+        let now = self.born.elapsed();
+        let owner = owner.filter(|id| self.enabled && self.is_local(*id));
+        if intent == CompanionIntent::Rest {
+            self.care.rested(now);
+        }
+        let context = if running && owner.is_some() {
+            RenderContext::new(
+                Behavior::WatchCommand,
+                BodyLanguage::from_state(self.life.state()),
+                false,
+            )
+        } else {
+            owner
+                .map(|id| self.base_context_at(id, now))
+                .unwrap_or_else(|| PreviewPose::Calm.context())
+        };
+        self.reply = self.voice.respond(
+            intent,
+            RenderContext {
+                body_language: BodyLanguage::from_state(self.life.state()),
+                ..context
+            },
+        );
+    }
+
+    pub fn reply(&self) -> &'static str {
+        self.reply
+    }
+
+    pub fn temperament_description(&self) -> &'static str {
+        self.voice.temperament().description()
+    }
+
+    pub fn set_care_reminders(&mut self, enabled: bool) {
+        self.care.set_enabled(enabled && self.enabled);
+    }
+
+    pub fn snooze_care(&mut self) {
+        self.care.snooze(self.born.elapsed());
+        self.reply = "Of course. I'll keep the break reminders quiet for twenty minutes.";
+    }
+
+    /// Existing foreground heartbeats only. The adapter admits a text toast
+    /// after real human activity and a quiet, visible native interaction slot.
+    pub fn care_prompt(&mut self, owner: Option<usize>, can_offer: bool) -> Option<&'static str> {
+        let now = self.born.elapsed();
+        self.care_prompt_at(owner, can_offer, now)
+    }
+
+    fn care_prompt_at(
+        &mut self,
+        owner: Option<usize>,
+        can_offer: bool,
+        now: Duration,
+    ) -> Option<&'static str> {
+        let owner = owner.filter(|id| self.enabled && self.is_local(*id));
+        let engaged = owner.is_some()
+            && self
+                .last_human_input
+                .is_some_and(|last| now.saturating_sub(last) <= Duration::from_secs(5 * 60));
+        let quiet = owner.is_some_and(|id| {
+            matches!(
+                self.base_context_at(id, now).behavior,
+                Behavior::Idle
+                    | Behavior::Sleep
+                    | Behavior::Explore
+                    | Behavior::Approach
+                    | Behavior::GlanceAside
+            )
+        });
+        self.care
+            .observe(
+                now,
+                engaged,
+                can_offer && quiet && !self.live_pointer_inside,
+            )
+            .map(|prompt| {
+                self.reply = prompt.text();
+                prompt.text()
+            })
     }
 
     pub fn sync_greeting_geometry(&mut self, glyph: bool, presentable: bool) {
@@ -1352,6 +1469,133 @@ impl Organism {
 mod tests {
     use super::*;
     use jterm_core::organism::WatchRhythm;
+
+    #[test]
+    fn companion_life_and_voice_survive_pane_close_and_visibility_toggle() {
+        let mut organism = completion_fixture(&[1, 2]);
+        organism.owner_changed(None, Some(1));
+        organism.completed(1, "cargo test", Some(101), Some(100), None);
+        let state = values(organism.life.state());
+        let temperament = organism.voice.temperament();
+        organism.talk(CompanionIntent::Story, Some(1), false);
+        let story = organism.reply();
+        let next_voice = organism.voice.clone();
+        organism.owner_changed(Some(1), Some(2));
+        organism.forget_session(1);
+        assert_eq!(values(organism.life.state()), state);
+        assert_eq!(organism.voice.temperament(), temperament);
+        assert_eq!(organism.reply(), story);
+        organism.set_enabled(false);
+        organism.set_enabled(true);
+        assert_eq!(values(organism.life.state()), state);
+        assert_eq!(organism.reply(), story);
+        assert!(
+            organism.sessions.is_empty(),
+            "command admission must not replay on reenable"
+        );
+        organism.prime_session(3, false);
+        organism.set_remote(3, false);
+        organism.talk(CompanionIntent::Story, Some(3), false);
+        let mut expected = next_voice;
+        assert_eq!(
+            organism.reply(),
+            expected.respond(CompanionIntent::Story, PreviewPose::Calm.context())
+        );
+    }
+
+    #[test]
+    fn companion_mind_follows_active_pane_and_background_output_cannot_restart_it() {
+        let mut organism = completion_fixture(&[1, 2]);
+        organism.owner_changed(None, Some(1));
+        let mut state = organism.life.state();
+        state.energy = 0.0;
+        organism.life.replace_state(state);
+        organism.tick_at(Some(1), false, false, Duration::ZERO);
+        assert_eq!(organism.ambient.current().display(), Behavior::Sleep);
+        let mind = format!("{:?}", organism.ambient);
+        organism.note_output(2);
+        organism.completed(2, "cargo test", Some(0), Some(1), None);
+        assert_eq!(format!("{:?}", organism.ambient), mind);
+        organism.owner_changed(Some(1), Some(2));
+        organism.forget_session(1);
+        assert_eq!(format!("{:?}", organism.ambient), mind);
+    }
+
+    #[test]
+    fn companion_talk_preserves_command_outcomes_and_uses_running_context() {
+        let mut organism = completion_fixture(&[1]);
+        organism.completed(1, "cargo test", Some(101), Some(100), None);
+        let state = values(organism.life.state());
+        let context = organism.sessions[&1].context;
+        organism.talk(CompanionIntent::Hello, Some(1), true);
+        assert!(organism.reply().contains("running command"));
+        organism.talk(CompanionIntent::Company, Some(1), false);
+        assert!(organism.reply().contains("failure"));
+        assert_eq!(values(organism.life.state()), state);
+        assert_eq!(organism.sessions[&1].context, context);
+    }
+
+    #[test]
+    fn companion_care_uses_one_window_clock_across_many_panes() {
+        let mut organism = completion_fixture(&[1, 2]);
+        assert!(!organism.care.enabled());
+        organism.set_care_reminders(true);
+        let mut prompts = Vec::new();
+        for second in (0..=45 * 60).step_by(5) {
+            let now = Duration::from_secs(second);
+            let owner = 1 + (second / 5) as usize % 2;
+            organism.last_human_input = Some(now);
+            if let Some(prompt) = organism.care_prompt_at(Some(owner), true, now) {
+                prompts.push((second, prompt));
+            }
+        }
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].0, 45 * 60);
+        assert_eq!(organism.reply(), prompts[0].1);
+        assert_eq!(
+            organism.care_prompt_at(Some(1), true, Duration::from_secs(45 * 60)),
+            None
+        );
+    }
+
+    #[test]
+    fn companion_rest_clears_due_care_instead_of_only_changing_the_reply() {
+        let mut organism = completion_fixture(&[1]);
+        organism.set_care_reminders(true);
+        for second in (0..=45 * 60).step_by(5) {
+            let now = Duration::from_secs(second);
+            organism.last_human_input = Some(now);
+            assert_eq!(organism.care_prompt_at(Some(1), false, now), None);
+        }
+        organism.talk(CompanionIntent::Rest, Some(1), false);
+        // Snooze expires, but a rest discarded the old debt. Keep samples
+        // frequent so a long scheduling gap cannot itself reset the clock.
+        for second in (45 * 60 + 5..=65 * 60 + 5).step_by(5) {
+            let now = Duration::from_secs(second);
+            organism.last_human_input = Some(now);
+            assert_eq!(organism.care_prompt_at(Some(1), true, now), None);
+        }
+    }
+
+    #[test]
+    fn companion_care_does_not_infer_human_work_from_output_or_background_panes() {
+        let mut organism = completion_fixture(&[1, 2]);
+        organism.set_care_reminders(true);
+        for second in (0..=60 * 60).step_by(5) {
+            let now = Duration::from_secs(second);
+            organism.life.note_output(now);
+            assert_eq!(organism.care_prompt_at(Some(1), true, now), None);
+        }
+        for second in (60 * 60..=120 * 60).step_by(5) {
+            let now = Duration::from_secs(second);
+            organism.last_human_input = Some(now);
+            assert_eq!(organism.care_prompt_at(None, true, now), None);
+        }
+        assert_eq!(
+            organism.care_prompt_at(Some(2), true, Duration::from_secs(120 * 60)),
+            None
+        );
+    }
 
     #[test]
     fn agent_lifecycle_edges_are_deduplicated_and_disabled_edges_are_consumed() {
@@ -2259,7 +2503,10 @@ mod tests {
         assert!(
             expanded_companion_hint(false).contains("Bottom status bar (cwd, git, last command)")
         );
-        assert!(expanded_companion_hint(true).contains("still companion remains"));
+        assert!(expanded_companion_hint(true).contains("One companion follows the active pane"));
+        assert!(
+            expanded_companion_hint(true).contains("Details and tooltips never add another body")
+        );
     }
 
     #[test]

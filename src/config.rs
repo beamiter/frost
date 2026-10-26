@@ -163,6 +163,9 @@ pub struct Config {
     /// Missing means Automatic: follow a verified desktop preference, otherwise Calm.
     #[serde(default)]
     pub ascii_organism_motion: Option<crate::organism::Motion>,
+    /// Optional local water/stretch/eye-rest invitations; disabled by default.
+    #[serde(default)]
+    pub ascii_organism_care_enabled: bool,
 
     /// AI features master switch. Off by default: nothing leaves the machine
     /// unless the user opts in.
@@ -669,6 +672,7 @@ impl Default for Config {
             ascii_organism_enabled: default_organism_enabled(),
             ascii_organism_expanded: true,
             ascii_organism_motion: None,
+            ascii_organism_care_enabled: false,
             jsh_update_check: default_jsh_update_check(),
             ai_enabled: false,
             remote_hosts: default_remote_hosts(),
@@ -1422,6 +1426,23 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn companion_care_reminders_are_opt_in_and_round_trip() {
+        assert!(!Config::default().ascii_organism_care_enabled);
+        assert!(
+            !Config::from_toml("ascii_organism_enabled = true\n")
+                .unwrap()
+                .ascii_organism_care_enabled
+        );
+        let config = Config::from_toml("ascii_organism_care_enabled = true\n").unwrap();
+        let saved = toml::to_string(&config).unwrap();
+        assert!(
+            Config::from_toml(&saved)
+                .unwrap()
+                .ascii_organism_care_enabled
+        );
     }
 
     #[test]
