@@ -185,6 +185,7 @@ const RESIZE_CORNER: f32 = 12.0;
 /// the bottom bar when the `bottom_bar` toggle is on.
 fn chrome_height(font_size: f32, chrome_font_size: f32, bottom_bar: bool) -> f32 {
     ui_typography::row_height(chrome_font_size, TAB_BAR_H, TAB_BAR_PADDING)
+        + jterm_core::title_bar::height(chrome_font_size)
         + if bottom_bar {
             ui_typography::row_height(font_size, STATUS_BAR_H, 4.0)
         } else {
@@ -7440,13 +7441,36 @@ impl Frost {
         (app, jsh_check)
     }
 
-    fn title(&self) -> String {
+    fn title_bar_content(&self) -> jterm_core::title_bar::Content {
         let title = self.tab_label(self.active_tab);
-        if title.is_empty() {
-            "frost".to_string()
-        } else {
-            title
-        }
+        let cwd = self
+            .sessions
+            .get(self.active)
+            .and_then(|session| session.cwd_display());
+        let private = self
+            .tabs
+            .get(self.active_tab)
+            .is_some_and(|tab| tab.private_title);
+        let mode = match self.config.effective_terminal_mode() {
+            config::TerminalMode::Normal => "normal",
+            config::TerminalMode::Block => "block",
+            config::TerminalMode::Chat => "chat",
+        };
+        jterm_core::title_bar::compose(&jterm_core::title_bar::Snapshot {
+            app: "Frost",
+            title: &title,
+            cwd: cwd.as_deref().map(std::path::Path::new),
+            mode,
+            tab_index: self.active_tab,
+            tab_count: self.tabs.len(),
+            pane_count: self.layout().leaf_count(),
+            private,
+            ..Default::default()
+        })
+    }
+
+    fn title(&self) -> String {
+        self.title_bar_content().window_title
     }
 
     fn iced_theme(&self) -> iced::Theme {
@@ -7533,6 +7557,10 @@ impl Frost {
     }
 
     fn tab_bar_height(&self) -> f32 {
+        self.navigation_bar_height() + jterm_core::title_bar::height(self.chrome_font_size())
+    }
+
+    fn navigation_bar_height(&self) -> f32 {
         ui_typography::row_height(self.chrome_font_size(), TAB_BAR_H, TAB_BAR_PADDING)
     }
 
@@ -21582,7 +21610,7 @@ impl Frost {
 
     fn workspace_toolbar(&self) -> Element<'_, Message> {
         let font_size = self.chrome_font_size();
-        let height = self.tab_bar_height() - 10.0;
+        let height = self.navigation_bar_height() - 10.0;
         let base = Theme::rgb_to_color32(self.theme.tabbar.bg);
         let inactive = Theme::rgb_to_color32(self.theme.tabbar.inactive_text);
         let accent = self.c_accent();
@@ -21857,40 +21885,70 @@ impl Frost {
                 token.map(Message::ChatInterrupt),
             ));
         }
-        // In Side mode the tab labels live in the dock, so the title is the
-        // only place the active session is named and there is room for it. In
-        // Top mode the active tab already shows the very same string
-        // (`Frost::title` is the active session's label), so repeating it here
-        // would only steal width from the strip.
-        if self.config.tab_position == config::TabPosition::Side {
-            bar = bar.push(
+        let navigation = container(bar.align_y(iced::Alignment::Center))
+            .width(Length::Fill)
+            .height(Length::Fixed(self.navigation_bar_height()))
+            .align_y(iced::Alignment::Center);
+        let context = self.title_bar_content();
+        let details = context.details_for_width(self.win_size.width).to_string();
+        let heading = container(
+            text(context.heading.clone())
+                .size(self.chrome_font_size())
+                .wrapping(text::Wrapping::None),
+        )
+        .width(Length::Fill)
+        .clip(true)
+        .padding([0, 10]);
+        let mut caption = row![heading].align_y(iced::Alignment::Center);
+        if !details.is_empty() {
+            caption = caption.push(
                 container(
-                    text(self.title())
+                    text(details)
                         .size(self.chrome_font_size())
                         .wrapping(text::Wrapping::None)
                         .style(text::secondary),
                 )
-                .padding([0, 8])
-                .clip(true),
+                .max_width((self.win_size.width * 0.48).max(1.0))
+                .clip(true)
+                .padding([0, 6]),
             );
         }
-        let bar = bar
-            .push(window_btn("—", Message::WindowMinimize))
-            .push(window_btn("▢", Message::WindowToggleMaximize))
-            .push(close)
-            .align_y(iced::Alignment::Center)
-            .width(Length::Fill);
-        // Presses that no button or tab consumed fall through to here and move
-        // the window, the way a title bar is expected to behave. `mouse_area`
-        // runs its content first and bails once the event is captured, so the
-        // chrome above keeps working.
-        let bar = mouse_area(bar)
-            .on_press(Message::WindowDrag)
-            .on_double_click(Message::WindowToggleMaximize);
-        container(bar)
+        let caption = tooltip(
+            caption.width(Length::Fill),
+            text(context.tooltip),
+            tooltip::Position::Bottom,
+        );
+        let window_control = |glyph: &str, message: Message, help: &'static str| {
+            tooltip(
+                window_btn(glyph, message),
+                text(help),
+                tooltip::Position::Bottom,
+            )
+        };
+        let title = row![
+            caption,
+            window_control("−", Message::WindowMinimize, "Minimize window"),
+            window_control(
+                "□",
+                Message::WindowToggleMaximize,
+                "Maximize or restore window"
+            ),
+            tooltip(close, text("Close window"), tooltip::Position::Bottom),
+        ]
+        .align_y(iced::Alignment::Center)
+        .width(Length::Fill);
+        let title = mouse_area(
+            container(title)
+                .height(Length::Fixed(jterm_core::title_bar::height(
+                    self.chrome_font_size(),
+                )))
+                .align_y(iced::Alignment::Center),
+        )
+        .on_press(Message::WindowDrag)
+        .on_double_click(Message::WindowToggleMaximize);
+        container(column![title, navigation])
             .width(Length::Fill)
             .height(Length::Fixed(self.tab_bar_height()))
-            .align_y(iced::Alignment::Center)
             .style(self.chrome_bar_style())
             .into()
     }
