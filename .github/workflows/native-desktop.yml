@@ -44,7 +44,7 @@ jobs:
             xvfb openbox xdotool xclip x11-utils sway wtype wl-clipboard grim imagemagick python3-xlib libwayland-bin tesseract-ocr
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - name: Cache native build dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: native-desktop-release
           cache-on-failure: true
@@ -126,7 +126,7 @@ jobs:
         run: python3 scripts/native-recovery-report.py --runner scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend wayland --pointer "$RUNNER_TEMP/frost-clipboard/native-pointer" --output native-smoke-artifacts/wayland-recovery-report
       - name: Preserve screenshots and PTY evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: frost-native-desktop-${{ github.sha }}
           path: native-smoke-artifacts
