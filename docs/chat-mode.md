@@ -171,3 +171,12 @@ omits these boundaries after a focus change, the first attempted composition may
 need to be entered again. Commit followed by an unrelated Enter without any active
 preedit cannot be identified as candidate confirmation by this API. Native IME
 behavior across Linux display backends still requires graphical acceptance tests.
+
+### Continuous output hierarchy
+
+Chat paint passes share one role policy. Neutral finished output remains on the
+canvas, while hover, selection and failed/unresolved/background states retain
+semantic decoration. The composer has an accent border distinct from history.
+Command and composer background fills respect configured window opacity;
+outline visibility is retained like normal Block chrome. No terminal geometry,
+projection, hit testing or input ownership changes are involved.

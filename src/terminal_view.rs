@@ -728,6 +728,39 @@ fn block_card_visual(
     }
 }
 
+/// One role policy for both Chat paint passes: output stays on the canvas,
+/// while command and composer remain distinct. Preserve selection and outcome
+/// state instead of overwriting it with the same generic bubble decoration.
+fn chat_card_visual(
+    role: crate::chat_mode::ChatRole,
+    segment: BlockCardSegment,
+    foreground: Color,
+    accent: Color,
+    hovered: bool,
+    opacity: f32,
+) -> BlockCardVisual {
+    use crate::chat_mode::ChatRole;
+    if segment.selected
+        || segment.selection_active
+        || !matches!(role, ChatRole::Command | ChatRole::Composer)
+    {
+        return block_card_visual(segment, foreground, accent, hovered, opacity);
+    }
+    let command = role == ChatRole::Command;
+    BlockCardVisual {
+        background: alpha(
+            alpha(
+                if command { accent } else { foreground },
+                if command { 0.30 } else { 0.055 },
+            ),
+            opacity,
+        ),
+        border: alpha(accent, if command { 0.20 } else { 0.37 }),
+        border_width: 1.0,
+        shadow: Shadow::default(),
+    }
+}
+
 fn block_card_shadow(segment: BlockCardSegment, shadow: Shadow) -> Shadow {
     if segment.real_top && segment.real_bottom {
         shadow
@@ -3862,14 +3895,14 @@ impl<Message> TermWidget<'_, Message> {
                 self.opacity,
             );
             if let Some(chat) = self.chat_rows.get(segment.start_row) {
-                let command = chat.role == crate::chat_mode::ChatRole::Command;
-                visual.background = alpha(
-                    if command { block_accent } else { default_fg },
-                    if command { 0.30 } else { 0.055 },
+                visual = chat_card_visual(
+                    chat.role,
+                    *segment,
+                    default_fg,
+                    block_accent,
+                    hovered_card == Some(segment.group),
+                    self.opacity,
                 );
-                visual.border = alpha(if command { block_accent } else { default_fg }, 0.20);
-                visual.border_width = 1.0;
-                visual.shadow = Shadow::default();
             }
             renderer.fill_quad(
                 Quad {
@@ -4390,14 +4423,14 @@ impl<Message> TermWidget<'_, Message> {
                 self.opacity,
             );
             if let Some(chat) = self.chat_rows.get(segment.start_row) {
-                let command = chat.role == crate::chat_mode::ChatRole::Command;
-                visual.background = alpha(
-                    if command { block_accent } else { default_fg },
-                    if command { 0.30 } else { 0.055 },
+                visual = chat_card_visual(
+                    chat.role,
+                    *segment,
+                    default_fg,
+                    block_accent,
+                    hovered_card == Some(segment.group),
+                    self.opacity,
                 );
-                visual.border = alpha(if command { block_accent } else { default_fg }, 0.20);
-                visual.border_width = 1.0;
-                visual.shadow = Shadow::default();
             }
             if segment.real_top && segment.real_bottom {
                 renderer.fill_quad(
@@ -7077,6 +7110,96 @@ mod mode_gesture_tests {
 #[cfg(test)]
 mod chat_card_action_tests {
     use super::*;
+
+    fn chat_segment(kind: BlockCardKind) -> BlockCardSegment {
+        BlockCardSegment {
+            group: 1,
+            start_row: 0,
+            end_row: 1,
+            kind,
+            real_top: true,
+            real_bottom: true,
+            selected: false,
+            selection_active: false,
+            stripe: None,
+            stripe_strong: false,
+        }
+    }
+
+    #[test]
+    fn chat_output_keeps_canvas_and_outcome_selection_hierarchy() {
+        use crate::chat_mode::ChatRole;
+        let foreground = Color::WHITE;
+        let accent = Color::BLACK;
+        for kind in [
+            BlockCardKind::Finished,
+            BlockCardKind::Failed,
+            BlockCardKind::Unknown,
+            BlockCardKind::Background,
+            BlockCardKind::Active,
+        ] {
+            for hovered in [false, true] {
+                let segment = chat_segment(kind);
+                assert_eq!(
+                    chat_card_visual(ChatRole::Output, segment, foreground, accent, hovered, 0.5),
+                    block_card_visual(segment, foreground, accent, hovered, 0.5)
+                );
+            }
+        }
+        let segment = chat_segment(BlockCardKind::Finished);
+        let output = chat_card_visual(ChatRole::Output, segment, foreground, accent, false, 1.0);
+        assert_eq!(output.background, Color::TRANSPARENT);
+        assert_eq!(output.border_width, 0.0);
+        for role in [ChatRole::Command, ChatRole::Composer, ChatRole::Output] {
+            for active in [false, true] {
+                let selected = BlockCardSegment {
+                    selected: true,
+                    selection_active: active,
+                    ..segment
+                };
+                assert_eq!(
+                    chat_card_visual(role, selected, foreground, accent, false, 0.5),
+                    block_card_visual(selected, foreground, accent, false, 0.5)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chat_composer_has_distinct_accent_and_respects_background_opacity() {
+        use crate::chat_mode::ChatRole;
+        let segment = chat_segment(BlockCardKind::Active);
+        for role in [ChatRole::Command, ChatRole::Composer] {
+            let opaque = chat_card_visual(role, segment, Color::WHITE, Color::BLACK, false, 1.0);
+            let half = chat_card_visual(role, segment, Color::WHITE, Color::BLACK, false, 0.5);
+            let transparent =
+                chat_card_visual(role, segment, Color::WHITE, Color::BLACK, false, 0.0);
+            assert_eq!(half.background.a, opaque.background.a * 0.5);
+            assert_eq!(transparent.background.a, 0.0);
+            assert_eq!(half.border, opaque.border);
+        }
+        let composer = chat_card_visual(
+            ChatRole::Composer,
+            segment,
+            Color::WHITE,
+            Color::BLACK,
+            false,
+            1.0,
+        );
+        let command = chat_card_visual(
+            ChatRole::Command,
+            segment,
+            Color::WHITE,
+            Color::BLACK,
+            false,
+            1.0,
+        );
+        assert!(composer.border.a > command.border.a);
+        assert_eq!(
+            (composer.border.r, composer.border.g, composer.border.b),
+            (0.0, 0.0, 0.0)
+        );
+    }
 
     #[test]
     fn chat_cards_only_claim_right_click_on_completed_cells() {
