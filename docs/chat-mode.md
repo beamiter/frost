@@ -62,7 +62,11 @@ fills the same space without moving already-visible output. Separate OSC `D`,
 `A` and `B` reads retain Chat cards throughout the shell's normal prompt gap;
 input controls still wait for their real parser authority.
 Touchpad pixels are presented directly, including sub-row movement; discrete
-mouse wheels and **Go live** move on the display frame clock. Streaming output
+mouse wheels and **Go live** move on the display frame clock. Repeated wheel
+notches first integrate elapsed motion before changing the destination, so
+input arriving between paints does not discard elapsed time or stall scrolling.
+Precision input takes over directly without adding pending wheel momentum.
+Streaming output
 retargets the existing motion while following live. Scrolling or selecting
 history pauses that following, so later output preserves the same raw or
 synthetic reading anchor and its fractional position.

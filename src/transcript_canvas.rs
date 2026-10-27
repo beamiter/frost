@@ -119,7 +119,7 @@ impl TranscriptCanvas {
     /// Mouse wheels provide notches; touchpads provide already integrated
     /// physical movement. Never add a second inertia filter to the latter.
     pub fn scroll(&mut self, delta_rows: f64, precise: bool, now: Instant) -> bool {
-        if !self.enabled || !delta_rows.is_finite() {
+        if !self.enabled || !delta_rows.is_finite() || delta_rows == 0.0 {
             return false;
         }
         let before = self.row();
@@ -127,10 +127,16 @@ impl TranscriptCanvas {
             self.motion
                 .jump_to(self.motion.position() + delta_rows * ROW);
         } else {
+            // Retarget at the input event's time, not the preceding paint.
+            // Resetting the clock on each notch without integrating loses
+            // all time between frequent wheel events and starves motion.
+            self.advance(now);
             self.motion.scroll_by(delta_rows * ROW);
         }
         self.following = self.motion.target() <= 0.0;
-        self.frame = Some(now);
+        if self.frame.is_none_or(|previous| now > previous) {
+            self.frame = Some(now);
+        }
         before != self.row()
     }
 
@@ -339,6 +345,118 @@ mod tests {
         canvas.navigate(0);
         assert!(!canvas.animating());
         assert!(canvas.following());
+    }
+
+    #[test]
+    fn frequent_wheel_events_preserve_time_between_paints() {
+        let mut canvas = TranscriptCanvas::default();
+        let mut reference = TranscriptCanvas::default();
+        let now = Instant::now();
+        for motion in [&mut canvas, &mut reference] {
+            motion.reconcile(20, 1_000, 25);
+            motion.applied(20);
+            motion.scroll(3.0, false, now);
+        }
+        for tick in 1..=10 {
+            let time = now + Duration::from_millis(tick * 8);
+            // Explicit integration describes the same input trajectory on
+            // a display that paints before every input instead of coalescing.
+            reference.advance(time);
+            reference.scroll(1.0, false, time);
+            canvas.scroll(1.0, false, time);
+        }
+        assert!(canvas.position_rows() > 20.0);
+        assert_eq!(canvas.position_rows(), reference.position_rows());
+        let paint = now + Duration::from_millis(96);
+        canvas.advance(paint);
+        reference.advance(paint);
+        assert_eq!(canvas.position_rows(), reference.position_rows());
+        for tick in 1..=120 {
+            canvas.advance(paint + Duration::from_millis(tick * 8));
+        }
+        assert_eq!(canvas.position_rows(), 33.0);
+        assert!(!canvas.animating());
+        assert_eq!(canvas.frame, None);
+        assert!(!canvas.advance(paint + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn precision_input_takes_over_without_adding_old_wheel_momentum() {
+        let mut canvas = TranscriptCanvas::default();
+        canvas.reconcile(20, 1_000, 25);
+        let now = Instant::now();
+        canvas.scroll(3.0, false, now);
+        canvas.advance(now + Duration::from_millis(16));
+        let before = canvas.position_rows();
+        canvas.scroll(0.125, true, now + Duration::from_millis(24));
+        assert!((canvas.position_rows() - before - 0.125).abs() < 1e-12);
+        assert!(!canvas.animating());
+        let held = canvas.position_rows();
+        canvas.advance(now + Duration::from_millis(40));
+        assert_eq!(canvas.position_rows(), held);
+    }
+
+    #[test]
+    fn dense_wheel_with_reduced_motion_is_immediate_and_finite() {
+        let mut canvas = TranscriptCanvas::default();
+        canvas.reconcile(20, 1_000, 25);
+        canvas.set_reduced_motion(true);
+        let now = Instant::now();
+        for tick in 0..10 {
+            canvas.scroll(1.0, false, now + Duration::from_millis(tick * 8));
+            assert_eq!(canvas.position_rows(), 21.0 + tick as f64);
+            assert!(!canvas.animating());
+        }
+    }
+
+    #[test]
+    fn zero_delta_does_not_cancel_live_follow_or_rewind_input_clock() {
+        let mut canvas = TranscriptCanvas::default();
+        canvas.reconcile(0, 100, 25);
+        canvas.reconcile(0, 105, 25);
+        let before = canvas.position_rows();
+        let clock = canvas.frame;
+        assert!(!canvas.scroll(0.0, true, Instant::now()));
+        assert_eq!(canvas.position_rows(), before);
+        assert_eq!(canvas.frame, clock);
+        assert!(canvas.following());
+        assert!(canvas.animating());
+    }
+
+    #[test]
+    fn queued_wheel_event_does_not_rewind_the_motion_clock() {
+        let mut canvas = TranscriptCanvas::default();
+        canvas.reconcile(20, 1_000, 25);
+        let now = Instant::now();
+        canvas.scroll(3.0, false, now);
+        canvas.advance(now + Duration::from_millis(16));
+        canvas.scroll(1.0, false, now + Duration::from_millis(8));
+        assert_eq!(canvas.frame, Some(now + Duration::from_millis(16)));
+    }
+
+    #[test]
+    fn duplicate_and_late_events_share_the_latest_integration_frontier() {
+        let mut canvas = TranscriptCanvas::default();
+        let mut reference = TranscriptCanvas::default();
+        let now = Instant::now();
+        let frontier = now + Duration::from_millis(24);
+        for motion in [&mut canvas, &mut reference] {
+            motion.reconcile(20, 1_000, 25);
+            motion.scroll(3.0, false, now);
+            motion.advance(frontier);
+            motion.scroll(1.0, false, frontier);
+        }
+        let before = canvas.position_rows();
+        assert!(!canvas.advance(frontier));
+        assert!(!canvas.advance(now + Duration::from_millis(8)));
+        assert_eq!(canvas.position_rows(), before);
+        canvas.scroll(1.0, false, now + Duration::from_millis(16));
+        reference.scroll(1.0, false, frontier);
+        assert_eq!(canvas.frame, Some(frontier));
+        let next = now + Duration::from_millis(40);
+        canvas.advance(next);
+        reference.advance(next);
+        assert_eq!(canvas.position_rows(), reference.position_rows());
     }
 
     #[test]
