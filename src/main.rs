@@ -5993,6 +5993,7 @@ impl Session {
                 self.projection.scroll_offset(),
                 self.projection.max_scroll_offset(),
                 self.terminal.grid.rows(),
+                self.terminal.grid.cols(),
             );
             let row = self.transcript_canvas.row();
             if row != self.projection.scroll_offset() {

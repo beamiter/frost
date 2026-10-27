@@ -18,6 +18,7 @@ pub struct TranscriptCanvas {
     applied_row: usize,
     extent: usize,
     viewport_rows: usize,
+    columns: usize,
     frame: Option<Instant>,
 }
 
@@ -62,8 +63,14 @@ impl TranscriptCanvas {
     /// `anchored_row` comes from the real raw/synthetic document anchor. When
     /// output grows above a reader, both presented position and destination
     /// move by that exact amount; the fractional screen position stays fixed.
-    pub fn reconcile(&mut self, anchored_row: usize, extent: usize, viewport_rows: usize) {
-        let reset = !self.enabled || self.viewport_rows != viewport_rows;
+    pub fn reconcile(
+        &mut self,
+        anchored_row: usize,
+        extent: usize,
+        viewport_rows: usize,
+        columns: usize,
+    ) {
+        let reset = !self.enabled || self.viewport_rows != viewport_rows || self.columns != columns;
         // Keep the old coordinate available until the anchor rebase has been
         // applied. Clamping a trimmed document first would lose its fraction.
         self.motion
@@ -105,6 +112,7 @@ impl TranscriptCanvas {
         self.motion.set_bounds(0.0, extent as f64 * ROW);
         self.extent = extent;
         self.viewport_rows = viewport_rows;
+        self.columns = columns;
         self.enabled = true;
         self.parked = false;
         if self.motion.is_animating() && self.frame.is_none() {
@@ -239,7 +247,7 @@ mod tests {
     #[test]
     fn touchpad_retains_every_fraction_without_a_timer() {
         let mut canvas = TranscriptCanvas::default();
-        canvas.reconcile(0, 100, 25);
+        canvas.reconcile(0, 100, 25, 80);
         canvas.scroll(0.125, true, Instant::now());
         assert_eq!(canvas.row(), 0);
         assert_eq!(canvas.fraction(), 0.125);
@@ -250,37 +258,67 @@ mod tests {
     #[test]
     fn resize_preserves_subrow_reader_without_reenabling_follow() {
         let mut canvas = TranscriptCanvas::default();
-        canvas.reconcile(0, 100, 25);
+        canvas.reconcile(0, 100, 25, 80);
         canvas.scroll(0.375, true, Instant::now());
         canvas.applied(0);
-        canvas.reconcile(0, 95, 30);
+        canvas.reconcile(0, 95, 30, 80);
         assert_eq!(canvas.position_rows(), 0.375);
         assert!(!canvas.following());
         assert!(!canvas.animating());
-        canvas.reconcile(5, 100, 30);
+        canvas.reconcile(5, 100, 30, 80);
         assert_eq!(canvas.position_rows(), 5.375);
     }
 
     #[test]
     fn resize_rebases_reader_and_retires_old_wheel_destination() {
         let mut canvas = TranscriptCanvas::default();
-        canvas.reconcile(7, 100, 25);
+        canvas.reconcile(7, 100, 25, 80);
         canvas.scroll(0.375, true, Instant::now());
         canvas.scroll(3.0, false, Instant::now());
         assert!(canvas.animating());
-        canvas.reconcile(10, 103, 30);
+        canvas.reconcile(10, 103, 30, 80);
         assert_eq!(canvas.position_rows(), 10.375);
         assert!(!canvas.animating());
         assert!(!canvas.following());
     }
 
     #[test]
+    fn width_only_reflow_rebases_fraction_and_retires_old_wheel_destination() {
+        let mut canvas = TranscriptCanvas::default();
+        let now = Instant::now();
+        canvas.reconcile(7, 100, 25, 80);
+        canvas.applied(7);
+        canvas.scroll(0.375, true, now);
+        canvas.scroll(3.0, false, now);
+        assert!(canvas.animating());
+        canvas.reconcile(12, 160, 25, 40);
+        assert_eq!(canvas.position_rows(), 12.375);
+        assert!(!canvas.animating());
+        assert!(!canvas.following());
+        canvas.applied(12);
+        canvas.reconcile(12, 160, 25, 40);
+        assert_eq!(canvas.position_rows(), 12.375);
+    }
+
+    #[test]
+    fn width_only_reflow_keeps_live_follow_at_tail() {
+        let mut canvas = TranscriptCanvas::default();
+        canvas.reconcile(0, 100, 25, 80);
+        canvas.reconcile(0, 105, 25, 80);
+        assert!(canvas.animating());
+        canvas.reconcile(10, 180, 25, 40);
+        assert_eq!(canvas.position_rows(), 0.0);
+        assert!(canvas.following());
+        assert!(!canvas.animating());
+    }
+
+    #[test]
     fn resize_keeps_live_follow_ownership_during_streaming_animation() {
         let mut canvas = TranscriptCanvas::default();
-        canvas.reconcile(0, 100, 25);
-        canvas.reconcile(0, 105, 25);
+        canvas.reconcile(0, 100, 25, 80);
+        canvas.reconcile(0, 105, 25, 80);
         assert!(canvas.animating());
-        canvas.reconcile(5, 100, 30);
+        canvas.reconcile(5, 100, 30, 80);
         assert_eq!(canvas.position_rows(), 0.0);
         assert!(canvas.following());
         assert!(!canvas.animating());
@@ -289,10 +327,10 @@ mod tests {
     #[test]
     fn streamed_output_preserves_readers_fraction_and_pending_destination() {
         let mut canvas = TranscriptCanvas::default();
-        canvas.reconcile(4, 100, 25);
+        canvas.reconcile(4, 100, 25, 80);
         canvas.applied(4);
         canvas.scroll(0.375, true, Instant::now());
-        canvas.reconcile(11, 107, 25);
+        canvas.reconcile(11, 107, 25, 80);
         assert_eq!(canvas.position_rows(), 11.375);
         assert!(!canvas.animating());
     }
@@ -300,8 +338,8 @@ mod tests {
     #[test]
     fn live_output_moves_continuously_and_settles_without_idle_frames() {
         let mut canvas = TranscriptCanvas::default();
-        canvas.reconcile(0, 10, 25);
-        canvas.reconcile(0, 12, 25);
+        canvas.reconcile(0, 10, 25, 80);
+        canvas.reconcile(0, 12, 25, 80);
         assert_eq!(canvas.position_rows(), 2.0);
         assert!(canvas.animating());
         let start = Instant::now();
@@ -319,7 +357,7 @@ mod tests {
         let mut reference = TranscriptCanvas::default();
         let now = Instant::now();
         for motion in [&mut canvas, &mut reference] {
-            motion.reconcile(0, 100, 25);
+            motion.reconcile(0, 100, 25, 80);
             motion.scroll(3.0, false, now);
         }
         assert!(!canvas.advance(now - Duration::from_millis(40)));
@@ -333,7 +371,7 @@ mod tests {
     #[test]
     fn wheel_reversal_and_explicit_navigation_retire_old_motion() {
         let mut canvas = TranscriptCanvas::default();
-        canvas.reconcile(20, 100, 25);
+        canvas.reconcile(20, 100, 25, 80);
         canvas.applied(20);
         let now = Instant::now();
         canvas.scroll(6.0, false, now);
@@ -353,7 +391,7 @@ mod tests {
         let mut reference = TranscriptCanvas::default();
         let now = Instant::now();
         for motion in [&mut canvas, &mut reference] {
-            motion.reconcile(20, 1_000, 25);
+            motion.reconcile(20, 1_000, 25, 80);
             motion.applied(20);
             motion.scroll(3.0, false, now);
         }
@@ -383,7 +421,7 @@ mod tests {
     #[test]
     fn precision_input_takes_over_without_adding_old_wheel_momentum() {
         let mut canvas = TranscriptCanvas::default();
-        canvas.reconcile(20, 1_000, 25);
+        canvas.reconcile(20, 1_000, 25, 80);
         let now = Instant::now();
         canvas.scroll(3.0, false, now);
         canvas.advance(now + Duration::from_millis(16));
@@ -399,7 +437,7 @@ mod tests {
     #[test]
     fn dense_wheel_with_reduced_motion_is_immediate_and_finite() {
         let mut canvas = TranscriptCanvas::default();
-        canvas.reconcile(20, 1_000, 25);
+        canvas.reconcile(20, 1_000, 25, 80);
         canvas.set_reduced_motion(true);
         let now = Instant::now();
         for tick in 0..10 {
@@ -412,8 +450,8 @@ mod tests {
     #[test]
     fn zero_delta_does_not_cancel_live_follow_or_rewind_input_clock() {
         let mut canvas = TranscriptCanvas::default();
-        canvas.reconcile(0, 100, 25);
-        canvas.reconcile(0, 105, 25);
+        canvas.reconcile(0, 100, 25, 80);
+        canvas.reconcile(0, 105, 25, 80);
         let before = canvas.position_rows();
         let clock = canvas.frame;
         assert!(!canvas.scroll(0.0, true, Instant::now()));
@@ -426,7 +464,7 @@ mod tests {
     #[test]
     fn queued_wheel_event_does_not_rewind_the_motion_clock() {
         let mut canvas = TranscriptCanvas::default();
-        canvas.reconcile(20, 1_000, 25);
+        canvas.reconcile(20, 1_000, 25, 80);
         let now = Instant::now();
         canvas.scroll(3.0, false, now);
         canvas.advance(now + Duration::from_millis(16));
@@ -441,7 +479,7 @@ mod tests {
         let now = Instant::now();
         let frontier = now + Duration::from_millis(24);
         for motion in [&mut canvas, &mut reference] {
-            motion.reconcile(20, 1_000, 25);
+            motion.reconcile(20, 1_000, 25, 80);
             motion.scroll(3.0, false, now);
             motion.advance(frontier);
             motion.scroll(1.0, false, frontier);
@@ -462,17 +500,17 @@ mod tests {
     #[test]
     fn trimmed_history_rebases_before_clamping_and_preserves_fraction() {
         let mut canvas = TranscriptCanvas::default();
-        canvas.reconcile(99, 100, 25);
+        canvas.reconcile(99, 100, 25, 80);
         canvas.applied(99);
         canvas.scroll(0.375, true, Instant::now());
-        canvas.reconcile(89, 90, 25);
+        canvas.reconcile(89, 90, 25, 80);
         assert_eq!(canvas.position_rows(), 89.375);
     }
 
     #[test]
     fn return_to_live_is_animated_unless_desktop_requests_reduced_motion() {
         let mut canvas = TranscriptCanvas::default();
-        canvas.reconcile(20, 100, 25);
+        canvas.reconcile(20, 100, 25, 80);
         canvas.follow_live(Instant::now());
         assert!(canvas.following());
         assert!(canvas.animating());
@@ -487,13 +525,13 @@ mod tests {
     #[test]
     fn between_prompt_reads_park_fraction_without_replaying_motion() {
         let mut canvas = TranscriptCanvas::default();
-        canvas.reconcile(7, 100, 25);
+        canvas.reconcile(7, 100, 25, 80);
         canvas.applied(7);
         canvas.scroll(0.375, true, Instant::now());
         canvas.park();
         assert!(!canvas.enabled());
         assert!(!canvas.animating());
-        canvas.reconcile(10, 103, 25);
+        canvas.reconcile(10, 103, 25, 80);
         assert_eq!(canvas.position_rows(), 10.375);
         assert!(!canvas.animating());
         assert!(!canvas.following());

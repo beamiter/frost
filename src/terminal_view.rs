@@ -5984,7 +5984,7 @@ mod mode_gesture_tests {
         let projection = terminal.get_projected_viewport(false);
         let theme = Theme::default();
         let mut motion = crate::transcript_canvas::TranscriptCanvas::default();
-        motion.reconcile(4, 100, 8);
+        motion.reconcile(4, 100, 8, 80);
         motion.applied(4);
         motion.scroll(0.375, true, Instant::now());
         let mut widget = fixture(&projection, &theme, TerminalMode::Block, 0).transcript_canvas(
@@ -6041,7 +6041,7 @@ mod mode_gesture_tests {
         let bounds = Rectangle::new(Point::new(13.0, 17.0), Size::new(600.0, 170.0));
         for fraction in [0.0, 0.375] {
             let mut motion = crate::transcript_canvas::TranscriptCanvas::default();
-            motion.reconcile(4, 100, 8);
+            motion.reconcile(4, 100, 8, 80);
             motion.applied(4);
             motion.scroll(fraction, true, Instant::now());
             let mut widget = fixture(&projection, &theme, TerminalMode::Block, 0)
@@ -6088,7 +6088,7 @@ mod mode_gesture_tests {
         let projection = terminal.get_projected_viewport(false);
         let theme = Theme::default();
         let mut motion = crate::transcript_canvas::TranscriptCanvas::default();
-        motion.reconcile(0, 100, 8);
+        motion.reconcile(0, 100, 8, 80);
         let now = Instant::now();
         motion.scroll(3.0, false, now);
         let mut widget = fixture(&projection, &theme, TerminalMode::Block, 0).transcript_canvas(

@@ -73,6 +73,8 @@ synthetic reading anchor and its fractional position.
 Resizing a pane retains that within-row reading position and does not silently
 resume following when the reader is less than one row above the tail. Layout
 changes discard old wheel destinations; panes already following remain live.
+Width-only column reflow uses the same reset, even if the visible row count
+stays unchanged, so an old-width wheel target cannot move the new reading anchor.
 
 The renderer materializes only the viewport plus one real history margin row.
 It changes that materialization only at row boundaries or source updates;
