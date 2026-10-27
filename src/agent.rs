@@ -16,6 +16,7 @@
 //!    only when it carries the locally armed one-shot approval generation and
 //!    its prompt-excluded command text exactly equals the reviewed command.
 
+use jterm_core::agent::ModelRequestToken;
 use crate::config::Config;
 use crate::terminal::CompletedCommand;
 use jterm_core::agent::{
@@ -107,10 +108,10 @@ fn proposal_command(session: &AgentSession, proposal_id: ProposalId) -> Option<&
     })
 }
 
-fn accept_model_reply_compat(session: &mut AgentSession, raw: &str) -> Result<(), String> {
+fn accept_model_reply_for(session: &mut AgentSession, request: &ModelRequestToken, raw: &str) -> Result<(), String> {
     let checkpoint = session.snapshot();
     let outcome = session
-        .accept_model_reply(raw)
+        .accept_model_reply_for(request, raw)
         .map_err(|error| error.to_string())?;
     let ModelOutcome::Proposal { command, .. } = outcome else {
         return Ok(());
@@ -338,6 +339,7 @@ struct PendingAgentExecution {
 }
 
 struct InFlightModelRequest {
+ model_token: ModelRequestToken,
     identity: ModelRequestIdentity,
     token: AiCancellationToken,
 }
@@ -582,7 +584,7 @@ impl AgentUi {
         if !self
             .session
             .as_ref()
-            .is_some_and(|session| session.is_current_epoch(identity.epoch))
+            .is_some_and(|session| session.is_current_epoch(identity.epoch) && self.in_flight.as_ref().is_some_and(|request| request.model_token.is_active()))
         {
             // This is not an older callback racing a newer request: it is the
             // currently tracked request after its task epoch was replaced.
@@ -677,6 +679,7 @@ impl AgentUi {
         let token = AiCancellationToken::new();
         let identity = ModelRequestIdentity { epoch, generation };
         self.in_flight = Some(InFlightModelRequest {
+ model_token: session.model_request_token()?,
             identity,
             token: token.clone(),
         });
@@ -704,7 +707,7 @@ impl AgentUi {
             if let Some(request) = self.in_flight.as_ref() {
                 request.token.cancel();
             }
-            self.in_flight = None;
+            let request = self.in_flight.take().expect("checked request").model_token;
             self.loading = false;
             // Invalidate the worker immediately. Relying on a later final
             // callback after cancellation could leave the UI permanently
@@ -716,7 +719,7 @@ impl AgentUi {
             self.generation = generation;
             let message = format!("AI reply exceeded the {MAX_AGENT_MODEL_REPLY_BYTES}-byte limit");
             if let Some(session) = self.session.as_mut() {
-                if let Err(error) = session.model_failed(message.clone()) {
+                if let Err(error) = session.model_failed_for(&request, message.clone()) {
                     self.set_status(error.to_string());
                     return;
                 }
@@ -751,7 +754,7 @@ impl AgentUi {
         if !self.accepts_model_callback(identity) {
             return;
         }
-        self.in_flight = None;
+        let request = self.in_flight.take().expect("checked request").model_token;
         self.loading = false;
         let Some(session) = self.session.as_mut() else {
             return;
@@ -759,16 +762,16 @@ impl AgentUi {
         let outcome = match result {
             Ok(raw) if raw.len() <= MAX_AGENT_MODEL_REPLY_BYTES => {
                 self.stream_raw.clear();
-                accept_model_reply_compat(session, &raw)
+                accept_model_reply_for(session, &request, &raw)
             }
             Ok(_) => session
-                .model_failed(format!(
+                .model_failed_for(&request, format!(
                     "AI reply exceeded the {MAX_AGENT_MODEL_REPLY_BYTES}-byte limit"
                 ))
                 .map(|_| ())
                 .map_err(|error| error.to_string()),
             Err(error) => session
-                .model_failed(error)
+                .model_failed_for(&request, error)
                 .map(|_| ())
                 .map_err(|error| error.to_string()),
         };
@@ -2658,4 +2661,10 @@ mod tests {
             AgentState::AwaitingApproval { proposal_id: id }
         );
     }
+}
+
+#[cfg(test)]
+fn accept_model_reply_compat(session: &mut AgentSession, raw: &str) -> Result<(), String> {
+ let request = session.model_request_token().expect("test request");
+ accept_model_reply_for(session, &request, raw)
 }
