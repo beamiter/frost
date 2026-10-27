@@ -109,7 +109,7 @@ pub enum ScrollbarVisibility {
     Always,
 }
 
-/// Explicit presentation. Missing preserves the legacy `block_mode` switch.
+/// Public Block/Chat presentation. Legacy Normal remains a readable migration value.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalMode {
@@ -121,7 +121,7 @@ pub enum TerminalMode {
 impl std::fmt::Display for TerminalMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Normal => "Normal",
+            Self::Normal => "Block",
             Self::Block => "Block",
             Self::Chat => "Chat",
         })
@@ -588,11 +588,11 @@ fn default_scrollback_lines() -> usize {
 }
 
 fn default_initial_width() -> f32 {
-    1200.0
+    jterm_core::reference_shell::REFERENCE_WIDTH
 }
 
 fn default_initial_height() -> f32 {
-    600.0
+    jterm_core::reference_shell::REFERENCE_HEIGHT
 }
 
 fn default_cols() -> usize {
@@ -734,11 +734,12 @@ impl Default for Config {
 
 impl Config {
     pub fn effective_terminal_mode(&self) -> TerminalMode {
-        self.terminal_mode.unwrap_or(if self.block_mode {
-            TerminalMode::Block
-        } else {
-            TerminalMode::Normal
-        })
+        // Legacy Normal and block_mode=false remain readable, but public
+        // presentation now has only Block and Chat. Both retain the real PTY.
+        match self.terminal_mode {
+            Some(TerminalMode::Chat) => TerminalMode::Chat,
+            Some(TerminalMode::Block | TerminalMode::Normal) | None => TerminalMode::Block,
+        }
     }
 
     pub fn is_block_mode(&self) -> bool {
@@ -2050,10 +2051,10 @@ mod tests {
     fn chat_mode_is_explicit_preserves_legacy_and_round_trips() {
         for legacy in [false, true] {
             let old = Config::from_toml(&format!("block_mode = {legacy}\n")).unwrap();
-            assert_eq!(old.is_block_mode(), legacy);
+            assert!(old.is_block_mode(), "legacy native mode migrates to Block");
             assert!(!old.is_chat_mode());
             for (value, expected) in [
-                ("normal", TerminalMode::Normal),
+                ("normal", TerminalMode::Block),
                 ("block", TerminalMode::Block),
                 ("chat", TerminalMode::Chat),
             ] {

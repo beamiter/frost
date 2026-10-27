@@ -13,6 +13,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import time
+import tempfile
 
 
 def wait_for(test, label, timeout=30):
@@ -34,8 +35,12 @@ class Smoke:
         for name in ('DISPLAY', 'WAYLAND_DISPLAY', 'SWAYSOCK'):
             self.env.pop(name, None)
         home = out / 'home'
-        runtime = out / 'runtime'
-        runtime.mkdir(mode=0o700)
+        # Unix-domain socket names have a108-byte limit. Deep evidence paths
+        # must not prevent the real compositor from starting before app launch.
+        self._runtime = tempfile.TemporaryDirectory(prefix='frost-native-', dir='/tmp')
+        runtime = Path(self._runtime.name)
+        (out / 'native-runtime.json').write_text(json.dumps({'runtime': str(runtime),
+            'reason': 'private short Unix-domain socket directory', 'removed_after_cleanup': True}, indent=2))
         home.mkdir()
         for key, suffix in [('HOME', ''), ('XDG_CONFIG_HOME', '.config'),
                             ('XDG_DATA_HOME', '.local/share'), ('XDG_STATE_HOME', '.local/state'),
@@ -108,7 +113,10 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
             cfg = self.out / 'sway.conf'
             cfg.write_text('xwayland disable\noutput * resolution 1280x900\nseat seat0 fallback true\nfocus_follows_mouse no\n')
             self.env.update(WLR_BACKENDS='headless', WLR_RENDERER='pixman', WLR_LIBINPUT_NO_DEVICES='1', WLR_HEADLESS_OUTPUTS='1')
-            server = self.spawn(['sway', '-d', '-c', str(cfg)], 'sway')
+            # The fixture uses the headless Pixman renderer. Sway's host-driver
+            # check still sees installed Nvidia modules even though no GPU is
+            # used; its documented flag permits this isolated software run.
+            server = self.spawn(['sway', '--unsupported-gpu', '-d', '-c', str(cfg)], 'sway')
             runtime = Path(self.env['XDG_RUNTIME_DIR'])
             sock = wait_for(lambda: next((p for p in runtime.glob('wayland-*') if p.is_socket()), None), 'Wayland socket')
             self.env['WAYLAND_DISPLAY'] = sock.name.removesuffix('.lock')
@@ -244,6 +252,7 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
                     proc.wait()
         for log in self.logs:
             log.close()
+        self._runtime.cleanup()
 
 
 def main():

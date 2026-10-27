@@ -1258,6 +1258,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "tiny-skia",
  "tokio",
  "toml",
  "unicode-normalization",

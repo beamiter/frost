@@ -38,6 +38,9 @@ pub(crate) struct OrganismBody {
     pub epoch: u64,
     pub sprite: String,
     pub walking_sprite: String,
+    pub status: String,
+    pub explanation: String,
+    pub life: &'static str,
     pub frame: u64,
     pub wander: Option<u64>,
     pub bottom: bool,
@@ -747,6 +750,17 @@ fn chat_card_visual(
         return block_card_visual(segment, foreground, accent, hovered, opacity);
     }
     let command = role == ChatRole::Command;
+    if role == ChatRole::Composer {
+        return BlockCardVisual {
+            background: alpha(
+                Theme::rgb_to_color32(jterm_core::reference_shell::color::COMPOSER),
+                opacity,
+            ),
+            border: alpha(accent, 0.37),
+            border_width: 1.0,
+            shadow: Shadow::default(),
+        };
+    }
     BlockCardVisual {
         background: alpha(
             alpha(
@@ -953,6 +967,7 @@ impl Metrics {
 /// A custom widget that renders a terminal grid snapshot using the advanced
 /// renderer (quads for backgrounds/cursor, real text shaping for glyphs).
 pub struct TermWidget<'a, Message> {
+    shared_shell: bool,
     canvas: crate::transcript_canvas::CanvasGeometry,
     canvas_position: Option<f64>,
     canvas_animating: bool,
@@ -1042,6 +1057,11 @@ pub struct TermWidget<'a, Message> {
 }
 
 impl<'a, Message> TermWidget<'a, Message> {
+    pub(crate) fn shared_shell(mut self) -> Self {
+        self.shared_shell = true;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         grid: &'a [Vec<TerminalCell>],
@@ -1067,6 +1087,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             canvas_app_mouse: false,
             on_canvas_scroll: None,
             on_canvas_pause: None,
+            shared_shell: false,
             mode_epoch: 0,
             terminal_mode: crate::config::TerminalMode::Normal,
             grid,
@@ -1313,7 +1334,7 @@ impl<'a, Message> TermWidget<'a, Message> {
     /// This exact clipped rectangle is shared by paint, pointer cursor and
     /// activation. The footer is synthetic and can never own terminal input.
     fn chat_submit_geometry(&self, bounds: Rectangle, viewport: &Rectangle) -> Option<Rectangle> {
-        if !self.focused || self.grid.first()?.len() < 8 {
+        if self.shared_shell || !self.focused || self.grid.first()?.len() < 8 {
             return None;
         }
         let row = self.chat_rows.iter().enumerate().find_map(|(row, chat)| {
@@ -1590,6 +1611,28 @@ impl<'a, Message> TermWidget<'a, Message> {
             height: ch.min(area.height),
         };
         Some((area, toggle))
+    }
+
+    fn organism_speech_geometry(&self, body: &OrganismBodyGeometry) -> Option<Rectangle> {
+        if !self.organism_expanded {
+            return None;
+        }
+        let width = (body.rect.x - body.travel.x - 8.0).min(240.0);
+        if width < 150.0 {
+            return None;
+        }
+        let speech = organism_block::Rect {
+            x: body.rect.x - width - 8.0,
+            y: body.rect.y,
+            width,
+            height: 64.0,
+        };
+        body.travel.includes(speech).then_some(Rectangle {
+            x: speech.x,
+            y: speech.y,
+            width,
+            height: speech.height,
+        })
     }
 
     fn organism_toggle_at(&self, position: Point, bounds: Rectangle, viewport: &Rectangle) -> bool {
@@ -2401,6 +2444,7 @@ mod tests {
         const ROWS: [ChatRow; 8] = {
             let row = ChatRow {
                 role: ChatRole::Composer,
+                role_header: false,
                 group: 0,
                 left_col: 0,
                 top: false,
@@ -2527,12 +2571,12 @@ mod tests {
         let projection = terminal.get_projected_viewport(false);
         let theme = crate::theme::Theme::default();
         let mut blocks = vec![BlockPaintRow::default(); 8];
-        for (index, row) in blocks.iter_mut().enumerate().take(6) {
+        for (index, row) in blocks.iter_mut().enumerate().take(8) {
             row.card_group = Some(0);
             row.card_kind = BlockCardKind::Active;
             row.app_eligible = true;
             row.card_top = index == 0;
-            row.card_bottom = index == 5;
+            row.card_bottom = index == 7;
         }
         let mut widget = super::TermWidget::new(
             projection.cells(),
@@ -2554,6 +2598,9 @@ mod tests {
         .blocks(blocks)
         .organism_body(
             Some(super::OrganismBody {
+                status: String::new(),
+                explanation: String::new(),
+                life: "",
                 block: terminal.raw_row_id_at_absolute(0).unwrap(),
                 epoch: 9,
                 sprite: crate::organism::LivePresentation::passive_presence().sprite,
@@ -2613,7 +2660,7 @@ mod tests {
             assert_eq!(geometry.epoch, 9);
             assert_eq!(Some(&geometry.projection), widget.projection_key.as_ref());
             assert_eq!(geometry.rect.y, 16.0);
-            assert_eq!(geometry.rect.height, 44.0);
+            assert_eq!(geometry.rect.height, jterm_core::reference_organism::SIZE);
             // Moving only the native widget origin moves the body by the same
             // amount; it never acquires a viewport-bottom anchor.
             let moved = Rectangle { y: 24.0, ..bounds };
@@ -2621,6 +2668,27 @@ mod tests {
             assert_eq!(moved_geometry.rect.y, geometry.rect.y + 24.0);
             widget.blocks[0].card_top = false;
             assert!(widget.organism_geometry(bounds, &bounds).is_none());
+        });
+    }
+
+    #[test]
+    fn graphical_speech_stays_in_the_same_proven_blank_suffix() {
+        with_native_body(|widget, bounds| {
+            let body = widget.organism_geometry(bounds, &bounds).unwrap();
+            assert!(widget.organism_speech_geometry(&body).is_none());
+            widget.organism_expanded = true;
+            let speech = widget.organism_speech_geometry(&body).unwrap();
+            assert!(body.travel.includes(super::native_body_rect(speech)));
+            assert!(speech.x + speech.width < body.rect.x);
+            assert!(speech.y >= body.rect.y);
+            assert!(speech.y + speech.height <= body.travel.y + body.travel.height);
+            widget.blocks[5].card_bottom = true;
+            widget.blocks[6].card_group = None;
+            widget.blocks[7].card_group = None;
+            assert!(
+                widget.organism_geometry(bounds, &bounds).is_none(),
+                "A six-row small-font card cannot fit the 64px contour"
+            );
         });
     }
 
@@ -2655,6 +2723,9 @@ mod tests {
                 let test_widget: super::TermWidget<'_, ()> = super::TermWidget {
                     grid: &cells,
                     organism_body: widget.organism_body.as_ref().map(|b| super::OrganismBody {
+                        status: String::new(),
+                        explanation: String::new(),
+                        life: "",
                         block: b.block,
                         epoch: b.epoch,
                         sprite: b.sprite.clone(),
@@ -3904,6 +3975,18 @@ impl<Message> TermWidget<'_, Message> {
                     self.opacity,
                 );
             }
+            if self.shared_shell
+                && (self
+                    .chat_rows
+                    .get(segment.start_row)
+                    .is_some_and(|row| row.role == crate::chat_mode::ChatRole::Composer)
+                    || (self.terminal_mode == crate::config::TerminalMode::Block
+                        && segment.kind == BlockCardKind::Active))
+            {
+                visual.background = Color::TRANSPARENT;
+                visual.border = Color::TRANSPARENT;
+                visual.border_width = 0.0;
+            }
             renderer.fill_quad(
                 Quad {
                     bounds: geometry.body,
@@ -4432,6 +4515,18 @@ impl<Message> TermWidget<'_, Message> {
                     self.opacity,
                 );
             }
+            if self.shared_shell
+                && (self
+                    .chat_rows
+                    .get(segment.start_row)
+                    .is_some_and(|row| row.role == crate::chat_mode::ChatRole::Composer)
+                    || (self.terminal_mode == crate::config::TerminalMode::Block
+                        && segment.kind == BlockCardKind::Active))
+            {
+                visual.background = Color::TRANSPARENT;
+                visual.border = Color::TRANSPARENT;
+                visual.border_width = 0.0;
+            }
             if segment.real_top && segment.real_bottom {
                 renderer.fill_quad(
                     Quad {
@@ -4487,6 +4582,80 @@ impl<Message> TermWidget<'_, Message> {
                     Background::Color(alpha(stripe, if segment.stripe_strong { 1.0 } else { 0.7 })),
                 );
             }
+        }
+
+        // Rich production Shell role headers are synthetic host rows in the
+        // existing projection. Native output cells, selection, links, search,
+        // images, reading anchors and fractional scroll remain unchanged.
+        for (row, chat) in self.chat_rows.iter().enumerate() {
+            if !chat.role_header || !belongs(row) {
+                continue;
+            }
+            let y = self.row_y(bounds, row);
+            let sans = iced::Font::with_name(jterm_core::reference_shell::FONT_SANS);
+            renderer.fill_quad(
+                Quad {
+                    bounds: Rectangle {
+                        x: ox,
+                        y: y + 2.0,
+                        width: 18.0,
+                        height: 18.0,
+                    },
+                    border: Border {
+                        radius: 5.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                Background::Color(Theme::rgb_to_color32(
+                    jterm_core::reference_shell::color::ACCENT_PALE,
+                )),
+            );
+            chrome_text(
+                renderer,
+                "SH",
+                Rectangle {
+                    x: ox + 3.0,
+                    y: y + 2.0,
+                    width: 14.0,
+                    height: 18.0,
+                },
+                sans,
+                8.0,
+                block_accent,
+                clip,
+            );
+            chrome_text(
+                renderer,
+                "Shell",
+                Rectangle {
+                    x: ox + 27.0,
+                    y: y + 2.0,
+                    width: 42.0,
+                    height: 18.0,
+                },
+                iced::Font {
+                    weight: iced::font::Weight::Bold,
+                    ..sans
+                },
+                12.0,
+                default_fg,
+                clip,
+            );
+            chrome_text(
+                renderer,
+                "·  Terminal output",
+                Rectangle {
+                    x: ox + 71.0,
+                    y: y + 2.0,
+                    width: 150.0,
+                    height: 18.0,
+                },
+                sans,
+                9.0,
+                alpha(default_fg, 0.55),
+                clip,
+            );
         }
 
         // Block-mode UI chrome (per-row, precomputed by the app) sits above
@@ -4838,70 +5007,85 @@ impl<Message> TermWidget<'_, Message> {
                     width: geometry.rect.width,
                     height: geometry.rect.height,
                 };
-                let color = organism_tone_color(body.tone, self.theme);
-                let hovered = cursor.position().is_some_and(|p| rect.contains(p));
-                renderer.fill_quad(
-                    Quad {
-                        bounds: rect,
-                        border: Border {
-                            color: if hovered {
-                                alpha(default_fg, 0.45)
-                            } else {
-                                alpha(color, organism_body_border_opacity(body.tone))
-                            },
-                            width: 1.0,
-                            radius: 6.0.into(),
-                        },
-                        shadow: Shadow::default(),
-                        snap: true,
+                let size = jterm_core::reference_organism::SIZE
+                    .min(rect.width)
+                    .min(rect.height);
+                renderer.draw_image(
+                    iced::advanced::image::Image::new(crate::reference_organism::handle()),
+                    Rectangle {
+                        x: rect.x + (rect.width - size) * 0.5,
+                        y: rect.y + (rect.height - size) * 0.5,
+                        width: size,
+                        height: size,
                     },
-                    Background::Color(alpha(default_bg, 0.8)),
+                    clip,
                 );
-                let bold = iced::Font {
-                    weight: iced::font::Weight::Bold,
-                    ..self.mono
-                };
-                let walking = self.organism_walking(
-                    Some(&geometry),
-                    _tree.state.downcast_ref::<State>(),
-                    cursor.position().map(|p| (p.x, p.y)),
-                );
-                let sprite = if walking {
-                    &body.walking_sprite
-                } else {
-                    &body.sprite
-                };
-                for (row, line) in sprite.lines().enumerate() {
-                    for (col, glyph) in line.chars().enumerate() {
-                        if glyph == ' ' {
-                            continue;
-                        }
-                        renderer.fill_text(
-                            Text {
-                                content: glyph.to_string(),
-                                bounds: Size::new(cw, ch),
-                                size: Pixels(self.metrics.font_size),
-                                line_height: text::LineHeight::Absolute(Pixels(ch)),
-                                font: bold,
-                                align_x: text::Alignment::Center,
-                                align_y: iced::alignment::Vertical::Center,
-                                shaping: text::Shaping::Basic,
-                                wrapping: text::Wrapping::None,
+                let speech = self.organism_speech_geometry(&geometry);
+                log::debug!(target: "frost::reference_organism", "body={:?} speech={:?} owner_block={:?}", rect, speech, body.block);
+                if let Some(speech) = speech {
+                    let rgba =
+                        |c: [u8; 4]| Color::from_rgba8(c[0], c[1], c[2], c[3] as f32 / 255.0);
+                    renderer.fill_quad(
+                        Quad {
+                            bounds: speech,
+                            border: Border {
+                                color: rgba(jterm_core::reference_organism::SPEECH_BORDER),
+                                width: 1.0,
+                                radius: jterm_core::reference_organism::SPEECH_RADIUS.into(),
                             },
-                            Point::new(
-                                rect.x
-                                    + organism_block::BODY_PAD_X
-                                    + organism_block::BODY_BORDER
-                                    + (col as f32 + 0.5) * cw,
-                                rect.y
-                                    + organism_block::BODY_PAD_Y
-                                    + organism_block::BODY_BORDER
-                                    + (row as f32 + 0.5) * ch,
-                            ),
-                            color,
-                            clip,
-                        );
-                    }
+                            shadow: Shadow::default(),
+                            snap: true,
+                        },
+                        Background::Color(rgba(jterm_core::reference_organism::SPEECH_SURFACE)),
+                    );
+                    let sans = iced::Font::with_name(jterm_core::reference_shell::FONT_SANS);
+                    let text_rect = |y, height| Rectangle {
+                        x: speech.x + 10.0,
+                        y: speech.y + y,
+                        width: speech.width - 30.0,
+                        height,
+                    };
+                    chrome_text(
+                        renderer,
+                        body.life,
+                        text_rect(6.0, 14.0),
+                        sans,
+                        9.0,
+                        rgba(jterm_core::reference_organism::AWAKE_COLOR),
+                        clip,
+                    );
+                    chrome_text(
+                        renderer,
+                        &body.status,
+                        text_rect(22.0, 15.0),
+                        sans,
+                        10.0,
+                        Color::from_rgb8(225, 233, 246),
+                        clip,
+                    );
+                    chrome_text(
+                        renderer,
+                        &body.explanation,
+                        text_rect(39.0, 16.0),
+                        sans,
+                        8.0,
+                        Color::from_rgb8(145, 162, 187),
+                        clip,
+                    );
+                    chrome_text(
+                        renderer,
+                        "×",
+                        Rectangle {
+                            x: speech.x + speech.width - 20.0,
+                            y: speech.y + 4.0,
+                            width: 16.0,
+                            height: 16.0,
+                        },
+                        sans,
+                        12.0,
+                        Color::from_rgb8(145, 162, 187),
+                        clip,
+                    );
                 }
             }
         }
@@ -5144,6 +5328,47 @@ where
             return;
         }
         let bounds = layout.bounds();
+        // A native speech close is chrome, not a terminal reading gesture.
+        // Consume it before canvas pause and before any PTY mouse bookkeeping.
+        if self.organism_expanded
+            && matches!(
+                event,
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+            )
+        {
+            if let (Some(pos), Some(toggle)) = (
+                cursor.position_over(bounds),
+                self.on_organism_toggle.as_ref(),
+            ) {
+                let previous = tree.state.downcast_ref::<State>();
+                if let Some(speech) = self
+                    .painted_organism_geometry(
+                        bounds,
+                        viewport,
+                        previous.body_geometry.as_ref(),
+                        previous.body_frame,
+                        Some((pos.x, pos.y)),
+                    )
+                    .and_then(|body| self.organism_speech_geometry(&body))
+                {
+                    let close = Rectangle {
+                        x: speech.x + speech.width - 24.0,
+                        y: speech.y,
+                        width: 24.0,
+                        height: 24.0,
+                    };
+                    if close.contains(pos) {
+                        let state = tree.state.downcast_mut::<State>();
+                        state.consumed_presses[MouseButton::Left.slot()] = true;
+                        state.published_presses[MouseButton::Left.slot()] = false;
+                        state.dragging = false;
+                        shell.publish(toggle(false));
+                        shell.capture_event();
+                        return;
+                    }
+                }
+            }
+        }
         if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)))
             && cursor.position_over(bounds).is_some()
         {
@@ -5657,7 +5882,9 @@ where
             // the translucent theme background, so repainting it here would stack
             // two alpha layers and defeat the transparency; only a per-pane OSC 11
             // override still needs its own (equally translucent) fill.
-            if self.opacity >= 1.0 {
+            if self.opacity >= 1.0
+                && !(self.shared_shell && self.terminal_mode == crate::config::TerminalMode::Chat)
+            {
                 renderer.fill_quad(solid_quad(bounds), Background::Color(default_bg));
             } else if self.dynamic_bg.is_some() {
                 renderer.fill_quad(
@@ -5934,6 +6161,9 @@ mod block_spacing_render_tests {
                         .on_summary(projection.key(), |_| ())
                         .organism_body(
                             Some(OrganismBody {
+                                status: String::new(),
+                                explanation: String::new(),
+                                life: "",
                                 block: raw_block,
                                 epoch: 1,
                                 sprite: crate::organism::LivePresentation::passive_presence()
@@ -5966,8 +6196,23 @@ mod block_spacing_render_tests {
                             assert!(geometry.is_none(), "narrow panes still fail closed");
                             continue;
                         }
-                        let geometry = geometry.unwrap();
-                        assert_eq!(geometry.rect.height, 3.0 * metrics.cell_h + 8.0);
+                        let Some(geometry) = geometry else {
+                            let active = block_card_segments(&widget.blocks)
+                                .into_iter()
+                                .find(|part| part.kind == BlockCardKind::Active)
+                                .unwrap();
+                            let card = widget.card_geometry(bounds, active).body;
+                            let first_blank = bounds.y
+                                + metrics.padding
+                                + widget.canvas.offset(widget.cursor.0 + 1, metrics.cell_h);
+                            assert!(card.y + card.height - 3.0 - first_blank < jterm_core::reference_organism::SIZE,
+                                "Only an insufficient verified blank suffix may reject this wide fixture");
+                            continue;
+                        };
+                        assert_eq!(
+                            geometry.rect.height,
+                            (3.0 * metrics.cell_h + 8.0).max(jterm_core::reference_organism::SIZE)
+                        );
                         assert_eq!(geometry.rect.width, 12.0 * metrics.cell_w + 14.0);
                         assert!(geometry.rect.y + 0.001 >= pos.y + metrics.cell_h * 0.5);
                         if let Some(previous) = body_y {

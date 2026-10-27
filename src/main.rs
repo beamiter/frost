@@ -39,6 +39,10 @@ mod keybindings;
 mod kitty_graphics;
 mod link;
 mod native_enter;
+mod native_input_surface;
+mod native_popup_surface;
+mod native_shell;
+mod native_viewport;
 mod organism;
 mod organism_activity;
 mod organism_block;
@@ -55,6 +59,9 @@ mod pty;
 #[cfg(all(test, unix))]
 mod readline_preservation_tests;
 mod recovery_report;
+mod reference_conversation;
+mod reference_icon;
+mod reference_organism;
 mod remote_fs;
 mod remote_host_editor;
 mod review_text;
@@ -4650,6 +4657,17 @@ fn main() -> iced::Result {
 
 #[derive(Debug, Clone)]
 enum Message {
+    ReferenceInspector(native_shell::InspectorTab),
+    ReferenceInspectorToggle,
+    ReferenceCommand(keybindings::Command),
+    ReferencePalette,
+    ReferenceToolsToggle,
+    ReferenceToolsClose,
+    ReferenceToolsSelect(usize),
+    ReferenceToolsChoose(usize),
+    ReferenceHelp,
+    ReferenceCopy(String),
+    ReferenceFocusTerminal,
     TranscriptPause(usize, u64),
     TranscriptScroll(usize, u64, f64, bool),
     TranscriptFrame(usize, u64),
@@ -6856,6 +6874,10 @@ fn overlay_release_disposition(
 }
 
 struct Frost {
+    reference_inspector_tab: native_shell::InspectorTab,
+    reference_inspector_open: bool,
+    reference_inspector_drawer: bool,
+    reference_tools_selection: Option<usize>,
     vim9_tabs: std::collections::HashMap<usize, vim9_ide::Ide>,
     config: Config,
     terminal_interaction_mode: config::TerminalMode,
@@ -7200,7 +7222,7 @@ impl Frost {
             .ai_temperature
             .map(|t| format!("{t}"))
             .unwrap_or_default();
-        let theme = Theme::get_theme(&config.theme).unwrap_or_default();
+        let theme = Self::reference_theme(&config);
         let mono = resolve_mono_font(&config.font_family);
         let metrics = Metrics::with_font(
             mono,
@@ -7251,9 +7273,13 @@ impl Frost {
         } else {
             SidebarPanel::Files
         };
-        let sidebar_open = side_tabs;
+        let sidebar_open = true;
 
         let mut app = Frost {
+            reference_inspector_tab: native_shell::InspectorTab::Agent,
+            reference_inspector_open: true,
+            reference_inspector_drawer: false,
+            reference_tools_selection: None,
             vim9_tabs: Default::default(),
             terminal_interaction_mode: config.effective_terminal_mode(),
             terminal_interaction_epoch: 0,
@@ -7339,7 +7365,7 @@ impl Frost {
             sidebar_scans: sidebar::DirectoryScanCoordinator::default(),
             sidebar_open,
             sidebar_panel,
-            dock_width: SIDEBAR_W,
+            dock_width: jterm_core::reference_shell::INSPECTOR_WIDTH,
             dragging_sidebar: false,
             sidebar_menu: None,
             sidebar_dialog: None,
@@ -7531,7 +7557,7 @@ impl Frost {
     }
 
     fn tab_bar_height(&self) -> f32 {
-        ui_typography::row_height(self.chrome_font_size(), TAB_BAR_H, TAB_BAR_PADDING)
+        jterm_core::reference_shell::TITLEBAR_HEIGHT
     }
 
     fn status_bar_height(&self) -> f32 {
@@ -7606,7 +7632,7 @@ impl Frost {
                 sess.block_selection.clear();
             }
         }
-        self.theme = Theme::get_theme(&self.config.theme).unwrap_or_default();
+        self.theme = Self::reference_theme(&self.config);
         self.sync_theme_colors();
         self.mono = resolve_mono_font(&self.config.font_family);
         self.cjk_mono = resolve_optional_font(Config::cjk_monospace_font_family());
@@ -7896,6 +7922,25 @@ impl Frost {
         self.sidebar_open
     }
 
+    fn reference_inspector_visible(&self) -> bool {
+        self.reference_layout().inspector.is_some() || self.reference_inspector_drawer
+    }
+
+    /// The Files surface belongs to the right inspector/drawer, independently
+    /// of whether workspace navigation is collapsed.
+    fn files_surface_visible(&self) -> bool {
+        self.reference_inspector_visible()
+            && self.reference_inspector_tab == native_shell::InspectorTab::Files
+            && self.sidebar_panel == SidebarPanel::Files
+    }
+
+    fn tasks_surface_visible(&self) -> bool {
+        self.reference_inspector_visible()
+            && self.reference_inspector_tab == native_shell::InspectorTab::Agent
+            && self.sidebar_panel == SidebarPanel::Tasks
+            && self.config.experimental_task_sidebar
+    }
+
     /// Whether the terminal itself owns text/IME input. Every overlay with an
     /// editable field or modal action takes ownership until it closes.
     fn sync_terminal_ime_owner(&mut self) {
@@ -7926,6 +7971,7 @@ impl Frost {
             && !self.search_replace.is_open
             && !self.agent_sessions.open
             && !self.palette.is_open
+            && self.reference_tools_selection.is_none()
             && !self.ai_chats.is_open
             && self.ai_ask.is_none()
             && !self.config_panel_open
@@ -7969,6 +8015,7 @@ impl Frost {
         !self.search_replace.is_open
             && !self.agent_sessions.open
             && !self.palette.is_open
+            && self.reference_tools_selection.is_none()
             && !self.ai_chats.is_open
             && self.ai_ask.is_none()
             && !self.config_panel_open
@@ -8250,7 +8297,7 @@ impl Frost {
             tree_generation: self.sidebar.generation(),
             tree_location: self.sidebar.location.clone(),
             tree_root: self.sidebar.current_dir.clone(),
-            sidebar_open: self.sidebar_open,
+            sidebar_open: self.files_surface_visible(),
             sidebar_panel: self.sidebar_panel,
         });
 
@@ -8310,7 +8357,7 @@ impl Frost {
         let tree_still_matches = sidebar_remote_follow_context_is_current(
             &pending,
             &self.sidebar,
-            self.sidebar_open,
+            self.files_surface_visible(),
             self.sidebar_panel,
             self.sidebar_hosts_epoch,
             self.sidebar_follow_intent_epoch,
@@ -8599,10 +8646,10 @@ impl Frost {
         self.task_panel.set_show_hidden(false);
         self.invalidate_sidebar_remote_follow_intent();
         self.sidebar_open = !self.sidebar_open;
-        self.sidebar_files_focused = self.sidebar_open && self.sidebar_panel == SidebarPanel::Files;
+        self.sidebar_files_focused = self.files_surface_visible();
         // The cwd follow is local-only, exactly as in SetSidebarPanel.
         let follow_local = self.sidebar.location == remote_fs::FsLocation::Local;
-        let request = if self.sidebar_open && self.sidebar_panel == SidebarPanel::Files {
+        let request = if self.files_surface_visible() {
             if follow_local {
                 if let Some(cwd) = self
                     .sessions
@@ -8894,8 +8941,7 @@ impl Frost {
     /// (dock closed, another panel, pointer over the terminal) — those drops
     /// keep the terminal's own drop behavior.
     fn sidebar_drop_target(&self) -> Option<std::path::PathBuf> {
-        if !(self.dock_open() && self.sidebar_panel == SidebarPanel::Files && self.sidebar_hovered)
-        {
+        if !(self.files_surface_visible() && self.sidebar_hovered) {
             return None;
         }
         Some(match &self.sidebar_hovered_row {
@@ -8959,7 +9005,7 @@ impl Frost {
 
     fn files_shortcut_scope(&self) -> bool {
         files_shortcut_scope(
-            self.dock_open(),
+            self.files_surface_visible(),
             self.sidebar_panel == SidebarPanel::Files,
             self.sidebar_hovered,
             self.sidebar_files_focused,
@@ -9100,10 +9146,7 @@ impl Frost {
         modifiers: keyboard::Modifiers,
         repeat: bool,
     ) -> Option<Task<Message>> {
-        if !self.sidebar_files_focused
-            || !self.dock_open()
-            || self.sidebar_panel != SidebarPanel::Files
-        {
+        if !self.sidebar_files_focused || !self.files_surface_visible() {
             return None;
         }
         let no_mod =
@@ -9359,29 +9402,23 @@ impl Frost {
     }
 
     fn term_height(&self) -> f32 {
-        terminal_height_after_chrome(
-            (self.win_size.height - self.startup_recovery.banner_height(self.chrome_font_size()))
-                .max(0.0),
-            self.effective_font_size(),
-            self.chrome_font_size(),
-            self.config.bottom_bar,
+        native_viewport::raw_rect(
+            self.reference_layout().center,
             self.block_reading_bar_height(),
-            self.organism_strip_height(),
+            self.startup_recovery.banner_height(self.chrome_font_size()),
         )
+        .height
     }
 
-    /// Terminal area width: window minus the sidebar (when shown).
+    /// Native terminal pixels exclude the measured rail, navigation,
+    /// inspector and canvas insets; the same dimensions are sent to the PTY.
     fn term_width(&self) -> f32 {
-        (self.win_size.width - self.sidebar_width()).max(0.0)
+        (self.reference_layout().center.width - 2.0 * jterm_core::reference_shell::COMPOSER_INSET)
+            .max(0.0)
     }
 
-    /// Current sidebar width (0 when hidden), including the resize divider.
     fn sidebar_width(&self) -> f32 {
-        if self.dock_open() {
-            self.dock_width + DIVIDER
-        } else {
-            0.0
-        }
+        self.reference_layout().center.x
     }
 
     fn host_clipboard_read_blocked_for(&self, id: usize, fd: RawFd) -> bool {
@@ -11825,7 +11862,8 @@ impl Frost {
     /// is deliberately absent: its input has no Escape owner, so forwarding
     /// there would send a stray ESC to the foreground program.
     fn overlay_owns_escape(&self) -> bool {
-        self.block_clear_confirm.is_some()
+        self.reference_tools_selection.is_some()
+            || self.block_clear_confirm.is_some()
             || self.block_reading_menu.is_some()
             || self.tab_close_confirm.is_some()
             || self.block_menu.is_some()
@@ -16251,7 +16289,9 @@ impl Frost {
         self.sync_terminal_ime_owner();
         let active = self.sessions.get(self.active).map(|s| s.id);
         for (id, editor) in &mut self.vim9_tabs {
-            editor.focus_embedded(self.focused && active == Some(*id));
+            editor.focus_embedded(
+                self.focused && active == Some(*id) && self.reference_tools_selection.is_none(),
+            );
         }
         Task::batch([task, self.dispatch_block_search_work()])
     }
@@ -16262,6 +16302,7 @@ impl Frost {
             .get(self.active)
             .is_some_and(|s| self.vim9_tabs.contains_key(&s.id));
         if editor_active
+            && self.reference_tools_selection.is_none()
             && matches!(
                 &message,
                 Message::WindowKey(..)
@@ -16304,6 +16345,116 @@ impl Frost {
             self.sync_organism_watch();
         }
         match message {
+            Message::ReferenceToolsToggle => {
+                self.native_enter_ownership.lock().claim_held();
+                self.reference_tools_selection =
+                    self.reference_tools_selection.is_none().then_some(0);
+                self.trace_reference_tools("toggle");
+                // Blur previous chrome inputs without introducing another editor.
+                return iced::widget::operation::focus(iced::widget::Id::new(
+                    "frost-terminal-input-owner",
+                ));
+            }
+            Message::ReferenceToolsClose => {
+                self.native_enter_ownership.lock().claim_held();
+                self.reference_tools_selection = None;
+                self.trace_reference_tools("dismiss");
+            }
+            Message::ReferenceToolsSelect(index) => {
+                if self.reference_tools_selection.is_some()
+                    && jterm_core::reference_popup::COMMANDS
+                        .get(index)
+                        .is_some_and(|item| !item.placeholder)
+                {
+                    self.reference_tools_selection = Some(index);
+                }
+            }
+            Message::ReferenceToolsChoose(index) => {
+                if self.reference_tools_selection.is_none() {
+                    return Task::none();
+                }
+                let Some(command) = jterm_core::reference_popup::COMMANDS
+                    .get(index)
+                    .filter(|item| !item.placeholder)
+                else {
+                    return Task::none();
+                };
+                self.native_enter_ownership.lock().claim_held();
+                self.reference_tools_selection = None;
+                self.trace_reference_tools("choose");
+                use jterm_core::reference_popup::ToolCommandId;
+                return self.update(match command.id {
+                    ToolCommandId::Terminal => Message::ReferenceFocusTerminal,
+                    ToolCommandId::CommandPalette => Message::ReferencePalette,
+                    ToolCommandId::SearchCanvas => {
+                        Message::ReferenceCommand(keybindings::Command::SearchOpen)
+                    }
+                    _ => return Task::none(),
+                });
+            }
+            Message::ReferenceCopy(value) => return iced::clipboard::write(value),
+            Message::ReferenceFocusTerminal => {
+                self.reference_tools_selection = None;
+                self.sidebar_files_focused = false;
+                return iced::widget::operation::focus(iced::widget::Id::new(
+                    "frost-terminal-input-owner",
+                ));
+            }
+            Message::ReferenceCommand(command) => {
+                self.reference_tools_selection = None;
+                return self.dispatch_command(command).unwrap_or_else(Task::none);
+            }
+            Message::ReferencePalette => {
+                self.reference_tools_selection = None;
+                self.palette.toggle();
+                if self.palette.is_open {
+                    self.palette.bind_greeting_target(
+                        self.sessions.get(self.active).map(|session| session.id),
+                    );
+                    return iced::widget::operation::focus(PALETTE_INPUT_ID.clone());
+                }
+            }
+            Message::ReferenceHelp => self.help_open = !self.help_open,
+            Message::ReferenceInspectorToggle => {
+                self.task_panel.retire_panel_callbacks();
+                self.task_panel.input_focused = false;
+                self.sidebar_files_focused = false;
+                self.sidebar_hovered = false;
+                self.invalidate_sidebar_remote_follow_intent();
+                if jterm_core::reference_shell::Layout::for_size(
+                    self.win_size.width,
+                    self.win_size.height,
+                )
+                .inspector
+                .is_none()
+                {
+                    self.reference_inspector_drawer = !self.reference_inspector_drawer;
+                } else {
+                    self.reference_inspector_open = !self.reference_inspector_open;
+                    self.reference_inspector_drawer = false;
+                    self.apply_config();
+                }
+            }
+            Message::ReferenceInspector(tab) => {
+                self.task_panel.retire_panel_callbacks();
+                self.task_panel.input_focused = false;
+                self.sidebar_files_focused = false;
+                self.sidebar_hovered = false;
+                self.invalidate_sidebar_remote_follow_intent();
+                self.reference_inspector_tab = tab;
+                self.reference_inspector_open = true;
+                self.reference_inspector_drawer = jterm_core::reference_shell::Layout::for_size(
+                    self.win_size.width,
+                    self.win_size.height,
+                )
+                .inspector
+                .is_none();
+                self.apply_config();
+                if tab == native_shell::InspectorTab::Files {
+                    return Task::done(Message::SetSidebarPanel(SidebarPanel::Files));
+                }
+                self.sidebar_files_focused = false;
+            }
             Message::PollShellVim => {
                 let mut tasks = Vec::new();
                 for invocation in jterm_core::vim9::take_shell_vim_requests() {
@@ -16335,6 +16486,18 @@ impl Frost {
                 return Task::batch(tasks);
             }
             Message::EmbeddedVim(id, message) => {
+                // A queued editor event may outlive its focus subscription.
+                // The visible Tools menu owns it; it must not move/modify Vim.
+                if self.reference_tools_selection.is_some()
+                    && matches!(
+                        message.as_ref(),
+                        vim9_ide::Message::Keyboard(..)
+                            | vim9_ide::Message::Ime(..)
+                            | vim9_ide::Message::CancelledCommit
+                    )
+                {
+                    return Task::none();
+                }
                 let body_press = if let vim9_ide::Message::BodyMouse {
                     entry_id, input, ..
                 } = message.as_ref()
@@ -17290,8 +17453,7 @@ impl Frost {
                 self.task_panel.next_attention(&dashboard);
             }
             Message::TaskSelect(task_id) => {
-                if self.sidebar_open
-                    && self.sidebar_panel == SidebarPanel::Tasks
+                if self.tasks_surface_visible()
                     && self
                         .task_dashboard()
                         .selected_index(Some(task_id))
@@ -18099,7 +18261,8 @@ impl Frost {
                     || self.workflow_overlay.is_some()
                     || self.block_review.is_some()
                     || self.block_menu.is_some()
-                    || self.block_reading_menu.is_some();
+                    || self.block_reading_menu.is_some()
+                    || self.reference_tools_selection.is_some();
                 if recall_surface_open {
                     self.native_enter_ownership.lock().claim_held();
                 }
@@ -18107,6 +18270,35 @@ impl Frost {
                     .prompt_recall_enter_latch
                     .consume(&event, recall_surface_open)
                 {
+                    return Task::none();
+                }
+                if let Some(selected) = self.reference_tools_selection {
+                    if let keyboard::Event::KeyPressed {
+                        key,
+                        modifiers,
+                        repeat,
+                        ..
+                    } = &event
+                    {
+                        use keyboard::{key::Named, Key};
+                        match key {
+                            Key::Named(Named::Escape) => {
+                                return self.update(Message::ReferenceToolsClose)
+                            }
+                            Key::Named(Named::ArrowDown | Named::Tab) if !modifiers.shift() => {
+                                self.reference_tools_selection = Some((selected + 1) % 3)
+                            }
+                            Key::Named(Named::ArrowUp | Named::Tab) => {
+                                self.reference_tools_selection = Some((selected + 2) % 3)
+                            }
+                            Key::Named(Named::Enter) if !repeat => {
+                                return self.update(Message::ReferenceToolsChoose(selected))
+                            }
+                            _ => {}
+                        }
+                    }
+                    // All presses and releases belong to the visible menu;
+                    // Enter ownership persists through the action's dismissal.
                     return Task::none();
                 }
                 // Iced's pick_list handles pointer input only. Own every key
@@ -18650,10 +18842,7 @@ impl Frost {
                     if task_input {
                         return Task::none();
                     }
-                    if self.sidebar_files_focused
-                        && self.dock_open()
-                        && self.sidebar_panel == SidebarPanel::Files
-                    {
+                    if self.sidebar_files_focused && self.files_surface_visible() {
                         return Task::none();
                     }
                     let mut dead_input = false;
@@ -19375,7 +19564,8 @@ impl Frost {
                     self.invalidate_sidebar_remote_follow_intent();
                 }
                 self.sidebar_panel = panel;
-                self.sidebar_files_focused = panel == SidebarPanel::Files && self.sidebar_open;
+                self.sidebar_files_focused =
+                    panel == SidebarPanel::Files && self.files_surface_visible();
                 // Opening the file tree should reflect the active tab's cwd.
                 // That follow is a local-filesystem notion only: with a remote
                 // location active, keep its root and just reload it.
@@ -19586,7 +19776,7 @@ impl Frost {
             }
             Message::SidebarHover(hovered) => self.sidebar_hovered = hovered,
             Message::SidebarFilesFocus => {
-                if self.dock_open() && self.sidebar_panel == SidebarPanel::Files {
+                if self.files_surface_visible() {
                     self.sidebar_files_focused = true;
                 }
             }
@@ -19775,10 +19965,7 @@ impl Frost {
             Message::FileDropped(path) => {
                 // Over the files panel a drop is an import; everywhere else it
                 // keeps today's terminal payload behavior.
-                if !(self.dock_open()
-                    && self.sidebar_panel == SidebarPanel::Files
-                    && self.sidebar_hovered)
-                {
+                if !(self.files_surface_visible() && self.sidebar_hovered) {
                     return self.update(Message::ImageDropped(path));
                 }
                 self.invalidate_sidebar_remote_follow_intent();
@@ -19940,10 +20127,7 @@ impl Frost {
                 if inside && self.sidebar_drop_hint {
                     // Hint already up; nothing to refresh (the target row
                     // tracks the pointer through SidebarRowHover).
-                } else if inside
-                    && self.dock_open()
-                    && self.sidebar_panel == SidebarPanel::Files
-                    && self.sidebar_transfer.is_none()
+                } else if inside && self.files_surface_visible() && self.sidebar_transfer.is_none()
                 {
                     let target = self
                         .sidebar_drop_target()
@@ -20240,9 +20424,11 @@ impl Frost {
                 self.apply_config();
             }
             Message::SetOrganismExpanded(expanded) => {
+                self.trace_reference_tools("companion-before");
                 self.config.ascii_organism_expanded = expanded;
                 self.config_dirty = true;
                 self.apply_config();
+                self.trace_reference_tools("companion-after");
             }
             Message::SetOrganismMotion(choice) => {
                 let next = choice.configured();
@@ -26136,6 +26322,9 @@ impl Frost {
                 terminal_view::OrganismBody {
                     block,
                     epoch: self.organism_geometry_epoch,
+                    status: presentation.status.into_owned(),
+                    explanation: presentation.explanation.into_owned(),
+                    life: presentation.life,
                     sprite: presentation.sprite,
                     walking_sprite: presentation.walking_sprite,
                     tone: presentation.tone,
@@ -26235,6 +26424,7 @@ impl Frost {
         } else {
             None
         })
+        .shared_shell()
         .blink_on(self.blink_on)
         .opacity(self.config.opacity)
         .on_mouse(move |inp| Message::MousePane(session_id, inp))
@@ -27662,6 +27852,7 @@ impl Frost {
         // Leaf terminal/editor widgets own their content font. A capturing
         // scope around the entire tree would resize the shell behind Vim.
         let body: Element<'_, Message> = body.into();
+        let body: Element<'_, Message> = self.reference_terminal_surface(body);
         let body: Element<'_, Message> = if self.config_panel_open {
             let overlay = if self.theme_editor.is_some() {
                 self.theme_editor_view()
@@ -27714,47 +27905,14 @@ impl Frost {
             body
         };
 
-        // Optional left dock (file tree and/or tab list) beside the terminal,
-        // separated by a draggable resize divider. Enter/exit tracking on the
-        // dock gates the window-space pointer subscription the file-ops menu
-        // anchors to (the tab strip does the same for its menu).
-        let main_area: Element<'_, Message> = if self.dock_open() {
-            let dock =
-                mouse_area(self.font_zoom_region(font_zoom::Group::Chrome, self.sidebar_view()))
-                    .on_enter(Message::SidebarHover(true))
-                    .on_exit(Message::SidebarHover(false));
-            let dock_row = row![dock, self.sidebar_divider(), body]
-                .width(Length::Fill)
-                .height(Length::Fill);
-            // While dragging, pointer moves drive the resize and release ends it.
-            if self.dragging_sidebar {
-                mouse_area(dock_row)
-                    .on_move(Message::SidebarDragMove)
-                    .on_release(Message::SidebarDragEnd)
-                    .on_exit(Message::SidebarDragEnd)
-                    .into()
-            } else {
-                dock_row.into()
-            }
+        let body: Element<'_, Message> = if let Some(banner) = self.session_recovery_banner() {
+            column![banner, body].height(Length::Fill).into()
         } else {
             body
         };
-        // The top bar is always present: in Top mode it holds the tab strip; in
-        // Side mode it holds the dock toggle so chrome never overlaps the grid.
-        // The jsh notice, when there is one, sits directly under it.
-        let mut chrome = column![self.font_zoom_region(font_zoom::Group::Chrome, self.tab_bar())];
-        if let Some(notice) = self.jsh_notice() {
-            chrome = chrome.push(notice);
-        }
-        if let Some(banner) = self.session_recovery_banner() {
-            chrome = chrome.push(banner);
-        }
-        chrome = chrome.push(main_area);
-        if self.config.bottom_bar {
-            chrome =
-                chrome.push(self.font_zoom_region(font_zoom::Group::Content, self.status_bar()));
-        }
-        let root: Element<'_, Message> = chrome.width(Length::Fill).height(Length::Fill).into();
+        // Measured native workspace shell. Pane widgets and all of their
+        // retained input/scroll state stay inside the central surface.
+        let root: Element<'_, Message> = self.reference_workspace(body);
         let root: Element<'_, Message> = if self.agent_sessions.open {
             stack![root, self.agent_sessions_view()].into()
         } else {
@@ -28238,7 +28396,7 @@ impl Frost {
             checkbox(self.config.ascii_organism_enabled).text_size(self.effective_font_size()).label("ASCII Organism")
                 .on_toggle(Message::SetAsciiOrganism),
             text("One companion per window. Its personality and life stay with you across panes; closing the window ends this local session.").size(self.effective_font_size()),
-            checkbox(self.config.ascii_organism_expanded).text_size(self.effective_font_size()).label("Expanded companion in Traditional mode")
+            checkbox(self.config.ascii_organism_expanded).text_size(self.effective_font_size()).label("Show companion status bubble")
                 .on_toggle(Message::SetOrganismExpanded),
             text(if self.config.is_card_mode() && self.config.ascii_organism_enabled {
                 "Block and Chat keep one body in the active card, with no extra status cards in split panes. Full wanders in safe blank space; Calm rests; Static keeps the body still. Typing lets it step out of your way."
@@ -28605,11 +28763,7 @@ impl Frost {
             self.effective_font_size(),
             "Terminal",
             pick_list(
-                [
-                    config::TerminalMode::Normal,
-                    config::TerminalMode::Block,
-                    config::TerminalMode::Chat,
-                ],
+                [config::TerminalMode::Block, config::TerminalMode::Chat],
                 Some(self.config.effective_terminal_mode()),
                 Message::SetTerminalMode,
             )
@@ -30128,8 +30282,7 @@ impl Frost {
     fn task_input_owns_keys(&self) -> bool {
         self.task_panel.input_focused
             && self.config.experimental_task_sidebar
-            && self.dock_open()
-            && self.sidebar_panel == SidebarPanel::Tasks
+            && self.tasks_surface_visible()
             && !self.agent_sessions.open
     }
 
@@ -30147,8 +30300,7 @@ impl Frost {
     /// but cannot authorize a delayed action from the previous card.
     fn task_inspector_visible(&self, task_id: agent_task::TaskId) -> bool {
         self.config.experimental_task_sidebar
-            && self.dock_open()
-            && self.sidebar_panel == SidebarPanel::Tasks
+            && self.tasks_surface_visible()
             && !self.agent_sessions.open
             && !self.task_panel.composer_open
             && self.task_panel.inspector_is_visible(
@@ -30184,7 +30336,7 @@ impl Frost {
     /// Keep Tasks dock geometry and keyboard ownership in sync for every
     /// entry point, including opening it while the ordinary sidebar is hidden.
     fn set_task_panel_open(&mut self, open: bool) {
-        if self.sidebar_open != open || self.sidebar_panel != SidebarPanel::Tasks {
+        if self.tasks_surface_visible() != open || self.sidebar_panel != SidebarPanel::Tasks {
             self.task_panel.retire_panel_callbacks();
             self.task_panel.input_focused = false;
         }
@@ -30193,8 +30345,16 @@ impl Frost {
         // starts in the workspace, where tasks that need the user are listed.
         self.task_panel.set_show_hidden(false);
         self.invalidate_sidebar_remote_follow_intent();
-        self.sidebar_open = open;
+        self.reference_inspector_open = open;
+        self.reference_inspector_drawer = open
+            && jterm_core::reference_shell::Layout::for_size(
+                self.win_size.width,
+                self.win_size.height,
+            )
+            .inspector
+            .is_none();
         if open {
+            self.reference_inspector_tab = native_shell::InspectorTab::Agent;
             self.sidebar_panel = SidebarPanel::Tasks;
         }
         self.sidebar_files_focused = false;
@@ -30211,7 +30371,7 @@ impl Frost {
             );
             return;
         }
-        let showing = self.sidebar_open && self.sidebar_panel == SidebarPanel::Tasks;
+        let showing = self.tasks_surface_visible();
         self.set_task_panel_open(!showing);
     }
 
@@ -30326,8 +30486,7 @@ impl Frost {
         provider: agent_task::AgentProvider,
     ) {
         if !self.config.experimental_task_sidebar
-            || !self.dock_open()
-            || self.sidebar_panel != SidebarPanel::Tasks
+            || !self.tasks_surface_visible()
             || self.task_panel.composer_open
         {
             return;
@@ -30652,9 +30811,7 @@ impl Frost {
         role: agent_task::TaskTerminalRole,
     ) {
         if !agent_task_ui::task_focus_allowed(
-            self.config.experimental_task_sidebar
-                && self.sidebar_open
-                && self.sidebar_panel == SidebarPanel::Tasks,
+            self.config.experimental_task_sidebar && self.tasks_surface_visible(),
             self.task_panel.selected,
             task_id,
         ) {
@@ -33384,7 +33541,7 @@ impl Frost {
         // Same trick for the file-ops menu anchor: track the window-space
         // pointer only while it is over the dock with the file tree showing,
         // so motion elsewhere never rebuilds the view.
-        if self.sidebar_hovered && self.dock_open() && self.sidebar_panel == SidebarPanel::Files {
+        if self.sidebar_hovered && self.files_surface_visible() {
             subs.push(iced::event::listen_with(
                 |event, _status, _id| match event {
                     iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
@@ -33402,10 +33559,7 @@ impl Frost {
                     .map(|_| Message::SidebarTransferTick),
             );
         }
-        if self.dock_open()
-            && self.sidebar_panel == SidebarPanel::Files
-            && self.sidebar.root.last_loaded_at.is_some()
-        {
+        if self.files_surface_visible() && self.sidebar.root.last_loaded_at.is_some() {
             subs.push(
                 iced::time::every(std::time::Duration::from_secs(30))
                     .map(|_| Message::SidebarSnapshotTick),
@@ -33441,10 +33595,8 @@ impl Frost {
         // Background work must drain even while hidden. Parked review state
         // only needs display refreshes in the focused, visible Tasks panel;
         // an already loaded diff must not keep a hidden panel polling forever.
-        let tasks_open = self.focused
-            && self.config.experimental_task_sidebar
-            && self.dock_open()
-            && self.sidebar_panel == SidebarPanel::Tasks;
+        let tasks_open =
+            self.focused && self.config.experimental_task_sidebar && self.tasks_surface_visible();
         if self.agent_runtime.has_any_activity()
             || self.task_panel.pending_creation.is_some()
             || self.task_panel.diff.state().loading
@@ -37151,8 +37303,27 @@ mod tests {
         assert!(!height.contains("organism_owner") && !height.contains("win_size"));
         let term = source.split_once("    fn term_height(&self)").unwrap().1;
         let term = term.split_once("    fn term_width(&self)").unwrap().0;
-        assert!(term.contains("self.organism_strip_height()"));
-        assert!(source.contains("self.status_bar_height() + self.organism_strip_height() + 12.0"));
+        // Execute the production allocator: the new shell reserves 80px once,
+        // while the companion lives in proven native blank space. It must not
+        // restore the old independent statusbar/companion height deduction.
+        let layout = jterm_core::reference_shell::Layout::for_size(1356.0, 704.0);
+        for enabled in [false, true] {
+            for expanded in [false, true] {
+                let legacy_strip = companion_strip_height(enabled, expanded, true);
+                assert_eq!(legacy_strip, if enabled && expanded { 88.0 } else { 0.0 });
+                let raw = native_viewport::raw_rect(layout.center, 0.0, 0.0);
+                assert_eq!(raw.height, 506.0);
+                assert_eq!(raw.y + raw.height, layout.composer.y);
+                assert_eq!(
+                    native_viewport::INPUT_STRIP_HEIGHT + native_viewport::TOOLS_HEIGHT,
+                    80.0
+                );
+            }
+        }
+        assert!(
+            !term.contains("organism_strip_height"),
+            "companion may not consume a second native viewport reservation"
+        );
         let bar = source.split_once("    fn status_bar(&self)").unwrap().1;
         let bar = bar.split_once("    fn jsh_notice(&self)").unwrap().0;
         assert_eq!(bar.matches(".presentation_with_attention(").count(), 1);

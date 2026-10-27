@@ -114,6 +114,8 @@ pub enum ChatRole {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChatRow {
     pub role: ChatRole,
+    /// Native host-only Shell role header. Never copied as terminal text.
+    pub role_header: bool,
     pub group: usize,
     pub left_col: usize,
     pub top: bool,

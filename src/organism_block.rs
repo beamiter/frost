@@ -102,7 +102,8 @@ pub(crate) fn travel_band(surface: Surface) -> Option<Rect> {
     let top = y + row as f32 * ch;
     let bottom = (y + end_row as f32 * ch).min(card.y + card.height - 3.0);
     let width = BODY_COLS as f32 * cw + 2.0 * (BODY_PAD_X + BODY_BORDER);
-    let height = BODY_ROWS as f32 * ch + 2.0 * (BODY_PAD_Y + BODY_BORDER);
+    let height = (BODY_ROWS as f32 * ch + 2.0 * (BODY_PAD_Y + BODY_BORDER))
+        .max(jterm_core::reference_organism::SIZE);
     let rect = Rect {
         x: left,
         y: top,
@@ -118,7 +119,8 @@ pub(crate) fn travel_band(surface: Surface) -> Option<Rect> {
 pub(crate) fn layout(surface: Surface) -> Option<(Rect, Rect)> {
     let band = travel_band(surface)?;
     let width = BODY_COLS as f32 * surface.cell.0 + 2.0 * (BODY_PAD_X + BODY_BORDER);
-    let height = BODY_ROWS as f32 * surface.cell.1 + 2.0 * (BODY_PAD_Y + BODY_BORDER);
+    let height = (BODY_ROWS as f32 * surface.cell.1 + 2.0 * (BODY_PAD_Y + BODY_BORDER))
+        .max(jterm_core::reference_organism::SIZE);
     let body = Rect {
         x: band.x + band.width - width,
         y: band.y,
@@ -286,11 +288,29 @@ mod tests {
             s.card.height *= scale;
             s.clip.width *= scale;
             s.clip.height *= scale;
-            assert_eq!(placement(s).unwrap().height, 60.0 * scale + 8.0);
+            assert_eq!(
+                placement(s).unwrap().height,
+                (60.0_f32 * scale + 8.0).max(jterm_core::reference_organism::SIZE)
+            );
         }
         let mut s = surface();
         s.cell.0 = f32::NAN;
         assert!(placement(s).is_none());
+    }
+    #[test]
+    fn vector_minimum_height_uses_only_real_blank_space() {
+        let mut s = surface();
+        s.cell.1 = 12.0;
+        s.card.height = 72.0;
+        assert!(
+            layout(s).is_none(),
+            "legacy 3-row room is insufficient for the 64px contour"
+        );
+        s.card.height = 100.0;
+        s.end_row = 8;
+        let (body, band) = layout(s).unwrap();
+        assert_eq!(body.height, 64.0);
+        assert!(band.includes(body) && s.card.includes(band));
     }
     #[test]
     fn clipped_or_scrolled_card_never_sticks_to_viewport_bottom() {

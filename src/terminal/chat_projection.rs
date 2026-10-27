@@ -2,6 +2,10 @@
 use super::*;
 use crate::chat_mode::{resolve_surface, ChatRole, ChatRow, ChatSessionState, ChatSurface};
 
+// The compact shared composer reserves two real editable rows initially.
+// Occupied/multiline input still grows from actual cells and cursor extent.
+const CHAT_MIN_INPUT_ROWS: usize = 2;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ChatPlanKey {
     prompt: Option<usize>,
@@ -122,7 +126,7 @@ impl TerminalState {
             occupied
                 .max(self.scrollback.len() + self.cursor_row + 1)
                 .max(self.active_app_extent_row().map_or(0, |row| row + 1))
-                .max(start.saturating_add(crate::block_mode::MIN_INPUT_ROWS))
+                .max(start.saturating_add(CHAT_MIN_INPUT_ROWS))
                 .min(total)
         } else {
             total
@@ -361,14 +365,30 @@ impl TerminalState {
             let status_zone = (role == ChatRole::Output && absolute < active_start)
                 .then(|| zone_index.map(|index| zones[index].id))
                 .flatten();
+            let role_header = role == ChatRole::Output && status_zone.is_some();
+            if role_header {
+                if let Some(next) = next {
+                    for line in 0..2 {
+                        rows.push(Self::chat_synthetic_row(next));
+                        roles.push(ChatRow {
+                            role: ChatRole::Output,
+                            group: next_group,
+                            top: line == 0,
+                            role_header: line == 0,
+                            ..ChatRow::default()
+                        });
+                    }
+                }
+            }
             let len = group.len();
             for (index, row) in group.into_iter().enumerate() {
                 rows.push(row);
                 roles.push(ChatRow {
                     role,
+                    role_header: false,
                     group: next_group,
                     left_col: left,
-                    top: index == 0,
+                    top: index == 0 && !role_header,
                     bottom: index + 1 == len && role != ChatRole::Composer && status_zone.is_none(),
                     app_eligible: absolute >= active_start && role != ChatRole::Command,
                     status_line: None,

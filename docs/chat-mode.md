@@ -6,9 +6,11 @@ Select **Settings → Terminal → Chat**, or add:
 terminal_mode = "chat"
 ```
 
-The explicit `terminal_mode` accepts `normal`, `block`, and `chat`, and takes
-precedence over the legacy `block_mode` switch. With no explicit mode, the
-existing boolean and its default are unchanged. Saving Chat preserves `chat`.
+The public presentations are **Block** and **Chat**. `terminal_mode = "chat"`
+selects Chat; Block is the default. Legacy `terminal_mode = "normal"` and
+`block_mode = false` configurations remain readable and resolve to Block.
+Their original serialized values are preserved until the user explicitly picks
+another presentation. Saving Chat preserves `chat`.
 The setting applies to all sessions in the window, as the existing presentation
 setting does; it does not create simultaneous mixed Chat/Block panes.
 
@@ -16,7 +18,8 @@ Chat is a new presentation of the same running shell and PTY:
 
 - Submitted short prompt/command rows become right-aligned capsules, including
   the command currently running.
-- Results use left-aligned full-width cards. Wide output and long commands keep
+- Results use the light canvas with semantic hover, selection and outcome
+  decoration. Wide output and long commands keep
   their native column budget; they are never wrapped to a chat-message width.
 - At a proven shell prompt, the original terminal cells are docked at the bottom.
   History scrolls independently while the draft and cursor remain in the dock.
@@ -26,11 +29,10 @@ Chat is a new presentation of the same running shell and PTY:
 - The up-arrow sends the existing native Enter encoding once, after checking the
   current parser state, pane, projection, and actual foreground shell. Keyboard Enter,
   Tab, multiline editing, IME, paste, Ctrl-C and EOF still use their normal path.
-- While a command runs, the existing title bar shows elapsed time and **Stop**.
-  Stop sends one native Ctrl-C to the same still-running execution. It does not
-  claim success or completion; the program can handle or ignore the interrupt.
-  The controls hide in alternate-screen apps and very narrow windows; keyboard
-  Ctrl-C remains available. Their fixed title-bar placement never resizes the PTY.
+- While a command runs, the composer action changes to **Stop**. Stop sends one
+  native Ctrl-C to the same still-running execution. It does not claim success
+  or completion; the program can handle or ignore the interrupt. The control is
+  disabled without native authority; keyboard Ctrl-C remains available.
 - Optional buttons make a single immediate, one-byte native write. They do not
   enter the delayed input FIFO, drain older input, or automatically retry. Busy
   input, an ownership change, or a refused write leaves the draft/control unaccepted.
@@ -80,7 +82,7 @@ The renderer materializes only the viewport plus one real history margin row.
 It changes that materialization only at row boundaries or source updates;
 fractional frames reuse the same text and provenance. Text, cards, selection,
 links, cursor, IME and pointer mapping use the same vertical transform. Chat's
-composer remains docked and separately clipped. Normal/alternate-screen
+composer remains docked and separately clipped. Native passthrough/alternate-screen
 terminal input and application mouse reporting keep their existing behavior.
 
 Motion stops scheduling frames when settled. The existing desktop preference
@@ -180,3 +182,11 @@ semantic decoration. The composer has an accent border distinct from history.
 Command and composer background fills respect configured window opacity;
 outline visibility is retained like normal Block chrome. No terminal geometry,
 projection, hit testing or input ownership changes are involved.
+
+## Unified workspace shell
+
+See [the native shell contract](reference-shell.md) for measured region geometry,
+compact inspector behavior, input ownership, and the current acceptance limits.
+The initial compact Chat composer has two real editable rows; occupied multiline
+input grows from the actual cells and cursor extent. The same kernel PTY keeps
+its terminal dimensions and enhanced-keyboard/IME ownership throughout.

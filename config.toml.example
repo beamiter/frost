@@ -6,7 +6,7 @@
 # Restore selected custom settings from that private backup as needed.
 # Use scripts/install.sh --no-config to always keep your existing configuration.
 # Example customizations:
-# font_size = 14.0  # main content (Block / Chat / VTE and split panes)
+# font_size = 14.0  # main content (Block / Chat and split panes)
 # chrome_font_size = 14.0  # top bar + sidebar; omitted legacy values inherit font_size once
 # ASCII organism is enabled by default; uncomment to turn it off.
 # ascii_organism_enabled = false
