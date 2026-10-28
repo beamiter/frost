@@ -46,6 +46,7 @@ def between(source, start_marker, end_marker):
 
 def build_harness():
     source = (ROOT / "src/main.rs").read_text(encoding="utf-8")
+    shell = (ROOT / "src/native_shell.rs").read_text(encoding="utf-8")
     sidebar = (ROOT / "src/sidebar.rs").read_text(encoding="utf-8")
     remote = (ROOT / "src/remote_fs.rs").read_text(encoding="utf-8")
     template = (ROOT / "scripts/files_follow_harness.rs").read_text(encoding="utf-8")
@@ -57,6 +58,8 @@ def build_harness():
         "fn suppress_armed_sidebar_retry(",
     ]
     methods = [
+        "fn reference_inspector_visible(",
+        "fn files_surface_visible(",
         "fn cancel_sidebar_remote_follow(",
         "fn invalidate_sidebar_remote_follow_intent(",
         "fn active_session_changed_for_remote_follow(",
@@ -68,12 +71,18 @@ def build_harness():
         "fn staged_ssh_follow_never_overrides_newer_file_tree_or_chrome_intent(",
     ]
     replacements = {
+        "reference-shell": (ROOT.parent / "jterm_core/src/reference_shell.rs").read_text(
+            encoding="utf-8"
+        ),
+        "inspector-tab": "#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]\n"
+        + item(shell, "pub(crate) enum InspectorTab {"),
         "types": "\n\n".join(
             "#[derive(Clone, Debug)]\n" + item(source, name)
             for name in ["struct SidebarRemoteFollow {", "struct SidebarRemoteFollowResult {"]
         ),
         "helpers": "\n\n".join(item(source, name) for name in helpers),
-        "methods": "\n\n".join(item(source, name) for name in methods),
+        "methods": item(shell, "pub(crate) fn reference_layout(") + "\n\n"
+        + "\n\n".join(item(source, name) for name in methods),
         "sidebar-commit": item(sidebar, "pub fn commit_probed_location_listing("),
         "cancel-token": between(
             remote,

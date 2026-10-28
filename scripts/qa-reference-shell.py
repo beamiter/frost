@@ -28,6 +28,8 @@ def wait_for(check, label, timeout=35):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
+    parser.add_argument("--runtime-wrapper", type=Path,
+                        help="Task-local runtime loader; metadata still hashes the actual native binary")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--mode", choices=["block", "chat"], required=True)
     parser.add_argument("--scale", type=float, choices=[1.0, 1.25, 1.5], default=1.0)
@@ -36,6 +38,8 @@ def main():
     parser.add_argument("--companion-only", action="store_true", help="Capture quiet native companion at16px font and dismiss its real bubble")
     parser.add_argument("--expanded-organism", action="store_true", help="Start the existing unique companion with its real state bubble expanded")
     parser.add_argument("--fixture", action="store_true", help="Show explicitly labelled rich component sample data")
+    parser.add_argument("--chrome-font-size", type=float, default=14.0)
+    parser.add_argument("--font-probe-only", action="store_true", help="Capture actual shaped fixture roles without running the interaction matrix")
     args = parser.parse_args()
     if args.companion_only or args.companion_output:
         args.expanded_organism = True
@@ -50,7 +54,7 @@ def main():
     config_file.write_text(
         'shell = "/bin/bash"\nrestore_session = false\njsh_update_check = "never"\n'
         f'terminal_mode = "{args.mode}"\ninitial_width = 1356\ninitial_height = 704\n'
-        'font_family = "DejaVu Sans Mono"\nfont_size = 12\nchrome_font_size = 10\n'
+        'font_family = "DejaVu Sans Mono"\nfont_size = 12\n' + f'chrome_font_size = {args.chrome_font_size}\n'
         'show_repo_strip = false\nbottom_bar = false\n' + f'ui_scale = {args.scale}\n'
     )
     if args.companion_only or args.companion_output:
@@ -95,11 +99,15 @@ PS1='\[\e]133;A\a\]❯ \[\e]133;B\a\]'
         env["VIMINIT"] = "execute 'source ' . fnameescape(" + vq(vimrc) + ")"
     if args.fixture:
         env["JTERM_REFERENCE_FIXTURE"] = "1"
+        if args.font_probe_only:
+            env["JTERM_NATIVE_FONT_PROBE"] = str(out / "native-fonts.json")
     else:
         env.pop("JTERM_REFERENCE_FIXTURE", None)
     processes, logs = [], []
     result = {"mode": args.mode, "status": "running", "fixture": True, "rich_component_fixture": args.fixture,
-              "native_backend": "Iced X11 / software Vulkan", "captures": [],
+              "native_backend": "Iced X11 / " + env.get("ICED_BACKEND", "software Vulkan"),
+              "runtime_wrapper": str(args.runtime_wrapper.resolve()) if args.runtime_wrapper else None,
+              "captures": [],
               "behavior": {}, "logical_reference_size": [1356, 704], "app_scale": args.scale,
               "display_dpr": 1.0, "effective_pixel_scale": args.scale,
               "binary_sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest(),
@@ -144,9 +152,11 @@ PS1='\[\e]133;A\a\]❯ \[\e]133;B\a\]'
         result["captures"].append({"file": path.name, "geometry": geometry})
 
     def type_text(value):
+        assert run(["xdotool", "getactivewindow"]).stdout.strip() == wid, "Native Frost lost keyboard focus before typing"
         run(["xdotool", "type", "--clearmodifiers", "--delay", "2", "--", value])
 
     def key(value):
+        assert run(["xdotool", "getactivewindow"]).stdout.strip() == wid, "Native Frost lost keyboard focus before key input"
         run(["xdotool", "key", "--clearmodifiers", value])
         time.sleep(0.1)
 
@@ -172,6 +182,8 @@ PS1='\[\e]133;A\a\]❯ \[\e]133;B\a\]'
         os.close(read_fd)
         assert display and server.poll() is None
         env["DISPLAY"] = ":" + display
+        result["display"] = env["DISPLAY"]
+        result["xvfb_pid"] = server.pid
         wait_for(lambda: subprocess.run(["xdpyinfo"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0,
                  "X11 readiness")
         wm_config = out / "openbox.xml"
@@ -184,8 +196,13 @@ PS1='\[\e]133;A\a\]❯ \[\e]133;B\a\]'
         # fixture leaves application shortcuts to the actual focused client.
         spawn(["openbox", "--sm-disable", "--config-file", str(wm_config)], "openbox")
         result["window_manager_shortcuts"] = "private Openbox config without global keybindings"
-        app = spawn([str(args.binary.resolve())], "frost")
+        app_argv = [str(args.binary.resolve())]
+        if args.runtime_wrapper:
+            app_argv.insert(0, str(args.runtime_wrapper.resolve(strict=True)))
+        app = spawn(app_argv, "frost")
         wid = wait_for(window, "native Frost window")
+        result["initial_visible_frost_windows"] = run(["xdotool", "search", "--onlyvisible", "--class", "io.github.beamiter.frost"]).stdout.strip().splitlines()
+        assert result["initial_visible_frost_windows"] == [wid], "Private X11 session contains multiple Frost windows"
         run(["xdotool", "windowactivate", "--sync", wid])
         run(["xdotool", "windowsize", "--sync", wid, str(round(1356 * args.scale)), str(round(704 * args.scale))])
         run(["xdotool", "mousemove", "--window", wid, "600", "330"])
@@ -194,6 +211,19 @@ PS1='\[\e]133;A\a\]❯ \[\e]133;B\a\]'
         capture("empty-1356", wid)
         time.sleep(3)
         capture("idle-organism", wid)
+        if args.font_probe_only:
+            assert args.fixture, "Native role measurement requires the labelled fixture"
+            wait_for(lambda: (out / "native-fonts.json").exists(), "actual native shaped text probe")
+            result["native_fonts"] = json.loads((out / "native-fonts.json").read_text())
+            if args.chrome_font_size > 14:
+                # At the measured 1.3x UI font the unavailable attachment
+                # actions move into the same real Tools menu, freeing the row.
+                click(495, 671)
+                assert "toggle open=true" in (out / "frost.log").read_text(), "Compact Tools did not open"
+                capture("compact-tools-menu", wid)
+                key("Escape")
+            result.update(status="pass", scope="native shaped fixture role measurement", chrome_font_size=args.chrome_font_size, content_font_size=12)
+            return
         if args.companion_output:
             from PIL import ImageGrab
             import threading

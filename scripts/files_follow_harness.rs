@@ -15,6 +15,9 @@ use std::{
 };
 
 mod jterm_core {
+    pub mod reference_shell {
+        // @files-follow:reference-shell
+    }
     pub mod jsh_remote {
         #[derive(Clone, Debug, PartialEq, Eq)]
         pub struct RemoteHostConfig {
@@ -47,6 +50,15 @@ mod jterm_core {
             value.chars().take(limit).collect()
         }
     }
+}
+use jterm_core::reference_shell as shell;
+mod native_shell {
+    // @files-follow:inspector-tab
+}
+#[derive(Clone, Copy)]
+struct Size {
+    width: f32,
+    height: f32,
 }
 mod config {
     pub fn default_remote_hosts() -> Vec<crate::jterm_core::jsh_remote::RemoteHostConfig> {
@@ -306,6 +318,10 @@ impl DropIntentInvalidation {
 }
 
 struct TerminalApp {
+    win_size: Size,
+    reference_inspector_open: bool,
+    reference_inspector_drawer: bool,
+    reference_inspector_tab: native_shell::InspectorTab,
     sidebar: sidebar::Sidebar,
     sidebar_follow_pending: Option<SidebarRemoteFollow>,
     sidebar_follow_observed: Option<(usize, Vec<String>)>,
@@ -396,6 +412,10 @@ fn setup() -> Rc<RefCell<TerminalApp>> {
         sidebar_panel: SidebarPanel::Tabs,
     };
     Rc::new(RefCell::new(TerminalApp {
+        win_size: Size { width: 1356.0, height: 704.0 },
+        reference_inspector_open: true,
+        reference_inspector_drawer: false,
+        reference_inspector_tab: native_shell::InspectorTab::Agent,
         sidebar,
         sidebar_follow_pending: Some(pending),
         sidebar_follow_observed: Some((3, argv.clone())),
@@ -641,7 +661,7 @@ fn manual_navigation_survives_source_focus_change() {
     assert_eq!(
         app.borrow().sidebar.current_dir,
         PathBuf::from("/manual/chosen")
-    )
+    );
 }
 #[test]
 fn same_target_rebind_skips_listing_and_preserves_rows() {
@@ -676,5 +696,64 @@ fn same_target_stale_source_cannot_rebind() {
     };
     assert_eq!(p.control_path.as_deref(), Some("/run/old.sock"));
     assert_eq!(app.mutations, 0)
+}
+
+fn pending_files_surface() -> Rc<RefCell<TerminalApp>> {
+    let app = setup();
+    {
+        let mut a = app.borrow_mut();
+        a.sidebar_panel = SidebarPanel::Files;
+        a.reference_inspector_tab = native_shell::InspectorTab::Files;
+        let pending = a.sidebar_follow_pending.as_mut().unwrap();
+        pending.sidebar_panel = SidebarPanel::Files;
+        pending.sidebar_open = true;
+        assert!(a.files_surface_visible());
+    }
+    app
+}
+
+#[test]
+fn left_navigation_toggle_does_not_retire_the_right_files_surface() {
+    for open in [false, true] {
+        let app = pending_files_surface();
+        let result = work(&app);
+        app.borrow_mut().sidebar_open = open;
+        finish(&app, result);
+        assert_eq!(app.borrow().sidebar.commits, 1);
+    }
+}
+
+#[test]
+fn inspector_visibility_and_tab_changes_reject_a_stale_files_completion() {
+    for change in 0..4 {
+        let app = pending_files_surface();
+        let result = work(&app);
+        {
+            let mut a = app.borrow_mut();
+            match change {
+                0 => a.reference_inspector_open = false,
+                1 => a.reference_inspector_tab = native_shell::InspectorTab::Context,
+                2 => a.sidebar_panel = SidebarPanel::Tabs,
+                _ => a.win_size.width = 700.0,
+            }
+            assert!(!a.files_surface_visible());
+        }
+        finish(&app, result);
+        assert_kept(&app);
+    }
+}
+
+#[test]
+fn narrow_files_drawer_retains_its_own_follow_completion() {
+    let app = pending_files_surface();
+    {
+        let mut a = app.borrow_mut();
+        a.win_size.width = 700.0;
+        a.reference_inspector_drawer = true;
+        assert!(a.files_surface_visible());
+    }
+    let result = work(&app);
+    finish(&app, result);
+    assert_eq!(app.borrow().sidebar.commits, 1);
 }
 // @files-follow:native-tests

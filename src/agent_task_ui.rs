@@ -2704,14 +2704,33 @@ mod tests {
             .unwrap();
         for required in [
             "self.task_panel.input_focused",
-            "self.sidebar_panel == SidebarPanel::Tasks",
-            "self.dock_open()",
+            "self.tasks_surface_visible()",
         ] {
             assert!(owner.contains(required), "{required}");
         }
-        assert!(source.contains(
-            "agent_task_ui::report_input_focus(\n                self.sidebar_tasks_view(),"
-        ));
+        let visible = source
+            .split("    fn tasks_surface_visible(")
+            .nth(1)
+            .unwrap()
+            .split("\n    }\n")
+            .next()
+            .unwrap();
+        for required in [
+            "self.reference_inspector_visible()",
+            "native_shell::InspectorTab::Agent",
+            "self.sidebar_panel == SidebarPanel::Tasks",
+            "self.config.experimental_task_sidebar",
+        ] {
+            assert!(visible.contains(required), "{required}");
+        }
+        // The input observer must wrap the current production inspector, not
+        // merely remain in the former left dock retained by migration tests.
+        let shell = include_str!("native_shell.rs");
+        let inspector = shell.split("    fn reference_inspector(").nth(1).unwrap();
+        assert!(inspector.contains("agent_task_ui::report_input_focus("));
+        assert!(inspector.contains("self.sidebar_tasks_view(),"));
+        assert!(inspector.contains("self.task_panel.input_focused,"));
+        assert!(inspector.contains("Message::TaskInputFocus,"));
     }
 }
 

@@ -12,7 +12,7 @@ import shlex
 import subprocess
 import time
 
-from native_clipboard_observation import observe_exact_word
+from native_clipboard_observation import capture_find_text, observe_exact_word
 
 p = argparse.ArgumentParser(description=__doc__)
 for name in ('runner', 'binary', 'owner', 'pointer', 'output'):
@@ -125,6 +125,11 @@ def words(label):
     return [row for row in csv.DictReader(io.StringIO(tsv), delimiter='\t', quoting=csv.QUOTE_NONE) if row['text'].strip()]
 
 
+def widget_words(label):
+    s.screenshot(label)
+    return capture_find_text(out / (label + '.png'), s.run)
+
+
 def exact_output_word(rows, expected):
     # OCR may split one rendered word into adjacent boxes. Match only an entire
     # exact output line, never a prompt/command substring or approximate text.
@@ -187,7 +192,7 @@ try:
     # make OCR pass, and retain every original frame/TSV, including failures.
     widget_observations = []
     try:
-        observe_exact_word(words, 'widget-pasted', 'FROSTWIDGET', widget_observations)
+        observe_exact_word(widget_words, 'widget-pasted', 'FROSTWIDGET', widget_observations)
     finally:
         (out / 'widget-observations.json').write_text(json.dumps(widget_observations, indent=2))
     # Remove the original source before copying: it must not satisfy the idle read.

@@ -4,6 +4,12 @@ pub fn row_height(font_size: f32, minimum: f32, padding: f32) -> f32 {
     (font_size * 1.3 + padding).ceil().max(minimum)
 }
 
+/// Reference role sizes are calibrated at the existing default 14px font.
+/// This scales text only: window/UI scale and terminal metrics are independent.
+pub(crate) fn reference_role_size(role: f32, configured: f32) -> f32 {
+    role * configured / 14.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -38,7 +38,9 @@ mod immersive_command;
 mod keybindings;
 mod kitty_graphics;
 mod link;
+mod native_companion;
 mod native_enter;
+mod native_font_probe;
 mod native_input_surface;
 mod native_popup_surface;
 mod native_shell;
@@ -168,17 +170,9 @@ const WINDOW_APP_ID: &str = "io.github.beamiter.frost";
 /// carries its icon even when the .desktop entry is not installed.
 const WINDOW_ICON_PNG: &[u8] = include_bytes!("../data/io.github.beamiter.frost-128.png");
 
-/// Height reserved for the tab bar at the top of the window.
-const TAB_BAR_H: f32 = 40.0;
-const TAB_BAR_PADDING: f32 = 20.0;
 /// Height reserved for the status bar at the bottom of the window. The family
 /// constant, so all four jterms reserve the same room for the same bar.
 const STATUS_BAR_H: f32 = jterm_core::bottom_bar::BAR_HEIGHT;
-/// Default width of the file-tree sidebar when shown.
-const SIDEBAR_W: f32 = 220.0;
-/// Drag-resize bounds for the sidebar width.
-const SIDEBAR_W_MIN: f32 = 120.0;
-const SIDEBAR_W_MAX: f32 = 500.0;
 /// Thickness of the divider drawn between split panes (also its drag hit area).
 const DIVIDER: f32 = 6.0;
 /// Hit width of the invisible window-resize strips along the window edges.
@@ -188,20 +182,8 @@ const RESIZE_EDGE: f32 = 5.0;
 /// Hit size of the diagonal resize grips in the window corners.
 const RESIZE_CORNER: f32 = 12.0;
 
-/// Vertical chrome around the terminal area: the always-present tab bar plus
-/// the bottom bar when the `bottom_bar` toggle is on.
-fn chrome_height(font_size: f32, chrome_font_size: f32, bottom_bar: bool) -> f32 {
-    ui_typography::row_height(chrome_font_size, TAB_BAR_H, TAB_BAR_PADDING)
-        + if bottom_bar {
-            ui_typography::row_height(font_size, STATUS_BAR_H, 4.0)
-        } else {
-            0.0
-        }
-}
-
 const COMPANION_BODY_WIDTH: f32 = 200.0;
 const COMPANION_HORIZONTAL_PADDING: f32 = 10.0;
-const COMPANION_CARD_SPRITE_WIDTH: f32 = 104.0;
 const COMPANION_CARD_DETAILS_MIN_WIDTH: f32 = 360.0;
 const ORGANISM_STATUS_MIN_WIDTH: f32 = 640.0;
 
@@ -279,60 +261,6 @@ fn organism_layout(width: f32, enabled: bool, expanded: bool, bottom_bar: bool) 
     }
 }
 
-/// A narrow collapsed card still has a way back, without admitting a live body
-/// or hover observer while it is hidden. Configuration chrome only.
-fn companion_narrow_reopen(width: f32, enabled: bool, expanded: bool, bottom_bar: bool) -> bool {
-    !expanded
-        && !organism_layout(width, enabled, false, bottom_bar).glyph
-        && organism_layout(width, enabled, true, bottom_bar).body
-}
-
-fn companion_compact_slot<'a, R: iced::advanced::renderer::Renderer + 'a>(
-    glyph: Element<'a, Message, iced::Theme, R>,
-    toggle: Element<'a, Message, iced::Theme, R>,
-) -> iced::widget::Container<'a, Message, iced::Theme, R> {
-    container(row![glyph, toggle].align_y(iced::Alignment::Center)).width(Length::Fixed(84.0))
-}
-
-/// Reserve companion chrome before laying out crowded status content.
-/// Only the status content is clipped; the sibling slot keeps its hit boxes.
-fn companion_status_with_slot<'a, R: iced::advanced::renderer::Renderer + 'a>(
-    status: Element<'a, Message, iced::Theme, R>,
-    slot: Element<'a, Message, iced::Theme, R>,
-    spacing: u32,
-) -> Element<'a, Message, iced::Theme, R> {
-    row![container(status).width(Length::Fill).clip(true), slot]
-        .spacing(spacing)
-        .align_y(iced::Alignment::Center)
-        .width(Length::Fill)
-        .into()
-}
-
-/// The same native card geometry is used by production and renderer-free tests.
-fn companion_card_content<'a, R: iced::advanced::renderer::Renderer + 'a>(
-    body: Element<'a, Message, iced::Theme, R>,
-    detail: Option<Element<'a, Message, iced::Theme, R>>,
-    toggle: Element<'a, Message, iced::Theme, R>,
-) -> iced::widget::Container<'a, Message, iced::Theme, R> {
-    let body = container(body)
-        .width(Length::Fixed(COMPANION_CARD_SPRITE_WIDTH))
-        .height(Length::Fill)
-        .align_y(iced::Alignment::Center);
-    let detail = container(detail.unwrap_or_else(|| Space::new().width(Length::Fill).into()))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_y(iced::Alignment::Center)
-        .clip(true);
-    container(
-        row![body, detail, toggle]
-            .spacing(12)
-            .align_y(iced::Alignment::Center),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .padding([8.0, 12.0])
-}
-
 /// Retain release cleanup offscreen without admitting new hidden observations.
 fn organism_pointer_observation_needed(
     visible: bool,
@@ -358,32 +286,13 @@ fn organism_pointer_event(event: iced::Event, visible: bool) -> Option<Message> 
     }
 }
 
-fn organism_settings_hint(
-    width: f32,
-    enabled: bool,
-    expanded: bool,
-    bottom_bar: bool,
-) -> &'static str {
+fn organism_settings_hint(enabled: bool, expanded: bool) -> &'static str {
     if !enabled {
-        return "Enable ASCII Organism to allow the live companion.";
-    }
-    if !bottom_bar {
-        return organism::expanded_companion_hint(false);
-    }
-    let layout = organism_layout(width, enabled, expanded, bottom_bar);
-    if !layout.presentable() {
-        return if organism_layout(width, enabled, true, bottom_bar).body {
-            "Use the status-bar arrow to reopen the companion card. This width has no room for the status glyph or live hover target."
-        } else if expanded {
-            "Resize the window to make room for the live body. The expanded strip keeps its reserved height."
-        } else {
-            "Resize the window to make room for the live companion; even the expanded body needs more width."
-        };
-    }
-    if expanded {
-        organism::expanded_companion_hint(true)
+        "Enable Companion in Settings to allow the live companion."
+    } else if expanded {
+        "Show companion status bubble is enabled. The body and bubble appear only where safe blank space is available."
     } else {
-        "Use the status-bar arrow or enable Show expanded companion to keep the full body visible."
+        "Enable Show companion status bubble in Settings for companion details. The body appears only where safe blank space is available."
     }
 }
 
@@ -403,21 +312,6 @@ fn companion_strip_height(enabled: bool, expanded: bool, bottom_bar: bool) -> f3
     } else {
         0.0
     }
-}
-
-fn terminal_height_after_chrome(
-    window_height: f32,
-    font_size: f32,
-    chrome_font_size: f32,
-    bottom_bar: bool,
-    reading_bar_height: f32,
-    companion_height: f32,
-) -> f32 {
-    (window_height
-        - chrome_height(font_size, chrome_font_size, bottom_bar)
-        - reading_bar_height
-        - companion_height)
-        .max(0.0)
 }
 
 /// Whether an existing block selection may consume plain navigation/Enter.
@@ -1624,10 +1518,6 @@ fn tab_drag_release_action(
         (Some(tab), Some(_)) if !moved => TabDragReleaseAction::Activate(tab),
         _ => TabDragReleaseAction::RestoreOrigin,
     }
-}
-
-fn tab_drag_hover_left_source(source: Option<usize>, hovered: Option<usize>) -> bool {
-    source.is_some_and(|source| hovered != Some(source))
 }
 
 fn tab_split_commit_allowed(
@@ -4665,7 +4555,6 @@ enum Message {
     ReferenceToolsClose,
     ReferenceToolsSelect(usize),
     ReferenceToolsChoose(usize),
-    ReferenceHelp,
     ReferenceCopy(String),
     ReferenceFocusTerminal,
     TranscriptPause(usize, u64),
@@ -4844,7 +4733,6 @@ enum Message {
     /// not widen every other variant).
     JshChecked(Box<jterm_core::jsh_install::Status>),
     /// Install jsh, or update the installed one, in a dedicated session.
-    JshInstall,
     /// Close the remote host picker overlay.
     RemotePickerClose,
     /// Open the picked `[[remote_hosts]]` entry in a new session.
@@ -4862,7 +4750,6 @@ enum Message {
     RemoteHostAdd(Arc<()>),
     RemoteHostRemove(remote_host_editor::RowTarget),
     /// Hide the jsh notice until the next launch.
-    JshNoticeDismiss,
     /// Hide only the recovery banner; retain the report and write protection.
     SessionRecoveryDismiss,
     SetAiEnabled(bool),
@@ -4915,7 +4802,6 @@ enum Message {
     Focus(bool),
     NewSession,
     /// Close the tab with this stable session id.
-    CloseTab(usize),
     WindowClose,
     /// Title-bar press on empty chrome: hand the window to the compositor to
     /// be moved. The window is undecorated, so nothing else offers this.
@@ -4925,7 +4811,6 @@ enum Message {
     WindowResizeDrag(iced::window::Direction),
     WindowMinimize,
     WindowToggleMaximize,
-    TabHover(Option<usize>),
     /// User pressed the mouse over a tab — start tracking its stable tab id.
     TabDragStart(usize),
     /// User released the mouse over a tab. Both endpoints are stable tab ids.
@@ -4944,9 +4829,6 @@ enum Message {
     ToggleSidebar,
     SetSidebarPanel(SidebarPanel),
     SetTabPosition(config::TabPosition),
-    SidebarDragStart,
-    SidebarDragMove(iced::Point),
-    SidebarDragEnd,
     SidebarInsertPath(std::path::PathBuf),
     /// Open a new terminal from the Files header. Local starts at the visible
     /// tree root; Remote opens the selected profile at its default directory.
@@ -5038,7 +4920,6 @@ enum Message {
     PaneDragLeavePaneArea,
     PaneDragEnd,
     /// Release a split pane on tab chrome, optionally after a specific tab.
-    PanePromoteToTab(Option<usize>),
     SearchToggleRegex,
     SearchToggleCase,
     SearchInput(String),
@@ -5077,7 +4958,6 @@ enum Message {
     ChatSubmit(chat_mode::ControlToken),
     ChatInterrupt(chat_mode::ControlToken),
     SetBlockCompact(bool),
-    ToggleBlockReadingBar,
     SetShowRepoStrip(bool),
     SetBottomBar(bool),
     SetAsciiOrganism(bool),
@@ -5097,8 +4977,6 @@ enum Message {
         Option<terminal::RawRowId>,
         terminal_view::OrganismBodyObservation,
     ),
-    OrganismHoverEnter(usize, jterm_core::organism_live::LiveAttentionTicket),
-    OrganismHoverExit(usize, jterm_core::organism_live::LiveAttentionTicket),
     OrganismPointerButton(iced::mouse::Button, bool),
     OrganismPointerLeft,
     ThemeEditOpen,
@@ -7972,8 +7850,10 @@ impl Frost {
             && !self.agent_sessions.open
             && !self.palette.is_open
             && self.reference_tools_selection.is_none()
-            && !self.ai_chats.is_open
-            && self.ai_ask.is_none()
+            && !native_input_surface::ai_surface_active(
+                self.ai_chats.is_open,
+                self.ai_ask.is_some(),
+            )
             && !self.config_panel_open
             && !self.help_open
             && !self.debug_open
@@ -8016,8 +7896,10 @@ impl Frost {
             && !self.agent_sessions.open
             && !self.palette.is_open
             && self.reference_tools_selection.is_none()
-            && !self.ai_chats.is_open
-            && self.ai_ask.is_none()
+            && !native_input_surface::ai_surface_active(
+                self.ai_chats.is_open,
+                self.ai_ask.is_some(),
+            )
             && !self.config_panel_open
             && !self.help_open
             && !self.debug_open
@@ -9417,10 +9299,6 @@ impl Frost {
             .max(0.0)
     }
 
-    fn sidebar_width(&self) -> f32 {
-        self.reference_layout().center.x
-    }
-
     fn host_clipboard_read_blocked_for(&self, id: usize, fd: RawFd) -> bool {
         self.host_clipboard_read_owner
             .is_some_and(|(owner_id, owner_fd)| owner_id != id || owner_fd != fd)
@@ -10709,26 +10587,6 @@ impl Frost {
             .and_then(|index| self.sessions.get(index))
             .map(|session| session.label())
             .unwrap_or_default()
-    }
-
-    /// Pin / mark indicators prefixed to a tab's label. They are the only
-    /// on-strip evidence of state the context menu can set, so both placements
-    /// (top strip and sidebar dock) render them.
-    fn tab_state_prefix(&self, tab: usize) -> String {
-        let Some(tab) = self.tabs.get(tab) else {
-            return String::new();
-        };
-        let mut prefix = String::new();
-        if tab.pinned {
-            prefix.push('◆');
-        }
-        if tab.marked {
-            prefix.push('★');
-        }
-        if !prefix.is_empty() {
-            prefix.push(' ');
-        }
-        prefix
     }
 
     /// Switch to `tab` and hand keyboard focus to the pane it had selected.
@@ -16414,7 +16272,6 @@ impl Frost {
                     return iced::widget::operation::focus(PALETTE_INPUT_ID.clone());
                 }
             }
-            Message::ReferenceHelp => self.help_open = !self.help_open,
             Message::ReferenceInspectorToggle => {
                 self.task_panel.retire_panel_callbacks();
                 self.task_panel.input_focused = false;
@@ -16585,10 +16442,13 @@ impl Frost {
             }
             Message::PtyOutput(id, fd, data, watch_stamp) => {
                 let t0 = std::time::Instant::now();
-                let is_active_output = self
-                    .sessions
-                    .get(self.active)
-                    .is_some_and(|session| session.id == id && session.master_fd == fd);
+                let is_active_output = native_companion::active_output(
+                    self.sessions
+                        .get(self.active)
+                        .map(|session| (session.id, session.master_fd)),
+                    id,
+                    fd,
+                );
                 let mut clip_set: Option<String> = None;
                 let mut clip_queries = Vec::new();
                 let mut clip_requests: Vec<terminal::ClipboardReadKind> = Vec::new();
@@ -17075,7 +16935,6 @@ impl Frost {
                     log::info!("jsh notice: {}", prompt.banner_title());
                 }
             }
-            Message::JshInstall => self.install_or_update_jsh(),
             Message::RemotePickerClose => self.remote_picker = None,
             Message::RemotePickerConnect(identity, profile) => {
                 let Some(index) = remote_picker_target_index(
@@ -17222,7 +17081,6 @@ impl Frost {
                     }
                 }
             }
-            Message::JshNoticeDismiss => self.jsh_notice_dismissed = true,
             Message::SessionRecoveryDismiss => {
                 self.startup_recovery.dismiss();
                 let term_w = (self.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
@@ -19292,12 +19150,6 @@ impl Frost {
                 }
             }
             Message::NewSession => self.new_session(),
-            Message::CloseTab(id) => {
-                // Closing a tab closes every pane in it.
-                if let Some(tab) = self.tab_index_by_id(id) {
-                    return self.request_close_tab(tab);
-                }
-            }
             Message::WindowClose => return self.request_window_close(),
             // Window moves and resizes are compositor operations: we only get
             // to ask, and only while the button that started them is held.
@@ -19314,21 +19166,6 @@ impl Frost {
             }
             Message::WindowToggleMaximize => {
                 return iced::window::latest().and_then(iced::window::toggle_maximize);
-            }
-            Message::TabHover(id) => {
-                self.hovered_tab = id;
-                if tab_drag_hover_left_source(self.dragging_tab, id) {
-                    self.tab_drag_moved = true;
-                }
-                let active_id = self.tabs.get(self.active_tab).map(|tab| tab.id);
-                self.tab_drag_hover_since = match (self.dragging_tab, id) {
-                    (Some(source), Some(target))
-                        if source != target && active_id != Some(target) =>
-                    {
-                        Some((target, std::time::Instant::now()))
-                    }
-                    _ => None,
-                };
             }
             Message::TabDragStart(id) => {
                 if self.tab_index_by_id(id).is_some() {
@@ -19534,22 +19371,6 @@ impl Frost {
                         drag.target.and_then(|id| self.session_index_by_id(id)),
                     ) {
                         self.swap_pane_sessions(source, target);
-                    }
-                }
-            }
-            Message::PanePromoteToTab(after_tab_id) => {
-                self.finish_pane_promotion(after_tab_id);
-            }
-            Message::SidebarDragStart => self.dragging_sidebar = true,
-            Message::SidebarDragEnd => self.dragging_sidebar = false,
-            Message::SidebarDragMove(pt) => {
-                if self.dragging_sidebar {
-                    // pt.x is relative to the dock+body row, which starts at the
-                    // window's left edge, so it is the desired dock width directly.
-                    let w = pt.x.clamp(SIDEBAR_W_MIN, SIDEBAR_W_MAX);
-                    if (w - self.dock_width).abs() > f32::EPSILON {
-                        self.dock_width = w;
-                        self.apply_config();
                     }
                 }
             }
@@ -20402,10 +20223,6 @@ impl Frost {
                 self.sync_organism_geometry();
                 self.refresh_active_context();
             }
-            Message::ToggleBlockReadingBar => {
-                self.block_bar_user_hidden = !self.block_bar_user_hidden;
-                self.close_block_reading_menu();
-            }
             Message::SetShowRepoStrip(show) => {
                 self.config.show_repo_strip = show;
                 // Hide immediately; the periodic tick would otherwise show a
@@ -20465,25 +20282,22 @@ impl Frost {
             Message::OrganismBodyObserved(id, epoch, projection, block, observation) => {
                 // Even a withdrawal carries the originating native snapshot.
                 // An old None must not erase a newly visible body in this pane.
-                if epoch == self.organism_geometry_epoch
-                    && block == self.organism_block_key()
-                    && self
-                        .sessions
-                        .get(self.active)
-                        .is_some_and(|s| s.id == id && s.projection.key() == projection)
-                {
+                if self.sessions.get(self.active).is_some_and(|session| {
+                    native_companion::Snapshot {
+                        owner: id,
+                        epoch,
+                        projection: &projection,
+                        block: &block,
+                    }
+                    .matches(&native_companion::Snapshot {
+                        owner: session.id,
+                        epoch: self.organism_geometry_epoch,
+                        projection: &session.projection.key(),
+                        block: &self.organism_block_key(),
+                    })
+                }) {
                     self.observe_organism_body(id, observation);
                 }
-            }
-            Message::OrganismHoverEnter(id, epoch) => {
-                if !self.config.is_block_mode() && self.organism_owner() == Some(id) {
-                    let facts = self.organism_attention_facts();
-                    self.organism.enter_live_greeting(id, epoch, facts);
-                }
-            }
-            Message::OrganismHoverExit(id, epoch) => {
-                let facts = self.organism_attention_facts();
-                self.organism.exit_live_greeting(id, epoch, facts);
             }
             Message::OrganismPointerButton(button, pressed) => {
                 organism_hover::update_pressed_button(
@@ -21527,30 +21341,6 @@ impl Frost {
         }
     }
 
-    /// Sidebar dock background, matching the theme's panel color.
-    fn panel_style_with_focus(
-        &self,
-        files_focused: bool,
-    ) -> impl Fn(&iced::Theme) -> container::Style {
-        let bg = self.with_window_opacity(self.c_panel());
-        let text = self.c_text();
-        let accent = self.c_accent();
-        move |_| container::Style {
-            text_color: Some(text),
-            background: Some(bg.into()),
-            border: iced::Border {
-                color: if files_focused {
-                    accent
-                } else {
-                    Color::TRANSPARENT
-                },
-                width: if files_focused { 1.0 } else { 0.0 },
-                radius: 0.0.into(),
-            },
-            ..Default::default()
-        }
-    }
-
     /// `active` (hovered or mid-drag) tints the strip with the accent color so
     /// the user can see the divider is grabbable / being dragged.
     fn divider_style(&self, active: bool) -> impl Fn(&iced::Theme) -> container::Style {
@@ -21562,46 +21352,6 @@ impl Frost {
         move |_| container::Style {
             background: Some(bg.into()),
             ..Default::default()
-        }
-    }
-
-    /// Container-flavored variant of `tab_btn_style`, used when wrapping a tab
-    /// in `mouse_area` (which can't hand the hover status off to a Button).
-    /// `hovered`/`dragging` are pushed in by the caller from `self.hovered_tab`
-    /// and `self.dragging_tab`.
-    fn tab_container_style(
-        &self,
-        active: bool,
-        hovered: bool,
-        dragging: bool,
-    ) -> impl Fn(&iced::Theme) -> container::Style {
-        let base = Theme::rgb_to_color32(self.theme.tabbar.bg);
-        let accent = self.c_accent();
-        let active_text = Theme::rgb_to_color32(self.theme.tabbar.active_text);
-        let inactive_text = Theme::rgb_to_color32(self.theme.tabbar.inactive_text);
-        move |_t| {
-            let (mut bg, txt, bw) = if active {
-                (blend(base, accent, 0.22), active_text, 1.0)
-            } else if hovered {
-                (blend(base, accent, 0.10), inactive_text, 0.0)
-            } else {
-                (base, inactive_text, 0.0)
-            };
-            // Dim the source tab while it is being dragged so the user sees
-            // which one will move.
-            if dragging {
-                bg = Color { a: 0.55, ..bg };
-            }
-            container::Style {
-                text_color: Some(txt),
-                background: Some(bg.into()),
-                border: iced::Border {
-                    color: accent,
-                    width: bw,
-                    radius: 4.0.into(),
-                },
-                ..Default::default()
-            }
         }
     }
 
@@ -21717,273 +21467,6 @@ impl Frost {
         }
     }
 
-    /// Close (×) button using the theme's close-button colors.
-    fn close_btn_style(&self) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
-        let normal = Theme::rgb_to_color32(self.theme.tabbar.close_btn_bg);
-        let hover = Theme::rgb_to_color32(self.theme.tabbar.close_btn_hover);
-        let text = self.c_text();
-        move |_t, status| {
-            let bg = match status {
-                button::Status::Hovered => hover,
-                _ => normal,
-            };
-            button::Style {
-                background: Some(bg.into()),
-                text_color: text,
-                border: iced::Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: 4.0.into(),
-                },
-                ..Default::default()
-            }
-        }
-    }
-
-    /// Close button embedded in a tab. The tab container owns the shared
-    /// background and outline; only the close button's hover affordance paints
-    /// a separate background.
-    fn tab_close_btn_style(&self) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
-        let hover = Theme::rgb_to_color32(self.theme.tabbar.close_btn_hover);
-        let text = self.c_text();
-        move |_t, status| {
-            let background = match status {
-                button::Status::Hovered | button::Status::Pressed => Some(hover.into()),
-                _ => None,
-            };
-            button::Style {
-                background,
-                text_color: text,
-                border: iced::Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: 3.0.into(),
-                },
-                ..Default::default()
-            }
-        }
-    }
-
-    fn workspace_toolbar(&self) -> Element<'_, Message> {
-        let font_size = self.chrome_font_size();
-        let height = self.tab_bar_height() - 10.0;
-        let base = Theme::rgb_to_color32(self.theme.tabbar.bg);
-        let inactive = Theme::rgb_to_color32(self.theme.tabbar.inactive_text);
-        let accent = self.c_accent();
-        let blocks_visible = !self.block_bar_user_hidden;
-        let vim9 = tooltip(
-            button(text("Vim9").size(font_size).center())
-                .on_press(Message::OpenVim9Ide)
-                .width(Length::Fixed(52.0_f32.max(font_size * 3.2 + 6.0)))
-                .height(Length::Fixed(height))
-                .padding(0)
-                .style(move |_, status| button::Style {
-                    background: Some(
-                        blend(
-                            base,
-                            inactive,
-                            match status {
-                                button::Status::Hovered => 0.20,
-                                button::Status::Pressed => 0.26,
-                                _ => 0.12,
-                            },
-                        )
-                        .into(),
-                    ),
-                    text_color: inactive,
-                    border: iced::Border {
-                        radius: 5.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }),
-            container(text("Open this project in the native Vim9 IDE").size(font_size))
-                .padding([4, 8])
-                .style(self.popup_style()),
-            tooltip::Position::Bottom,
-        );
-        let blocks = tooltip(
-            button(text("▤").size(font_size.min(18.0)).center())
-                .on_press(Message::ToggleBlockReadingBar)
-                .width(Length::Fixed(26.0_f32.max(font_size * 1.3 + 8.0)))
-                .height(Length::Fixed(height))
-                .padding(0)
-                .style(move |_, status| button::Style {
-                    background: Some(
-                        blend(
-                            base,
-                            accent,
-                            match status {
-                                button::Status::Hovered => 0.22,
-                                button::Status::Pressed => 0.28,
-                                _ => 0.08,
-                            },
-                        )
-                        .into(),
-                    ),
-                    text_color: if blocks_visible { accent } else { inactive },
-                    border: iced::Border {
-                        radius: 5.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }),
-            container(
-                text(if blocks_visible {
-                    "Hide Blocks navigator (auto-hidden inside interactive apps)"
-                } else {
-                    "Show Blocks navigator at the shell (interactive apps stay full-screen)"
-                })
-                .size(font_size),
-            )
-            .padding([4, 8])
-            .style(self.popup_style()),
-            tooltip::Position::Bottom,
-        );
-        // Nothing else outside the dock says that a task waits for the user.
-        let attention = self.task_attention_badge();
-        let sessions = tooltip(
-            button(
-                text(match &attention {
-                    Some((total, _)) => format!("Agents · {total}"),
-                    None => "Agents".to_owned(),
-                })
-                .size(font_size),
-            )
-            .on_press(Message::AgentSessionsToggle)
-            .padding([2, 6])
-            .height(Length::Fixed(height))
-            .style(button::secondary),
-            text(match attention {
-                Some((_, summary)) => format!("Agent Sessions · Ctrl+Alt+Shift+G\n{summary}"),
-                None => "Agent Sessions · Ctrl+Alt+Shift+G".to_owned(),
-            }),
-            tooltip::Position::Bottom,
-        );
-        container(
-            row![sessions, vim9, blocks]
-                .spacing(6)
-                .align_y(iced::Alignment::Center),
-        )
-        .padding([0, 6])
-        .into()
-    }
-
-    fn tab_bar(&self) -> Element<'_, Message> {
-        let mut tabs = row![]
-            .spacing(2)
-            .padding(2)
-            .align_y(iced::Alignment::Center);
-        // Sidebar/dock toggle button at the far left of the tab bar.
-        tabs = tabs.push(
-            button(text("☰").size(self.chrome_font_size()))
-                .on_press(Message::ToggleSidebar)
-                .padding([3, 8])
-                .style(self.tab_btn_style(self.sidebar_open)),
-        );
-        // In side-tab mode the tab list lives in the dock; the top bar keeps only
-        // the dock toggle plus a button to move tabs back to the top.
-        if self.config.tab_position == config::TabPosition::Side {
-            tabs = tabs.push(
-                button(text("▔").size(self.chrome_font_size()))
-                    .on_press(Message::SetTabPosition(config::TabPosition::Top))
-                    .padding([3, 8])
-                    .style(self.ghost_btn_style()),
-            );
-            tabs = tabs.push(self.workspace_toolbar());
-            if self.pane_drag.is_some() {
-                tabs = tabs.push(self.pane_to_tab_drop_hint(false));
-                let tabs = mouse_area(tabs.width(Length::Fill))
-                    .on_release(Message::PanePromoteToTab(None))
-                    .interaction(iced::mouse::Interaction::Grabbing);
-                return self.top_bar_with_close(tabs.into());
-            }
-            return self.top_bar_with_close(tabs.into());
-        }
-        // Dock the tab strip into the left sidebar (vertical tab list).
-        tabs = tabs.push(
-            button(text("◧").size(self.chrome_font_size()))
-                .on_press(Message::SetTabPosition(config::TabPosition::Side))
-                .padding([3, 8])
-                .style(self.ghost_btn_style()),
-        );
-        tabs = tabs.push(self.workspace_toolbar());
-        for i in 0..self.tabs.len() {
-            let id = self.tabs[i].id;
-            let active = i == self.active_tab;
-            // A tab shows its selected pane.
-            let label = self.tab_label(i);
-            let label = if label.chars().count() > 24 {
-                let truncated: String = label.chars().take(23).collect();
-                format!("{truncated}…")
-            } else {
-                label
-            };
-            // The label and close button share one styled outer container. The
-            // label keeps its own mouse area so dragging it cannot accidentally
-            // trigger the close button.
-            let hovered = self.hovered_tab == Some(id);
-            let dragging_this = self.dragging_tab == Some(id);
-            let label = format!("{}{label}", self.tab_state_prefix(i));
-            let tab_label = container(text(label).size(self.chrome_font_size())).padding([3, 8]);
-            // Drag press/release lives on the label so a press on the close
-            // button never starts a tab drag. Right-click opens the context menu.
-            let tab: Element<'_, Message> = mouse_area(tab_label)
-                .on_press(Message::TabDragStart(id))
-                .on_release(Message::TabDragEnd(id))
-                .on_right_press(Message::TabMenuOpen(id))
-                .into();
-            // Reveal the close button only on the active or hovered tab to cut
-            // visual noise; keep its footprint reserved otherwise so tabs don't
-            // jump when hovered.
-            let show_close = active || hovered;
-            let close: Element<'_, Message> = if show_close {
-                button(text("×").size(self.chrome_font_size()))
-                    .on_press(Message::CloseTab(id))
-                    .padding([3, 6])
-                    .style(self.tab_close_btn_style())
-                    .into()
-            } else {
-                Space::new().width(Length::Fixed(18.0)).into()
-            };
-            let cell = container(row![tab, close].align_y(iced::Alignment::Center))
-                .style(self.tab_container_style(active, hovered, dragging_this));
-            // Hover tracking on the whole cell so moving onto the close
-            // button does not collapse it out of the layout.
-            tabs = tabs.push(tooltip(
-                mouse_area(cell)
-                    .on_enter(Message::TabHover(Some(id)))
-                    .on_exit(Message::TabHover(None)),
-                text(self.tab_label(i)),
-                tooltip::Position::Bottom,
-            ));
-        }
-        tabs = tabs.push(
-            button(text("+").size(self.chrome_font_size()))
-                .on_press(Message::NewSession)
-                .padding([3, 8])
-                .style(self.ghost_btn_style()),
-        );
-        if self.pane_drag.is_some() {
-            tabs = tabs.push(self.pane_to_tab_drop_hint(false));
-        }
-        let scroller: Element<'_, Message> = scrollable(tabs)
-            .direction(scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::new().width(0).scroller_width(0),
-            ))
-            .width(Length::Fill)
-            .into();
-        let scroller = if self.pane_drag.is_some() {
-            mouse_area(scroller)
-                .on_release(Message::PanePromoteToTab(None))
-                .interaction(iced::mouse::Interaction::Grabbing)
-                .into()
-        } else {
-            scroller
-        };
-        self.top_bar_with_close(scroller)
-    }
-
     fn chat_running_status(&self) -> Option<(usize, u64, u64)> {
         if !self.config.is_chat_mode()
             || self.win_size.width < 240.0
@@ -22002,83 +21485,6 @@ impl Frost {
             ))
         })
         .flatten()
-    }
-
-    /// The top bar doubles as the window's title bar: the window is
-    /// undecorated, so this row owns the title, the window buttons, and
-    /// drag-to-move.
-    fn top_bar_with_close<'a>(&'a self, content: Element<'a, Message>) -> Element<'a, Message> {
-        let window_btn = |glyph: &str, msg: Message| {
-            button(text(glyph.to_string()).size(self.chrome_font_size()))
-                .on_press(msg)
-                .padding([3, 9])
-                .style(self.ghost_btn_style())
-        };
-        let close = button(text("×").size(self.chrome_font_size()))
-            .on_press(Message::WindowClose)
-            .padding([3, 9])
-            .style(self.close_btn_style());
-
-        let mut bar = row![container(content).width(Length::Fill)];
-        if let Some((id, _, elapsed)) = self.chat_running_status() {
-            let label = if self.win_size.width >= 440.0 {
-                format!("Running · {}", block_mode::running_badge_text(elapsed))
-            } else {
-                block_mode::running_badge_text(elapsed)
-            };
-            bar = bar.push(
-                text(label)
-                    .size(self.chrome_font_size())
-                    .color(self.c_text_dim()),
-            );
-            let session = &self.sessions[self.active];
-            let token = session
-                .enabled_chat_control(chat_mode::ControlKind::Interrupt, self.chat_input_ready(id));
-            let stop = container(
-                text(if token.is_some() { "Stop" } else { "Ctrl+C" }).size(self.chrome_font_size()),
-            )
-            .padding([3, 7]);
-            bar = bar.push(chat_mode::press_control(
-                stop,
-                token.map(Message::ChatInterrupt),
-            ));
-        }
-        // In Side mode the tab labels live in the dock, so the title is the
-        // only place the active session is named and there is room for it. In
-        // Top mode the active tab already shows the very same string
-        // (`Frost::title` is the active session's label), so repeating it here
-        // would only steal width from the strip.
-        if self.config.tab_position == config::TabPosition::Side {
-            bar = bar.push(
-                container(
-                    text(self.title())
-                        .size(self.chrome_font_size())
-                        .wrapping(text::Wrapping::None)
-                        .style(text::secondary),
-                )
-                .padding([0, 8])
-                .clip(true),
-            );
-        }
-        let bar = bar
-            .push(window_btn("—", Message::WindowMinimize))
-            .push(window_btn("▢", Message::WindowToggleMaximize))
-            .push(close)
-            .align_y(iced::Alignment::Center)
-            .width(Length::Fill);
-        // Presses that no button or tab consumed fall through to here and move
-        // the window, the way a title bar is expected to behave. `mouse_area`
-        // runs its content first and bails once the event is captured, so the
-        // chrome above keeps working.
-        let bar = mouse_area(bar)
-            .on_press(Message::WindowDrag)
-            .on_double_click(Message::WindowToggleMaximize);
-        container(bar)
-            .width(Length::Fill)
-            .height(Length::Fixed(self.tab_bar_height()))
-            .align_y(iced::Alignment::Center)
-            .style(self.chrome_bar_style())
-            .into()
     }
 
     /// Floating tab context menu, the same item set anvil/forge put on their
@@ -25066,24 +24472,29 @@ impl Frost {
     }
 
     fn organism_observation_owner(&self) -> Option<usize> {
-        if !self.config.ascii_organism_enabled
-            || (!self.config.is_card_mode() && !self.config.bottom_bar)
-            || !self.focused
-            || !self.terminal_input_active()
-            || !self.organism_layout().presentable()
-        {
-            return None;
+        native_companion::Observation {
+            enabled: self.config.ascii_organism_enabled,
+            card_mode: self.config.is_card_mode(),
+            bottom_bar: self.config.bottom_bar,
+            focused: self.focused,
+            input_active: self.terminal_input_active(),
+            presentable: self.organism_layout().presentable(),
+            session: self
+                .sessions
+                .get(self.active)
+                .map(|s| native_companion::SessionOwner {
+                    id: s.id,
+                    managed_remote: s.managed_remote,
+                    read_only: s.transcript_read_only(),
+                    alternate_screen: s.terminal.is_alt_buffer_active(),
+                    local: self.organism.is_local(s.id),
+                    remote_foreground: matches!(
+                        s.fg_proc_cache.as_deref(),
+                        Some("ssh" | "mosh" | "telnet")
+                    ),
+                }),
         }
-        self.sessions
-            .get(self.active)
-            .filter(|s| {
-                !s.managed_remote
-                    && !s.transcript_read_only()
-                    && !s.terminal.is_alt_buffer_active()
-                    && self.organism.is_local(s.id)
-                    && !matches!(s.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
-            })
-            .map(|s| s.id)
+        .owner()
     }
 
     fn organism_watch_owner(&self) -> Option<usize> {
@@ -25113,13 +24524,14 @@ impl Frost {
 
     fn greet_companion(&mut self, target: Option<usize>) {
         let refusal = if !self.config.ascii_organism_enabled {
-            Some("Enable ASCII Organism in Settings before greeting.")
+            Some("Enable Companion in Settings before greeting.")
         } else if self.organism_effective_motion() == Some(organism::Motion::Static) {
             Some("Choose Full or Calm motion before greeting the live companion.")
-        } else if target.is_none()
-            || target != self.organism_owner()
-            || !self.organism_interaction_eligible()
-        {
+        } else if !native_companion::greeting_target(
+            target,
+            self.organism_owner(),
+            self.organism_interaction_eligible(),
+        ) {
             Some("The companion is unavailable for the original pane right now.")
         } else if let Some(id) = target {
             use jterm_core::organism_live::{
@@ -25153,394 +24565,56 @@ impl Frost {
             activity: self.sessions.get(self.active).map_or(
                 jterm_core::organism_live::LiveActivityKnowledge::Unknown,
                 |session| {
-                    if session.terminal.is_command_running() {
-                        jterm_core::organism_live::LiveActivityKnowledge::Busy
-                    } else if eligible {
-                        session.terminal.live_activity_facts().knowledge()
-                    } else {
-                        // Hard-ineligible input never needs a prompt-grid capture.
-                        jterm_core::organism_live::LiveActivityKnowledge::Unknown
-                    }
+                    native_companion::activity(
+                        session.terminal.is_command_running(),
+                        eligible,
+                        || session.terminal.live_activity_facts().knowledge(),
+                    )
                 },
             ),
         }
     }
 
-    fn organism_hover_eligible(&self) -> bool {
-        (if self.config.is_card_mode() {
-            self.organism_body_hover_available()
-        } else {
-            self.organism_layout().presentable()
-        }) && self.organism_interaction_eligible()
-    }
-
     fn organism_interaction_eligible(&self) -> bool {
-        self.organism_available_for_interaction()
-            && self.organism_effective_motion() != Some(organism::Motion::Static)
+        native_companion::attention_available(
+            self.organism_available_for_interaction(),
+            self.organism_effective_motion(),
+        )
     }
 
     /// Shared native admission for attention and optional care. Motion only
     /// controls animation/hover, never whether an explicit text reminder works.
     fn organism_available_for_interaction(&self) -> bool {
-        self.organism_layout().presentable()
-            && self.organism_owner().is_some()
-            && self.organism_pointer_buttons.is_empty()
-            && self.dragging_tab.is_none()
-            && self.pane_drag.is_none()
-            && self.dragging_divider.is_none()
-            && !self.dragging_sidebar
-            && self.terminal_mouse_gestures.iter().all(Option::is_none)
-            && self
+        native_companion::Interaction {
+            presentable: self.organism_layout().presentable(),
+            has_owner: self.organism_owner().is_some(),
+            pointer_down: !self.organism_pointer_buttons.is_empty(),
+            dragging: self.dragging_tab.is_some()
+                || self.pane_drag.is_some()
+                || self.dragging_divider.is_some()
+                || self.dragging_sidebar,
+            application_gesture: self.terminal_mouse_gestures.iter().any(Option::is_some),
+            running: self
                 .sessions
                 .get(self.active)
-                .is_some_and(|session| !session.terminal.is_command_running())
+                .is_none_or(|session| session.terminal.is_command_running()),
+        }
+        .available()
     }
 
     fn organism_care_eligible(&self) -> bool {
-        self.config.ascii_organism_care_enabled
-            && self.organism_available_for_interaction()
-            && (!self.config.is_card_mode() || self.organism_body_hover_available())
-            && self.sessions.get(self.active).is_some_and(|session| {
+        self.sessions.get(self.active).is_some_and(|session| {
+            native_companion::care_available(
+                self.config.ascii_organism_care_enabled,
+                self.organism_available_for_interaction(),
+                !self.config.is_card_mode() || self.organism_body_hover_available(),
                 !session.terminal.has_text_selection()
                     && !session.terminal.is_mouse_enabled()
                     && session.terminal.preedit_text.is_empty()
-                    && session.terminal.kitty_graphics.get_placements().is_empty()
-                    && matches!(
-                        session.terminal.live_activity_facts().knowledge(),
-                        jterm_core::organism_live::LiveActivityKnowledge::KnownIdle
-                    )
-            })
-    }
-
-    fn status_bar(&self) -> Element<'_, Message> {
-        let layout = self.organism_layout();
-        let surface = CompanionSurface::choose(
-            self.config.ascii_organism_enabled,
-            true,
-            !self.config.is_card_mode()
-                && !self.config_panel_open
-                && self.organism_observation_owner().is_some(),
-            self.organism.is_retreating(),
-            layout.body,
-            layout.glyph,
-        );
-        let layout = OrganismLayout {
-            glyph: surface == CompanionSurface::Compact,
-            body: surface == CompanionSurface::Body,
-            explanation: surface == CompanionSurface::Body && layout.explanation,
-        };
-        let attention_facts = self.organism_attention_facts();
-        let sess = self.sessions.get(self.active);
-        let cwd = sess
-            .and_then(|s| s.cwd_cache.as_deref())
-            .map(std::path::Path::new);
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        // Report the active pane's own grid size; when split it differs from the
-        // whole-window `self.cols`×`self.rows`.
-        let (grid_cols, grid_rows) = sess
-            .map(|s| (s.terminal.grid.cols(), s.terminal.grid.rows()))
-            .unwrap_or((self.cols, self.rows));
-        let snapshot = jterm_core::bottom_bar::Snapshot {
-            cwd,
-            home: home.as_deref(),
-            git: sess.and_then(|s| s.git_meta_cache.as_ref()),
-            running: sess.is_some_and(|s| s.terminal.is_command_running()),
-            last_exit: sess.and_then(|s| s.last_exit),
-            last_duration_ms: sess.and_then(|s| s.last_duration_ms),
-            cols: grid_cols as u16,
-            rows: grid_rows as u16,
-            tab_index: self.active_tab,
-            tab_count: self.tabs.len(),
-        };
-        let content = jterm_core::bottom_bar::compose(&snapshot);
-
-        // One label per segment, colored by its tone — the renderer contract.
-        let segment = |seg: &jterm_core::bottom_bar::Segment| {
-            text(crate::review_text::bound_toast_text(seg.text.clone()))
-                .size(self.effective_font_size())
-                .color(Theme::rgb_to_color32(seg.tone.color(&self.theme)))
-        };
-        let mut left = row![].spacing(12).align_y(iced::Alignment::Center);
-        for seg in &content.left {
-            left = left.push(segment(seg));
-        }
-        let mut right = row![].spacing(12).align_y(iced::Alignment::Center);
-        for seg in &content.right {
-            right = right.push(segment(seg));
-        }
-
-        // One snapshot feeds the status glyph, tooltip and optional full body.
-        let presentation = self.organism_owner().map(|id| {
-            let running = sess.is_some_and(|s| s.terminal.is_command_running());
-            let settled = sess
-                .and_then(|s| s.terminal.running_duration_ms())
-                .is_some_and(|ms| ms >= 60_000);
-            self.organism.presentation_with_attention(
-                id,
-                running,
-                settled,
-                self.organism_effective_motion(),
-                attention_facts,
+                    && session.terminal.kitty_graphics.get_placements().is_empty(),
+                || session.terminal.live_activity_facts().knowledge(),
             )
-        });
-        let presentation = presentation.unwrap_or_default();
-        let companion_color = terminal_view::organism_tone_color(presentation.tone, &self.theme);
-        let companion_height = self.organism_strip_height();
-        let companion: Element<'_, Message> = if !layout.body || presentation.explanation.is_empty()
-        {
-            Space::new().width(Length::Fill).into()
-        } else {
-            // The complete shared sprite uses at most twelve monospace columns.
-            // Three rows at 13px with a fixed 16px line height fit in the card.
-            let body = text(presentation.sprite.clone())
-                .font(iced::Font::MONOSPACE)
-                .size(13)
-                .line_height(iced::widget::text::LineHeight::Absolute(16.0.into()))
-                .color(companion_color)
-                .into();
-            let body = self.companion_hover_target(body);
-            let detail = layout.explanation.then(|| {
-                let mut header = row![text("ASCII organism")
-                    .size(self.effective_font_size())
-                    .font(iced::Font {
-                        weight: iced::font::Weight::Bold,
-                        ..iced::Font::DEFAULT
-                    })]
-                .spacing(8)
-                .align_y(iced::Alignment::Center);
-                // The expanded body owns the one surface; its details contain
-                // words only, never a second status-bar avatar.
-                if layout.explanation {
-                    header = header.push(Space::new().width(Length::Fill)).push(
-                        text(presentation.life)
-                            .size(self.effective_font_size())
-                            .color(self.c_text_dim()),
-                    );
-                }
-                column![
-                    header,
-                    container(
-                        column![
-                            text(presentation.status.clone().into_owned())
-                                .size(self.effective_font_size())
-                                .color(companion_color)
-                                .wrapping(text::Wrapping::None),
-                            text(presentation.explanation.clone().into_owned())
-                                .size(self.effective_font_size())
-                                .color(self.c_text_dim())
-                                .wrapping(text::Wrapping::None),
-                        ]
-                        .spacing(2),
-                    )
-                    .height(Length::Fixed(self.effective_font_size() * 2.6))
-                    .clip(true),
-                ]
-                .spacing(3)
-                .width(Length::Fill)
-                .into()
-            });
-            let accent = companion_color;
-            let border = blend(self.c_border(), accent, 0.35);
-            let background = self.with_window_opacity(blend(self.c_panel(), accent, 0.035));
-            companion_card_content(body, detail, self.companion_toggle(true))
-                .style(move |_| container::Style {
-                    background: Some(background.into()),
-                    border: iced::Border {
-                        color: border,
-                        width: 1.0,
-                        radius: 6.0.into(),
-                    },
-                    ..Default::default()
-                })
-                .into()
-        };
-        let companion = container(companion)
-            .width(Length::Fill)
-            .height(Length::Fixed(companion_height))
-            // The reserved strip is separate from the terminal, even when tiny.
-            .clip(true)
-            .padding([3.0, 8.0])
-            .style(self.chrome_bar_style());
-        let mut compact_slot: Option<Element<'_, Message>> = None;
-        if layout.glyph {
-            // Compact and expanded surfaces are mutually exclusive. The
-            // tooltip describes this one body without reproducing its sprite.
-            let organism::LivePresentation {
-                glyph,
-                explanation,
-                status,
-                life,
-                ..
-            } = presentation;
-            let candidate_visible = self.organism_hover_eligible()
-                && self.organism_owner().is_some_and(|id| {
-                    self.organism
-                        .live_greeting_candidate_visible(id, attention_facts)
-                });
-            // Always reserve this tiny mark inside the existing slot. It is
-            // a passive dwell cue, not a focus ring or a behavior change.
-            let cue_color = self.c_text_dim();
-            let cue = container(Space::new())
-                .width(Length::Fixed(2.0))
-                .height(Length::Fixed(2.0))
-                .style(move |_| container::Style {
-                    background: candidate_visible.then_some(cue_color.into()),
-                    ..Default::default()
-                });
-            let slot = container(
-                row![
-                    text(glyph)
-                        .font(iced::Font::MONOSPACE)
-                        .size(11)
-                        .color(companion_color),
-                    Space::new().width(Length::Fill),
-                    cue,
-                ]
-                .align_y(iced::Alignment::Center),
-            )
-            .width(Length::Fixed(64.0))
-            .clip(true);
-            let slot: Element<'_, Message> =
-                if explanation.is_empty() || !self.terminal_input_active() {
-                    slot.into()
-                } else {
-                    let detail = container(
-                        column![
-                            text(status.into_owned())
-                                .size(self.effective_font_size())
-                                .color(companion_color),
-                            text(explanation.into_owned()).size(self.effective_font_size()),
-                            text(life)
-                                .size(self.effective_font_size())
-                                .color(self.c_text_dim()),
-                        ]
-                        .spacing(8),
-                    )
-                    .padding(8)
-                    .width(Length::Fixed(220.0))
-                    .max_height(220.0)
-                    // Tooltip overlays otherwise pass an unbounded draw viewport.
-                    .clip(true);
-                    tooltip(slot, detail, tooltip::Position::Top).into()
-                };
-            let slot = self.companion_hover_target(slot);
-            // Separate sibling of the greeting target; never an implicit hello.
-            compact_slot = Some(
-                companion_compact_slot(
-                    slot,
-                    self.companion_toggle(self.config.ascii_organism_expanded),
-                )
-                .into(),
-            );
-        }
-        let bar = row![left, Space::new().width(Length::Fill), right]
-            .spacing(12)
-            .align_y(iced::Alignment::Center);
-        let bar: Element<'_, Message> = if let Some(slot) = compact_slot {
-            companion_status_with_slot(bar.into(), slot, 12)
-        } else if !self.config.is_card_mode()
-            && companion_narrow_reopen(
-                self.win_size.width,
-                self.config.ascii_organism_enabled,
-                self.config.ascii_organism_expanded,
-                self.config.bottom_bar,
-            )
-        {
-            companion_status_with_slot(bar.into(), self.companion_toggle(false), 8)
-        } else {
-            bar.into()
-        };
-        let bar: Element<'_, Message> = container(bar)
-            .width(Length::Fill)
-            .height(Length::Fixed(self.status_bar_height()))
-            .padding([0, 10])
-            .align_y(iced::Alignment::Center)
-            .style(self.chrome_bar_style())
-            .into();
-        if companion_height > 0.0 {
-            column![companion, bar].into()
-        } else {
-            bar
-        }
-    }
-
-    /// The selected body or compact glyph shares a single live greeting owner.
-    fn companion_hover_target<'a>(&self, target: Element<'a, Message>) -> Element<'a, Message> {
-        if let Some(id) = self.organism_owner() {
-            // One core offer binds both edges before the next view rebuild.
-            let mut area = mouse_area(target);
-            if !self.config.is_card_mode() {
-                if let Some(ticket) = self.organism.live_greeting_offer(id) {
-                    area = area.on_enter(Message::OrganismHoverEnter(id, ticket));
-                }
-                if let Some(ticket) = self.organism.live_greeting_exit_reference(id) {
-                    area = area.on_exit(Message::OrganismHoverExit(id, ticket));
-                }
-            }
-            area.into()
-        } else {
-            target
-        }
-    }
-
-    /// A native chrome action, not part of the live greeting hit area.
-    fn companion_toggle(&self, expanded: bool) -> Element<'_, Message> {
-        let available = self.focused && self.terminal_input_active();
-        let toggle = button(text(if expanded { "v" } else { "^" }).size(11))
-            .width(Length::Fixed(20.0))
-            .height(Length::Fixed(self.status_bar_height()))
-            .padding(0)
-            .on_press_maybe(available.then_some(Message::SetOrganismExpanded(!expanded)))
-            .style(self.ghost_btn_style());
-        if available {
-            tooltip(
-                toggle,
-                text(if expanded {
-                    "Collapse companion"
-                } else {
-                    "Keep companion expanded"
-                })
-                .size(self.effective_font_size()),
-                tooltip::Position::Top,
-            )
-            .into()
-        } else {
-            toggle.into()
-        }
-    }
-
-    /// One-line offer to install or update jsh, shown under the tab bar only
-    /// while the background check has something actionable and the user has not
-    /// waved it away.
-    fn jsh_notice(&self) -> Option<Element<'_, Message>> {
-        if self.jsh_notice_dismissed {
-            return None;
-        }
-        let prompt = self.jsh_prompt.as_ref()?;
-        let dim = self.c_text_dim();
-        let bar = row![
-            text(prompt.banner_title())
-                .size(self.effective_font_size())
-                .style(move |_t: &iced::Theme| text::Style { color: Some(dim) }),
-            Space::new().width(Length::Fill),
-            button(text(prompt.button_label()).size(self.effective_font_size()))
-                .on_press(Message::JshInstall)
-                .padding([3, 9])
-                .style(self.ghost_btn_style()),
-            button(text("×").size(self.effective_font_size()))
-                .on_press(Message::JshNoticeDismiss)
-                .padding([3, 9])
-                .style(self.ghost_btn_style()),
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center);
-        Some(
-            container(bar)
-                .width(Length::Fill)
-                .padding([2, 10])
-                .style(self.chrome_bar_style())
-                .into(),
-        )
+        })
     }
 
     /// The live block badge when it fits over blank cells on `viewport_row`,
@@ -26073,26 +25147,25 @@ impl Frost {
     /// Drawing can represent Busy/watch while hover still requires shared idle
     /// admission. Static keeps this same body still, never adds a status clone.
     fn organism_body_owner(&self) -> Option<usize> {
-        if !self.config.is_card_mode()
-            || self.organism_geometry_epoch == u64::MAX
-            || !self.organism_pointer_buttons.is_empty()
-            || self.dragging_tab.is_some()
-            || self.pane_drag.is_some()
-            || self.dragging_divider.is_some()
-            || self.dragging_sidebar
-            || self.terminal_mouse_gestures.iter().any(Option::is_some)
-        {
+        let session = self.sessions.get(self.active)?;
+        let guards = native_companion::BodyGuards {
+            card_mode: self.config.is_card_mode(),
+            epoch_exhausted: self.organism_geometry_epoch == u64::MAX,
+            pointer_down: !self.organism_pointer_buttons.is_empty(),
+            dragging: self.dragging_tab.is_some()
+                || self.pane_drag.is_some()
+                || self.dragging_divider.is_some()
+                || self.dragging_sidebar,
+            application_gesture: self.terminal_mouse_gestures.iter().any(Option::is_some),
+            selected: session.terminal.has_text_selection(),
+            mouse_reporting: session.terminal.is_mouse_enabled(),
+            preedit: !session.terminal.preedit_text.is_empty(),
+            images: !session.terminal.kitty_graphics.get_placements().is_empty(),
+        };
+        if !guards.allows() {
             return None;
         }
         let owner = self.organism_owner()?;
-        let session = self.sessions.get(self.active)?;
-        if session.terminal.has_text_selection()
-            || session.terminal.is_mouse_enabled()
-            || !session.terminal.preedit_text.is_empty()
-            || !session.terminal.kitty_graphics.get_placements().is_empty()
-        {
-            return None;
-        }
         (CompanionSurface::choose(
             self.config.ascii_organism_enabled,
             self.sessions
@@ -26319,19 +25392,12 @@ impl Frost {
                     self.organism_effective_motion(),
                     self.organism_attention_facts(),
                 );
-                terminal_view::OrganismBody {
+                terminal_view::OrganismBody::from_presentation(
                     block,
-                    epoch: self.organism_geometry_epoch,
-                    status: presentation.status.into_owned(),
-                    explanation: presentation.explanation.into_owned(),
-                    life: presentation.life,
-                    sprite: presentation.sprite,
-                    walking_sprite: presentation.walking_sprite,
-                    tone: presentation.tone,
-                    frame: self.organism.paint_frame(self.organism_effective_motion()),
-                    wander: presentation.wander,
-                    bottom: presentation.bottom,
-                }
+                    self.organism_geometry_epoch,
+                    presentation,
+                    self.organism.paint_frame(self.organism_effective_motion()),
+                )
             });
         let submit_token = sess.enabled_chat_control(
             chat_mode::ControlKind::Submit,
@@ -26434,72 +25500,6 @@ impl Frost {
         self.font_zoom_region(font_zoom::Group::Content, terminal)
     }
 
-    /// Left dock. A header lets the user switch between the file tree and the
-    /// vertical tab list and dock the tab strip back to the top.
-    fn sidebar_view(&self) -> Element<'_, Message> {
-        // Panel switcher: highlight the active panel.
-        let panel_btn = |label: &str, panel: SidebarPanel| {
-            let active = self.sidebar_panel == panel;
-            button(text(label.to_string()).size(self.chrome_font_size()))
-                .on_press(Message::SetSidebarPanel(panel))
-                .padding([2, 8])
-                .style(self.tab_btn_style(active))
-        };
-        let header = row![
-            panel_btn("Tabs", SidebarPanel::Tabs),
-            panel_btn("Files", SidebarPanel::Files),
-            Space::new().width(Length::Fill),
-        ]
-        .spacing(4)
-        .align_y(iced::Alignment::Center);
-        // The experimental Tasks dashboard joins the switcher only when the
-        // feature flag is on; with the flag off no task UI is reachable.
-        let header = if self.config.experimental_task_sidebar {
-            // Tasks needing approval, a reply, review or recovery are counted
-            // on the switcher so they are visible from any panel.
-            let tasks: Element<'_, Message> = match self.task_attention_badge() {
-                Some((total, summary)) => tooltip(
-                    panel_btn(&format!("Tasks · {total}"), SidebarPanel::Tasks),
-                    text(summary).size(self.chrome_font_size()),
-                    tooltip::Position::Bottom,
-                )
-                .into(),
-                None => panel_btn("Tasks", SidebarPanel::Tasks).into(),
-            };
-            row![
-                panel_btn("Tabs", SidebarPanel::Tabs),
-                panel_btn("Files", SidebarPanel::Files),
-                tasks,
-                Space::new().width(Length::Fill),
-            ]
-            .spacing(4)
-            .align_y(iced::Alignment::Center)
-        } else {
-            header
-        };
-        let header = container(header.wrap()).padding([4, 6]);
-
-        let panel: Element<'_, Message> = match self.sidebar_panel {
-            SidebarPanel::Tabs => self.sidebar_tabs_view(),
-            SidebarPanel::Files => self.sidebar_files_view(),
-            // Iced leaves arrows, Tab and Enter without a submit action
-            // uncaptured; the reported focus keeps them from the terminal.
-            SidebarPanel::Tasks => agent_task_ui::report_input_focus(
-                self.sidebar_tasks_view(),
-                self.task_panel.input_focused,
-                Message::TaskInputFocus,
-            ),
-        };
-
-        container(column![header, panel].spacing(2))
-            .width(Length::Fixed(self.dock_width))
-            .height(Length::Fill)
-            .style(self.panel_style_with_focus(
-                self.sidebar_files_focused && self.sidebar_panel == SidebarPanel::Files,
-            ))
-            .into()
-    }
-
     /// Invisible resize grips hugging the window border, stacked over the rest
     /// of the UI. An undecorated window has no frame to grab, so without these
     /// the window could not be resized at all.
@@ -26596,18 +25596,6 @@ impl Frost {
         column![top, middle, bottom]
             .width(Length::Fill)
             .height(Length::Fill)
-            .into()
-    }
-
-    /// Draggable vertical strip between the dock and the terminal body. Pressing
-    /// it starts a width-resize drag (continued via the row's `on_move`).
-    fn sidebar_divider(&self) -> Element<'_, Message> {
-        let strip = container(Space::new())
-            .width(Length::Fixed(DIVIDER))
-            .height(Length::Fill);
-        mouse_area(strip.style(self.divider_style(self.dragging_sidebar)))
-            .on_press(Message::SidebarDragStart)
-            .interaction(iced::mouse::Interaction::ResizingHorizontally)
             .into()
     }
 
@@ -27127,104 +26115,6 @@ impl Frost {
         column![chrome, container(tree).height(Length::Fill)]
             .height(Length::Fill)
             .into()
-    }
-
-    /// Vertical session tab list shown in the dock. Mirrors the top tab strip:
-    /// click to select, hover to reveal close, and a trailing "new tab" button.
-    fn sidebar_tabs_view(&self) -> Element<'_, Message> {
-        let mut list = column![].spacing(2).padding([2, 4]);
-        for i in 0..self.tabs.len() {
-            let id = self.tabs[i].id;
-            let active = i == self.active_tab;
-            let label = self.tab_label(i);
-            let label = if label.chars().count() > 22 {
-                let truncated: String = label.chars().take(21).collect();
-                format!("{truncated}…")
-            } else {
-                label
-            };
-            let hovered = self.hovered_tab == Some(id);
-            let dragging_this = self.dragging_tab == Some(id);
-            let label = format!("{}{label}", self.tab_state_prefix(i));
-            let tab_label = container(
-                text(label)
-                    .size(self.chrome_font_size())
-                    .wrapping(text::Wrapping::None),
-            )
-            .width(Length::Fill)
-            .padding([4, 8]);
-            // Right-click opens the same tab menu the top strip uses — this is
-            // the tab list in Side mode, so it must offer the same actions.
-            let tab: Element<'_, Message> = mouse_area(tab_label)
-                .on_press(Message::TabDragStart(id))
-                .on_release(Message::TabDragEnd(id))
-                .on_right_press(Message::TabMenuOpen(id))
-                .into();
-            // Reveal the close button on the active or hovered tab only.
-            let show_close = active || hovered;
-            let close_inner: Element<'_, Message> = if show_close {
-                button(text("×").size(self.chrome_font_size()))
-                    .on_press(Message::CloseTab(id))
-                    .padding([4, 6])
-                    .style(self.tab_close_btn_style())
-                    .into()
-            } else {
-                Space::new().into()
-            };
-            let close = container(close_inner)
-                .width(Length::Fixed((self.chrome_font_size() * 2.0).max(24.0)))
-                .center_x(Length::Fixed((self.chrome_font_size() * 2.0).max(24.0)));
-            let cell = container(row![tab, close].align_y(iced::Alignment::Center))
-                .width(Length::Fill)
-                .style(self.tab_container_style(active, hovered, dragging_this));
-            list = list.push(tooltip(
-                mouse_area(cell)
-                    .on_enter(Message::TabHover(Some(id)))
-                    .on_exit(Message::TabHover(None)),
-                text(self.tab_label(i)),
-                tooltip::Position::Bottom,
-            ));
-        }
-        // A compact, flat "+ New" sits apart from the filled tab rows so it does
-        // not read as just another tab.
-        let new_tab = container(
-            button(text("+ New").size(self.chrome_font_size()))
-                .on_press(Message::NewSession)
-                .padding([2, 10])
-                .style(self.ghost_btn_style()),
-        )
-        .width(Length::Fill)
-        .center_x(Length::Fill)
-        .padding([4, 0]);
-        list = list.push(new_tab);
-        if self.pane_drag.is_some() {
-            list = list.push(self.pane_to_tab_drop_hint(true));
-        }
-        let list: Element<'_, Message> = scrollable(list).height(Length::Fill).into();
-        if self.pane_drag.is_some() {
-            mouse_area(list)
-                .on_release(Message::PanePromoteToTab(None))
-                .interaction(iced::mouse::Interaction::Grabbing)
-                .into()
-        } else {
-            list
-        }
-    }
-
-    fn pane_to_tab_drop_hint(&self, compact: bool) -> Element<'_, Message> {
-        let label = if compact {
-            "↓ Drop pane as tab"
-        } else {
-            "Drop pane here → new tab"
-        };
-        container(
-            text(label)
-                .size(self.chrome_font_size())
-                .color(self.c_text()),
-        )
-        .padding(if compact { [5, 8] } else { [3, 9] })
-        .style(self.split_drop_zone_style())
-        .into()
     }
 
     /// Paint one virtualized Files-tree slot (file row, inline error, or cap).
@@ -27905,11 +26795,6 @@ impl Frost {
             body
         };
 
-        let body: Element<'_, Message> = if let Some(banner) = self.session_recovery_banner() {
-            column![banner, body].height(Length::Fill).into()
-        } else {
-            body
-        };
         // Measured native workspace shell. Pane widgets and all of their
         // retained input/scroll state stay inside the central surface.
         let root: Element<'_, Message> = self.reference_workspace(body);
@@ -28393,7 +27278,7 @@ impl Frost {
             .spacing(8),
         );
         column![
-            checkbox(self.config.ascii_organism_enabled).text_size(self.effective_font_size()).label("ASCII Organism")
+            checkbox(self.config.ascii_organism_enabled).text_size(self.effective_font_size()).label("Companion")
                 .on_toggle(Message::SetAsciiOrganism),
             text("One companion per window. Its personality and life stay with you across panes; closing the window ends this local session.").size(self.effective_font_size()),
             checkbox(self.config.ascii_organism_expanded).text_size(self.effective_font_size()).label("Show companion status bubble")
@@ -28401,10 +27286,8 @@ impl Frost {
             text(if self.config.is_card_mode() && self.config.ascii_organism_enabled {
                 "Block and Chat keep one body in the active card, with no extra status cards in split panes. Full wanders in safe blank space; Calm rests; Static keeps the body still. Typing lets it step out of your way."
             } else { organism_settings_hint(
-                self.win_size.width,
                 self.config.ascii_organism_enabled,
                 self.config.ascii_organism_expanded,
-                self.config.bottom_bar,
             ) }).size(self.effective_font_size()),
             text("Organism Motion").size(self.effective_font_size()),
             pick_list(organism::MotionChoice::ALL,
@@ -35629,7 +34512,7 @@ mod tests {
             .split_once("    fn chat_running_status(&self)")
             .unwrap()
             .1
-            .split_once("    /// The top bar doubles")
+            .split_once("    fn tab_context_menu(")
             .unwrap()
             .0;
         assert!(status.contains("ChatSurface::Running"));
@@ -35686,8 +34569,13 @@ mod tests {
         ] {
             assert!(owner.contains(gate), "missing action ownership {gate}");
         }
-        assert!(source.contains("chat_mode::press_control("));
-        assert!(source.contains("token.map(Message::ChatInterrupt)"));
+        let shell = include_str!("native_shell.rs");
+        assert!(shell.contains("chat_mode::press_control(arrow, action)"));
+        assert!(shell.contains(".enabled_chat_control(kind, self.chat_input_ready(session.id))"));
+        assert!(
+            shell.contains("chat_mode::ControlKind::Interrupt => Message::ChatInterrupt(token)")
+        );
+        assert!(shell.contains("chat_mode::ControlKind::Submit => Message::ChatSubmit(token)"));
         let visibility = source
             .split_once("        let native_visible =")
             .unwrap()
@@ -36114,7 +35002,7 @@ mod tests {
             .unwrap()
             .1;
         let handlers = handlers
-            .split_once("            Message::JshNoticeDismiss")
+            .split_once("            Message::AgentClose")
             .unwrap()
             .0;
         assert_eq!(
@@ -36498,37 +35386,6 @@ mod tests {
     }
 
     #[test]
-    fn companion_strip_and_tooltip_clip_to_their_allocated_bounds() {
-        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
-        let bar = source.split_once("    fn status_bar(&self)").unwrap().1;
-        let bar = bar.split_once("    fn ").unwrap().0;
-        let companion = bar
-            .split_once("let companion = container(companion)")
-            .unwrap()
-            .1;
-        let companion = companion.split_once("if layout.glyph").unwrap().0;
-        assert!(companion.contains(".height(Length::Fixed(companion_height))"));
-        assert!(companion.contains(".clip(true)"));
-        let tooltip = bar.split_once("let detail = container(").unwrap().1;
-        let tooltip = tooltip.split_once("tooltip(slot, detail").unwrap().0;
-        assert!(tooltip.contains(".width(Length::Fixed(220.0))"));
-        assert!(tooltip.contains(".max_height(220.0)"));
-        assert!(tooltip.contains(".clip(true)"));
-        assert_eq!(bar.matches(".clip(true)").count(), 4);
-    }
-
-    #[test]
-    fn live_rhythm_explanation_is_shared_by_body_and_tooltip() {
-        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
-        let bar = source.split_once("    fn status_bar(&self)").unwrap().1;
-        let bar = bar.split_once("    fn ").unwrap().0;
-        assert_eq!(bar.matches(".presentation_with_attention(").count(), 1);
-        assert!(bar.contains("text(presentation.explanation.clone().into_owned())"));
-        assert!(bar.contains("text(explanation.into_owned())"));
-        assert!(!bar.contains("behavior_explanation("));
-    }
-
-    #[test]
     fn demo_and_hello_requests_share_the_preview_visibility_guard() {
         let source = include_str!("main.rs");
         let gate = source
@@ -36545,7 +35402,7 @@ mod tests {
             .split_once("            Message::OrganismPreviewAction(request) => {")
             .unwrap()
             .1
-            .split_once("            Message::OrganismHoverEnter")
+            .split_once("            Message::OrganismPointerButton")
             .unwrap()
             .0;
         assert!(handler.contains("if self.organism_preview_visible()"));
@@ -36608,41 +35465,27 @@ mod tests {
     }
 
     #[test]
-    fn organism_settings_hint_prioritizes_enabled_and_bottom_bar_before_geometry() {
-        for width in [0.0, 220.0, 640.0, f32::NAN] {
-            for expanded in [false, true] {
-                for bottom_bar in [false, true] {
-                    assert_eq!(
-                        organism_settings_hint(width, false, expanded, bottom_bar),
-                        "Enable ASCII Organism to allow the live companion."
-                    );
-                }
-                assert_eq!(
-                    organism_settings_hint(width, true, expanded, false),
-                    organism::expanded_companion_hint(false)
-                );
-            }
+    fn organism_settings_hint_prioritizes_enabled_state() {
+        for expanded in [false, true] {
+            assert_eq!(
+                organism_settings_hint(false, expanded),
+                "Enable Companion in Settings to allow the live companion."
+            );
         }
     }
 
     #[test]
-    fn organism_settings_hint_tracks_shared_width_capabilities_and_preview_distinction() {
-        for width in [0.0, 219.99, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            assert!(organism_settings_hint(width, true, true, true).contains("Resize the window"));
-            assert!(!organism_settings_hint(width, true, false, true).contains("status-bar arrow"));
+    fn organism_settings_hint_describes_real_bubble_setting_and_safe_space() {
+        for expanded in [false, true] {
+            let hint = organism_settings_hint(true, expanded);
+            assert!(hint.contains("Show companion status bubble"));
+            assert!(hint.contains("safe blank space"));
+            assert!(!hint.contains("arrow"));
+            assert!(!hint.contains("strip"));
+            assert!(!hint.contains("Resize"));
         }
-        for width in [220.0, 639.99] {
-            assert!(organism_settings_hint(width, true, false, true).contains("status-bar arrow"));
-            assert_eq!(
-                organism_settings_hint(width, true, true, true),
-                organism::expanded_companion_hint(true)
-            );
-        }
-        assert!(organism_settings_hint(640.0, true, false, true).contains("status-bar arrow"));
-        assert_eq!(
-            organism_settings_hint(640.0, true, true, true),
-            organism::expanded_companion_hint(true)
-        );
+        assert!(organism_settings_hint(true, true).contains("is enabled"));
+        assert!(organism_settings_hint(true, false).starts_with("Enable Show"));
     }
 
     #[test]
@@ -36652,10 +35495,9 @@ mod tests {
             .split_once("fn organism_settings_hint(")
             .unwrap()
             .1
-            .split_once("fn companion_strip_height(")
+            .split_once("/// Calendar knowledge")
             .unwrap()
             .0;
-        assert!(helper.contains("organism_layout(width, enabled, expanded, bottom_bar)"));
         for forbidden in [
             "organism_owner",
             "focused",
@@ -36667,234 +35509,25 @@ mod tests {
             assert!(!helper.contains(forbidden));
         }
         let settings = source
-            .split_once("            text(if self.config.is_card_mode()")
+            .split_once("    fn organism_settings(")
             .unwrap()
             .1
-            .split_once("            text(\"Organism Motion\")")
+            .split_once("    fn config_panel(")
             .unwrap()
             .0;
-        for current in [
-            "self.win_size.width",
-            "self.config.ascii_organism_enabled",
-            "self.config.ascii_organism_expanded",
-            "self.config.bottom_bar",
-        ] {
-            assert!(settings.contains(current));
-        }
-    }
-
-    #[test]
-    fn native_body_uses_shared_context_and_current_owner_without_new_timers() {
-        let source = include_str!("main.rs");
-        let pane = source
-            .split_once("    fn pane_view(")
+        assert!(settings.contains(".label(\"Companion\")"));
+        assert!(settings.contains(".label(\"Show companion status bubble\")"));
+        let hint = settings
+            .split_once("organism_settings_hint(")
             .unwrap()
             .1
-            .split_once("    fn sidebar_view(")
+            .split_once(") }")
             .unwrap()
             .0;
-        assert!(pane.contains("self.organism_body_owner() == Some(session_id)"));
-        assert!(pane.contains("self.organism.presentation_with_attention("));
-        assert!(pane.contains("sess.terminal.is_command_running()"));
-        assert!(pane.contains("self.organism_attention_facts()"));
-        assert!(!pane.contains("sprite_frame"));
-        let owner = source
-            .split_once("    fn organism_body_owner(")
-            .unwrap()
-            .1
-            .split_once("    fn organism_body_hover_available(")
-            .unwrap()
-            .0;
-        for gate in [
-            "self.organism_owner()?",
-            "CompanionSurface::choose(",
-            "has_text_selection()",
-            "is_mouse_enabled()",
-            "preedit_text",
-            "get_placements()",
-            "terminal_mouse_gestures",
-            "dragging_sidebar",
-        ] {
-            assert!(owner.contains(gate), "missing native gate: {gate}");
-        }
-        assert!(!owner.contains("!session.terminal.is_command_running()"));
-        let body = include_str!("organism_block.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        assert!(!body.contains("Duration"));
-        assert!(!body.contains("LiveAttention"));
-        assert!(!body.contains("std::thread"));
-        assert!(!body.contains("Behavior::"));
-    }
-
-    #[test]
-    fn native_body_withdrawals_and_entries_validate_exact_native_snapshot() {
-        let source = include_str!("main.rs");
-        let dispatch = source
-            .split_once("            Message::OrganismBodyObserved(id,")
-            .unwrap()
-            .1
-            .split_once("            Message::OrganismHoverEnter")
-            .unwrap()
-            .0;
-        for check in [
-            "epoch == self.organism_geometry_epoch",
-            "block == self.organism_block_key()",
-            "s.id == id && s.projection.key() == projection",
-        ] {
-            assert!(dispatch.contains(check));
-        }
-        let observer = source
-            .split_once("    fn observe_organism_body(")
-            .unwrap()
-            .1
-            .split_once("    /// Build the terminal widget")
-            .unwrap()
-            .0;
-        assert!(observer.contains("facts.hover_available = false"));
-        assert!(observer.contains("self.organism.leave_live_greeting(facts)"));
-        assert!(observer.contains("Edge::Enter if self.organism_body_hover_available()"));
-        assert!(observer.contains("self.organism.enter_live_greeting(id, ticket, facts)"));
-        assert!(!observer.contains("write_pty"));
-        assert!(!observer.contains("resize"));
-        let status = source
-            .split_once("// One core offer binds both edges")
-            .unwrap()
-            .1
-            .split_once("            area.into()")
-            .unwrap()
-            .0;
-        assert!(status.contains("if !self.config.is_card_mode()"));
-        let widget = include_str!("terminal_view.rs");
-        let passive = widget
-            .split_once("// Observe the exact geometry used by draw")
-            .unwrap()
-            .1
-            .split_once("// Keep the input method")
-            .unwrap()
-            .0;
-        assert!(passive.contains("self.painted_organism_geometry("));
-        assert!(passive.contains("CursorMoved"));
-        assert!(!passive.contains("capture_event"));
-        assert!(passive.contains("shell.request_redraw()"));
-    }
-
-    #[test]
-    fn narrow_reopen_is_configuration_only_and_preserves_live_thresholds() {
-        for width in [
-            0.0,
-            219.99,
-            220.0,
-            359.99,
-            360.0,
-            639.99,
-            640.0,
-            1024.0,
-            f32::NAN,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-        ] {
-            for enabled in [false, true] {
-                for expanded in [false, true] {
-                    for bottom_bar in [false, true] {
-                        let reopen = companion_narrow_reopen(width, enabled, expanded, bottom_bar);
-                        assert_eq!(
-                            reopen,
-                            enabled && bottom_bar && !expanded && (220.0..640.0).contains(&width)
-                        );
-                        if reopen {
-                            let layout = organism_layout(width, enabled, expanded, bottom_bar);
-                            assert!(!layout.presentable());
-                            assert!(!layout.maintenance_eligible(true));
-                            assert_eq!(companion_strip_height(enabled, expanded, bottom_bar), 0.0);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn companion_card_header_and_narrow_reopen_do_not_add_live_inputs() {
-        let source = include_str!("main.rs");
-        let bar = source
-            .split_once("    fn status_bar(&self)")
-            .unwrap()
-            .1
-            .split_once("    fn companion_toggle(")
-            .unwrap()
-            .0;
-        assert!(bar.contains("text(presentation.life)"));
-        assert!(bar.contains("text(presentation.status.clone().into_owned())"));
-        assert!(bar.contains("terminal_view::organism_tone_color(presentation.tone, &self.theme)"));
-        assert!(bar.contains(".size(self.effective_font_size())"));
-        assert!(bar.contains("weight: iced::font::Weight::Bold"));
-        assert!(bar.contains(".height(Length::Fixed(self.effective_font_size() * 2.6))"));
-        assert!(
-            bar.contains("companion_status_with_slot(bar.into(), self.companion_toggle(false), 8)")
-        );
-        assert!(bar.contains("let mut compact_slot: Option<Element<'_, Message>> = None;"));
-        assert!(bar.contains("companion_status_with_slot(bar.into(), slot, 12)"));
-        assert!(!bar.contains("right = right.push(companion_compact_slot"));
-        assert_eq!(
-            bar.matches(".on_enter(Message::OrganismHoverEnter(")
-                .count(),
-            1
-        );
-        let narrow = source
-            .split_once("fn companion_status_with_slot<")
-            .unwrap()
-            .1
-            .split_once("/// The same native card geometry")
-            .unwrap()
-            .0;
-        assert!(narrow.contains("container(status).width(Length::Fill).clip(true), slot"));
-        for forbidden in [
-            "OrganismHello",
-            "OrganismHover",
-            "KnownIdle",
-            "write_pty",
-            "focus(",
-            "time::every",
-        ] {
-            assert!(!narrow.contains(forbidden));
-        }
-    }
-
-    #[test]
-    fn companion_care_admission_keeps_native_guards_without_excluding_static_motion() {
-        let source = include_str!("main.rs");
-        let shared = source
-            .split_once("    fn organism_available_for_interaction(")
-            .unwrap()
-            .1
-            .split_once("    fn organism_care_eligible(")
-            .unwrap()
-            .0;
-        assert!(shared.contains("self.organism_owner().is_some()"));
-        assert!(shared.contains("self.organism_pointer_buttons.is_empty()"));
-        assert!(shared.contains("!session.terminal.is_command_running()"));
-        assert!(!shared.contains("organism_effective_motion"));
-        let care = source
-            .split_once("    fn organism_care_eligible(")
-            .unwrap()
-            .1
-            .split_once("    fn status_bar(")
-            .unwrap()
-            .0;
-        for guard in [
-            "ascii_organism_care_enabled",
-            "organism_available_for_interaction",
-            "organism_body_hover_available",
-            "has_text_selection",
-            "preedit_text",
-            "KnownIdle",
-        ] {
-            assert!(care.contains(guard), "missing care guard: {guard}");
-        }
-        assert!(!care.contains("organism_effective_motion"));
-        assert!(!care.contains("organism_interaction_eligible"));
+        assert!(hint.contains("self.config.ascii_organism_enabled"));
+        assert!(hint.contains("self.config.ascii_organism_expanded"));
+        assert!(!hint.contains("self.win_size.width"));
+        assert!(!hint.contains("self.config.bottom_bar"));
     }
 
     #[test]
@@ -37079,8 +35712,10 @@ mod tests {
             .split_once("    fn organism_watch_owner(")
             .unwrap()
             .0;
-        assert!(owner.contains("!self.organism_layout().presentable()"));
-        assert!(owner.contains("!self.terminal_input_active()"));
+        assert!(owner.contains("native_companion::Observation {"));
+        assert!(owner.contains("presentable: self.organism_layout().presentable()"));
+        assert!(owner.contains("input_active: self.terminal_input_active()"));
+        assert!(owner.contains(".owner()"));
     }
 
     #[test]
@@ -37172,76 +35807,6 @@ mod tests {
     }
 
     #[test]
-    fn narrow_companion_owner_view_and_subscription_share_geometry_without_second_target() {
-        let source = include_str!("main.rs");
-        let owner = source
-            .split_once("    fn organism_observation_owner(")
-            .unwrap()
-            .1
-            .split_once("    fn organism_watch_owner(")
-            .unwrap()
-            .0;
-        assert!(owner.contains("!self.organism_layout().presentable()"));
-        assert!(owner.contains("!self.terminal_input_active()"));
-        assert!(owner.contains("!s.terminal.is_alt_buffer_active()"));
-        let bar = source
-            .split_once("    fn status_bar(")
-            .unwrap()
-            .1
-            .split_once("    /// One-line offer")
-            .unwrap()
-            .0;
-        assert!(bar.contains("let layout = self.organism_layout()"));
-        assert!(bar.contains("if !layout.body || presentation.explanation.is_empty()"));
-        assert!(bar.contains("layout.explanation.then("));
-        assert!(bar.contains("if layout.glyph"));
-        assert_eq!(
-            bar.matches(".on_enter(Message::OrganismHoverEnter(")
-                .count(),
-            1
-        );
-        let subs = source
-            .split_once("        let preview_visible =")
-            .unwrap()
-            .1
-            .split_once("        // A right-press on a tab")
-            .unwrap()
-            .0;
-        assert!(subs.contains("let live_layout = self.organism_layout()"));
-        assert!(subs.contains("live_layout.maintenance_eligible(self.focused)"));
-        assert!(subs.contains("organism_pointer_observation_needed("));
-        assert!(subs.contains("organism_wake_plan::periodic(organism_wake_plan::ScheduleFacts"));
-        assert!(subs.contains("motion: effective"));
-        assert!(subs.contains("live_owner: self.organism_owner().is_some()"));
-        assert!(subs.contains("iced::time::every(reason.interval())"));
-        assert_eq!(subs.matches("iced::time::every(").count(), 1);
-        let resize = source
-            .split_once("            Message::Resized(size) => {")
-            .unwrap()
-            .1
-            .split_once("            Message::Focus(f)")
-            .unwrap()
-            .0;
-        assert!(
-            resize.find("self.sync_organism_geometry()").unwrap()
-                < resize.find("self.metrics.grid_size").unwrap()
-        );
-        let sync = source
-            .split_once("    fn sync_organism_geometry(")
-            .unwrap()
-            .1
-            .split_once("    fn organism_effective_motion(")
-            .unwrap()
-            .0;
-        assert!(sync.contains("!self.config.is_card_mode() && layout.presentable()"));
-        assert!(sync.contains("layout.presentable()"));
-        assert!(sync.contains("self.organism_geometry_epoch"));
-        assert!(!sync.contains("enter_live_greeting"));
-        assert!(!sync.contains("preview"));
-        assert!(!sync.contains("demo"));
-    }
-
-    #[test]
     fn expanded_companion_reserves_height_only_for_explicit_config() {
         for enabled in [false, true] {
             for expanded in [false, true] {
@@ -37257,141 +35822,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    #[test]
-    fn companion_height_is_stable_and_tiny_terminal_viewports_are_nonnegative() {
-        let reserved = companion_strip_height(true, true, true);
-        for window_height in [0.0, 1.0, 40.0, 88.0, 100.0, 800.0] {
-            for reading_height in [0.0, 64.0, 116.0] {
-                let compact = terminal_height_after_chrome(
-                    window_height,
-                    14.0,
-                    14.0,
-                    true,
-                    reading_height,
-                    0.0,
-                );
-                let expanded = terminal_height_after_chrome(
-                    window_height,
-                    14.0,
-                    14.0,
-                    true,
-                    reading_height,
-                    reserved,
-                );
-                assert_eq!(
-                    compact,
-                    (window_height - chrome_height(14.0, 14.0, true) - reading_height).max(0.0)
-                );
-                assert_eq!(expanded, (compact - 88.0).max(0.0));
-                assert!(expanded >= 0.0);
-            }
-        }
-    }
-
-    #[test]
-    fn expanded_companion_reuses_one_snapshot_and_shared_geometry() {
-        let source = include_str!("main.rs");
-        let height = source
-            .split_once("    fn organism_strip_height(&self)")
-            .unwrap()
-            .1;
-        let height = height.split_once("    fn term_height(&self)").unwrap().0;
-        assert!(height.contains("companion_strip_height("));
-        assert!(!height.contains("organism_owner") && !height.contains("win_size"));
-        let term = source.split_once("    fn term_height(&self)").unwrap().1;
-        let term = term.split_once("    fn term_width(&self)").unwrap().0;
-        // Execute the production allocator: the new shell reserves 80px once,
-        // while the companion lives in proven native blank space. It must not
-        // restore the old independent statusbar/companion height deduction.
-        let layout = jterm_core::reference_shell::Layout::for_size(1356.0, 704.0);
-        for enabled in [false, true] {
-            for expanded in [false, true] {
-                let legacy_strip = companion_strip_height(enabled, expanded, true);
-                assert_eq!(legacy_strip, if enabled && expanded { 88.0 } else { 0.0 });
-                let raw = native_viewport::raw_rect(layout.center, 0.0, 0.0);
-                assert_eq!(raw.height, 506.0);
-                assert_eq!(raw.y + raw.height, layout.composer.y);
-                assert_eq!(
-                    native_viewport::INPUT_STRIP_HEIGHT + native_viewport::TOOLS_HEIGHT,
-                    80.0
-                );
-            }
-        }
-        assert!(
-            !term.contains("organism_strip_height"),
-            "companion may not consume a second native viewport reservation"
-        );
-        let bar = source.split_once("    fn status_bar(&self)").unwrap().1;
-        let bar = bar.split_once("    fn jsh_notice(&self)").unwrap().0;
-        assert_eq!(bar.matches(".presentation_with_attention(").count(), 1);
-        assert!(bar.contains("let presentation = self.organism_owner().map"));
-        assert!(bar.contains("if !layout.body || presentation.explanation.is_empty()"));
-        assert!(bar.contains("let companion_height = self.organism_strip_height()"));
-        assert!(bar.contains("column![companion, bar]"));
-        assert_eq!(
-            bar.matches(".on_enter(Message::OrganismHoverEnter(")
-                .count(),
-            1
-        );
-        for marker in [
-            "Message::SetAsciiOrganism(enabled)",
-            "Message::SetOrganismExpanded(expanded)",
-        ] {
-            let handler = source
-                .split_once(marker)
-                .unwrap()
-                .1
-                .split_once("            Message::")
-                .unwrap()
-                .0;
-            assert!(handler.contains("self.apply_config()"));
-        }
-    }
-
-    #[test]
-    fn unavailable_companion_has_no_passive_clone_or_extra_wakes() {
-        let source = include_str!("main.rs");
-        let bar = source
-            .split_once("    fn status_bar(&self)")
-            .unwrap()
-            .1
-            .split_once("    /// One-line offer")
-            .unwrap()
-            .0;
-        assert!(bar.contains("presentation.unwrap_or_default()"));
-        assert!(!bar.contains("LivePresentation::passive_presence"));
-        assert!(bar.contains("CompanionSurface::choose("));
-        assert!(bar.contains("!self.config_panel_open"));
-        assert!(bar.contains("self.organism_observation_owner().is_some()"));
-        assert!(bar.contains("if explanation.is_empty() || !self.terminal_input_active()"));
-        assert!(bar.contains("let slot = self.companion_hover_target(slot)"));
-        assert_eq!(
-            bar.matches(".on_enter(Message::OrganismHoverEnter(")
-                .count(),
-            1
-        );
-        assert!(!bar.contains("greet_live("));
-        assert!(!bar.contains("KnownIdle"));
-        assert!(!bar.contains("time::every"));
-        let owner = source
-            .split_once("    fn organism_observation_owner(")
-            .unwrap()
-            .1
-            .split_once("    fn organism_watch_owner(")
-            .unwrap()
-            .0;
-        for gate in [
-            "!self.focused",
-            "!self.terminal_input_active()",
-            "!s.managed_remote",
-            "!s.transcript_read_only()",
-            "!s.terminal.is_alt_buffer_active()",
-            "self.organism.is_local(s.id)",
-        ] {
-            assert!(owner.contains(gate), "missing live gate: {gate}");
         }
     }
 
@@ -37441,70 +35871,6 @@ mod tests {
         );
         assert!(terminal.contains("state.published_presses[button.slot()]"));
         assert!(terminal.contains("if !state.dragging"));
-    }
-
-    #[test]
-    fn companion_toggle_is_separate_config_chrome_without_terminal_or_greeting_actions() {
-        let source = include_str!("main.rs");
-        let bar = source
-            .split_once("    fn status_bar(&self)")
-            .unwrap()
-            .1
-            .split_once("    fn companion_toggle(")
-            .unwrap()
-            .0;
-        assert!(bar.contains("self.companion_toggle(self.config.ascii_organism_expanded)"));
-        assert!(bar.contains("companion_card_content(body, detail, self.companion_toggle(true))"));
-        assert!(bar.contains("companion_compact_slot("));
-        let toggle = source
-            .split_once("    fn companion_toggle(")
-            .unwrap()
-            .1
-            .split_once("    /// One-line offer")
-            .unwrap()
-            .0;
-        assert!(toggle.contains("self.focused && self.terminal_input_active()"));
-        assert!(toggle.contains("available.then_some(Message::SetOrganismExpanded(!expanded))"));
-        assert!(toggle.contains("Length::Fixed(20.0)"));
-        assert!(toggle.contains("if available {"));
-        assert!(!toggle.contains("mouse_area"));
-        assert!(!toggle.contains("OrganismHover"));
-        assert!(!toggle.contains("OrganismHello"));
-        let handler = source
-            .split_once("            Message::SetOrganismExpanded(expanded) => {")
-            .unwrap()
-            .1
-            .split_once("            Message::SetOrganismMotion")
-            .unwrap()
-            .0;
-        assert!(handler.contains("self.config.ascii_organism_expanded = expanded"));
-        assert!(handler.contains("self.config_dirty = true"));
-        assert!(handler.contains("self.apply_config()"));
-        for forbidden in ["greet_", "write_pty", "write_paste", "focus(", "KnownIdle"] {
-            assert!(!handler.contains(forbidden));
-        }
-    }
-
-    #[test]
-    fn live_sprite_detail_describes_the_owner_without_another_sprite() {
-        let source = include_str!("main.rs");
-        let bar = source.split_once("    fn status_bar(&self)").unwrap().1;
-        let slot = bar
-            .split_once("let presentation = self.organism_owner().map")
-            .unwrap()
-            .1;
-        let slot = slot
-            .split_once("            let slot = self.companion_hover_target(slot)")
-            .unwrap()
-            .0;
-        assert!(slot.contains("presentation.unwrap_or_default()"));
-        assert!(slot.contains("if explanation.is_empty() || !self.terminal_input_active()"));
-        assert!(slot.contains("Length::Fixed(64.0)"));
-        assert!(!slot.contains("text(sprite).font(iced::Font::MONOSPACE)"));
-        assert!(slot.contains("text(status.into_owned())"));
-        assert!(slot.contains(".max_height(220.0)"));
-        assert!(slot.contains("tooltip(slot, detail, tooltip::Position::Top)"));
-        assert!(!slot.contains("on_press"));
     }
 
     #[test]
@@ -41016,12 +39382,22 @@ mod tests {
         let window = iced::Size::new(1000.0, 700.0);
         let panel = iced::Size::new(360.0, 500.0);
         assert_eq!(
-            anchored_overlay_position(iced::Point::new(100.0, 80.0), window, panel, TAB_BAR_H),
+            anchored_overlay_position(
+                iced::Point::new(100.0, 80.0),
+                window,
+                panel,
+                jterm_core::reference_shell::TITLEBAR_HEIGHT
+            ),
             iced::Point::new(106.0, 86.0)
         );
         // Bottom-right summons above the pointer and clamps away from the edge.
         assert_eq!(
-            anchored_overlay_position(iced::Point::new(990.0, 690.0), window, panel, TAB_BAR_H),
+            anchored_overlay_position(
+                iced::Point::new(990.0, 690.0),
+                window,
+                panel,
+                jterm_core::reference_shell::TITLEBAR_HEIGHT
+            ),
             iced::Point::new(634.0, 184.0)
         );
         // Corrupt/non-finite pointer state stays reachable instead of
@@ -41031,10 +39407,10 @@ mod tests {
                 iced::Point::new(f32::NAN, f32::NAN),
                 window,
                 panel,
-                TAB_BAR_H,
+                jterm_core::reference_shell::TITLEBAR_HEIGHT,
             ),
             // The top floor (below the tab bar) plus the overlay gap.
-            iced::Point::new(6.0, TAB_BAR_H + 6.0)
+            iced::Point::new(6.0, jterm_core::reference_shell::TITLEBAR_HEIGHT + 6.0)
         );
     }
 
@@ -41277,68 +39653,6 @@ mod tests {
             agent_prompt_status_with_foreground(AgentPromptStatus::InputNotEmpty, 100, Some(100)),
             AgentPromptStatus::InputNotEmpty
         );
-    }
-
-    #[test]
-    fn ui_scale_change_resizes_logical_viewport_and_terminal_grid() {
-        let old_viewport = Size::new(1200.0, 800.0);
-        let old_scale = 1.0;
-        let new_scale = 2.0;
-        let new_viewport = logical_viewport_after_scale(old_viewport, old_scale, new_scale);
-
-        assert_eq!(new_viewport, Size::new(600.0, 400.0));
-        assert_eq!(
-            new_viewport.width * new_scale,
-            old_viewport.width * old_scale
-        );
-        assert_eq!(
-            new_viewport.height * new_scale,
-            old_viewport.height * old_scale
-        );
-
-        // The terminal and chrome use one configured size in production.
-        // Keep exact grid expectations at small, default and enlarged fonts so
-        // a stale fixed-height reservation cannot silently return extra rows.
-        // Chrome is the 40 px-minimum tab bar (20 px padding) plus the status
-        // bar: 62, 63, 88 and 212 px of the 400 px logical height.
-        for (font_size, expected_grid) in [
-            (10.0, (98, 28)),
-            (14.0, (70, 20)),
-            (24.0, (40, 10)),
-            (72.0, (13, 2)),
-        ] {
-            let metrics = Metrics::new(font_size, 1.0, 0.0, false);
-            let old_grid = metrics.grid_size(
-                old_viewport.width - terminal_view::SCROLLBAR_WIDTH,
-                old_viewport.height - chrome_height(metrics.font_size, metrics.font_size, true),
-            );
-            let new_grid = metrics.grid_size(
-                new_viewport.width - terminal_view::SCROLLBAR_WIDTH,
-                new_viewport.height - chrome_height(metrics.font_size, metrics.font_size, true),
-            );
-            assert!(new_grid.0 < old_grid.0);
-            assert!(new_grid.1 < old_grid.1);
-            assert_eq!(new_grid, expected_grid, "font size {font_size}");
-        }
-    }
-
-    #[test]
-    fn disabling_the_bottom_bar_returns_its_rows_to_the_grid() {
-        let viewport = Size::new(1200.0, 800.0);
-        let width = viewport.width - terminal_view::SCROLLBAR_WIDTH;
-        for font_size in [10.0, 14.0, 24.0, 72.0] {
-            let metrics = Metrics::new(font_size, 1.0, 0.0, false);
-            let with_bar = metrics.grid_size(
-                width,
-                viewport.height - chrome_height(metrics.font_size, metrics.font_size, true),
-            );
-            let without_bar = metrics.grid_size(
-                width,
-                viewport.height - chrome_height(metrics.font_size, metrics.font_size, false),
-            );
-            assert_eq!(with_bar.0, without_bar.0);
-            assert!(without_bar.1 > with_bar.1);
-        }
     }
 
     #[test]
@@ -41715,9 +40029,6 @@ mod tests {
 
     #[test]
     fn a_drag_returning_to_its_source_restores_origin_but_a_click_activates() {
-        assert!(tab_drag_hover_left_source(Some(2), None));
-        assert!(tab_drag_hover_left_source(Some(2), Some(3)));
-        assert!(!tab_drag_hover_left_source(Some(2), Some(2)));
         assert_eq!(
             tab_drag_release_action(Some(2), Some(2), false),
             TabDragReleaseAction::Activate(2)
@@ -45243,122 +43554,6 @@ mod tests {
     }
 
     #[test]
-    fn activity_facts_reconcile_only_fresh_active_output_after_context_updates() {
-        let source = include_str!("main.rs");
-        let output = source
-            .split_once("            Message::PtyOutput(id, fd, data, watch_stamp) => {")
-            .unwrap()
-            .1
-            .split_once("                self.last_ingest_us =")
-            .unwrap()
-            .0;
-        assert!(output.contains("session.id == id && session.master_fd == fd"));
-        assert!(output.contains("if is_active_output {"));
-        assert!(
-            output.find("sess.terminal.process_batch(&data)").unwrap()
-                < output
-                    .find("self.organism.poll_live_greeting(Some(id), facts)")
-                    .unwrap()
-        );
-        assert!(
-            output.find("self.organism.completed_event(").unwrap()
-                < output
-                    .find("self.organism.poll_live_greeting(Some(id), facts)")
-                    .unwrap()
-        );
-        assert!(
-            output
-                .find(".batch_finished(id, sess.terminal.is_command_running())")
-                .unwrap()
-                < output
-                    .find("self.organism.poll_live_greeting(Some(id), facts)")
-                    .unwrap()
-        );
-        let facts = source
-            .split_once("    fn organism_attention_facts(")
-            .unwrap()
-            .1
-            .split_once("    fn organism_hover_eligible(")
-            .unwrap()
-            .0;
-        assert!(facts.contains("self.organism_interaction_eligible()"));
-        assert!(
-            facts.find("session.terminal.is_command_running()").unwrap()
-                < facts
-                    .find("session.terminal.live_activity_facts().knowledge()")
-                    .unwrap()
-        );
-        assert!(facts.contains("else if eligible"));
-        let terminal = include_str!("terminal.rs");
-        let getter = terminal
-            .split_once("    pub(crate) fn live_activity_facts(")
-            .unwrap()
-            .1
-            .split_once("    pub fn agent_prompt_status(")
-            .unwrap()
-            .0;
-        for field in [
-            "agent_prompt_input_tainted",
-            "idle_prompt_input_dirty",
-            "prompt_submission_pending",
-            "prompt_cancel_pending",
-            "pending_prompt_typeahead",
-            "armed_agent_execution",
-            "active_agent_execution",
-        ] {
-            assert!(getter.contains(field));
-        }
-        assert!(getter.contains(".with_prompt_ready(|| self.agent_prompt_status().is_ready())"));
-    }
-
-    #[test]
-    fn shared_attention_coordinates_identity_without_accepting_before_input() {
-        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
-        let entry = source
-            .split_once("    fn update(&mut self, message: Message)")
-            .unwrap()
-            .1
-            .split_once("        match message {")
-            .unwrap()
-            .0;
-        assert!(entry.contains("self.sync_organism_attention_owner();"));
-        assert!(!entry.contains("poll_live_greeting"));
-        let tick = source
-            .split_once("            Message::OrganismTick(cause) => {")
-            .unwrap()
-            .1
-            .split_once("            Message::SetBottomBar")
-            .unwrap()
-            .0;
-        assert!(tick.contains("self.sessions.get(self.active).map(|session| session.id)"));
-        assert!(tick.contains(".poll_live_greeting("));
-        let edges = source
-            .split_once("            Message::OrganismHoverEnter(id, epoch) => {")
-            .unwrap()
-            .1
-            .split_once("            Message::OrganismPointerButton")
-            .unwrap()
-            .0;
-        assert!(edges.contains("self.organism.enter_live_greeting("));
-        assert!(edges.contains(".exit_live_greeting(id, epoch, facts)"));
-        let view = source
-            .split_once("// One core offer binds both edges before the next view rebuild.")
-            .unwrap()
-            .1
-            .split_once("            area.into()")
-            .unwrap()
-            .0;
-        assert!(view.contains("live_greeting_offer(id)"));
-        assert!(view.contains("on_enter(Message::OrganismHoverEnter(id, ticket))"));
-        assert!(view.contains("live_greeting_exit_reference(id)"));
-        assert!(view.contains("on_exit(Message::OrganismHoverExit(id, ticket))"));
-        let adapter = include_str!("organism_hover.rs");
-        assert!(!adapter.contains("GentleInteraction"));
-        assert!(!adapter.contains("struct LiveGreeting"));
-        assert!(adapter.contains("update_pressed_button"));
-    }
-
-    #[test]
     fn organism_pointer_offscreen_release_retires_held_buttons() {
         use iced::mouse::{Button, Event};
         for cleanup in [Event::ButtonReleased(Button::Left), Event::CursorLeft] {
@@ -45569,56 +43764,6 @@ mod tests {
     }
 
     #[test]
-    fn palette_greeting_uses_opening_target_after_close_and_presentable_admission() {
-        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
-        let key = source
-            .split_once("    fn handle_palette_key(")
-            .unwrap()
-            .1
-            .split_once("    fn edit_copy_task(")
-            .unwrap()
-            .0;
-        assert!(
-            key.find("let greeting_target = self.palette.greeting_target()")
-                .unwrap()
-                < key
-                    .find("Some(a) => self.execute_palette_action(a, greeting_target)")
-                    .unwrap()
-        );
-        let click = source
-            .split_once("            Message::PaletteExecute(epoch, i) => {")
-            .unwrap()
-            .1
-            .split_once("            Message::ToggleConfigPanel")
-            .unwrap()
-            .0;
-        assert!(
-            click.find("self.palette.action_at(&epoch, i)").unwrap()
-                < click.find("self.palette.greeting_target()").unwrap()
-        );
-        assert!(
-            click.find("self.palette.greeting_target()").unwrap()
-                < click.find("self.palette.close()").unwrap()
-        );
-        let greet = source
-            .split_once("    fn greet_companion(")
-            .unwrap()
-            .1
-            .split_once("    fn status_bar(")
-            .unwrap()
-            .0;
-        assert!(greet.contains("target != self.organism_owner()"));
-        assert!(greet.contains("!self.organism_interaction_eligible()"));
-        assert!(greet.contains("Some(organism::Motion::Static)"));
-        assert!(greet.contains("self.organism_layout().presentable()"));
-        assert!(greet.contains("self.organism_body_hover_available()"));
-        assert!(!greet.contains("Task::"));
-        assert!(!greet.contains("write_pty"));
-        assert!(!greet.contains("say_hello"));
-        assert!(!greet.contains("set_enabled"));
-    }
-
-    #[test]
     fn standalone_modifiers_never_encode_payload_across_keyboard_protocols() {
         use keyboard::{key::Named, Key, Location, Modifiers};
         for named in [Named::Control, Named::Shift, Named::Alt, Named::Super] {
@@ -45788,82 +43933,6 @@ mod tests {
     }
 
     #[test]
-    fn hover_candidate_cue_stays_inside_glyph_slot_and_uses_existing_admission() {
-        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
-        let bar = source
-            .split_once("    fn status_bar(")
-            .unwrap()
-            .1
-            .split_once("    fn jsh_notice(")
-            .unwrap()
-            .0;
-        let glyph = bar.split_once("        if layout.glyph {").unwrap().1;
-        assert!(glyph.contains("let candidate_visible = self.organism_hover_eligible()"));
-        assert!(glyph.contains(".live_greeting_candidate_visible(id, attention_facts)"));
-        assert!(glyph.contains("background: candidate_visible.then_some(cue_color.into())"));
-        assert!(glyph.contains(".width(Length::Fixed(2.0))"));
-        assert!(glyph.contains(".height(Length::Fixed(2.0))"));
-        assert!(glyph.contains(".width(Length::Fixed(64.0))"));
-        assert!(glyph.contains("companion_compact_slot("));
-        assert!(!bar.contains("time::"));
-        assert!(!bar.contains("Behavior::"));
-        assert_eq!(
-            bar.matches(".on_enter(Message::OrganismHoverEnter(")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn live_hover_is_passive_owner_bound_and_deadline_driven() {
-        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
-        let bar = source
-            .split_once("    fn status_bar(")
-            .unwrap()
-            .1
-            .split_once("    fn jsh_notice(")
-            .unwrap()
-            .0;
-        assert!(bar.contains("companion_compact_slot("));
-        assert!(bar.contains(".on_enter(Message::OrganismHoverEnter("));
-        assert!(bar.contains("self.organism.live_greeting_offer(id)"));
-        assert!(bar.contains(".on_exit(Message::OrganismHoverExit(id, ticket))"));
-        assert!(!bar.contains(".on_press("));
-        assert!(!bar.contains("write_pty"));
-        let eligible = source
-            .split_once("    fn organism_hover_eligible(")
-            .unwrap()
-            .1
-            .split_once("    fn status_bar(")
-            .unwrap()
-            .0;
-        assert!(eligible.contains("self.organism_owner().is_some()"));
-        assert!(eligible.contains("Some(organism::Motion::Static)"));
-        assert!(eligible.contains("self.organism_pointer_buttons.is_empty()"));
-        assert!(eligible.contains("self.terminal_mouse_gestures.iter().all(Option::is_none)"));
-        assert!(eligible.contains("!session.terminal.is_command_running()"));
-        let hover = source
-            .split_once("            Message::OrganismHoverEnter(id, epoch) => {")
-            .unwrap()
-            .1
-            .split_once("            Message::OrganismTick(cause) => {")
-            .unwrap()
-            .0;
-        assert!(hover.contains("self.organism_owner() == Some(id)"));
-        assert!(!hover.contains("write_pty"));
-        assert!(!hover.contains("set_focus"));
-        let subscriptions = source
-            .split_once("        let preview_visible =")
-            .unwrap()
-            .1
-            .split_once("        // A right-press on a tab")
-            .unwrap()
-            .0;
-        assert!(subscriptions.contains("if self.organism_interaction_eligible()"));
-        assert!(subscriptions.contains(".live_greeting_deadline(attention_facts)"));
-    }
-
-    #[test]
     fn organism_preview_retreat_and_completion_use_one_shot_deadlines() {
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
         let subscription = source
@@ -45909,16 +43978,19 @@ mod tests {
             .split_once("    fn organism_watch_owner(")
             .unwrap()
             .0;
+        assert!(owner.contains("native_companion::Observation {"));
+        assert!(owner.contains(".owner()"));
         for gate in [
-            "!self.config.ascii_organism_enabled",
-            "!self.config.bottom_bar",
-            "!self.focused",
-            "!self.terminal_input_active()",
-            "!self.organism_layout().presentable()",
+            "card_mode: self.config.is_card_mode()",
+            "enabled: self.config.ascii_organism_enabled",
+            "bottom_bar: self.config.bottom_bar",
+            "focused: self.focused",
+            "input_active: self.terminal_input_active()",
+            "presentable: self.organism_layout().presentable()",
             ".get(self.active)",
-            "!s.managed_remote",
-            "!s.transcript_read_only()",
-            "!s.terminal.is_alt_buffer_active()",
+            "managed_remote: s.managed_remote",
+            "read_only: s.transcript_read_only()",
+            "alternate_screen: s.terminal.is_alt_buffer_active()",
             "self.organism.is_local(s.id)",
             "Some(\"ssh\" | \"mosh\" | \"telnet\")",
         ] {
@@ -45944,88 +44016,6 @@ mod tests {
         assert!(dispatch.contains("organism_deadline_subscription(wake)"));
         assert!(!expiry.contains("time::every"));
         assert!(!expiry.contains("sessions.iter()"));
-    }
-
-    #[test]
-    fn organism_observation_reuses_terminal_input_ownership() {
-        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
-        let owner = source
-            .split_once("    fn organism_observation_owner(")
-            .unwrap()
-            .1
-            .split_once("    fn status_bar(")
-            .unwrap()
-            .0;
-        assert!(owner.contains("|| !self.terminal_input_active()"));
-        let display_owner = source
-            .split_once("    fn organism_owner(")
-            .unwrap()
-            .1
-            .split_once("    fn organism_observation_owner(")
-            .unwrap()
-            .0;
-        assert!(display_owner.contains("self.organism_observation_owner()"));
-        let tick = source
-            .split_once("            Message::OrganismTick(cause) => {")
-            .unwrap()
-            .1
-            .split_once("            Message::SetBottomBar(")
-            .unwrap()
-            .0;
-        assert!(tick.contains("let owner = self.organism_observation_owner();"));
-        assert!(tick.contains("self.organism.tick(owner, running, any_running);"));
-    }
-
-    #[test]
-    fn modal_ai_surfaces_gate_terminal_input_and_mouse_ownership() {
-        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
-        for (start, end) in [
-            (
-                "    fn terminal_input_active(",
-                "    fn terminal_mouse_active(",
-            ),
-            (
-                "    fn terminal_mouse_active(",
-                "    fn local_sidebar_fallback_root(",
-            ),
-        ] {
-            let body = source
-                .split_once(start)
-                .unwrap()
-                .1
-                .split_once(end)
-                .unwrap()
-                .0;
-            assert!(body.contains("&& !self.ai_chats.is_open"));
-            assert!(body.contains("&& self.ai_ask.is_none()"));
-        }
-        for (start, end) in [
-            (
-                "            Message::Ime(event) => {",
-                "            Message::ModifiersChanged(",
-            ),
-            (
-                "            Message::ImageDropped(path) => {",
-                "            Message::Pasted(id, Some(text))",
-            ),
-        ] {
-            let body = source
-                .split_once(start)
-                .unwrap()
-                .1
-                .split_once(end)
-                .unwrap()
-                .0;
-            assert!(body.contains("if !self.terminal_input_active()"));
-        }
-        let pane = source
-            .split_once("    fn pane_view(")
-            .unwrap()
-            .1
-            .split_once("    fn sidebar_view(")
-            .unwrap()
-            .0;
-        assert!(pane.contains("self.focused && is_active && self.terminal_input_active()"));
     }
 
     #[test]
@@ -46954,7 +44944,7 @@ mod tests {
             .contains("command_requires_block_context(&cmd) && !self.block_binding_available()"));
     }
     #[test]
-    fn keyboard_menu_mode_matrix_keeps_chat_and_normal_on_the_terminal_path() {
+    fn keyboard_menu_mode_matrix_migrates_normal_to_block_and_keeps_chat_on_terminal() {
         for mode in [
             config::TerminalMode::Normal,
             config::TerminalMode::Block,
@@ -46972,7 +44962,12 @@ mod tests {
                     let target = block_menu_keyboard_target(available, "", Some(42), true);
                     assert_eq!(
                         target,
-                        if mode == config::TerminalMode::Block && !alt && !running {
+                        if matches!(
+                            mode,
+                            config::TerminalMode::Normal | config::TerminalMode::Block
+                        ) && !alt
+                            && !running
+                        {
                             Some(42)
                         } else {
                             None
@@ -47049,7 +45044,9 @@ mod bounded_clipboard_lifecycle_tests {
     #[test]
     fn every_config_replacement_revokes_before_permission_change() {
         let source = include_str!("main.rs");
-        let production = source.split("\n#[cfg(test)]").next().unwrap();
+        // Test-only compatibility helpers precede the main test module. A
+        // generic cfg boundary would truncate the real configuration paths.
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
         let compact: String = production
             .chars()
             .filter(|ch| !ch.is_whitespace())
@@ -47270,9 +45267,35 @@ mod startup_recovery_tests {
             .split_once("    fn search_bar(")
             .unwrap()
             .0;
-        assert_eq!(view.matches("self.session_recovery_banner()").count(), 2);
+        assert_eq!(view.matches("self.session_recovery_banner()").count(), 1);
         assert!(view.contains("column![banner, empty]"));
-        assert!(view.contains("chrome = chrome.push(banner)"));
+        let shell = include_str!("native_shell.rs");
+        let workspace = shell
+            .split_once("    pub(crate) fn reference_workspace")
+            .unwrap()
+            .1;
+        let workspace: String = workspace.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert_eq!(
+            workspace.matches("self.session_recovery_banner()").count(),
+            1
+        );
+        assert!(
+            workspace.find("self.reference_topbar()").unwrap()
+                < workspace.find("self.session_recovery_banner()").unwrap()
+        );
+        assert!(
+            workspace.find("self.session_recovery_banner()").unwrap()
+                < workspace.find("workspace.push(body)").unwrap()
+        );
+        let height = source
+            .split_once("    fn term_height(")
+            .unwrap()
+            .1
+            .split_once("\n    }\n")
+            .unwrap()
+            .0;
+        assert!(height.contains("native_viewport::raw_rect("));
+        assert!(height.contains("self.startup_recovery.banner_height(self.chrome_font_size())"));
         let zoom = source
             .split_once("    fn font_zoom_enabled(")
             .unwrap()

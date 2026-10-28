@@ -42,6 +42,23 @@ fn mono(value: impl Into<String>, size: f32, dark: bool) -> iced::widget::Text<'
         }))
 }
 
+#[derive(Clone, Copy)]
+struct TextScale(f32);
+impl TextScale {
+    fn txt(
+        self,
+        value: impl Into<String>,
+        size: f32,
+        dim: bool,
+        dark: bool,
+    ) -> iced::widget::Text<'static> {
+        txt(value, size * self.0, dim, dark)
+    }
+    fn mono(self, value: impl Into<String>, size: f32, dark: bool) -> iced::widget::Text<'static> {
+        mono(value, size * self.0, dark)
+    }
+}
+
 fn elide(value: &str, max: usize) -> String {
     let short: String = value.chars().take(max).collect();
     if value.chars().count() > max {
@@ -107,7 +124,7 @@ fn part(value: &Part) -> Element<'static, AppMessage> {
         Part::Steps(steps) => {
             let rows = steps
                 .iter()
-                .map(|step| step_row(step, false))
+                .map(|step| step_row(step, false, 1.0))
                 .collect::<Vec<_>>();
             container(column(rows).spacing(1))
                 .style(|_| frame(color::ACCENT_PALE, color::LIGHT_BORDER, 8.0))
@@ -137,7 +154,8 @@ fn part(value: &Part) -> Element<'static, AppMessage> {
     }
 }
 
-fn step_row(step: &Step, dark: bool) -> Element<'static, AppMessage> {
+fn step_row(step: &Step, dark: bool, font_scale: f32) -> Element<'static, AppMessage> {
+    let fonts = TextScale(font_scale);
     let mark = match step.state {
         StepState::Complete => Icon::Check,
         StepState::Running => Icon::Agent,
@@ -156,24 +174,33 @@ fn step_row(step: &Step, dark: bool) -> Element<'static, AppMessage> {
                 13.0
             ),
             tooltip(
-                txt(
-                    elide(&step.title, if dark { 35 } else { 80 }),
-                    10.0,
-                    false,
-                    dark
+                container(
+                    fonts
+                        .txt(
+                            elide(&step.title, if dark { 35 } else { 80 }),
+                            10.0,
+                            false,
+                            dark
+                        )
+                        .wrapping(text::Wrapping::None)
                 )
-                .width(Length::Fill),
-                txt(&step.title, 10.0, false, dark),
+                .width(Length::Fill)
+                .clip(true),
+                fonts.txt(&step.title, 10.0, false, dark),
                 tooltip::Position::Left
             ),
-            txt(step.elapsed.as_deref().unwrap_or(""), 9.0, true, dark)
+            fonts.txt(step.elapsed.as_deref().unwrap_or(""), 9.0, true, dark)
         ]
         .spacing(7)
         .align_y(iced::Alignment::Center),
     )
     .padding([5, 9])
     .height(if dark {
-        shell::INSPECTOR_QUEUE_ROW_HEIGHT
+        if font_scale <= 1.0 {
+            shell::INSPECTOR_QUEUE_ROW_HEIGHT
+        } else {
+            ui_typography::row_height(10.0 * font_scale, shell::INSPECTOR_QUEUE_ROW_HEIGHT, 10.0)
+        }
     } else {
         shell::TASK_ROW_HEIGHT
     })
@@ -439,28 +466,40 @@ pub(crate) fn conversation_view(conversation: &Conversation) -> Element<'static,
 pub(crate) fn inspector_view(
     inspector: &Inspector,
     is_fixture: bool,
+    chrome_font_size: f32,
 ) -> Element<'static, AppMessage> {
+    let fonts = TextScale(ui_typography::reference_role_size(1.0, chrome_font_size));
     let mut content = column![
         row![
             icon(Icon::Agent, rgb(color::CHROME_TEXT), 16.0),
             tooltip(
-                txt(elide(&inspector.title, 20), 12.0, false, true).font(iced::Font {
-                    weight: iced::font::Weight::Bold,
-                    ..iced::Font::with_name(shell::FONT_SANS)
-                }),
-                txt(&inspector.title, 12.0, false, true),
+                container(
+                    fonts
+                        .txt(elide(&inspector.title, 20), 12.0, false, true)
+                        .wrapping(text::Wrapping::None)
+                        .font(iced::Font {
+                            weight: iced::font::Weight::Bold,
+                            ..iced::Font::with_name(shell::FONT_SANS)
+                        })
+                )
+                .width(Length::Fill)
+                .clip(true),
+                fonts.txt(&inspector.title, 12.0, false, true),
                 tooltip::Position::Left
             ),
-            Space::new().width(Length::Fill),
-            container(txt(&inspector.badge, 9.0, false, true))
-                .padding([3, 6])
-                .style(|_| frame(color::NAVIGATION_SELECTED, color::DARK_BORDER, 6.0))
+            container(
+                fonts
+                    .txt(&inspector.badge, 9.0, false, true)
+                    .wrapping(text::Wrapping::None)
+            )
+            .padding([3, 6])
+            .style(|_| frame(color::NAVIGATION_SELECTED, color::DARK_BORDER, 6.0))
         ]
         .spacing(7)
         .align_y(iced::Alignment::Center),
         tooltip(
-            txt(elide(&inspector.subtitle, 44), 10.0, true, true),
-            txt(&inspector.subtitle, 10.0, true, true),
+            fonts.txt(elide(&inspector.subtitle, 44), 10.0, true, true),
+            fonts.txt(&inspector.subtitle, 10.0, true, true),
             tooltip::Position::Left
         ),
         container(
@@ -478,7 +517,7 @@ pub(crate) fn inspector_view(
                         ..Default::default()
                     }
                 }),
-                txt(
+                fonts.txt(
                     if inspector.total == 0 {
                         "No progress".into()
                     } else {
@@ -511,11 +550,11 @@ pub(crate) fn inspector_view(
         metadata = metadata.push(
             container(
                 row![
-                    txt(name.to_uppercase(), 8.0, true, true),
+                    fonts.txt(name.to_uppercase(), 8.0, true, true),
                     Space::new().width(Length::Fill),
                     tooltip(
-                        txt(visible, 10.0, false, true),
-                        txt(value, 10.0, false, true),
+                        fonts.txt(visible, 10.0, false, true),
+                        fonts.txt(value, 10.0, false, true),
                         tooltip::Position::Left
                     )
                 ]
@@ -526,18 +565,30 @@ pub(crate) fn inspector_view(
         );
     }
     content = content.push(metadata);
-    content = content.push(container(txt("CURRENT STEP", 8.0, true, true)).height(12));
+    content = content.push(container(fonts.txt("CURRENT STEP", 8.0, true, true)).height(12));
     let current = if let Some(step) = &inspector.current_step {
         container(
             column![
                 tooltip(
-                    txt(elide(&step.title, 43), 10.0, false, true),
-                    txt(&step.title, 10.0, false, true),
+                    container(
+                        fonts
+                            .txt(elide(&step.title, 43), 10.0, false, true)
+                            .wrapping(text::Wrapping::None)
+                    )
+                    .width(Length::Fill)
+                    .clip(true),
+                    fonts.txt(&step.title, 10.0, false, true),
                     tooltip::Position::Left
                 ),
                 tooltip(
-                    txt(elide(&step.detail, 49), 9.0, true, true),
-                    txt(&step.detail, 9.0, true, true),
+                    container(
+                        fonts
+                            .txt(elide(&step.detail, 49), 9.0, true, true)
+                            .wrapping(text::Wrapping::None)
+                    )
+                    .width(Length::Fill)
+                    .clip(true),
+                    fonts.txt(&step.detail, 9.0, true, true),
                     tooltip::Position::Left
                 )
             ]
@@ -547,29 +598,33 @@ pub(crate) fn inspector_view(
         .width(Length::Fill)
         .style(|_| frame(color::NAVIGATION, color::DARK_BORDER, 8.0))
     } else {
-        container(txt("No active step", 10.0, true, true))
+        container(fonts.txt("No active step", 10.0, true, true))
             .padding(9)
             .width(Length::Fill)
             .style(|_| frame(color::NAVIGATION, color::DARK_BORDER, 8.0))
     };
-    content = content.push(current.height(shell::INSPECTOR_CURRENT_HEIGHT));
-    content = content.push(txt("TASK QUEUE", 8.0, true, true));
+    content = content.push(current.height(if fonts.0 <= 1.0 {
+        shell::INSPECTOR_CURRENT_HEIGHT
+    } else {
+        ui_typography::row_height(19.0 * fonts.0, shell::INSPECTOR_CURRENT_HEIGHT, 20.0)
+    }));
+    content = content.push(fonts.txt("TASK QUEUE", 8.0, true, true));
     let mut queue = column![].spacing(shell::INSPECTOR_QUEUE_GAP);
     if inspector.queue.is_empty() {
         queue = queue.push(
-            container(txt("No queued tasks", 10.0, true, true))
+            container(fonts.txt("No queued tasks", 10.0, true, true))
                 .height(shell::INSPECTOR_QUEUE_ROW_HEIGHT),
         );
     }
     for step in &inspector.queue {
-        queue = queue.push(step_row(step, true));
+        queue = queue.push(step_row(step, true, fonts.0));
     }
     content = content.push(queue).push(Space::new().height(Length::Fill));
     content = content.push(
         row![
-            txt(inspector.output_title.to_uppercase(), 8.0, true, true),
+            fonts.txt(inspector.output_title.to_uppercase(), 8.0, true, true),
             Space::new().width(Length::Fill),
-            txt(
+            fonts.txt(
                 if is_fixture { "Sample" } else { "Observed" },
                 9.0,
                 true,
@@ -579,7 +634,7 @@ pub(crate) fn inspector_view(
         .spacing(6),
     );
     content = content.push(
-        container(scrollable(mono(&inspector.output, 10.0, true)))
+        container(scrollable(fonts.mono(&inspector.output, 10.0, true)))
             .padding(10)
             .height(shell::INSPECTOR_OUTPUT_HEIGHT)
             .width(Length::Fill)

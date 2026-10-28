@@ -47,6 +47,33 @@ pub(crate) struct OrganismBody {
     pub tone: Option<jterm_core::organism::Tone>,
 }
 
+impl OrganismBody {
+    pub(crate) fn from_presentation(
+        block: crate::terminal::RawRowId,
+        epoch: u64,
+        presentation: crate::organism::LivePresentation,
+        frame: u64,
+    ) -> Self {
+        Self {
+            block,
+            epoch,
+            frame,
+            status: presentation.status.into_owned(),
+            explanation: presentation.explanation.into_owned(),
+            life: presentation.life,
+            sprite: presentation.sprite,
+            walking_sprite: presentation.walking_sprite,
+            tone: presentation.tone,
+            wander: presentation.wander,
+            bottom: presentation.bottom,
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "native_companion_tests.rs"]
+mod native_companion_contracts;
+
 #[derive(Clone, Debug)]
 pub(crate) struct OrganismBodyObservation {
     pub geometry: Option<OrganismBodyGeometry>,
@@ -2455,13 +2482,13 @@ mod tests {
             };
             let mut rows = [row; 8];
             rows[0].top = true;
-            rows[5].bottom = true;
-            rows[5].app_eligible = false;
+            rows[7].bottom = true;
+            rows[7].app_eligible = false;
             rows
         };
         with_native_body(|widget, bounds| {
             widget.chat_rows = &ROWS;
-            widget.blocks[5].host_spacer = true;
+            widget.blocks[7].host_spacer = true;
             let button = widget.chat_submit_geometry(bounds, &bounds).unwrap();
             let body = widget.organism_geometry(bounds, &bounds).unwrap();
             assert!(body.rect.y + body.rect.height <= button.y);
@@ -5025,11 +5052,15 @@ impl<Message> TermWidget<'_, Message> {
                 if let Some(speech) = speech {
                     let rgba =
                         |c: [u8; 4]| Color::from_rgba8(c[0], c[1], c[2], c[3] as f32 / 255.0);
+                    let mut speech_border = rgba(jterm_core::reference_organism::SPEECH_BORDER);
+                    // Preserve the existing quiet/error state hierarchy while
+                    // the default reference contour remains unchanged.
+                    speech_border.a *= organism_body_border_opacity(body.tone) / 0.5;
                     renderer.fill_quad(
                         Quad {
                             bounds: speech,
                             border: Border {
-                                color: rgba(jterm_core::reference_organism::SPEECH_BORDER),
+                                color: speech_border,
                                 width: 1.0,
                                 radius: jterm_core::reference_organism::SPEECH_RADIUS.into(),
                             },
@@ -6202,18 +6233,22 @@ mod block_spacing_render_tests {
                                 .find(|part| part.kind == BlockCardKind::Active)
                                 .unwrap();
                             let card = widget.card_geometry(bounds, active).body;
-                            let first_blank = bounds.y
-                                + metrics.padding
-                                + widget.canvas.offset(widget.cursor.0 + 1, metrics.cell_h);
-                            assert!(card.y + card.height - 3.0 - first_blank < jterm_core::reference_organism::SIZE,
-                                "Only an insufficient verified blank suffix may reject this wide fixture");
+                            let first_blank = widget.row_y(bounds, widget.cursor.0 + 1);
+                            let required = (3.0 * metrics.cell_h + 8.0)
+                                .max(jterm_core::reference_organism::SIZE);
+                            assert!(card.y + card.height - 3.0 - first_blank < required,
+                                "Only an insufficient verified blank suffix may reject this wide fixture: cols={columns} font={font_size} spacing={line_spacing} compact={compact} card={card:?} bounds={bounds:?} first_blank={first_blank} cursor=({}, {})", cursor.row, cursor.col);
                             continue;
                         };
+                        // Keep the existing conservative cell-sized admission
+                        // envelope; the drawn contour occupies a 64px square
+                        // inside it and never enlarges the terminal grid.
                         assert_eq!(
                             geometry.rect.height,
                             (3.0 * metrics.cell_h + 8.0).max(jterm_core::reference_organism::SIZE)
                         );
                         assert_eq!(geometry.rect.width, 12.0 * metrics.cell_w + 14.0);
+                        assert!(geometry.travel.includes(geometry.rect));
                         assert!(geometry.rect.y + 0.001 >= pos.y + metrics.cell_h * 0.5);
                         if let Some(previous) = body_y {
                             assert_eq!(

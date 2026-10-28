@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import shlex
 import time
+import native_scale_geometry as scale_geometry
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--runner', type=Path, required=True)
@@ -50,7 +51,7 @@ def read_pwd(label):
 
 try:
     smoke.start_desktop()
-    smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "normal"\nrestore_session = true\ninitial_width = 1100\ninitial_height = 760\n')
+    smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "normal"\nrestore_session = true\ninitial_width = 1100\ninitial_height = 760\nfont_family = "DejaVu Sans Mono"\nfont_size = 14\nchrome_font_size = 14\nline_spacing = 1\npadding = 2\nui_scale = 1\n')
     dirs = [out / 'first-cwd', out / 'second-cwd']
     for directory in dirs:
         directory.mkdir()
@@ -82,25 +83,17 @@ try:
     result['assertions'].append('Two tabs, active tab, and actual shell cwd restored after graceful installed-binary restart')
     smoke.screenshot('after-restart')
     if args.backend == 'wayland':
-        dimensions = []
-        for index, scale in enumerate((1, 1.5, 2, 1)):
-            smoke.run(['swaymsg', 'output', 'HEADLESS-1', 'scale', str(scale)])
-            time.sleep(2)
-            record = out / ('scale-' + str(index) + '-stty.txt')
-            identity = execute('stty size > ' + shlex.quote(str(record)), 'scale-' + str(index))
+        probe = scale_geometry.build_probe(out / 'production-geometry')
+        def record_grid(label):
+            record = out / (label + '-stty.txt')
+            identity = execute('stty size > ' + shlex.quote(str(record)), label)
             assert identity == restored_first, 'Scaling changed the active session'
             rows, cols = map(int, record.read_text().split())
-            assert rows > 0 and cols > 0
-            dimensions.append({'scale': scale, 'rows': rows, 'cols': cols})
-            smoke.screenshot('scale-' + str(index))
-            outputs = smoke.run(['swaymsg', '-t', 'get_outputs', '-r'], text=True, capture_output=True)
-            (out / ('scale-' + str(index) + '-outputs.json')).write_text(outputs.stdout)
-            assert any(o['name'] == 'HEADLESS-1' and o['scale'] == scale for o in json.loads(outputs.stdout))
-        assert dimensions[0]['rows'] == dimensions[3]['rows'] and dimensions[0]['cols'] == dimensions[3]['cols'], dimensions
-        assert dimensions[1]['rows'] < dimensions[0]['rows'] and dimensions[2]['rows'] < dimensions[1]['rows'], dimensions
-        assert dimensions[1]['cols'] < dimensions[0]['cols'] and dimensions[2]['cols'] < dimensions[1]['cols'], dimensions
+            pid, tty = identity.split(':', 1)
+            return {'rows': rows, 'cols': cols, 'pid': int(pid), 'tty': tty}
+        dimensions = scale_geometry.run_sequence(smoke, second.pid, probe, record_grid)
         result['scaling'] = dimensions
-        result['assertions'].append('Headless Wayland scale 1/1.5/2/1: positive shrinking PTY geometry and exact round-trip grid')
+        result['assertions'].append('Wayland 1/1.25/1.5/2/1: exact production viewport/font PTY geometry, native panel edges and same-shell reset')
     close(second)
     result['status'] = 'pass'
 except Exception as error:

@@ -25,6 +25,7 @@ import tempfile
 import time
 import unittest
 import uuid
+import native_scale_geometry as scale_geometry
 
 READY = 'FROSTRECOVERYREADY'
 SUMMARY = 'Recovered saved session: 1 invalid tab titles removed'
@@ -269,12 +270,7 @@ def assert_dismiss_geometry(before, after):
 
 
 def assert_scale(records):
-    require(len(records) == 4 and len({identity(record) for record in records}) == 1,
-            'Scale probe changed the original shell')
-    for dimension in ('rows', 'cols'):
-        require(records[0][dimension] > records[1][dimension] > records[2][dimension] > 0,
-                f'Wayland scale did not strictly shrink PTY {dimension}')
-        require(records[3][dimension] == records[0][dimension], f'Wayland scale did not restore {dimension}')
+    scale_geometry.assert_sequence(records)
 
 
 class PrivateDirectory:
@@ -642,21 +638,12 @@ class Case:
         self.result['zoom'] = [base, enlarged, reduced, reset]
         self.result['assertions'].append('Real Ctrl+=/Ctrl+-/Ctrl+0 shrank, enlarged and restored stty rows/columns in the original shell')
         if self.args.backend == 'wayland':
-            dimensions = []
-            for index, scale in enumerate((1, 1.5, 2, 1)):
-                self.smoke.run(['swaymsg', 'output', 'HEADLESS-1', 'scale', str(scale)])
-                time.sleep(1)
-                outputs = self.smoke.run(['swaymsg', '-t', 'get_outputs', '-r'], text=True, capture_output=True).stdout
-                (self.out / f'scale-{index}-outputs.json').write_text(outputs)
-                actual = [output for output in json.loads(outputs) if output.get('active') and output['name'] == 'HEADLESS-1']
-                require(len(actual) == 1 and actual[0]['scale'] == scale, 'Compositor did not apply the requested scale')
-                measured = self.record(f'scale-{index}', original=True)
-                measured['scale'] = scale
-                dimensions.append(measured)
-                self.smoke.screenshot(f'scale-{index}')
+            probe = scale_geometry.build_probe(self.out / 'production-geometry')
+            dimensions = scale_geometry.run_sequence(self.smoke, self.app.pid, probe,
+                lambda label: self.record(label, original=True), recovery=self.name == 'repaired')
             assert_scale(dimensions)
             self.result['scaling'] = dimensions
-            self.result['assertions'].append('Real Wayland 1/1.5/2/1 scale: monotonic stty change and exact grid reset')
+            self.result['assertions'].append('Wayland 1/1.25/1.5/2/1 exact production viewport/font grid, native panel edges and same-shell reset')
 
     def execute(self):
         self.budget()
@@ -670,6 +657,7 @@ class Case:
         self.directory = PrivateDirectory(smoke.config.parent, self.out)
         config = ('shell = "/bin/bash"\nterminal_mode = "normal"\nrestore_session = true\n'
                   'font_size = 14\nchrome_font_size = 14\nui_scale = 1\n'
+                  'font_family = "DejaVu Sans Mono"\nline_spacing = 1\npadding = 2\n'
                   'initial_width = 1100\ninitial_height = 760\nascii_organism_enabled = false\n'
                   'jsh_update_check = "never"\n')
         write_new_private(smoke.config, config.encode())
@@ -1027,10 +1015,10 @@ class PureTests(unittest.TestCase):
         self.assertRaises(AssertionError, assert_dismiss_geometry, before, dict(before, rows=44, cols=101))
         self.assertRaises(AssertionError, assert_dismiss_geometry, before, dict(before, rows=44, pid=456))
 
-    def test_scale_requires_real_monotonic_change_and_reset(self):
+    def test_scale_rejects_legacy_stty_only_without_independent_geometry(self):
         base = {'pid': 123, 'tty': '/dev/pts/2', 'rows': 40, 'cols': 100}
         records = [base, dict(base, rows=25, cols=65), dict(base, rows=18, cols=48), dict(base)]
-        assert_scale(records)
+        self.assertRaises(AssertionError, assert_scale, records)
         self.assertRaises(AssertionError, assert_scale, [base] * 4)
         self.assertRaises(AssertionError, assert_scale, records[:-1] + [dict(base, rows=39)])
 

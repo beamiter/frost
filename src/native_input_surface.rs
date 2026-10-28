@@ -1,5 +1,10 @@
 //! One retained terminal widget, viewed through history and composer clips.
 //! No editor, PTY input queue, cursor or IME state is duplicated.
+/// Both keyboard/IME and application-mouse gates share this actual modal fact.
+pub(crate) fn ai_surface_active(chats_open: bool, ask_open: bool) -> bool {
+    chats_open || ask_open
+}
+
 use iced::advanced::widget::{tree, Tree};
 use iced::advanced::{layout, mouse, overlay, renderer, Clipboard, Layout, Shell, Widget};
 use iced::{Element, Event, Length, Rectangle, Size, Vector};
@@ -317,8 +322,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         } else {
             mouse::Cursor::Unavailable
         };
-        if !input && self.history.is_some() {
-            self.history.as_mut().unwrap().as_widget_mut().update(
+        if let (false, Some(history)) = (input, self.history.as_mut()) {
+            history.as_widget_mut().update(
                 &mut tree.children[1],
                 event,
                 layout.child(2),

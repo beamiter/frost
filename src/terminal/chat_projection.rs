@@ -365,7 +365,10 @@ impl TerminalState {
             let status_zone = (role == ChatRole::Output && absolute < active_start)
                 .then(|| zone_index.map(|index| zones[index].id))
                 .flatten();
-            let role_header = role == ChatRole::Output && status_zone.is_some();
+            // Reserve the same host-only role header while output is still
+            // running. Adding it only after OSC D moves every native output
+            // row down at completion, even when no terminal cells changed.
+            let role_header = role == ChatRole::Output;
             if role_header {
                 if let Some(next) = next {
                     for line in 0..2 {
@@ -579,10 +582,28 @@ mod tests {
             .iter()
             .position(|r| r.role == ChatRole::Command)
             .unwrap();
+        let output_header = view
+            .chat_rows()
+            .iter()
+            .position(|r| r.role == ChatRole::Output && r.role_header)
+            .unwrap();
+        assert!(
+            view.view_to_raw(ViewportCell {
+                row: output_header,
+                col: 0,
+            })
+            .is_none(),
+            "role header is host chrome, never native output"
+        );
         let output = view
             .chat_rows()
             .iter()
-            .position(|r| r.role == ChatRole::Output)
+            .enumerate()
+            .find_map(|(row, role)| {
+                (role.role == ChatRole::Output
+                    && view.view_to_raw(ViewportCell { row, col: 0 }).is_some())
+                .then_some(row)
+            })
             .unwrap();
         assert!(view.chat_rows()[command].left_col > 15);
         assert_eq!(view.chat_rows()[output].left_col, 0);
@@ -879,7 +900,10 @@ mod tests {
         terminal.process_batch(b"run\r\n\x1b]133;C\x07live output");
         let mut state = ProjectionViewState::new();
         let live = snapshot(&mut terminal, &mut state);
-        state.scroll(40, &live);
+        // Host role headers add display rows without adding native history.
+        // Select a proven historical viewport rather than a fixed display
+        // distance that can stop among the current live-grid rows.
+        state.set_offset(live.max_scroll_offset(), &live);
         let history = snapshot(&mut terminal, &mut state);
         let first_raw = |view: &ProjectedViewport| {
             view.provenance

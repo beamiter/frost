@@ -93,12 +93,6 @@ fn label(
         }))
 }
 
-fn section(value: &'static str) -> Element<'static, Message> {
-    container(label(value, 9.0, true, false))
-        .padding([4, 0])
-        .into()
-}
-
 fn short(value: &str, count: usize) -> String {
     let mut result: String = value.chars().take(count).collect();
     if value.chars().count() > count {
@@ -108,6 +102,37 @@ fn short(value: &str, count: usize) -> String {
 }
 
 impl Frost {
+    fn chrome_label(
+        &self,
+        value: impl Into<String>,
+        size: f32,
+        muted: bool,
+        light: bool,
+    ) -> iced::widget::Text<'static> {
+        label(
+            value,
+            ui_typography::reference_role_size(size, self.chrome_font_size()),
+            muted,
+            light,
+        )
+    }
+    fn chrome_row_height(&self, roles: f32, minimum: f32, padding: f32) -> f32 {
+        if self.chrome_font_size() <= 14.0 {
+            minimum
+        } else {
+            ui_typography::row_height(
+                ui_typography::reference_role_size(roles, self.chrome_font_size()),
+                minimum,
+                padding,
+            )
+        }
+    }
+    fn chrome_section(&self, value: &'static str) -> Element<'static, Message> {
+        container(self.chrome_label(value, 9.0, true, false))
+            .padding([4, 0])
+            .into()
+    }
+
     pub(crate) fn reference_layout(&self) -> shell::Layout {
         let mut layout = shell::Layout::for_size(self.win_size.width, self.win_size.height);
         if !self.sidebar_open {
@@ -177,7 +202,7 @@ impl Frost {
         selected: bool,
         light: bool,
     ) -> iced::widget::Button<'static, Message> {
-        button(label(value, 11.0, false, light))
+        button(self.chrome_label(value, 11.0, false, light))
             .on_press(action)
             .height(shell::CONTROL_HEIGHT)
             .padding([4, 8])
@@ -200,7 +225,7 @@ impl Frost {
 
     pub(crate) fn reference_topbar(&self) -> Element<'_, Message> {
         let window_control = |glyph: &'static str, action: Message| {
-            button(container(label(glyph, 12.0, false, false)).center(24))
+            button(container(self.chrome_label(glyph, 12.0, false, false)).center(24))
                 .on_press(action)
                 .width(24)
                 .height(24)
@@ -219,7 +244,7 @@ impl Frost {
                 "frost",
                 jterm_core::reference_identity::PRODUCT_ICON_SIZE
             ),
-            label(
+            self.chrome_label(
                 if self.win_size.width >= 560.0 {
                     "Frost"
                 } else {
@@ -235,10 +260,10 @@ impl Frost {
         let path = self.reference_cwd();
         let path: Element<'_, Message> = if self.win_size.width >= 1050.0 {
             tooltip(
-                container(label(format!("⌁  {}", short(&path, 28)), 10.0, true, false))
+                container(self.chrome_label(format!("⌁  {}", short(&path, 28)), 10.0, true, false))
                     .width(Length::Fixed(205.0))
                     .clip(true),
-                label(path, 11.0, false, false),
+                self.chrome_label(path, 11.0, false, false),
                 tooltip::Position::Bottom,
             )
             .into()
@@ -249,9 +274,9 @@ impl Frost {
             button(
                 row![
                     vector_icon(Icon::Search, rgb(color::CHROME_MUTED), 14.0),
-                    label("Search or run a command…", 10.0, true, false),
+                    self.chrome_label("Search or run a command…", 10.0, true, false),
                     Space::new().width(Length::Fill),
-                    container(label("Ctrl ⇧ P", 9.0, true, false))
+                    container(self.chrome_label("Ctrl ⇧ P", 9.0, true, false))
                         .padding([2, 4])
                         .style(|_| panel(color::TITLEBAR, color::DARK_BORDER, 4.0))
                 ]
@@ -359,7 +384,7 @@ impl Frost {
                     .height(34)
                     .padding(0)
                     .style(control(selected, false)),
-                label(hint, 11.0, false, false),
+                self.chrome_label(hint, 11.0, false, false),
                 tooltip::Position::Right,
             )
             .into()
@@ -398,7 +423,7 @@ impl Frost {
                     false,
                 ))
                 .push(
-                    container(label(initial, 12.0, false, false).center())
+                    container(self.chrome_label(initial, 12.0, false, false).center())
                         .width(shell::PROFILE_DIAMETER)
                         .height(shell::PROFILE_DIAMETER)
                         .center_y(shell::PROFILE_DIAMETER)
@@ -451,33 +476,38 @@ impl Frost {
         let branch_slot: Element<'_, Message> = if fixture || actual_branch.is_some() {
             row![
                 vector_icon(Icon::Branch, rgb(color::CHROME_MUTED), 10.0),
-                label(short(branch, 6), 8.0, true, false).wrapping(text::Wrapping::None)
+                self.chrome_label(short(branch, 6), 8.0, true, false)
+                    .wrapping(text::Wrapping::None)
             ]
             .spacing(3)
             .align_y(iced::Alignment::Center)
             .into()
         } else {
-            label("Local", 8.0, true, false).into()
+            self.chrome_label("Local", 8.0, true, false).into()
         };
         let selector = tooltip(
             container(
                 row![
                     vector_icon(Icon::Files, rgb(color::CHROME_MUTED), 14.0),
-                    label(
-                        short(
-                            if fixture {
-                                "Canvas workspace"
-                            } else {
-                                workspace
-                            },
-                            12
-                        ),
-                        11.0,
-                        false,
-                        false
+                    container(
+                        self.chrome_label(
+                            short(
+                                if fixture {
+                                    "Canvas workspace"
+                                } else {
+                                    workspace
+                                },
+                                12
+                            ),
+                            11.0,
+                            false,
+                            false
+                        )
+                        .width(Length::Fill)
+                        .wrapping(text::Wrapping::None)
                     )
                     .width(Length::Fill)
-                    .wrapping(text::Wrapping::None),
+                    .clip(true),
                     container(branch_slot).width(49).clip(true),
                     vector_icon(Icon::ChevronDown, rgb(color::CHROME_MUTED), 13.0)
                 ]
@@ -487,7 +517,7 @@ impl Frost {
             .height(shell::WORKSPACE_SELECTOR_HEIGHT)
             .padding([6, 9])
             .style(|_| panel(color::INSPECTOR_CARD, color::DARK_BORDER, 8.0)),
-            label(format!("{cwd} · {branch_metadata}"), 10.0, false, false),
+            self.chrome_label(format!("{cwd} · {branch_metadata}"), 10.0, false, false),
             tooltip::Position::Right,
         );
         let mut destinations = column![].spacing(shell::NAVIGATION_ROW_GAP);
@@ -517,7 +547,7 @@ impl Frost {
                 button(
                     row![
                         vector_icon(Icon::from_key(key), rgb(color::CHROME_MUTED), 15.0),
-                        label(title, 10.0, false, false)
+                        self.chrome_label(title, 10.0, false, false)
                     ]
                     .spacing(8)
                     .align_y(iced::Alignment::Center),
@@ -541,17 +571,27 @@ impl Frost {
                                 13.0
                             ),
                             column![
-                                label(item.title, 10.0, false, false),
-                                label(item.detail, 8.0, true, false)
+                                tooltip(
+                                    container(
+                                        self.chrome_label(&item.title, 10.0, false, false)
+                                            .wrapping(text::Wrapping::None)
+                                    )
+                                    .width(Length::Fill)
+                                    .clip(true),
+                                    self.chrome_label(item.title, 10.0, false, false),
+                                    tooltip::Position::Right
+                                ),
+                                self.chrome_label(item.detail, 8.0, true, false)
+                                    .wrapping(text::Wrapping::None)
                             ]
                             .spacing(1)
                             .width(Length::Fill),
-                            label(item.time, 8.0, true, false)
+                            self.chrome_label(item.time, 8.0, true, false)
                         ]
                         .spacing(7)
                         .align_y(iced::Alignment::Center),
                     )
-                    .height(shell::RECENT_ROW_HEIGHT)
+                    .height(self.chrome_row_height(18.0, shell::RECENT_ROW_HEIGHT, 7.0))
                     .padding([3, 7])
                     .style(move |_| {
                         panel(
@@ -572,12 +612,12 @@ impl Frost {
                 let item = container(
                     row![
                         vector_icon(Icon::Terminal, rgb(color::CHROME_MUTED), 14.0),
-                        label(short(&self.tab_label(index), 22), 10.0, false, false)
+                        self.chrome_label(short(&self.tab_label(index), 22), 10.0, false, false)
                             .width(Length::Fill)
                     ]
                     .spacing(7),
                 )
-                .height(shell::RECENT_ROW_HEIGHT)
+                .height(self.chrome_row_height(18.0, shell::RECENT_ROW_HEIGHT, 7.0))
                 .padding([7, 8])
                 .style(move |_| {
                     panel(
@@ -595,7 +635,7 @@ impl Frost {
                         .on_press(Message::TabDragStart(tab.id))
                         .on_release(Message::TabDragEnd(tab.id))
                         .on_right_press(Message::TabMenuOpen(tab.id)),
-                    label(self.tab_label(index), 11.0, false, false),
+                    self.chrome_label(self.tab_label(index), 11.0, false, false),
                     tooltip::Position::Right,
                 ));
             }
@@ -611,8 +651,8 @@ impl Frost {
                             jterm_core::reference_identity::SPACE_ICON_SIZE
                         ),
                         column![
-                            label(*name, 10.0, false, false),
-                            label(
+                            self.chrome_label(*name, 10.0, false, false),
+                            self.chrome_label(
                                 if fixture || selected {
                                     *description
                                 } else {
@@ -628,13 +668,13 @@ impl Frost {
                     .spacing(9)
                     .align_y(iced::Alignment::Center),
                 )
-                .height(shell::SPACES_ROW_HEIGHT)
+                .height(self.chrome_row_height(18.0, shell::SPACES_ROW_HEIGHT, 7.0))
                 .padding([2, 6]),
             );
         }
         let navigation = column![
             Space::new().height(shell::NAVIGATION_LABEL_TOP - shell::TITLEBAR_HEIGHT),
-            container(label("WORKSPACE", 9.0, true, false))
+            container(self.chrome_label("WORKSPACE", 9.0, true, false))
                 .height(shell::WORKSPACE_SELECTOR_TOP - shell::NAVIGATION_LABEL_TOP),
             selector,
             Space::new().height(
@@ -644,10 +684,13 @@ impl Frost {
             ),
             destinations,
             Space::new().height(8),
-            container(section("RECENT")).height(20),
-            container(recent).height(177),
+            container(self.chrome_section("RECENT")).height(20),
+            container(recent).height(
+                177.0_f32
+                    .max(5.0 * self.chrome_row_height(18.0, shell::RECENT_ROW_HEIGHT, 7.0) + 12.0)
+            ),
             Space::new().height(7),
-            container(section("SPACES")).height(20),
+            container(self.chrome_section("SPACES")).height(20),
             spaces
         ];
         let status = self
@@ -680,11 +723,11 @@ impl Frost {
                             color::CHROME_MUTED,
                             3.0
                         )),
-                        label("Local session", 10.0, false, false)
+                        self.chrome_label("Local session", 10.0, false, false)
                     ]
                     .spacing(7)
                     .align_y(iced::Alignment::Center),
-                    label(status, 8.0, true, false)
+                    self.chrome_label(status, 8.0, true, false)
                 ]
                 .spacing(0)
             )
@@ -710,11 +753,12 @@ impl Frost {
             self.tab_label(self.active_tab)
         };
         let heading = column![
-            label(short(&name, 55), 12.0, false, true).font(iced::Font {
-                weight: iced::font::Weight::Bold,
-                ..iced::Font::with_name(shell::FONT_SANS)
-            }),
-            label(
+            self.chrome_label(short(&name, 55), 12.0, false, true)
+                .font(iced::Font {
+                    weight: iced::font::Weight::Bold,
+                    ..iced::Font::with_name(shell::FONT_SANS)
+                }),
+            self.chrome_label(
                 if jterm_core::reference_conversation::fixture_enabled() {
                     jterm_core::reference_conversation::FIXTURE_LABEL.to_string()
                 } else {
@@ -802,16 +846,18 @@ impl Frost {
                     jterm_core::reference_popup::FOOTER_ICON_SIZE,
                 ));
             }
-            let caption = label(
-                title,
-                jterm_core::reference_popup::FOOTER_LABEL_SIZE,
-                !enabled,
-                true,
-            )
-            .color(rgb(fg));
+            let caption = self
+                .chrome_label(
+                    title,
+                    jterm_core::reference_popup::FOOTER_LABEL_SIZE,
+                    !enabled,
+                    true,
+                )
+                .color(rgb(fg))
+                .wrapping(text::Wrapping::None);
             if is_model {
                 contents = contents
-                    .push(caption.width(Length::Fill))
+                    .push(container(caption).width(Length::Fill).clip(true))
                     .push(vector_icon(Icon::ChevronDown, rgb(fg), 11.0))
                     .spacing(4);
             } else {
@@ -824,7 +870,9 @@ impl Frost {
                 .on_press_maybe(action)
                 .height(shell::CONTROL_HEIGHT)
                 .width(if is_model {
-                    Length::Fixed(shell::COMPOSER_MODEL_MIN_WIDTH)
+                    Length::Fixed(
+                        shell::COMPOSER_MODEL_MIN_WIDTH * (self.chrome_font_size() / 14.0).max(1.0),
+                    )
                 } else {
                     Length::Shrink
                 })
@@ -854,7 +902,7 @@ impl Frost {
             } else {
                 tooltip(
                     button,
-                    label("Not available yet", 10.0, true, true),
+                    self.chrome_label(format!("{title} · Not available yet"), 10.0, true, true),
                     tooltip::Position::Top,
                 )
                 .into()
@@ -870,7 +918,8 @@ impl Frost {
         .style(control(false, true))]
         .spacing(shell::METADATA_GAP)
         .align_y(iced::Alignment::Center);
-        if self.reference_layout().center.width >= 640.0 {
+        if self.reference_layout().center.width >= 640.0 * (self.chrome_font_size() / 14.0).max(1.0)
+        {
             tools = tools
                 .push(tool(
                     Icon::Attach,
@@ -946,7 +995,7 @@ impl Frost {
         });
         tools = tools.push(tooltip(
             chat_mode::press_control(arrow, action),
-            label(
+            self.chrome_label(
                 if !enabled {
                     "Use the terminal keyboard"
                 } else if running {
@@ -970,11 +1019,12 @@ impl Frost {
             .height(TOOLS_HEIGHT)
             .align_y(iced::Alignment::Center)
             .into();
+        let tools = self.font_zoom_region(font_zoom::Group::Chrome, tools);
         let content: Element<'_, Message> = if self.config.is_chat_mode() {
             tools
         } else {
             column![
-                container(label(
+                container(self.chrome_label(
                     "Type in the terminal · Enter to run",
                     12.0,
                     true,
@@ -1005,7 +1055,7 @@ impl Frost {
 
     fn reference_inspector(&self) -> Element<'_, Message> {
         let tab = |name: &'static str, value| {
-            button(label(name, 10.0, false, false))
+            button(self.chrome_label(name, 10.0, false, false))
                 .on_press(Message::ReferenceInspector(value))
                 .width(shell::INSPECTOR_TAB_WIDTH)
                 .height(shell::CONTROL_HEIGHT)
@@ -1018,7 +1068,7 @@ impl Frost {
                 tab("Context", InspectorTab::Context),
                 tab("Files", InspectorTab::Files),
                 Space::new().width(Length::Fill),
-                label("⊞", 13.0, true, false)
+                self.chrome_label("⊞", 13.0, true, false)
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center),
@@ -1043,10 +1093,10 @@ impl Frost {
                     .unwrap_or_else(|| "No repository context".into());
                 container(
                     column![
-                        label("SESSION CONTEXT", 9.0, true, false),
-                        label(cwd, 12.0, false, false),
-                        label(git, 10.0, true, false),
-                        label(
+                        self.chrome_label("SESSION CONTEXT", 9.0, true, false),
+                        self.chrome_label(cwd, 12.0, false, false),
+                        self.chrome_label(git, 10.0, true, false),
+                        self.chrome_label(
                             format!("{} terminal session(s)", self.sessions.len()),
                             10.0,
                             true,
@@ -1071,7 +1121,13 @@ impl Frost {
                 if self.config.experimental_task_sidebar
                     && self.sidebar_panel == SidebarPanel::Tasks =>
             {
-                self.sidebar_tasks_view()
+                // Unconsumed arrows/Tab/Enter from task text fields must not
+                // reach the native terminal behind the new inspector.
+                agent_task_ui::report_input_focus(
+                    self.sidebar_tasks_view(),
+                    self.task_panel.input_focused,
+                    Message::TaskInputFocus,
+                )
             }
             InspectorTab::Agent => {
                 let fixture = jterm_core::reference_conversation::fixture_enabled();
@@ -1080,7 +1136,11 @@ impl Frost {
                 } else {
                     crate::reference_conversation::observed_inspector(self)
                 };
-                crate::reference_conversation::inspector_view(&inspector, fixture)
+                crate::reference_conversation::inspector_view(
+                    &inspector,
+                    fixture,
+                    self.chrome_font_size(),
+                )
             }
         };
         container(column![header, body].height(Length::Fill))
@@ -1213,9 +1273,10 @@ impl Frost {
             let row = button(
                 row![
                     vector_icon(Icon::from_key(item.icon_key), fg, popup::ICON_SIZE),
-                    label(item.title, 10.0, false, false).color(fg),
+                    self.chrome_label(item.title, 10.0, false, false).color(fg),
                     Space::new().width(Length::Fill),
-                    label(item.description, 9.0, true, false).color(rgba(popup::MUTED))
+                    self.chrome_label(item.description, 9.0, true, false)
+                        .color(rgba(popup::MUTED))
                 ]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),
@@ -1321,7 +1382,7 @@ impl Frost {
             });
         let center = container(
             column![
-                self.reference_header(),
+                self.font_zoom_region(font_zoom::Group::Chrome, self.reference_header()),
                 container(column![terminal, self.reference_tools()].spacing(0))
                     .padding(iced::Padding {
                         top: CONTENT_TOP,
@@ -1340,15 +1401,27 @@ impl Frost {
             style.text_color = Some(rgb(color::CANVAS_TEXT));
             style
         });
-        let mut body = row![self.reference_rail()].height(Length::Fill);
+        let mut body = row![self.font_zoom_region(font_zoom::Group::Chrome, self.reference_rail())]
+            .height(Length::Fill);
         if layout.navigation.is_some() {
-            body = body.push(self.reference_navigation());
+            body = body
+                .push(self.font_zoom_region(font_zoom::Group::Chrome, self.reference_navigation()));
         }
         body = body.push(center);
         if layout.inspector.is_some() {
-            body = body.push(self.reference_inspector());
+            body = body
+                .push(self.font_zoom_region(font_zoom::Group::Chrome, self.reference_inspector()));
         }
-        let workspace: Element<'_, Message> = column![self.reference_topbar(), body]
+        // Recovery is a window-level notice. The fixed-height text was
+        // designed for the full window; narrowing it to the central column
+        // hid preservation wording and the repaired-session summary.
+        let mut workspace =
+            column![self.font_zoom_region(font_zoom::Group::Chrome, self.reference_topbar())];
+        if let Some(banner) = self.session_recovery_banner() {
+            workspace = workspace.push(banner);
+        }
+        let workspace: Element<'_, Message> = workspace
+            .push(body)
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
@@ -1367,13 +1440,15 @@ impl Frost {
                     background: Some(Color::from_rgba(0.05, 0.08, 0.14, 0.24).into()),
                     ..Default::default()
                 });
-                let inspector = container(self.reference_inspector())
-                    .padding(iced::Padding {
-                        top: shell::TITLEBAR_HEIGHT,
-                        ..iced::Padding::ZERO
-                    })
-                    .align_right(Length::Fill)
-                    .height(Length::Fill);
+                let inspector = container(
+                    self.font_zoom_region(font_zoom::Group::Chrome, self.reference_inspector()),
+                )
+                .padding(iced::Padding {
+                    top: shell::TITLEBAR_HEIGHT,
+                    ..iced::Padding::ZERO
+                })
+                .align_right(Length::Fill)
+                .height(Length::Fill);
                 stack![workspace, dismiss, inspector].into()
             } else {
                 workspace
@@ -1395,6 +1470,8 @@ impl Frost {
                     Space::new().width(0).height(0).into(),
                 )
             };
-        crate::native_popup_surface::layers(workspace, dismiss, menu)
+        crate::native_font_probe::observe(crate::native_popup_surface::layers(
+            workspace, dismiss, menu,
+        ))
     }
 }

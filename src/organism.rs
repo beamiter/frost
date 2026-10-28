@@ -143,14 +143,6 @@ impl fmt::Display for MotionChoice {
     }
 }
 
-pub fn expanded_companion_hint(bottom_bar: bool) -> &'static str {
-    if bottom_bar {
-        "One companion follows the active pane. Block and Chat place its body in safe empty space inside the active card; typing, clipping or insufficient room hides it. Full wanders while idle, Calm rests, and Static keeps the same body still. Traditional mode shows either the expanded body or its compact status glyph. Details and tooltips never add another body."
-    } else {
-        "Traditional mode needs Bottom status bar (cwd, git, last command) to show the companion. Block and Chat keep one body in the active card independently."
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pose(pub PreviewPose);
 
@@ -1225,6 +1217,8 @@ impl Organism {
             .ok()
     }
 
+    // The reference shell has one graphical body; this compact cue is legacy test coverage.
+    #[cfg(test)]
     pub fn live_greeting_candidate_visible(&self, id: usize, facts: AttentionFacts) -> bool {
         self.live_attention.owner() == Some(&id)
             && self
@@ -2499,14 +2493,18 @@ mod tests {
     }
 
     #[test]
-    fn expanded_hint_names_the_actual_bottom_bar_control_when_needed() {
-        assert!(
-            expanded_companion_hint(false).contains("Bottom status bar (cwd, git, last command)")
-        );
-        assert!(expanded_companion_hint(true).contains("One companion follows the active pane"));
-        assert!(
-            expanded_companion_hint(true).contains("Details and tooltips never add another body")
-        );
+    fn settings_hint_names_real_companion_control_and_safe_visibility() {
+        for expanded in [false, true] {
+            assert_eq!(
+                crate::organism_settings_hint(false, expanded),
+                "Enable Companion in Settings to allow the live companion."
+            );
+            let live = crate::organism_settings_hint(true, expanded);
+            assert!(live.contains("Show companion status bubble"));
+            assert!(live.contains("safe blank space"));
+            assert!(!live.contains("Traditional"));
+            assert!(!live.contains("arrow"));
+        }
     }
 
     #[test]
