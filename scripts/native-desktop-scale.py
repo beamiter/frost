@@ -49,8 +49,25 @@ def main():
         probe_source = json.loads((probe.parent / 'source-manifest.json').read_text())
         geometry.require(probe_source['rust_sources_sha256'] == source['rust_sources_sha256'],
                          'Independent observer source differs from frozen application source')
-        for key in ('cargo_toml_sha256', 'cargo_lock_sha256'):
-            geometry.require(probe_source[key] == source[key], 'Observer/app dependency contract mismatch: ' + key)
+        cargo_toml_sha = source.get('cargo_toml_sha256')
+        if cargo_toml_sha is None:
+            # Older frozen build manifests recorded the lock but not this
+            # field. Use an explicit immutable source-blob bridge, preserving
+            # that omission rather than inventing an original build record.
+            head = source['git_head']
+            geometry.require(len(head) == 40 and all(c in '0123456789abcdef' for c in head),
+                             'Invalid frozen source commit')
+            original_toml = subprocess.check_output(['git', '-C', str(geometry.ROOT),
+                                                     'show', head + ':Cargo.toml'])
+            current_toml = (geometry.ROOT / 'Cargo.toml').read_bytes()
+            geometry.require(original_toml == current_toml, 'Cargo.toml differs from frozen build source commit')
+            cargo_toml_sha = hashlib.sha256(original_toml).hexdigest()
+            result['cargo_toml_bridge'] = {'origin': head + ':Cargo.toml',
+                'sha256': cargo_toml_sha, 'original_build_manifest_recorded_this_field': False}
+        geometry.require(probe_source['cargo_toml_sha256'] == cargo_toml_sha,
+                         'Observer/app Cargo.toml source contract mismatch')
+        geometry.require(probe_source['cargo_lock_sha256'] == source['cargo_lock_sha256'],
+                         'Observer/app locked dependency contract mismatch')
         core = geometry.ROOT.parent / 'jterm_core'
         core_source = subprocess.check_output(['git', '-C', str(core), 'show',
                                                source['shared_core_commit'] + ':src/reference_shell.rs'])

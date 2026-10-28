@@ -39,10 +39,12 @@ def main():
     parser.add_argument("--expanded-organism", action="store_true", help="Start the existing unique companion with its real state bubble expanded")
     parser.add_argument("--fixture", action="store_true", help="Show explicitly labelled rich component sample data")
     parser.add_argument("--chrome-font-size", type=float, default=14.0)
+    parser.add_argument("--content-font-size", type=float, default=14.0)
     parser.add_argument("--font-probe-only", action="store_true", help="Capture actual shaped fixture roles without running the interaction matrix")
     args = parser.parse_args()
     if args.companion_only or args.companion_output:
         args.expanded_organism = True
+        args.content_font_size = 16.0
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     home, runtime = out / "home", out / "runtime"
@@ -54,11 +56,9 @@ def main():
     config_file.write_text(
         'shell = "/bin/bash"\nrestore_session = false\njsh_update_check = "never"\n'
         f'terminal_mode = "{args.mode}"\ninitial_width = 1356\ninitial_height = 704\n'
-        'font_family = "DejaVu Sans Mono"\nfont_size = 12\n' + f'chrome_font_size = {args.chrome_font_size}\n'
+        'font_family = "DejaVu Sans Mono"\n' + f'font_size = {args.content_font_size}\nchrome_font_size = {args.chrome_font_size}\n'
         'show_repo_strip = false\nbottom_bar = false\n' + f'ui_scale = {args.scale}\n'
     )
-    if args.companion_only or args.companion_output:
-        config_file.write_text(config_file.read_text().replace("font_size = 12\n", "font_size = 16\n"))
     if args.expanded_organism:
         config_file.write_text(config_file.read_text() + "ascii_organism_expanded = true\n")
     for directory in [home, home / ".config", config]:
@@ -109,6 +109,7 @@ PS1='\[\e]133;A\a\]❯ \[\e]133;B\a\]'
               "runtime_wrapper": str(args.runtime_wrapper.resolve()) if args.runtime_wrapper else None,
               "captures": [],
               "behavior": {}, "logical_reference_size": [1356, 704], "app_scale": args.scale,
+              "configured_font_groups": {"main": args.content_font_size, "chrome": args.chrome_font_size},
               "display_dpr": 1.0, "effective_pixel_scale": args.scale,
               "binary_sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest(),
               "git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
@@ -222,7 +223,7 @@ PS1='\[\e]133;A\a\]❯ \[\e]133;B\a\]'
                 assert "toggle open=true" in (out / "frost.log").read_text(), "Compact Tools did not open"
                 capture("compact-tools-menu", wid)
                 key("Escape")
-            result.update(status="pass", scope="native shaped fixture role measurement", chrome_font_size=args.chrome_font_size, content_font_size=12)
+            result.update(status="pass", scope="native shaped fixture role measurement", chrome_font_size=args.chrome_font_size, content_font_size=args.content_font_size)
             return
         if args.companion_output:
             from PIL import ImageGrab

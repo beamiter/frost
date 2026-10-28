@@ -1228,6 +1228,7 @@ impl Frost {
         let history = jterm_core::reference_conversation::fixture_enabled().then(|| {
             crate::reference_conversation::conversation_view(
                 &jterm_core::reference_conversation::acceptance_fixture(),
+                self.effective_font_size(),
             )
         });
         crate::native_input_surface::surface(

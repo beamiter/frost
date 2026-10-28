@@ -50,6 +50,8 @@ fn collect(tree: &Tree, rows: &mut Vec<serde_json::Value>) {
             "Model unavailable",
             "Assistant",
             "One continuous canvas, a stable reading position",
+            "The message surface keeps your place as new output arrives. Navigation, context and tools remain together around the canvas.",
+            "Update the canvas renderer with retained scroll and an infinite canvas.",
             "Read files",
             "Inspect the current renderer",
             "src/canvas.rs",

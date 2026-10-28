@@ -25,8 +25,8 @@ The old native QA helper explicitly set Chrome to 10, which the fixed-size bug
 silently ignored. It now sets Chrome to 14 to match the existing production
 default and preserve the reference roles. This is a correction to the fixture
 parameters. It does not change the application's default setting or migrate
-stored user preferences. The independent Main fixture remains at 12 for this
-Chrome-only batch.
+stored user preferences. That Chrome-only batch kept Main at 12; those earlier
+captures retain their original parameters.
 
 ## Evidence and measurement
 
@@ -70,8 +70,43 @@ short-query font result nor static glyph measurements close that input gate.
 No heredoc assertion, input delay, or production input ownership was changed
 to make it pass.
 
-Rich Content heading/body/chip/task/diff/gutter scaling is a separate follow-up
-and must use its own native measurements and default-base parameter bridge.
+## Content group
+
+Rich heading, body, metadata, task, diff and gutter roles now use the same
+ratio against the existing production Main default of 14. The new QA fixture
+explicitly sets Main 14 as well as Chrome 14. Its former Main 12 parameter
+was hidden by the fixed-role defect; it is not a new nominal font size or a
+change to Config defaults. Main 14 preserves the authored 20px heading, 12px
+body, 10px task/code and 9px chip/gutter roles.
+
+Native renderer measurements before the Content change showed identical role
+sizes at Main 14 and 18.2. After the change, Main 18.2 produces a 26px heading,
+15.6px body, 13px task/code and 11.7px chip/gutter. The independent Chrome
+header remains 12px and MODEL remains 8px. Larger user bubbles, task rows and
+diff headers/rows retain enough height for the scaled text; the original
+default geometry is preserved. Long code retains its unwrapped monospace
+presentation and the Copy payload is unchanged.
+
+At Main 14, the before/after topbar, left shell, center header, rich message
+region and inspector have zero differing RGB pixels above the recorded
+two-level threshold. Four footer text paint texels differ; their individual
+RGB values and same-before-binary comparison are retained rather than calling
+the complete image identical. Main 14's composer input starts near y609, four pixels above
+the older Main 12 fixture; Main 18.2 starts near y599. These positions are
+identical before and after this Content change, so they are not evidence of
+an exactly 80px composer at every Main size. The empty-input/multiline budget
+still needs its own input-state investigation.
+
+Both Main sizes pass exact native diff Copy, unchanged settled reading pixels
+across Tools open/close, and actual clipboard paste followed by shell
+execution. A same-source Block fixture is also captured. This bounded smoke
+does not replace the unresolved 2ms keyboard stream gate. A later accepted
+Bash history capture proves that one 170-byte synthetic command arrived as
+164 bytes, missing bytes 43..49 (` >> /h`). Short paired old/current runs
+subsequently received all 170 bytes; read-only kernel size sampling stayed
+34 rows by 94 columns. Those passes exclude neither intermittent loss nor
+unobserved input stages. The event-to-PTY layer remains to be localized.
+
 This document does not certify physical IME, every font/DPI combination, or
 complete 1:1 reference fidelity. New screenshots are local evidence until the
 parent task saves the selected final images; this batch does not publish code.

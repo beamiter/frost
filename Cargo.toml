@@ -68,6 +68,8 @@ iced_tiny_skia = { path = "vendor/iced_tiny_skia" }
 winit = { path = "vendor/winit" }
 cryoglyph = { path = "vendor/cryoglyph" }
 iced_winit = { path = "vendor/iced_winit" }
+# Preserve ordered native input through stalled subscription consumers.
+iced_futures = { path = "vendor/iced_futures" }
 window_clipboard = { path = "vendor/window_clipboard" }
 clipboard_wayland = { path = "vendor/clipboard_wayland" }
 clipboard_x11 = { path = "vendor/clipboard_x11" }

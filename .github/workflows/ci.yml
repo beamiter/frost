@@ -269,7 +269,9 @@ jobs:
           shared-key: tests
 
       - name: Run tests
-        run: cargo test --all-targets --all-features --locked --no-fail-fast
+        run: |
+          cargo test -p iced_futures --locked
+          cargo test --all-targets --all-features --locked --no-fail-fast
 
   release-build:
     name: Release build

@@ -45,6 +45,14 @@ fn mono(value: impl Into<String>, size: f32, dark: bool) -> iced::widget::Text<'
 #[derive(Clone, Copy)]
 struct TextScale(f32);
 impl TextScale {
+    fn line_box(self, role: f32, minimum: f32, padding: f32) -> f32 {
+        if self.0 <= 1.0 {
+            minimum
+        } else {
+            ui_typography::row_height(role * self.0, minimum, padding)
+        }
+    }
+
     fn txt(
         self,
         value: impl Into<String>,
@@ -68,15 +76,16 @@ fn elide(value: &str, max: usize) -> String {
     }
 }
 
-fn part(value: &Part) -> Element<'static, AppMessage> {
+fn part(value: &Part, fonts: TextScale) -> Element<'static, AppMessage> {
     match value {
-        Part::Heading(value) => txt(value, shell::type_size::HEADLINE, false, false)
+        Part::Heading(value) => fonts
+            .txt(value, shell::type_size::HEADLINE, false, false)
             .font(iced::Font {
                 weight: iced::font::Weight::Bold,
                 ..iced::Font::with_name(shell::FONT_SANS)
             })
             .into(),
-        Part::Paragraph(value) => txt(value, 12.0, false, false).line_height(1.5).into(),
+        Part::Paragraph(value) => fonts.txt(value, 12.0, false, false).line_height(1.5).into(),
         Part::Metadata(values) => row(values
             .iter()
             .enumerate()
@@ -96,13 +105,13 @@ fn part(value: &Part) -> Element<'static, AppMessage> {
                             rgb(fg),
                             11.0
                         ),
-                        txt(value, 9.0, true, false).color(rgb(fg))
+                        fonts.txt(value, 9.0, true, false).color(rgb(fg))
                     ]
                     .spacing(4)
                     .align_y(iced::Alignment::Center),
                 )
                 .padding([2, 6])
-                .height(shell::METADATA_PILL_HEIGHT)
+                .height(fonts.line_box(9.0, shell::METADATA_PILL_HEIGHT, 4.0))
                 .align_y(iced::Alignment::Center)
                 .style(move |_| {
                     frame(
@@ -124,13 +133,13 @@ fn part(value: &Part) -> Element<'static, AppMessage> {
         Part::Steps(steps) => {
             let rows = steps
                 .iter()
-                .map(|step| step_row(step, false, 1.0))
+                .map(|step| step_row(step, false, fonts.0))
                 .collect::<Vec<_>>();
             container(column(rows).spacing(1))
                 .style(|_| frame(color::ACCENT_PALE, color::LIGHT_BORDER, 8.0))
                 .into()
         }
-        Part::Diff(diff) => diff_view(diff),
+        Part::Diff(diff) => diff_view(diff, fonts),
         Part::Terminal {
             title,
             text: output,
@@ -138,7 +147,7 @@ fn part(value: &Part) -> Element<'static, AppMessage> {
             container(
                 row![
                     icon(Icon::Terminal, rgb(color::CHROME_MUTED), 13.0),
-                    txt(title, 10.0, false, true),
+                    fonts.txt(title, 10.0, false, true),
                     Space::new().width(Length::Fill),
                     icon(Icon::ChevronDown, rgb(color::CHROME_MUTED), 12.0)
                 ]
@@ -146,7 +155,7 @@ fn part(value: &Part) -> Element<'static, AppMessage> {
                 .align_y(iced::Alignment::Center)
             )
             .padding([7, 10]),
-            container(mono(output, 10.0, true)).padding([8, 10]),
+            container(fonts.mono(output, 10.0, true)).padding([8, 10]),
         ])
         .width(Length::Fill)
         .style(|_| frame(color::TERMINAL, color::DARK_BORDER, 10.0))
@@ -202,7 +211,7 @@ fn step_row(step: &Step, dark: bool, font_scale: f32) -> Element<'static, AppMes
             ui_typography::row_height(10.0 * font_scale, shell::INSPECTOR_QUEUE_ROW_HEIGHT, 10.0)
         }
     } else {
-        shell::TASK_ROW_HEIGHT
+        fonts.line_box(10.0, shell::TASK_ROW_HEIGHT, 10.0)
     })
     .width(Length::Fill)
     .style(move |_| {
@@ -258,7 +267,7 @@ fn diff_action_style(_: &iced::Theme, status: button::Status) -> button::Style {
     }
 }
 
-fn diff_view(diff: &CodeDiff) -> Element<'static, AppMessage> {
+fn diff_view(diff: &CodeDiff, fonts: TextScale) -> Element<'static, AppMessage> {
     let copied = diff
         .lines
         .iter()
@@ -268,29 +277,29 @@ fn diff_view(diff: &CodeDiff) -> Element<'static, AppMessage> {
     let copy = button(
         row![
             icon(Icon::Copy, rgb(color::CANVAS_MUTED), 12.0),
-            txt("Copy", 9.0, true, false)
+            fonts.txt("Copy", 9.0, true, false)
         ]
         .spacing(4),
     )
     .on_press(AppMessage::ReferenceCopy(copied))
     .padding([3, 6])
-    .height(22)
+    .height(fonts.line_box(9.0, 22.0, 6.0))
     .style(diff_action_style);
     let apply = tooltip(
-        button(txt("Apply", 9.0, true, false))
+        button(fonts.txt("Apply", 9.0, true, false))
             .padding([3, 6])
-            .height(22)
+            .height(fonts.line_box(9.0, 22.0, 6.0))
             .style(diff_action_style),
-        txt("No authorized edit target", 10.0, true, false),
+        fonts.txt("No authorized edit target", 10.0, true, false),
         tooltip::Position::Top,
     );
     let header = container(
         row![
             icon(Icon::Code, rgb(color::CANVAS_MUTED), 13.0),
-            txt(&diff.path, 10.0, false, false),
+            fonts.txt(&diff.path, 10.0, false, false),
             Space::new().width(Length::Fill),
-            txt(&diff.language, 9.0, true, false),
-            txt(
+            fonts.txt(&diff.language, 9.0, true, false),
+            fonts.txt(
                 format!("+{}  −{}", diff.added, diff.removed),
                 9.0,
                 true,
@@ -303,7 +312,11 @@ fn diff_view(diff: &CodeDiff) -> Element<'static, AppMessage> {
         .align_y(iced::Alignment::Center),
     )
     .padding([4, 9])
-    .height(shell::DIFF_HEADER_HEIGHT)
+    .height(
+        fonts
+            .line_box(10.0, shell::DIFF_HEADER_HEIGHT, 8.0)
+            .max(fonts.line_box(9.0, 22.0, 6.0) + 8.0),
+    )
     .style(|_| frame([242, 246, 253], color::LIGHT_BORDER, 8.0));
     let mut lines = column![];
     for line in &diff.lines {
@@ -325,28 +338,34 @@ fn diff_view(diff: &CodeDiff) -> Element<'static, AppMessage> {
         lines = lines.push(
             container(
                 row![
-                    mono(
-                        line.old_line.map(|n| n.to_string()).unwrap_or_default(),
-                        9.0,
-                        false
-                    )
-                    .width(shell::DIFF_GUTTER_COLUMN_WIDTH),
-                    mono(
-                        line.new_line.map(|n| n.to_string()).unwrap_or_default(),
-                        9.0,
-                        false
-                    )
-                    .width(shell::DIFF_GUTTER_COLUMN_WIDTH),
-                    mono(sign, 10.0, false)
+                    fonts
+                        .mono(
+                            line.old_line.map(|n| n.to_string()).unwrap_or_default(),
+                            9.0,
+                            false
+                        )
+                        .width(shell::DIFF_GUTTER_COLUMN_WIDTH * fonts.0.max(1.0)),
+                    fonts
+                        .mono(
+                            line.new_line.map(|n| n.to_string()).unwrap_or_default(),
+                            9.0,
+                            false
+                        )
+                        .width(shell::DIFF_GUTTER_COLUMN_WIDTH * fonts.0.max(1.0)),
+                    fonts
+                        .mono(sign, 10.0, false)
                         .color(rgb(foreground))
-                        .width(shell::DIFF_SIGN_WIDTH),
-                    mono(&line.text, 10.0, false).color(rgb(foreground))
+                        .width(shell::DIFF_SIGN_WIDTH * fonts.0.max(1.0)),
+                    fonts
+                        .mono(&line.text, 10.0, false)
+                        .color(rgb(foreground))
+                        .wrapping(text::Wrapping::None)
                 ]
                 .spacing(0)
                 .align_y(iced::Alignment::Center),
             )
             .padding([0, 8])
-            .height(shell::DIFF_LINE_HEIGHT)
+            .height(fonts.line_box(10.0, shell::DIFF_LINE_HEIGHT, 0.0))
             .width(Length::Fill)
             .style(move |_| frame(bg, bg, 0.0)),
         );
@@ -364,7 +383,11 @@ fn diff_view(diff: &CodeDiff) -> Element<'static, AppMessage> {
     .into()
 }
 
-pub(crate) fn conversation_view(conversation: &Conversation) -> Element<'static, AppMessage> {
+pub(crate) fn conversation_view(
+    conversation: &Conversation,
+    content_font_size: f32,
+) -> Element<'static, AppMessage> {
+    let fonts = TextScale(ui_typography::reference_role_size(1.0, content_font_size));
     let mut messages = column![].spacing(12);
     for message in &conversation.messages {
         if message.role == Role::User {
@@ -380,12 +403,16 @@ pub(crate) fn conversation_view(conversation: &Conversation) -> Element<'static,
             messages = messages.push(
                 container(
                     row![
-                        container(txt(paragraphs, 12.0, false, false))
+                        container(fonts.txt(paragraphs, 12.0, false, false))
                             .padding([8, 13])
                             .width(shell::USER_BUBBLE_WIDTH)
-                            .height(shell::USER_BUBBLE_HEIGHT)
+                            .height(if fonts.0 <= 1.0 {
+                                Length::Fixed(shell::USER_BUBBLE_HEIGHT)
+                            } else {
+                                Length::Shrink
+                            })
                             .style(|_| frame(color::USER_BUBBLE, color::USER_BUBBLE, 10.0)),
-                        container(txt(&message.avatar, 10.0, false, false).center())
+                        container(fonts.txt(&message.avatar, 10.0, false, false).center())
                             .center(24)
                             .width(24)
                             .height(24)
@@ -402,22 +429,24 @@ pub(crate) fn conversation_view(conversation: &Conversation) -> Element<'static,
             );
         } else {
             let mut parts = column![row![
-                txt(&message.author, shell::type_size::ROLE, false, false).font(iced::Font {
-                    weight: iced::font::Weight::Bold,
-                    ..iced::Font::with_name(shell::FONT_SANS)
-                }),
-                txt("·", 10.0, true, false),
-                txt(message.timing.as_deref().unwrap_or(""), 9.0, true, false)
+                fonts
+                    .txt(&message.author, shell::type_size::ROLE, false, false)
+                    .font(iced::Font {
+                        weight: iced::font::Weight::Bold,
+                        ..iced::Font::with_name(shell::FONT_SANS)
+                    }),
+                fonts.txt("·", 10.0, true, false),
+                fonts.txt(message.timing.as_deref().unwrap_or(""), 9.0, true, false)
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center)]
             .spacing(shell::MESSAGE_PART_GAP);
             for item in &message.parts {
-                parts = parts.push(part(item));
+                parts = parts.push(part(item, fonts));
             }
             messages = messages.push(
                 row![
-                    container(txt(&message.avatar, 13.0, false, false).center())
+                    container(fonts.txt(&message.avatar, 13.0, false, false).center())
                         .center(24)
                         .width(24)
                         .height(24)
@@ -435,8 +464,8 @@ pub(crate) fn conversation_view(conversation: &Conversation) -> Element<'static,
     }
     let dated = if conversation.is_fixture {
         column![
-            container(txt(FIXTURE_DATE_SEPARATOR, 9.0, true, false))
-                .height(12)
+            container(fonts.txt(FIXTURE_DATE_SEPARATOR, 9.0, true, false))
+                .height(fonts.line_box(9.0, 12.0, 0.0))
                 .align_x(iced::Alignment::Center)
                 .width(Length::Fill),
             Space::new().height(2),

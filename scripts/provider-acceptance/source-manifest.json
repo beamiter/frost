@@ -1,5 +1,5 @@
 {
-  "production_manifest_sha256": "de186e22c8eb3a70b9cbb709875fea6ef324c48781df336674fc28da3bdf9714",
+  "production_manifest_sha256": "8aa9dbd82cebee06d262af0bd64f0bae16ba2ef6dadcbd49c4a320f83be270a3",
   "files": [
     {
       "path": "vendor/window_clipboard/.cargo_vcs_info.json",
