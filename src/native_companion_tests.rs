@@ -424,16 +424,17 @@ fn narrow_companion_owner_view_and_subscription_share_geometry_without_second_ta
 #[test]
 fn companion_height_is_stable_and_tiny_terminal_viewports_are_nonnegative() {
     for height in [0.0, 1.0, 40.0, 88.0, 100.0, 704.0] {
-        let layout = jterm_core::reference_shell::Layout::for_size(800.0, height);
+        let layout = crate::glass_layout::Layout::for_size(800.0, height);
         for reading in [0.0, 64.0, 116.0] {
             for recovery in [0.0, 40.0] {
-                let raw = crate::native_viewport::raw_rect(layout.center, reading, recovery);
+                // This is the direct native surface, without a separate editor.
+                let raw = crate::native_viewport::raw_rect(layout, reading, recovery, None);
                 assert!(raw.height >= 0.0 && raw.width >= 0.0);
                 let expected = (layout.center.height
-                    - jterm_core::reference_shell::CANVAS_HEADER_HEIGHT
+                    - layout.header.height
                     - crate::native_viewport::CONTENT_TOP
-                    - jterm_core::reference_shell::COMPOSER_HEIGHT
-                    - jterm_core::reference_shell::COMPOSER_BOTTOM
+                    - layout.composer.height
+                    - crate::glass_shell_tokens::TERMINAL_FOOTER_GAP
                     - reading
                     - recovery)
                     .max(0.0);
@@ -445,16 +446,20 @@ fn companion_height_is_stable_and_tiny_terminal_viewports_are_nonnegative() {
 
 #[test]
 fn expanded_companion_reuses_one_snapshot_and_shared_geometry() {
-    let layout = jterm_core::reference_shell::Layout::for_size(1356.0, 704.0);
-    let raw = crate::native_viewport::raw_rect(layout.center, 0.0, 0.0);
-    assert_eq!(
-        (raw.x, raw.y, raw.width, raw.height),
-        (320.0, 107.0, 702.0, 506.0)
-    );
-    assert_eq!(raw.y + raw.height, layout.composer.y);
+    for (width, height, expected) in [
+        (1612.0, 976.0, (365.0, 171.0, 859.0, 648.0)),
+        (1356.0, 704.0, (365.0, 151.0, 603.0, 430.0)),
+    ] {
+        let layout = crate::glass_layout::Layout::for_size(width, height);
+        let raw = crate::native_viewport::raw_rect(layout, 0.0, 0.0, None);
+        assert_eq!((raw.x, raw.y, raw.width, raw.height), expected);
+        assert_eq!(raw.bottom() + 13.0, layout.composer.y);
+    }
+    assert_eq!(crate::native_viewport::INPUT_STRIP_HEIGHT, 44.0);
+    assert_eq!(crate::native_viewport::TOOLS_HEIGHT, 98.0);
     assert_eq!(
         crate::native_viewport::INPUT_STRIP_HEIGHT + crate::native_viewport::TOOLS_HEIGHT,
-        80.0
+        142.0
     );
     with_widget(|widget, bounds, _| {
         let state = tree(widget);
@@ -612,11 +617,11 @@ fn ui_scale_change_resizes_logical_viewport_and_terminal_grid() {
     assert_eq!(scaled.height * 2.0, old.height);
     for font in [10.0, 14.0, 24.0, 72.0] {
         let metrics = Metrics::new(font, 1.0, 0.0, false);
-        let layout = jterm_core::reference_shell::Layout::for_size(scaled.width, scaled.height);
-        let raw = crate::native_viewport::raw_rect(layout.center, 0.0, 0.0);
+        let layout = crate::glass_layout::Layout::for_size(scaled.width, scaled.height);
+        let raw = crate::native_viewport::raw_rect(layout, 0.0, 0.0, None);
         let grid = metrics.grid_size((raw.width - SCROLLBAR_WIDTH).max(0.0), raw.height);
         assert!(grid.0 >= 2 && grid.1 >= 1);
-        assert_eq!(raw.y + raw.height, layout.composer.y);
+        assert_eq!(raw.bottom() + 13.0, layout.composer.y);
         // Side panel thresholds can add width, so monotone columns are not an oracle.
         assert!(raw.width <= scaled.width && raw.height <= scaled.height);
     }
@@ -626,12 +631,16 @@ fn ui_scale_change_resizes_logical_viewport_and_terminal_grid() {
 fn disabling_the_bottom_bar_returns_its_rows_to_the_grid() {
     // The obsolete bottom bar is not drawn by the current Block/Chat shell.
     // A legacy setting must not deduct phantom rows from either presentation.
-    let layout = jterm_core::reference_shell::Layout::for_size(1356.0, 704.0);
-    let expected = crate::native_viewport::raw_rect(layout.center, 0.0, 0.0);
-    for mode in [
-        crate::config::TerminalMode::Block,
-        crate::config::TerminalMode::Chat,
+    let layout = crate::glass_layout::Layout::for_size(1356.0, 704.0);
+    // Native Block and Chat fallback have no editor; a retained Chat prompt
+    // reserves its actual editor height above the same fixed glass tool row.
+    for (mode, input_height, expected_height, expected_bottom) in [
+        (crate::config::TerminalMode::Block, None, 430.0, 581.0),
+        (crate::config::TerminalMode::Chat, None, 430.0, 581.0),
+        (crate::config::TerminalMode::Chat, Some(44.0), 386.0, 537.0),
+        (crate::config::TerminalMode::Chat, Some(180.0), 250.0, 401.0),
     ] {
+        let expected = crate::native_viewport::raw_rect(layout, 0.0, 0.0, input_height);
         for bottom_bar in [false, true] {
             let config = crate::config::Config {
                 terminal_mode: Some(mode),
@@ -647,8 +656,12 @@ fn disabling_the_bottom_bar_returns_its_rows_to_the_grid() {
                 config.is_card_mode(),
             );
             assert!(body.body && !body.glyph);
-            assert_eq!(expected.height, 506.0);
-            assert_eq!(expected.y + expected.height, layout.composer.y);
+            assert_eq!(expected.height, expected_height);
+            assert_eq!(expected.bottom(), expected_bottom);
+            assert_eq!(
+                expected.bottom() + 13.0 + input_height.unwrap_or(0.0),
+                layout.composer.y
+            );
         }
     }
 }

@@ -103,7 +103,6 @@ fn control(
                 },
                 width: if light { 1.0 } else { 0.0 },
                 radius: shell::CONTROL_RADIUS.into(),
-                ..Default::default()
             },
             ..Default::default()
         }
