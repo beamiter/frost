@@ -780,7 +780,7 @@ fn chat_card_visual(
     if role == ChatRole::Composer {
         return BlockCardVisual {
             background: alpha(
-                Theme::rgb_to_color32(jterm_core::reference_shell::color::COMPOSER),
+                crate::glass_profile::rgba(crate::glass_profile::color::COMPOSER, 1.0),
                 opacity,
             ),
             border: alpha(accent, 0.37),
@@ -5909,9 +5909,9 @@ where
                 .map(|(r, g, b)| Color::from_rgb8(r, g, b))
                 .unwrap_or_else(|| self.theme.terminal_background());
             // Whole-widget background. At full opacity this is the classic opaque
-            // fill. Below 1.0 the app-level style already clears the surface with
-            // the translucent theme background, so repainting it here would stack
-            // two alpha layers and defeat the transparency; only a per-pane OSC 11
+            // fill. Below 1.0 the native pane already paints its translucent
+            // background, so repainting it here would stack two alpha layers
+            // and defeat transparency; only a per-pane OSC 11
             // override still needs its own (equally translucent) fill.
             if self.opacity >= 1.0
                 && !(self.shared_shell && self.terminal_mode == crate::config::TerminalMode::Chat)

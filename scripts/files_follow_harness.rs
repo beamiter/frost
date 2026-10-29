@@ -2,7 +2,8 @@
 //!
 //! Run with `python3 scripts/test-files-follow.py`. Production worker, callback,
 //! context gates, invalidators, synchronous commit helper, cancellation token,
-//! and selected native tests are inserted from the current checkout each run.
+//! actual glass layout/tokens and selected native tests are inserted from the
+//! current checkout each run. This does not substitute the legacy core Layout.
 //! Sidebar/UI, process observation, and transport boundaries are deterministic
 //! doubles. This does not test real rendering, SSH, or observation admission.
 
@@ -14,10 +15,16 @@ use std::{
     rc::Rc,
 };
 
+mod glass_shell_tokens {
+    // @files-follow:glass-tokens
+}
+mod glass_layout {
+    // @files-follow:glass-layout
+}
+mod glass_profile {
+    pub use crate::glass_layout::Layout;
+}
 mod jterm_core {
-    pub mod reference_shell {
-        // @files-follow:reference-shell
-    }
     pub mod jsh_remote {
         #[derive(Clone, Debug, PartialEq, Eq)]
         pub struct RemoteHostConfig {
@@ -51,7 +58,7 @@ mod jterm_core {
         }
     }
 }
-use jterm_core::reference_shell as shell;
+use crate::glass_profile as shell;
 mod native_shell {
     // @files-follow:inspector-tab
 }
@@ -368,6 +375,7 @@ impl TerminalApp {
         }
     }
     // @files-follow:methods
+    // @files-follow:drawer-decisions
 }
 type Hook = Box<dyn FnOnce()>;
 thread_local! {
@@ -755,5 +763,189 @@ fn narrow_files_drawer_retains_its_own_follow_completion() {
     let result = work(&app);
     finish(&app, result);
     assert_eq!(app.borrow().sidebar.commits, 1);
+}
+
+#[test]
+fn actual_glass_inspector_boundaries_and_hidden_navigation_are_not_legacy_geometry() {
+    for height in [400.0, 640.0, 976.0] {
+        for width in [700.0, 800.0, 1077.0, 1078.0, 1100.0, 1179.0, 1180.0, 1279.0, 1280.0, 1612.0] {
+            for nav in [false, true] {
+                for open in [false, true] {
+                    let app = setup();
+                    let mut a = app.borrow_mut();
+                    a.win_size = Size { width, height };
+                    a.sidebar_open = nav;
+                    a.reference_inspector_open = open;
+                    a.reference_inspector_drawer = false;
+                    a.reference_inspector_tab = native_shell::InspectorTab::Files;
+                    a.sidebar_panel = SidebarPanel::Files;
+                    let inline = open && width >= 1180.0;
+                    assert_eq!(a.reference_layout().inspector.is_some(), inline,
+                        "wrong actual inline boundary width={width}, height={height}, nav={nav}, open={open}");
+                    assert_eq!(a.reference_inspector_visible(), inline);
+                    assert_eq!(a.files_surface_visible(), inline);
+                    a.reference_inspector_drawer = true;
+                    assert!(a.reference_inspector_visible());
+                    assert!(a.files_surface_visible());
+                    a.reference_inspector_tab = native_shell::InspectorTab::Context;
+                    assert!(!a.files_surface_visible(), "Context cannot inherit Files follow ownership");
+                }
+            }
+        }
+    }
+    let app = setup();
+    let mut a = app.borrow_mut();
+    a.win_size = Size { width: 1612.0, height: 976.0 };
+    a.sidebar_open = true;
+    let layout = a.reference_layout();
+    assert_eq!(layout.titlebar.height, 69.0);
+    assert_eq!(layout.center.x, 342.0);
+    assert_eq!(layout.center.width, 902.0);
+    assert_eq!(layout.composer.width, 892.0);
+    a.reference_inspector_open = false;
+    let hidden = a.reference_layout();
+    assert_eq!(hidden.center.width - layout.center.width, 360.0);
+    assert_eq!(hidden.header.width, hidden.center.width);
+    assert_eq!(hidden.composer.width - layout.composer.width, 360.0);
+}
+
+#[test]
+fn crossing_the_actual_glass_breakpoint_rejects_only_hidden_files_ownership() {
+    for width in [1078.0, 1100.0, 1179.0] {
+        for drawer in [false, true] {
+            let app = pending_files_surface();
+            let result = work(&app);
+            {
+                let mut a = app.borrow_mut();
+                a.win_size = Size { width, height: 640.0 };
+                a.reference_inspector_drawer = drawer;
+                assert_eq!(a.files_surface_visible(), drawer);
+            }
+            finish(&app, result);
+            if drawer {
+                assert_eq!(app.borrow().sidebar.commits, 1);
+                assert_eq!(app.borrow().queued_loads, 0);
+            } else {
+                assert_kept(&app);
+            }
+        }
+    }
+}
+
+#[test]
+fn returning_to_the_inline_glass_boundary_preserves_the_same_files_follow() {
+    let app = pending_files_surface();
+    {
+        let mut a = app.borrow_mut();
+        a.win_size = Size { width: 1179.0, height: 640.0 };
+        a.reference_inspector_drawer = true;
+        assert!(a.files_surface_visible());
+    }
+    let result = work(&app);
+    {
+        let mut a = app.borrow_mut();
+        a.win_size.width = 1180.0;
+        a.reference_inspector_drawer = false;
+        assert!(a.files_surface_visible());
+    }
+    finish(&app, result);
+    assert_eq!(app.borrow().sidebar.commits, 1);
+    assert_eq!(app.borrow().queued_loads, 0);
+}
+
+#[test]
+fn the_three_actual_drawer_decisions_reopen_at_1100_and_both_sides_of_1180() {
+    for width in [700.0, 800.0, 1078.0, 1100.0, 1179.0, 1180.0, 1280.0, 1612.0] {
+        for nav in [false, true] {
+            for entry in 0..3 {
+                let app = setup();
+                let mut a = app.borrow_mut();
+                a.win_size = Size { width, height: 640.0 };
+                a.sidebar_open = nav;
+                a.reference_inspector_open = false;
+                a.reference_inspector_drawer = false;
+                a.reference_inspector_tab = native_shell::InspectorTab::Context;
+                match entry {
+                    0 => a.fixture_drawer_toggle(),
+                    1 => a.fixture_drawer_tab(native_shell::InspectorTab::Files),
+                    _ => a.fixture_drawer_tasks(true),
+                }
+                assert!(a.reference_inspector_visible(), "entry={entry}, width={width}, nav={nav}");
+                assert_eq!(a.reference_inspector_drawer, width < 1180.0);
+                assert_eq!(a.reference_layout().inspector.is_some(), width >= 1180.0);
+            }
+        }
+    }
+}
+
+#[test]
+fn actual_toggle_drawer_decision_preserves_selected_page_and_can_close_again() {
+    for width in [800.0, 1100.0, 1180.0, 1612.0] {
+        let app = setup();
+        let mut a = app.borrow_mut();
+        a.win_size = Size { width, height: 640.0 };
+        a.reference_inspector_open = false;
+        a.reference_inspector_drawer = false;
+        a.reference_inspector_tab = native_shell::InspectorTab::Context;
+        for _ in 0..3 {
+            a.fixture_drawer_toggle();
+            assert!(a.reference_inspector_visible());
+            assert_eq!(a.reference_inspector_tab, native_shell::InspectorTab::Context);
+            a.fixture_drawer_toggle();
+            assert!(!a.reference_inspector_visible());
+            assert!(!a.reference_inspector_drawer);
+            assert_eq!(a.reference_inspector_tab, native_shell::InspectorTab::Context);
+        }
+    }
+}
+
+#[test]
+fn active_session_identity_without_a_cancel_notification_cannot_publish() {
+    let app = pending_files_surface();
+    let result = work(&app);
+    {
+        let mut a = app.borrow_mut();
+        let mut other = a.sessions[0].clone();
+        other.id = 99;
+        a.sessions.push(other);
+        a.active = 1;
+    }
+    finish(&app, result);
+    assert_kept(&app);
+}
+
+#[test]
+fn long_labels_and_tree_roots_keep_narrow_drawer_follow_intent_and_loaded_rows() {
+    for width in [700.0, 800.0, 1100.0, 1179.0] {
+        let app = same_target();
+        let long_root = PathBuf::from(format!("/remote/{}/kept", "long_component_".repeat(30)));
+        {
+            let mut a = app.borrow_mut();
+            a.win_size = Size { width, height: 400.0 };
+            a.reference_inspector_drawer = true;
+            a.reference_inspector_tab = native_shell::InspectorTab::Files;
+            a.sidebar_panel = SidebarPanel::Files;
+            a.sidebar.current_dir = long_root.clone();
+            let pending = a.sidebar_follow_pending.as_mut().unwrap();
+            pending.sidebar_open = true;
+            pending.sidebar_panel = SidebarPanel::Files;
+            pending.tree_root = long_root.clone();
+            pending.source_profile.name = "very-long-visible-remote-label-".repeat(20);
+            let profile = pending.source_profile.clone();
+            a.sessions[0].command.as_mut().unwrap().target =
+                jterm_core::jsh_remote::ObservedSshTarget::Target(profile);
+            assert!(a.reference_layout().inspector.is_none());
+            assert!(a.files_surface_visible());
+        }
+        let result = work(&app);
+        assert!(result.as_ref().unwrap().listing.is_none());
+        finish(&app, result);
+        let a = app.borrow();
+        assert_eq!(a.sidebar.current_dir, long_root);
+        assert_eq!(a.sidebar.rows[0].name, "kept child");
+        assert_eq!(a.sidebar.rebinds, 1);
+        assert_eq!(a.sidebar.commits, 0);
+        assert_eq!(a.queued_loads, 0);
+    }
 }
 // @files-follow:native-tests

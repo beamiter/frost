@@ -37,12 +37,13 @@ impl Engine {
         clip_bounds: Rectangle,
     ) {
         let physical_bounds = quad.bounds * transformation;
+        let physical_paint_bounds = quad_paint_bounds(quad) * transformation;
 
-        if !clip_bounds.intersects(&physical_bounds) {
+        if !clip_bounds.intersects(&physical_paint_bounds) {
             return;
         }
 
-        let clip_mask = (!physical_bounds.is_within(&clip_bounds))
+        let clip_mask = (!physical_paint_bounds.is_within(&clip_bounds))
             .then_some(clip_mask as &_);
 
         let transform = into_transform(transformation);
@@ -78,12 +79,24 @@ impl Engine {
                 .into_iter()
                 .map(|radius| radius * transformation.scale_factor())
                 .collect::<Vec<_>>();
-            let (x, y, width, height) = (
-                shadow_bounds.x as u32,
-                shadow_bounds.y as u32,
-                shadow_bounds.width as u32,
-                shadow_bounds.height as u32,
-            );
+            // Rasterize only visible global pixels. Clamping a negative
+            // origin before retaining its original width changes the sampled
+            // region; intersect first and round outward instead.
+            let visible_shadow =
+                shadow_bounds.intersection(&clip_bounds).and_then(|bounds| {
+                    bounds.intersection(&Rectangle::with_size(Size::new(
+                        pixels.width() as f32,
+                        pixels.height() as f32,
+                    )))
+                });
+            let (x, y, width, height) =
+                visible_shadow.map_or((0, 0, 0, 0), |bounds| {
+                    let x = bounds.x.floor() as u32;
+                    let y = bounds.y.floor() as u32;
+                    let right = (bounds.x + bounds.width).ceil() as u32;
+                    let bottom = (bounds.y + bounds.height).ceil() as u32;
+                    (x, y, right - x, bottom - y)
+                });
             let half_width = physical_bounds.width / 2.0;
             let half_height = physical_bounds.height / 2.0;
 
@@ -139,7 +152,7 @@ impl Engine {
                     pixmap.as_ref(),
                     &tiny_skia::PixmapPaint::default(),
                     tiny_skia::Transform::default(),
-                    None,
+                    clip_mask,
                 );
             }
         }
@@ -647,6 +660,23 @@ impl Engine {
     }
 }
 
+/// Conservative logical pixels painted by a quad, including its shadow and
+/// the same one-pixel antialiasing allowance used for ordinary quad damage.
+/// Shared by culling and dirty-region calculation; this is not a public API.
+pub(crate) fn quad_paint_bounds(quad: &Quad) -> Rectangle {
+    let mut bounds = quad.bounds;
+    if quad.shadow.color.a > 0.0 {
+        let blur = quad.shadow.blur_radius.max(0.0);
+        bounds = bounds.union(&Rectangle {
+            x: quad.bounds.x + quad.shadow.offset.x - blur,
+            y: quad.bounds.y + quad.shadow.offset.y - blur,
+            width: quad.bounds.width + blur * 2.0,
+            height: quad.bounds.height + blur * 2.0,
+        });
+    }
+    bounds.expand(1.0)
+}
+
 pub fn into_color(color: Color) -> tiny_skia::Color {
     tiny_skia::Color::from_rgba(color.b, color.g, color.r, color.a)
         .expect("Convert color from iced to tiny_skia")
@@ -858,3 +888,7 @@ pub fn adjust_clip_mask(clip_mask: &mut tiny_skia::Mask, bounds: Rectangle) {
         tiny_skia::Transform::default(),
     );
 }
+
+#[cfg(test)]
+#[path = "shadow_tests.rs"]
+mod shadow_tests;

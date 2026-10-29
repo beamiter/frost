@@ -14,6 +14,7 @@ struct Surface<'a, Message> {
     history: Option<Element<'a, Message>>,
     dock: Option<Dock>,
     foreground_hint: String,
+    native_height: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -64,8 +65,7 @@ pub(crate) fn dock_metrics(rows: usize, cell_height: f32, cap: f32) -> DockMetri
 
 impl<Message> Surface<'_, Message> {
     fn input_height(&self) -> f32 {
-        self.dock
-            .map_or(INPUT_STRIP_HEIGHT, |dock| dock.input_height)
+        self.dock.map_or(0.0, |dock| dock.input_height)
     }
     fn input_layout_index(&self) -> usize {
         usize::from(self.dock.is_some())
@@ -82,20 +82,27 @@ pub(crate) fn surface<'a, Message: 'a>(
     history: Option<Element<'a, Message>>,
     dock: Option<Dock>,
     foreground_hint: impl Into<String>,
+    native_height: f32,
 ) -> Element<'a, Message> {
     Element::new(Surface {
         terminal,
         history,
         dock,
         foreground_hint: foreground_hint.into(),
+        native_height,
     })
 }
 
 fn clips(bounds: Rectangle, input_height: f32) -> (Rectangle, Rectangle) {
     let height = input_height.min(bounds.height).max(0.0);
+    let gap = if height > 0.0 {
+        crate::glass_shell_tokens::TERMINAL_FOOTER_GAP.min((bounds.height - height).max(0.0))
+    } else {
+        0.0
+    };
     (
         Rectangle {
-            height: bounds.height - height,
+            height: bounds.height - height - gap,
             ..bounds
         },
         Rectangle {
@@ -142,10 +149,19 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         limits: &layout::Limits,
     ) -> layout::Node {
         let size = limits.max();
-        let native_size = Size::new(
-            size.width,
-            crate::native_viewport::native_body_height(size.height),
+        debug_assert!(
+            (size.height
+                - self.input_height()
+                - if self.dock.is_some() {
+                    crate::glass_shell_tokens::TERMINAL_FOOTER_GAP
+                } else {
+                    0.0
+                }
+                - self.native_height)
+                .abs()
+                < 0.01
         );
+        let native_size = Size::new(size.width, self.native_height);
         let terminal = self.terminal.as_widget_mut().layout(
             &mut tree.children[0],
             renderer,
@@ -160,7 +176,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         // layout is translated; no native child or input owner is recreated.
         let dock = terminal.clone().translate(Vector::new(0.0, shift));
         let mut nodes = vec![terminal, dock];
-        let history_height = (size.height - self.input_height()).max(0.0);
+        let history_height = self.native_height;
         if let Some(history) = &mut self.history {
             let history_size = Size::new(size.width, history_height);
             nodes.push(history.as_widget_mut().layout(
@@ -185,6 +201,26 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         let (history_clip, input_clip) = clips(layout.bounds(), self.input_height());
         if let Some(clip) = history_clip.intersection(viewport) {
             renderer.with_layer(clip, |renderer| {
+                if self.dock.is_some() {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: history_clip,
+                            border: iced::Border {
+                                color: crate::glass_profile::rgba(
+                                    crate::glass_profile::color::LIGHT_BORDER,
+                                    theme.palette().background.a,
+                                ),
+                                width: 1.0,
+                                radius: crate::glass_shell_tokens::PANEL_RADIUS.into(),
+                            },
+                            ..Default::default()
+                        },
+                        iced::Background::Color(crate::glass_profile::rgba(
+                            crate::glass_profile::color::TERMINAL,
+                            theme.palette().background.a,
+                        )),
+                    );
+                }
                 if let Some(history) = &self.history {
                     history.as_widget().draw(
                         &tree.children[1],
@@ -236,7 +272,10 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
                         },
                         ..Default::default()
                     },
-                    iced::Background::Color(iced::Color::from_rgb8(254, 254, 254)),
+                    iced::Background::Color(crate::glass_profile::rgba(
+                        crate::glass_profile::color::COMPOSER,
+                        theme.palette().background.a,
+                    )),
                 );
                 renderer.fill_quad(
                     renderer::Quad {
@@ -248,7 +287,10 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
                         },
                         ..Default::default()
                     },
-                    iced::Background::Color(iced::Color::from_rgb8(254, 254, 254)),
+                    iced::Background::Color(crate::glass_profile::rgba(
+                        crate::glass_profile::color::COMPOSER,
+                        theme.palette().background.a,
+                    )),
                 );
                 if self.dock.is_some() {
                     let native_clip = Rectangle {
@@ -478,8 +520,89 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
 
 #[cfg(test)]
 mod tests {
-    use super::{clips, dock_metrics};
-    use iced::Rectangle;
+    use super::{clips, dock_metrics, surface, Dock, State};
+    use iced::advanced::{layout, mouse, renderer, widget::Tree, Layout, Widget};
+    use iced::{Element, Length, Rectangle, Size};
+
+    /// A retained native child must keep its state when a proven prompt comes
+    /// and goes. Real key/PTY dispatch is checked separately in native QA.
+    struct NativeChild;
+    impl Widget<(), iced::Theme, iced::Renderer> for NativeChild {
+        fn tag(&self) -> iced::advanced::widget::tree::Tag {
+            iced::advanced::widget::tree::Tag::of::<u64>()
+        }
+        fn state(&self) -> iced::advanced::widget::tree::State {
+            iced::advanced::widget::tree::State::new(0_u64)
+        }
+        fn size(&self) -> Size<Length> {
+            Size::new(Length::Fill, Length::Fill)
+        }
+        fn layout(
+            &mut self,
+            _tree: &mut Tree,
+            _renderer: &iced::Renderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            layout::Node::new(limits.max())
+        }
+        fn draw(
+            &self,
+            _tree: &Tree,
+            _renderer: &mut iced::Renderer,
+            _theme: &iced::Theme,
+            _style: &renderer::Style,
+            _layout: Layout<'_>,
+            _cursor: mouse::Cursor,
+            _viewport: &Rectangle,
+        ) {
+        }
+    }
+
+    #[test]
+    fn prompt_running_prompt_keeps_the_same_surface_and_native_child_tree() {
+        let make = |prompt: bool| {
+            surface(
+                Element::new(NativeChild),
+                prompt.then(|| Element::new(NativeChild)),
+                prompt.then_some(Dock {
+                    y: 100.0,
+                    history_end_y: 100.0,
+                    input_height: 44.0,
+                    vertical_padding: 8.0,
+                }),
+                "",
+                100.0,
+            )
+        };
+        let first = make(false);
+        let mut tree = Tree::new(first.as_widget());
+        *tree.children[0].state.downcast_mut::<u64>() = 42;
+        tree.state.downcast_mut::<State>().gesture = Some(true);
+        for prompt in [true, false, true, false] {
+            let next = make(prompt);
+            tree.diff(next.as_widget());
+            assert_eq!(*tree.children[0].state.downcast_ref::<u64>(), 42);
+            assert_eq!(tree.state.downcast_ref::<State>().gesture, Some(true));
+            assert_eq!(tree.children.len(), if prompt { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn no_dock_allocates_no_editor_or_phantom_floating_gap() {
+        let bounds = Rectangle {
+            x: 365.0,
+            y: 171.0,
+            width: 859.0,
+            height: 648.0,
+        };
+        let (history, input) = clips(bounds, 0.0);
+        assert_eq!(history, bounds);
+        assert_eq!(input.height, 0.0);
+        let (history, input) = clips(bounds, 180.0);
+        assert_eq!(history.y + history.height + 13.0, input.y);
+        assert_eq!(input.height, 180.0);
+        assert_eq!(input.y + input.height, bounds.y + bounds.height);
+    }
 
     #[test]
     fn two_default_rows_fit_the_reference_strip_without_losing_a_row() {

@@ -32,11 +32,18 @@ mod find_focus;
 mod fold_preview;
 mod font_zoom;
 mod font_zoom_scope;
+mod glass_layout;
+mod glass_profile;
+mod glass_shell_tokens;
 mod history_picker;
 mod image_drop;
 mod immersive_command;
+mod inspector_layout;
 mod keybindings;
 mod kitty_graphics;
+#[cfg(test)]
+#[path = "native_viewport.rs"]
+mod legacy_native_viewport;
 mod link;
 mod native_companion;
 mod native_enter;
@@ -44,6 +51,7 @@ mod native_font_probe;
 mod native_input_surface;
 mod native_popup_surface;
 mod native_shell;
+#[path = "glass_native_viewport.rs"]
 mod native_viewport;
 mod organism;
 mod organism_activity;
@@ -6839,6 +6847,8 @@ struct Frost {
     /// Blink clock phase, toggled by a timer; drives blinking-attribute cells.
     blink_on: bool,
     win_size: Size,
+    /// Actual allocated window geometry has arrived; never resize retired panes.
+    glass_geometry_ready: bool,
     /// Exact bytes this in-memory config was loaded/saved against. `None`
     /// fails closed because a concurrent-safe comparison is impossible.
     config_revision: Option<persistence::FileRevision>,
@@ -7213,6 +7223,7 @@ impl Frost {
             debug_open: false,
             blink_on: true,
             win_size,
+            glass_geometry_ready: false,
             config_revision,
             config_write_blocked: config_diagnostic.is_some(),
             config_diagnostic,
@@ -7355,7 +7366,7 @@ impl Frost {
         iced::Theme::custom(
             "frost".to_string(),
             iced::theme::Palette {
-                background: self.theme.terminal_background(),
+                background: self.with_window_opacity(self.theme.terminal_background()),
                 text: self.theme.terminal_foreground(),
                 primary: self.theme.cursor_color(),
                 success: self.theme.ansi_color(2),
@@ -7365,15 +7376,15 @@ impl Frost {
         )
     }
 
-    /// Application-level surface style. With `transparent: true` on the window
-    /// this is the layer that makes the configured background opacity real:
-    /// the whole surface is cleared with the theme background at that alpha,
-    /// and the terminal widget skips its own default fill below 1.0 so the two
-    /// never stack (see `TermWidget::draw`).
+    /// Leave the application clear transparent. Individual glass panels own
+    /// their configured background alpha; clearing the whole window with a
+    /// second theme layer would obscure the real desktop and panel gaps.
     fn app_style(&self, theme: &iced::Theme) -> iced::theme::Style {
         let palette = theme.palette();
         iced::theme::Style {
-            background_color: self.with_window_opacity(palette.background),
+            // Individual glass surfaces blend once over the real desktop.
+            // An opaque clear would erase that alpha before the panels paint.
+            background_color: Color::TRANSPARENT,
             text_color: palette.text,
         }
     }
@@ -9290,18 +9301,41 @@ impl Frost {
 
     /// One visibility transition must update both the Iced layout and PTY grid.
     /// Reflow only on a transition, never on every frame or process-cache tick.
-    fn sync_block_reading_bar_geometry(&mut self) {
+    fn refresh_glass_grid_dimensions(&mut self) -> bool {
+        if !self.glass_geometry_ready
+            || !self.win_size.width.is_finite()
+            || !self.win_size.height.is_finite()
+            || self.win_size.width <= 0.0
+            || self.win_size.height <= 0.0
+            || !self.sessions.get(self.active).is_some_and(|session| {
+                !session.transcript_read_only() && !self.vim9_tabs.contains_key(&session.id)
+            })
+        {
+            return false;
+        }
         let term_w = (self.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
-        (self.cols, self.rows) = self.metrics.grid_size(term_w, self.term_height());
-        self.relayout();
-        self.refresh_active_context();
+        let (cols, rows) = self.metrics.grid_size(term_w, self.term_height());
+        if (cols, rows) != (self.cols, self.rows) {
+            (self.cols, self.rows) = (cols, rows);
+            return true;
+        }
+        false
+    }
+
+    fn sync_block_reading_bar_geometry(&mut self) {
+        if self.refresh_glass_grid_dimensions() {
+            self.relayout();
+            self.refresh_active_context();
+        }
     }
 
     fn term_height(&self) -> f32 {
         native_viewport::raw_rect(
-            self.reference_layout().center,
+            self.reference_layout(),
             self.block_reading_bar_height(),
             self.startup_recovery.banner_height(self.chrome_font_size()),
+            self.reference_input_metrics()
+                .map(|metrics| metrics.input_height),
         )
         .height
     }
@@ -9309,8 +9343,7 @@ impl Frost {
     /// Native terminal pixels exclude the measured rail, navigation,
     /// inspector and canvas insets; the same dimensions are sent to the PTY.
     fn term_width(&self) -> f32 {
-        (self.reference_layout().center.width - 2.0 * jterm_core::reference_shell::COMPOSER_INSET)
-            .max(0.0)
+        self.reference_native_budget().raw.width
     }
 
     fn host_clipboard_read_blocked_for(&self, id: usize, fd: RawFd) -> bool {
@@ -10096,6 +10129,7 @@ impl Frost {
     /// because a stalled state filesystem must not turn quitting into a hang;
     /// a missed deadline is logged and the exit continues.
     fn exit_flushing_durable_state(&mut self) -> Task<Message> {
+        self.glass_geometry_ready = false;
         if let Some((id, fd)) = self.host_clipboard_read_owner {
             self.release_host_clipboard_read(id, fd);
         }
@@ -10793,6 +10827,10 @@ impl Frost {
     /// While a pane is zoomed every session gets the full area, so the zoomed
     /// pane renders full-size and unzooming is a plain relayout.
     fn relayout(&mut self) {
+        // Legal owner activation/split already requested a relayout. Refresh
+        // its own dimensions before the existing single per-session pass;
+        // never add another pass or write through a retired owner callback.
+        self.refresh_glass_grid_dimensions();
         // Retire old raw coordinates before resizing or replacing projections.
         self.sync_terminal_pane_owners();
         let mut targets = vec![(self.cols, self.rows); self.sessions.len()];
@@ -16135,9 +16173,24 @@ impl Frost {
     fn update(&mut self, message: Message) -> Task<Message> {
         self.sync_terminal_ime_owner();
         self.sync_terminal_pane_owners();
-        let reading_bar_was_visible = self.block_reading_bar_visible();
+        let geometry_owner = self
+            .sessions
+            .get(self.active)
+            .filter(|session| !session.transcript_read_only())
+            .map(|session| (session.id, session.pty.master_fd()));
+        let geometry_allowed = match &message {
+            Message::PtyOutput(id, fd, ..) => geometry_owner == Some((*id, *fd)),
+            Message::PtyExited(..) | Message::WindowClose | Message::TabCloseConfirmYes => false,
+            _ => true,
+        };
         let task = self.update_message(message);
-        if reading_bar_was_visible != self.block_reading_bar_visible() {
+        let current_owner = self
+            .sessions
+            .get(self.active)
+            .filter(|session| !session.transcript_read_only())
+            .map(|session| (session.id, session.pty.master_fd()));
+        if geometry_allowed && geometry_owner.is_some() && current_owner == geometry_owner {
+            // One deduplicated budget sync covers early-return reducers too.
             self.sync_block_reading_bar_geometry();
         }
         if self
@@ -16295,13 +16348,8 @@ impl Frost {
                 self.invalidate_sidebar_remote_follow_intent();
                 let show = !self.reference_inspector_visible();
                 self.reference_inspector_open = show;
-                self.reference_inspector_drawer = show
-                    && jterm_core::reference_shell::Layout::for_size(
-                        self.win_size.width,
-                        self.win_size.height,
-                    )
-                    .inspector
-                    .is_none();
+                self.reference_inspector_drawer =
+                    show && self.reference_layout().inspector.is_none();
                 self.sync_reference_inspector_geometry();
                 self.trace_reference_inspector("toggle-after");
                 return iced::widget::operation::focus(iced::widget::Id::new(
@@ -16316,12 +16364,7 @@ impl Frost {
                 self.invalidate_sidebar_remote_follow_intent();
                 self.reference_inspector_tab = tab;
                 self.reference_inspector_open = true;
-                self.reference_inspector_drawer = jterm_core::reference_shell::Layout::for_size(
-                    self.win_size.width,
-                    self.win_size.height,
-                )
-                .inspector
-                .is_none();
+                self.reference_inspector_drawer = self.reference_layout().inspector.is_none();
                 self.sync_reference_inspector_geometry();
                 if tab == native_shell::InspectorTab::Files {
                     return Task::done(Message::SetSidebarPanel(SidebarPanel::Files));
@@ -19093,6 +19136,7 @@ impl Frost {
                 }
             }
             Message::Resized(size) => {
+                self.glass_geometry_ready = true;
                 let search_was_compact = block_search_layout::compact(
                     block_search_layout::panel_size(self.win_size),
                     self.effective_font_size(),
@@ -25508,7 +25552,7 @@ impl Frost {
         })
         .shared_shell()
         .blink_on(self.blink_on)
-        .opacity(self.config.opacity)
+        .opacity(self.config.opacity * glass_shell_tokens::TERMINAL[3] as f32 / 255.0)
         .on_mouse(move |inp| Message::MousePane(session_id, inp))
         .on_summary(sess.projection.key(), move |activation| {
             Message::SummaryActivate(session_id, activation)
@@ -29245,13 +29289,7 @@ impl Frost {
         self.task_panel.set_show_hidden(false);
         self.invalidate_sidebar_remote_follow_intent();
         self.reference_inspector_open = open;
-        self.reference_inspector_drawer = open
-            && jterm_core::reference_shell::Layout::for_size(
-                self.win_size.width,
-                self.win_size.height,
-            )
-            .inspector
-            .is_none();
+        self.reference_inspector_drawer = open && self.reference_layout().inspector.is_none();
         if open {
             self.reference_inspector_tab = native_shell::InspectorTab::Agent;
             self.sidebar_panel = SidebarPanel::Tasks;

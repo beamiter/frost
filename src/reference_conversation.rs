@@ -1,12 +1,12 @@
 //! Native rich components shared by fixture and observed shell/agent boundaries.
 use super::{Message as AppMessage, *};
+use crate::glass_profile::{self as shell, color};
 use crate::reference_icon::{icon, Icon};
 use iced::widget::{column, progress_bar};
 use jterm_core::reference_conversation::*;
-use jterm_core::reference_shell::{self as shell, color};
 
 fn rgb(value: [u8; 3]) -> Color {
-    Color::from_rgb8(value[0], value[1], value[2])
+    shell::rgba(value, 1.0)
 }
 fn txt(value: impl Into<String>, size: f32, dim: bool, dark: bool) -> iced::widget::Text<'static> {
     text(value.into())
@@ -125,7 +125,7 @@ fn part(value: &Part, fonts: TextScale) -> Element<'static, AppMessage> {
             .map(|(index, value)| {
                 let progress = index == 5;
                 let fg = if progress {
-                    [31, 111, 65]
+                    color::DIFF_ADDED_TEXT
                 } else {
                     color::CANVAS_MUTED
                 };
@@ -149,7 +149,7 @@ fn part(value: &Part, fonts: TextScale) -> Element<'static, AppMessage> {
                 .style(move |_| {
                     frame(
                         if progress {
-                            [228, 245, 233]
+                            color::DIFF_ADDED_BACKGROUND
                         } else {
                             color::ACCENT_PALE
                         },
@@ -209,7 +209,7 @@ fn step_row(step: &Step, dark: bool, font_scale: f32) -> Element<'static, AppMes
             icon(
                 mark,
                 rgb(if step.state == StepState::Complete {
-                    [48, 142, 104]
+                    color::DIFF_ADDED_TEXT
                 } else {
                     color::ACCENT
                 }),
@@ -249,11 +249,7 @@ fn step_row(step: &Step, dark: bool, font_scale: f32) -> Element<'static, AppMes
     )
     .padding([5, 9])
     .height(if dark {
-        if font_scale <= 1.0 {
-            shell::INSPECTOR_QUEUE_ROW_HEIGHT
-        } else {
-            ui_typography::row_height(10.0 * font_scale, shell::INSPECTOR_QUEUE_ROW_HEIGHT, 10.0)
-        }
+        crate::inspector_layout::queue_row_height(font_scale)
     } else {
         fonts.line_box(10.0, shell::TASK_ROW_HEIGHT, 10.0)
     })
@@ -361,17 +357,17 @@ fn diff_view(diff: &CodeDiff, fonts: TextScale) -> Element<'static, AppMessage> 
             .line_box(10.0, shell::DIFF_HEADER_HEIGHT, 8.0)
             .max(fonts.line_box(9.0, 22.0, 6.0) + 8.0),
     )
-    .style(|_| frame([242, 246, 253], color::LIGHT_BORDER, 8.0));
+    .style(|_| frame(color::CONTROL_SURFACE, color::LIGHT_BORDER, 8.0));
     let mut lines = column![];
     for line in &diff.lines {
         let bg = match line.kind {
-            DiffKind::Added => [228, 245, 233],
-            DiffKind::Removed => [252, 234, 236],
-            DiffKind::Context => [251, 252, 255],
+            DiffKind::Added => color::DIFF_ADDED_BACKGROUND,
+            DiffKind::Removed => color::DIFF_REMOVED_BACKGROUND,
+            DiffKind::Context => color::TERMINAL,
         };
         let foreground = match line.kind {
-            DiffKind::Added => [31, 111, 65],
-            DiffKind::Removed => [164, 54, 66],
+            DiffKind::Added => color::DIFF_ADDED_TEXT,
+            DiffKind::Removed => color::DIFF_REMOVED_TEXT,
             DiffKind::Context => color::CANVAS_TEXT,
         };
         let sign = match line.kind {
@@ -423,7 +419,7 @@ fn diff_view(diff: &CodeDiff, fonts: TextScale) -> Element<'static, AppMessage> 
         })
     ])
     .clip(true)
-    .style(|_| frame([251, 252, 255], color::LIGHT_BORDER, 10.0))
+    .style(|_| frame(color::TERMINAL, color::LIGHT_BORDER, 10.0))
     .into()
 }
 
@@ -549,8 +545,14 @@ pub(crate) fn inspector_view(
     inspector: &Inspector,
     is_fixture: bool,
     chrome_font_size: f32,
+    viewport_height: f32,
 ) -> Element<'static, AppMessage> {
-    let fonts = TextScale(ui_typography::reference_role_size(1.0, chrome_font_size));
+    let fonts = TextScale(ui_typography::reference_role_size(1.4, chrome_font_size));
+    let metrics = crate::inspector_layout::Metrics::new(
+        fonts.0,
+        inspector.metadata.len(),
+        inspector.queue.len(),
+    );
     let inactive_badge =
         inspector.badge == "No task" || inspector.badge.eq_ignore_ascii_case("Unavailable");
     let mut content = column![
@@ -586,11 +588,7 @@ pub(crate) fn inspector_view(
                     shell::INSPECTOR_BADGE_VERTICAL_PADDING,
                     shell::INSPECTOR_BADGE_HORIZONTAL_PADDING,
                 ])
-                .height(fonts.line_box(
-                    shell::INSPECTOR_BADGE_FONT_SIZE,
-                    shell::INSPECTOR_BADGE_HEIGHT,
-                    shell::INSPECTOR_BADGE_VERTICAL_PADDING * 2.0,
-                ))
+                .height(metrics.badge)
                 .max_width(120.0 * fonts.0.max(1.0))
                 .clip(true)
                 .align_y(iced::Alignment::Center)
@@ -610,9 +608,15 @@ pub(crate) fn inspector_view(
             )
         ]
         .spacing(7)
+        .height(metrics.header)
         .align_y(iced::Alignment::Center),
         tooltip(
-            fonts.txt(elide(&inspector.subtitle, 44), 10.0, true, true),
+            container(
+                fonts
+                    .txt(elide(&inspector.subtitle, 44), 10.0, true, true)
+                    .wrapping(text::Wrapping::None),
+            )
+            .height(metrics.subtitle),
             fonts.txt(&inspector.subtitle, 10.0, true, true),
             tooltip::Position::Left
         ),
@@ -646,13 +650,14 @@ pub(crate) fn inspector_view(
             .spacing(8)
             .align_y(iced::Alignment::Center)
         )
+        .height(metrics.progress)
         .padding(iced::Padding {
             top: 5.0,
             bottom: 8.0,
             ..iced::Padding::ZERO
         }),
     ]
-    .spacing(6);
+    .spacing(crate::inspector_layout::CONTENT_GAP);
     let mut metadata = column![];
     for (name, value) in &inspector.metadata {
         let visible: String = value.chars().take(24).collect();
@@ -675,11 +680,12 @@ pub(crate) fn inspector_view(
                 .spacing(6)
                 .align_y(iced::Alignment::Center),
             )
-            .height(shell::INSPECTOR_METADATA_ROW_HEIGHT),
+            .height(metrics.metadata_row),
         );
     }
     content = content.push(metadata);
-    content = content.push(container(fonts.txt("CURRENT STEP", 8.0, true, true)).height(12));
+    content = content
+        .push(container(fonts.txt("CURRENT STEP", 9.0, true, true)).height(metrics.current_label));
     let current = if let Some(step) = &inspector.current_step {
         container(
             column![
@@ -717,17 +723,13 @@ pub(crate) fn inspector_view(
             .width(Length::Fill)
             .style(|_| frame(color::NAVIGATION, color::DARK_BORDER, 8.0))
     };
-    content = content.push(current.height(if fonts.0 <= 1.0 {
-        shell::INSPECTOR_CURRENT_HEIGHT
-    } else {
-        ui_typography::row_height(19.0 * fonts.0, shell::INSPECTOR_CURRENT_HEIGHT, 20.0)
-    }));
-    content = content.push(fonts.txt("TASK QUEUE", 8.0, true, true));
+    content = content.push(current.height(metrics.current));
+    content = content
+        .push(container(fonts.txt("TASK QUEUE", 8.0, true, true)).height(metrics.queue_label));
     let mut queue = column![].spacing(shell::INSPECTOR_QUEUE_GAP);
     if inspector.queue.is_empty() {
         queue = queue.push(
-            container(fonts.txt("No queued tasks", 10.0, true, true))
-                .height(shell::INSPECTOR_QUEUE_ROW_HEIGHT),
+            container(fonts.txt("No queued tasks", 10.0, true, true)).height(metrics.queue_row),
         );
     }
     for step in &inspector.queue {
@@ -745,31 +747,42 @@ pub(crate) fn inspector_view(
                 true
             )
         ]
-        .spacing(6),
+        .spacing(6)
+        .height(metrics.output_label),
     );
     content = content.push(
         container(scrollable(fonts.mono(&inspector.output, 10.0, true)))
             .padding(10)
-            .height(shell::INSPECTOR_OUTPUT_HEIGHT)
+            .height(metrics.output)
             .width(Length::Fill)
             .style(|_| frame(color::TERMINAL, color::DARK_BORDER, 8.0)),
     );
     container(
-        container(content)
-            .padding(iced::Padding {
-                top: 13.0,
-                right: 13.0,
-                bottom: shell::INSPECTOR_OUTPUT_BOTTOM,
-                left: 13.0,
-            })
-            .height(Length::Fill)
-            .style(|_| frame(color::INSPECTOR_CARD, color::DARK_BORDER, 12.0)),
+        scrollable(
+            container(content)
+                .padding(iced::Padding {
+                    top: crate::inspector_layout::CARD_TOP,
+                    right: crate::inspector_layout::CARD_SIDE,
+                    bottom: shell::INSPECTOR_OUTPUT_BOTTOM,
+                    left: crate::inspector_layout::CARD_SIDE,
+                })
+                .height(metrics.card_height(viewport_height))
+                .style(|_| {
+                    frame(
+                        color::INSPECTOR_CARD,
+                        color::DARK_BORDER,
+                        shell::CARD_RADIUS,
+                    )
+                }),
+        )
+        .style(conversation_scrollbar_style)
+        .height(Length::Fill),
     )
     .padding(iced::Padding {
         top: 0.0,
-        right: 14.0,
-        bottom: 14.0,
-        left: 14.0,
+        right: 12.0,
+        bottom: crate::inspector_layout::OUTER_BOTTOM,
+        left: 9.0,
     })
     .height(Length::Fill)
     .into()

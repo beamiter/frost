@@ -2,9 +2,9 @@
 //! The terminal widget remains the sole PTY, selection and IME input owner.
 
 use super::*;
+use crate::glass_profile::{self as shell, color};
 use crate::reference_icon::{icon as vector_icon, Icon};
 use iced::widget::{column, opaque};
-use jterm_core::reference_shell::{self as shell, color};
 
 pub(crate) const CONTENT_TOP: f32 = crate::native_viewport::CONTENT_TOP;
 pub(crate) const TOOLS_HEIGHT: f32 = crate::native_viewport::TOOLS_HEIGHT;
@@ -18,18 +18,9 @@ pub(crate) enum InspectorTab {
 }
 
 fn rgb(value: [u8; 3]) -> Color {
-    Color::from_rgb8(value[0], value[1], value[2])
+    shell::rgba(value, 1.0)
 }
 
-fn canvas_background() -> iced::Background {
-    iced::gradient::Linear::new(iced::Radians::PI)
-        .add_stop(0.0, rgb(color::CANVAS))
-        .add_stop(1.0, rgb(color::CANVAS_COOL))
-        .into()
-}
-
-/// The retained native input and footer share one quiet enclosing outline.
-/// Alpha softens their joining edge without changing either widget's geometry.
 pub(crate) fn composer_border_color() -> Color {
     rgb(color::LIGHT_BORDER).scale_alpha(0.6)
 }
@@ -41,14 +32,28 @@ pub(crate) fn accent_pill_background() -> iced::Background {
         .into()
 }
 
-fn panel(background: [u8; 3], border: [u8; 3], radius: f32) -> container::Style {
+fn panel(
+    theme: &iced::Theme,
+    background: [u8; 3],
+    border: [u8; 3],
+    radius: f32,
+) -> container::Style {
     container::Style {
-        background: Some(rgb(background).into()),
+        background: Some(shell::rgba(background, theme.palette().background.a).into()),
         text_color: Some(rgb(color::CHROME_TEXT)),
         border: iced::Border {
-            color: rgb(border),
+            color: shell::rgba(border, theme.palette().background.a),
             width: 1.0,
             radius: radius.into(),
+        },
+        shadow: if radius >= crate::glass_shell_tokens::PANEL_RADIUS {
+            iced::Shadow {
+                color: Color::from_rgba8(71, 115, 255, 0.16),
+                offset: iced::Vector::new(0.0, 0.0),
+                blur_radius: 18.0,
+            }
+        } else {
+            iced::Shadow::default()
         },
         ..Default::default()
     }
@@ -58,22 +63,25 @@ fn control(
     selected: bool,
     light: bool,
 ) -> impl Fn(&iced::Theme, button::Status) -> button::Style + 'static {
-    move |_, status| {
+    move |theme, status| {
         let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
         let disabled = matches!(status, button::Status::Disabled);
         button::Style {
-            background: (selected || hovered).then(|| {
-                rgb(if selected {
-                    if light {
+            background: (selected || hovered || light).then(|| {
+                shell::rgba(
+                    if selected {
+                        if light {
+                            color::ACCENT_PALE
+                        } else {
+                            color::NAVIGATION_SELECTED
+                        }
+                    } else if hovered {
                         color::ACCENT_PALE
                     } else {
-                        color::NAVIGATION_SELECTED
-                    }
-                } else if light {
-                    color::ACCENT_PALE
-                } else {
-                    color::INSPECTOR_CARD
-                })
+                        color::CONTROL_SURFACE
+                    },
+                    theme.palette().background.a,
+                )
                 .into()
             }),
             text_color: rgb(if disabled {
@@ -88,6 +96,12 @@ fn control(
                 color::CHROME_TEXT
             }),
             border: iced::Border {
+                color: if light {
+                    rgb(color::CONTROL_BORDER)
+                } else {
+                    Color::TRANSPARENT
+                },
+                width: if light { 1.0 } else { 0.0 },
                 radius: shell::CONTROL_RADIUS.into(),
                 ..Default::default()
             },
@@ -99,6 +113,15 @@ fn control(
 fn mode_control(selected: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
     move |theme, status| {
         let mut style = control(selected, false)(theme, status);
+        style.border = iced::Border {
+            color: rgb(color::CONTROL_BORDER),
+            width: 1.0,
+            radius: shell::CONTROL_RADIUS.into(),
+        };
+        if !selected {
+            style.background =
+                Some(shell::rgba(color::CONTROL_SURFACE, theme.palette().background.a).into());
+        }
         if selected {
             style.background = Some(accent_pill_background());
             style.border.color = rgb(color::ACCENT).scale_alpha(0.5);
@@ -143,7 +166,7 @@ impl Frost {
     ) -> iced::widget::Text<'static> {
         label(
             value,
-            ui_typography::reference_role_size(size, self.chrome_font_size()),
+            ui_typography::reference_role_size(size * 1.5, self.chrome_font_size()),
             muted,
             light,
         )
@@ -153,7 +176,7 @@ impl Frost {
             minimum
         } else {
             ui_typography::row_height(
-                ui_typography::reference_role_size(roles, self.chrome_font_size()),
+                ui_typography::reference_role_size(roles * 1.5, self.chrome_font_size()),
                 minimum,
                 padding,
             )
@@ -168,10 +191,7 @@ impl Frost {
     pub(crate) fn reference_layout(&self) -> shell::Layout {
         let mut layout = shell::Layout::for_size(self.win_size.width, self.win_size.height);
         if !self.sidebar_open {
-            if let Some(nav) = layout.navigation.take() {
-                layout.center.x -= nav.width;
-                layout.center.width += nav.width;
-            }
+            layout = layout.without_navigation();
         }
         if !self.reference_inspector_open {
             layout = layout.without_inspector();
@@ -200,20 +220,9 @@ impl Frost {
         // Custom terminal palettes stay under user control. The default shell
         // combines dark chrome with the light conversation surface.
         if matches!(config.theme.as_str(), "dark" | "light") {
-            if config.is_chat_mode() {
-                theme.terminal = Theme::builtin_light().terminal;
-                theme.terminal.background = color::CANVAS;
-                theme.terminal.foreground = color::CANVAS_TEXT;
-                theme.terminal.cursor = color::ACCENT;
-                // ANSI bright variants must stay readable on the pale canvas.
-                // Explicit user palettes and native Block colors are retained.
-                theme.terminal.ansi_colors[1] = [173, 49, 66];
-                theme.terminal.ansi_colors[9] = [190, 52, 68];
-                theme.terminal.ansi_colors[2] = [29, 112, 65];
-                theme.terminal.ansi_colors[10] = [24, 125, 70];
-            } else {
-                theme.terminal.background = color::TERMINAL;
-            }
+            theme.terminal.background = color::TERMINAL;
+            theme.terminal.foreground = color::CHROME_TEXT;
+            theme.terminal.cursor = color::CHROME_TEXT;
         }
         theme.ui.window_bg = color::CANVAS;
         theme.ui.panel_bg = color::INSPECTOR_CARD;
@@ -245,12 +254,12 @@ impl Frost {
         action: Message,
         selected: bool,
     ) -> iced::widget::Button<'static, Message> {
-        button(container(vector_icon(glyph, rgb(color::CHROME_TEXT), 15.0)).center(28))
+        button(container(vector_icon(glyph, rgb(color::CHROME_TEXT), 20.0)).center(44))
             .on_press(action)
-            .width(28)
-            .height(28)
+            .width(44)
+            .height(44)
             .padding(0)
-            .style(control(selected, false))
+            .style(control(selected, true))
     }
 
     pub(crate) fn reference_topbar(&self) -> Element<'_, Message> {
@@ -268,31 +277,38 @@ impl Frost {
             window_control("□", Message::WindowToggleMaximize),
         ]
         .spacing(0)
+        .width(105.0)
         .align_y(iced::Alignment::Center);
         let identity = row![
-            crate::reference_icon::identity(
-                "frost",
-                jterm_core::reference_identity::PRODUCT_ICON_SIZE
-            ),
+            crate::reference_icon::identity("frost", 32.0),
             self.chrome_label(
                 if self.win_size.width >= 560.0 {
                     "Frost"
                 } else {
                     ""
                 },
-                12.0,
+                16.0,
                 false,
                 false
             ),
         ]
-        .spacing(7)
+        .spacing(14)
         .align_y(iced::Alignment::Center);
         let path = self.reference_cwd();
         let path: Element<'_, Message> = if self.win_size.width >= 1050.0 {
             tooltip(
-                container(self.chrome_label(format!("⌁  {}", short(&path, 28)), 10.0, true, false))
-                    .width(Length::Fixed(205.0))
-                    .clip(true),
+                container(self.chrome_label(
+                    if self.config.is_chat_mode() {
+                        "Chat"
+                    } else {
+                        "Block"
+                    },
+                    10.667,
+                    true,
+                    false,
+                ))
+                .width(Length::Fixed(90.0))
+                .clip(true),
                 self.chrome_label(path, 11.0, false, false),
                 tooltip::Position::Bottom,
             )
@@ -303,18 +319,20 @@ impl Frost {
         let search: Element<'_, Message> = if self.win_size.width >= 850.0 {
             button(
                 row![
-                    vector_icon(Icon::Search, rgb(color::CHROME_MUTED), 14.0),
+                    vector_icon(Icon::Search, rgb(color::CHROME_MUTED), 20.0),
                     self.chrome_label("Search or run a command…", 10.0, true, false),
                     Space::new().width(Length::Fill),
                     container(self.chrome_label("Ctrl ⇧ P", 9.0, true, false))
                         .padding([2, 4])
-                        .style(|_| panel(color::TITLEBAR, color::DARK_BORDER, 4.0))
+                        .style(|theme| panel(theme, color::TITLEBAR, color::DARK_BORDER, 4.0))
                 ]
                 .align_y(iced::Alignment::Center),
             )
             .on_press(Message::ReferencePalette)
-            .width(Length::Fixed(if self.win_size.width >= 1250.0 {
-                362.0
+            .width(Length::Fixed(if self.win_size.width >= 1500.0 {
+                shell::SEARCH_WIDTH
+            } else if self.win_size.width >= 1250.0 {
+                400.0
             } else {
                 230.0
             }))
@@ -343,8 +361,10 @@ impl Frost {
                 .into()
         };
         let mode = self.config.effective_terminal_mode();
-        let search_width = if self.win_size.width >= 1250.0 {
+        let search_width = if self.win_size.width >= 1500.0 {
             shell::SEARCH_WIDTH
+        } else if self.win_size.width >= 1250.0 {
+            400.0
         } else if self.win_size.width >= 850.0 {
             230.0
         } else {
@@ -363,7 +383,7 @@ impl Frost {
             .max(106.0)
             .min((self.win_size.width - search_width - right_minimum - 28.0).max(106.0));
         let left = row![controls, identity, path]
-            .spacing(7)
+            .spacing(14)
             .align_y(iced::Alignment::Center)
             .width(left_width);
         let mode_button = |caption, mode, selected| {
@@ -425,7 +445,14 @@ impl Frost {
         .padding([0, 8])
         .height(shell::TITLEBAR_HEIGHT)
         .align_y(iced::Alignment::Center)
-        .style(|_| panel(color::TITLEBAR, color::DARK_BORDER, 0.0))
+        .style(|theme| {
+            panel(
+                theme,
+                color::TITLEBAR,
+                color::DARK_BORDER,
+                shell::CARD_RADIUS,
+            )
+        })
         .into()
     }
 
@@ -436,10 +463,10 @@ impl Frost {
                      selected: bool|
          -> Element<'_, Message> {
             tooltip(
-                button(container(vector_icon(glyph, rgb(color::CHROME_TEXT), 18.0)).center(34))
+                button(container(vector_icon(glyph, rgb(color::CHROME_TEXT), 24.0)).center(50))
                     .on_press(action)
-                    .width(34)
-                    .height(34)
+                    .width(50)
+                    .height(50)
                     .padding(0)
                     .style(control(selected, false)),
                 self.chrome_label(hint, 11.0, false, false),
@@ -485,8 +512,9 @@ impl Frost {
                         .width(shell::PROFILE_DIAMETER)
                         .height(shell::PROFILE_DIAMETER)
                         .center(shell::PROFILE_DIAMETER)
-                        .style(|_| {
+                        .style(|theme| {
                             panel(
+                                theme,
                                 color::PROFILE_BACKGROUND,
                                 color::PROFILE_BORDER,
                                 shell::PROFILE_DIAMETER / 2.0,
@@ -500,10 +528,10 @@ impl Frost {
             bottom: 10.0,
             left: 0.0,
         })
-        .width(shell::RAIL_WIDTH)
+        .width(self.reference_layout().rail.width)
         .align_x(iced::Alignment::Center)
         .height(Length::Fill)
-        .style(|_| panel(color::RAIL, color::DARK_BORDER, 0.0))
+        .style(|theme| panel(theme, color::RAIL, color::DARK_BORDER, shell::CARD_RADIUS))
         .into()
     }
 
@@ -580,7 +608,7 @@ impl Frost {
             )
             .height(shell::WORKSPACE_SELECTOR_HEIGHT)
             .padding([6, 9])
-            .style(|_| panel(color::INSPECTOR_CARD, color::DARK_BORDER, 8.0)),
+            .style(|theme| panel(theme, color::INSPECTOR_CARD, color::DARK_BORDER, 8.0)),
             self.chrome_label(format!("{cwd} · {branch_metadata}"), 10.0, false, false),
             tooltip::Position::Right,
         );
@@ -657,8 +685,9 @@ impl Frost {
                     )
                     .height(self.chrome_row_height(18.0, shell::RECENT_ROW_HEIGHT, 7.0))
                     .padding([3, 7])
-                    .style(move |_| {
+                    .style(move |theme| {
                         panel(
+                            theme,
                             if item.selected {
                                 color::NAVIGATION_SELECTED
                             } else {
@@ -683,8 +712,9 @@ impl Frost {
                 )
                 .height(self.chrome_row_height(18.0, shell::RECENT_ROW_HEIGHT, 7.0))
                 .padding([7, 8])
-                .style(move |_| {
+                .style(move |theme| {
                     panel(
+                        theme,
                         if active {
                             color::NAVIGATION_SELECTED
                         } else {
@@ -710,10 +740,7 @@ impl Frost {
             spaces = spaces.push(
                 container(
                     row![
-                        crate::reference_icon::identity(
-                            name,
-                            jterm_core::reference_identity::SPACE_ICON_SIZE
-                        ),
+                        crate::reference_icon::identity(name, 32.0),
                         column![
                             self.chrome_label(*name, 10.0, false, false),
                             self.chrome_label(
@@ -748,7 +775,7 @@ impl Frost {
             ),
             destinations,
             Space::new().height(8),
-            container(self.chrome_section("RECENT")).height(20),
+            container(self.chrome_section("TABS")).height(20),
             container(recent).height(
                 177.0_f32
                     .max(5.0 * self.chrome_row_height(18.0, shell::RECENT_ROW_HEIGHT, 7.0) + 12.0)
@@ -782,11 +809,15 @@ impl Frost {
                         }),
                     Space::new().height(shell::NAVIGATION_PADDING - 1.0),
                     row![
-                        container(Space::new()).width(5).height(5).style(|_| panel(
-                            color::CHROME_MUTED,
-                            color::CHROME_MUTED,
-                            3.0
-                        )),
+                        container(Space::new())
+                            .width(5)
+                            .height(5)
+                            .style(|theme| panel(
+                                theme,
+                                color::CHROME_MUTED,
+                                color::CHROME_MUTED,
+                                3.0
+                            )),
                         self.chrome_label("Local session", 10.0, false, false)
                     ]
                     .spacing(7)
@@ -799,9 +830,20 @@ impl Frost {
             .width(Length::Fill)
         ])
         .padding([0.0, shell::NAVIGATION_PADDING])
-        .width(shell::NAVIGATION_WIDTH)
+        .width(
+            self.reference_layout()
+                .navigation
+                .map_or(0.0, |nav| nav.width),
+        )
         .height(Length::Fill)
-        .style(|_| panel(color::NAVIGATION, color::DARK_BORDER, 0.0))
+        .style(|theme| {
+            panel(
+                theme,
+                color::NAVIGATION,
+                color::DARK_BORDER,
+                shell::CARD_RADIUS,
+            )
+        })
         .into()
     }
 
@@ -817,26 +859,48 @@ impl Frost {
             self.tab_label(self.active_tab)
         };
         let heading = column![
-            self.chrome_label(short(&name, 55), 12.0, false, true)
-                .font(iced::Font {
-                    weight: iced::font::Weight::Bold,
-                    ..iced::Font::with_name(shell::FONT_SANS)
-                }),
+            self.chrome_label(
+                if name.starts_with("Workspace / ") {
+                    name.clone()
+                } else {
+                    format!("Workspace / {}", short(&name, 55))
+                },
+                14.667,
+                false,
+                true
+            )
+            .font(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..iced::Font::with_name(shell::FONT_SANS)
+            }),
             self.chrome_label(
                 if jterm_core::reference_conversation::fixture_enabled() {
                     jterm_core::reference_conversation::FIXTURE_LABEL.to_string()
                 } else {
                     format!("{mode}  ·  Local session")
                 },
-                9.0,
+                10.0,
                 true,
                 true
             )
         ]
         .spacing(3);
+        let title = row![
+            container(crate::reference_icon::identity("frost", 40.0))
+                .center(54.0)
+                .style(|theme| panel(
+                    theme,
+                    color::CONTROL_SURFACE,
+                    color::LIGHT_BORDER,
+                    shell::CONTROL_RADIUS
+                )),
+            heading
+        ]
+        .spacing(16)
+        .align_y(iced::Alignment::Center);
         container(
             row![
-                heading,
+                title,
                 Space::new().width(Length::Fill),
                 button(
                     container(vector_icon(Icon::Plus, rgb(color::CANVAS_MUTED), 16.0))
@@ -869,11 +933,11 @@ impl Frost {
             .spacing(shell::HEADER_ACTION_GAP)
             .align_y(iced::Alignment::Center),
         )
-        .height(shell::CANVAS_HEADER_HEIGHT)
+        .height(self.reference_layout().header.height)
         .padding([6.0, shell::COMPOSER_INSET])
         .align_y(iced::Alignment::Center)
-        .style(|_| {
-            let mut style = panel(color::CANVAS, color::LIGHT_BORDER, 0.0);
+        .style(|theme| {
+            let mut style = panel(theme, color::CANVAS, color::LIGHT_BORDER, 0.0);
             style.text_color = Some(rgb(color::CANVAS_TEXT));
             style
         })
@@ -881,19 +945,14 @@ impl Frost {
     }
 
     pub(crate) fn reference_tools_height(&self) -> f32 {
-        if self.config.is_chat_mode() {
-            TOOLS_HEIGHT
-        } else {
-            shell::COMPOSER_HEIGHT
-        }
+        TOOLS_HEIGHT
     }
 
     fn reference_tools(&self) -> Element<'_, Message> {
         let font_scale = (self.chrome_font_size() / 14.0).max(1.0);
         // Use the rendered composer's inner surface, including sidebar toggles,
         // rather than the original layout's cached composer rectangle.
-        let composer_width =
-            (self.reference_layout().center.width - 2.0 * shell::COMPOSER_INSET).max(0.0);
+        let composer_width = self.reference_layout().composer.width;
         let available = composer_width / font_scale;
         let tool = |glyph: Icon,
                     title: &'static str,
@@ -911,11 +970,7 @@ impl Frost {
                 .spacing(jterm_core::reference_popup::FOOTER_ICON_LABEL_GAP)
                 .align_y(iced::Alignment::Center);
             if !is_model {
-                contents = contents.push(vector_icon(
-                    glyph,
-                    rgb(fg),
-                    jterm_core::reference_popup::FOOTER_ICON_SIZE,
-                ));
+                contents = contents.push(vector_icon(glyph, rgb(fg), 18.0));
             }
             let caption = self
                 .chrome_label(
@@ -929,20 +984,12 @@ impl Frost {
             if is_model {
                 contents = contents
                     .push(container(caption).width(Length::Fill).clip(true))
-                    .push(vector_icon(
-                        Icon::ChevronDown,
-                        rgb(fg),
-                        jterm_core::reference_popup::FOOTER_ICON_SIZE,
-                    ))
+                    .push(vector_icon(Icon::ChevronDown, rgb(fg), 18.0))
                     .spacing(4);
             } else {
                 contents = contents.push(caption);
                 if title == jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[4] {
-                    contents = contents.push(vector_icon(
-                        Icon::ChevronDown,
-                        rgb(fg),
-                        jterm_core::reference_popup::FOOTER_ICON_SIZE,
-                    ));
+                    contents = contents.push(vector_icon(Icon::ChevronDown, rgb(fg), 18.0));
                 }
             }
             let button = button(contents)
@@ -950,8 +997,8 @@ impl Frost {
                 .height(shell::CONTROL_HEIGHT)
                 .width(width * font_scale)
                 .padding([4.0, jterm_core::reference_popup::FOOTER_HORIZONTAL_PADDING])
-                .style(move |_, status| {
-                    let mut style = control(false, true)(&iced::Theme::Light, status);
+                .style(move |theme, status| {
+                    let mut style = control(false, true)(theme, status);
                     style.background = Some(
                         rgb(
                             if matches!(status, button::Status::Hovered | button::Status::Pressed) {
@@ -962,7 +1009,12 @@ impl Frost {
                         )
                         .into(),
                     );
-                    style.text_color = rgb(fg);
+                    if title == jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[3] {
+                        style.background = Some(accent_pill_background());
+                        style.text_color = rgb(color::CHROME_TEXT);
+                    } else {
+                        style.text_color = rgb(fg);
+                    }
                     style.border = iced::Border {
                         color: rgb(color::CONTROL_BORDER),
                         width: 1.0,
@@ -982,12 +1034,8 @@ impl Frost {
             }
         };
         let mut tools = row![button(
-            container(vector_icon(
-                Icon::Plus,
-                rgb(color::CANVAS_TEXT),
-                jterm_core::reference_popup::FOOTER_ICON_SIZE
-            ))
-            .center(shell::COMPOSER_PLUS_WIDTH)
+            container(vector_icon(Icon::Plus, rgb(color::CANVAS_TEXT), 18.0))
+                .center(shell::COMPOSER_PLUS_WIDTH)
         )
         .on_press(Message::NewSession)
         .width(shell::COMPOSER_PLUS_WIDTH)
@@ -1063,13 +1111,14 @@ impl Frost {
         let arrow = container(vector_icon(
             if running { Icon::Close } else { Icon::Send },
             rgb(color::CHROME_TEXT),
-            jterm_core::reference_popup::FOOTER_ICON_SIZE,
+            18.0,
         ))
         .center(shell::COMPOSER_SEND_WIDTH)
         .width(shell::COMPOSER_SEND_WIDTH)
         .height(shell::CONTROL_HEIGHT)
-        .style(move |_| {
+        .style(move |theme| {
             panel(
+                theme,
                 if enabled {
                     color::ACCENT
                 } else {
@@ -1100,7 +1149,7 @@ impl Frost {
             .align_y(iced::Alignment::Center);
         let tools: Element<'_, Message> = container(tools)
             .padding(iced::Padding {
-                top: 0.0,
+                top: shell::COMPOSER_CONTROL_BOTTOM,
                 right: shell::COMPOSER_CONTROL_RIGHT,
                 bottom: shell::COMPOSER_CONTROL_BOTTOM,
                 left: shell::COMPOSER_CONTROL_LEFT,
@@ -1109,45 +1158,16 @@ impl Frost {
             .align_y(iced::Alignment::Center)
             .into();
         let tools = self.font_zoom_region(font_zoom::Group::Chrome, tools);
-        let content: Element<'_, Message> = if self.config.is_chat_mode() {
-            // The native input draws the upper part of the enclosing composer.
-            // Remove only the footer container's redundant inner top stroke.
-            // Draw beneath the existing controls so their 28px borders remain
-            // complete; keep `tools` as the Stack's unchanged sizing layer.
-            let join = container(
-                container(Space::new().width(Length::Fill).height(1.0)).style(|_| {
-                    container::Style {
-                        background: Some(rgb(color::COMPOSER).into()),
-                        ..Default::default()
-                    }
-                }),
-            )
-            .width(Length::Fill)
-            .height(1.0)
-            .padding([0.0, 1.0]);
-            iced::widget::stack![tools]
-                .push_under(join)
-                .width(Length::Fill)
-                .height(TOOLS_HEIGHT)
-                .into()
-        } else {
-            column![
-                container(self.chrome_label(
-                    "Type in the terminal · Enter to run",
-                    12.0,
-                    true,
-                    true
-                ))
-                .padding([10, 14])
-                .height(44),
-                tools
-            ]
-            .into()
-        };
+        let content: Element<'_, Message> = tools;
         container(content)
             .height(self.reference_tools_height())
-            .style(move |_| {
-                let mut style = panel(color::COMPOSER, color::LIGHT_BORDER, shell::COMPOSER_RADIUS);
+            .style(move |theme| {
+                let mut style = panel(
+                    theme,
+                    color::COMPOSER,
+                    color::LIGHT_BORDER,
+                    shell::COMPOSER_RADIUS,
+                );
                 style.border.color = composer_border_color();
                 if self.config.is_chat_mode() {
                     style.border.radius = iced::border::Radius {
@@ -1167,7 +1187,7 @@ impl Frost {
             button(self.chrome_label(name, 10.0, false, false))
                 .on_press(Message::ReferenceInspector(value))
                 .width(shell::INSPECTOR_TAB_WIDTH)
-                .height(shell::CONTROL_HEIGHT)
+                .height(44.0)
                 .padding([4, 5])
                 .style(control(self.reference_inspector_tab == value, false))
         };
@@ -1182,7 +1202,7 @@ impl Frost {
             .spacing(6)
             .align_y(iced::Alignment::Center),
         )
-        .height(shell::CANVAS_HEADER_HEIGHT)
+        .height(72.0_f32.min(self.reference_layout().header.height))
         .padding([5, 12])
         .align_y(iced::Alignment::Center);
         let body: Element<'_, Message> = match self.reference_inspector_tab {
@@ -1249,14 +1269,75 @@ impl Frost {
                     &inspector,
                     fixture,
                     self.chrome_font_size(),
+                    self.reference_layout().center.height
+                        - 72.0_f32.min(self.reference_layout().header.height),
                 )
             }
         };
         container(column![header, body].height(Length::Fill))
             .width(shell::INSPECTOR_WIDTH)
             .height(Length::Fill)
-            .style(|_| panel(color::INSPECTOR, color::DARK_BORDER, 0.0))
+            .style(|theme| {
+                panel(
+                    theme,
+                    color::INSPECTOR,
+                    color::DARK_BORDER,
+                    shell::CARD_RADIUS,
+                )
+            })
             .into()
+    }
+
+    pub(crate) fn reference_input_metrics(
+        &self,
+    ) -> Option<crate::native_input_surface::DockMetrics> {
+        if !self.config.is_chat_mode() || self.is_split() {
+            return None;
+        }
+        let session = self.sessions.get(self.active)?;
+        if session.transcript_read_only() || self.vim9_tabs.contains_key(&session.id) {
+            return None;
+        }
+        let dock = session
+            .projection
+            .chat_rows()
+            .iter()
+            .position(|row| row.role == crate::chat_mode::ChatRole::Composer)?;
+        let last_raw = session
+            .projection
+            .chat_rows()
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(row, kind)| {
+                kind.role == crate::chat_mode::ChatRole::Composer
+                    && matches!(
+                        session.projection.row_kinds().get(*row),
+                        Some(terminal::ProjectedRowKind::Raw)
+                    )
+            })
+            .map(|(row, _)| row)
+            .unwrap_or(dock);
+        let rows = last_raw.max(session.cursor.0).saturating_sub(dock) + 1;
+        let cap = self.reference_layout().input_cap(
+            self.block_reading_bar_height(),
+            self.startup_recovery.banner_height(self.chrome_font_size()),
+        );
+        Some(crate::native_input_surface::dock_metrics(
+            rows,
+            self.metrics.cell_h,
+            cap,
+        ))
+    }
+
+    pub(crate) fn reference_native_budget(&self) -> crate::glass_layout::NativeBudget {
+        crate::native_viewport::native_budget(
+            self.reference_layout(),
+            self.block_reading_bar_height(),
+            self.startup_recovery.banner_height(self.chrome_font_size()),
+            self.reference_input_metrics()
+                .map(|metrics| metrics.input_height),
+        )
     }
 
     pub(crate) fn reference_terminal_surface<'a>(
@@ -1266,19 +1347,25 @@ impl Frost {
         if !self.config.is_chat_mode() {
             return terminal;
         }
-        macro_rules! foreground {
-            ($hint:expr) => {
-                crate::native_input_surface::surface(terminal, None, None, $hint)
+        macro_rules! direct {
+            () => {
+                crate::native_input_surface::surface(
+                    terminal,
+                    None,
+                    None,
+                    "",
+                    self.reference_native_budget().raw.height,
+                )
             };
         }
         let Some(session) = self.sessions.get(self.active) else {
-            return foreground!("No active terminal session");
+            return direct!();
         };
         if self.is_split() {
-            return foreground!("Input remains in the focused terminal pane");
+            return direct!();
         }
         if self.vim9_tabs.contains_key(&session.id) {
-            return foreground!("Input remains in the editor");
+            return direct!();
         }
         let Some(dock) = session
             .projection
@@ -1286,13 +1373,7 @@ impl Frost {
             .iter()
             .position(|row| row.role == crate::chat_mode::ChatRole::Composer)
         else {
-            return foreground!(match session.terminal.chat_surface() {
-                crate::chat_mode::ChatSurface::Running =>
-                    "Command running · Input remains in the terminal",
-                crate::chat_mode::ChatSurface::Fullscreen =>
-                    "Foreground application · Input remains in the terminal",
-                _ => "Input remains in the terminal",
-            });
+            return direct!();
         };
         let margin = if session.transcript_canvas.enabled() && session.projection.has_canvas_head()
         {
@@ -1316,9 +1397,11 @@ impl Frost {
             .map(|(row, _)| row)
             .unwrap_or(dock);
         let needed_rows = last_raw.max(session.cursor.0).saturating_sub(dock) + 1;
-        let cap = (self.term_height() * 0.45).clamp(44.0, 180.0);
-        let dock_metrics =
-            crate::native_input_surface::dock_metrics(needed_rows, self.metrics.cell_h, cap);
+        let Some(dock_metrics) = self.reference_input_metrics() else {
+            return direct!();
+        };
+        let budget = self.reference_native_budget();
+        debug_assert_eq!(dock_metrics.input_height, budget.input_height);
         log::debug!(target: "frost::reference_tools", "native_dock rows={} cell_h={} padding={} height={} visible_rows={}",
             needed_rows, self.metrics.cell_h, dock_metrics.vertical_padding,
             dock_metrics.input_height, dock_metrics.visible_rows);
@@ -1349,14 +1432,14 @@ impl Frost {
                 vertical_padding: dock_metrics.vertical_padding,
             }),
             "",
+            budget.raw.height,
         )
     }
 
     pub(crate) fn trace_reference_tools(&self, event: &str) {
         if let Some(session) = self.sessions.get(self.active) {
             log::debug!(target: "frost::reference_tools", "{event} open={} raw={:?} position_rows={} following={} projection={:?}",
-                self.reference_tools_selection.is_some(), crate::native_viewport::raw_rect(self.reference_layout().center,
-                    self.block_reading_bar_height(), self.startup_recovery.banner_height(self.chrome_font_size())),
+                self.reference_tools_selection.is_some(), self.reference_native_budget().raw,
                 session.transcript_canvas.position_rows(), session.transcript_canvas.following(), session.projection.key());
         }
     }
@@ -1463,12 +1546,7 @@ impl Frost {
         let left = (layout.center.x + shell::COMPOSER_INSET + 270.0)
             .min((self.win_size.width - popup::WIDTH - 8.0).max(0.0));
         let height = popup::COMMANDS.len() as f32 * popup::ROW_HEIGHT + 2.0 * popup::PADDING + 1.0;
-        let top = (self.win_size.height
-            - shell::COMPOSER_BOTTOM
-            - shell::COMPOSER_CONTROL_BOTTOM
-            - shell::CONTROL_HEIGHT
-            - 8.0
-            - height)
+        let top = (layout.composer.y + shell::COMPOSER_CONTROL_BOTTOM - 8.0 - height)
             .max(shell::TITLEBAR_HEIGHT);
         container(opaque(menu))
             .padding(iced::Padding {
@@ -1485,75 +1563,110 @@ impl Frost {
         &'a self,
         terminal: Element<'a, Message>,
     ) -> Element<'a, Message> {
+        use crate::glass_shell_tokens as glass;
         let layout = self.reference_layout();
+        let budget = self.reference_native_budget();
+        let main_bottom = (self.win_size.height - layout.center.bottom()).max(0.0);
+        let navigation_bottom = (self.win_size.height - layout.rail.bottom()).max(0.0);
         let terminal = container(terminal)
             .width(Length::Fill)
             .height(Length::Fill)
             .clip(true)
-            .style(move |_| {
-                let mut style = panel(
-                    if self.config.is_chat_mode() {
-                        color::CANVAS
-                    } else {
-                        color::TERMINAL
-                    },
-                    if self.config.is_chat_mode() {
-                        color::CANVAS
-                    } else {
-                        color::LIGHT_BORDER
-                    },
-                    shell::CARD_RADIUS,
-                );
-                style.text_color = Some(rgb(if self.config.is_chat_mode() {
-                    color::CANVAS_TEXT
+            .style(move |theme| {
+                if budget.editor.is_some() {
+                    container::Style::default()
                 } else {
-                    color::CHROME_TEXT
-                }));
-                if self.config.is_chat_mode() {
-                    // Let the native semantic canvas share the enclosing light
-                    // gradient. Terminal cells and custom palettes still paint
-                    // through their existing renderer without an overlay.
-                    style.background = None;
-                    style.border.color = Color::TRANSPARENT;
+                    panel(
+                        theme,
+                        color::TERMINAL,
+                        color::LIGHT_BORDER,
+                        glass::PANEL_RADIUS,
+                    )
                 }
-                style
             });
+        let pane = container(terminal)
+            .padding(iced::Padding {
+                top: glass::TERMINAL_TOP_GAP,
+                right: glass::TERMINAL_INSET_RIGHT,
+                bottom: if budget.editor.is_some() {
+                    0.0
+                } else {
+                    glass::TERMINAL_FOOTER_GAP
+                },
+                left: glass::TERMINAL_INSET_LEFT,
+            })
+            .height(Length::Fill);
+        let tools = container(self.reference_tools())
+            .padding(iced::Padding {
+                left: glass::TOOLBAR_INSET_LEFT,
+                right: glass::TOOLBAR_INSET_RIGHT,
+                ..iced::Padding::ZERO
+            })
+            .height(glass::TOOLBAR_HEIGHT);
         let center = container(
             column![
                 self.font_zoom_region(font_zoom::Group::Chrome, self.reference_header()),
-                container(column![terminal, self.reference_tools()].spacing(0))
-                    .padding(iced::Padding {
-                        top: CONTENT_TOP,
-                        right: shell::COMPOSER_INSET,
-                        bottom: shell::COMPOSER_BOTTOM,
-                        left: shell::COMPOSER_INSET
-                    })
-                    .height(Length::Fill)
+                pane,
+                tools
             ]
             .height(Length::Fill),
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(|_| {
-            let mut style = panel(color::CANVAS, color::LIGHT_BORDER, 0.0);
-            style.background = Some(canvas_background());
-            style.text_color = Some(rgb(color::CANVAS_TEXT));
-            style
+        .style(|theme| {
+            panel(
+                theme,
+                color::CANVAS,
+                color::DARK_BORDER,
+                glass::PANEL_RADIUS,
+            )
         });
-        let mut body = row![self.font_zoom_region(font_zoom::Group::Chrome, self.reference_rail())]
+        let mut body = row![column![
+            self.font_zoom_region(font_zoom::Group::Chrome, self.reference_rail()),
+            Space::new().height(navigation_bottom)
+        ]
+        .width(layout.rail.width)
+        .height(Length::Fill)]
+        .height(Length::Fill);
+        if let Some(nav) = layout.navigation {
+            body = body.push(
+                column![
+                    self.font_zoom_region(font_zoom::Group::Chrome, self.reference_navigation()),
+                    Space::new().height(navigation_bottom)
+                ]
+                .width(nav.width)
+                .height(Length::Fill),
+            );
+        }
+        body = body.push(Space::new().width(glass::LEFT_GAP));
+        body = body.push(
+            column![
+                Space::new().height(glass::MAIN_TOP - glass::TOPBAR_HEIGHT),
+                center,
+                Space::new().height(main_bottom)
+            ]
+            .width(Length::Fill)
+            .height(Length::Fill),
+        );
+        if let Some(inspector) = layout.inspector {
+            body = body.push(Space::new().width(glass::INSPECTOR_GAP));
+            body = body.push(
+                column![
+                    Space::new().height(glass::MAIN_TOP - glass::TOPBAR_HEIGHT),
+                    self.font_zoom_region(font_zoom::Group::Chrome, self.reference_inspector()),
+                    Space::new().height(main_bottom)
+                ]
+                .width(inspector.width)
+                .height(Length::Fill),
+            );
+        }
+        let body = container(body)
+            .padding(iced::Padding {
+                left: glass::OUTER_LEFT,
+                right: glass::OUTER_RIGHT,
+                ..iced::Padding::ZERO
+            })
             .height(Length::Fill);
-        if layout.navigation.is_some() {
-            body = body
-                .push(self.font_zoom_region(font_zoom::Group::Chrome, self.reference_navigation()));
-        }
-        body = body.push(center);
-        if layout.inspector.is_some() {
-            body = body
-                .push(self.font_zoom_region(font_zoom::Group::Chrome, self.reference_inspector()));
-        }
-        // Recovery is a window-level notice. The fixed-height text was
-        // designed for the full window; narrowing it to the central column
-        // hid preservation wording and the repaired-session summary.
         let mut workspace =
             column![self.font_zoom_region(font_zoom::Group::Chrome, self.reference_topbar())];
         if let Some(banner) = self.session_recovery_banner() {
@@ -1567,22 +1680,18 @@ impl Frost {
         let (dismiss, inspector): (Element<'_, Message>, Element<'_, Message>) =
             if layout.inspector.is_none() && self.reference_inspector_drawer {
                 let dismiss = container(
-                    button(
-                        container(Space::new())
-                            .width(Length::Fill)
-                            .height(Length::Fill),
-                    )
-                    .on_press(Message::ReferenceInspectorToggle)
-                    .padding(0)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .style(|_, _| button::Style {
-                        background: Some(Color::from_rgba(0.05, 0.08, 0.14, 0.24).into()),
-                        ..Default::default()
-                    }),
+                    button(Space::new().width(Length::Fill).height(Length::Fill))
+                        .on_press(Message::ReferenceInspectorToggle)
+                        .padding(0)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .style(|_, _| button::Style {
+                            background: Some(Color::from_rgba(0.02, 0.04, 0.09, 0.18).into()),
+                            ..Default::default()
+                        }),
                 )
                 .padding(iced::Padding {
-                    top: shell::TITLEBAR_HEIGHT,
+                    top: glass::TOPBAR_HEIGHT,
                     ..iced::Padding::ZERO
                 })
                 .width(Length::Fill)
@@ -1591,7 +1700,9 @@ impl Frost {
                     self.font_zoom_region(font_zoom::Group::Chrome, self.reference_inspector()),
                 )
                 .padding(iced::Padding {
-                    top: shell::TITLEBAR_HEIGHT,
+                    top: glass::MAIN_TOP,
+                    right: glass::OUTER_RIGHT,
+                    bottom: main_bottom,
                     ..iced::Padding::ZERO
                 })
                 .align_right(Length::Fill)
@@ -1603,10 +1714,8 @@ impl Frost {
                     Space::new().width(0).height(0).into(),
                 )
             };
-        // Keep the retained workspace at index0 while the narrow drawer opens
-        // and closes. Its dismiss surface begins below the global toolbar.
+        // Constant base index preserves the native terminal/model through toggles.
         let workspace = crate::native_popup_surface::layers(workspace, dismiss, inspector);
-        // Fixed Stack/base position in both states retains every native child.
         let (dismiss, menu): (Element<'_, Message>, Element<'_, Message>) =
             if self.reference_tools_selection.is_some() {
                 let dismiss = button(Space::new().width(Length::Fill).height(Length::Fill))

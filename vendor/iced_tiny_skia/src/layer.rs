@@ -218,8 +218,7 @@ impl Layer {
             &previous.quads,
             &current.quads,
             |(quad, _)| {
-                quad.bounds
-                    .expand(1.0)
+                crate::engine::quad_paint_bounds(quad)
                     .intersection(&current.bounds)
                     .into_iter()
                     .collect()
