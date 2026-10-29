@@ -5,6 +5,7 @@ This uses rustc only, preserving the fmt CI job's no-native-SDK contract.
 It does not certify native shell text zoom or archived footer geometry.
 """
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -46,7 +47,14 @@ for name in ['sidebar_files_view', 'sidebar_render_item', 'sidebar_tasks_view', 
     assert 'self.effective_font_size()' not in source, name
 assert main.count('self.sidebar_row_height(),') >= 2
 assert 'self.sidebar_row_height() + sidebar::SIDEBAR_TREE_ROW_GAP' in main
-assert 'self.effective_font_size()' in function(main, 'term_height')
+# Height delegates to the measured native budget. Actual fontsize authority is
+# checked through the production getters/metrics/strip functions below, not by
+# requiring a direct getter token in this particular wrapper.
+term_height = function(main, 'term_height')
+for route in ['native_viewport::raw_rect(', 'self.reference_layout().center',
+              'self.block_reading_bar_height()',
+              'self.startup_recovery.banner_height(self.chrome_font_size())']:
+    assert route in term_height, route
 settings = function(main, 'config_panel')
 assert 'scrollable::Direction::Both' in settings
 assert 'let buttons = buttons.wrap()' in settings
@@ -66,6 +74,74 @@ for name in ['SIDEBAR_TREE_ROW_GAP', 'SIDEBAR_TREE_OVERSCAN']:
 for name in ['sidebar_tree_window', 'sidebar_tree_reveal_offset']:
     code += function(sidebar, name) + '\n'
 code += '#[test]\n' + function(sidebar, 'zoomed_tree_virtualization_and_keyboard_reveal_share_row_geometry')
+
+# Bind the real App->viewport and Config->Metrics chains without native SDKs.
+def braced_item(source, marker):
+    start = source.index(marker)
+    opening = source.index('{', start)
+    depth, end = 1, opening + 1
+    while depth:
+        depth += (source[end] == '{') - (source[end] == '}')
+        end += 1
+    return source[start:end]
+
+
+def constant(source, name):
+    matches = re.findall(r'^(?:pub )?const ' + name + r':[^;]+;', source, re.MULTILINE)
+    assert len(matches) == 1, name
+    return matches[0]
+
+
+terminal = (ROOT / 'src/terminal.rs').read_text()
+view = (ROOT / 'src/terminal_view.rs').read_text()
+config = (ROOT / 'src/config.rs').read_text()
+metrics_new = braced_item(view, 'pub fn new(')
+chrome_getter = function(main, 'chrome_font_size')
+metrics_start = apply.index('self.metrics = Metrics::with_font(')
+metrics_assignment = apply[metrics_start:apply.index(';', metrics_start) + 1]
+replacements = {
+    'constants': '\n'.join([constant(view, name) for name in ['SCROLLBAR_WIDTH', 'BLOCK_GUTTER_WIDTH']]
+                           + [constant(terminal, name) for name in ['MAX_TERMINAL_COLS', 'MAX_TERMINAL_ROWS']]
+                           + [constant(main, 'PANE_HEADER_H')]),
+    'clamp': function(terminal, 'clamp_terminal_dimensions'),
+    'metrics-type': '#[derive(Clone, Copy, Debug)]\n' + braced_item(view, 'pub struct Metrics {'),
+    'metrics-methods': '\n'.join(braced_item(view, marker) for marker in
+                                ['pub fn new(', 'pub fn with_font(', 'fn block_gutter_width(', 'pub fn grid_size(']),
+    'config-functions': function(config, 'default_font_size') + '\n' + function(config, 'finite_clamp'),
+    'config-methods': '\n'.join(function(config, name) for name in
+                               ['effective_chrome_font_size', 'set_content_font_size', 'clamp_font_size']),
+    'banner': function(main, 'banner_height'),
+    'apply-metrics': metrics_assignment,
+    'app-methods': '\n'.join(function(source, name) for source, name in
+                            [(main, 'effective_font_size'), (main, 'chrome_font_size'),
+                             ((ROOT / 'src/native_shell.rs').read_text(), 'reference_layout'),
+                             (main, 'block_reading_bar_height'), (main, 'term_width'),
+                             (main, 'term_height'), (main, 'pane_header_height')]),
+}
+budget = (ROOT / 'scripts/font_viewport_budget_harness.rs').read_text()
+for name, value in replacements.items():
+    token = '@' + name + '@'
+    assert budget.count(token) == 1, name
+    budget = budget.replace(token, value)
+code += '\n' + budget
+# These temporary mutants must COMPILE and then fail the executable numerical
+# contract. No production source or expected assertion is changed on disk.
+assert metrics_new.count('font_size * 1.2 * line_spacing') == 1
+assert term_height.count('self.block_reading_bar_height()') == 1
+assert chrome_getter.count('self.config.effective_chrome_font_size()') == 1
+assert metrics_assignment.count('self.effective_font_size()') == 1
+mutants = [
+    ('fixed-content-cell-height', metrics_new,
+     metrics_new.replace('font_size * 1.2 * line_spacing', '14.0 * 1.2 * line_spacing')),
+    ('fixed-reading-strip-height', term_height,
+     term_height.replace('self.block_reading_bar_height()',
+                         'if self.block_reading_bar_visible() { 36.0 } else { 0.0 }')),
+    ('metrics-caller-coupled-to-chrome', metrics_assignment,
+     metrics_assignment.replace('self.effective_font_size()', 'self.chrome_font_size()')),
+    ('chrome-coupled-to-content', chrome_getter,
+     chrome_getter.replace('self.config.effective_chrome_font_size()', 'self.effective_font_size()')),
+]
+assert all(code.count(original) == 1 for _, original, _ in mutants)
 with tempfile.TemporaryDirectory(prefix='frost-font-sync-') as directory:
     source = Path(directory) / 'font_sync.rs'
     source.write_text(code)
@@ -74,4 +150,26 @@ with tempfile.TemporaryDirectory(prefix='frost-font-sync-') as directory:
     env['RUSTUP_AUTO_INSTALL'] = '0'
     subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test', str(source), '-o', str(binary)], env=env, check=True)
     subprocess.run([str(binary)], env=env, check=True)
+    evidence = os.environ.get('FROST_FONT_SYNC_EVIDENCE')
+    evidence = Path(evidence) if evidence else None
+    if evidence:
+        evidence.mkdir(parents=True, exist_ok=True)
+        (evidence / 'actual-font-contract.rs').write_text(code)
+    receipts = []
+    for name, original, mutated in mutants:
+        source.write_text(code.replace(original, mutated, 1))
+        subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test', str(source),
+                        '-o', str(binary)], env=env, check=True)
+        result = subprocess.run([str(binary), 'font_viewport_budget::', '--nocapture'],
+                                env=env, capture_output=True, text=True)
+        assert result.returncode != 0 and 'test result: FAILED' in result.stdout, name
+        receipts.append({'name': name, 'compiled': True, 'numerical_gate_rejected': True,
+                         'exit_code': result.returncode,
+                         'original_item_sha256': hashlib.sha256(original.encode()).hexdigest()})
+        if evidence:
+            (evidence / (name + '.stdout')).write_text(result.stdout)
+            (evidence / (name + '.stderr')).write_text(result.stderr)
+        print('negative font-budget contract rejected: ' + name)
+    if evidence:
+        (evidence / 'negative-results.json').write_text(json.dumps(receipts, indent=2) + '\n')
 print('actual typography, sidebar virtualization and native viewport contracts passed; native shell font pixels are a separate gate')
