@@ -21,6 +21,26 @@ fn rgb(value: [u8; 3]) -> Color {
     Color::from_rgb8(value[0], value[1], value[2])
 }
 
+fn canvas_background() -> iced::Background {
+    iced::gradient::Linear::new(iced::Radians::PI)
+        .add_stop(0.0, rgb(color::CANVAS))
+        .add_stop(1.0, rgb(color::CANVAS_COOL))
+        .into()
+}
+
+/// The retained native input and footer share one quiet enclosing outline.
+/// Alpha softens their joining edge without changing either widget's geometry.
+pub(crate) fn composer_border_color() -> Color {
+    rgb(color::LIGHT_BORDER).scale_alpha(0.6)
+}
+
+pub(crate) fn accent_pill_background() -> iced::Background {
+    iced::gradient::Linear::new(iced::Radians::PI)
+        .add_stop(0.0, rgb(color::ACCENT).scale_alpha(0.9))
+        .add_stop(1.0, rgb(color::ACCENT))
+        .into()
+}
+
 fn panel(background: [u8; 3], border: [u8; 3], radius: f32) -> container::Style {
     container::Style {
         background: Some(rgb(background).into()),
@@ -73,6 +93,18 @@ fn control(
             },
             ..Default::default()
         }
+    }
+}
+
+fn mode_control(selected: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let mut style = control(selected, false)(theme, status);
+        if selected {
+            style.background = Some(accent_pill_background());
+            style.border.color = rgb(color::ACCENT).scale_alpha(0.5);
+            style.border.width = 1.0;
+        }
+        style
     }
 }
 
@@ -321,26 +353,40 @@ impl Frost {
             28.0
         };
         let search_x = (self.win_size.width - search_width) * 0.5 + shell::SEARCH_CENTER_OFFSET;
+        let mode_width = shell::MODE_CONTROL_MIN_WIDTH * (self.chrome_font_size() / 14.0).max(1.0);
+        let right_minimum = mode_width * 2.0
+            + 28.0
+            + if self.win_size.width >= 500.0 {
+                28.0 + 4.0 * shell::METADATA_GAP
+            } else {
+                3.0 * shell::METADATA_GAP
+            };
         let left_width = (search_x - 14.0)
             .max(106.0)
-            .min((self.win_size.width - search_width - 148.0).max(106.0));
+            .min((self.win_size.width - search_width - right_minimum - 28.0).max(106.0));
         let left = row![controls, identity, path]
             .spacing(7)
             .align_y(iced::Alignment::Center)
             .width(left_width);
+        let mode_button = |caption, mode, selected| {
+            button(container(self.chrome_label(caption, 11.0, false, false)).center_x(Length::Fill))
+                .on_press(Message::SetTerminalMode(mode))
+                .width(mode_width)
+                .height(shell::MODE_CONTROL_HEIGHT)
+                .padding([4, 8])
+                .style(mode_control(selected))
+        };
         let mut right = row![
             Space::new().width(Length::Fill),
-            self.shell_button(
+            mode_button(
                 "Block",
-                Message::SetTerminalMode(config::TerminalMode::Block),
+                config::TerminalMode::Block,
                 mode != config::TerminalMode::Chat,
-                false
             ),
-            self.shell_button(
+            mode_button(
                 "Chat",
-                Message::SetTerminalMode(config::TerminalMode::Chat),
+                config::TerminalMode::Chat,
                 mode == config::TerminalMode::Chat,
-                false
             ),
             self.vector_button(
                 Icon::Grid,
@@ -426,7 +472,7 @@ impl Frost {
                     container(self.chrome_label(initial, 12.0, false, false).center())
                         .width(shell::PROFILE_DIAMETER)
                         .height(shell::PROFILE_DIAMETER)
-                        .center_y(shell::PROFILE_DIAMETER)
+                        .center(shell::PROFILE_DIAMETER)
                         .style(|_| {
                             panel(
                                 color::PROFILE_BACKGROUND,
@@ -436,8 +482,14 @@ impl Frost {
                         }),
                 ),
         )
-        .padding([14, 0])
+        .padding(iced::Padding {
+            top: 12.0,
+            right: 0.0,
+            bottom: 10.0,
+            left: 0.0,
+        })
         .width(shell::RAIL_WIDTH)
+        .align_x(iced::Alignment::Center)
         .height(Length::Fill)
         .style(|_| panel(color::RAIL, color::DARK_BORDER, 0.0))
         .into()
@@ -825,8 +877,15 @@ impl Frost {
     }
 
     fn reference_tools(&self) -> Element<'_, Message> {
+        let font_scale = (self.chrome_font_size() / 14.0).max(1.0);
+        // Use the rendered composer's inner surface, including sidebar toggles,
+        // rather than the original layout's cached composer rectangle.
+        let composer_width =
+            (self.reference_layout().center.width - 2.0 * shell::COMPOSER_INSET).max(0.0);
+        let available = composer_width / font_scale;
         let tool = |glyph: Icon,
                     title: &'static str,
+                    width: f32,
                     action: Option<Message>|
          -> Element<'_, Message> {
             let enabled = action.is_some();
@@ -858,24 +917,26 @@ impl Frost {
             if is_model {
                 contents = contents
                     .push(container(caption).width(Length::Fill).clip(true))
-                    .push(vector_icon(Icon::ChevronDown, rgb(fg), 11.0))
+                    .push(vector_icon(
+                        Icon::ChevronDown,
+                        rgb(fg),
+                        jterm_core::reference_popup::FOOTER_ICON_SIZE,
+                    ))
                     .spacing(4);
             } else {
                 contents = contents.push(caption);
                 if title == jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[4] {
-                    contents = contents.push(vector_icon(Icon::ChevronDown, rgb(fg), 11.0));
+                    contents = contents.push(vector_icon(
+                        Icon::ChevronDown,
+                        rgb(fg),
+                        jterm_core::reference_popup::FOOTER_ICON_SIZE,
+                    ));
                 }
             }
             let button = button(contents)
                 .on_press_maybe(action)
                 .height(shell::CONTROL_HEIGHT)
-                .width(if is_model {
-                    Length::Fixed(
-                        shell::COMPOSER_MODEL_MIN_WIDTH * (self.chrome_font_size() / 14.0).max(1.0),
-                    )
-                } else {
-                    Length::Shrink
-                })
+                .width(width * font_scale)
                 .padding([4.0, jterm_core::reference_popup::FOOTER_HORIZONTAL_PADDING])
                 .style(move |_, status| {
                     let mut style = control(false, true)(&iced::Theme::Light, status);
@@ -909,50 +970,63 @@ impl Frost {
             }
         };
         let mut tools = row![button(
-            container(vector_icon(Icon::Plus, rgb(color::CANVAS_TEXT), 18.0)).center(28)
+            container(vector_icon(
+                Icon::Plus,
+                rgb(color::CANVAS_TEXT),
+                jterm_core::reference_popup::FOOTER_ICON_SIZE
+            ))
+            .center(shell::COMPOSER_PLUS_WIDTH)
         )
         .on_press(Message::NewSession)
-        .width(28)
-        .height(28)
+        .width(shell::COMPOSER_PLUS_WIDTH)
+        .height(shell::CONTROL_HEIGHT)
         .padding(0)
         .style(control(false, true))]
         .spacing(shell::METADATA_GAP)
         .align_y(iced::Alignment::Center);
-        if self.reference_layout().center.width >= 640.0 * (self.chrome_font_size() / 14.0).max(1.0)
-        {
+        if available >= shell::COMPOSER_SECONDARY_MIN_WIDTH {
             tools = tools
                 .push(tool(
                     Icon::Attach,
                     jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[0],
+                    shell::COMPOSER_ATTACH_WIDTH,
                     None,
                 ))
                 .push(tool(
                     Icon::Image,
                     jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[1],
+                    shell::COMPOSER_IMAGE_WIDTH,
                     None,
                 ))
                 .push(tool(
                     Icon::Code,
                     jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[2],
+                    shell::COMPOSER_CODE_WIDTH,
                     None,
                 ));
         }
-        tools = tools
-            .push(tool(
+        if available >= shell::COMPOSER_TERMINAL_MIN_AVAILABLE {
+            tools = tools.push(tool(
                 Icon::Terminal,
                 jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[3],
+                shell::COMPOSER_TERMINAL_WIDTH,
                 Some(Message::ReferenceFocusTerminal),
-            ))
-            .push(tool(
-                Icon::Grid,
-                jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[4],
-                Some(Message::ReferenceToolsToggle),
-            ))
-            .push(Space::new().width(Length::Fill));
-        if self.reference_layout().center.width >= 650.0 {
-            tools = tools.push(tool(
+            ));
+        }
+        tools = tools.push(tool(
+            Icon::Grid,
+            jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[4],
+            shell::COMPOSER_TOOLS_WIDTH,
+            Some(Message::ReferenceToolsToggle),
+        ));
+        let mut controls = row![]
+            .spacing(shell::METADATA_GAP)
+            .align_y(iced::Alignment::Center);
+        if available >= shell::COMPOSER_MODEL_MIN_AVAILABLE {
+            controls = controls.push(tool(
                 Icon::ChevronDown,
                 shell::MODEL_UNAVAILABLE_LABEL,
+                shell::COMPOSER_MODEL_MIN_WIDTH,
                 None,
             ));
         }
@@ -977,11 +1051,11 @@ impl Frost {
         let arrow = container(vector_icon(
             if running { Icon::Close } else { Icon::Send },
             rgb(color::CHROME_TEXT),
-            16.0,
+            jterm_core::reference_popup::FOOTER_ICON_SIZE,
         ))
-        .center(28)
-        .width(28)
-        .height(28)
+        .center(shell::COMPOSER_SEND_WIDTH)
+        .width(shell::COMPOSER_SEND_WIDTH)
+        .height(shell::CONTROL_HEIGHT)
         .style(move |_| {
             panel(
                 if enabled {
@@ -993,7 +1067,7 @@ impl Frost {
                 7.0,
             )
         });
-        tools = tools.push(tooltip(
+        controls = controls.push(tooltip(
             chat_mode::press_control(arrow, action),
             self.chrome_label(
                 if !enabled {
@@ -1009,6 +1083,9 @@ impl Frost {
             ),
             tooltip::Position::Top,
         ));
+        let tools = row![tools.width(Length::Fill), controls]
+            .spacing(shell::METADATA_GAP)
+            .align_y(iced::Alignment::Center);
         let tools: Element<'_, Message> = container(tools)
             .padding(iced::Padding {
                 top: 0.0,
@@ -1021,7 +1098,26 @@ impl Frost {
             .into();
         let tools = self.font_zoom_region(font_zoom::Group::Chrome, tools);
         let content: Element<'_, Message> = if self.config.is_chat_mode() {
-            tools
+            // The native input draws the upper part of the enclosing composer.
+            // Remove only the footer container's redundant inner top stroke.
+            // Draw beneath the existing controls so their 28px borders remain
+            // complete; keep `tools` as the Stack's unchanged sizing layer.
+            let join = container(
+                container(Space::new().width(Length::Fill).height(1.0)).style(|_| {
+                    container::Style {
+                        background: Some(rgb(color::COMPOSER).into()),
+                        ..Default::default()
+                    }
+                }),
+            )
+            .width(Length::Fill)
+            .height(1.0)
+            .padding([0.0, 1.0]);
+            iced::widget::stack![tools]
+                .push_under(join)
+                .width(Length::Fill)
+                .height(TOOLS_HEIGHT)
+                .into()
         } else {
             column![
                 container(self.chrome_label(
@@ -1040,6 +1136,7 @@ impl Frost {
             .height(self.reference_tools_height())
             .style(move |_| {
                 let mut style = panel(color::COMPOSER, color::LIGHT_BORDER, shell::COMPOSER_RADIUS);
+                style.border.color = composer_border_color();
                 if self.config.is_chat_mode() {
                     style.border.radius = iced::border::Radius {
                         top_left: 0.0,
@@ -1208,12 +1305,11 @@ impl Frost {
             .unwrap_or(dock);
         let needed_rows = last_raw.max(session.cursor.0).saturating_sub(dock) + 1;
         let cap = (self.term_height() * 0.45).clamp(44.0, 180.0);
-        let input_height = (needed_rows as f32 * self.metrics.cell_h + 16.0)
-            .max(44.0)
-            .min(cap);
-        let visible_rows = ((input_height - 16.0) / self.metrics.cell_h)
-            .floor()
-            .max(1.0) as usize;
+        let dock_metrics =
+            crate::native_input_surface::dock_metrics(needed_rows, self.metrics.cell_h, cap);
+        log::debug!(target: "frost::reference_tools", "native_dock rows={} cell_h={} padding={} height={} visible_rows={}",
+            needed_rows, self.metrics.cell_h, dock_metrics.vertical_padding,
+            dock_metrics.input_height, dock_metrics.visible_rows);
         // Very long drafts scroll inside this bounded native input surface.
         // Pick an origin that includes the actual caret, rather than clipping
         // the first two rows while an IME edits below them.
@@ -1222,7 +1318,7 @@ impl Frost {
                 .cursor
                 .0
                 .saturating_add(1)
-                .saturating_sub(visible_rows),
+                .saturating_sub(dock_metrics.visible_rows),
         );
         let dock_y = self.metrics.padding + visible_start as f32 * self.metrics.cell_h - margin;
         let history = jterm_core::reference_conversation::fixture_enabled().then(|| {
@@ -1237,7 +1333,8 @@ impl Frost {
             Some(crate::native_input_surface::Dock {
                 y: dock_y,
                 history_end_y: self.metrics.padding + dock as f32 * self.metrics.cell_h - margin,
-                input_height,
+                input_height: dock_metrics.input_height,
+                vertical_padding: dock_metrics.vertical_padding,
             }),
             "",
         )
@@ -1379,6 +1476,13 @@ impl Frost {
                 } else {
                     color::CHROME_TEXT
                 }));
+                if self.config.is_chat_mode() {
+                    // Let the native semantic canvas share the enclosing light
+                    // gradient. Terminal cells and custom palettes still paint
+                    // through their existing renderer without an overlay.
+                    style.background = None;
+                    style.border.color = Color::TRANSPARENT;
+                }
                 style
             });
         let center = container(
@@ -1399,6 +1503,7 @@ impl Frost {
         .height(Length::Fill)
         .style(|_| {
             let mut style = panel(color::CANVAS, color::LIGHT_BORDER, 0.0);
+            style.background = Some(canvas_background());
             style.text_color = Some(rgb(color::CANVAS_TEXT));
             style
         });

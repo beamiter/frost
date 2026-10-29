@@ -31,6 +31,35 @@ fn frame(bg: [u8; 3], border: [u8; 3], radius: f32) -> container::Style {
         ..Default::default()
     }
 }
+
+/// Keep the retained rich canvas scrollable quiet without changing its rail
+/// dimensions, hit area or offset model.
+fn conversation_scrollbar_style(
+    theme: &iced::Theme,
+    status: iced::widget::scrollable::Status,
+) -> iced::widget::scrollable::Style {
+    use iced::widget::scrollable::Status;
+    let alpha = match status {
+        Status::Dragged {
+            is_vertical_scrollbar_dragged: true,
+            ..
+        } => 0.5,
+        Status::Hovered {
+            is_vertical_scrollbar_hovered: true,
+            ..
+        } => 0.4,
+        _ => 0.15,
+    };
+    let mut style = iced::widget::scrollable::default(theme, status);
+    style.vertical_rail.background = None;
+    style.vertical_rail.border = iced::Border::default();
+    style.vertical_rail.scroller.background = rgb(color::CANVAS_MUTED).scale_alpha(alpha).into();
+    style.vertical_rail.scroller.border = iced::Border {
+        radius: 2.0.into(),
+        ..Default::default()
+    };
+    style
+}
 fn mono(value: impl Into<String>, size: f32, dark: bool) -> iced::widget::Text<'static> {
     text(value.into())
         .font(iced::Font::with_name(shell::FONT_MONOSPACE))
@@ -85,7 +114,11 @@ fn part(value: &Part, fonts: TextScale) -> Element<'static, AppMessage> {
                 ..iced::Font::with_name(shell::FONT_SANS)
             })
             .into(),
-        Part::Paragraph(value) => fonts.txt(value, 12.0, false, false).line_height(1.5).into(),
+        Part::Paragraph(value) => fonts
+            .txt(value, 12.0, false, false)
+            .color(rgb(color::MESSAGE_BODY))
+            .line_height(1.5)
+            .into(),
         Part::Metadata(values) => row(values
             .iter()
             .enumerate()
@@ -192,10 +225,21 @@ fn step_row(step: &Step, dark: bool, font_scale: f32) -> Element<'static, AppMes
                             dark
                         )
                         .wrapping(text::Wrapping::None)
+                        .color(rgb(if dark {
+                            color::CHROME_TEXT
+                        } else {
+                            color::MESSAGE_STEP_TEXT
+                        }))
                 )
                 .width(Length::Fill)
                 .clip(true),
-                fonts.txt(&step.title, 10.0, false, dark),
+                fonts
+                    .txt(&step.title, 10.0, false, dark)
+                    .color(rgb(if dark {
+                        color::CHROME_TEXT
+                    } else {
+                        color::MESSAGE_STEP_TEXT
+                    })),
                 tooltip::Position::Left
             ),
             fonts.txt(step.elapsed.as_deref().unwrap_or(""), 9.0, true, dark)
@@ -403,15 +447,23 @@ pub(crate) fn conversation_view(
             messages = messages.push(
                 container(
                     row![
-                        container(fonts.txt(paragraphs, 12.0, false, false))
-                            .padding([8, 13])
-                            .width(shell::USER_BUBBLE_WIDTH)
-                            .height(if fonts.0 <= 1.0 {
-                                Length::Fixed(shell::USER_BUBBLE_HEIGHT)
-                            } else {
-                                Length::Shrink
-                            })
-                            .style(|_| frame(color::USER_BUBBLE, color::USER_BUBBLE, 10.0)),
+                        container(
+                            fonts
+                                .txt(paragraphs, 12.0, false, false)
+                                .color(rgb(color::MESSAGE_USER_TEXT))
+                        )
+                        .padding([8, 13])
+                        .width(shell::USER_BUBBLE_WIDTH)
+                        .height(if fonts.0 <= 1.0 {
+                            Length::Fixed(shell::USER_BUBBLE_HEIGHT)
+                        } else {
+                            Length::Shrink
+                        })
+                        .style(|_| frame(
+                            color::USER_BUBBLE,
+                            color::USER_BUBBLE,
+                            10.0
+                        )),
                         container(fonts.txt(&message.avatar, 10.0, false, false).center())
                             .center(24)
                             .width(24)
@@ -489,6 +541,7 @@ pub(crate) fn conversation_view(
             .width(Length::Fill),
     )
     .height(Length::Fill)
+    .style(conversation_scrollbar_style)
     .into()
 }
 
@@ -498,6 +551,8 @@ pub(crate) fn inspector_view(
     chrome_font_size: f32,
 ) -> Element<'static, AppMessage> {
     let fonts = TextScale(ui_typography::reference_role_size(1.0, chrome_font_size));
+    let inactive_badge =
+        inspector.badge == "No task" || inspector.badge.eq_ignore_ascii_case("Unavailable");
     let mut content = column![
         row![
             icon(Icon::Agent, rgb(color::CHROME_TEXT), 16.0),
@@ -516,13 +571,43 @@ pub(crate) fn inspector_view(
                 fonts.txt(&inspector.title, 12.0, false, true),
                 tooltip::Position::Left
             ),
-            container(
-                fonts
-                    .txt(&inspector.badge, 9.0, false, true)
-                    .wrapping(text::Wrapping::None)
+            tooltip(
+                container(
+                    fonts
+                        .txt(
+                            &inspector.badge,
+                            shell::INSPECTOR_BADGE_FONT_SIZE,
+                            inactive_badge,
+                            true,
+                        )
+                        .wrapping(text::Wrapping::None)
+                )
+                .padding([
+                    shell::INSPECTOR_BADGE_VERTICAL_PADDING,
+                    shell::INSPECTOR_BADGE_HORIZONTAL_PADDING,
+                ])
+                .height(fonts.line_box(
+                    shell::INSPECTOR_BADGE_FONT_SIZE,
+                    shell::INSPECTOR_BADGE_HEIGHT,
+                    shell::INSPECTOR_BADGE_VERTICAL_PADDING * 2.0,
+                ))
+                .max_width(120.0 * fonts.0.max(1.0))
+                .clip(true)
+                .align_y(iced::Alignment::Center)
+                .style(move |_| {
+                    frame(
+                        if inactive_badge {
+                            color::NAVIGATION
+                        } else {
+                            color::NAVIGATION_SELECTED
+                        },
+                        color::DARK_BORDER,
+                        shell::INSPECTOR_BADGE_RADIUS,
+                    )
+                }),
+                fonts.txt(&inspector.badge, 9.0, inactive_badge, true),
+                tooltip::Position::Left
             )
-            .padding([3, 6])
-            .style(|_| frame(color::NAVIGATION_SELECTED, color::DARK_BORDER, 6.0))
         ]
         .spacing(7)
         .align_y(iced::Alignment::Center),
@@ -548,7 +633,7 @@ pub(crate) fn inspector_view(
                 }),
                 fonts.txt(
                     if inspector.total == 0 {
-                        "No progress".into()
+                        shell::NO_PROGRESS_LABEL.into()
                     } else {
                         format!("{} / {}", inspector.completed, inspector.total)
                     },
@@ -579,7 +664,7 @@ pub(crate) fn inspector_view(
         metadata = metadata.push(
             container(
                 row![
-                    fonts.txt(name.to_uppercase(), 8.0, true, true),
+                    fonts.txt(name, 8.0, true, true),
                     Space::new().width(Length::Fill),
                     tooltip(
                         fonts.txt(visible, 10.0, false, true),

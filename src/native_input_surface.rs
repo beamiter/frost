@@ -21,11 +21,46 @@ pub(crate) struct Dock {
     pub y: f32,
     pub history_end_y: f32,
     pub input_height: f32,
+    pub vertical_padding: f32,
 }
 
 // The raw native viewport always reserves the full outer composer. The outer
 // Surface includes this input strip and the separate tools row is below it.
 pub(crate) const INPUT_STRIP_HEIGHT: f32 = crate::native_viewport::INPUT_STRIP_HEIGHT;
+
+pub(crate) struct DockMetrics {
+    pub input_height: f32,
+    pub vertical_padding: f32,
+    pub visible_rows: usize,
+}
+
+/// Short prompts may use less decoration, never fewer native rows. Longer
+/// drafts retain the original 8px padding and bounded scrolling behavior.
+pub(crate) fn dock_metrics(rows: usize, cell_height: f32, cap: f32) -> DockMetrics {
+    let rows = rows.max(1);
+    let body_height = rows as f32 * cell_height;
+    let vertical_padding = if rows <= 2 && body_height <= INPUT_STRIP_HEIGHT {
+        ((INPUT_STRIP_HEIGHT - body_height) * 0.5).min(8.0)
+    } else {
+        8.0
+    };
+    let decorated_height = body_height + 2.0 * vertical_padding;
+    let input_height = decorated_height.max(INPUT_STRIP_HEIGHT).min(cap);
+    let visible_rows = if decorated_height <= input_height {
+        // All requested rows fit. Avoid losing a row to a rounded float
+        // division at the exact two-row boundary.
+        rows
+    } else {
+        ((input_height - 2.0 * vertical_padding) / cell_height)
+            .floor()
+            .max(1.0) as usize
+    };
+    DockMetrics {
+        input_height,
+        vertical_padding,
+        visible_rows,
+    }
+}
 
 impl<Message> Surface<'_, Message> {
     fn input_height(&self) -> f32 {
@@ -118,7 +153,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         );
         log::debug!(target: "frost::reference_tools", "native_surface canonical={:?} outer={:?}", terminal.bounds(), size);
         let shift = self.dock.map_or(0.0, |dock| {
-            (size.height - dock.input_height).max(0.0) + 8.0 - dock.y
+            (size.height - dock.input_height).max(0.0) + dock.vertical_padding - dock.y
         });
         // The canonical native child keeps this origin and stable raw height
         // through Prompt/Running/TUI. Only a proven prompt's dock paint/IME
@@ -190,7 +225,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
                     renderer::Quad {
                         bounds: input_clip,
                         border: iced::Border {
-                            color: iced::Color::from_rgb8(210, 221, 239),
+                            color: crate::native_shell::composer_border_color(),
                             width: 1.0,
                             radius: iced::border::Radius {
                                 top_left: 14.0,
@@ -290,6 +325,16 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         let (history_clip, input_clip) = clips(layout.bounds(), self.input_height());
         let input_hit = cursor.position_over(input_clip).is_some();
         let history_hit = cursor.position_over(history_clip).is_some();
+        let history_redraw_cursor = matches!(
+            event,
+            Event::Window(iced::window::Event::RedrawRequested(_))
+        )
+        .then(|| {
+            cursor
+                .position()
+                .filter(|position| history_clip.contains(*position))
+                .map_or(mouse::Cursor::Unavailable, mouse::Cursor::Available)
+        });
         let pointer_event = matches!(event, Event::Mouse(_) | Event::Touch(_));
         let state = tree.state.downcast_mut::<State>();
         if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)))
@@ -347,6 +392,24 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
                 shell,
                 &clip,
             );
+        }
+        if input {
+            if let (Some(history), Some(cursor)) = (self.history.as_mut(), history_redraw_cursor) {
+                // Iced Scrollable commits its paint status on RedrawRequested.
+                // Preserve the terminal update above, while refreshing retained
+                // history hover/drag paint with its own real clip and cursor.
+                // Keyboard, IME and every other event keep the exclusive route.
+                history.as_widget_mut().update(
+                    &mut tree.children[1],
+                    event,
+                    layout.child(2),
+                    cursor,
+                    renderer,
+                    clipboard,
+                    shell,
+                    &history_clip,
+                );
+            }
         }
         if matches!(
             event,
@@ -410,5 +473,78 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
             viewport,
             translation,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clips, dock_metrics};
+    use iced::Rectangle;
+
+    #[test]
+    fn two_default_rows_fit_the_reference_strip_without_losing_a_row() {
+        let metrics = dock_metrics(2, 16.8, 180.0);
+        assert_eq!(metrics.input_height, 44.0);
+        assert_eq!(metrics.visible_rows, 2);
+        assert!(metrics.vertical_padding < 8.0);
+        assert!(2.0 * 16.8 + 2.0 * metrics.vertical_padding <= metrics.input_height);
+    }
+
+    #[test]
+    fn a_short_prompt_keeps_its_existing_padding() {
+        let metrics = dock_metrics(1, 16.8, 180.0);
+        assert_eq!(metrics.input_height, 44.0);
+        assert_eq!(metrics.vertical_padding, 8.0);
+        assert_eq!(metrics.visible_rows, 1);
+    }
+
+    #[test]
+    fn two_row_float_boundaries_keep_both_cells_and_caret_inside_the_clip() {
+        for cell_height in [14.4_f32, 16.2, 16.8, 17.1, 18.6, 21.6, 22.0] {
+            let metrics = dock_metrics(2, cell_height, 180.0);
+            assert_eq!(metrics.input_height, 44.0, "{cell_height}");
+            assert_eq!(metrics.visible_rows, 2, "{cell_height}");
+            let (_, clip) = clips(
+                Rectangle {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 702.0,
+                    height: 550.0,
+                },
+                metrics.input_height,
+            );
+            for row in 0..2 {
+                let cell_top = clip.y + metrics.vertical_padding + row as f32 * cell_height;
+                assert!(cell_top >= clip.y, "cell {row}/{cell_height}");
+                assert!(
+                    cell_top + cell_height <= clip.y + clip.height,
+                    "cell/caret {row}/{cell_height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn larger_physical_cells_grow_instead_of_being_clipped() {
+        let metrics = dock_metrics(2, 24.0, 180.0);
+        assert_eq!(metrics.input_height, 64.0);
+        assert_eq!(metrics.vertical_padding, 8.0);
+        assert_eq!(metrics.visible_rows, 2);
+    }
+
+    #[test]
+    fn multiline_and_capped_drafts_keep_the_original_budget_and_last_row() {
+        let multiline = dock_metrics(4, 16.8, 180.0);
+        assert_eq!(multiline.input_height, 4.0 * 16.8 + 16.0);
+        assert_eq!(multiline.vertical_padding, 8.0);
+        assert_eq!(multiline.visible_rows, 4);
+
+        let capped = dock_metrics(100, 16.8, 180.0);
+        assert_eq!(capped.input_height, 180.0);
+        assert_eq!(capped.vertical_padding, 8.0);
+        assert_eq!(capped.visible_rows, 9);
+        let cursor = 99_usize;
+        let visible_start = (cursor + 1).saturating_sub(capped.visible_rows);
+        assert!(visible_start <= cursor && cursor < visible_start + capped.visible_rows);
     }
 }
