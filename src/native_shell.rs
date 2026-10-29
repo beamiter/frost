@@ -174,9 +174,7 @@ impl Frost {
             }
         }
         if !self.reference_inspector_open {
-            if let Some(inspector) = layout.inspector.take() {
-                layout.center.width += inspector.width;
-            }
+            layout = layout.without_inspector();
         }
         layout
     }
@@ -388,11 +386,6 @@ impl Frost {
                 config::TerminalMode::Chat,
                 mode == config::TerminalMode::Chat,
             ),
-            self.vector_button(
-                Icon::Grid,
-                Message::ReferenceInspectorToggle,
-                self.reference_inspector_open
-            ),
         ]
         .spacing(6)
         .align_y(iced::Alignment::Center)
@@ -401,6 +394,25 @@ impl Frost {
             right =
                 right.push(self.vector_button(Icon::Settings, Message::ToggleConfigPanel, false));
         }
+        let inspector_visible = self.reference_inspector_visible();
+        right = right.push(tooltip(
+            self.vector_button(
+                Icon::PanelRight,
+                Message::ReferenceInspectorToggle,
+                inspector_visible,
+            ),
+            self.chrome_label(
+                if inspector_visible {
+                    "Hide right sidebar"
+                } else {
+                    "Show right sidebar"
+                },
+                10.0,
+                false,
+                false,
+            ),
+            tooltip::Position::Bottom,
+        ));
         let bar = row![left, search, right]
             .spacing(6)
             .align_y(iced::Alignment::Center)
@@ -1349,6 +1361,27 @@ impl Frost {
         }
     }
 
+    /// Opt-in transition metadata only: no command, task, file or output text.
+    pub(crate) fn trace_reference_inspector(&self, event: &str) {
+        if !log::log_enabled!(target: "frost::reference_inspector", log::Level::Debug) {
+            return;
+        }
+        if let Some(session) = self.sessions.get(self.active) {
+            let anchor = (0..session.projection.cells().len()).find_map(|row| {
+                session
+                    .projection
+                    .view_to_raw(terminal::ViewportCell { row, col: 0 })
+            });
+            log::debug!(target: "frost::reference_inspector",
+                "{event} open={} drawer={} visible={} tab={:?} center={:?} session={} bash_pid={} tabs={} active_tab={} position_rows={} following={} anchor={:?} input_active={}",
+                self.reference_inspector_open, self.reference_inspector_drawer,
+                self.reference_inspector_visible(), self.reference_inspector_tab,
+                self.reference_layout().center, session.id, session.pty.get_child_pid(),
+                self.tabs.len(), self.active_tab, session.transcript_canvas.position_rows(),
+                session.transcript_canvas.following(), anchor, self.terminal_input_active());
+        }
+    }
+
     fn reference_tools_popover(&self) -> Element<'_, Message> {
         use jterm_core::reference_popup as popup;
         let rgba = |c: [u8; 4]| Color::from_rgba8(c[0], c[1], c[2], c[3] as f32 / 255.0);
@@ -1531,21 +1564,29 @@ impl Frost {
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
-        let workspace: Element<'_, Message> =
+        let (dismiss, inspector): (Element<'_, Message>, Element<'_, Message>) =
             if layout.inspector.is_none() && self.reference_inspector_drawer {
-                let dismiss = button(
-                    container(Space::new())
-                        .width(Length::Fill)
-                        .height(Length::Fill),
+                let dismiss = container(
+                    button(
+                        container(Space::new())
+                            .width(Length::Fill)
+                            .height(Length::Fill),
+                    )
+                    .on_press(Message::ReferenceInspectorToggle)
+                    .padding(0)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(|_, _| button::Style {
+                        background: Some(Color::from_rgba(0.05, 0.08, 0.14, 0.24).into()),
+                        ..Default::default()
+                    }),
                 )
-                .on_press(Message::ReferenceInspectorToggle)
-                .padding(0)
+                .padding(iced::Padding {
+                    top: shell::TITLEBAR_HEIGHT,
+                    ..iced::Padding::ZERO
+                })
                 .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_, _| button::Style {
-                    background: Some(Color::from_rgba(0.05, 0.08, 0.14, 0.24).into()),
-                    ..Default::default()
-                });
+                .height(Length::Fill);
                 let inspector = container(
                     self.font_zoom_region(font_zoom::Group::Chrome, self.reference_inspector()),
                 )
@@ -1555,10 +1596,16 @@ impl Frost {
                 })
                 .align_right(Length::Fill)
                 .height(Length::Fill);
-                stack![workspace, dismiss, inspector].into()
+                (dismiss.into(), inspector.into())
             } else {
-                workspace
+                (
+                    Space::new().width(0).height(0).into(),
+                    Space::new().width(0).height(0).into(),
+                )
             };
+        // Keep the retained workspace at index0 while the narrow drawer opens
+        // and closes. Its dismiss surface begins below the global toolbar.
+        let workspace = crate::native_popup_surface::layers(workspace, dismiss, inspector);
         // Fixed Stack/base position in both states retains every native child.
         let (dismiss, menu): (Element<'_, Message>, Element<'_, Message>) =
             if self.reference_tools_selection.is_some() {

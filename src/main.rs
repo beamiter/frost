@@ -7804,6 +7804,20 @@ impl Frost {
         self.reference_layout().inspector.is_some() || self.reference_inspector_drawer
     }
 
+    /// Reflow the existing sessions after an inspector geometry change without
+    /// reapplying config, clearing selections or replacing terminal widgets.
+    fn sync_reference_inspector_geometry(&mut self) {
+        self.sync_organism_geometry();
+        let term_w = (self.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
+        let (cols, rows) = self.metrics.grid_size(term_w, self.term_height());
+        if cols != self.cols || rows != self.rows {
+            self.cols = cols;
+            self.rows = rows;
+            self.relayout();
+            self.refresh_active_context();
+        }
+    }
+
     /// The Files surface belongs to the right inspector/drawer, independently
     /// of whether workspace navigation is collapsed.
     fn files_surface_visible(&self) -> bool {
@@ -16273,24 +16287,26 @@ impl Frost {
                 }
             }
             Message::ReferenceInspectorToggle => {
+                self.trace_reference_inspector("toggle-before");
                 self.task_panel.retire_panel_callbacks();
                 self.task_panel.input_focused = false;
                 self.sidebar_files_focused = false;
                 self.sidebar_hovered = false;
                 self.invalidate_sidebar_remote_follow_intent();
-                if jterm_core::reference_shell::Layout::for_size(
-                    self.win_size.width,
-                    self.win_size.height,
-                )
-                .inspector
-                .is_none()
-                {
-                    self.reference_inspector_drawer = !self.reference_inspector_drawer;
-                } else {
-                    self.reference_inspector_open = !self.reference_inspector_open;
-                    self.reference_inspector_drawer = false;
-                    self.apply_config();
-                }
+                let show = !self.reference_inspector_visible();
+                self.reference_inspector_open = show;
+                self.reference_inspector_drawer = show
+                    && jterm_core::reference_shell::Layout::for_size(
+                        self.win_size.width,
+                        self.win_size.height,
+                    )
+                    .inspector
+                    .is_none();
+                self.sync_reference_inspector_geometry();
+                self.trace_reference_inspector("toggle-after");
+                return iced::widget::operation::focus(iced::widget::Id::new(
+                    "frost-terminal-input-owner",
+                ));
             }
             Message::ReferenceInspector(tab) => {
                 self.task_panel.retire_panel_callbacks();
@@ -16306,7 +16322,7 @@ impl Frost {
                 )
                 .inspector
                 .is_none();
-                self.apply_config();
+                self.sync_reference_inspector_geometry();
                 if tab == native_shell::InspectorTab::Files {
                     return Task::done(Message::SetSidebarPanel(SidebarPanel::Files));
                 }
