@@ -34,7 +34,12 @@ code = '#![allow(dead_code)]\nuse smallvec::SmallVec;\n'
 code += 'use std::{borrow::Cow, collections::{BTreeMap, BTreeSet, HashMap, VecDeque}, sync::atomic::{AtomicU64, Ordering}};\n'
 code += item('thread_local!') + '\n'
 code += 'const MAX_TERMINAL_COLS: usize = 1024; const MAX_TERMINAL_ROWS: usize = 512;\n'
-code += between('#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]\npub struct RawRowId', '#[derive(Clone, Debug, PartialEq, Eq)]\nstruct ProjectedViewportCacheKey')
+types = between('#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]\npub struct RawRowId', '#[derive(Clone, Debug, PartialEq, Eq)]\nstruct ProjectedViewportCacheKey')
+# The native canvas suite needs the full TerminalState/parser. Its registration
+# sits between production viewport items but belongs to the normal app tests.
+canvas_tests = '#[cfg(test)]\n#[path = "terminal/canvas_tests.rs"]\nmod canvas_tests;\n'
+assert types.count(canvas_tests) == 1
+code += types.replace(canvas_tests, '')
 code += '#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n' + item('enum ProjectedTopAnchor')
 # These contiguous types include the pure copy helper and selection anchors.
 start = source.index('#[derive(Debug)]\nstruct ProjectedLine')
@@ -51,7 +56,7 @@ impl TerminalState {
         Self { scrollback: VecDeque::new(), grid: TerminalGrid::new(rows, cols) }
     }
 '''
-for method in ['identity_projection_plan', 'materialize_projection_plan', 'projection_indexes']:
+for method in ['identity_projection_plan', 'materialize_projection_plan', 'materialize_projection_plan_with_margin', 'projection_indexes']:
     code += item('fn ' + method + '(') + '\n'
 code += '}\n'
 code += '#[path = ' + json.dumps(str(ROOT / 'src/terminal/projection_properties.rs')) + '] mod projection_properties;\n'

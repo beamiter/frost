@@ -74,7 +74,7 @@ impl TerminalState {
  fn block_spacing_boundaries(&self,enabled:bool)->Vec<RawRowId> { assert!(!enabled); Vec::new() }
  fn projected_row_to_absolute(&self,_:&ProjectedViewport,_:usize)->usize { panic!("raw bypass outside fixture scope") }
 '''
-for method in ['projection_selection_revision','projection_plan_key_matches_current_source','new_projected_selection','projected_selection_point','projected_row_real_column_bounds','projected_selection_same_surface','reanchor_projected_selection','copy_projected_selection','materialize_projection_plan','projection_indexes']:
+for method in ['projection_selection_revision','projection_plan_key_matches_current_source','new_projected_selection','projected_selection_point','projected_row_real_column_bounds','projected_selection_same_surface','reanchor_projected_selection','copy_projected_selection','materialize_projection_plan','materialize_projection_plan_with_margin','projection_indexes']:
  code+=item('fn '+method+'(')+'\n'
 for method in ['clear_text_selection','select_line_in_projection','extend_line_selection_in_projection']:
  code+=item('pub fn '+method+'(')+'\n'
