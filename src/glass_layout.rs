@@ -497,9 +497,9 @@ mod tests {
         assert_eq!(
             p.center,
             Rect {
-                x: 270.0,
+                x: 266.0,
                 y: 42.0,
-                width: 1048.0,
+                width: 1056.0,
                 height: 924.0
             }
         );
@@ -515,18 +515,18 @@ mod tests {
         assert_eq!(
             p.composer,
             Rect {
-                x: 298.0,
+                x: 294.0,
                 y: 930.0,
-                width: 992.0,
+                width: 1000.0,
                 height: 36.0
             }
         );
         assert_eq!(
             p.raw_rect(0.0, 0.0, false),
             Rect {
-                x: 298.0,
+                x: 294.0,
                 y: 101.0,
-                width: 992.0,
+                width: 1000.0,
                 height: 821.0
             }
         );
@@ -541,7 +541,7 @@ mod tests {
             assert_eq!(hidden.titlebar, shown.titlebar);
             assert_eq!(hidden.rail, shown.rail);
             assert_eq!(hidden.navigation, shown.navigation);
-            assert_eq!(hidden.center.width - shown.center.width, 294.0);
+            assert_eq!(hidden.center.width - shown.center.width, 290.0);
             assert_eq!(hidden.header.width, hidden.center.width);
             assert_eq!(
                 hidden.composer.right(),
