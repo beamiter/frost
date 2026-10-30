@@ -2,6 +2,7 @@
 use crate::glass_layout::{Layout, NativeBudget, Rect};
 
 pub(crate) const CONTENT_TOP: f32 = crate::glass_shell_tokens::TERMINAL_TOP_GAP;
+#[cfg(test)]
 pub(crate) const TOOLS_HEIGHT: f32 = crate::glass_shell_tokens::TOOLBAR_HEIGHT;
 pub(crate) const INPUT_STRIP_HEIGHT: f32 = crate::glass_layout::INPUT_STRIP_HEIGHT;
 
@@ -35,7 +36,10 @@ mod tests {
                 let budget = native_budget(layout, 0.0, 0.0, Some(requested));
                 assert_eq!(raw_rect(layout, 0.0, 0.0, Some(requested)), budget.raw);
                 let editor = budget.editor.unwrap();
-                assert_eq!(budget.raw.bottom() + 13.0, editor.y);
+                assert_eq!(
+                    budget.raw.bottom() + crate::glass_shell_tokens::TERMINAL_FOOTER_GAP,
+                    editor.y
+                );
                 assert_eq!(editor.bottom(), layout.composer.y);
                 assert_eq!(editor.height, budget.input_height);
                 assert_eq!(budget.composer.bottom(), layout.composer.bottom());
@@ -50,7 +54,10 @@ mod tests {
         assert!(direct.editor.is_none());
         assert_eq!(direct.input_height, 0.0);
         assert_eq!(direct.composer, layout.composer);
-        assert_eq!(direct.raw.height, 648.0);
-        assert_eq!(direct.raw.bottom() + 13.0, layout.composer.y);
+        assert_eq!(direct.raw.height, 830.0);
+        assert_eq!(
+            direct.raw.bottom() + crate::glass_shell_tokens::TERMINAL_FOOTER_GAP,
+            layout.composer.y
+        );
     }
 }

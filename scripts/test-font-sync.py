@@ -177,6 +177,7 @@ code += ('\n#[cfg(test)] mod input_surface_geometry {\n'
          'use crate::native_input_surface::dock_metrics;\n'
          + function(input_surface, 'clips') + '\n')
 for name in ['no_dock_allocates_no_editor_or_phantom_floating_gap',
+             'retained_prompt_clips_partition_new_window_constraints_during_resize',
              'two_default_rows_fit_the_reference_strip_without_losing_a_row',
              'a_short_prompt_keeps_its_existing_padding',
              'two_row_float_boundaries_keep_both_cells_and_caret_inside_the_clip',

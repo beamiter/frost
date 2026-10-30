@@ -202,19 +202,24 @@ fn step_row(step: &Step, dark: bool, font_scale: f32) -> Element<'static, AppMes
         StepState::Complete => Icon::Check,
         StepState::Running => Icon::Agent,
         StepState::Queued => Icon::More,
+        StepState::Attention => Icon::More,
     };
     let state = step.state;
     container(
         row![
-            icon(
-                mark,
-                rgb(if step.state == StepState::Complete {
-                    color::DIFF_ADDED_TEXT
-                } else {
-                    color::ACCENT
-                }),
-                13.0
-            ),
+            if step.state == StepState::Attention {
+                fonts.txt("!", 12.0, false, dark).into()
+            } else {
+                icon(
+                    mark,
+                    rgb(if step.state == StepState::Complete {
+                        color::DIFF_ADDED_TEXT
+                    } else {
+                        color::ACCENT
+                    }),
+                    13.0,
+                )
+            },
             tooltip(
                 container(
                     fonts
@@ -791,104 +796,115 @@ pub(crate) fn inspector_view(
 /// Production boundary: only observed native data is mapped. A shell is never
 /// relabelled Assistant, and terminal output is never inferred task progress.
 pub(crate) fn observed_inspector(app: &Frost) -> Inspector {
-    let mut inspector = Inspector::empty();
-    if let Some(task) = app
-        .task_panel
-        .selected
-        .and_then(|id| app.task_manager.get(id))
-    {
-        inspector.title = task.title.clone();
-        inspector.badge = task.status.label().into();
-        inspector.subtitle = task
-            .status_detail
-            .clone()
-            .unwrap_or_else(|| "Selected task".into());
-        inspector.subtitle = format!("{} · {}", inspector.subtitle, task.provider.display_name());
-    }
-    if app.agent.session.is_some() && inspector.badge == "No task" {
-        inspector.badge = if app.agent.loading {
-            "Thinking"
-        } else {
-            "Active"
+    let tasks = if app.config.experimental_task_sidebar {
+        app.task_manager.tasks()
+    } else {
+        &[]
+    };
+    let inspector = observed_task_inspector(tasks, app.task_panel.selected, |id| {
+        crate::agent_task::DashboardActivity {
+            has_agent_terminal: app
+                .task_terminal_index(id, crate::agent_task::TaskTerminalRole::Agent)
+                .is_some(),
+            has_validation_terminal: app
+                .task_terminal_index(id, crate::agent_task::TaskTerminalRole::Validation)
+                .is_some(),
+            has_active_agent_stream: app.task_manager.has_active_agent_event_stream(id),
+            native_preparing: app.agent_runtime.has_preparing(id),
         }
-        .into();
-        inspector.subtitle = if app.agent.status.is_empty() {
-            "Local agent session".into()
-        } else {
-            app.agent.status.clone()
-        };
-        if !app.agent.provider_label.is_empty() {
-            inspector.subtitle = format!("{} · {}", inspector.subtitle, app.agent.provider_label);
-        }
-    }
-    inspector.queue = app
-        .task_manager
-        .tasks()
-        .iter()
-        .rev()
-        .take(5)
-        .map(|task| Step {
-            title: task.title.clone(),
-            detail: task.status.label().into(),
-            elapsed: None,
-            state: if task.status == crate::agent_task::TaskStatus::Completed {
-                StepState::Complete
-            } else if task.status.is_running() {
-                StepState::Running
-            } else {
-                StepState::Queued
-            },
-        })
-        .collect();
-    if let Some(session) = app.sessions.get(app.active) {
-        let private = app
-            .tabs
+    });
+    private_inspector(
+        redact_inspector(inspector, app.config.ai_redact_secrets),
+        app.tabs
             .get(app.active_tab)
-            .is_some_and(|tab| tab.private_title);
-        for (name, value) in &mut inspector.metadata {
-            match name.as_str() {
-                "Model" if app.agent.session.is_some() => *value = app.config.ai_model.clone(),
-                "Workspace" => {
-                    *value = if private {
-                        "Private workspace".into()
-                    } else {
-                        session
-                            .cwd_display()
-                            .unwrap_or_else(|| "Local workspace".into())
-                    }
-                }
-                "Branch" if !private => {
-                    *value = session
-                        .git_meta_cache
-                        .as_ref()
-                        .map(|meta| meta.branch.clone())
-                        .unwrap_or_else(|| "—".into())
-                }
-                "Environment" => *value = "Local terminal".into(),
-                _ => {}
-            }
+            .is_some_and(|tab| tab.private_title),
+    )
+}
+
+fn redact_inspector(mut inspector: Inspector, enabled: bool) -> Inspector {
+    if enabled {
+        let redact = |text: &mut String| {
+            *text = jterm_core::redact::redact_secrets(text);
+        };
+        redact(&mut inspector.title);
+        redact(&mut inspector.subtitle);
+        for (_, value) in &mut inspector.metadata {
+            redact(value);
         }
-        if let Some(command) = session.terminal.running_command_text() {
-            inspector.current_step = Some(Step {
-                title: command.chars().take(100).collect(),
-                detail: "Observed terminal command".into(),
-                state: StepState::Running,
-                elapsed: None,
-            });
+        if let Some(step) = &mut inspector.current_step {
+            redact(&mut step.title);
+            redact(&mut step.detail);
         }
-        let output = session
-            .projection
-            .cells()
-            .iter()
-            .rev()
-            .take(12)
-            .collect::<Vec<_>>();
-        inspector.output = output
-            .into_iter()
-            .rev()
-            .map(|row| row.iter().take(38).map(|c| c.character).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n");
+        for step in &mut inspector.queue {
+            redact(&mut step.title);
+            redact(&mut step.detail);
+        }
+        redact(&mut inspector.output);
     }
     inspector
+}
+
+fn private_inspector(mut inspector: Inspector, private: bool) -> Inspector {
+    if private {
+        inspector.title = "Private task".into();
+        for (name, value) in &mut inspector.metadata {
+            if matches!(name.as_str(), "Workspace" | "Branch") {
+                *value = "Hidden for private tab".into();
+            }
+        }
+        if let Some(step) = &mut inspector.current_step {
+            step.detail = "Open the task workspace to inspect task details.".into();
+        }
+        for step in &mut inspector.queue {
+            step.title = "Private task".into();
+        }
+        inspector.output = "Task details are hidden for this private tab.".into();
+    }
+    inspector
+}
+
+#[cfg(test)]
+mod inspector_tests {
+    use super::*;
+
+    #[test]
+    fn task_projection_obeys_secret_redaction_preference_everywhere() {
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let mut inspector = acceptance_fixture().inspector;
+        inspector.title = secret.into();
+        inspector.subtitle = secret.into();
+        inspector.metadata = vec![("Workspace".into(), secret.into())];
+        inspector.current_step.as_mut().unwrap().title = secret.into();
+        inspector.current_step.as_mut().unwrap().detail = secret.into();
+        inspector.queue[0].title = secret.into();
+        inspector.queue[0].detail = secret.into();
+        inspector.output = secret.into();
+        assert_eq!(redact_inspector(inspector.clone(), false), inspector);
+        assert!(!format!("{:?}", redact_inspector(inspector, true)).contains(secret));
+    }
+
+    #[test]
+    fn private_task_projection_hides_paths_titles_and_retained_detail() {
+        let inspector = acceptance_fixture().inspector;
+        let original = inspector.clone();
+        assert_eq!(private_inspector(inspector.clone(), false), original);
+        let private = private_inspector(inspector, true);
+        assert_eq!(private.title, "Private task");
+        assert!(private
+            .metadata
+            .iter()
+            .filter(|(name, _)| matches!(name.as_str(), "Workspace" | "Branch"))
+            .all(|(_, value)| value == "Hidden for private tab"));
+        assert!(private
+            .queue
+            .iter()
+            .all(|step| step.title == "Private task"));
+        assert_eq!(private.completed, original.completed);
+        assert_eq!(private.total, original.total);
+        assert!(!private.output.contains(&original.output));
+        assert_ne!(
+            private.current_step.unwrap().detail,
+            original.current_step.unwrap().detail
+        );
+    }
 }

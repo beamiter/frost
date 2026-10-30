@@ -7,7 +7,6 @@ use crate::reference_icon::{icon as vector_icon, Icon};
 use iced::widget::{column, opaque};
 
 pub(crate) const CONTENT_TOP: f32 = crate::native_viewport::CONTENT_TOP;
-pub(crate) const TOOLS_HEIGHT: f32 = crate::native_viewport::TOOLS_HEIGHT;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum InspectorTab {
@@ -15,6 +14,25 @@ pub(crate) enum InspectorTab {
     Agent,
     Context,
     Files,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ContextCopy {
+    Directory { session_id: usize, expected: String },
+    Command { session_id: usize, expected: String },
+}
+
+fn context_copy_value(
+    expected_session: usize,
+    active_session: usize,
+    private: bool,
+    remote: bool,
+    expected: &str,
+    current: Option<String>,
+) -> Option<String> {
+    current.filter(|current| {
+        expected_session == active_session && !private && !remote && current == expected
+    })
 }
 
 fn rgb(value: [u8; 3]) -> Color {
@@ -46,15 +64,7 @@ fn panel(
             width: 1.0,
             radius: radius.into(),
         },
-        shadow: if radius >= crate::glass_shell_tokens::PANEL_RADIUS {
-            iced::Shadow {
-                color: Color::from_rgba8(71, 115, 255, 0.16),
-                offset: iced::Vector::new(0.0, 0.0),
-                blur_radius: 18.0,
-            }
-        } else {
-            iced::Shadow::default()
-        },
+        shadow: iced::Shadow::default(),
         ..Default::default()
     }
 }
@@ -96,12 +106,16 @@ fn control(
                 color::CHROME_TEXT
             }),
             border: iced::Border {
-                color: if light {
+                color: if light && (selected || hovered) {
                     rgb(color::CONTROL_BORDER)
                 } else {
                     Color::TRANSPARENT
                 },
-                width: if light { 1.0 } else { 0.0 },
+                width: if light && (selected || hovered) {
+                    1.0
+                } else {
+                    0.0
+                },
                 radius: shell::CONTROL_RADIUS.into(),
             },
             ..Default::default()
@@ -155,6 +169,40 @@ fn short(value: &str, count: usize) -> String {
     result
 }
 
+fn assistant_state_label(state: jterm_core::agent::AgentState) -> &'static str {
+    use jterm_core::agent::AgentState;
+    match state {
+        AgentState::Ready => "Ready for a task",
+        AgentState::AwaitingModel => "Waiting for the model",
+        AgentState::AwaitingApproval { .. } => "Command awaiting your approval",
+        AgentState::AwaitingObservation { .. } => "Approved command running",
+        AgentState::Completed => "Task completed",
+        AgentState::Cancelled => "Session cancelled",
+        AgentState::TurnLimitReached => "Turn limit reached",
+    }
+}
+
+/// Private tab titles also suppress details and clipboard actions in Context.
+fn context_command(private: bool, command: Option<&str>) -> Option<String> {
+    (!private)
+        .then_some(command)
+        .flatten()
+        .filter(|command| !command.trim().is_empty())
+        .map(|command| jterm_core::review_input::safe_inline_display(command, 4096))
+}
+
+fn context_exit_label(exit: Option<i32>, duration_ms: Option<u64>) -> String {
+    let status = match exit {
+        Some(0) => "Last command succeeded · exit 0".into(),
+        Some(code) => format!("Last command exited with {code}"),
+        None => "No recorded command exit".into(),
+    };
+    match duration_ms {
+        Some(duration) => format!("{status} · {:.2}s", duration as f64 / 1000.0),
+        None => status,
+    }
+}
+
 impl Frost {
     fn chrome_label(
         &self,
@@ -188,14 +236,48 @@ impl Frost {
     }
 
     pub(crate) fn reference_layout(&self) -> shell::Layout {
-        let mut layout = shell::Layout::for_size(self.win_size.width, self.win_size.height);
-        if !self.sidebar_open {
-            layout = layout.without_navigation();
-        }
-        if !self.reference_inspector_open {
-            layout = layout.without_inspector();
-        }
-        layout
+        shell::Layout::with_panels(
+            self.win_size.width,
+            self.win_size.height,
+            self.config.sidebar_width,
+            self.config.inspector_width,
+            self.sidebar_open,
+            self.reference_inspector_open,
+        )
+        .with_chrome_font_size(self.chrome_font_size())
+    }
+
+    pub(crate) fn reference_inspector_width(&self) -> f32 {
+        self.reference_layout().inspector.map_or_else(
+            || {
+                self.config
+                    .inspector_width
+                    .and_then(crate::glass_layout::inspector_width)
+                    .unwrap_or(shell::INSPECTOR_WIDTH)
+                    .min(
+                        (self.win_size.width
+                            - crate::glass_shell_tokens::OUTER_LEFT
+                            - crate::glass_shell_tokens::OUTER_RIGHT
+                            - crate::glass_shell_tokens::INSPECTOR_GAP)
+                            .max(0.0),
+                    )
+            },
+            |panel| panel.width,
+        )
+    }
+
+    fn reference_resize_grip(
+        &self,
+        side: crate::sidebar_resize::Side,
+        width: f32,
+    ) -> Element<'_, Message> {
+        crate::sidebar_resize::grip(
+            width,
+            self.sidebar_resize.is_some_and(|drag| drag.side == side),
+            self.c_accent(),
+            self.c_border(),
+            move |action| Message::SidebarResize(side, action),
+        )
     }
 
     fn reference_private_title(&self) -> bool {
@@ -210,7 +292,13 @@ impl Frost {
         }
         self.sessions
             .get(self.active)
-            .and_then(Session::cwd_display)
+            .and_then(|session| {
+                if session.managed_remote {
+                    Some("Remote terminal".into())
+                } else {
+                    session.cwd_display()
+                }
+            })
             .unwrap_or_else(|| "Local workspace".into())
     }
 
@@ -242,7 +330,9 @@ impl Frost {
     ) -> iced::widget::Button<'static, Message> {
         button(self.chrome_label(value, 11.0, false, light))
             .on_press(action)
-            .height(shell::CONTROL_HEIGHT)
+            .height(crate::glass_layout::chrome_control_height(
+                self.chrome_font_size(),
+            ))
             .padding([4, 8])
             .style(control(selected, light))
     }
@@ -253,20 +343,21 @@ impl Frost {
         action: Message,
         selected: bool,
     ) -> iced::widget::Button<'static, Message> {
-        button(container(vector_icon(glyph, rgb(color::CHROME_TEXT), 20.0)).center(44))
+        button(container(vector_icon(glyph, rgb(color::CHROME_TEXT), 18.0)).center(32))
             .on_press(action)
-            .width(44)
-            .height(44)
+            .width(32)
+            .height(32)
             .padding(0)
             .style(control(selected, true))
     }
 
     pub(crate) fn reference_topbar(&self) -> Element<'_, Message> {
+        let compact = self.win_size.width < 560.0 || self.chrome_font_size() > 24.0;
         let window_control = |glyph: &'static str, action: Message| {
-            button(container(self.chrome_label(glyph, 12.0, false, false)).center(24))
+            button(container(label(glyph, 16.0, false, false)).center(28))
                 .on_press(action)
-                .width(24)
-                .height(24)
+                .width(28)
+                .height(28)
                 .padding(0)
                 .style(control(false, false))
         };
@@ -276,25 +367,25 @@ impl Frost {
             window_control("□", Message::WindowToggleMaximize),
         ]
         .spacing(0)
-        .width(105.0)
+        .width(84.0)
         .align_y(iced::Alignment::Center);
         let identity = row![
-            crate::reference_icon::identity("frost", 32.0),
+            crate::reference_icon::identity("frost", 22.0),
             self.chrome_label(
-                if self.win_size.width >= 560.0 {
+                if self.win_size.width >= 850.0 && !compact {
                     "Frost"
                 } else {
                     ""
                 },
-                16.0,
+                10.667,
                 false,
                 false
             ),
         ]
-        .spacing(14)
+        .spacing(6)
         .align_y(iced::Alignment::Center);
         let path = self.reference_cwd();
-        let path: Element<'_, Message> = if self.win_size.width >= 1050.0 {
+        let path: Element<'_, Message> = if self.win_size.width >= 1050.0 && !compact {
             tooltip(
                 container(self.chrome_label(
                     if self.config.is_chat_mode() {
@@ -315,10 +406,10 @@ impl Frost {
         } else {
             Space::new().into()
         };
-        let search: Element<'_, Message> = if self.win_size.width >= 850.0 {
+        let search: Element<'_, Message> = if self.win_size.width >= 850.0 && !compact {
             button(
                 row![
-                    vector_icon(Icon::Search, rgb(color::CHROME_MUTED), 20.0),
+                    vector_icon(Icon::Search, rgb(color::CHROME_MUTED), 16.0),
                     self.chrome_label("Search or run a command…", 10.0, true, false),
                     Space::new().width(Length::Fill),
                     container(self.chrome_label("Ctrl ⇧ P", 9.0, true, false))
@@ -331,11 +422,13 @@ impl Frost {
             .width(Length::Fixed(if self.win_size.width >= 1500.0 {
                 shell::SEARCH_WIDTH
             } else if self.win_size.width >= 1250.0 {
-                400.0
+                320.0
             } else {
                 230.0
             }))
-            .height(shell::SEARCH_HEIGHT)
+            .height(crate::glass_layout::chrome_control_height(
+                self.chrome_font_size(),
+            ))
             .padding([3, 9])
             .style(|theme, status| {
                 let mut style = control(false, false)(theme, status);
@@ -356,23 +449,25 @@ impl Frost {
             })
             .into()
         } else {
-            self.shell_button("⌕", Message::ReferencePalette, false, false)
+            self.vector_button(Icon::Search, Message::ReferencePalette, false)
                 .into()
         };
         let mode = self.config.effective_terminal_mode();
-        let search_width = if self.win_size.width >= 1500.0 {
+        let search_width = if compact {
+            32.0
+        } else if self.win_size.width >= 1500.0 {
             shell::SEARCH_WIDTH
         } else if self.win_size.width >= 1250.0 {
-            400.0
+            320.0
         } else if self.win_size.width >= 850.0 {
             230.0
         } else {
-            28.0
+            32.0
         };
         let search_x = (self.win_size.width - search_width) * 0.5 + shell::SEARCH_CENTER_OFFSET;
         let mode_width = shell::MODE_CONTROL_MIN_WIDTH * (self.chrome_font_size() / 14.0).max(1.0);
-        let right_minimum = mode_width * 2.0
-            + 28.0
+        let right_minimum = (if compact { 32.0 } else { mode_width * 2.0 })
+            + 32.0
             + if self.win_size.width >= 500.0 {
                 28.0 + 4.0 * shell::METADATA_GAP
             } else {
@@ -381,34 +476,66 @@ impl Frost {
         let left_width = (search_x - 14.0)
             .max(106.0)
             .min((self.win_size.width - search_width - right_minimum - 28.0).max(106.0));
+        let identity: Element<'_, Message> = if self.win_size.width >= 560.0 {
+            identity.into()
+        } else {
+            Space::new().into()
+        };
         let left = row![controls, identity, path]
-            .spacing(14)
+            .spacing(6)
             .align_y(iced::Alignment::Center)
             .width(left_width);
         let mode_button = |caption, mode, selected| {
             button(container(self.chrome_label(caption, 11.0, false, false)).center_x(Length::Fill))
                 .on_press(Message::SetTerminalMode(mode))
                 .width(mode_width)
-                .height(shell::MODE_CONTROL_HEIGHT)
+                .height(crate::glass_layout::chrome_control_height(
+                    self.chrome_font_size(),
+                ))
                 .padding([4, 8])
                 .style(mode_control(selected))
         };
-        let mut right = row![
-            Space::new().width(Length::Fill),
-            mode_button(
-                "Block",
-                config::TerminalMode::Block,
-                mode != config::TerminalMode::Chat,
-            ),
-            mode_button(
-                "Chat",
-                config::TerminalMode::Chat,
-                mode == config::TerminalMode::Chat,
-            ),
-        ]
-        .spacing(6)
-        .align_y(iced::Alignment::Center)
-        .width(Length::Fill);
+        let mut right = row![Space::new().width(Length::Fill)]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .width(Length::Fill);
+        if !compact {
+            right = right
+                .push(mode_button(
+                    "Block",
+                    config::TerminalMode::Block,
+                    mode != config::TerminalMode::Chat,
+                ))
+                .push(mode_button(
+                    "Chat",
+                    config::TerminalMode::Chat,
+                    mode == config::TerminalMode::Chat,
+                ));
+        } else {
+            let (caption, target) = if mode == config::TerminalMode::Chat {
+                ("Chat", config::TerminalMode::Block)
+            } else {
+                ("Block", config::TerminalMode::Chat)
+            };
+            right = right.push(tooltip(
+                self.vector_button(
+                    if mode == config::TerminalMode::Chat {
+                        Icon::from_key("conversation")
+                    } else {
+                        Icon::Terminal
+                    },
+                    Message::SetTerminalMode(target),
+                    true,
+                ),
+                self.chrome_label(
+                    format!("{caption} · Switch Block / Chat"),
+                    10.0,
+                    false,
+                    false,
+                ),
+                tooltip::Position::Bottom,
+            ));
+        }
         if self.win_size.width >= 500.0 {
             right =
                 right.push(self.vector_button(Icon::Settings, Message::ToggleConfigPanel, false));
@@ -442,7 +569,7 @@ impl Frost {
                 .on_double_click(Message::WindowToggleMaximize),
         )
         .padding([0, 8])
-        .height(shell::TITLEBAR_HEIGHT)
+        .height(self.reference_layout().titlebar.height)
         .align_y(iced::Alignment::Center)
         .style(|theme| {
             panel(
@@ -462,10 +589,10 @@ impl Frost {
                      selected: bool|
          -> Element<'_, Message> {
             tooltip(
-                button(container(vector_icon(glyph, rgb(color::CHROME_TEXT), 24.0)).center(50))
+                button(container(vector_icon(glyph, rgb(color::CHROME_TEXT), 18.0)).center(32))
                     .on_press(action)
-                    .width(50)
-                    .height(50)
+                    .width(32)
+                    .height(32)
                     .padding(0)
                     .style(control(selected, false)),
                 self.chrome_label(hint, 11.0, false, false),
@@ -473,7 +600,7 @@ impl Frost {
             )
             .into()
         };
-        let mut rail = column![].spacing(12).align_x(iced::Alignment::Center);
+        let mut rail = column![].spacing(6).align_x(iced::Alignment::Center);
         for (key, title) in jterm_core::reference_conversation::RAIL_NAVIGATION {
             let (action, selected) = match key {
                 "workspace" => (Message::ToggleSidebar, self.sidebar_open),
@@ -507,7 +634,7 @@ impl Frost {
                     false,
                 ))
                 .push(
-                    container(self.chrome_label(initial, 12.0, false, false).center())
+                    container(label(initial, 14.0, false, false).center())
                         .width(shell::PROFILE_DIAMETER)
                         .height(shell::PROFILE_DIAMETER)
                         .center(shell::PROFILE_DIAMETER)
@@ -522,9 +649,9 @@ impl Frost {
                 ),
         )
         .padding(iced::Padding {
-            top: 12.0,
+            top: 6.0,
             right: 0.0,
-            bottom: 10.0,
+            bottom: 6.0,
             left: 0.0,
         })
         .width(self.reference_layout().rail.width)
@@ -545,7 +672,7 @@ impl Frost {
         let actual_branch = self
             .sessions
             .get(self.active)
-            .filter(|_| !self.reference_private_title())
+            .filter(|session| !self.reference_private_title() && !session.managed_remote)
             .and_then(|session| session.git_meta_cache.as_ref())
             .map(|meta| meta.branch.as_str());
         let branch_metadata = if fixture {
@@ -577,7 +704,7 @@ impl Frost {
             self.chrome_label("Local", 8.0, true, false).into()
         };
         let selector = tooltip(
-            container(
+            button(
                 row![
                     vector_icon(Icon::Files, rgb(color::CHROME_MUTED), 14.0),
                     container(
@@ -605,10 +732,18 @@ impl Frost {
                 .spacing(7)
                 .align_y(iced::Alignment::Center),
             )
-            .height(shell::WORKSPACE_SELECTOR_HEIGHT)
-            .padding([6, 9])
-            .style(|theme| panel(theme, color::INSPECTOR_CARD, color::DARK_BORDER, 8.0)),
-            self.chrome_label(format!("{cwd} · {branch_metadata}"), 10.0, false, false),
+            .on_press(Message::ReferenceWorkspaceToggle)
+            .height(crate::glass_layout::chrome_control_height(
+                self.chrome_font_size(),
+            ))
+            .padding([4, 6])
+            .style(control(false, false)),
+            self.chrome_label(
+                format!("Switch workspace tab · {cwd} · {branch_metadata}"),
+                10.0,
+                false,
+                false,
+            ),
             tooltip::Position::Right,
         );
         let mut destinations = column![].spacing(shell::NAVIGATION_ROW_GAP);
@@ -634,21 +769,29 @@ impl Frost {
             } else {
                 title
             };
-            destinations = destinations.push(
+            destinations = destinations.push(tooltip(
                 button(
                     row![
                         vector_icon(Icon::from_key(key), rgb(color::CHROME_MUTED), 15.0),
-                        self.chrome_label(title, 10.0, false, false)
+                        container(
+                            self.chrome_label(title, 10.0, false, false)
+                                .width(Length::Fill)
+                                .wrapping(text::Wrapping::None)
+                        )
+                        .width(Length::Fill)
+                        .clip(true)
                     ]
                     .spacing(8)
                     .align_y(iced::Alignment::Center),
                 )
                 .on_press(action)
-                .height(shell::NAVIGATION_ROW_HEIGHT)
+                .height(self.chrome_row_height(10.0, shell::NAVIGATION_ROW_HEIGHT, 10.0))
                 .width(Length::Fill)
                 .padding([5, 8])
                 .style(control(index == 0, false)),
-            );
+                self.chrome_label(title, 10.0, false, false),
+                tooltip::Position::Right,
+            ));
         }
         let mut recent = column![].spacing(3);
         if fixture {
@@ -682,7 +825,9 @@ impl Frost {
                         .spacing(7)
                         .align_y(iced::Alignment::Center),
                     )
-                    .height(self.chrome_row_height(18.0, shell::RECENT_ROW_HEIGHT, 7.0))
+                    .height(self.chrome_row_height(18.0, shell::RECENT_ROW_HEIGHT.max(43.0), 7.0))
+                    .width(Length::Fill)
+                    .clip(true)
                     .padding([3, 7])
                     .style(move |theme| {
                         panel(
@@ -704,12 +849,19 @@ impl Frost {
                 let item = container(
                     row![
                         vector_icon(Icon::Terminal, rgb(color::CHROME_MUTED), 14.0),
-                        self.chrome_label(short(&self.tab_label(index), 22), 10.0, false, false)
-                            .width(Length::Fill)
+                        container(
+                            self.chrome_label(self.tab_label(index), 10.0, false, false)
+                                .width(Length::Fill)
+                                .wrapping(text::Wrapping::None)
+                        )
+                        .width(Length::Fill)
+                        .clip(true)
                     ]
                     .spacing(7),
                 )
-                .height(self.chrome_row_height(18.0, shell::RECENT_ROW_HEIGHT, 7.0))
+                .height(self.chrome_row_height(10.0, shell::RECENT_ROW_HEIGHT, 14.0))
+                .width(Length::Fill)
+                .clip(true)
                 .padding([7, 8])
                 .style(move |theme| {
                     panel(
@@ -736,36 +888,47 @@ impl Frost {
         let mut spaces = column![].spacing(3);
         for (name, description) in model::SPACES.iter() {
             let selected = *name == "Frost";
-            spaces = spaces.push(
+            let description = if fixture || selected {
+                *description
+            } else {
+                "Unavailable here"
+            };
+            let labels = column![
+                self.chrome_label(*name, 10.0, false, false)
+                    .width(Length::Fill)
+                    .wrapping(text::Wrapping::None),
+                self.chrome_label(description, 8.0, true, false)
+                    .width(Length::Fill)
+                    .wrapping(text::Wrapping::None)
+            ]
+            .spacing(3)
+            .width(Length::Fill);
+            spaces = spaces.push(tooltip(
                 container(
                     row![
-                        crate::reference_icon::identity(name, 32.0),
-                        column![
-                            self.chrome_label(*name, 10.0, false, false),
-                            self.chrome_label(
-                                if fixture || selected {
-                                    *description
-                                } else {
-                                    "Unavailable here"
-                                },
-                                8.0,
-                                true,
-                                false
-                            )
-                        ]
-                        .spacing(3)
+                        crate::reference_icon::identity(name, 18.0),
+                        container(labels).width(Length::Fill).clip(true),
                     ]
                     .spacing(9)
                     .align_y(iced::Alignment::Center),
                 )
                 .height(self.chrome_row_height(18.0, shell::SPACES_ROW_HEIGHT, 7.0))
+                .width(Length::Fill)
+                .clip(true)
                 .padding([2, 6]),
-            );
+                self.chrome_label(format!("{name} · {description}"), 10.0, false, false),
+                tooltip::Position::Right,
+            ));
         }
         let navigation = column![
             Space::new().height(shell::NAVIGATION_LABEL_TOP - shell::TITLEBAR_HEIGHT),
-            container(self.chrome_label("WORKSPACE", 9.0, true, false))
-                .height(shell::WORKSPACE_SELECTOR_TOP - shell::NAVIGATION_LABEL_TOP),
+            container(self.chrome_label("WORKSPACE", 9.0, true, false)).height(
+                self.chrome_row_height(
+                    9.0,
+                    shell::WORKSPACE_SELECTOR_TOP - shell::NAVIGATION_LABEL_TOP,
+                    2.0
+                )
+            ),
             selector,
             Space::new().height(
                 shell::NAVIGATION_ITEMS_TOP
@@ -774,13 +937,10 @@ impl Frost {
             ),
             destinations,
             Space::new().height(8),
-            container(self.chrome_section("TABS")).height(20),
-            container(recent).height(
-                177.0_f32
-                    .max(5.0 * self.chrome_row_height(18.0, shell::RECENT_ROW_HEIGHT, 7.0) + 12.0)
-            ),
+            self.chrome_section("TABS"),
+            recent,
             Space::new().height(7),
-            container(self.chrome_section("SPACES")).height(20),
+            self.chrome_section("SPACES"),
             spaces
         ];
         let status = self
@@ -796,159 +956,162 @@ impl Frost {
                 }
             })
             .unwrap_or("No session");
-        container(column![
-            scrollable(navigation).height(Length::Fill),
-            container(
-                column![
-                    container(Space::new().height(1))
-                        .width(Length::Fill)
-                        .style(|_| container::Style {
-                            background: Some(rgb(color::DARK_BORDER).into()),
-                            ..Default::default()
-                        }),
-                    Space::new().height(shell::NAVIGATION_PADDING - 1.0),
-                    row![
-                        container(Space::new())
-                            .width(5)
-                            .height(5)
-                            .style(|theme| panel(
-                                theme,
-                                color::CHROME_MUTED,
-                                color::CHROME_MUTED,
-                                3.0
-                            )),
-                        self.chrome_label("Local session", 10.0, false, false)
+        let footer: Element<'_, Message> = if self.chrome_font_size() <= 24.0 {
+            tooltip(
+                container(
+                    column![
+                        container(Space::new().height(1))
+                            .width(Length::Fill)
+                            .style(|_| container::Style {
+                                background: Some(rgb(color::DARK_BORDER).into()),
+                                ..Default::default()
+                            }),
+                        Space::new().height(shell::NAVIGATION_PADDING - 1.0),
+                        row![
+                            container(Space::new())
+                                .width(5)
+                                .height(5)
+                                .style(|theme| panel(
+                                    theme,
+                                    color::CHROME_MUTED,
+                                    color::CHROME_MUTED,
+                                    3.0
+                                )),
+                            container(
+                                self.chrome_label("Local session", 10.0, false, false)
+                                    .width(Length::Fill)
+                                    .wrapping(text::Wrapping::None)
+                            )
+                            .width(Length::Fill)
+                            .clip(true)
+                        ]
+                        .spacing(7)
+                        .align_y(iced::Alignment::Center),
+                        self.chrome_label(status, 8.0, true, false)
+                            .width(Length::Fill)
+                            .wrapping(text::Wrapping::None)
                     ]
-                    .spacing(7)
-                    .align_y(iced::Alignment::Center),
-                    self.chrome_label(status, 8.0, true, false)
-                ]
-                .spacing(0)
+                    .spacing(0),
+                )
+                .height(
+                    (ui_typography::reference_role_size(27.0, self.chrome_font_size()) * 1.3
+                        + shell::NAVIGATION_PADDING)
+                        .ceil()
+                        .max(shell::NAVIGATION_STATUS_HEIGHT),
+                )
+                .width(Length::Fill)
+                .clip(true),
+                self.chrome_label(format!("Local session · {status}"), 10.0, false, false),
+                tooltip::Position::Right,
             )
-            .height(shell::NAVIGATION_STATUS_HEIGHT)
-            .width(Length::Fill)
-        ])
-        .padding([0.0, shell::NAVIGATION_PADDING])
-        .width(
-            self.reference_layout()
-                .navigation
-                .map_or(0.0, |nav| nav.width),
-        )
-        .height(Length::Fill)
-        .style(|theme| {
-            panel(
-                theme,
-                color::NAVIGATION,
-                color::DARK_BORDER,
-                shell::CARD_RADIUS,
+            .into()
+        } else {
+            // The terminal and navigation already expose this session; omit
+            // the duplicate status when large text would consume the sidebar.
+            Space::new().height(0).into()
+        };
+        container(column![scrollable(navigation).height(Length::Fill), footer,])
+            .padding([0.0, shell::NAVIGATION_PADDING])
+            .width(
+                self.reference_layout()
+                    .navigation
+                    .map_or(0.0, |nav| nav.width),
             )
-        })
-        .into()
+            .height(Length::Fill)
+            .style(|theme| {
+                panel(
+                    theme,
+                    color::NAVIGATION,
+                    color::DARK_BORDER,
+                    shell::CARD_RADIUS,
+                )
+            })
+            .into()
     }
 
     fn reference_header(&self) -> Element<'_, Message> {
-        let mode = if self.config.is_chat_mode() {
-            "Chat"
-        } else {
-            "Block"
-        };
+        let layout = self.reference_layout();
         let name = if jterm_core::reference_conversation::fixture_enabled() {
             jterm_core::reference_conversation::acceptance_fixture().title
         } else {
             self.tab_label(self.active_tab)
         };
-        let heading = column![
-            self.chrome_label(
-                if name.starts_with("Workspace / ") {
-                    name.clone()
-                } else {
-                    format!("Workspace / {}", short(&name, 55))
-                },
-                14.667,
+        let full_title = if name.starts_with("Workspace / ") {
+            name.clone()
+        } else {
+            format!("Workspace / {name}")
+        };
+        // A single session title shares the row with its existing actions.
+        // Truncate only the visible label; the complete title stays in a tooltip.
+        let available = (layout.header.width
+            - 2.0 * shell::COMPOSER_INSET
+            - 3.0 * (shell::HEADER_ACTION_SIZE + shell::HEADER_ACTION_GAP))
+            .max(0.0);
+        let title_size = ui_typography::reference_role_size(15.0, self.chrome_font_size());
+        let title_chars = (available / (title_size * 0.6).max(1.0)).floor() as usize;
+        let heading = self
+            .chrome_label(
+                short(
+                    if layout.header.width < 600.0 {
+                        &name
+                    } else {
+                        &full_title
+                    },
+                    title_chars.saturating_sub(1),
+                ),
+                10.0,
                 false,
-                true
+                true,
             )
+            .width(Length::Fill)
+            .wrapping(text::Wrapping::None)
             .font(iced::Font {
                 weight: iced::font::Weight::Bold,
                 ..iced::Font::with_name(shell::FONT_SANS)
-            }),
-            self.chrome_label(
-                if jterm_core::reference_conversation::fixture_enabled() {
-                    jterm_core::reference_conversation::FIXTURE_LABEL.to_string()
-                } else {
-                    format!("{mode}  ·  Local session")
-                },
-                10.0,
-                true,
-                true
+            });
+        let heading = tooltip(
+            container(heading).width(Length::Fill).clip(true),
+            self.chrome_label(full_title, 10.0, false, true),
+            iced::widget::tooltip::Position::Bottom,
+        )
+        .style(self.popup_style());
+        let action = |icon, message| {
+            button(
+                container(vector_icon(icon, rgb(color::CANVAS_MUTED), 16.0))
+                    .center(shell::HEADER_ACTION_SIZE),
             )
-        ]
-        .spacing(3);
-        let title = row![
-            container(crate::reference_icon::identity("frost", 40.0))
-                .center(54.0)
-                .style(|theme| panel(
-                    theme,
-                    color::CONTROL_SURFACE,
-                    color::LIGHT_BORDER,
-                    shell::CONTROL_RADIUS
-                )),
-            heading
-        ]
-        .spacing(16)
-        .align_y(iced::Alignment::Center);
+            .on_press(message)
+            .width(shell::HEADER_ACTION_SIZE)
+            .height(shell::HEADER_ACTION_SIZE)
+            .padding(0)
+            .style(control(false, true))
+        };
         container(
             row![
-                title,
-                Space::new().width(Length::Fill),
-                button(
-                    container(vector_icon(Icon::Plus, rgb(color::CANVAS_MUTED), 16.0))
-                        .center(shell::HEADER_ACTION_SIZE)
-                )
-                .on_press(Message::NewSession)
-                .width(shell::HEADER_ACTION_SIZE)
-                .height(shell::HEADER_ACTION_SIZE)
-                .padding(0)
-                .style(control(false, true)),
-                button(
-                    container(vector_icon(Icon::Search, rgb(color::CANVAS_MUTED), 16.0))
-                        .center(shell::HEADER_ACTION_SIZE)
-                )
-                .on_press(Message::ReferenceCommand(keybindings::Command::SearchOpen))
-                .width(shell::HEADER_ACTION_SIZE)
-                .height(shell::HEADER_ACTION_SIZE)
-                .padding(0)
-                .style(control(false, true)),
-                button(
-                    container(vector_icon(Icon::More, rgb(color::CANVAS_MUTED), 16.0))
-                        .center(shell::HEADER_ACTION_SIZE)
-                )
-                .on_press(Message::ReferencePalette)
-                .width(shell::HEADER_ACTION_SIZE)
-                .height(shell::HEADER_ACTION_SIZE)
-                .padding(0)
-                .style(control(false, true))
+                heading,
+                action(Icon::Plus, Message::NewSession),
+                action(
+                    Icon::Search,
+                    Message::ReferenceCommand(keybindings::Command::SearchOpen)
+                ),
+                action(Icon::More, Message::ReferencePalette),
             ]
             .spacing(shell::HEADER_ACTION_GAP)
             .align_y(iced::Alignment::Center),
         )
-        .height(self.reference_layout().header.height)
-        .padding([6.0, shell::COMPOSER_INSET])
+        .height(layout.header.height)
+        .padding([2.0, shell::COMPOSER_INSET])
         .align_y(iced::Alignment::Center)
-        .style(|theme| {
-            let mut style = panel(theme, color::CANVAS, color::LIGHT_BORDER, 0.0);
-            style.text_color = Some(rgb(color::CANVAS_TEXT));
-            style
-        })
         .into()
     }
 
     pub(crate) fn reference_tools_height(&self) -> f32 {
-        TOOLS_HEIGHT
+        self.reference_layout().composer.height
     }
 
     fn reference_tools(&self) -> Element<'_, Message> {
         let font_scale = (self.chrome_font_size() / 14.0).max(1.0);
+        let control_height = crate::glass_layout::chrome_control_height(self.chrome_font_size());
         // Use the rendered composer's inner surface, including sidebar toggles,
         // rather than the original layout's cached composer rectangle.
         let composer_width = self.reference_layout().composer.width;
@@ -956,45 +1119,40 @@ impl Frost {
         let tool = |glyph: Icon,
                     title: &'static str,
                     width: f32,
-                    action: Option<Message>|
+                    action: Message|
          -> Element<'_, Message> {
-            let enabled = action.is_some();
-            let fg = if enabled {
-                color::CANVAS_MUTED
-            } else {
-                color::DISABLED_TEXT
-            };
-            let is_model = title == shell::MODEL_UNAVAILABLE_LABEL;
+            let fg = color::CANVAS_MUTED;
+            let icon_only = title == jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[4]
+                && composer_width
+                    < shell::COMPOSER_CONTROL_LEFT
+                        + shell::COMPOSER_CONTROL_RIGHT
+                        + shell::COMPOSER_PLUS_WIDTH
+                        + shell::COMPOSER_SEND_WIDTH
+                        + width * font_scale
+                        + 2.0 * shell::METADATA_GAP;
             let mut contents = row![]
                 .spacing(jterm_core::reference_popup::FOOTER_ICON_LABEL_GAP)
                 .align_y(iced::Alignment::Center);
-            if !is_model {
-                contents = contents.push(vector_icon(glyph, rgb(fg), 18.0));
-            }
+            contents = contents.push(vector_icon(glyph, rgb(fg), 18.0));
             let caption = self
                 .chrome_label(
                     title,
                     jterm_core::reference_popup::FOOTER_LABEL_SIZE,
-                    !enabled,
+                    false,
                     true,
                 )
                 .color(rgb(fg))
                 .wrapping(text::Wrapping::None);
-            if is_model {
-                contents = contents
-                    .push(container(caption).width(Length::Fill).clip(true))
-                    .push(vector_icon(Icon::ChevronDown, rgb(fg), 18.0))
-                    .spacing(4);
-            } else {
+            if !icon_only {
                 contents = contents.push(caption);
                 if title == jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[4] {
                     contents = contents.push(vector_icon(Icon::ChevronDown, rgb(fg), 18.0));
                 }
             }
             let button = button(contents)
-                .on_press_maybe(action)
-                .height(shell::CONTROL_HEIGHT)
-                .width(width * font_scale)
+                .on_press(action)
+                .height(control_height)
+                .width(if icon_only { 32.0 } else { width * font_scale })
                 .padding([4.0, jterm_core::reference_popup::FOOTER_HORIZONTAL_PADDING])
                 .style(move |theme, status| {
                     let mut style = control(false, true)(theme, status);
@@ -1016,20 +1174,20 @@ impl Frost {
                     }
                     style.border = iced::Border {
                         color: rgb(color::CONTROL_BORDER),
-                        width: 1.0,
+                        width: 0.0,
                         radius: shell::CONTROL_RADIUS.into(),
                     };
                     style
                 });
-            if enabled {
-                button.into()
-            } else {
+            if icon_only {
                 tooltip(
                     button,
-                    self.chrome_label(format!("{title} · Not available yet"), 10.0, true, true),
+                    self.chrome_label(title, 10.0, false, true),
                     tooltip::Position::Top,
                 )
                 .into()
+            } else {
+                button.into()
             }
         };
         let mut tools = row![button(
@@ -1038,57 +1196,28 @@ impl Frost {
         )
         .on_press(Message::NewSession)
         .width(shell::COMPOSER_PLUS_WIDTH)
-        .height(shell::CONTROL_HEIGHT)
+        .height(control_height)
         .padding(0)
         .style(control(false, true))]
         .spacing(shell::METADATA_GAP)
         .align_y(iced::Alignment::Center);
-        if available >= shell::COMPOSER_SECONDARY_MIN_WIDTH {
-            tools = tools
-                .push(tool(
-                    Icon::Attach,
-                    jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[0],
-                    shell::COMPOSER_ATTACH_WIDTH,
-                    None,
-                ))
-                .push(tool(
-                    Icon::Image,
-                    jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[1],
-                    shell::COMPOSER_IMAGE_WIDTH,
-                    None,
-                ))
-                .push(tool(
-                    Icon::Code,
-                    jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[2],
-                    shell::COMPOSER_CODE_WIDTH,
-                    None,
-                ));
-        }
         if available >= shell::COMPOSER_TERMINAL_MIN_AVAILABLE {
             tools = tools.push(tool(
                 Icon::Terminal,
                 jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[3],
                 shell::COMPOSER_TERMINAL_WIDTH,
-                Some(Message::ReferenceFocusTerminal),
+                Message::ReferenceFocusTerminal,
             ));
         }
         tools = tools.push(tool(
             Icon::Grid,
             jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[4],
             shell::COMPOSER_TOOLS_WIDTH,
-            Some(Message::ReferenceToolsToggle),
+            Message::ReferenceToolsToggle,
         ));
         let mut controls = row![]
             .spacing(shell::METADATA_GAP)
             .align_y(iced::Alignment::Center);
-        if available >= shell::COMPOSER_MODEL_MIN_AVAILABLE {
-            controls = controls.push(tool(
-                Icon::ChevronDown,
-                shell::MODEL_UNAVAILABLE_LABEL,
-                shell::COMPOSER_MODEL_MIN_WIDTH,
-                None,
-            ));
-        }
         let action = self.sessions.get(self.active).and_then(|session| {
             let kind = if session.terminal.is_command_running() {
                 chat_mode::ControlKind::Interrupt
@@ -1114,7 +1243,7 @@ impl Frost {
         ))
         .center(shell::COMPOSER_SEND_WIDTH)
         .width(shell::COMPOSER_SEND_WIDTH)
-        .height(shell::CONTROL_HEIGHT)
+        .height(control_height)
         .style(move |theme| {
             panel(
                 theme,
@@ -1153,7 +1282,7 @@ impl Frost {
                 bottom: shell::COMPOSER_CONTROL_BOTTOM,
                 left: shell::COMPOSER_CONTROL_LEFT,
             })
-            .height(TOOLS_HEIGHT)
+            .height(self.reference_tools_height())
             .align_y(iced::Alignment::Center)
             .into();
         let tools = self.font_zoom_region(font_zoom::Group::Chrome, tools);
@@ -1167,13 +1296,13 @@ impl Frost {
                     color::LIGHT_BORDER,
                     shell::COMPOSER_RADIUS,
                 );
-                style.border.color = composer_border_color();
+                style.border.width = 0.0;
                 if self.config.is_chat_mode() {
                     style.border.radius = iced::border::Radius {
                         top_left: 0.0,
                         top_right: 0.0,
-                        bottom_left: 14.0,
-                        bottom_right: 14.0,
+                        bottom_left: shell::COMPOSER_RADIUS,
+                        bottom_right: shell::COMPOSER_RADIUS,
                     };
                 }
                 style
@@ -1181,14 +1310,390 @@ impl Frost {
             .into()
     }
 
+    pub(crate) fn reference_context_copy(&self, request: ContextCopy) -> Option<String> {
+        let session = self.sessions.get(self.active)?;
+        let (session_id, expected, current) = match request {
+            ContextCopy::Directory {
+                session_id,
+                expected,
+            } => (session_id, expected, session.cwd_cache.clone()),
+            ContextCopy::Command {
+                session_id,
+                expected,
+            } => {
+                let running = session.terminal.running_command_text();
+                let latest = session
+                    .terminal
+                    .command_zones
+                    .iter()
+                    .rev()
+                    .find_map(|zone| {
+                        zone.command
+                            .as_deref()
+                            .filter(|command| !command.trim().is_empty())
+                    });
+                (
+                    session_id,
+                    expected,
+                    context_command(false, running.or(latest)),
+                )
+            }
+        };
+        context_copy_value(
+            session_id,
+            session.id,
+            self.reference_private_title(),
+            session.managed_remote,
+            &expected,
+            current,
+        )
+    }
+
+    fn reference_context_inspector(&self) -> Element<'_, Message> {
+        let private = self.reference_private_title();
+        let mut content = column![
+            self.chrome_section("SESSION CONTEXT"),
+            self.chrome_label(
+                if private
+                    || self
+                        .sessions
+                        .get(self.active)
+                        .is_some_and(|session| session.managed_remote)
+                {
+                    self.reference_cwd()
+                } else {
+                    format!("Local directory · {}", self.reference_cwd())
+                },
+                12.0,
+                false,
+                false,
+            ),
+            self.chrome_label(
+                format!(
+                    "{} terminal session(s) · {} mode",
+                    self.sessions.len(),
+                    self.config.effective_terminal_mode()
+                ),
+                10.0,
+                true,
+                false
+            ),
+        ]
+        .spacing(10);
+        if let Some(session) = self.sessions.get(self.active) {
+            let (cols, rows) = session.terminal.get_dimensions();
+            content = content.push(self.chrome_label(
+                format!("Terminal {} · {cols} × {rows} cells", session.id + 1),
+                10.0,
+                true,
+                false,
+            ));
+            if private {
+                content = content.push(self.chrome_label(
+                    "Directory, repository and command details are hidden for this private tab.",
+                    10.0,
+                    true,
+                    false,
+                ));
+            } else if session.managed_remote {
+                content = content.push(self.chrome_label(
+                    "Remote terminal. A verified remote directory is not available here. Use Files to browse a configured remote host.",
+                    10.0,
+                    true,
+                    false,
+                )).push(self.shell_button(
+                    "Open Files",
+                    Message::ReferenceInspector(InspectorTab::Files),
+                    false,
+                    false,
+                ));
+            } else {
+                if let Some(git) = session.git_meta_cache.as_ref() {
+                    content = content.push(self.chrome_label(
+                        jterm_core::git_meta::format_strip(git),
+                        10.0,
+                        false,
+                        false,
+                    ));
+                }
+                let mut directory_actions = row![self.shell_button(
+                    "Browse files",
+                    Message::ReferenceInspector(InspectorTab::Files),
+                    false,
+                    false,
+                )]
+                .spacing(6);
+                if let Some(cwd) = session.cwd_cache.as_ref() {
+                    directory_actions = directory_actions.push(self.shell_button(
+                        "Copy path",
+                        Message::ReferenceContextCopy(ContextCopy::Directory {
+                            session_id: session.id,
+                            expected: cwd.clone(),
+                        }),
+                        false,
+                        false,
+                    ));
+                }
+                content = content.push(directory_actions.wrap());
+                if let Some(process) = session.fg_proc_cache.as_ref() {
+                    content = content.push(self.chrome_label(
+                        format!("Foreground process · {process}"),
+                        10.0,
+                        false,
+                        false,
+                    ));
+                }
+                let running = session.terminal.running_command_text();
+                let latest = session.terminal.command_zones.iter().rev().find(|zone| {
+                    zone.command
+                        .as_deref()
+                        .is_some_and(|cmd| !cmd.trim().is_empty())
+                });
+                let command = context_command(
+                    private,
+                    running.or_else(|| latest.and_then(|zone| zone.command.as_deref())),
+                );
+                content = content.push(self.chrome_section(if running.is_some() {
+                    "RUNNING COMMAND"
+                } else {
+                    "LATEST COMMAND"
+                }));
+                if let Some(command) = command {
+                    content = content
+                        .push(self.chrome_label(&command, 10.0, false, false))
+                        .push(self.shell_button(
+                            "Copy shown command",
+                            Message::ReferenceContextCopy(ContextCopy::Command {
+                                session_id: session.id,
+                                expected: command,
+                            }),
+                            false,
+                            false,
+                        ));
+                } else {
+                    content = content.push(self.chrome_label(
+                        "No command reported by shell integration yet.",
+                        10.0,
+                        true,
+                        false,
+                    ));
+                }
+                content = content.push(self.chrome_label(
+                    context_exit_label(session.last_exit, session.last_duration_ms),
+                    10.0,
+                    true,
+                    false,
+                ));
+                if let Some(zone) = latest.filter(|zone| !zone.output_preview.is_empty()) {
+                    content = content
+                        .push(self.chrome_section("LATEST OUTPUT PREVIEW"))
+                        .push(self.chrome_label(
+                            jterm_core::review_input::safe_multiline_display(
+                                &zone.output_preview,
+                                4096,
+                            ),
+                            10.0,
+                            true,
+                            false,
+                        ));
+                }
+            }
+        }
+        content = content
+            .push(self.shell_button("Open native Vim", Message::OpenVim9Ide, false, false))
+            .push(self.chrome_section("AI CONTEXT SETTINGS"))
+            .push(self.chrome_label(
+                if self.config.ai_enabled {
+                    "AI is enabled. These preferences apply when you request AI assistance."
+                } else {
+                    "AI is disabled. Configure a provider in Settings to use the assistant."
+                },
+                10.0,
+                true,
+                false,
+            ))
+            .push(
+                checkbox(self.config.ai_share_command_context)
+                    .label("Share command context with cloud AI")
+                    .text_size(self.chrome_font_size())
+                    .on_toggle(Message::SetAiShareCommandContext),
+            )
+            .push(
+                checkbox(self.config.ai_redact_secrets)
+                    .label("Redact secrets in AI-bound text")
+                    .text_size(self.chrome_font_size())
+                    .on_toggle(Message::SetAiRedactSecrets),
+            )
+            .push(self.shell_button(
+                "AI settings",
+                Message::ReferenceCommand(keybindings::Command::ConfigOpen),
+                false,
+                false,
+            ));
+        scrollable(container(content).padding(16).width(Length::Fill))
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn reference_agent_inspector(&self) -> Element<'_, Message> {
+        let mut content = column![self.chrome_section("AI ASSISTANT")].spacing(10);
+        if let Some(session) = self.agent.session.as_ref() {
+            content = content
+                .push(self.chrome_label(assistant_state_label(session.state()), 12.0, false, false))
+                .push(self.chrome_label(
+                    format!(
+                        "{} / {} turns used",
+                        session.turns_used(),
+                        session.max_turns()
+                    ),
+                    10.0,
+                    true,
+                    false,
+                ));
+            if !self.agent.provider_label.is_empty() {
+                content =
+                    content.push(self.chrome_label(&self.agent.provider_label, 10.0, true, false));
+            }
+            if let Some(bound) = self.agent.bound_session_id {
+                content = content.push(self.chrome_label(
+                    format!("Bound to terminal {}", bound + 1),
+                    10.0,
+                    true,
+                    false,
+                ));
+            }
+        } else {
+            content = content.push(self.chrome_label(
+                "Ask the assistant to propose shell commands. Review each command before it runs.",
+                10.0,
+                true,
+                false,
+            ));
+        }
+        if !self.agent.status.is_empty() {
+            content = content.push(self.chrome_label(
+                jterm_core::review_input::safe_multiline_display(&self.agent.status, 4096),
+                10.0,
+                true,
+                false,
+            ));
+        }
+        let (assistant_label, assistant_action) = if self.agent.is_open {
+            ("Close assistant", Message::AgentClose)
+        } else if self.config.ai_enabled || self.agent.session.is_some() {
+            (
+                "Open assistant",
+                Message::ReferenceCommand(keybindings::Command::AgentToggle),
+            )
+        } else {
+            (
+                "Configure AI assistant",
+                Message::ReferenceCommand(keybindings::Command::ConfigOpen),
+            )
+        };
+        content = content
+            .push(self.shell_button(assistant_label, assistant_action, false, false))
+            .push(self.chrome_section("PROJECT TASKS"));
+        if self.config.experimental_task_sidebar {
+            let inspector = crate::reference_conversation::observed_inspector(self);
+            content = content
+                .push(self.chrome_label(&inspector.subtitle, 10.0, true, false))
+                .push(self.shell_button("Create task", Message::TaskComposerOpen, false, false))
+                .push(self.shell_button(
+                    "Open task workspace",
+                    Message::TaskPanelToggle,
+                    false,
+                    false,
+                ));
+            if inspector.total > 0 {
+                content = content
+                    .push(self.chrome_label(&inspector.title, 11.0, false, false))
+                    .push(self.chrome_label(&inspector.badge, 10.0, true, false));
+                for (name, value) in &inspector.metadata {
+                    content = content.push(self.chrome_label(
+                        format!("{name} · {value}"),
+                        9.0,
+                        true,
+                        false,
+                    ));
+                }
+                if let Some(step) = &inspector.current_step {
+                    content = content
+                        .push(self.chrome_label(&step.title, 10.0, false, false))
+                        .push(self.chrome_label(&step.detail, 10.0, true, false));
+                }
+            }
+        } else {
+            content = content
+                .push(self.chrome_label(
+                    "Enable the Tasks dashboard in Settings to create isolated project tasks.",
+                    10.0,
+                    true,
+                    false,
+                ))
+                .push(self.shell_button(
+                    "Task settings",
+                    Message::ReferenceCommand(keybindings::Command::ConfigOpen),
+                    false,
+                    false,
+                ));
+        }
+        content = content
+            .push(self.chrome_section("CODING AGENT TERMINALS"))
+            .push(self.chrome_label(
+                "Open an installed provider CLI in a new local tab.",
+                10.0,
+                true,
+                false,
+            ));
+        for provider in agent_task::AgentProvider::ALL {
+            content = content.push(self.shell_button(
+                format!("Open {}", provider.display_name()),
+                Message::AgentLaunch(provider),
+                false,
+                false,
+            ));
+        }
+        content = content.push(self.shell_button(
+            "Saved agent sessions",
+            Message::AgentSessionsToggle,
+            false,
+            false,
+        ));
+        scrollable(container(content).padding(16).width(Length::Fill))
+            .height(Length::Fill)
+            .into()
+    }
+
     fn reference_inspector(&self) -> Element<'_, Message> {
+        let width = self.reference_inspector_width();
+        let tab_width = ((width - 12.0 - 28.0 - 24.0) / 3.0).clamp(1.0, shell::INSPECTOR_TAB_WIDTH);
         let tab = |name: &'static str, value| {
-            button(self.chrome_label(name, 10.0, false, false))
-                .on_press(Message::ReferenceInspector(value))
-                .width(shell::INSPECTOR_TAB_WIDTH)
-                .height(44.0)
-                .padding([4, 5])
-                .style(control(self.reference_inspector_tab == value, false))
+            let content: Element<'_, Message> = if self.chrome_font_size() > 16.0 {
+                vector_icon(
+                    match value {
+                        InspectorTab::Agent => Icon::from_key("agent"),
+                        InspectorTab::Context => Icon::PanelRight,
+                        InspectorTab::Files => Icon::Files,
+                    },
+                    rgb(color::CHROME_TEXT),
+                    16.0,
+                )
+            } else {
+                self.chrome_label(name, 10.0, false, false).into()
+            };
+            tooltip(
+                button(container(content).center_x(Length::Fill))
+                    .on_press(Message::ReferenceInspector(value))
+                    .width(tab_width)
+                    .height(crate::glass_layout::chrome_control_height(
+                        self.chrome_font_size(),
+                    ))
+                    .padding([4, 5])
+                    .style(control(self.reference_inspector_tab == value, false)),
+                self.chrome_label(name, 10.0, false, false),
+                tooltip::Position::Bottom,
+            )
         };
         let header = container(
             row![
@@ -1196,13 +1701,22 @@ impl Frost {
                 tab("Context", InspectorTab::Context),
                 tab("Files", InspectorTab::Files),
                 Space::new().width(Length::Fill),
-                self.chrome_label("⊞", 13.0, true, false)
+                tooltip(
+                    button(vector_icon(Icon::Close, rgb(color::CHROME_MUTED), 14.0))
+                        .on_press(Message::ReferenceInspectorToggle)
+                        .width(28)
+                        .height(28)
+                        .padding(0)
+                        .style(control(false, false)),
+                    self.chrome_label("Close inspector", 10.0, false, false),
+                    tooltip::Position::Left,
+                )
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center),
         )
         .height(72.0_f32.min(self.reference_layout().header.height))
-        .padding([5, 12])
+        .padding([2, 6])
         .align_y(iced::Alignment::Center);
         let body: Element<'_, Message> = match self.reference_inspector_tab {
             InspectorTab::Files => mouse_area(
@@ -1211,40 +1725,7 @@ impl Frost {
             .on_enter(Message::SidebarHover(true))
             .on_exit(Message::SidebarHover(false))
             .into(),
-            InspectorTab::Context => {
-                let session = self.sessions.get(self.active);
-                let cwd = self.reference_cwd();
-                let git = session
-                    .filter(|_| !self.reference_private_title())
-                    .and_then(|s| s.git_meta_cache.as_ref())
-                    .map(jterm_core::git_meta::format_strip)
-                    .unwrap_or_else(|| "No repository context".into());
-                container(
-                    column![
-                        self.chrome_label("SESSION CONTEXT", 9.0, true, false),
-                        self.chrome_label(cwd, 12.0, false, false),
-                        self.chrome_label(git, 10.0, true, false),
-                        self.chrome_label(
-                            format!("{} terminal session(s)", self.sessions.len()),
-                            10.0,
-                            true,
-                            false
-                        ),
-                        self.shell_button("Open native Vim", Message::OpenVim9Ide, false, false),
-                        self.shell_button(
-                            "Agent sessions",
-                            Message::AgentSessionsToggle,
-                            false,
-                            false
-                        )
-                    ]
-                    .spacing(12),
-                )
-                .padding(16)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-            }
+            InspectorTab::Context => self.reference_context_inspector(),
             InspectorTab::Agent
                 if self.config.experimental_task_sidebar
                     && self.sidebar_panel == SidebarPanel::Tasks =>
@@ -1259,22 +1740,21 @@ impl Frost {
             }
             InspectorTab::Agent => {
                 let fixture = jterm_core::reference_conversation::fixture_enabled();
-                let inspector = if fixture {
-                    jterm_core::reference_conversation::acceptance_fixture().inspector
+                if fixture {
+                    crate::reference_conversation::inspector_view(
+                        &jterm_core::reference_conversation::acceptance_fixture().inspector,
+                        true,
+                        self.chrome_font_size(),
+                        self.reference_layout().center.height
+                            - 72.0_f32.min(self.reference_layout().header.height),
+                    )
                 } else {
-                    crate::reference_conversation::observed_inspector(self)
-                };
-                crate::reference_conversation::inspector_view(
-                    &inspector,
-                    fixture,
-                    self.chrome_font_size(),
-                    self.reference_layout().center.height
-                        - 72.0_f32.min(self.reference_layout().header.height),
-                )
+                    self.reference_agent_inspector()
+                }
             }
         };
         container(column![header, body].height(Length::Fill))
-            .width(shell::INSPECTOR_WIDTH)
+            .width(width)
             .height(Length::Fill)
             .style(|theme| {
                 panel(
@@ -1466,30 +1946,31 @@ impl Frost {
 
     fn reference_tools_popover(&self) -> Element<'_, Message> {
         use jterm_core::reference_popup as popup;
-        let rgba = |c: [u8; 4]| Color::from_rgba8(c[0], c[1], c[2], c[3] as f32 / 255.0);
+        let border = self.c_border();
+        let muted = self.c_text_dim();
         let mut rows = column![];
         for (index, item) in popup::COMMANDS.iter().enumerate() {
             if item.separator_before {
                 rows = rows.push(container(Space::new().height(1)).width(Length::Fill).style(
                     move |_| container::Style {
-                        background: Some(rgba(popup::BORDER).into()),
+                        background: Some(border.into()),
                         ..Default::default()
                     },
                 ));
             }
             let selected = self.reference_tools_selection == Some(index);
-            let fg = rgba(if item.placeholder {
-                popup::MUTED
+            let fg = if item.placeholder {
+                muted
             } else {
-                popup::FOREGROUND
-            });
+                self.c_text()
+            };
             let row = button(
                 row![
                     vector_icon(Icon::from_key(item.icon_key), fg, popup::ICON_SIZE),
                     self.chrome_label(item.title, 10.0, false, false).color(fg),
                     Space::new().width(Length::Fill),
                     self.chrome_label(item.description, 9.0, true, false)
-                        .color(rgba(popup::MUTED))
+                        .color(muted)
                 ]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),
@@ -1498,49 +1979,13 @@ impl Frost {
             .width(Length::Fill)
             .padding([5, 7])
             .on_press_maybe((!item.placeholder).then_some(Message::ReferenceToolsChoose(index)))
-            .style(move |_, status| button::Style {
-                background: Some(
-                    rgba(
-                        if selected
-                            || (!item.placeholder
-                                && matches!(
-                                    status,
-                                    button::Status::Hovered | button::Status::Pressed
-                                ))
-                        {
-                            popup::SELECTED
-                        } else {
-                            popup::SURFACE
-                        },
-                    )
-                    .into(),
-                ),
-                text_color: fg,
-                border: iced::Border {
-                    radius: 6.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
+            .style(move |_, status| theme::popup_button_style(&self.theme, selected, status));
             rows = rows.push(mouse_area(row).on_enter(Message::ReferenceToolsSelect(index)));
         }
         let menu = container(rows)
             .width(popup::WIDTH)
             .padding(popup::PADDING)
-            .style(move |_| container::Style {
-                background: Some(rgba(popup::SURFACE).into()),
-                border: iced::Border {
-                    color: rgba(popup::BORDER),
-                    width: 1.0,
-                    radius: popup::RADIUS.into(),
-                },
-                shadow: iced::Shadow {
-                    color: Color::from_rgba(0.02, 0.04, 0.08, 0.22),
-                    offset: iced::Vector::new(0.0, 4.0),
-                    blur_radius: 12.0,
-                },
-                ..Default::default()
-            });
+            .style(self.popup_style());
         let layout = self.reference_layout();
         let left = (layout.center.x + shell::COMPOSER_INSET + 270.0)
             .min((self.win_size.width - popup::WIDTH - 8.0).max(0.0));
@@ -1575,12 +2020,12 @@ impl Frost {
                 if budget.editor.is_some() {
                     container::Style::default()
                 } else {
-                    panel(
-                        theme,
-                        color::TERMINAL,
-                        color::LIGHT_BORDER,
-                        glass::PANEL_RADIUS,
-                    )
+                    container::Style {
+                        background: Some(
+                            shell::rgba(color::TERMINAL, theme.palette().background.a).into(),
+                        ),
+                        ..Default::default()
+                    }
                 }
             });
         let pane = container(terminal)
@@ -1601,7 +2046,7 @@ impl Frost {
                 right: glass::TOOLBAR_INSET_RIGHT,
                 ..iced::Padding::ZERO
             })
-            .height(glass::TOOLBAR_HEIGHT);
+            .height(layout.composer.height);
         let center = container(
             column![
                 self.font_zoom_region(font_zoom::Group::Chrome, self.reference_header()),
@@ -1637,7 +2082,21 @@ impl Frost {
                 .height(Length::Fill),
             );
         }
-        body = body.push(Space::new().width(glass::LEFT_GAP));
+        body = body.push(if layout.navigation.is_some() {
+            column![
+                Space::new().height(glass::MAIN_TOP - glass::TOPBAR_HEIGHT),
+                self.reference_resize_grip(
+                    crate::sidebar_resize::Side::Navigation,
+                    glass::LEFT_GAP
+                ),
+                Space::new().height(main_bottom)
+            ]
+            .width(glass::LEFT_GAP)
+            .height(Length::Fill)
+            .into()
+        } else {
+            Element::from(Space::new().width(glass::LEFT_GAP))
+        });
         body = body.push(
             column![
                 Space::new().height(glass::MAIN_TOP - glass::TOPBAR_HEIGHT),
@@ -1648,7 +2107,18 @@ impl Frost {
             .height(Length::Fill),
         );
         if let Some(inspector) = layout.inspector {
-            body = body.push(Space::new().width(glass::INSPECTOR_GAP));
+            body = body.push(
+                column![
+                    Space::new().height(glass::MAIN_TOP - glass::TOPBAR_HEIGHT),
+                    self.reference_resize_grip(
+                        crate::sidebar_resize::Side::Inspector,
+                        glass::INSPECTOR_GAP
+                    ),
+                    Space::new().height(main_bottom)
+                ]
+                .width(glass::INSPECTOR_GAP)
+                .height(Length::Fill),
+            );
             body = body.push(
                 column![
                     Space::new().height(glass::MAIN_TOP - glass::TOPBAR_HEIGHT),
@@ -1690,16 +2160,23 @@ impl Frost {
                         }),
                 )
                 .padding(iced::Padding {
-                    top: glass::TOPBAR_HEIGHT,
+                    top: layout.titlebar.height,
                     ..iced::Padding::ZERO
                 })
                 .width(Length::Fill)
                 .height(Length::Fill);
                 let inspector = container(
-                    self.font_zoom_region(font_zoom::Group::Chrome, self.reference_inspector()),
+                    row![
+                        self.reference_resize_grip(
+                            crate::sidebar_resize::Side::Inspector,
+                            glass::INSPECTOR_GAP
+                        ),
+                        self.font_zoom_region(font_zoom::Group::Chrome, self.reference_inspector()),
+                    ]
+                    .width(self.reference_inspector_width() + glass::INSPECTOR_GAP),
                 )
                 .padding(iced::Padding {
-                    top: glass::MAIN_TOP,
+                    top: layout.center.y,
                     right: glass::OUTER_RIGHT,
                     bottom: main_bottom,
                     ..iced::Padding::ZERO
@@ -1734,5 +2211,119 @@ impl Frost {
         crate::native_font_probe::observe(crate::native_popup_surface::layers(
             workspace, dismiss, menu,
         ))
+    }
+}
+
+#[cfg(test)]
+mod panel_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_picker_keeps_all_tabs_scrollable_within_the_window() {
+        assert_eq!(
+            tab_switcher_panel_size(Size::new(1280.0, 900.0)),
+            Size::new(420.0, 420.0)
+        );
+        assert_eq!(
+            tab_switcher_panel_size(Size::new(300.0, 240.0)),
+            Size::new(268.0, 208.0)
+        );
+        assert_eq!(
+            tab_switcher_panel_size(Size::new(0.0, 0.0)),
+            Size::new(1.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn private_context_never_exposes_a_command_or_a_copy_payload() {
+        let command = "deploy --token=private /sensitive/workspace";
+        assert_eq!(context_command(true, Some(command)), None);
+        assert_eq!(context_command(false, None), None);
+        assert_eq!(context_command(false, Some("  ")), None);
+        assert_eq!(
+            context_command(false, Some("cargo test")),
+            Some("cargo test".into())
+        );
+    }
+
+    #[test]
+    fn context_command_bounds_unicode_and_makes_controls_visible() {
+        let rendered = context_command(false, Some("echo safe\u{202e}\n\u{1b}hidden")).unwrap();
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(rendered.contains('\u{fffd}'));
+        let rendered = context_command(false, Some(&"界".repeat(4096))).unwrap();
+        assert!(rendered.len() <= 4096);
+        assert!(rendered.ends_with('…'));
+    }
+
+    #[test]
+    fn context_copy_rejects_stale_private_remote_and_changed_values() {
+        let current = Some("/workspace/project".to_owned());
+        assert_eq!(
+            context_copy_value(2, 2, false, false, "/workspace/project", current.clone()),
+            current
+        );
+        assert_eq!(
+            context_copy_value(2, 3, false, false, "/workspace/project", current.clone()),
+            None
+        );
+        assert_eq!(
+            context_copy_value(2, 2, true, false, "/workspace/project", current.clone()),
+            None
+        );
+        assert_eq!(
+            context_copy_value(2, 2, false, true, "/workspace/project", current.clone()),
+            None
+        );
+        assert_eq!(
+            context_copy_value(2, 2, false, false, "/old/project", current),
+            None
+        );
+        assert_eq!(
+            context_copy_value(2, 2, false, false, "/workspace/project", None),
+            None
+        );
+    }
+
+    #[test]
+    fn context_distinguishes_unknown_exit_from_success_and_failure() {
+        assert_eq!(context_exit_label(None, None), "No recorded command exit");
+        assert_eq!(
+            context_exit_label(Some(0), Some(1250)),
+            "Last command succeeded · exit 0 · 1.25s"
+        );
+        assert_eq!(
+            context_exit_label(Some(7), None),
+            "Last command exited with 7"
+        );
+    }
+
+    #[test]
+    fn assistant_activity_tracks_real_approval_and_completion_states() {
+        let mut session = jterm_core::agent::AgentSession::new(4);
+        assert_eq!(assistant_state_label(session.state()), "Ready for a task");
+        session.submit_user("inspect the directory").unwrap();
+        assert_eq!(
+            assistant_state_label(session.state()),
+            "Waiting for the model"
+        );
+        session
+            .accept_model_reply(r#"{"action":"run","command":"pwd"}"#)
+            .unwrap();
+        assert_eq!(
+            assistant_state_label(session.state()),
+            "Command awaiting your approval"
+        );
+        session.cancel();
+        assert_eq!(assistant_state_label(session.state()), "Session cancelled");
+
+        let mut completed = jterm_core::agent::AgentSession::new(4);
+        completed.submit_user("finish").unwrap();
+        completed
+            .accept_model_reply(r#"{"action":"done","message":"complete"}"#)
+            .unwrap();
+        assert_eq!(assistant_state_label(completed.state()), "Task completed");
     }
 }

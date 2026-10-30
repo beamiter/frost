@@ -149,34 +149,43 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         limits: &layout::Limits,
     ) -> layout::Node {
         let size = limits.max();
-        debug_assert!(
-            (size.height
-                - self.input_height()
-                - if self.dock.is_some() {
-                    crate::glass_shell_tokens::TERMINAL_FOOTER_GAP
-                } else {
-                    0.0
-                }
-                - self.native_height)
-                .abs()
-                < 0.01
+        // Iced can relayout the retained view at new window constraints before
+        // its Resize message rebuilds the model budget. Partition these actual
+        // bounds with the same clips used by drawing and pointer/IME routing.
+        // The next view still computes the PTY from the one shared budget.
+        let (history_clip, input_clip) = clips(
+            Rectangle {
+                width: size.width,
+                height: size.height,
+                ..Rectangle::default()
+            },
+            self.input_height(),
         );
-        let native_size = Size::new(size.width, self.native_height);
+        let gap = input_clip.y - history_clip.height;
+        debug_assert!(
+            (history_clip.height + gap + input_clip.height - size.height).abs() < 0.01,
+            "native/input clips must partition the allocated surface"
+        );
+        let native_size = Size::new(size.width, history_clip.height);
         let terminal = self.terminal.as_widget_mut().layout(
             &mut tree.children[0],
             renderer,
             &layout::Limits::new(native_size, native_size),
         );
-        log::debug!(target: "frost::reference_tools", "native_surface canonical={:?} outer={:?}", terminal.bounds(), size);
-        let shift = self.dock.map_or(0.0, |dock| {
-            (size.height - dock.input_height).max(0.0) + dock.vertical_padding - dock.y
-        });
-        // The canonical native child keeps this origin and stable raw height
-        // through Prompt/Running/TUI. Only a proven prompt's dock paint/IME
+        debug_assert!(
+            (terminal.bounds().height - history_clip.height).abs() < 0.01,
+            "retained native child must use its allocated history height"
+        );
+        log::debug!(target: "frost::reference_tools", "native_surface canonical={:?} outer={:?} requested_native_height={}", terminal.bounds(), size, self.native_height);
+        let shift = self
+            .dock
+            .map_or(0.0, |dock| input_clip.y + dock.vertical_padding - dock.y);
+        // The canonical native child keeps this origin through
+        // Prompt/Running/TUI. Only a proven prompt's dock paint/IME
         // layout is translated; no native child or input owner is recreated.
         let dock = terminal.clone().translate(Vector::new(0.0, shift));
         let mut nodes = vec![terminal, dock];
-        let history_height = self.native_height;
+        let history_height = history_clip.height;
         if let Some(history) = &mut self.history {
             let history_size = Size::new(size.width, history_height);
             nodes.push(history.as_widget_mut().layout(
@@ -210,7 +219,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
                                     crate::glass_profile::color::LIGHT_BORDER,
                                     theme.palette().background.a,
                                 ),
-                                width: 1.0,
+                                width: 0.0,
                                 radius: crate::glass_shell_tokens::PANEL_RADIUS.into(),
                             },
                             ..Default::default()
@@ -262,10 +271,10 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
                         bounds: input_clip,
                         border: iced::Border {
                             color: crate::native_shell::composer_border_color(),
-                            width: 1.0,
+                            width: 0.0,
                             radius: iced::border::Radius {
-                                top_left: 14.0,
-                                top_right: 14.0,
+                                top_left: crate::glass_shell_tokens::PANEL_RADIUS,
+                                top_right: crate::glass_shell_tokens::PANEL_RADIUS,
                                 bottom_left: 0.0,
                                 bottom_right: 0.0,
                             },
@@ -590,18 +599,46 @@ mod tests {
     #[test]
     fn no_dock_allocates_no_editor_or_phantom_floating_gap() {
         let bounds = Rectangle {
-            x: 365.0,
-            y: 171.0,
-            width: 859.0,
-            height: 648.0,
+            x: 282.0,
+            y: 90.0,
+            width: 1024.0,
+            height: 830.0,
         };
         let (history, input) = clips(bounds, 0.0);
         assert_eq!(history, bounds);
         assert_eq!(input.height, 0.0);
         let (history, input) = clips(bounds, 180.0);
-        assert_eq!(history.y + history.height + 13.0, input.y);
+        assert_eq!(
+            history.y + history.height + crate::glass_shell_tokens::TERMINAL_FOOTER_GAP,
+            input.y
+        );
         assert_eq!(input.height, 180.0);
         assert_eq!(input.y + input.height, bounds.y + bounds.height);
+    }
+
+    #[test]
+    fn retained_prompt_clips_partition_new_window_constraints_during_resize() {
+        // The retained view can still carry a 180px draft while Iced applies
+        // the smaller window limits, before the model receives Resize.
+        for height in [0.0, 20.0, 44.0, 100.0, 250.0, 535.0, 830.0] {
+            for requested_input in [0.0, 44.0, 180.0] {
+                let bounds = Rectangle {
+                    x: 8.0,
+                    y: 90.0,
+                    width: 506.0,
+                    height,
+                };
+                let (history, input) = clips(bounds, requested_input);
+                let gap = input.y - history.y - history.height;
+                assert!(history.height >= 0.0 && input.height >= 0.0);
+                assert!(gap >= 0.0);
+                assert!(gap <= crate::glass_shell_tokens::TERMINAL_FOOTER_GAP);
+                assert_eq!(history.height + gap + input.height, height);
+                assert_eq!(input.y + input.height, bounds.y + bounds.height);
+                assert_eq!(history.width, input.width);
+                assert!(input.height <= requested_input);
+            }
+        }
     }
 
     #[test]

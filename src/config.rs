@@ -276,6 +276,13 @@ pub struct Config {
     #[serde(default = "default_scrollback_lines")]
     pub scrollback_lines: usize,
 
+    /// Preferred navigation/inspector widths. Missing legacy values keep the
+    /// responsive glass defaults; narrow windows do not rewrite preferences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_width: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspector_width: Option<f32>,
+
     #[serde(default = "default_initial_width")]
     pub initial_width: f32,
 
@@ -700,6 +707,8 @@ impl Default for Config {
             scrollbar_visibility: ScrollbarVisibility::default(),
             tab_position: TabPosition::default(),
             scrollback_lines: default_scrollback_lines(),
+            sidebar_width: None,
+            inspector_width: None,
             initial_width: default_initial_width(),
             initial_height: default_initial_height(),
             cols: default_cols(),
@@ -772,6 +781,12 @@ impl Config {
         self.opacity = Self::clamp_opacity(self.opacity);
         self.font_weight = finite_clamp(self.font_weight, default_font_weight(), 0.1, 2.0);
         self.font_sharpness = finite_clamp(self.font_sharpness, default_font_sharpness(), 0.1, 2.0);
+        self.sidebar_width = self
+            .sidebar_width
+            .and_then(crate::glass_layout::sidebar_width);
+        self.inspector_width = self
+            .inspector_width
+            .and_then(crate::glass_layout::inspector_width);
         self.initial_width =
             finite_clamp(self.initial_width, default_initial_width(), 320.0, 16_384.0);
         self.initial_height = finite_clamp(
@@ -1311,6 +1326,32 @@ pub fn create_default_config() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sidebar_width_preferences_default_safely_normalize_and_round_trip() {
+        let legacy = super::Config::from_toml("").unwrap();
+        assert_eq!(legacy.sidebar_width, None);
+        assert_eq!(legacy.inspector_width, None);
+        let custom =
+            super::Config::from_toml("sidebar_width = 400.0\ninspector_width = 490.0").unwrap();
+        let reloaded = super::Config::from_toml(&toml::to_string(&custom).unwrap()).unwrap();
+        assert_eq!(reloaded.sidebar_width, Some(400.0));
+        assert_eq!(reloaded.inspector_width, Some(490.0));
+        let bounded =
+            super::Config::from_toml("sidebar_width = -1.0\ninspector_width = 99999.0").unwrap();
+        assert_eq!(
+            bounded.sidebar_width,
+            Some(crate::glass_layout::MIN_SIDEBAR_WIDTH)
+        );
+        assert_eq!(
+            bounded.inspector_width,
+            Some(crate::glass_layout::MAX_INSPECTOR_WIDTH)
+        );
+        let invalid =
+            super::Config::from_toml("sidebar_width = nan\ninspector_width = inf").unwrap();
+        assert_eq!(invalid.sidebar_width, None);
+        assert_eq!(invalid.inspector_width, None);
+    }
+
     #[test]
     fn vim9_buffer_defaults_are_independent_from_optional_workbench_chrome() {
         for config in [

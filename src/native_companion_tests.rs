@@ -447,19 +447,23 @@ fn companion_height_is_stable_and_tiny_terminal_viewports_are_nonnegative() {
 #[test]
 fn expanded_companion_reuses_one_snapshot_and_shared_geometry() {
     for (width, height, expected) in [
-        (1612.0, 976.0, (365.0, 171.0, 859.0, 648.0)),
-        (1356.0, 704.0, (365.0, 151.0, 603.0, 430.0)),
+        (1612.0, 976.0, (282.0, 90.0, 1024.0, 830.0)),
+        (1356.0, 704.0, (282.0, 90.0, 768.0, 558.0)),
+        (800.0, 640.0, (282.0, 90.0, 506.0, 494.0)),
     ] {
         let layout = crate::glass_layout::Layout::for_size(width, height);
         let raw = crate::native_viewport::raw_rect(layout, 0.0, 0.0, None);
         assert_eq!((raw.x, raw.y, raw.width, raw.height), expected);
-        assert_eq!(raw.bottom() + 13.0, layout.composer.y);
+        assert_eq!(
+            raw.bottom() + crate::glass_shell_tokens::TERMINAL_FOOTER_GAP,
+            layout.composer.y
+        );
     }
     assert_eq!(crate::native_viewport::INPUT_STRIP_HEIGHT, 44.0);
-    assert_eq!(crate::native_viewport::TOOLS_HEIGHT, 98.0);
+    assert_eq!(crate::native_viewport::TOOLS_HEIGHT, 44.0);
     assert_eq!(
         crate::native_viewport::INPUT_STRIP_HEIGHT + crate::native_viewport::TOOLS_HEIGHT,
-        142.0
+        88.0
     );
     with_widget(|widget, bounds, _| {
         let state = tree(widget);
@@ -469,6 +473,61 @@ fn expanded_companion_reuses_one_snapshot_and_shared_geometry() {
         paint(widget, &state, bounds, bounds);
         assert_eq!(widget.organism_geometry(bounds, &bounds), Some(body));
     });
+}
+
+#[test]
+fn compact_chrome_returns_native_rows_and_columns_at_the_same_terminal_font() {
+    // Previous native content rectangles, including the existing sidebar state.
+    // These baselines make a geometry regression fail even if paint and PTY
+    // accidentally agree on a newly oversized chrome budget.
+    for (width, height, previous_width, previous_height) in [
+        (1612.0, 976.0, 859.0, 648.0),
+        (1356.0, 704.0, 603.0, 430.0),
+        (800.0, 640.0, 456.0, 366.0),
+        (700.0, 400.0, 356.0, 126.0),
+    ] {
+        let layout = crate::glass_layout::Layout::for_size(width, height);
+        for font in [14.0, 36.0, 72.0] {
+            let metrics = Metrics::new(font, 1.0, 2.0, false);
+            for requested in [None, Some(44.0_f32), Some(180.0_f32)] {
+                let native = crate::native_viewport::native_budget(layout, 0.0, 0.0, requested);
+                let previous_input = requested.map_or(0.0, |input| {
+                    input.min((previous_height * 0.45_f32).clamp(44.0, 180.0))
+                });
+                let previous_native_height = previous_height - previous_input;
+                let old_grid = metrics.grid_size(
+                    (previous_width - SCROLLBAR_WIDTH).max(0.0),
+                    previous_native_height,
+                );
+                let grid = metrics.grid_size(
+                    (native.raw.width - SCROLLBAR_WIDTH).max(0.0),
+                    native.raw.height,
+                );
+                assert!(native.raw.width > previous_width);
+                assert!(native.raw.height > previous_native_height);
+                assert!(
+                    grid.0 > old_grid.0,
+                    "columns at {width}×{height}, font {font}, input {requested:?}"
+                );
+                assert!(
+                    grid.1 >= old_grid.1,
+                    "rows at {width}×{height}, font {font}, input {requested:?}"
+                );
+                if requested.is_none() {
+                    assert!(grid.1 > old_grid.1, "direct native rows at font {font}");
+                }
+                if let Some(editor) = native.editor {
+                    assert_eq!(editor.width, native.raw.width);
+                    assert_eq!(
+                        native.raw.bottom() + crate::glass_shell_tokens::TERMINAL_FOOTER_GAP,
+                        editor.y
+                    );
+                    assert_eq!(editor.bottom(), layout.composer.y);
+                    assert!(editor.height <= crate::glass_layout::MAX_INPUT_HEIGHT);
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -621,7 +680,10 @@ fn ui_scale_change_resizes_logical_viewport_and_terminal_grid() {
         let raw = crate::native_viewport::raw_rect(layout, 0.0, 0.0, None);
         let grid = metrics.grid_size((raw.width - SCROLLBAR_WIDTH).max(0.0), raw.height);
         assert!(grid.0 >= 2 && grid.1 >= 1);
-        assert_eq!(raw.bottom() + 13.0, layout.composer.y);
+        assert_eq!(
+            raw.bottom() + crate::glass_shell_tokens::TERMINAL_FOOTER_GAP,
+            layout.composer.y
+        );
         // Side panel thresholds can add width, so monotone columns are not an oracle.
         assert!(raw.width <= scaled.width && raw.height <= scaled.height);
     }
@@ -635,10 +697,10 @@ fn disabling_the_bottom_bar_returns_its_rows_to_the_grid() {
     // Native Block and Chat fallback have no editor; a retained Chat prompt
     // reserves its actual editor height above the same fixed glass tool row.
     for (mode, input_height, expected_height, expected_bottom) in [
-        (crate::config::TerminalMode::Block, None, 430.0, 581.0),
-        (crate::config::TerminalMode::Chat, None, 430.0, 581.0),
-        (crate::config::TerminalMode::Chat, Some(44.0), 386.0, 537.0),
-        (crate::config::TerminalMode::Chat, Some(180.0), 250.0, 401.0),
+        (crate::config::TerminalMode::Block, None, 558.0, 648.0),
+        (crate::config::TerminalMode::Chat, None, 558.0, 648.0),
+        (crate::config::TerminalMode::Chat, Some(44.0), 514.0, 604.0),
+        (crate::config::TerminalMode::Chat, Some(180.0), 378.0, 468.0),
     ] {
         let expected = crate::native_viewport::raw_rect(layout, 0.0, 0.0, input_height);
         for bottom_bar in [false, true] {
@@ -659,7 +721,9 @@ fn disabling_the_bottom_bar_returns_its_rows_to_the_grid() {
             assert_eq!(expected.height, expected_height);
             assert_eq!(expected.bottom(), expected_bottom);
             assert_eq!(
-                expected.bottom() + 13.0 + input_height.unwrap_or(0.0),
+                expected.bottom()
+                    + crate::glass_shell_tokens::TERMINAL_FOOTER_GAP
+                    + input_height.unwrap_or(0.0),
                 layout.composer.y
             );
         }

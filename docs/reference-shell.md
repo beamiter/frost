@@ -1,5 +1,9 @@
 # Native workspace shell
 
+The current local compact profile and native budget are documented in
+[Compact native workspace](compact-shell.md). The measurements below record the
+earlier shared reference implementation and its acceptance history.
+
 Frost binds `jterm_core::reference_shell` to Iced widgets. The contract was
 measured from the supplied 1448 × 1086 JPEG by the supervising task; the
 implementation task did not obtain original image pixels. Pixel-level visual

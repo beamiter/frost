@@ -80,6 +80,7 @@ mod search_replace;
 mod search_replace_panel;
 mod session_persistence;
 mod sidebar;
+mod sidebar_resize;
 mod terminal;
 mod terminal_ime;
 mod terminal_view;
@@ -120,6 +121,13 @@ fn history_picker_panel_size(window: Size, visible_results: usize) -> Size {
     Size::new(
         (window.width - 24.0).clamp(1.0, 560.0),
         (window.height - 24.0).clamp(1.0, list_height + 160.0),
+    )
+}
+
+fn tab_switcher_panel_size(window: Size) -> Size {
+    Size::new(
+        (window.width - 32.0).clamp(1.0, 420.0),
+        (window.height - 32.0).clamp(1.0, 420.0),
     )
 }
 
@@ -4557,6 +4565,7 @@ fn main() -> iced::Result {
 enum Message {
     ReferenceInspector(native_shell::InspectorTab),
     ReferenceInspectorToggle,
+    SidebarResize(sidebar_resize::Side, sidebar_resize::Action),
     ReferenceCommand(keybindings::Command),
     ReferencePalette,
     ReferenceToolsToggle,
@@ -4564,6 +4573,8 @@ enum Message {
     ReferenceToolsSelect(usize),
     ReferenceToolsChoose(usize),
     ReferenceCopy(String),
+    ReferenceContextCopy(native_shell::ContextCopy),
+    ReferenceWorkspaceToggle,
     ReferenceFocusTerminal,
     TranscriptPause(usize, u64),
     TranscriptScroll(usize, u64, f64, bool),
@@ -6914,8 +6925,8 @@ struct Frost {
     sidebar_panel: SidebarPanel,
     /// Current dock width in pixels (drag-resizable).
     dock_width: f32,
-    /// Whether the sidebar-resize divider is being dragged.
-    dragging_sidebar: bool,
+    /// Pointer-only sidebar resize. It never changes keyboard/IME focus.
+    sidebar_resize: Option<sidebar_resize::Drag>,
     /// Right-click file-ops menu of the file tree (floating, pointer-anchored).
     sidebar_menu: Option<SidebarMenuState>,
     /// Modal New File / New Folder / Rename input of the file tree.
@@ -7255,7 +7266,7 @@ impl Frost {
             sidebar_open,
             sidebar_panel,
             dock_width: jterm_core::reference_shell::INSPECTOR_WIDTH,
-            dragging_sidebar: false,
+            sidebar_resize: None,
             sidebar_menu: None,
             sidebar_dialog: None,
             sidebar_delete_confirm: None,
@@ -7365,14 +7376,7 @@ impl Frost {
     fn iced_theme(&self) -> iced::Theme {
         iced::Theme::custom(
             "frost".to_string(),
-            iced::theme::Palette {
-                background: self.with_window_opacity(self.theme.terminal_background()),
-                text: self.theme.terminal_foreground(),
-                primary: self.theme.cursor_color(),
-                success: self.theme.ansi_color(2),
-                warning: self.theme.ansi_color(3),
-                danger: self.theme.ansi_color(1),
-            },
+            theme::chrome_palette(&self.theme, self.config.opacity),
         )
     }
 
@@ -7489,6 +7493,8 @@ impl Frost {
     /// Single re-apply path for live config changes (Set*, Reset, hot reload):
     /// re-resolve the theme, rebuild metrics, and regrid every session.
     fn apply_config(&mut self) {
+        self.finish_sidebar_resize();
+        self.dock_width = self.reference_inspector_width();
         for gesture in change_terminal_interaction_mode(
             &mut self.terminal_interaction_mode,
             self.config.effective_terminal_mode(),
@@ -7817,7 +7823,70 @@ impl Frost {
 
     /// Reflow the existing sessions after an inspector geometry change without
     /// reapplying config, clearing selections or replacing terminal widgets.
+    fn finish_sidebar_resize(&mut self) {
+        if self.sidebar_resize.take().is_some_and(|drag| drag.moved) {
+            self.persist_live_config();
+        }
+    }
+
+    fn resize_sidebar(&mut self, side: sidebar_resize::Side, action: sidebar_resize::Action) {
+        use sidebar_resize::{Action, Drag, Side};
+        match action {
+            Action::Start(pointer) => {
+                if !self.focused || !self.terminal_mouse_active() {
+                    return;
+                }
+                let layout = self.reference_layout();
+                let width = match side {
+                    Side::Navigation => layout.navigation.map(|panel| panel.width),
+                    Side::Inspector => self
+                        .reference_inspector_visible()
+                        .then(|| self.reference_inspector_width()),
+                };
+                if let Some(width) = width {
+                    self.cancel_layout_drags();
+                    self.sidebar_resize = Drag::new(side, pointer, width);
+                }
+            }
+            Action::Move(pointer) => {
+                let Some(mut drag) = self.sidebar_resize.filter(|drag| drag.side == side) else {
+                    return;
+                };
+                let layout = self.reference_layout();
+                let available = match side {
+                    Side::Navigation => {
+                        layout.navigation.map(|panel| panel.width).unwrap_or(0.0)
+                            + (layout.center.width - glass_layout::MIN_CENTER_WIDTH).max(0.0)
+                    }
+                    Side::Inspector if layout.inspector.is_some() => {
+                        layout.inspector.map(|panel| panel.width).unwrap_or(0.0)
+                            + (layout.center.width - glass_layout::MIN_CENTER_WIDTH).max(0.0)
+                    }
+                    Side::Inspector => (self.win_size.width
+                        - glass_shell_tokens::OUTER_LEFT
+                        - glass_shell_tokens::OUTER_RIGHT
+                        - glass_shell_tokens::INSPECTOR_GAP)
+                        .max(0.0),
+                };
+                if let Some(width) = drag.width_at(pointer, available) {
+                    let setting = match side {
+                        Side::Navigation => &mut self.config.sidebar_width,
+                        Side::Inspector => &mut self.config.inspector_width,
+                    };
+                    if *setting != Some(width) {
+                        *setting = Some(width);
+                        self.config_dirty = true;
+                        self.sync_reference_inspector_geometry();
+                    }
+                }
+                self.sidebar_resize = Some(drag);
+            }
+            Action::End => self.finish_sidebar_resize(),
+        }
+    }
+
     fn sync_reference_inspector_geometry(&mut self) {
+        self.dock_width = self.reference_inspector_width();
         self.sync_organism_geometry();
         let term_w = (self.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
         let (cols, rows) = self.metrics.grid_size(term_w, self.term_height());
@@ -7917,7 +7986,8 @@ impl Frost {
     /// Search is intentionally non-modal for scrolling/selection. The remaining
     /// overlays block pointer actions from reaching panes underneath them.
     fn terminal_mouse_active(&self) -> bool {
-        !self.search_replace.is_open
+        self.sidebar_resize.is_none()
+            && !self.search_replace.is_open
             && !self.agent_sessions.open
             && !self.palette.is_open
             && self.reference_tools_selection.is_none()
@@ -8547,6 +8617,7 @@ impl Frost {
     /// Keeping this in one place makes the toolbar, shortcut, and command
     /// palette behave identically.
     fn toggle_sidebar(&mut self) -> Task<Message> {
+        self.finish_sidebar_resize();
         self.task_panel.retire_panel_callbacks();
         self.task_panel.input_focused = false;
         // Hiding or showing the dock ends the Hidden tasks browsing mode.
@@ -10533,7 +10604,7 @@ impl Frost {
         self.pane_drag = None;
         self.dragging_divider = None;
         self.hovered_divider = None;
-        self.dragging_sidebar = false;
+        self.finish_sidebar_resize();
     }
 
     /// Commit the current split-pane → ordinary-tab drop. `after_tab_id` is
@@ -16318,6 +16389,19 @@ impl Frost {
                 });
             }
             Message::ReferenceCopy(value) => return iced::clipboard::write(value),
+            Message::ReferenceContextCopy(request) => {
+                if let Some(value) = self.reference_context_copy(request) {
+                    return iced::clipboard::write(value);
+                }
+            }
+            Message::ReferenceWorkspaceToggle => {
+                self.native_enter_ownership.lock().claim_held();
+                self.reference_tools_selection = None;
+                if self.tab_switcher.take().is_none() {
+                    self.tab_switcher = Some(TabSwitcherState::default());
+                    return iced::widget::operation::focus(TAB_SWITCHER_INPUT_ID.clone());
+                }
+            }
             Message::ReferenceFocusTerminal => {
                 self.reference_tools_selection = None;
                 self.sidebar_files_focused = false;
@@ -16339,7 +16423,9 @@ impl Frost {
                     return iced::widget::operation::focus(PALETTE_INPUT_ID.clone());
                 }
             }
+            Message::SidebarResize(side, action) => self.resize_sidebar(side, action),
             Message::ReferenceInspectorToggle => {
+                self.finish_sidebar_resize();
                 self.trace_reference_inspector("toggle-before");
                 self.task_panel.retire_panel_callbacks();
                 self.task_panel.input_focused = false;
@@ -16357,6 +16443,7 @@ impl Frost {
                 ));
             }
             Message::ReferenceInspector(tab) => {
+                self.finish_sidebar_resize();
                 self.task_panel.retire_panel_callbacks();
                 self.task_panel.input_focused = false;
                 self.sidebar_files_focused = false;
@@ -19136,12 +19223,14 @@ impl Frost {
                 }
             }
             Message::Resized(size) => {
+                self.finish_sidebar_resize();
                 self.glass_geometry_ready = true;
                 let search_was_compact = block_search_layout::compact(
                     block_search_layout::panel_size(self.win_size),
                     self.effective_font_size(),
                 );
                 self.win_size = size;
+                self.dock_width = self.reference_inspector_width();
                 self.sync_organism_geometry();
                 let term_h = self.term_height();
                 let term_w = (self.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
@@ -21365,6 +21454,16 @@ impl Frost {
         }
     }
 
+    fn popup_picker_style(&self) -> impl Fn(&iced::Theme, pick_list::Status) -> pick_list::Style {
+        let theme = self.theme.clone();
+        move |_, status| theme::popup_picker_style(&theme, status)
+    }
+
+    fn popup_menu_style(&self) -> impl Fn(&iced::Theme) -> iced::overlay::menu::Style {
+        let style = theme::popup_menu_style(&self.theme);
+        move |_| style
+    }
+
     fn popup_text<'a>(
         &self,
         content: impl iced::widget::text::IntoFragment<'a>,
@@ -21506,25 +21605,8 @@ impl Frost {
 
     /// Flat button (toggles, file rows, "+ New"): transparent, accent on hover.
     fn ghost_btn_style(&self) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
-        let base = self.c_panel();
-        let accent = self.c_accent();
-        let text = self.c_text();
-        move |_t, status| {
-            let bg = match status {
-                button::Status::Hovered => Some(blend(base, accent, 0.16).into()),
-                _ => None,
-            };
-            button::Style {
-                background: bg,
-                text_color: text,
-                border: iced::Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: 4.0.into(),
-                },
-                ..Default::default()
-            }
-        }
+        let theme = self.theme.clone();
+        move |_, status| theme::popup_button_style(&theme, false, status)
     }
 
     fn chat_running_status(&self) -> Option<(usize, u64, u64)> {
@@ -22218,7 +22300,7 @@ impl Frost {
         let panel = container(content)
             .width(Length::Fixed(panel_width))
             .padding([8, 12])
-            .style(container::dark);
+            .style(self.popup_style());
         container(panel)
             .align_right(Length::Fill)
             .align_top(Length::Fill)
@@ -22281,10 +22363,11 @@ impl Frost {
             }
         }
 
-        let body = column![query_line, list].spacing(8);
+        let body = column![query_line, scrollable(list).height(Length::Fill)].spacing(8);
+        let size = tab_switcher_panel_size(self.win_size);
         let panel = container(body)
-            .width(Length::Fixed(420.0))
-            .max_height(420.0)
+            .width(size.width)
+            .height(size.height)
             .padding(12)
             .style(self.popup_style());
         let dismiss = mouse_area(
@@ -23362,7 +23445,7 @@ impl Frost {
             .max_height(panel_size.height)
             .height(Length::Fixed(panel_size.height))
             .padding(12)
-            .style(container::dark);
+            .style(self.popup_style());
         let dismiss = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -23417,7 +23500,7 @@ impl Frost {
             .delay(std::time::Duration::from_millis(500))
             .gap(4)
             .padding(6)
-            .style(container::dark)
+            .style(self.popup_style())
         };
         let live_ids: Vec<_> = sess.terminal.command_zones.iter().map(|z| z.id).collect();
         let content: Element<'_, Message> = if sess.terminal.is_alt_buffer_active() {
@@ -23436,7 +23519,7 @@ impl Frost {
             .delay(std::time::Duration::from_millis(500))
             .gap(4)
             .padding(6)
-            .style(container::dark)
+            .style(self.popup_style())
             .into()
         } else {
             let status_label = if compact {
@@ -23471,7 +23554,7 @@ impl Frost {
             .delay(std::time::Duration::from_millis(500))
             .gap(4)
             .padding(6)
-            .style(container::dark);
+            .style(self.popup_style());
             let back = sess.block_reading.can_navigate(&live_ids, true);
             let forward = sess.block_reading.can_navigate(&live_ids, false);
             let has_blocks = !live_ids.is_empty();
@@ -23502,13 +23585,14 @@ impl Frost {
                         pick_list(actions, None::<&str>, move |action| {
                             Message::BlockReadingMenuAction(session_id, action)
                         })
+                        .menu_style(self.popup_menu_style())
                         .on_open(Message::BlockReadingMenuOpened(session_id))
                         .on_close(Message::BlockReadingMenuClosed)
                         .placeholder("Actions")
                         .text_size(font_size)
                         .padding([3, 7])
-                        .style(move |theme, status| {
-                            let mut style = pick_list::default(theme, status);
+                        .style(move |_, status| {
+                            let mut style = theme::popup_picker_style(&self.theme, status);
                             style.placeholder_color = self.c_text();
                             style
                         }),
@@ -23956,7 +24040,7 @@ impl Frost {
             .padding(18)
             .width(Length::Fixed(panel_size.width))
             .height(Length::Fixed(panel_size.height))
-            .style(container::dark);
+            .style(self.popup_style());
         let backdrop = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -24652,7 +24736,7 @@ impl Frost {
             dragging: self.dragging_tab.is_some()
                 || self.pane_drag.is_some()
                 || self.dragging_divider.is_some()
-                || self.dragging_sidebar,
+                || self.sidebar_resize.is_some(),
             application_gesture: self.terminal_mouse_gestures.iter().any(Option::is_some),
             running: self
                 .sessions
@@ -25215,7 +25299,7 @@ impl Frost {
             dragging: self.dragging_tab.is_some()
                 || self.pane_drag.is_some()
                 || self.dragging_divider.is_some()
-                || self.dragging_sidebar,
+                || self.sidebar_resize.is_some(),
             application_gesture: self.terminal_mouse_gestures.iter().any(Option::is_some),
             selected: session.terminal.has_text_selection(),
             mouse_reporting: session.terminal.is_mouse_enabled(),
@@ -25942,6 +26026,8 @@ impl Frost {
             let picker = pick_list(choices, selected, move |choice| {
                 Message::SidebarSetLocation(hosts_epoch, choice.location)
             })
+            .style(self.popup_picker_style())
+            .menu_style(self.popup_menu_style())
             .text_size(self.chrome_font_size())
             .width(Length::Fill);
             rows.push(container(picker).padding([0, 6]).into());
@@ -26952,7 +27038,12 @@ impl Frost {
         );
         // Resize grips sit above everything, including the overlays: the
         // window border has to stay grabbable whatever panel is open.
-        stack![root, self.window_resize_edges()].into()
+        let capture: Element<'_, Message> = if let Some(drag) = self.sidebar_resize {
+            sidebar_resize::capture(move |action| Message::SidebarResize(drag.side, action))
+        } else {
+            Space::new().width(0).height(0).into()
+        };
+        stack![root, capture, self.window_resize_edges()].into()
     }
 
     /// Search bar overlaid at the top-right of the terminal. The query is an
@@ -27047,7 +27138,9 @@ impl Frost {
                 .align_y(iced::Alignment::Center),
             );
         }
-        let inner = container(content).padding([4, 10]).style(container::dark);
+        let inner = container(content)
+            .padding([4, 10])
+            .style(self.popup_style());
         container(inner)
             .align_right(Length::Fill)
             .align_top(Length::Fill)
@@ -27146,7 +27239,7 @@ impl Frost {
         let panel = container(body)
             .width(Length::Fixed(panel_width))
             .padding(12)
-            .style(container::dark);
+            .style(self.popup_style());
         let dismiss = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -27350,9 +27443,14 @@ impl Frost {
                 self.config.ascii_organism_expanded,
             ) }).size(self.effective_font_size()),
             text("Organism Motion").size(self.effective_font_size()),
-            pick_list(organism::MotionChoice::ALL,
+            pick_list(
+                organism::MotionChoice::ALL,
                 Some(organism::MotionChoice::from_config(self.config.ascii_organism_motion)),
-                Message::SetOrganismMotion).text_size(self.effective_font_size()),
+                Message::SetOrganismMotion,
+            )
+            .style(self.popup_picker_style())
+            .menu_style(self.popup_menu_style())
+            .text_size(self.effective_font_size()),
             text(self.organism_motion_description()).size(self.effective_font_size()),
             text(motion.description()).size(self.effective_font_size()),
             text(motion.interaction_hint()).size(self.effective_font_size()),
@@ -27375,7 +27473,10 @@ impl Frost {
                 .on_press_maybe(self.config.ascii_organism_care_enabled.then_some(Message::OrganismCareSnooze)),
             text("Organism Preview").size(self.effective_font_size()),
             text("Pose").size(self.effective_font_size()),
-            pick_list(poses, Some(self.organism.pose), Message::SetOrganismPose).text_size(self.effective_font_size()),
+            pick_list(poses, Some(self.organism.pose), Message::SetOrganismPose)
+                .style(self.popup_picker_style())
+                .menu_style(self.popup_menu_style())
+                .text_size(self.effective_font_size()),
             container(text(preview.sprite)
                 .font(self.mono).size(13))
                 .width(Length::Fixed(200.0)).height(Length::Fixed(72.0)),
@@ -27414,6 +27515,8 @@ impl Frost {
         };
 
         let theme_picker = pick_list(themes, current_theme, Message::SetTheme)
+            .style(self.popup_picker_style())
+            .menu_style(self.popup_menu_style())
             .text_size(self.effective_font_size())
             .width(Length::Fill);
         let mut theme_actions =
@@ -27462,6 +27565,8 @@ impl Frost {
             Some(self.config.font_family.clone()),
             Message::SetFontFamily,
         )
+        .style(self.popup_picker_style())
+        .menu_style(self.popup_menu_style())
         .text_size(self.effective_font_size())
         .width(Length::Fill);
         let font_family_row: Element<'_, Message> = if compact {
@@ -27710,6 +27815,8 @@ impl Frost {
                 Some(self.config.effective_terminal_mode()),
                 Message::SetTerminalMode,
             )
+            .style(self.popup_picker_style())
+            .menu_style(self.popup_menu_style())
             .text_size(self.effective_font_size())
             .into(),
         );
@@ -27751,6 +27858,8 @@ impl Frost {
                 Some(self.config.ai_provider.clone()),
                 Message::SetAiProvider,
             )
+            .style(self.popup_picker_style())
+            .menu_style(self.popup_menu_style())
             .text_size(self.effective_font_size())
             .width(Length::Fill)
             .into(),
@@ -27883,6 +27992,8 @@ impl Frost {
                 Some(self.config.preferred_agent_provider.clone()),
                 Message::SetPreferredAgentProvider,
             )
+            .style(self.popup_picker_style())
+            .menu_style(self.popup_menu_style())
             .text_size(self.effective_font_size())
             .into(),
         );
@@ -27975,6 +28086,8 @@ impl Frost {
                 Some(deploy_label),
                 move |v| Message::RemoteHostDeploy(deploy_target.clone(), v),
             )
+            .style(self.popup_picker_style())
+            .menu_style(self.popup_menu_style())
             .text_size(self.effective_font_size())
             .width(Length::Fixed(110.0));
             let toggles = row![docker_box, deploy_pick]
@@ -28129,7 +28242,7 @@ impl Frost {
         .width(Length::Fixed(panel_width))
         .height(Length::Fixed(panel_height))
         .padding(panel_padding)
-        .style(container::dark);
+        .style(self.popup_style());
         container(inner)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
@@ -28217,7 +28330,7 @@ impl Frost {
             .width(Length::Fixed(420.0))
             .max_height(560.0)
             .padding(16)
-            .style(container::dark);
+            .style(self.popup_style());
         container(inner)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
@@ -28451,7 +28564,7 @@ impl Frost {
             .width(Length::Fixed(panel_width))
             .max_height(panel_height)
             .padding(16)
-            .style(container::dark);
+            .style(self.popup_style());
         container(inner)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
@@ -28548,7 +28661,7 @@ impl Frost {
         let inner = container(lines)
             .width(Length::Fixed(240.0))
             .padding(10)
-            .style(container::dark);
+            .style(self.popup_style());
         container(inner)
             .align_right(Length::Fill)
             .align_top(Length::Fill)
@@ -30320,6 +30433,8 @@ impl Frost {
                     )),
                     |project| Message::TaskDashboardRepository(project.0),
                 )
+                .style(self.popup_picker_style())
+                .menu_style(self.popup_menu_style())
                 .text_size(self.chrome_font_size())
                 .width(Length::Fill),
             );
@@ -30331,6 +30446,8 @@ impl Frost {
                         Some(self.task_panel.dashboard_sort),
                         Message::TaskDashboardSort
                     )
+                    .style(self.popup_picker_style())
+                    .menu_style(self.popup_menu_style())
                     .text_size(self.chrome_font_size())
                     .width(Length::Fill),
                 ]
@@ -31615,7 +31732,7 @@ impl Frost {
         .width(Length::Fixed(560.0))
         .height(Length::Fixed(520.0))
         .padding(12)
-        .style(container::dark);
+        .style(self.popup_style());
         container(inner)
             .align_right(Length::Fill)
             .align_top(Length::Fill)
@@ -31733,7 +31850,7 @@ impl Frost {
         let inner = container(card)
             .width(Length::Fixed(560.0))
             .padding(12)
-            .style(container::dark);
+            .style(self.popup_style());
         Some(
             container(inner)
                 .align_right(Length::Fill)
@@ -31784,7 +31901,7 @@ impl Frost {
             .width(Length::Fixed(560.0))
             .height(Length::Fixed(520.0))
             .padding(12)
-            .style(container::dark);
+            .style(self.popup_style());
         container(inner)
             .align_right(Length::Fill)
             .align_top(Length::Fill)
@@ -32174,7 +32291,7 @@ impl Frost {
         let inner = container(card)
             .width(Length::Fixed(560.0))
             .padding(12)
-            .style(container::dark);
+            .style(self.popup_style());
         Some(
             container(inner)
                 .align_right(Length::Fill)
@@ -32212,7 +32329,7 @@ impl Frost {
         let panel = container(body)
             .width(Length::Fixed(560.0))
             .padding(12)
-            .style(container::dark);
+            .style(self.popup_style());
         let dismiss = mouse_area(
             container(Space::new())
                 .width(Length::Fill)

@@ -139,7 +139,7 @@ pub(crate) fn popup_input_style(
                 Theme::rgb_to_color32(theme.ui.border)
             },
             width: 1.0,
-            radius: 4.0.into(),
+            radius: crate::glass_shell_tokens::CONTROL_RADIUS.into(),
         },
         icon: dim,
         placeholder: dim,
@@ -161,9 +161,114 @@ pub(crate) fn popup_style(theme: &Theme) -> iced::widget::container::Style {
         border: iced::Border {
             color: Theme::rgb_to_color32(theme.ui.border),
             width: 1.0,
-            radius: 6.0.into(),
+            radius: crate::glass_shell_tokens::PANEL_RADIUS.into(),
+        },
+        shadow: iced::Shadow {
+            color: Color::from_rgba(0.02, 0.04, 0.08, 0.22),
+            offset: iced::Vector::new(0.0, 4.0),
+            blur_radius: 12.0,
         },
         ..Default::default()
+    }
+}
+
+/// Generic controls belong to the workspace chrome, not the terminal's ANSI
+/// foreground or cursor. In particular a white terminal cursor must not turn
+/// an opened selector into a white-on-white selection.
+pub(crate) fn chrome_palette(theme: &Theme, opacity: f32) -> iced::theme::Palette {
+    iced::theme::Palette {
+        background: Color {
+            a: opacity,
+            ..Theme::rgb_to_color32(theme.ui.window_bg)
+        },
+        text: Theme::rgb_to_color32(theme.ui.text),
+        primary: Theme::rgb_to_color32(theme.tabbar.active_border),
+        success: theme.ansi_color(2),
+        warning: theme.ansi_color(3),
+        danger: theme.ansi_color(1),
+    }
+}
+
+pub(crate) fn popup_button_style(
+    theme: &Theme,
+    selected: bool,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    use iced::widget::button::Status;
+    let disabled = status == Status::Disabled;
+    let highlight = if disabled {
+        0.0
+    } else if status == Status::Pressed {
+        0.30
+    } else if selected {
+        0.24
+    } else if status == Status::Hovered {
+        0.16
+    } else {
+        0.0
+    };
+    iced::widget::button::Style {
+        background: (highlight > 0.0).then(|| {
+            crate::blend(
+                Theme::rgb_to_color32(theme.ui.panel_bg),
+                Theme::rgb_to_color32(theme.tabbar.active_border),
+                highlight,
+            )
+            .into()
+        }),
+        text_color: Theme::rgb_to_color32(if disabled {
+            theme.ui.text_disabled
+        } else {
+            theme.ui.text
+        }),
+        border: iced::Border {
+            radius: crate::glass_shell_tokens::CONTROL_RADIUS.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+pub(crate) fn popup_picker_style(
+    theme: &Theme,
+    status: iced::widget::pick_list::Status,
+) -> iced::widget::pick_list::Style {
+    let focused = !matches!(status, iced::widget::pick_list::Status::Active);
+    iced::widget::pick_list::Style {
+        text_color: Theme::rgb_to_color32(theme.ui.text),
+        placeholder_color: Theme::rgb_to_color32(theme.ui.text_disabled),
+        handle_color: Theme::rgb_to_color32(if focused {
+            theme.tabbar.active_border
+        } else {
+            theme.ui.text_disabled
+        }),
+        background: Theme::rgb_to_color32(theme.ui.panel_bg).into(),
+        border: iced::Border {
+            color: Theme::rgb_to_color32(if focused {
+                theme.tabbar.active_border
+            } else {
+                theme.ui.border
+            }),
+            width: 1.0,
+            radius: crate::glass_shell_tokens::CONTROL_RADIUS.into(),
+        },
+    }
+}
+
+pub(crate) fn popup_menu_style(theme: &Theme) -> iced::overlay::menu::Style {
+    let panel = popup_style(theme);
+    iced::overlay::menu::Style {
+        background: Theme::rgb_to_color32(theme.ui.panel_bg).into(),
+        border: panel.border,
+        text_color: Theme::rgb_to_color32(theme.ui.text),
+        selected_text_color: Theme::rgb_to_color32(theme.ui.text),
+        selected_background: crate::blend(
+            Theme::rgb_to_color32(theme.ui.panel_bg),
+            Theme::rgb_to_color32(theme.tabbar.active_border),
+            0.24,
+        )
+        .into(),
+        shadow: panel.shadow,
     }
 }
 
@@ -328,6 +433,74 @@ mod tests {
                 panic!("solid popup background");
             };
             assert_eq!(background.a, 1.0);
+        }
+    }
+
+    #[test]
+    fn popup_chrome_is_independent_of_custom_terminal_palette_and_window_opacity() {
+        let mut theme = Theme::builtin_light();
+        theme.ui.window_bg = [25, 40, 65];
+        theme.ui.panel_bg = [42, 59, 96];
+        theme.ui.text = [239, 245, 255];
+        theme.ui.text_disabled = [184, 204, 238];
+        theme.ui.border = [134, 168, 247];
+        theme.tabbar.active_border = [62, 108, 255];
+        let chrome = super::chrome_palette(&theme, 0.35);
+        let popup = super::popup_style(&theme);
+        let picker = super::popup_picker_style(&theme, iced::widget::pick_list::Status::Active);
+        let menu = super::popup_menu_style(&theme);
+        theme.terminal.background = [255, 245, 225];
+        theme.terminal.foreground = [10, 20, 30];
+        theme.terminal.cursor = [255, 255, 255];
+        let changed = super::chrome_palette(&theme, 0.35);
+        assert_eq!(changed.background, chrome.background);
+        assert_eq!(changed.text, chrome.text);
+        assert_eq!(changed.primary, chrome.primary);
+        assert_ne!(changed.primary, theme.cursor_color());
+        assert_eq!(changed.background.a, 0.35);
+        assert_eq!(popup.background, Some(menu.background));
+        assert_eq!(picker.background, menu.background);
+        assert_eq!(picker.text_color, menu.text_color);
+        let iced::Background::Color(surface) = menu.background else {
+            panic!("opaque popup surface");
+        };
+        assert_eq!(surface.a, 1.0, "glass opacity must not leak into menus");
+        assert_ne!(menu.selected_background, menu.background);
+        assert_eq!(menu.selected_text_color, menu.text_color);
+    }
+
+    #[test]
+    fn popup_selection_hover_and_disabled_states_share_the_live_ui_palette() {
+        use iced::widget::{button, pick_list};
+        let mut custom = Theme::builtin_light();
+        custom.ui.panel_bg = [20, 30, 40];
+        custom.ui.text = [235, 240, 250];
+        custom.ui.text_disabled = [145, 160, 180];
+        custom.ui.border = [65, 85, 110];
+        custom.tabbar.active_border = [80, 140, 240];
+        for theme in [Theme::default(), Theme::builtin_light(), custom] {
+            let menu = super::popup_menu_style(&theme);
+            let selected = super::popup_button_style(&theme, true, button::Status::Active);
+            let hovered = super::popup_button_style(&theme, false, button::Status::Hovered);
+            let pressed = super::popup_button_style(&theme, false, button::Status::Pressed);
+            let disabled = super::popup_button_style(&theme, true, button::Status::Disabled);
+            let opened =
+                super::popup_picker_style(&theme, pick_list::Status::Opened { is_hovered: false });
+            assert_eq!(selected.background, Some(menu.selected_background));
+            assert_eq!(selected.text_color, menu.selected_text_color);
+            assert_ne!(hovered.background, pressed.background);
+            assert_eq!(disabled.background, None, "disabled rows must stay quiet");
+            assert_ne!(disabled.text_color, selected.text_color);
+            assert_eq!(
+                disabled.text_color,
+                Theme::rgb_to_color32(theme.ui.text_disabled)
+            );
+            assert_eq!(
+                opened.border.color,
+                Theme::rgb_to_color32(theme.tabbar.active_border)
+            );
+            assert_eq!(opened.text_color, menu.text_color);
+            assert_eq!(menu.border, super::popup_style(&theme).border);
         }
     }
 

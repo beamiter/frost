@@ -27,7 +27,7 @@ impl Metrics {
 }
 struct Config {
     font_size: f32, chrome_font_size: Option<f32>, line_spacing: f32,
-    padding: f32, chat: bool,
+    padding: f32, chat: bool, sidebar_width: Option<f32>, inspector_width: Option<f32>,
 }
 @config-functions@
 impl Config {
@@ -88,7 +88,7 @@ mod font_viewport_budget {
     fn app(content: f32, chrome: f32, width: f32, height: f32) -> Frost {
         let mut value=Frost { win_size: Size { width, height }, sidebar_open: true,
             reference_inspector_open: true,
-            config: Config { font_size: content, chrome_font_size: Some(chrome), line_spacing: 1.0, padding: 2.0, chat: false },
+            config: Config { font_size: content, chrome_font_size: Some(chrome), line_spacing: 1.0, padding: 2.0, chat: false, sidebar_width: None, inspector_width: None },
             mono: iced::Font::Measured, metrics: Metrics::new(1.0,1.0,0.0,true),
             reading: false, startup_recovery: Recovery { active: false },
             sessions: vec![session(7,1)], active: 0, vim9_tabs: HashMap::new(), split: false,
@@ -108,9 +108,9 @@ mod font_viewport_budget {
                         a.apply_metrics(); let m=a.metrics;
                         close(m.font_size, size);
                         close(m.cell_h, size * 1.2 * spacing);
-                        close(a.term_height(),430.0);
+                        close(a.term_height(),558.0);
                         let (_, rows) = m.grid_size(a.term_width()-SCROLLBAR_WIDTH, a.term_height());
-                        let expected = (((430.0-padding*2.0).max(0.0)/(size*1.2*spacing)).floor() as usize).clamp(1,512);
+                        let expected = (((558.0-padding*2.0).max(0.0)/(size*1.2*spacing)).floor() as usize).clamp(1,512);
                         assert_eq!(rows, expected, "content={size},spacing={spacing},padding={padding}");
                         assert!(rows <= previous); previous=rows;
                     }
@@ -120,8 +120,41 @@ mod font_viewport_budget {
         let normal=app(14.0,14.0,1356.0,704.0);
         let zoomed=app(28.0,14.0,1356.0,704.0);
         let rows=|a: &Frost| a.metrics.grid_size(a.term_width()-SCROLLBAR_WIDTH,a.term_height()).1;
-        assert_eq!(rows(&normal),25); assert_eq!(rows(&zoomed),12);
-        close(app(14.0,14.0,1612.0,976.0).term_height(),648.0);
+        assert_eq!(rows(&normal),32); assert_eq!(rows(&zoomed),16);
+        close(app(14.0,14.0,1612.0,976.0).term_height(),830.0);
+    }
+    #[test]
+    fn compact_chrome_returns_pty_rows_and_columns_without_changing_content_font() {
+        for (width,height,old_width,old_height) in [
+            (1612.0,976.0,859.0,648.0), (1356.0,704.0,603.0,430.0),
+            (800.0,640.0,456.0,366.0), (700.0,400.0,356.0,126.0),
+        ] {
+            for content in [14.0,36.0,72.0] {
+                for draft_rows in [None,Some(1),Some(100)] {
+                    let mut a=app(content,14.0,width,height);
+                    a.config.chat=draft_rows.is_some();
+                    a.sessions[0]=session(7,draft_rows.unwrap_or(1));
+                    let old_input=draft_rows.map_or(0.0, |rows| {
+                        let cap=(old_height*0.45_f32).clamp(44.0,180.0).min(old_height);
+                        native_input_surface::dock_metrics(rows,a.metrics.cell_h,cap).input_height
+                    });
+                    let old_grid=a.metrics.grid_size(old_width-SCROLLBAR_WIDTH,old_height-old_input);
+                    close(a.effective_font_size(),content);
+                    close(a.metrics.cell_h,content*1.2);
+                    assert!(a.term_width()>old_width);
+                    assert!(a.term_height()>old_height-old_input);
+                    assert!(a.refresh_glass_grid_dimensions());
+                    assert!(a.cols>old_grid.0,"columns at {width}×{height}, content {content}");
+                    assert!(a.rows>=old_grid.1,"rows at {width}×{height}, content {content}");
+                    if draft_rows.is_none() { assert!(a.rows>old_grid.1); }
+                    if let Some(editor)=a.reference_native_budget().editor {
+                        close(editor.width,a.term_width());
+                        close(a.reference_native_budget().raw.bottom()+crate::glass_shell_tokens::TERMINAL_FOOTER_GAP,editor.y);
+                        close(editor.bottom(),a.reference_layout().composer.y);
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn delegated_viewport_charges_actual_content_and_chrome_strips_once() {
@@ -138,10 +171,10 @@ mod font_viewport_budget {
                                 let bar=if reading { (content*1.3+14.0).ceil().max(36.0) }else{0.0};
                                 let banner=if recovery {(chrome.clamp(8.0,32.0)*1.3*3.0+12.0).ceil()}else{0.0};
                                 close(a.block_reading_bar_height(),bar);
-                                let native_top=layout.header.y+layout.header.height+13.0+bar+banner;
-                                let expected=(layout.composer.y-13.0-native_top).max(0.0);
+                                let native_top=layout.header.y+layout.header.height+crate::glass_shell_tokens::TERMINAL_TOP_GAP+bar+banner;
+                                let expected=(layout.composer.y-crate::glass_shell_tokens::TERMINAL_FOOTER_GAP-native_top).max(0.0);
                                 close(a.term_height(),expected);
-                                close(a.term_width(),(layout.center.width-43.0).max(0.0));
+                                close(a.term_width(),(layout.center.width-crate::glass_shell_tokens::TERMINAL_INSET_LEFT-crate::glass_shell_tokens::TERMINAL_INSET_RIGHT).max(0.0));
                                 assert!(a.term_height()>=0.0);
                             }
                         }
@@ -177,7 +210,7 @@ mod font_viewport_budget {
                     a.config.chat=true; a.sessions[0]=session(7,rows);
                     let input=a.reference_input_metrics().unwrap();
                     let layout=a.reference_layout();
-                    let available=(layout.composer.y-13.0-(layout.header.y+layout.header.height+13.0)).max(0.0);
+                    let available=(layout.composer.y-crate::glass_shell_tokens::TERMINAL_FOOTER_GAP-(layout.header.y+layout.header.height+crate::glass_shell_tokens::TERMINAL_TOP_GAP)).max(0.0);
                     let cap=(available*0.45).clamp(44.0,180.0).min(available);
                     let cell=content*1.2;
                     let body=rows as f32*cell;
@@ -190,7 +223,7 @@ mod font_viewport_budget {
                     close(a.term_height(),(available-expected).max(0.0));
                     close(a.term_width(),editor.width);
                     close(joint.raw.height,a.term_height());
-                    close(joint.raw.bottom()+13.0,editor.y);
+                    close(joint.raw.bottom()+crate::glass_shell_tokens::TERMINAL_FOOTER_GAP,editor.y);
                     close(editor.bottom(),layout.composer.y);
                     assert!(joint.raw.height+0.001>=available*0.55);
                     assert!(input.input_height<=180.0);
@@ -203,7 +236,7 @@ mod font_viewport_budget {
         let mut a=app(14.0,14.0,1612.0,976.0); a.config.chat=true;
         a.sessions[0]=session(7,4);
         close(a.reference_input_metrics().unwrap().input_height,83.2);
-        close(a.term_height(),564.8);
+        close(a.term_height(),746.8);
         // A cursor below the last proven Composer/raw row must remain included.
         a.sessions[0].cursor.0=99;
         close(a.reference_input_metrics().unwrap().input_height,180.0);
@@ -224,7 +257,7 @@ mod font_viewport_budget {
             assert!(a.reference_input_metrics().is_none());
             let joint=a.reference_native_budget();
             assert!(joint.editor.is_none()); close(joint.input_height,0.0);
-            close(a.term_height(),648.0);
+            close(a.term_height(),830.0);
             assert_eq!(joint.composer,a.reference_layout().composer);
         }
     }
@@ -253,17 +286,17 @@ mod font_viewport_budget {
     }
     #[test]
     fn actual_toolbar_width_fits_all_reference_tools_and_compacts_narrow_windows() {
-        close(toolbar::COMPOSER_SECONDARY_MIN_WIDTH,874.0);
-        close(toolbar::COMPOSER_MODEL_MIN_AVAILABLE,580.0);
-        close(toolbar::COMPOSER_TERMINAL_MIN_AVAILABLE,394.0);
+        assert!(toolbar::COMPOSER_SECONDARY_MIN_WIDTH>toolbar::COMPOSER_MODEL_MIN_AVAILABLE);
+        assert!(toolbar::COMPOSER_MODEL_MIN_AVAILABLE>toolbar::COMPOSER_TERMINAL_MIN_AVAILABLE);
         let standard=app(14.0,14.0,1612.0,976.0).reference_layout();
-        close(standard.composer.width,892.0);
+        close(standard.composer.width,1040.0);
         assert!(standard.composer.width>=toolbar::COMPOSER_SECONDARY_MIN_WIDTH,
-                "the real reference toolbar must expose all six tools/model/send");
+                "the real toolbar must expose all six tools/model/send");
         let narrow=app(14.0,14.0,800.0,640.0).reference_layout();
-        assert!(narrow.composer.width<toolbar::COMPOSER_MODEL_MIN_AVAILABLE);
+        close(narrow.composer.width,522.0);
+        assert!(narrow.composer.width<toolbar::COMPOSER_SECONDARY_MIN_WIDTH);
         assert!(narrow.composer.width>=toolbar::COMPOSER_TERMINAL_MIN_AVAILABLE);
-        let compact=app(14.0,14.0,700.0,640.0).reference_layout();
+        let compact=app(14.0,14.0,580.0,640.0).reference_layout();
         assert!(compact.composer.width<toolbar::COMPOSER_TERMINAL_MIN_AVAILABLE);
         let mandatory=toolbar::COMPOSER_PLUS_WIDTH+toolbar::COMPOSER_TOOLS_WIDTH
             +toolbar::COMPOSER_SEND_WIDTH+2.0*toolbar::METADATA_GAP
