@@ -223,7 +223,7 @@ impl Layout {
             return self;
         }
         let control_height = chrome_control_height(font_size);
-        let topbar_height = token::TOPBAR_HEIGHT.max(control_height + 10.0);
+        let topbar_height = token::TOPBAR_HEIGHT.max(control_height + 8.0);
         let viewport_height = if self.titlebar.height < token::TOPBAR_HEIGHT {
             self.titlebar.height
         } else {
@@ -254,7 +254,7 @@ impl Layout {
             .min(self.center.height);
         self.update_center_geometry();
         let tools_height = token::TOOLBAR_HEIGHT
-            .max(control_height + 12.0)
+            .max(control_height + 10.0)
             .min((self.center.height - self.header.height).max(0.0));
         self.composer.y = self.center.bottom() - tools_height;
         self.composer.height = tools_height;
@@ -396,9 +396,9 @@ mod tests {
             for font in [8.0, 14.0, 24.0, 32.0, 40.0, 72.0] {
                 let layout = compact.with_chrome_font_size(font);
                 let control = chrome_control_height(font);
-                assert!(layout.titlebar.height >= control + 10.0);
+                assert!(layout.titlebar.height >= control + 8.0);
                 assert!(layout.header.height >= control + 4.0);
-                assert!(layout.composer.height >= control + 12.0);
+                assert!(layout.composer.height >= control + 10.0);
                 assert_eq!(layout.center.y - layout.titlebar.height, 4.0);
                 assert_eq!(layout.center.width, compact.center.width);
                 for input in [44.0, 180.0] {
@@ -473,54 +473,54 @@ mod tests {
             p.rail,
             Rect {
                 x: 4.0,
-                y: 42.0,
-                width: 48.0,
-                height: 928.0
+                y: 40.0,
+                width: 44.0,
+                height: 930.0
             }
         );
         assert_eq!(
             p.navigation,
             Some(Rect {
-                x: 52.0,
-                y: 42.0,
+                x: 48.0,
+                y: 40.0,
                 width: 216.0,
-                height: 928.0
+                height: 930.0
             })
         );
         assert_eq!(
             p.center,
             Rect {
-                x: 274.0,
-                y: 46.0,
-                width: 1040.0,
-                height: 924.0
+                x: 270.0,
+                y: 44.0,
+                width: 1044.0,
+                height: 926.0
             }
         );
         assert_eq!(
             p.inspector,
             Some(Rect {
                 x: 1320.0,
-                y: 46.0,
+                y: 44.0,
                 width: 288.0,
-                height: 924.0
+                height: 926.0
             })
         );
         assert_eq!(
             p.composer,
             Rect {
-                x: 274.0,
-                y: 926.0,
-                width: 1040.0,
-                height: 44.0
+                x: 270.0,
+                y: 928.0,
+                width: 1044.0,
+                height: 42.0
             }
         );
         assert_eq!(
             p.raw_rect(0.0, 0.0, false),
             Rect {
-                x: 282.0,
-                y: 90.0,
-                width: 1024.0,
-                height: 830.0
+                x: 278.0,
+                y: 86.0,
+                width: 1028.0,
+                height: 836.0
             }
         );
     }
@@ -548,7 +548,7 @@ mod tests {
             assert_eq!(layout, layout.without_inspector());
             assert_eq!(layout.center.right(), width - token::OUTER_RIGHT);
             assert!(layout.center.width >= 300.0);
-            assert_eq!(layout.header.height, 38.0);
+            assert_eq!(layout.header.height, 36.0);
             assert_eq!(layout.composer.bottom(), 634.0);
         }
     }
@@ -568,8 +568,8 @@ mod tests {
             assert_eq!(outer.width, layout.composer.width);
             assert!(outer.height <= token::TOOLBAR_HEIGHT + MAX_INPUT_HEIGHT);
         }
-        assert_eq!(layout.editable_composer(44.0).height, 88.0);
-        assert_eq!(layout.editable_composer(180.0).height, 224.0);
+        assert_eq!(layout.editable_composer(44.0).height, 86.0);
+        assert_eq!(layout.editable_composer(180.0).height, 222.0);
     }
 
     #[test]

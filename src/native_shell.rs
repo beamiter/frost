@@ -616,6 +616,15 @@ impl Frost {
                 ),
                 _ => unreachable!("shared rail key"),
             };
+            let title = if key == "workspace" {
+                if self.sidebar_open {
+                    "Hide left sidebar"
+                } else {
+                    "Show left sidebar"
+                }
+            } else {
+                title
+            };
             rail = rail.push(entry(Icon::from_key(key), title, action, selected));
         }
         let initial = std::env::var("USER")

@@ -5,8 +5,8 @@ user padding, native PTY, clipboard, selection and IME ownership remain under
 the existing terminal controls. The shell returns pixels to that native surface
 by reducing chrome rather than scaling the terminal.
 
-At the default 14px UI font, the top bar is 42px, rail 48px, navigation 216px,
-inspector 288px, center header 38px and tools row 44px. Outer insets are 4px;
+At the default 14px UI font, the top bar is 40px, rail 44px, navigation 216px,
+inspector 288px, center header 36px and tools row 42px. Outer insets are 4px;
 panel gaps are 6px. Terminal side insets are 8px and its top/footer gaps are 6px.
 The tools row has 32px controls, the header has 28px icon hit areas, and rail
 buttons have 32px hit areas with 18px glyphs. Major surfaces retain a subtle
@@ -21,17 +21,17 @@ Both sidebars keep the existing requested widths, resizing grips, collapse
 controls and narrow-window inspector drawer. The initial visibility preference
 is unchanged. Explicit `sidebar_width` and `inspector_width` values retain their
 existing bounds. Narrow windows no longer enlarge the rail beyond its compact
-48px default.
+44px default.
 
 | Logical window | Previous direct native pixels | Compact direct native pixels |
 | --- | --- | --- |
-| 1612 × 976 | 859 × 648 | 1024 × 830 |
-| 1356 × 704 | 603 × 430 | 768 × 558 |
-| 800 × 640 | 456 × 366 | 506 × 494 |
+| 1612 × 976 | 859 × 648 | 1028 × 836 |
+| 1356 × 704 | 603 × 430 | 772 × 564 |
+| 800 × 640 | 456 × 366 | 510 × 500 |
 
 These are native viewport rectangles before the terminal's own scrollbar,
 cell gutter and configured padding. The same rectangle feeds the PTY grid and
-native pane. Chat reserves the actual bounded input height above the 44px tools
+native pane. Chat reserves the actual bounded input height above the 42px tools
 row, with one 6px history/input gap. Direct Block input and running/native
 passthrough keep the existing terminal owner; a second editor is not created.
 
@@ -56,9 +56,7 @@ model view recomputes the shared PTY budget. The allocation assertion checks
 that history, gap and input account for the full available height, including
 short windows whose previous draft is larger than the new allocation.
 
-`scripts/test-font-sync.py` passes 43 production-source geometry and font tests,
-including unchanged content font authority, direct/Chat row and column gains at
-14/36/72px terminal fonts, short windows, bounded multiline input and retained
-resize clips. All six compiled negative budget mutants are rejected. Native
-window, PTY and physical input checks remain separate acceptance gates; the
-headless geometry harness does not substitute for those checks.
+The layout unit tests cover shared PTY/input budgets, panel collapse and width
+restoration, short windows, bounded multiline input, and enlarged UI text.
+Native window, PTY and physical input checks remain separate acceptance gates;
+the headless geometry tests do not substitute for those checks.
