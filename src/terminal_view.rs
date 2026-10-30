@@ -1326,7 +1326,11 @@ impl<'a, Message> TermWidget<'a, Message> {
             + self.metrics.padding
             + self.canvas.offset(segment.start_row, self.metrics.cell_h);
         let right = block_chrome_right(bounds, self.metrics);
-        let Some(chat) = self.chat_rows.get(segment.start_row) else {
+        let chat = self
+            .chat_rows
+            .get(segment.start_row)
+            .filter(|_| self.terminal_mode == crate::config::TerminalMode::Chat);
+        let Some(chat) = chat else {
             return block_card_geometry(
                 bounds,
                 right,
@@ -1837,6 +1841,21 @@ impl<'a, Message> TermWidget<'a, Message> {
                 .min((bounds.height - pad * 2.0).max(0.0)),
             ..bounds
         }
+    }
+
+    /// The dock translates the same native grid into a smaller input clip.
+    /// Its final row may extend through the canonical widget's bottom padding;
+    /// enlarge only the presentation bound, keeping the grid and origin intact.
+    fn prompt_presentation_bounds(&self, mut bounds: Rectangle, viewport: &Rectangle) -> Rectangle {
+        if self.shared_shell
+            && self.canvas.dock_start.is_some_and(|row| {
+                let y = self.row_y(bounds, row);
+                y >= viewport.y && y < viewport.y + viewport.height
+            })
+        {
+            bounds.height = bounds.height.max(viewport.y + viewport.height - bounds.y);
+        }
+        bounds
     }
 }
 
@@ -3938,7 +3957,11 @@ impl<Message> TermWidget<'_, Message> {
         let ox = bounds.x + pad + self.metrics.block_gutter_width();
         let belongs = |row: usize| {
             self.canvas.dock_start.is_none_or(|dock| {
-                !self.canvas.head || (row >= dock) == (clip.y >= self.row_y(bounds, dock))
+                // The native dock includes padding before its first row.
+                // Its clip therefore begins above the prompt, while its
+                // bottom crosses it. History ends exactly at that row.
+                !self.canvas.head
+                    || (row >= dock) == (clip.y + clip.height > self.row_y(bounds, dock))
             })
         };
         let scrollbar_track_left = block_chrome_right(bounds, self.metrics);
@@ -3992,7 +4015,11 @@ impl<Message> TermWidget<'_, Message> {
                 hovered_card == Some(segment.group),
                 self.opacity,
             );
-            if let Some(chat) = self.chat_rows.get(segment.start_row) {
+            if let Some(chat) = self
+                .chat_rows
+                .get(segment.start_row)
+                .filter(|_| self.terminal_mode == crate::config::TerminalMode::Chat)
+            {
                 visual = chat_card_visual(
                     chat.role,
                     *segment,
@@ -4001,6 +4028,16 @@ impl<Message> TermWidget<'_, Message> {
                     hovered_card == Some(segment.group),
                     self.opacity,
                 );
+            }
+            if self.terminal_mode == crate::config::TerminalMode::Block
+                && segment.kind == BlockCardKind::Finished
+                && !segment.selected
+                && !segment.selection_active
+                && hovered_card != Some(segment.group)
+            {
+                visual.background = alpha(Color::from_rgb8(14, 22, 33), self.opacity);
+                visual.border = Color::from_rgb8(41, 60, 87);
+                visual.border_width = 1.0;
             }
             if self.shared_shell
                 && (self
@@ -4532,7 +4569,11 @@ impl<Message> TermWidget<'_, Message> {
                 hovered_card == Some(segment.group),
                 self.opacity,
             );
-            if let Some(chat) = self.chat_rows.get(segment.start_row) {
+            if let Some(chat) = self
+                .chat_rows
+                .get(segment.start_row)
+                .filter(|_| self.terminal_mode == crate::config::TerminalMode::Chat)
+            {
                 visual = chat_card_visual(
                     chat.role,
                     *segment,
@@ -4541,6 +4582,16 @@ impl<Message> TermWidget<'_, Message> {
                     hovered_card == Some(segment.group),
                     self.opacity,
                 );
+            }
+            if self.terminal_mode == crate::config::TerminalMode::Block
+                && segment.kind == BlockCardKind::Finished
+                && !segment.selected
+                && !segment.selection_active
+                && hovered_card != Some(segment.group)
+            {
+                visual.background = alpha(Color::from_rgb8(14, 22, 33), self.opacity);
+                visual.border = Color::from_rgb8(41, 60, 87);
+                visual.border_width = 1.0;
             }
             if self.shared_shell
                 && (self
@@ -5358,7 +5409,7 @@ where
         if tree.state.downcast_mut::<State>().reset_on_unfocused(event) {
             return;
         }
-        let bounds = layout.bounds();
+        let bounds = self.prompt_presentation_bounds(layout.bounds(), viewport);
         // A native speech close is chrome, not a terminal reading gesture.
         // Consume it before canvas pause and before any PTY mouse bookkeeping.
         if self.organism_expanded
@@ -5899,7 +5950,7 @@ where
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        let bounds = layout.bounds();
+        let bounds = self.prompt_presentation_bounds(layout.bounds(), viewport);
         let Some(surface_clip) = bounds.intersection(viewport) else {
             return;
         };
@@ -5927,7 +5978,18 @@ where
                 );
             }
         });
-        let Some(clip) = self.canvas_content_bounds(bounds).intersection(viewport) else {
+        // The translated prompt may occupy the native widget's bottom
+        // padding. The history's overscan clip must not cut off its last row.
+        let prompt_clip = self.canvas.dock_start.is_some_and(|row| {
+            let y = self.row_y(bounds, row);
+            y >= viewport.y && y < viewport.y + viewport.height
+        });
+        let content_bounds = if self.shared_shell && prompt_clip {
+            bounds
+        } else {
+            self.canvas_content_bounds(bounds)
+        };
+        let Some(clip) = content_bounds.intersection(viewport) else {
             return;
         };
         // Independent clips preserve the fixed Chat composer. History ink may

@@ -2273,6 +2273,7 @@ pub struct ProjectionPolicy {
     native_chrome: bool,
     organism_rows: usize,
     chat: bool,
+    command_bubbles: bool,
 }
 
 impl Default for ProjectionPolicy {
@@ -2284,6 +2285,7 @@ impl Default for ProjectionPolicy {
             native_chrome: false,
             organism_rows: 0,
             chat: false,
+            command_bubbles: true,
         }
     }
 }
@@ -2317,6 +2319,19 @@ impl ProjectionPolicy {
 
     pub fn is_chat(&self) -> bool {
         self.chat
+    }
+
+    /// Prompt docking is shared; right-aligned command bubbles belong to Chat.
+    pub fn set_command_bubbles(&mut self, enabled: bool) -> bool {
+        if self.command_bubbles == enabled {
+            return false;
+        }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
+        self.command_bubbles = enabled;
+        self.revision = revision;
+        true
     }
 
     pub fn set_block_spacing(&mut self, enabled: bool) -> bool {

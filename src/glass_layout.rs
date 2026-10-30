@@ -251,6 +251,7 @@ impl Layout {
         self.header.y = self.center.y;
         self.header.height = token::HEADER_HEIGHT
             .max(control_height + 4.0)
+            .max(29.0 * (font_size / 14.0).max(1.0) + 4.0)
             .min(self.center.height);
         self.update_center_geometry();
         let tools_height = token::TOOLBAR_HEIGHT
@@ -372,14 +373,14 @@ impl Layout {
     }
 }
 
-/// 16.5px is the largest compact control label at the default 14px UI size.
+/// Compact controls follow Anvil's 11px label at the default UI size.
 pub fn chrome_control_height(font_size: f32) -> f32 {
     let scale = if font_size.is_finite() {
         (font_size / 14.0).clamp(1.0, 72.0 / 14.0)
     } else {
         1.0
     };
-    (16.5 * scale * 1.3 + 8.0)
+    (11.0 * scale * 1.3 + 8.0)
         .ceil()
         .max(token::TOOL_BUTTON_HEIGHT)
 }
@@ -399,12 +400,18 @@ mod tests {
                 assert!(layout.titlebar.height >= control + 8.0);
                 assert!(layout.header.height >= control + 4.0);
                 assert!(layout.composer.height >= control + 10.0);
-                assert_eq!(layout.center.y - layout.titlebar.height, 4.0);
+                assert_eq!(
+                    layout.center.y - layout.titlebar.height,
+                    token::MAIN_TOP - token::TOPBAR_HEIGHT
+                );
                 assert_eq!(layout.center.width, compact.center.width);
                 for input in [44.0, 180.0] {
                     let native = layout.native_budget(0.0, 0.0, Some(input));
                     if let Some(editor) = native.editor {
-                        assert_eq!(native.raw.bottom() + token::TERMINAL_FOOTER_GAP, editor.y);
+                        assert!(
+                            (native.raw.bottom() + token::TERMINAL_FOOTER_GAP - editor.y).abs()
+                                < 0.001
+                        );
                         assert_eq!(editor.bottom(), layout.composer.y);
                     } else {
                         assert_eq!(native.input_height, 0.0);
@@ -472,55 +479,55 @@ mod tests {
         assert_eq!(
             p.rail,
             Rect {
-                x: 4.0,
-                y: 40.0,
-                width: 44.0,
-                height: 930.0
+                x: 0.0,
+                y: 42.0,
+                width: 48.0,
+                height: 934.0
             }
         );
         assert_eq!(
             p.navigation,
             Some(Rect {
                 x: 48.0,
-                y: 40.0,
+                y: 42.0,
                 width: 216.0,
-                height: 930.0
+                height: 934.0
             })
         );
         assert_eq!(
             p.center,
             Rect {
                 x: 270.0,
-                y: 44.0,
-                width: 1044.0,
-                height: 926.0
+                y: 42.0,
+                width: 1048.0,
+                height: 924.0
             }
         );
         assert_eq!(
             p.inspector,
             Some(Rect {
-                x: 1320.0,
-                y: 44.0,
+                x: 1324.0,
+                y: 42.0,
                 width: 288.0,
-                height: 926.0
+                height: 924.0
             })
         );
         assert_eq!(
             p.composer,
             Rect {
-                x: 270.0,
-                y: 928.0,
-                width: 1044.0,
-                height: 42.0
+                x: 298.0,
+                y: 930.0,
+                width: 992.0,
+                height: 36.0
             }
         );
         assert_eq!(
             p.raw_rect(0.0, 0.0, false),
             Rect {
-                x: 278.0,
-                y: 86.0,
-                width: 1028.0,
-                height: 836.0
+                x: 298.0,
+                y: 101.0,
+                width: 992.0,
+                height: 821.0
             }
         );
     }
@@ -536,7 +543,10 @@ mod tests {
             assert_eq!(hidden.navigation, shown.navigation);
             assert_eq!(hidden.center.width - shown.center.width, 294.0);
             assert_eq!(hidden.header.width, hidden.center.width);
-            assert_eq!(hidden.composer.right(), width - token::OUTER_RIGHT);
+            assert_eq!(
+                hidden.composer.right(),
+                width - token::OUTER_RIGHT - token::TOOLBAR_INSET_RIGHT
+            );
         }
     }
 
@@ -548,8 +558,8 @@ mod tests {
             assert_eq!(layout, layout.without_inspector());
             assert_eq!(layout.center.right(), width - token::OUTER_RIGHT);
             assert!(layout.center.width >= 300.0);
-            assert_eq!(layout.header.height, 36.0);
-            assert_eq!(layout.composer.bottom(), 634.0);
+            assert_eq!(layout.header.height, token::HEADER_HEIGHT);
+            assert_eq!(layout.composer.bottom(), 640.0 - token::MAIN_BOTTOM_GAP);
         }
     }
 
@@ -568,8 +578,14 @@ mod tests {
             assert_eq!(outer.width, layout.composer.width);
             assert!(outer.height <= token::TOOLBAR_HEIGHT + MAX_INPUT_HEIGHT);
         }
-        assert_eq!(layout.editable_composer(44.0).height, 86.0);
-        assert_eq!(layout.editable_composer(180.0).height, 222.0);
+        assert_eq!(
+            layout.editable_composer(44.0).height,
+            INPUT_STRIP_HEIGHT + token::TOOLBAR_HEIGHT
+        );
+        assert_eq!(
+            layout.editable_composer(180.0).height,
+            MAX_INPUT_HEIGHT + token::TOOLBAR_HEIGHT
+        );
     }
 
     #[test]

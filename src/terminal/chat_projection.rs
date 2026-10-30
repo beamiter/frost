@@ -8,6 +8,7 @@ const CHAT_MIN_INPUT_ROWS: usize = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ChatPlanKey {
+    command_bubbles: bool,
     prompt: Option<usize>,
     keep_end: usize,
     companion_rows: usize,
@@ -158,6 +159,7 @@ impl TerminalState {
             _ => None,
         };
         Some(ChatPlanKey {
+            command_bubbles: policy.command_bubbles,
             prompt,
             keep_end,
             companion_rows,
@@ -343,7 +345,7 @@ impl TerminalState {
                         .all(|s| s.source.absolute_row >= start && s.source.absolute_row < end)
                 });
             let mut left = 0;
-            if safe_command {
+            if safe_command && key.command_bubbles {
                 let mut max_end = 0;
                 for row in &mut group {
                     for slice in &mut row.raw_slices {
@@ -368,7 +370,7 @@ impl TerminalState {
             // Reserve the same host-only role header while output is still
             // running. Adding it only after OSC D moves every native output
             // row down at completion, even when no terminal cells changed.
-            let role_header = role == ChatRole::Output;
+            let role_header = role == ChatRole::Output && key.command_bubbles;
             if role_header {
                 if let Some(next) = next {
                     for line in 0..2 {
@@ -567,6 +569,40 @@ mod tests {
         assert!(!terminal.chat_surface().allows_submit_affordance());
         prompt(&mut terminal);
         assert!(terminal.chat_surface().allows_submit_affordance());
+    }
+
+    #[test]
+    fn block_docks_the_native_prompt_and_keeps_completed_commands_left_aligned() {
+        let mut terminal = TerminalState::new(40, 18);
+        command(&mut terminal, "echo hello", "hello");
+        prompt(&mut terminal);
+        let grid = terminal.grid.to_vec();
+        let cursor = terminal.get_cursor_pos();
+        let mut policy = policy();
+        let mut state = ProjectionViewState::new();
+        for bubbles in [false, true, false] {
+            policy.set_command_bubbles(bubbles);
+            let view = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+            let command = view
+                .chat_rows()
+                .iter()
+                .find(|row| row.role == ChatRole::Command)
+                .unwrap();
+            assert_eq!(command.left_col > 0, bubbles);
+            assert!(view
+                .chat_rows()
+                .iter()
+                .any(|row| row.role == ChatRole::Composer));
+            assert_eq!(terminal.grid.to_vec(), grid);
+            assert_eq!(terminal.get_cursor_pos(), cursor);
+            for (row, cells) in view.cells().iter().enumerate() {
+                for (col, cell) in cells.iter().enumerate() {
+                    if !cell.character.is_whitespace() {
+                        assert!(view.view_to_raw(ViewportCell { row, col }).is_some());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

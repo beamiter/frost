@@ -5670,7 +5670,8 @@ impl Session {
         terminal.set_max_scrollback(config.scrollback_lines);
         terminal.set_disable_alt_screen(config.disable_alt_screen);
         let mut projection_policy = ProjectionPolicy::new();
-        projection_policy.set_chat(config.is_chat_mode());
+        projection_policy.set_chat(config.is_card_mode());
+        projection_policy.set_command_bubbles(config.is_chat_mode());
         // Native metadata headers plus card-edge insets provide separation;
         // a full synthetic terminal row between cards is unnecessary.
         // The companion is a window-owned body. A synthetic status card in
@@ -7570,7 +7571,11 @@ impl Frost {
             self.rows = rows;
         }
         for sess in &mut self.sessions {
-            let chat_mode_changed = sess.projection_policy.set_chat(self.config.is_chat_mode());
+            let dock_changed = sess.projection_policy.set_chat(self.config.is_card_mode());
+            let bubbles_changed = sess
+                .projection_policy
+                .set_command_bubbles(self.config.is_chat_mode());
+            let chat_mode_changed = dock_changed || bubbles_changed;
             let projection_mode_changed =
                 sess.projection_block_mode != self.config.is_card_mode() || chat_mode_changed;
             sess.projection_block_mode = self.config.is_card_mode();
@@ -7989,7 +7994,7 @@ impl Frost {
     }
 
     fn chat_input_ready(&self, session_id: usize) -> bool {
-        self.config.is_chat_mode()
+        self.config.is_card_mode()
             && self.focused
             && self.terminal_input_active()
             && self
@@ -24963,7 +24968,39 @@ impl Frost {
                 }
             }
         }
-        let paint = self.build_block_paint_rows(sess);
+        let mut paint = self.build_block_paint_rows(sess);
+        // Docking inserts host-only spacing between a command and its output.
+        // Keep those rows inside their one finished card when both neighbours
+        // belong to the same zone; gaps between different commands stay empty.
+        let mut index = 1;
+        while index + 1 < paint.len() {
+            if paint[index].card_group.is_some() || !paint[index].host_spacer {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < paint.len()
+                && paint[index].card_group.is_none()
+                && paint[index].host_spacer
+            {
+                index += 1;
+            }
+            let previous = paint[start - 1].clone();
+            if previous.card_group.is_some()
+                && paint
+                    .get(index)
+                    .is_some_and(|next| next.card_group == previous.card_group)
+            {
+                for row in &mut paint[start..index] {
+                    row.card_group = previous.card_group;
+                    row.card_kind = previous.card_kind;
+                    row.card_selected = previous.card_selected;
+                    row.card_selection_active = previous.card_selection_active;
+                    row.zone_id = previous.zone_id;
+                    row.selectable = previous.selectable;
+                }
+            }
+        }
         let failed_markers = self.block_marker_fractions(sess);
         let bookmark_markers = self.block_bookmark_marker_fractions(sess);
         *sess.block_chrome_cache.borrow_mut() = Some(BlockChromeCache {
@@ -25655,9 +25692,7 @@ impl Frost {
         .blocks(blocks)
         .chat_rows(
             sess.projection.chat_rows(),
-            self.config
-                .is_chat_mode()
-                .then_some(sess.projection.as_ref()),
+            (!sess.projection.chat_rows().is_empty()).then_some(sess.projection.as_ref()),
             submit_token.map(Message::ChatSubmit),
         )
         .transcript_canvas(
@@ -26952,6 +26987,10 @@ impl Frost {
         } else {
             panes_body
         };
+        // The reading bar is fixed workspace chrome. Keep it outside the
+        // translated native surface so prompt paint and IME share the same
+        // origin as the PTY budget, including in Block presentation.
+        let panes_body = self.reference_terminal_surface(panes_body);
         let panes_body = terminal_panes_body(
             self.block_reading_bar_visible().then(|| {
                 self.font_zoom_region(font_zoom::Group::Content, self.block_reading_bar())
@@ -26964,7 +27003,6 @@ impl Frost {
         // Leaf terminal/editor widgets own their content font. A capturing
         // scope around the entire tree would resize the shell behind Vim.
         let body: Element<'_, Message> = body.into();
-        let body: Element<'_, Message> = self.reference_terminal_surface(body);
         let body: Element<'_, Message> = if self.config_panel_open {
             let overlay = if self.theme_editor.is_some() {
                 self.theme_editor_view()

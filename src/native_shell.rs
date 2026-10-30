@@ -213,7 +213,7 @@ impl Frost {
     ) -> iced::widget::Text<'static> {
         label(
             value,
-            ui_typography::reference_role_size(size * 1.5, self.chrome_font_size()),
+            ui_typography::reference_role_size(size, self.chrome_font_size()),
             muted,
             light,
         )
@@ -223,7 +223,7 @@ impl Frost {
             minimum
         } else {
             ui_typography::row_height(
-                ui_typography::reference_role_size(roles * 1.5, self.chrome_font_size()),
+                ui_typography::reference_role_size(roles, self.chrome_font_size()),
                 minimum,
                 padding,
             )
@@ -343,7 +343,7 @@ impl Frost {
         action: Message,
         selected: bool,
     ) -> iced::widget::Button<'static, Message> {
-        button(container(vector_icon(glyph, rgb(color::CHROME_TEXT), 18.0)).center(32))
+        button(container(vector_icon(glyph, rgb(color::CHROME_TEXT), 14.0)).center(32))
             .on_press(action)
             .width(32)
             .height(32)
@@ -589,7 +589,7 @@ impl Frost {
                      selected: bool|
          -> Element<'_, Message> {
             tooltip(
-                button(container(vector_icon(glyph, rgb(color::CHROME_TEXT), 18.0)).center(32))
+                button(container(vector_icon(glyph, rgb(color::CHROME_TEXT), 14.0)).center(32))
                     .on_press(action)
                     .width(32)
                     .height(32)
@@ -781,7 +781,7 @@ impl Frost {
             destinations = destinations.push(tooltip(
                 button(
                     row![
-                        vector_icon(Icon::from_key(key), rgb(color::CHROME_MUTED), 15.0),
+                        vector_icon(Icon::from_key(key), rgb(color::CHROME_MUTED), 13.0),
                         container(
                             self.chrome_label(title, 10.0, false, false)
                                 .width(Length::Fill)
@@ -915,7 +915,7 @@ impl Frost {
             spaces = spaces.push(tooltip(
                 container(
                     row![
-                        crate::reference_icon::identity(name, 18.0),
+                        crate::reference_icon::identity(name, 22.0),
                         container(labels).width(Length::Fill).clip(true),
                     ]
                     .spacing(9)
@@ -946,11 +946,8 @@ impl Frost {
             ),
             destinations,
             Space::new().height(8),
-            self.chrome_section("TABS"),
-            recent,
-            Space::new().height(7),
-            self.chrome_section("SPACES"),
-            spaces
+            self.chrome_section("RECENT"),
+            recent
         ];
         let status = self
             .sessions
@@ -1003,7 +1000,7 @@ impl Frost {
                     .spacing(0),
                 )
                 .height(
-                    (ui_typography::reference_role_size(27.0, self.chrome_font_size()) * 1.3
+                    (ui_typography::reference_role_size(20.0, self.chrome_font_size()) * 1.3
                         + shell::NAVIGATION_PADDING)
                         .ceil()
                         .max(shell::NAVIGATION_STATUS_HEIGHT),
@@ -1019,23 +1016,28 @@ impl Frost {
             // the duplicate status when large text would consume the sidebar.
             Space::new().height(0).into()
         };
-        container(column![scrollable(navigation).height(Length::Fill), footer,])
-            .padding([0.0, shell::NAVIGATION_PADDING])
-            .width(
-                self.reference_layout()
-                    .navigation
-                    .map_or(0.0, |nav| nav.width),
+        let destinations = column![self.chrome_section("SPACES"), spaces].spacing(3);
+        container(column![
+            scrollable(navigation).height(Length::Fill),
+            destinations,
+            footer,
+        ])
+        .padding([0.0, shell::NAVIGATION_PADDING])
+        .width(
+            self.reference_layout()
+                .navigation
+                .map_or(0.0, |nav| nav.width),
+        )
+        .height(Length::Fill)
+        .style(|theme| {
+            panel(
+                theme,
+                color::NAVIGATION,
+                color::DARK_BORDER,
+                shell::CARD_RADIUS,
             )
-            .height(Length::Fill)
-            .style(|theme| {
-                panel(
-                    theme,
-                    color::NAVIGATION,
-                    color::DARK_BORDER,
-                    shell::CARD_RADIUS,
-                )
-            })
-            .into()
+        })
+        .into()
     }
 
     fn reference_header(&self) -> Element<'_, Message> {
@@ -1056,7 +1058,7 @@ impl Frost {
             - 2.0 * shell::COMPOSER_INSET
             - 3.0 * (shell::HEADER_ACTION_SIZE + shell::HEADER_ACTION_GAP))
             .max(0.0);
-        let title_size = ui_typography::reference_role_size(15.0, self.chrome_font_size());
+        let title_size = ui_typography::reference_role_size(12.0, self.chrome_font_size());
         let title_chars = (available / (title_size * 0.6).max(1.0)).floor() as usize;
         let heading = self
             .chrome_label(
@@ -1068,25 +1070,42 @@ impl Frost {
                     },
                     title_chars.saturating_sub(1),
                 ),
-                10.0,
+                12.0,
                 false,
                 true,
             )
             .width(Length::Fill)
             .wrapping(text::Wrapping::None)
             .font(iced::Font {
-                weight: iced::font::Weight::Bold,
+                weight: iced::font::Weight::Semibold,
                 ..iced::Font::with_name(shell::FONT_SANS)
             });
         let heading = tooltip(
-            container(heading).width(Length::Fill).clip(true),
+            container(
+                column![
+                    heading,
+                    self.chrome_label(
+                        if self.config.is_chat_mode() {
+                            "Chat session · Local"
+                        } else {
+                            "Block session · Local"
+                        },
+                        9.0,
+                        true,
+                        false,
+                    )
+                ]
+                .spacing(1),
+            )
+            .width(Length::Fill)
+            .clip(true),
             self.chrome_label(full_title, 10.0, false, true),
             iced::widget::tooltip::Position::Bottom,
         )
         .style(self.popup_style());
         let action = |icon, message| {
             button(
-                container(vector_icon(icon, rgb(color::CANVAS_MUTED), 16.0))
+                container(vector_icon(icon, rgb(color::CANVAS_MUTED), 14.0))
                     .center(shell::HEADER_ACTION_SIZE),
             )
             .on_press(message)
@@ -1142,7 +1161,7 @@ impl Frost {
             let mut contents = row![]
                 .spacing(jterm_core::reference_popup::FOOTER_ICON_LABEL_GAP)
                 .align_y(iced::Alignment::Center);
-            contents = contents.push(vector_icon(glyph, rgb(fg), 18.0));
+            contents = contents.push(vector_icon(glyph, rgb(fg), 12.0));
             let caption = self
                 .chrome_label(
                     title,
@@ -1155,7 +1174,7 @@ impl Frost {
             if !icon_only {
                 contents = contents.push(caption);
                 if title == jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[4] {
-                    contents = contents.push(vector_icon(Icon::ChevronDown, rgb(fg), 18.0));
+                    contents = contents.push(vector_icon(Icon::ChevronDown, rgb(fg), 12.0));
                 }
             }
             let button = button(contents)
@@ -1200,7 +1219,7 @@ impl Frost {
             }
         };
         let mut tools = row![button(
-            container(vector_icon(Icon::Plus, rgb(color::CANVAS_TEXT), 18.0))
+            container(vector_icon(Icon::Plus, rgb(color::CANVAS_TEXT), 12.0))
                 .center(shell::COMPOSER_PLUS_WIDTH)
         )
         .on_press(Message::NewSession)
@@ -1248,7 +1267,7 @@ impl Frost {
         let arrow = container(vector_icon(
             if running { Icon::Close } else { Icon::Send },
             rgb(color::CHROME_TEXT),
-            18.0,
+            12.0,
         ))
         .center(shell::COMPOSER_SEND_WIDTH)
         .width(shell::COMPOSER_SEND_WIDTH)
@@ -1787,7 +1806,7 @@ impl Frost {
     pub(crate) fn reference_input_metrics(
         &self,
     ) -> Option<crate::native_input_surface::DockMetrics> {
-        if !self.config.is_chat_mode() || self.is_split() {
+        if !self.config.is_card_mode() || self.is_split() {
             return None;
         }
         let session = self.sessions.get(self.active)?;
@@ -1840,7 +1859,7 @@ impl Frost {
         &'a self,
         terminal: Element<'a, Message>,
     ) -> Element<'a, Message> {
-        if !self.config.is_chat_mode() {
+        if !self.config.is_card_mode() {
             return terminal;
         }
         macro_rules! direct {
@@ -1912,12 +1931,44 @@ impl Frost {
                 .saturating_sub(dock_metrics.visible_rows),
         );
         let dock_y = self.metrics.padding + visible_start as f32 * self.metrics.cell_h - margin;
-        let history = jterm_core::reference_conversation::fixture_enabled().then(|| {
-            crate::reference_conversation::conversation_view(
+        let empty_history = !self.config.is_chat_mode()
+            && session
+                .projection
+                .cells()
+                .iter()
+                .take(dock)
+                .all(|row| row.iter().all(|cell| cell.character.is_whitespace()));
+        let history = if jterm_core::reference_conversation::fixture_enabled() {
+            Some(crate::reference_conversation::conversation_view(
                 &jterm_core::reference_conversation::acceptance_fixture(),
                 self.effective_font_size(),
+            ))
+        } else if empty_history {
+            Some(
+                container(
+                    column![
+                        self.chrome_label(
+                            "Finished commands become reusable cards here.",
+                            10.0,
+                            false,
+                            false
+                        ),
+                        self.chrome_label(
+                            "Click a card header to select · Right-click for actions",
+                            9.0,
+                            true,
+                            false
+                        ),
+                    ]
+                    .spacing(6),
+                )
+                .padding(16)
+                .width(Length::Fill)
+                .into(),
             )
-        });
+        } else {
+            None
+        };
         crate::native_input_surface::surface(
             terminal,
             history,

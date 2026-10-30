@@ -54,8 +54,8 @@ mod tests {
         assert!(direct.editor.is_none());
         assert_eq!(direct.input_height, 0.0);
         assert_eq!(direct.composer, layout.composer);
-        // Baseline fixture: 976 - 6 bottom - 42 toolbar - 6 footer - 86 top.
-        assert_eq!(direct.raw.height, 836.0);
+        // Baseline: 976 - 10 bottom - 36 tools - 8 gap - 101 top.
+        assert_eq!(direct.raw.height, 821.0);
         assert_eq!(
             direct.raw.bottom() + crate::glass_shell_tokens::TERMINAL_FOOTER_GAP,
             layout.composer.y

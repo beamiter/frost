@@ -20,10 +20,10 @@ pub const COMPOSER_INSET: f32 = glass::TERMINAL_INSET_LEFT;
 pub const COMPOSER_CONTROL_LEFT: f32 = 6.0;
 pub const COMPOSER_CONTROL_RIGHT: f32 = 6.0;
 pub const COMPOSER_CONTROL_BOTTOM: f32 = 5.0;
-pub const COMPOSER_PLUS_WIDTH: f32 = 32.0;
-pub const COMPOSER_TERMINAL_WIDTH: f32 = 106.0;
-pub const COMPOSER_TOOLS_WIDTH: f32 = 110.0;
-pub const COMPOSER_SEND_WIDTH: f32 = 32.0;
+pub const COMPOSER_PLUS_WIDTH: f32 = 26.0;
+pub const COMPOSER_TERMINAL_WIDTH: f32 = 76.0;
+pub const COMPOSER_TOOLS_WIDTH: f32 = 68.0;
+pub const COMPOSER_SEND_WIDTH: f32 = 26.0;
 pub const METADATA_GAP: f32 = glass::TOOL_GAP;
 // Charge the actual controls, outer padding and every fixed gap. These are
 // unscaled widths; dividing the available width by font_scale is conservative
@@ -35,26 +35,26 @@ pub const COMPOSER_TERMINAL_MIN_AVAILABLE: f32 = COMPOSER_CONTROL_LEFT
     + COMPOSER_TOOLS_WIDTH
     + COMPOSER_SEND_WIDTH
     + 3.0 * METADATA_GAP;
-pub const MODE_CONTROL_MIN_WIDTH: f32 = 64.0;
+pub const MODE_CONTROL_MIN_WIDTH: f32 = 52.0;
 pub const SEARCH_WIDTH: f32 = 400.0;
 pub const SEARCH_CENTER_OFFSET: f32 = 0.0;
-pub const HEADER_ACTION_SIZE: f32 = 28.0;
+pub const HEADER_ACTION_SIZE: f32 = 24.0;
 pub const HEADER_ACTION_GAP: f32 = 4.0;
-pub const PROFILE_DIAMETER: f32 = 32.0;
-pub const INSPECTOR_TAB_WIDTH: f32 = 72.0;
+pub const PROFILE_DIAMETER: f32 = 28.0;
+pub const INSPECTOR_TAB_WIDTH: f32 = 64.0;
 pub const NAVIGATION_LABEL_TOP: f32 = 50.0;
 pub const WORKSPACE_SELECTOR_TOP: f32 = 70.0;
-pub const WORKSPACE_SELECTOR_HEIGHT: f32 = 32.0;
+pub const WORKSPACE_SELECTOR_HEIGHT: f32 = 33.0;
 pub const NAVIGATION_ITEMS_TOP: f32 = 108.0;
-pub const NAVIGATION_ROW_HEIGHT: f32 = 32.0;
-pub const NAVIGATION_ROW_GAP: f32 = 4.0;
-pub const RECENT_ROW_HEIGHT: f32 = 34.0;
-pub const SPACES_ROW_HEIGHT: f32 = 44.0;
-pub const NAVIGATION_STATUS_HEIGHT: f32 = 52.0;
-pub const INSPECTOR_METADATA_ROW_HEIGHT: f32 = 28.0;
-pub const INSPECTOR_CURRENT_HEIGHT: f32 = 59.0;
-pub const INSPECTOR_QUEUE_ROW_HEIGHT: f32 = 32.0;
-pub const INSPECTOR_OUTPUT_HEIGHT: f32 = 170.0;
+pub const NAVIGATION_ROW_HEIGHT: f32 = 26.0;
+pub const NAVIGATION_ROW_GAP: f32 = 3.0;
+pub const RECENT_ROW_HEIGHT: f32 = 30.0;
+pub const SPACES_ROW_HEIGHT: f32 = 30.0;
+pub const NAVIGATION_STATUS_HEIGHT: f32 = 42.0;
+pub const INSPECTOR_METADATA_ROW_HEIGHT: f32 = 19.0;
+pub const INSPECTOR_CURRENT_HEIGHT: f32 = 45.0;
+pub const INSPECTOR_QUEUE_ROW_HEIGHT: f32 = 24.0;
+pub const INSPECTOR_OUTPUT_HEIGHT: f32 = 140.0;
 
 const fn rgb(c: [u8; 4]) -> [u8; 3] {
     [c[0], c[1], c[2]]
