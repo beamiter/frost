@@ -446,10 +446,13 @@ fn companion_height_is_stable_and_tiny_terminal_viewports_are_nonnegative() {
 
 #[test]
 fn expanded_companion_reuses_one_snapshot_and_shared_geometry() {
+    // Baseline fixture correction, not an Eva geometry change: the current
+    // glass profile has 8px side insets, 6px top gap and a 42px tool row.
+    // Keep exact pixel snapshots as well as the independent composer boundary.
     for (width, height, expected) in [
-        (1612.0, 976.0, (282.0, 90.0, 1024.0, 830.0)),
-        (1356.0, 704.0, (282.0, 90.0, 768.0, 558.0)),
-        (800.0, 640.0, (282.0, 90.0, 506.0, 494.0)),
+        (1612.0, 976.0, (278.0, 86.0, 1028.0, 836.0)),
+        (1356.0, 704.0, (278.0, 86.0, 772.0, 564.0)),
+        (800.0, 640.0, (278.0, 86.0, 510.0, 500.0)),
     ] {
         let layout = crate::glass_layout::Layout::for_size(width, height);
         let raw = crate::native_viewport::raw_rect(layout, 0.0, 0.0, None);
@@ -460,10 +463,10 @@ fn expanded_companion_reuses_one_snapshot_and_shared_geometry() {
         );
     }
     assert_eq!(crate::native_viewport::INPUT_STRIP_HEIGHT, 44.0);
-    assert_eq!(crate::native_viewport::TOOLS_HEIGHT, 44.0);
+    assert_eq!(crate::native_viewport::TOOLS_HEIGHT, 42.0);
     assert_eq!(
         crate::native_viewport::INPUT_STRIP_HEIGHT + crate::native_viewport::TOOLS_HEIGHT,
-        88.0
+        86.0
     );
     with_widget(|widget, bounds, _| {
         let state = tree(widget);
@@ -696,11 +699,13 @@ fn disabling_the_bottom_bar_returns_its_rows_to_the_grid() {
     let layout = crate::glass_layout::Layout::for_size(1356.0, 704.0);
     // Native Block and Chat fallback have no editor; a retained Chat prompt
     // reserves its actual editor height above the same fixed glass tool row.
+    // Current baseline tokens give y=44+36+6=86 and bottom=704-6-42-6=650.
+    // Each retained editor subtracts its exact height, not the obsolete 44px toolbar.
     for (mode, input_height, expected_height, expected_bottom) in [
-        (crate::config::TerminalMode::Block, None, 558.0, 648.0),
-        (crate::config::TerminalMode::Chat, None, 558.0, 648.0),
-        (crate::config::TerminalMode::Chat, Some(44.0), 514.0, 604.0),
-        (crate::config::TerminalMode::Chat, Some(180.0), 378.0, 468.0),
+        (crate::config::TerminalMode::Block, None, 564.0, 650.0),
+        (crate::config::TerminalMode::Chat, None, 564.0, 650.0),
+        (crate::config::TerminalMode::Chat, Some(44.0), 520.0, 606.0),
+        (crate::config::TerminalMode::Chat, Some(180.0), 384.0, 470.0),
     ] {
         let expected = crate::native_viewport::raw_rect(layout, 0.0, 0.0, input_height);
         for bottom_bar in [false, true] {

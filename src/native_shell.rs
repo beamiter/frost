@@ -1669,9 +1669,17 @@ impl Frost {
             false,
             false,
         ));
-        scrollable(container(content).padding(16).width(Length::Fill))
-            .height(Length::Fill)
-            .into()
+        let existing: Element<'_, Message> =
+            scrollable(container(content).padding(16).width(Length::Fill))
+                .height(Length::Fill)
+                .into();
+        if self.eva.is_some() {
+            column![self.eva_card(), existing]
+                .height(Length::Fill)
+                .into()
+        } else {
+            existing
+        }
     }
 
     fn reference_inspector(&self) -> Element<'_, Message> {

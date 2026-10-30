@@ -51,7 +51,8 @@ def build_probe(output, deps=None, rustc=None):
     sources = {name: (ROOT / name).read_text() for name in
                ('src/main.rs', 'src/native_shell.rs', 'src/terminal_view.rs',
                 'src/native_viewport.rs', 'src/terminal.rs', 'src/ui_typography.rs')}
-    core = (ROOT.parent / 'jterm_core/src/reference_shell.rs').resolve(strict=True)
+    core_root = Path(subprocess.check_output(['python3', str(ROOT / 'scripts/shared-core-path.py'), str(ROOT)], text=True).strip())
+    core = (core_root / 'src/reference_shell.rs').resolve(strict=True)
     hashes = {name: hashlib.sha256(text.encode()).hexdigest() for name, text in sources.items()}
     hashes[str(core)] = hashlib.sha256(core.read_bytes()).hexdigest()
     source_digest = hashlib.sha256()

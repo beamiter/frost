@@ -31,6 +31,7 @@ pub mod conversion;
 
 /// Frost opt-in native key ownership boundary; see FROST_PATCH.md.
 pub mod native_events;
+pub mod presentation_observer;
 
 mod error;
 mod proxy;
@@ -950,6 +951,7 @@ async fn run_instance<P>(
                         interact_span.finish();
 
                         let draw_span = debug::draw(id);
+                        presentation_observer::begin_draw(id);
                         interface.draw(
                             &mut window.renderer,
                             window.state.theme(),
@@ -990,6 +992,7 @@ async fn run_instance<P>(
                         ) {
                             Ok(()) => {
                                 present_span.finish();
+                                presentation_observer::submitted(id);
                             }
                             Err(error) => match error {
                                 compositor::SurfaceError::OutOfMemory => {

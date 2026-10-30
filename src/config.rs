@@ -154,6 +154,14 @@ pub struct Config {
     #[serde(default)]
     pub vim9: jterm_core::vim9::Vim9UiConfig,
 
+    /// Shared Eva is opt-in and takes effect on the next window launch.
+    #[serde(default)]
+    pub eva_companion_enabled: bool,
+    #[serde(default = "default_eva_skin")]
+    pub eva_companion_skin: String,
+    #[serde(default)]
+    pub eva_companion_high_contrast: bool,
+
     /// Offline companion, enabled unless explicitly disabled.
     #[serde(default = "default_organism_enabled")]
     pub ascii_organism_enabled: bool,
@@ -672,9 +680,16 @@ fn default_jsh_update_check() -> String {
         .to_string()
 }
 
+fn default_eva_skin() -> String {
+    "cat".into()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
+            eva_companion_enabled: false,
+            eva_companion_skin: default_eva_skin(),
+            eva_companion_high_contrast: false,
             vim9: jterm_core::vim9::Vim9UiConfig::default(),
             ascii_organism_enabled: default_organism_enabled(),
             ascii_organism_expanded: true,

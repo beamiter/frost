@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Headless production typography, sidebar virtualization and viewport budgets.
 
-This uses rustc only, preserving the fmt CI job's no-native-SDK contract.
+This uses rustc plus Cargo source resolution, without native SDKs.
 The production glass adapter, actual input row/cursor route and PTY dimension
 guard are exercised; native renderer/input dispatch remain separate gates.
 """
@@ -71,10 +71,8 @@ settings = function(main, 'config_panel')
 assert 'scrollable::Direction::Both' in settings
 assert 'let buttons = buttons.wrap()' in settings
 
-core_path = re.search(r'^jterm_core = \{[^\n]*\bpath = "([^"]+)"',
-                      (ROOT / 'Cargo.toml').read_text(), re.MULTILINE)
-assert core_path is not None, 'jterm_core must be the actual path dependency'
-core = (ROOT / core_path.group(1)).resolve()
+core = Path(subprocess.check_output(
+    ['python3', str(ROOT / 'scripts/shared-core-path.py'), str(ROOT)], text=True).strip())
 code = 'extern crate self as jterm_core;\n'
 for name in ['reference_shell']:
     code += '#[path = ' + json.dumps(str(core / 'src' / (name + '.rs'))) + '] pub mod ' + name + ';\n'
@@ -124,9 +122,22 @@ assert 'tree.children[0].diff(self.terminal.as_widget())' in function(input_surf
 assert 'self.dock.map_or(0.0, |dock| dock.input_height)' in function(input_surface, 'input_height')
 tools = function(native_shell, 'reference_tools')
 assert 'self.reference_layout().composer.width' in tools
-for requirement in ['COMPOSER_SECONDARY_MIN_WIDTH', 'COMPOSER_TERMINAL_MIN_AVAILABLE',
-                    'COMPOSER_MODEL_MIN_AVAILABLE']:
-    assert requirement in tools
+# Baseline contract correction: the unchanged glass toolbar now contains Plus,
+# optional Terminal, responsive Tools and Send/Interrupt. Secondary/model choices
+# are not separate toolbar controls, so their old width-token checks were stale.
+# Assert the actual font-scaled admission and full exact icon-only budget instead.
+compact_tools = re.sub(r'\s+', '', tools)
+assert 'letavailable=composer_width/font_scale;' in compact_tools
+assert 'ifavailable>=shell::COMPOSER_TERMINAL_MIN_AVAILABLE{' in compact_tools
+assert ('leticon_only=title==jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[4]'
+        '&&composer_width<shell::COMPOSER_CONTROL_LEFT+shell::COMPOSER_CONTROL_RIGHT'
+        '+shell::COMPOSER_PLUS_WIDTH+shell::COMPOSER_SEND_WIDTH+width*font_scale'
+        '+2.0*shell::METADATA_GAP;') in compact_tools
+assert '.width(ificon_only{32.0}else{width*font_scale})' in compact_tools
+assert 'if !icon_only {' in tools and 'if icon_only {' in tools
+for requirement in ['Message::NewSession', 'Message::ReferenceFocusTerminal',
+                    'Message::ReferenceToolsToggle', 'chat_mode::press_control(arrow, action)']:
+    assert requirement in tools, requirement
 native_chat = (ROOT / 'src/chat_mode.rs').read_text()
 code += ('mod chat_mode { pub use crate::core_chat_mode::*;\n'
          '#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]\n'
@@ -138,10 +149,8 @@ metrics_assignment = apply[metrics_start:apply.index(';', metrics_start) + 1]
 replacements = {
     'toolbar-constants': '\n'.join(constant(profile, name) for name in [
         'COMPOSER_CONTROL_LEFT', 'COMPOSER_CONTROL_RIGHT', 'COMPOSER_PLUS_WIDTH',
-        'COMPOSER_ATTACH_WIDTH', 'COMPOSER_IMAGE_WIDTH', 'COMPOSER_CODE_WIDTH',
         'COMPOSER_TERMINAL_WIDTH', 'COMPOSER_TOOLS_WIDTH', 'COMPOSER_SEND_WIDTH',
-        'COMPOSER_MODEL_MIN_WIDTH', 'METADATA_GAP', 'COMPOSER_TERMINAL_MIN_AVAILABLE',
-        'COMPOSER_MODEL_MIN_AVAILABLE', 'COMPOSER_SECONDARY_MIN_WIDTH']),
+        'METADATA_GAP', 'COMPOSER_TERMINAL_MIN_AVAILABLE']),
     'constants': '\n'.join([constant(view, name) for name in ['SCROLLBAR_WIDTH', 'BLOCK_GUTTER_WIDTH']]
                            + [constant(terminal, name) for name in ['MAX_TERMINAL_COLS', 'MAX_TERMINAL_ROWS']]
                            + [constant(main, 'PANE_HEADER_H')]),

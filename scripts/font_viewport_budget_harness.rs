@@ -108,9 +108,9 @@ mod font_viewport_budget {
                         a.apply_metrics(); let m=a.metrics;
                         close(m.font_size, size);
                         close(m.cell_h, size * 1.2 * spacing);
-                        close(a.term_height(),558.0);
+                        close(a.term_height(),564.0);
                         let (_, rows) = m.grid_size(a.term_width()-SCROLLBAR_WIDTH, a.term_height());
-                        let expected = (((558.0-padding*2.0).max(0.0)/(size*1.2*spacing)).floor() as usize).clamp(1,512);
+                        let expected = (((564.0-padding*2.0).max(0.0)/(size*1.2*spacing)).floor() as usize).clamp(1,512);
                         assert_eq!(rows, expected, "content={size},spacing={spacing},padding={padding}");
                         assert!(rows <= previous); previous=rows;
                     }
@@ -120,8 +120,8 @@ mod font_viewport_budget {
         let normal=app(14.0,14.0,1356.0,704.0);
         let zoomed=app(28.0,14.0,1356.0,704.0);
         let rows=|a: &Frost| a.metrics.grid_size(a.term_width()-SCROLLBAR_WIDTH,a.term_height()).1;
-        assert_eq!(rows(&normal),32); assert_eq!(rows(&zoomed),16);
-        close(app(14.0,14.0,1612.0,976.0).term_height(),830.0);
+        assert_eq!(rows(&normal),33); assert_eq!(rows(&zoomed),16);
+        close(app(14.0,14.0,1612.0,976.0).term_height(),836.0);
     }
     #[test]
     fn compact_chrome_returns_pty_rows_and_columns_without_changing_content_font() {
@@ -236,7 +236,8 @@ mod font_viewport_budget {
         let mut a=app(14.0,14.0,1612.0,976.0); a.config.chat=true;
         a.sessions[0]=session(7,4);
         close(a.reference_input_metrics().unwrap().input_height,83.2);
-        close(a.term_height(),746.8);
+        // Current raw budget 836px minus the unchanged 83.2px editor.
+        close(a.term_height(),752.8);
         // A cursor below the last proven Composer/raw row must remain included.
         a.sessions[0].cursor.0=99;
         close(a.reference_input_metrics().unwrap().input_height,180.0);
@@ -257,7 +258,7 @@ mod font_viewport_budget {
             assert!(a.reference_input_metrics().is_none());
             let joint=a.reference_native_budget();
             assert!(joint.editor.is_none()); close(joint.input_height,0.0);
-            close(a.term_height(),830.0);
+            close(a.term_height(),836.0);
             assert_eq!(joint.composer,a.reference_layout().composer);
         }
     }
@@ -285,22 +286,39 @@ mod font_viewport_budget {
         }
     }
     #[test]
-    fn actual_toolbar_width_fits_all_reference_tools_and_compacts_narrow_windows() {
-        assert!(toolbar::COMPOSER_SECONDARY_MIN_WIDTH>toolbar::COMPOSER_MODEL_MIN_AVAILABLE);
-        assert!(toolbar::COMPOSER_MODEL_MIN_AVAILABLE>toolbar::COMPOSER_TERMINAL_MIN_AVAILABLE);
+    fn actual_toolbar_width_fits_current_tools_and_compacts_narrow_windows() {
+        // Baseline fixture correction: production now has Plus/Terminal/Tools/Send,
+        // a 42px toolbar and 8px terminal insets, not six tools plus a model picker.
         let standard=app(14.0,14.0,1612.0,976.0).reference_layout();
-        close(standard.composer.width,1040.0);
-        assert!(standard.composer.width>=toolbar::COMPOSER_SECONDARY_MIN_WIDTH,
-                "the real toolbar must expose all six tools/model/send");
+        close(standard.composer.width,1044.0);
         let narrow=app(14.0,14.0,800.0,640.0).reference_layout();
-        close(narrow.composer.width,522.0);
-        assert!(narrow.composer.width<toolbar::COMPOSER_SECONDARY_MIN_WIDTH);
-        assert!(narrow.composer.width>=toolbar::COMPOSER_TERMINAL_MIN_AVAILABLE);
+        close(narrow.composer.width,526.0);
         let compact=app(14.0,14.0,580.0,640.0).reference_layout();
+        close(compact.composer.width,306.0);
+        close(toolbar::COMPOSER_TERMINAL_MIN_AVAILABLE,310.0);
+        assert!(standard.composer.width>=toolbar::COMPOSER_TERMINAL_MIN_AVAILABLE);
+        assert!(narrow.composer.width>=toolbar::COMPOSER_TERMINAL_MIN_AVAILABLE);
         assert!(compact.composer.width<toolbar::COMPOSER_TERMINAL_MIN_AVAILABLE);
-        let mandatory=toolbar::COMPOSER_PLUS_WIDTH+toolbar::COMPOSER_TOOLS_WIDTH
-            +toolbar::COMPOSER_SEND_WIDTH+2.0*toolbar::METADATA_GAP
-            +toolbar::COMPOSER_CONTROL_LEFT+toolbar::COMPOSER_CONTROL_RIGHT;
-        assert!(compact.composer.width>=mandatory,"Tools and the one Send remain reachable");
+        // test-font-sync.py binds these equations to the exact unchanged native
+        // expressions. Preserve the Terminal boundary and Tools fallback at every scale.
+        for scale in [1.0,2.0,3.0] {
+            let fixed=toolbar::COMPOSER_CONTROL_LEFT+toolbar::COMPOSER_CONTROL_RIGHT
+                +toolbar::COMPOSER_PLUS_WIDTH+toolbar::COMPOSER_SEND_WIDTH;
+            let tools_threshold=fixed+toolbar::COMPOSER_TOOLS_WIDTH*scale+2.0*toolbar::METADATA_GAP;
+            for width in [tools_threshold-1.0,tools_threshold,tools_threshold+1.0,
+                          toolbar::COMPOSER_TERMINAL_MIN_AVAILABLE*scale-1.0,
+                          toolbar::COMPOSER_TERMINAL_MIN_AVAILABLE*scale,
+                          compact.composer.width,narrow.composer.width,standard.composer.width] {
+                let terminal=width/scale>=toolbar::COMPOSER_TERMINAL_MIN_AVAILABLE;
+                let icon_only=width<tools_threshold;
+                let tools=if icon_only {32.0} else {toolbar::COMPOSER_TOOLS_WIDTH*scale};
+                let required=fixed+tools+if terminal {toolbar::COMPOSER_TERMINAL_WIDTH*scale+3.0*toolbar::METADATA_GAP} else {2.0*toolbar::METADATA_GAP};
+                assert!(required<=width,"reachable controls width={width} scale={scale}");
+                if width==tools_threshold {assert!(!icon_only);}
+                if width==tools_threshold-1.0 {assert!(icon_only);}
+                if width==toolbar::COMPOSER_TERMINAL_MIN_AVAILABLE*scale {assert!(terminal);}
+                if width==toolbar::COMPOSER_TERMINAL_MIN_AVAILABLE*scale-1.0 {assert!(!terminal);}
+            }
+        }
     }
 }

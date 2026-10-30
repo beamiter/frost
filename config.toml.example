@@ -16,6 +16,11 @@
 # sidebar_width = 216.0  # navigation, 180..480 logical pixels
 # inspector_width = 288.0  # right inspector, 260..520 logical pixels
 
+# One shared Eva identity across upgraded terminals (opt-in; restart window).
+eva_companion_enabled = false
+eva_companion_skin = "cat"
+eva_companion_high_contrast = false
+
 # Vim buffer rendering and optional workbench controls are independent.
 # Explicitly enter with frost --ide [file-or-project].
 [vim9]

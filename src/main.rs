@@ -28,6 +28,7 @@ mod command_palette;
 mod config;
 mod config_retry;
 mod debug;
+mod eva_companion;
 mod find_focus;
 mod fold_preview;
 mod font_zoom;
@@ -4563,6 +4564,7 @@ fn main() -> iced::Result {
 
 #[derive(Debug, Clone)]
 enum Message {
+    Eva(eva_companion::Event),
     ReferenceInspector(native_shell::InspectorTab),
     ReferenceInspectorToggle,
     SidebarResize(sidebar_resize::Side, sidebar_resize::Action),
@@ -6771,6 +6773,9 @@ fn overlay_release_disposition(
 }
 
 struct Frost {
+    eva: Option<eva_companion::Eva>,
+    eva_preview_pose: jterm_core::companion_host::atlas::Pose,
+    eva_preview_mood: jterm_core::companion_host::atlas::Mood,
     reference_inspector_tab: native_shell::InspectorTab,
     reference_inspector_open: bool,
     reference_inspector_drawer: bool,
@@ -7174,7 +7179,13 @@ impl Frost {
         };
         let sidebar_open = true;
 
+        let eva = (config.eva_companion_enabled
+            || jterm_core::companion_host::shared_mode_requested())
+        .then(eva_companion::Eva::new);
         let mut app = Frost {
+            eva,
+            eva_preview_pose: jterm_core::companion_host::atlas::Pose::Idle,
+            eva_preview_mood: jterm_core::companion_host::atlas::Mood::Neutral,
             reference_inspector_tab: native_shell::InspectorTab::Agent,
             reference_inspector_open: true,
             reference_inspector_drawer: false,
@@ -7361,7 +7372,14 @@ impl Frost {
         // machine has none or an old one. Nothing is installed without an
         // explicit click.
         let jsh_check = Self::jsh_update_check_task(&app.config.jsh_update_check);
-        (app, jsh_check)
+        (
+            app,
+            Task::batch([
+                jsh_check,
+                iced::window::oldest()
+                    .and_then(|id| Task::done(Message::Eva(eva_companion::Event::Bind(id)))),
+            ]),
+        )
     }
 
     fn title(&self) -> String {
@@ -7504,11 +7522,10 @@ impl Frost {
         ) {
             self.finish_cancelled_terminal_mouse_gesture(gesture);
         }
-        self.organism
-            .set_enabled(self.config.ascii_organism_enabled);
+        self.organism.set_enabled(self.legacy_organism_enabled());
         self.organism
             .set_care_reminders(self.config.ascii_organism_care_enabled);
-        if self.config.ascii_organism_enabled {
+        if self.legacy_organism_enabled() {
             for sess in &self.sessions {
                 if !sess.managed_remote && !sess.transcript_read_only() {
                     self.organism
@@ -7967,6 +7984,8 @@ impl Frost {
             && self.sidebar_delete_confirm.is_none()
             && !self.sidebar_files_focused
             && !self.task_input_owns_keys()
+            && !self.eva_input_owns_keys()
+            && !self.eva_closing()
     }
 
     fn chat_input_ready(&self, session_id: usize) -> bool {
@@ -9359,7 +9378,7 @@ impl Frost {
             return 0.0;
         }
         let base = companion_strip_height(
-            self.config.ascii_organism_enabled,
+            self.legacy_organism_enabled(),
             self.config.ascii_organism_expanded,
             self.config.bottom_bar,
         );
@@ -10200,6 +10219,12 @@ impl Frost {
     /// because a stalled state filesystem must not turn quitting into a hang;
     /// a missed deadline is logged and the exit continues.
     fn exit_flushing_durable_state(&mut self) -> Task<Message> {
+        if let Some(eva) = self.eva.as_mut() {
+            eva.request_close();
+            if !eva.ready_to_close() {
+                return Task::none();
+            }
+        }
         self.glass_geometry_ready = false;
         if let Some((id, fd)) = self.host_clipboard_read_owner {
             self.release_host_clipboard_read(id, fd);
@@ -16242,6 +16267,22 @@ impl Frost {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if let Message::WindowKey(id, _) | Message::CapturedEnterPress(id, _) = &message {
+            if let Some(eva) = self.eva.as_mut() {
+                eva.bind(*id);
+            }
+        }
+        if matches!(
+            &message,
+            Message::WindowKey(_, keyboard::Event::KeyPressed { .. })
+                | Message::Ime(_)
+                | Message::Pasted(..)
+        ) {
+            if let Some(eva) = self.eva.as_mut() {
+                eva.input();
+            }
+        }
+
         self.sync_terminal_ime_owner();
         self.sync_terminal_pane_owners();
         let geometry_owner = self
@@ -16289,6 +16330,10 @@ impl Frost {
                 self.focused && active == Some(*id) && self.reference_tools_selection.is_none(),
             );
         }
+        self.sync_eva();
+        if self.eva.as_ref().is_some_and(|eva| eva.ready_to_close()) {
+            return Task::batch([task, self.exit_flushing_durable_state()]);
+        }
         Task::batch([task, self.dispatch_block_search_work()])
     }
 
@@ -16327,8 +16372,7 @@ impl Frost {
         self.organism.freeze_watch(is_pty_output);
         // Coordinate identity only: due attention is not accepted ahead of input.
         self.sync_organism_attention_owner();
-        self.organism
-            .set_enabled(self.config.ascii_organism_enabled);
+        self.organism.set_enabled(self.legacy_organism_enabled());
         self.organism
             .set_care_reminders(self.config.ascii_organism_care_enabled);
         if self.organism_observation_owner().is_none() {
@@ -16341,6 +16385,7 @@ impl Frost {
             self.sync_organism_watch();
         }
         match message {
+            Message::Eva(event) => self.eva_event(event),
             Message::ReferenceToolsToggle => {
                 self.native_enter_ownership.lock().claim_held();
                 self.reference_tools_selection =
@@ -16602,7 +16647,7 @@ impl Frost {
                 let mut completed_commands: Vec<terminal::CompletedCommand> = Vec::new();
                 // Observe only live session identities, before processing this
                 // batch so enabling during C..D cannot replay that command.
-                if self.config.ascii_organism_enabled {
+                if self.legacy_organism_enabled() {
                     self.organism.observe_work_day(organism_local_day());
                     if let Some(sess) = self
                         .sessions
@@ -16653,9 +16698,33 @@ impl Frost {
                         sess.last_duration_ms = last.duration_ms;
                     }
                 }
+                // Shared Eva receives validated result metadata only; never commands,
+                // directory strings, terminal bytes or inferred successful results.
+                if is_active_output
+                    && self.sessions.iter().any(|s| {
+                        s.id == id
+                            && s.master_fd == fd
+                            && !s.managed_remote
+                            && !s.transcript_read_only()
+                            && !matches!(
+                                s.fg_proc_cache.as_deref(),
+                                Some("ssh" | "mosh" | "telnet")
+                            )
+                    })
+                {
+                    if let Some(eva) = self.eva.as_mut() {
+                        for completed in &completed_commands {
+                            let exit = (completed.completion_provenance
+                                == block_mode::CompletionProvenance::ShellReported)
+                                .then_some(completed.exit_code)
+                                .flatten();
+                            eva.task_result(id, exit);
+                        }
+                    }
+                }
                 // Borrow the existing one-shot drain. Do not drain again or
                 // infer successful exits for boundary-inferred completions.
-                if self.config.ascii_organism_enabled {
+                if self.legacy_organism_enabled() {
                     if let Some(sess) = self
                         .sessions
                         .iter()
@@ -18671,7 +18740,9 @@ impl Frost {
                     // zoom, scrolling, the Tasks and dock toggles) still
                     // work. Escape (consumed by the field) or a click
                     // elsewhere returns the keyboard.
-                    let task_input = self.task_input_owns_keys();
+                    let task_input = self.task_input_owns_keys()
+                        || self.eva_input_owns_keys()
+                        || self.eva_closing();
                     if task_input
                         && resolve_keybinding_command(&self.keybindings, &key, modifiers)
                             .is_some_and(|command| command_targets_terminal(&command))
@@ -20400,11 +20471,12 @@ impl Frost {
                 let next = choice.configured();
                 self.prepare_organism_motion_config(next);
                 self.config.ascii_organism_motion = next;
+                self.eva_motion_changed();
                 self.config_dirty = true;
             }
             Message::SetOrganismPose(pose) => self.organism.select_pose(pose),
             Message::OrganismCompanion(intent) => {
-                if self.config.ascii_organism_enabled && self.organism_preview_visible() {
+                if self.legacy_organism_enabled() && self.organism_preview_visible() {
                     let owner = self.sessions.get(self.active).map(|session| session.id);
                     let running = self
                         .sessions
@@ -20469,7 +20541,7 @@ impl Frost {
             }
             Message::OrganismTick(cause) => {
                 self.organism_wake_counts.record(&cause);
-                if self.config.ascii_organism_enabled {
+                if self.legacy_organism_enabled() {
                     // Closing a pane removes only its command context. The
                     // window's one life and mind follow the active owner.
                     self.organism.observe_work_day(organism_local_day());
@@ -20795,7 +20867,7 @@ impl Frost {
                 // this existing process-cache heartbeat to rediscover the
                 // active local shell after SSH exits, with no new timer and
                 // no background physiology/animation work.
-                if self.config.ascii_organism_enabled && self.focused {
+                if self.legacy_organism_enabled() && self.focused {
                     if let Some(sess) = self
                         .sessions
                         .get(self.active)
@@ -24523,7 +24595,7 @@ impl Frost {
         };
         organism_host_layout(
             width,
-            self.config.ascii_organism_enabled,
+            self.legacy_organism_enabled(),
             self.config.ascii_organism_expanded,
             self.config.bottom_bar,
             self.config.is_card_mode(),
@@ -24570,7 +24642,8 @@ impl Frost {
     }
 
     fn prepare_organism_motion_config(&mut self, configured: Option<organism::Motion>) {
-        let relevant = self.config.ascii_organism_enabled || self.organism_preview_visible();
+        let relevant =
+            self.eva.is_some() || self.legacy_organism_enabled() || self.organism_preview_visible();
         let transition = self.organism_motion_control.reconcile_with_canvas(
             configured.map(Into::into),
             relevant,
@@ -24581,7 +24654,8 @@ impl Frost {
     }
 
     fn sync_organism_motion(&mut self, foreground_resume: bool) {
-        let relevant = self.config.ascii_organism_enabled || self.organism_preview_visible();
+        let relevant =
+            self.eva.is_some() || self.legacy_organism_enabled() || self.organism_preview_visible();
         let transition = self.organism_motion_control.reconcile_with_canvas(
             self.config.ascii_organism_motion.map(Into::into),
             relevant,
@@ -24617,7 +24691,7 @@ impl Frost {
 
     fn organism_observation_owner(&self) -> Option<usize> {
         native_companion::Observation {
-            enabled: self.config.ascii_organism_enabled,
+            enabled: self.legacy_organism_enabled(),
             card_mode: self.config.is_card_mode(),
             bottom_bar: self.config.bottom_bar,
             focused: self.focused,
@@ -24667,7 +24741,7 @@ impl Frost {
     }
 
     fn greet_companion(&mut self, target: Option<usize>) {
-        let refusal = if !self.config.ascii_organism_enabled {
+        let refusal = if !self.legacy_organism_enabled() {
             Some("Enable Companion in Settings before greeting.")
         } else if self.organism_effective_motion() == Some(organism::Motion::Static) {
             Some("Choose Full or Calm motion before greeting the live companion.")
@@ -25311,7 +25385,7 @@ impl Frost {
         }
         let owner = self.organism_owner()?;
         (CompanionSurface::choose(
-            self.config.ascii_organism_enabled,
+            self.legacy_organism_enabled(),
             self.sessions
                 .get(self.active)
                 .is_some_and(|s| s.id == owner),
@@ -26825,11 +26899,13 @@ impl Frost {
             } else {
                 empty
             };
-            return if self.config_diagnostic.is_some() || !self.keybindings_diagnostics.is_empty() {
-                stack![empty, self.diagnostics_overlay()].into()
-            } else {
-                empty
-            };
+            return self.eva_witness(
+                if self.config_diagnostic.is_some() || !self.keybindings_diagnostics.is_empty() {
+                    stack![empty, self.diagnostics_overlay()].into()
+                } else {
+                    empty
+                },
+            );
         }
         let panes_body: Element<'_, Message> = if self.is_split() && self.pane_zoomed {
             // Zoomed: the focused pane fills the whole area; the hidden panes
@@ -27043,7 +27119,7 @@ impl Frost {
         } else {
             Space::new().width(0).height(0).into()
         };
-        stack![root, capture, self.window_resize_edges()].into()
+        self.eva_witness(stack![root, capture, self.window_resize_edges()].into())
     }
 
     /// Search bar overlaid at the top-right of the terminal. The query is an
@@ -27337,6 +27413,9 @@ impl Frost {
 
     /// The same gate admits preview actions and their timer subscription.
     fn organism_preview_visible(&self) -> bool {
+        if self.eva.is_some() {
+            return false;
+        }
         organism_preview::preview_visible(
             self.focused,
             self.config_panel_open,
@@ -27347,6 +27426,22 @@ impl Frost {
     /// Centered settings overlay (Ctrl+Shift+O). Controls live-apply on change;
     /// Save persists to disk, Reset restores defaults.
     fn organism_settings(&self) -> Element<'_, Message> {
+        if self.eva.is_some() {
+            return column![
+                self.eva_settings(),
+                text("Eva motion"),
+                pick_list(
+                    organism::MotionChoice::ALL,
+                    Some(organism::MotionChoice::from_config(
+                        self.config.ascii_organism_motion
+                    )),
+                    Message::SetOrganismMotion
+                )
+            ]
+            .spacing(8)
+            .into();
+        }
+
         let poses: Vec<organism::Pose> = jterm_core::organism_daily::PreviewPose::ALL
             .into_iter()
             .map(organism::Pose)
@@ -27431,15 +27526,16 @@ impl Frost {
             .spacing(8),
         );
         column![
+            self.eva_settings(),
             checkbox(self.config.ascii_organism_enabled).text_size(self.effective_font_size()).label("Companion")
                 .on_toggle(Message::SetAsciiOrganism),
             text("One companion per window. Its personality and life stay with you across panes; closing the window ends this local session.").size(self.effective_font_size()),
             checkbox(self.config.ascii_organism_expanded).text_size(self.effective_font_size()).label("Show companion status bubble")
                 .on_toggle(Message::SetOrganismExpanded),
-            text(if self.config.is_card_mode() && self.config.ascii_organism_enabled {
+            text(if self.config.is_card_mode() && self.legacy_organism_enabled() {
                 "Block and Chat keep one body in the active card, with no extra status cards in split panes. Full wanders in safe blank space; Calm rests; Static keeps the body still. Typing lets it step out of your way."
             } else { organism_settings_hint(
-                self.config.ascii_organism_enabled,
+                self.legacy_organism_enabled(),
                 self.config.ascii_organism_expanded,
             ) }).size(self.effective_font_size()),
             text("Organism Motion").size(self.effective_font_size()),
@@ -27457,10 +27553,10 @@ impl Frost {
             text("Output rhythm reflects observed activity, not command progress.").size(self.effective_font_size()),
             text("Keep me company").size(self.effective_font_size()),
             row![
-                button(text("Hello")).on_press_maybe(self.config.ascii_organism_enabled.then_some(Message::OrganismCompanion(CompanionIntent::Hello))),
-                button(text("Company")).on_press_maybe(self.config.ascii_organism_enabled.then_some(Message::OrganismCompanion(CompanionIntent::Company))),
-                button(text("A story")).on_press_maybe(self.config.ascii_organism_enabled.then_some(Message::OrganismCompanion(CompanionIntent::Story))),
-                button(text("A break")).on_press_maybe(self.config.ascii_organism_enabled.then_some(Message::OrganismCompanion(CompanionIntent::Rest))),
+                button(text("Hello")).on_press_maybe(self.legacy_organism_enabled().then_some(Message::OrganismCompanion(CompanionIntent::Hello))),
+                button(text("Company")).on_press_maybe(self.legacy_organism_enabled().then_some(Message::OrganismCompanion(CompanionIntent::Company))),
+                button(text("A story")).on_press_maybe(self.legacy_organism_enabled().then_some(Message::OrganismCompanion(CompanionIntent::Story))),
+                button(text("A break")).on_press_maybe(self.legacy_organism_enabled().then_some(Message::OrganismCompanion(CompanionIntent::Rest))),
             ].spacing(8).wrap(),
             text(self.organism.reply()).size(self.effective_font_size()),
             text(self.organism.temperament_description()).size(self.effective_font_size()).color(self.c_text_dim()),
@@ -32368,6 +32464,9 @@ impl Frost {
                 })
             })
             .collect();
+        if let Some(eva) = self.eva.as_ref() {
+            subs.push(eva.subscription());
+        }
         subs.push(
             iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::PollShellVim),
         );
@@ -35695,7 +35794,7 @@ mod tests {
             .split_once(") }")
             .unwrap()
             .0;
-        assert!(hint.contains("self.config.ascii_organism_enabled"));
+        assert!(hint.contains("self.legacy_organism_enabled()"));
         assert!(hint.contains("self.config.ascii_organism_expanded"));
         assert!(!hint.contains("self.win_size.width"));
         assert!(!hint.contains("self.config.bottom_bar"));
@@ -44153,7 +44252,7 @@ mod tests {
         assert!(owner.contains(".owner()"));
         for gate in [
             "card_mode: self.config.is_card_mode()",
-            "enabled: self.config.ascii_organism_enabled",
+            "enabled: self.legacy_organism_enabled()",
             "bottom_bar: self.config.bottom_bar",
             "focused: self.focused",
             "input_active: self.terminal_input_active()",
