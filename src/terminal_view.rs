@@ -387,13 +387,7 @@ fn chat_card_radius(
         },
         top_right: if real_top { rounded } else { 0.0 },
         bottom_left: if real_bottom { rounded } else { 0.0 },
-        bottom_right: if !real_bottom {
-            0.0
-        } else if command {
-            tail
-        } else {
-            rounded
-        },
+        bottom_right: if real_bottom { rounded } else { 0.0 },
     }
 }
 
@@ -1388,6 +1382,11 @@ impl<'a, Message> TermWidget<'a, Message> {
         };
         let ox = bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
         let left = (ox + chat.left_col as f32 * self.metrics.cell_w - 7.0).max(bounds.x + 2.0);
+        // The full command width comes from the projection plan, so scrolling
+        // a wrapped command out of view cannot make its capsule change width.
+        let right = chat.command_cols.map_or(right, |columns| {
+            (ox + (chat.left_col + columns) as f32 * self.metrics.cell_w + 7.0).min(right)
+        });
         let top = self.row_y(bounds, segment.start_row);
         let bottom = top + (segment.end_row - segment.start_row) as f32 * self.metrics.cell_h;
 
@@ -2539,6 +2538,7 @@ mod tests {
                 role_header: false,
                 group: 0,
                 left_col: 0,
+                command_cols: None,
                 top: false,
                 bottom: false,
                 app_eligible: true,
@@ -6519,6 +6519,139 @@ mod mode_gesture_tests {
     }
 
     #[test]
+    fn chat_native_widget_capsules_enclose_cells_and_keep_width_when_clipped() {
+        use crate::chat_mode::{ChatRole, ChatRow};
+        for columns in [13, 80] {
+            for font_size in [8.0, 14.0, 24.0, 72.0] {
+                let theme = Theme::default();
+                let metrics = Metrics::new(font_size, 1.2, 4.0, true);
+                let bounds = Rectangle {
+                    x: 13.0,
+                    y: 17.0,
+                    width: columns as f32 * metrics.cell_w
+                        + 2.0 * metrics.padding
+                        + metrics.block_gutter_width()
+                        + SCROLLBAR_WIDTH,
+                    height: 8.0 * metrics.cell_h + 2.0 * metrics.padding,
+                };
+                let segment = BlockCardSegment {
+                    group: 1,
+                    start_row: 1,
+                    end_row: 3,
+                    kind: BlockCardKind::Finished,
+                    real_top: true,
+                    real_bottom: true,
+                    selected: false,
+                    selection_active: false,
+                    stripe: None,
+                    stripe_strong: false,
+                };
+                let mut terminal = crate::terminal::TerminalState::new(columns, 8);
+                terminal.process_batch(b"header\r\n$ echo\r\nwrap\r\n\r\noutput");
+                let projection = terminal.get_projected_viewport(false);
+                let mut rows = [ChatRow::default(); 8];
+                for row in &mut rows[1..3] {
+                    row.role = ChatRole::Command;
+                    row.command_cols = Some(6);
+                }
+                rows[4].role = ChatRole::Output;
+                let mut widget = fixture(&projection, &theme, TerminalMode::Chat, 0)
+                    .chat_rows(&rows, Some(&projection), None);
+                widget.metrics = metrics;
+                let capsule = widget.card_geometry(bounds, segment);
+                let output = widget.card_geometry(
+                    bounds,
+                    BlockCardSegment {
+                        start_row: 4,
+                        end_row: 5,
+                        ..segment
+                    },
+                );
+                assert_eq!(capsule.body.x, output.body.x, "one left reading edge");
+                assert!(capsule.body.width < output.body.width);
+                let grid_left = bounds.x + metrics.padding + metrics.block_gutter_width();
+                for (row, occupied) in [(1, 6), (2, 4)] {
+                    for column in 0..occupied {
+                        let point = Point::new(
+                            grid_left + (column as f32 + 0.5) * metrics.cell_w,
+                            widget.row_y(bounds, row) + metrics.cell_h * 0.5,
+                        );
+                        assert!(capsule.body.contains(point), "native cell center is inside");
+                        assert_eq!(widget.cell_at(point, bounds), (column, row));
+                    }
+                }
+
+                // The visible final wrapped row is short. Its capsule still
+                // uses the full command width retained by the projection.
+                let mut long_terminal = crate::terminal::TerminalState::new(columns, 8);
+                long_terminal.process_batch(
+                    format!("header\r\n{}\r\noutput", "x".repeat(columns * 2 + 3)).as_bytes(),
+                );
+                let long_projection = long_terminal.get_projected_viewport(false);
+                let mut long_rows = [ChatRow::default(); 8];
+                for row in &mut long_rows[1..4] {
+                    row.role = ChatRole::Command;
+                    row.command_cols = Some(columns);
+                }
+                let mut long_widget = fixture(&long_projection, &theme, TerminalMode::Chat, 0)
+                    .chat_rows(&long_rows, Some(&long_projection), None);
+                long_widget.metrics = metrics;
+                let whole = long_widget.card_geometry(
+                    bounds,
+                    BlockCardSegment {
+                        end_row: 4,
+                        ..segment
+                    },
+                );
+                for (start_row, end_row, real_top, real_bottom) in
+                    [(1, 4, true, true), (3, 4, false, true), (2, 3, false, false)]
+                {
+                    let fragment = long_widget.card_geometry(
+                        bounds,
+                        BlockCardSegment {
+                            start_row,
+                            end_row,
+                            real_top,
+                            real_bottom,
+                            ..segment
+                        },
+                    );
+                    assert_eq!(fragment.body.x, whole.body.x);
+                    assert_eq!(fragment.body.width, whole.body.width);
+                    assert_eq!(fragment.body.x, output.body.x);
+                    assert!(fragment.body.x >= bounds.x);
+                    assert!(
+                        fragment.body.x + fragment.body.width
+                            <= block_chrome_right(bounds, metrics) + 0.001
+                    );
+                    assert!(fragment.body.y >= bounds.y);
+                    assert!(
+                        fragment.body.y + fragment.body.height
+                            <= bounds.y + bounds.height + 0.001
+                    );
+                    let limit = fragment.body.width.min(fragment.body.height) * 0.5;
+                    for corner in [
+                        fragment.radius.top_left,
+                        fragment.radius.top_right,
+                        fragment.radius.bottom_left,
+                        fragment.radius.bottom_right,
+                    ] {
+                        assert!(corner >= 0.0 && corner <= limit);
+                    }
+                    if !real_top {
+                        assert_eq!(fragment.radius.top_left, 0.0);
+                        assert_eq!(fragment.radius.top_right, 0.0);
+                    }
+                    if !real_bottom {
+                        assert_eq!(fragment.radius.bottom_left, 0.0);
+                        assert_eq!(fragment.radius.bottom_right, 0.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn dock_presentation_keeps_prompt_visible_beyond_native_bounds_without_overscan() {
         use crate::chat_mode::{ChatRole, ChatRow};
         let mut terminal = crate::terminal::TerminalState::new(80, 8);
@@ -7781,16 +7914,7 @@ mod chat_capsule_geometry_tests {
                             );
                             assert_eq!(r.top_right, if top { round } else { 0.0 });
                             assert_eq!(r.bottom_left, if bottom { round } else { 0.0 });
-                            assert_eq!(
-                                r.bottom_right,
-                                if !bottom {
-                                    0.0
-                                } else if role == ChatRole::Command {
-                                    tail
-                                } else {
-                                    round
-                                }
-                            );
+                            assert_eq!(r.bottom_right, if bottom { round } else { 0.0 });
                         }
                     }
                 }

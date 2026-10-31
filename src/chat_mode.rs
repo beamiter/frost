@@ -118,6 +118,9 @@ pub struct ChatRow {
     pub role_header: bool,
     pub group: usize,
     pub left_col: usize,
+    /// Full command width, retained across viewport clipping. Other roles use
+    /// the complete terminal width; this only bounds the painted capsule.
+    pub command_cols: Option<usize>,
     pub top: bool,
     pub bottom: bool,
     pub app_eligible: bool,
@@ -125,21 +128,22 @@ pub struct ChatRow {
     pub status_zone: Option<u64>,
 }
 
-/// Short commands move as one rectangle; wide commands and all output retain
-/// the entire native column budget. No text is rewrapped to a bubble width.
-pub fn command_left(cols: usize, occupied: usize) -> usize {
-    cols.saturating_sub(occupied.max((cols / 3).min(24)))
-        .saturating_sub(1)
+/// Size completed command capsules around their native cells. Keeping column
+/// zero fixed aligns commands with output and prevents horizontal movement
+/// when a window or a live command changes width.
+pub fn command_columns(cols: usize, occupied: usize) -> usize {
+    occupied.max(1).min(cols)
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn right_alignment_never_narrows_wide_content() {
-        assert!(super::command_left(80, 12) > 40);
-        assert_eq!(super::command_left(80, 80), 0);
-        assert_eq!(super::command_left(1, 1), 0);
-        assert_eq!(super::command_left(80, 160), 0);
+    fn command_capsules_keep_short_content_compact_and_wide_content_visible() {
+        assert_eq!(super::command_columns(80, 12), 12);
+        assert_eq!(super::command_columns(80, 80), 80);
+        assert_eq!(super::command_columns(1, 1), 1);
+        assert_eq!(super::command_columns(80, 160), 80);
+        assert_eq!(super::command_columns(0, 0), 0);
     }
 }
 

@@ -2062,10 +2062,14 @@ impl Frost {
             self.startup_recovery.banner_height(self.chrome_font_size()),
         );
         Some(crate::native_input_surface::dock_metrics(
-            rows,
+            if self.config.is_chat_mode() {
+                rows.max(3)
+            } else {
+                rows
+            },
             self.metrics.cell_h,
             cap,
-            if self.config.is_block_mode() { 2 } else { 0 },
+            if self.config.is_block_mode() { 2 } else { 1 },
         ))
     }
 

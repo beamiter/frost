@@ -13,7 +13,7 @@ pub(super) struct ChatPlanKey {
     keep_end: usize,
     companion_rows: usize,
     running_command: Option<(usize, usize)>,
-    // Right alignment depends on command cell widths. A primary-screen app
+    // Capsule width depends on command cell widths. A primary-screen app
     // can CUP into an earlier command and return within one parser batch, so
     // lifecycle/row identity alone cannot validate that cached geometry.
     live_command_versions: Vec<(RawRowId, u64)>,
@@ -344,7 +344,7 @@ impl TerminalState {
                         .iter()
                         .all(|s| s.source.absolute_row >= start && s.source.absolute_row < end)
                 });
-            let mut left = 0;
+            let mut command_cols = None;
             if safe_command && key.command_bubbles {
                 let mut max_end = 0;
                 for row in &mut group {
@@ -357,12 +357,7 @@ impl TerminalState {
                     }
                     row.raw_slices.retain(|slice| slice.len > 0);
                 }
-                left = crate::chat_mode::command_left(cols, max_end);
-                for row in &mut group {
-                    for slice in &mut row.raw_slices {
-                        slice.view_col_start += left;
-                    }
-                }
+                command_cols = Some(crate::chat_mode::command_columns(cols, max_end));
             }
             // Block already paints its status in the command header. Reserving
             // Chat's footer there adds a second empty row between every card.
@@ -395,7 +390,8 @@ impl TerminalState {
                     role,
                     role_header: false,
                     group: next_group,
-                    left_col: left,
+                    left_col: 0,
+                    command_cols,
                     top: index == 0 && !role_header,
                     bottom: index + 1 == len && role != ChatRole::Composer && status_zone.is_none(),
                     app_eligible: absolute >= active_start && role != ChatRole::Command,
@@ -592,7 +588,8 @@ mod tests {
                 .iter()
                 .find(|row| row.role == ChatRole::Command)
                 .unwrap();
-            assert_eq!(command.left_col > 0, bubbles);
+            assert_eq!(command.left_col, 0);
+            assert_eq!(command.command_cols.is_some(), bubbles);
             let next_prompt = terminal.command_zones[1].prompt_start;
             let previous_output = terminal.raw_row_id_at_absolute(next_prompt - 1).unwrap();
             let next_prompt = terminal.raw_row_id_at_absolute(next_prompt).unwrap();
@@ -616,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_short_command_is_right_aligned_and_output_keeps_full_width_and_origins() {
+    fn chat_commands_share_the_output_origin_and_keep_native_copy_coordinates() {
         let mut terminal = TerminalState::new(40, 18);
         command(&mut terminal, "echo hello", "hello");
         prompt(&mut terminal);
@@ -651,8 +648,10 @@ mod tests {
                 .then_some(row)
             })
             .unwrap();
-        assert!(view.chat_rows()[command].left_col > 15);
+        assert_eq!(view.chat_rows()[command].left_col, 0);
+        assert_eq!(view.chat_rows()[command].command_cols, Some(12));
         assert_eq!(view.chat_rows()[output].left_col, 0);
+        assert_eq!(view.chat_rows()[output].command_cols, None);
         assert_eq!(view.cells()[output][0].character, 'h');
         assert_eq!(terminal.grid.to_vec(), grid);
         for (row, cells) in view.cells().iter().enumerate() {
@@ -1060,10 +1059,12 @@ mod tests {
             .chat_rows()
             .iter()
             .all(|row| row.role != ChatRole::Composer));
-        assert!(view
-            .chat_rows()
-            .iter()
-            .any(|row| row.role == ChatRole::Command && row.left_col > 0 && !row.app_eligible));
+        assert!(view.chat_rows().iter().any(|row| {
+            row.role == ChatRole::Command
+                && row.left_col == 0
+                && row.command_cols.is_some()
+                && !row.app_eligible
+        }));
         assert!(view
             .chat_rows()
             .iter()
@@ -1179,12 +1180,13 @@ mod tests {
         prompt(&mut terminal);
         let mut state = ProjectionViewState::new();
         let before = snapshot(&mut terminal, &mut state);
-        let before_left = before
+        let before_columns = before
             .chat_rows()
             .iter()
             .find(|row| row.role == ChatRole::Command)
             .unwrap()
-            .left_col;
+            .command_cols
+            .unwrap();
         terminal.process_batch(b"\x1b[s\x1b[1;1Hrewritten long command\x1b[u");
         let after = snapshot(&mut terminal, &mut state);
         let command_row = after
@@ -1192,7 +1194,8 @@ mod tests {
             .iter()
             .position(|row| row.role == ChatRole::Command)
             .unwrap();
-        assert!(after.chat_rows()[command_row].left_col < before_left);
+        assert_eq!(after.chat_rows()[command_row].left_col, 0);
+        assert!(after.chat_rows()[command_row].command_cols.unwrap() > before_columns);
         let text: String = after.cells()[command_row]
             .iter()
             .map(|cell| cell.character)

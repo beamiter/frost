@@ -46,14 +46,20 @@ pub(crate) fn dock_metrics(
 ) -> DockMetrics {
     let rows = rows.max(1);
     let body_height = rows as f32 * cell_height;
-    let vertical_padding = if rows <= 2 && body_height <= INPUT_STRIP_HEIGHT {
+    let preferred_padding = if rows <= 2 && body_height <= INPUT_STRIP_HEIGHT {
         ((INPUT_STRIP_HEIGHT - body_height) * 0.5).min(8.0)
     } else {
         8.0
     };
-    let trailing_height = trailing_rows as f32 * cell_height;
-    let decorated_height = body_height + 2.0 * vertical_padding + trailing_height;
-    let input_height = decorated_height.max(INPUT_STRIP_HEIGHT).min(cap);
+    let preferred_trailing = trailing_rows as f32 * cell_height;
+    let decorated_height = body_height + 2.0 * preferred_padding + preferred_trailing;
+    let input_height = decorated_height.max(INPUT_STRIP_HEIGHT).min(cap.max(0.0));
+    // A short pane or a large terminal font must keep the caret's real cell
+    // before allocating decoration. Retain trailing space when possible and
+    // let padding yield instead of clipping the only visible input row.
+    let decoration_budget = (input_height - cell_height).max(0.0);
+    let trailing_height = preferred_trailing.min(decoration_budget);
+    let vertical_padding = preferred_padding.min((decoration_budget - trailing_height) * 0.5);
     let visible_rows = if decorated_height <= input_height {
         // All requested rows fit. Avoid losing a row to a rounded float
         // division at the exact two-row boundary.
@@ -727,5 +733,26 @@ mod tests {
         let caret_bottom = block.vertical_padding + (cursor - visible_start + 1) as f32 * 16.8;
         assert!(caret_bottom + 2.0 * 16.8 <= block.input_height);
         assert_eq!(block.input_height, capped.input_height);
+    }
+
+    #[test]
+    fn three_row_chat_editor_retains_clearance_without_clipping_a_zoomed_caret() {
+        let initial = dock_metrics(3, 16.8, 180.0, 1);
+        assert_eq!(initial.visible_rows, 3);
+        assert!((initial.input_height - (4.0 * 16.8 + 16.0)).abs() < 0.001);
+        for cell in [16.8_f32, 24.0, 42.0, 84.0] {
+            for cap in [cell, cell + 8.0, 2.0 * cell, 180.0] {
+                for trailing in [1, 2] {
+                    let metrics = dock_metrics(100, cell, cap, trailing);
+                    let caret_bottom =
+                        metrics.vertical_padding + metrics.visible_rows as f32 * cell;
+                    assert!(caret_bottom <= metrics.input_height + 0.001);
+                    assert!(metrics.input_height <= cap);
+                    if cap >= 2.0 * cell {
+                        assert!(caret_bottom + cell <= metrics.input_height + 0.001);
+                    }
+                }
+            }
+        }
     }
 }
