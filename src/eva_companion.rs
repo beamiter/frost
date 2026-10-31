@@ -37,6 +37,8 @@ pub(crate) enum Event {
     CancelDialogue(String),
     ReplySeen(String),
     DialogueSave(String, u64),
+    HistoryScope(String),
+    HistoryLoad(bool, u64),
     SelectionCapture(u64),
     SelectionReview(u64),
     SelectionApprove(String, u64),
@@ -209,6 +211,10 @@ pub(crate) struct Eva {
     draft: String,
     dialogue: Option<(String, shared::ContextRef)>,
     dialogue_save: shared::DialogueSave,
+    /// Local request error, shown until the history view changes.
+    history_error: Option<(String, u64)>,
+    /// Rendered page text keyed by view revision; view() stays allocation-free.
+    history_text: (u64, String),
     dialogue_status: String,
     dialogue_reply: String,
     projects: std::collections::BTreeMap<String, String>,
@@ -292,6 +298,8 @@ impl Eva {
             draft: String::new(),
             dialogue: None,
             dialogue_save: Default::default(),
+            history_error: None,
+            history_text: (0, String::new()),
             dialogue_status: "Offline dialogue; no terminal text attached".into(),
             dialogue_reply: String::new(),
             projects: Default::default(),
@@ -399,6 +407,13 @@ impl Eva {
                     .store(self.generation, Ordering::Release);
                 self.submission.pending.store(true, Ordering::Release);
             }
+        }
+        self.host.history.context_changed(self.context.as_ref());
+        if self.host.history.revision() != self.history_text.0 {
+            self.history_text = (
+                self.host.history.revision(),
+                self.host.history.text(self.context.as_ref()),
+            );
         }
         while let Some(reply) = self.host.take_dialogue() {
             if let shared::Reply::Dialogue {
@@ -742,6 +757,28 @@ impl Eva {
                         });
                     }
                 }
+            }
+            Event::HistoryScope(label) => {
+                if let Some(scope) = shared::history::SCOPES
+                    .into_iter()
+                    .find(|s| shared::history::scope_label(*s) == label)
+                {
+                    self.host.history.set_scope(scope);
+                }
+            }
+            Event::HistoryLoad(older, expected) => {
+                let result = match self.context.clone().filter(|c| c.revision == expected) {
+                    Some(context) => {
+                        self.send(Request::ContextObserved {
+                            context: context.clone(),
+                        });
+                        self.host.request_history(&context, older)
+                    }
+                    None => Err("Focus a terminal pane first."),
+                };
+                self.history_error = result
+                    .err()
+                    .map(|message| (message.to_owned(), self.host.history.revision()));
             }
             Event::DialogueSave(turn, revision) => {
                 if let Some(context) = self.context.as_ref().filter(|c| c.revision == revision) {
@@ -1685,6 +1722,50 @@ impl Frost {
                         button(text("Dismiss / return to current scope"))
                             .on_press(Message::Eva(Event::ScopeCurrent)),
                     );
+            }
+            let history = &eva.host.history;
+            let status = match eva
+                .history_error
+                .as_ref()
+                .filter(|(_, at)| *at == history.revision())
+            {
+                Some((message, _)) => message.as_str(),
+                None if history.status().is_empty() => {
+                    "Nothing is loaded until you choose Load history."
+                }
+                None => history.status(),
+            };
+            controls = controls
+                .push(text("Conversation history — read-only, loaded only on request"))
+                .push(
+                    text("Eva dialogue only. Terminal output and voice transcripts are never included.")
+                        .size(12),
+                )
+                .push(pick_list(
+                    shared::history::SCOPES
+                        .map(|s| shared::history::scope_label(s).to_string())
+                        .to_vec(),
+                    Some(shared::history::scope_label(history.scope()).to_string()),
+                    |label| Message::Eva(Event::HistoryScope(label)),
+                ))
+                .push(
+                    row![
+                        button(text("Load history")).on_press_maybe(
+                            (!history.pending())
+                                .then_some(Message::Eva(Event::HistoryLoad(false, context_revision)))
+                        ),
+                        button(text("Older")).on_press_maybe(
+                            history
+                                .can_load_older()
+                                .then_some(Message::Eva(Event::HistoryLoad(true, context_revision)))
+                        ),
+                    ]
+                    .spacing(4),
+                )
+                .push(text(status).size(12));
+            if !eva.history_text.1.is_empty() {
+                controls = controls
+                    .push(scrollable(text(eva.history_text.1.as_str()).size(12)).height(240));
             }
             controls = controls
                 .push(text("Scoped memory — explicit review before every change"))
