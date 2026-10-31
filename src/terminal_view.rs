@@ -6555,8 +6555,11 @@ mod mode_gesture_tests {
                     row.command_cols = Some(6);
                 }
                 rows[4].role = ChatRole::Output;
-                let mut widget = fixture(&projection, &theme, TerminalMode::Chat, 0)
-                    .chat_rows(&rows, Some(&projection), None);
+                let mut widget = fixture(&projection, &theme, TerminalMode::Chat, 0).chat_rows(
+                    &rows,
+                    Some(&projection),
+                    None,
+                );
                 widget.metrics = metrics;
                 let capsule = widget.card_geometry(bounds, segment);
                 let output = widget.card_geometry(
@@ -6603,9 +6606,11 @@ mod mode_gesture_tests {
                         ..segment
                     },
                 );
-                for (start_row, end_row, real_top, real_bottom) in
-                    [(1, 4, true, true), (3, 4, false, true), (2, 3, false, false)]
-                {
+                for (start_row, end_row, real_top, real_bottom) in [
+                    (1, 4, true, true),
+                    (3, 4, false, true),
+                    (2, 3, false, false),
+                ] {
                     let fragment = long_widget.card_geometry(
                         bounds,
                         BlockCardSegment {
@@ -6626,8 +6631,7 @@ mod mode_gesture_tests {
                     );
                     assert!(fragment.body.y >= bounds.y);
                     assert!(
-                        fragment.body.y + fragment.body.height
-                            <= bounds.y + bounds.height + 0.001
+                        fragment.body.y + fragment.body.height <= bounds.y + bounds.height + 0.001
                     );
                     let limit = fragment.body.width.min(fragment.body.height) * 0.5;
                     for corner in [
