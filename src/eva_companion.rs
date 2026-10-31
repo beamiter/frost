@@ -39,6 +39,8 @@ pub(crate) enum Event {
     DialogueSave(String, u64),
     HistoryScope(String),
     HistoryLoad(bool, u64),
+    VoiceTextReview(u64),
+    VoiceTextForget(u64),
     SelectionCapture(u64),
     SelectionReview(u64),
     SelectionApprove(String, u64),
@@ -215,6 +217,8 @@ pub(crate) struct Eva {
     history_error: Option<(String, u64)>,
     /// Rendered page text keyed by view revision; view() stays allocation-free.
     history_text: (u64, String),
+    /// Local voice-text request error, shown until the status changes.
+    voice_text_error: Option<(String, u64)>,
     dialogue_status: String,
     dialogue_reply: String,
     projects: std::collections::BTreeMap<String, String>,
@@ -300,6 +304,7 @@ impl Eva {
             dialogue_save: Default::default(),
             history_error: None,
             history_text: (0, String::new()),
+            voice_text_error: None,
             dialogue_status: "Offline dialogue; no terminal text attached".into(),
             dialogue_reply: String::new(),
             projects: Default::default(),
@@ -765,6 +770,24 @@ impl Eva {
                 {
                     self.host.history.set_scope(scope);
                 }
+            }
+            Event::VoiceTextReview(expected) | Event::VoiceTextForget(expected) => {
+                let review = matches!(event, Event::VoiceTextReview(_));
+                let result = match self.context.clone().filter(|c| c.revision == expected) {
+                    None => Err("Focus a terminal pane first."),
+                    Some(context) if review => match self.memory_scope() {
+                        None => Err("Choose the current task/project or explicitly choose Global."),
+                        Some(scope) => {
+                            self.memory_review = None;
+                            self.memory_context = Some(context.clone());
+                            self.host.request_voice_text_review(&context, scope)
+                        }
+                    },
+                    Some(context) => self.host.forget_voice_text(&context),
+                };
+                self.voice_text_error = result
+                    .err()
+                    .map(|message| (message.to_owned(), self.host.voice_text.revision()));
             }
             Event::HistoryLoad(older, expected) => {
                 let result = match self.context.clone().filter(|c| c.revision == expected) {
@@ -1772,6 +1795,36 @@ impl Frost {
                 .push(button(text("Review saving this exchange")).on_press_maybe(
                     eva.dialogue_save.turn_id().map(|id| Message::Eva(Event::DialogueSave(id.into(), context_revision)))
                 ))
+                .push(
+                    row![
+                        button(text("Review saving Eva's last spoken reply")).on_press_maybe(
+                            (!eva.host.voice_text.pending())
+                                .then_some(Message::Eva(Event::VoiceTextReview(context_revision)))
+                        ),
+                        button(text("Forget Eva's retained spoken text")).on_press_maybe(
+                            (!eva.host.voice_text.pending())
+                                .then_some(Message::Eva(Event::VoiceTextForget(context_revision)))
+                        ),
+                    ]
+                    .spacing(4)
+                    .wrap(),
+                )
+                .push(
+                    text(
+                        match eva
+                            .voice_text_error
+                            .as_ref()
+                            .filter(|(_, at)| *at == eva.host.voice_text.revision())
+                        {
+                            Some((message, _)) => message.as_str(),
+                            None if eva.host.voice_text.status().is_empty() => {
+                                "Eva keeps recent spoken replies only briefly in memory. Nothing is saved unless you review it here."
+                            }
+                            None => eva.host.voice_text.status(),
+                        },
+                    )
+                    .size(12),
+                )
                 .push(
                     checkbox(eva.memory_global)
                         .label("Manage GLOBAL scope explicitly (otherwise task; not model-memory consent)")
