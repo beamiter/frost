@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::glass_profile::{self as shell, color};
-use crate::reference_icon::{icon as vector_icon, Icon};
+use crate::reference_icon::{icon as vector_icon, local_icon, Icon, LocalIcon};
 use iced::widget::{column, opaque};
 
 pub(crate) const CONTENT_TOP: f32 = crate::native_viewport::CONTENT_TOP;
@@ -41,6 +41,112 @@ fn rgb(value: [u8; 3]) -> Color {
 
 pub(crate) fn composer_border_color() -> Color {
     rgb(color::LIGHT_BORDER).scale_alpha(0.6)
+}
+
+/// Live status dot: a calm green distinct from command success stripes.
+pub(crate) fn header_live() -> Color {
+    Color::from_rgb8(74, 222, 128)
+}
+pub(crate) fn header_accent() -> Color {
+    rgb(color::ACCENT)
+}
+
+/// Rounded status pill in the workspace header.
+pub(crate) fn header_pill_style(
+    reading: bool,
+) -> impl Fn(&iced::Theme, button::Status) -> button::Style + 'static {
+    move |theme, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: Some(
+                shell::rgba(
+                    if hovered {
+                        color::ACCENT_PALE
+                    } else {
+                        color::CONTROL_SURFACE
+                    },
+                    theme.palette().background.a,
+                )
+                .into(),
+            ),
+            text_color: rgb(color::CHROME_TEXT),
+            border: iced::Border {
+                color: if reading {
+                    rgb(color::ACCENT).scale_alpha(0.55)
+                } else {
+                    rgb(color::CONTROL_BORDER)
+                },
+                width: 1.0,
+                radius: 999.0.into(),
+            },
+            ..Default::default()
+        }
+    }
+}
+
+/// Square bordered header/composer control.
+pub(crate) fn header_outlined_style(
+) -> impl Fn(&iced::Theme, button::Status) -> button::Style + 'static {
+    move |theme, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let disabled = matches!(status, button::Status::Disabled);
+        button::Style {
+            background: Some(
+                shell::rgba(
+                    if hovered {
+                        color::ACCENT_PALE
+                    } else {
+                        color::CONTROL_SURFACE
+                    },
+                    theme.palette().background.a,
+                )
+                .into(),
+            ),
+            text_color: rgb(if disabled {
+                color::DISABLED_TEXT
+            } else {
+                color::CHROME_TEXT
+            }),
+            border: iced::Border {
+                color: if hovered {
+                    rgb(color::ACCENT).scale_alpha(0.55)
+                } else {
+                    rgb(color::CONTROL_BORDER)
+                },
+                width: 1.0,
+                radius: shell::CONTROL_RADIUS.into(),
+            },
+            ..Default::default()
+        }
+    }
+}
+
+/// Abbreviate the user's home directory in a session title.
+fn abbreviate_home(title: &str) -> String {
+    let Some(home) = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .and_then(|home| home.to_str().map(str::to_owned))
+        .filter(|home| home.len() > 1)
+    else {
+        return title.to_owned();
+    };
+    let home = home.trim_end_matches('/');
+    let mut out = String::with_capacity(title.len());
+    let mut rest = title;
+    while let Some(index) = rest.find(home) {
+        let after = &rest[index + home.len()..];
+        let boundary_before = index == 0 || rest[..index].ends_with([' ', ':', '(']);
+        let boundary_after = after.is_empty() || after.starts_with(['/', ' ', ')']);
+        out.push_str(&rest[..index]);
+        if boundary_before && boundary_after {
+            out.push('~');
+        } else {
+            out.push_str(home);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 pub(crate) fn accent_pill_background() -> iced::Background {
@@ -335,6 +441,56 @@ impl Frost {
             ))
             .padding([4, 8])
             .style(control(selected, light))
+    }
+
+    /// Full-width bordered inspector entry with a trailing chevron.
+    fn inspector_row(
+        &self,
+        value: impl Into<String>,
+        action: Message,
+    ) -> Element<'static, Message> {
+        button(
+            row![
+                self.chrome_label(value, 11.5, false, false)
+                    .width(Length::Fill)
+                    .wrapping(text::Wrapping::None),
+                local_icon(LocalIcon::ChevronRight, rgb(color::CHROME_MUTED), 13.0),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .on_press(action)
+        .width(Length::Fill)
+        .height(crate::glass_layout::chrome_control_height(self.chrome_font_size()) + 8.0)
+        .padding([4, 12])
+        .style(|theme, status| {
+            let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+            button::Style {
+                background: Some(
+                    shell::rgba(
+                        if hovered {
+                            color::ACCENT_PALE
+                        } else {
+                            color::CONTROL_SURFACE
+                        },
+                        theme.palette().background.a,
+                    )
+                    .into(),
+                ),
+                text_color: rgb(color::CHROME_TEXT),
+                border: iced::Border {
+                    color: if hovered {
+                        rgb(color::ACCENT).scale_alpha(0.55)
+                    } else {
+                        rgb(color::CONTROL_BORDER)
+                    },
+                    width: 1.0,
+                    radius: shell::CARD_RADIUS.into(),
+                },
+                ..Default::default()
+            }
+        })
+        .into()
     }
 
     fn vector_button(
@@ -1045,21 +1201,32 @@ impl Frost {
         let name = if jterm_core::reference_conversation::fixture_enabled() {
             jterm_core::reference_conversation::acceptance_fixture().title
         } else {
-            self.tab_label(self.active_tab)
+            abbreviate_home(&self.tab_label(self.active_tab))
         };
         let full_title = if name.starts_with("Workspace / ") {
             name.clone()
         } else {
             format!("Workspace / {name}")
         };
-        // A single session title shares the row with its existing actions.
+        let tile_size = (layout.header.height - 13.0).clamp(26.0, 36.0);
+        let action_size = (tile_size - 4.0).clamp(24.0, 30.0);
+        let reading = self
+            .config
+            .is_block_mode()
+            .then(|| self.block_reading_header())
+            .flatten();
+        let reading_width = if reading.is_some() { 170.0 } else { 0.0 };
+        // A single session title shares the row with its status and actions.
         // Truncate only the visible label; the complete title stays in a tooltip.
         let available = (layout.header.width
             - 2.0 * shell::COMPOSER_INSET
-            - 3.0 * (shell::HEADER_ACTION_SIZE + shell::HEADER_ACTION_GAP))
+            - tile_size
+            - 12.0
+            - reading_width
+            - 3.0 * (action_size + 6.0))
             .max(0.0);
-        let title_size = ui_typography::reference_role_size(12.0, self.chrome_font_size());
-        let title_chars = (available / (title_size * 0.6).max(1.0)).floor() as usize;
+        let title_size = ui_typography::reference_role_size(14.0, self.chrome_font_size());
+        let title_chars = (available / (title_size * 0.58).max(1.0)).floor() as usize;
         let heading = self
             .chrome_label(
                 short(
@@ -1070,7 +1237,7 @@ impl Frost {
                     },
                     title_chars.saturating_sub(1),
                 ),
-                12.0,
+                14.0,
                 false,
                 true,
             )
@@ -1086,16 +1253,16 @@ impl Frost {
                     heading,
                     self.chrome_label(
                         if self.config.is_chat_mode() {
-                            "Chat session · Local"
+                            "Chat session • Local"
                         } else {
-                            "Block session · Local"
+                            "Block session • Local"
                         },
-                        9.0,
+                        10.0,
                         true,
                         false,
                     )
                 ]
-                .spacing(1),
+                .spacing(2),
             )
             .width(Length::Fill)
             .clip(true),
@@ -1103,34 +1270,65 @@ impl Frost {
             iced::widget::tooltip::Position::Bottom,
         )
         .style(self.popup_style());
-        let action = |icon, message| {
-            button(
-                container(vector_icon(icon, rgb(color::CANVAS_MUTED), 14.0))
-                    .center(shell::HEADER_ACTION_SIZE),
-            )
-            .on_press(message)
-            .width(shell::HEADER_ACTION_SIZE)
-            .height(shell::HEADER_ACTION_SIZE)
-            .padding(0)
-            .style(control(false, true))
-        };
-        container(
-            row![
-                heading,
-                action(Icon::Plus, Message::NewSession),
-                action(
-                    Icon::Search,
-                    Message::ReferenceCommand(keybindings::Command::SearchOpen)
-                ),
-                action(Icon::More, Message::ReferencePalette),
-            ]
-            .spacing(shell::HEADER_ACTION_GAP)
-            .align_y(iced::Alignment::Center),
-        )
-        .height(layout.header.height)
-        .padding([2.0, shell::COMPOSER_INSET])
-        .align_y(iced::Alignment::Center)
-        .into()
+        let tile = container(vector_icon(
+            Icon::Terminal,
+            rgb(color::ACCENT),
+            (tile_size * 0.5).round(),
+        ))
+        .center(tile_size)
+        .style(|_| container::Style {
+            background: Some(rgb(color::ACCENT).scale_alpha(0.14).into()),
+            border: iced::Border {
+                color: rgb(color::ACCENT).scale_alpha(0.45),
+                width: 1.0,
+                radius: shell::CARD_RADIUS.into(),
+            },
+            ..Default::default()
+        });
+        let popup = crate::theme::popup_style(&self.theme);
+        let tip = |help: &'static str| self.chrome_label(help, 10.0, false, true);
+        let action =
+            move |icon, message, help: iced::widget::Text<'static>| -> Element<'static, Message> {
+                tooltip(
+                    button(
+                        container(vector_icon(icon, rgb(color::CHROME_TEXT), 15.0))
+                            .center(action_size),
+                    )
+                    .on_press(message)
+                    .width(action_size)
+                    .height(action_size)
+                    .padding(0)
+                    .style(header_outlined_style()),
+                    help,
+                    iced::widget::tooltip::Position::Bottom,
+                )
+                .style(move |_| popup)
+                .into()
+            };
+        let mut header = row![tile, heading]
+            .spacing(12)
+            .align_y(iced::Alignment::Center);
+        if let Some(reading) = reading {
+            header = header.push(reading);
+        }
+        header = header
+            .push(Space::new().width(4))
+            .push(action(Icon::Plus, Message::NewSession, tip("New session")))
+            .push(action(
+                Icon::Search,
+                Message::ReferenceCommand(keybindings::Command::SearchOpen),
+                tip("Find in terminal"),
+            ))
+            .push(action(
+                Icon::More,
+                Message::ReferencePalette,
+                tip("Command palette"),
+            ));
+        container(header.spacing(6))
+            .height(layout.header.height)
+            .padding([2.0, shell::COMPOSER_INSET])
+            .align_y(iced::Alignment::Center)
+            .into()
     }
 
     pub(crate) fn reference_tools_height(&self) -> f32 {
@@ -1144,108 +1342,139 @@ impl Frost {
         // rather than the original layout's cached composer rectangle.
         let composer_width = self.reference_layout().composer.width;
         let available = composer_width / font_scale;
-        let tool = |glyph: Icon,
-                    title: &'static str,
-                    width: f32,
-                    action: Message|
-         -> Element<'_, Message> {
-            let fg = color::CANVAS_MUTED;
-            let icon_only = title == jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[4]
-                && composer_width
-                    < shell::COMPOSER_CONTROL_LEFT
-                        + shell::COMPOSER_CONTROL_RIGHT
-                        + shell::COMPOSER_PLUS_WIDTH
-                        + shell::COMPOSER_SEND_WIDTH
-                        + width * font_scale
-                        + 2.0 * shell::METADATA_GAP;
-            let mut contents = row![]
-                .spacing(jterm_core::reference_popup::FOOTER_ICON_LABEL_GAP)
-                .align_y(iced::Alignment::Center);
-            contents = contents.push(vector_icon(glyph, rgb(fg), 12.0));
-            let caption = self
-                .chrome_label(
-                    title,
-                    jterm_core::reference_popup::FOOTER_LABEL_SIZE,
-                    false,
-                    true,
-                )
+        let label_size = 11.0;
+        let terminal_width = 84.0 * font_scale;
+        let tools_width = 82.0 * font_scale;
+        let square = control_height + 4.0;
+        // Actions on the right: attach, ask AI and send.
+        let trailing = 3.0 * square + 2.0 * shell::METADATA_GAP;
+        let caption = |title: &'static str, fg: [u8; 3]| {
+            self.chrome_label(title, label_size, false, true)
                 .color(rgb(fg))
-                .wrapping(text::Wrapping::None);
-            if !icon_only {
-                contents = contents.push(caption);
-                if title == jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[4] {
-                    contents = contents.push(vector_icon(Icon::ChevronDown, rgb(fg), 12.0));
-                }
-            }
-            let button = button(contents)
-                .on_press(action)
+                .wrapping(text::Wrapping::None)
+        };
+        let mut tools = row![]
+            .spacing(shell::METADATA_GAP + 2.0)
+            .align_y(iced::Alignment::Center);
+        if available >= shell::COMPOSER_TERMINAL_MIN_AVAILABLE {
+            tools = tools.push(
+                button(
+                    row![
+                        vector_icon(Icon::Terminal, rgb(color::CHROME_TEXT), 13.0),
+                        caption(
+                            jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[3],
+                            color::CHROME_TEXT
+                        )
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                )
+                .on_press(Message::ReferenceFocusTerminal)
                 .height(control_height)
-                .width(if icon_only { 32.0 } else { width * font_scale })
-                .padding([4.0, jterm_core::reference_popup::FOOTER_HORIZONTAL_PADDING])
+                .width(terminal_width)
+                .padding([4.0, 10.0])
                 .style(move |theme, status| {
                     let mut style = control(false, true)(theme, status);
-                    style.background = Some(
-                        rgb(
-                            if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-                                color::ACCENT_PALE
-                            } else {
-                                color::CONTROL_SURFACE
-                            },
-                        )
-                        .into(),
-                    );
-                    if title == jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[3] {
-                        style.background = Some(accent_pill_background());
-                        style.text_color = rgb(color::CHROME_TEXT);
-                    } else {
-                        style.text_color = rgb(fg);
-                    }
+                    style.background = Some(accent_pill_background());
+                    style.text_color = rgb(color::CHROME_TEXT);
                     style.border = iced::Border {
-                        color: rgb(color::CONTROL_BORDER),
-                        width: 0.0,
+                        color: rgb(color::ACCENT).scale_alpha(
+                            if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                                0.9
+                            } else {
+                                0.5
+                            },
+                        ),
+                        width: 1.0,
                         radius: shell::CONTROL_RADIUS.into(),
                     };
                     style
-                });
-            if icon_only {
-                tooltip(
-                    button,
-                    self.chrome_label(title, 10.0, false, true),
-                    tooltip::Position::Top,
-                )
-                .into()
-            } else {
-                button.into()
-            }
-        };
-        let mut tools = row![button(
-            container(vector_icon(Icon::Plus, rgb(color::CANVAS_TEXT), 12.0))
-                .center(shell::COMPOSER_PLUS_WIDTH)
-        )
-        .on_press(Message::NewSession)
-        .width(shell::COMPOSER_PLUS_WIDTH)
-        .height(control_height)
-        .padding(0)
-        .style(control(false, true))]
-        .spacing(shell::METADATA_GAP)
-        .align_y(iced::Alignment::Center);
-        if available >= shell::COMPOSER_TERMINAL_MIN_AVAILABLE {
-            tools = tools.push(tool(
-                Icon::Terminal,
-                jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[3],
-                shell::COMPOSER_TERMINAL_WIDTH,
-                Message::ReferenceFocusTerminal,
-            ));
+                }),
+            );
         }
-        tools = tools.push(tool(
-            Icon::Grid,
-            jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[4],
-            shell::COMPOSER_TOOLS_WIDTH,
-            Message::ReferenceToolsToggle,
-        ));
-        let mut controls = row![]
-            .spacing(shell::METADATA_GAP)
-            .align_y(iced::Alignment::Center);
+        let tools_title = jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[4];
+        let tools_icon_only = composer_width
+            < shell::COMPOSER_CONTROL_LEFT
+                + shell::COMPOSER_CONTROL_RIGHT
+                + terminal_width
+                + tools_width
+                + trailing
+                + 3.0 * shell::METADATA_GAP;
+        let mut tools_contents = row![local_icon(
+            LocalIcon::Sliders,
+            rgb(color::CANVAS_MUTED),
+            13.0
+        )]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+        if !tools_icon_only {
+            tools_contents = tools_contents
+                .push(caption(tools_title, color::CHROME_TEXT))
+                .push(vector_icon(
+                    Icon::ChevronDown,
+                    rgb(color::CANVAS_MUTED),
+                    12.0,
+                ));
+        }
+        let tools_button = button(tools_contents)
+            .on_press(Message::ReferenceToolsToggle)
+            .height(control_height)
+            .width(if tools_icon_only { square } else { tools_width })
+            .padding([4.0, 10.0])
+            .style(header_outlined_style());
+        tools = tools.push(if tools_icon_only {
+            Element::from(tooltip(
+                tools_button,
+                self.chrome_label(tools_title, 10.0, false, true),
+                tooltip::Position::Top,
+            ))
+        } else {
+            tools_button.into()
+        });
+        let popup = crate::theme::popup_style(&self.theme);
+        let square_action = |icon: Element<'static, Message>,
+                             message: Message,
+                             help: &'static str|
+         -> Element<'static, Message> {
+            tooltip(
+                button(container(icon).center(square))
+                    .on_press(message)
+                    .width(square)
+                    .height(control_height)
+                    .padding(0)
+                    .style(header_outlined_style()),
+                text(help).size(10.0),
+                tooltip::Position::Top,
+            )
+            .style(move |_| popup)
+            .into()
+        };
+        let (assistant_message, assistant_help) =
+            if self.config.ai_enabled || self.agent.session.is_some() || self.agent.is_open {
+                (
+                    Message::ReferenceCommand(keybindings::Command::AgentToggle),
+                    "Ask the AI assistant",
+                )
+            } else {
+                (
+                    Message::ReferenceCommand(keybindings::Command::ConfigOpen),
+                    "Configure the AI assistant",
+                )
+            };
+        let mut controls = row![
+            square_action(
+                vector_icon(Icon::Attach, rgb(color::CHROME_TEXT), 14.0),
+                Message::ReferenceInspector(InspectorTab::Files),
+                "Insert a file path from Files",
+            ),
+            square_action(
+                local_icon(LocalIcon::Sparkle, rgb(color::CHROME_TEXT), 14.0),
+                assistant_message,
+                assistant_help,
+            ),
+        ]
+        .spacing(shell::METADATA_GAP + 2.0)
+        .align_y(iced::Alignment::Center);
         let action = self.sessions.get(self.active).and_then(|session| {
             let kind = if session.terminal.is_command_running() {
                 chat_mode::ControlKind::Interrupt
@@ -1264,16 +1493,17 @@ impl Frost {
             .sessions
             .get(self.active)
             .is_some_and(|session| session.terminal.is_command_running());
+        let send_width = square + 8.0;
         let arrow = container(vector_icon(
             if running { Icon::Close } else { Icon::Send },
             rgb(color::CHROME_TEXT),
-            12.0,
+            15.0,
         ))
-        .center(shell::COMPOSER_SEND_WIDTH)
-        .width(shell::COMPOSER_SEND_WIDTH)
+        .center(send_width)
+        .width(send_width)
         .height(control_height)
         .style(move |theme| {
-            panel(
+            let mut style = panel(
                 theme,
                 if enabled {
                     color::ACCENT
@@ -1281,8 +1511,13 @@ impl Frost {
                     color::LIGHT_BORDER
                 },
                 color::LIGHT_BORDER,
-                7.0,
-            )
+                shell::CONTROL_RADIUS + 2.0,
+            );
+            if enabled {
+                style.background = Some(accent_pill_background());
+                style.border.color = rgb(color::ACCENT).scale_alpha(0.7);
+            }
+            style
         });
         controls = controls.push(tooltip(
             chat_mode::press_control(arrow, action),
@@ -1325,7 +1560,8 @@ impl Frost {
                     shell::COMPOSER_RADIUS,
                 );
                 style.border.width = 0.0;
-                if self.config.is_chat_mode() {
+                // A docked prompt sits directly above: one continuous card.
+                if self.config.is_chat_mode() || self.reference_input_metrics().is_some() {
                     style.border.radius = iced::border::Radius {
                         top_left: 0.0,
                         top_right: 0.0,
@@ -1620,19 +1856,14 @@ impl Frost {
             )
         };
         content = content
-            .push(self.shell_button(assistant_label, assistant_action, false, false))
+            .push(self.inspector_row(assistant_label, assistant_action))
             .push(self.chrome_section("PROJECT TASKS"));
         if self.config.experimental_task_sidebar {
             let inspector = crate::reference_conversation::observed_inspector(self);
             content = content
                 .push(self.chrome_label(&inspector.subtitle, 10.0, true, false))
-                .push(self.shell_button("Create task", Message::TaskComposerOpen, false, false))
-                .push(self.shell_button(
-                    "Open task workspace",
-                    Message::TaskPanelToggle,
-                    false,
-                    false,
-                ));
+                .push(self.inspector_row("Create task", Message::TaskComposerOpen))
+                .push(self.inspector_row("Open task workspace", Message::TaskPanelToggle));
             if inspector.total > 0 {
                 content = content
                     .push(self.chrome_label(&inspector.title, 11.0, false, false))
@@ -1659,11 +1890,9 @@ impl Frost {
                     true,
                     false,
                 ))
-                .push(self.shell_button(
+                .push(self.inspector_row(
                     "Task settings",
                     Message::ReferenceCommand(keybindings::Command::ConfigOpen),
-                    false,
-                    false,
                 ));
         }
         content = content
@@ -1675,19 +1904,13 @@ impl Frost {
                 false,
             ));
         for provider in agent_task::AgentProvider::ALL {
-            content = content.push(self.shell_button(
+            content = content.push(self.inspector_row(
                 format!("Open {}", provider.display_name()),
                 Message::AgentLaunch(provider),
-                false,
-                false,
             ));
         }
-        content = content.push(self.shell_button(
-            "Saved agent sessions",
-            Message::AgentSessionsToggle,
-            false,
-            false,
-        ));
+        content =
+            content.push(self.inspector_row("Saved agent sessions", Message::AgentSessionsToggle));
         let existing: Element<'_, Message> =
             scrollable(container(content).padding(16).width(Length::Fill))
                 .height(Length::Fill)
@@ -2115,11 +2338,47 @@ impl Frost {
                 ..iced::Padding::ZERO
             })
             .height(layout.composer.height);
+        // One accent outline (with a soft outer ring) around the docked prompt
+        // and its tools. Purely decorative: it holds no input or hit areas.
+        let ring = budget.composer;
+        let accent = rgb(color::ACCENT);
+        let radius = shell::COMPOSER_RADIUS;
+        let glow = container(
+            container(Space::new().width(Length::Fill).height(Length::Fill))
+                .width(ring.width)
+                .height(ring.height)
+                .style(move |_| container::Style {
+                    border: iced::Border {
+                        color: accent.scale_alpha(0.8),
+                        width: 1.5,
+                        radius: radius.into(),
+                    },
+                    ..Default::default()
+                }),
+        )
+        .padding(3)
+        .style(move |_| container::Style {
+            border: iced::Border {
+                color: accent.scale_alpha(0.18),
+                width: 3.0,
+                radius: (radius + 3.0).into(),
+            },
+            ..Default::default()
+        });
+        let glow = container(glow).padding(iced::Padding {
+            top: (ring.y - layout.center.y - 3.0).max(0.0),
+            left: (ring.x - layout.center.x - 3.0).max(0.0),
+            ..iced::Padding::ZERO
+        });
         let center = container(
-            column![
-                self.font_zoom_region(font_zoom::Group::Chrome, self.reference_header()),
-                pane,
-                tools
+            stack![
+                column![
+                    self.font_zoom_region(font_zoom::Group::Chrome, self.reference_header()),
+                    pane,
+                    tools
+                ]
+                .height(Length::Fill),
+                glow
             ]
             .height(Length::Fill),
         )

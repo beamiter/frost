@@ -167,7 +167,9 @@ PS1='\[\e]133;A\a\]❯ \[\e]133;B\a\]'
         time.sleep(0.25)
 
     def tools():
-        click(675, 671)
+        # Tools follows the fixed-width Terminal button; both widen with the
+        # chrome font, so the press point moves right at larger UI fonts.
+        click(306 + 125 * max(args.chrome_font_size / 14.0, 1.0), 672)
 
     def command(value):
         type_text(value)
@@ -217,9 +219,9 @@ PS1='\[\e]133;A\a\]❯ \[\e]133;B\a\]'
             wait_for(lambda: (out / "native-fonts.json").exists(), "actual native shaped text probe")
             result["native_fonts"] = json.loads((out / "native-fonts.json").read_text())
             if args.chrome_font_size > 14:
-                # At the measured 1.3x UI font the unavailable attachment
-                # actions move into the same real Tools menu, freeing the row.
-                click(495, 671)
+                # At the measured 1.3x UI font Tools keeps its place after the
+                # widened Terminal button.
+                tools()
                 assert "toggle open=true" in (out / "frost.log").read_text(), "Compact Tools did not open"
                 capture("compact-tools-menu", wid)
                 key("Escape")
@@ -317,7 +319,9 @@ PS1='\[\e]133;A\a\]❯ \[\e]133;B\a\]'
             wait_for(lambda: vim_state().get("sequence",0) > baseline["sequence"] + 2, "fresh independent Vim state after menu dismissal")
             assert {key: vim_state()[key] for key in fields} == stable, "Tools navigation/Escape changed Vim draft or cursor"
             tools()
-            click(1000, 100)
+            # Empty header space beside the session subtitle, outside both
+            # the Tools menu and the terminal grid.
+            click(750, 78)
             time.sleep(0.2)
             assert {key: vim_state()[key] for key in fields} == stable, "Tools outside click changed Vim state"
             tools()

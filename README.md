@@ -65,14 +65,14 @@ ascii_organism_care_enabled = false
 
 ## 命令块浏览器
 
-Block 阅读栏的 **Browse** 或 `Ctrl+Alt+F` 打开命令块浏览器。首次打开、清空查询或按
+工作区标题栏的 **Live** 状态胶囊或 `Ctrl+Alt+F` 打开命令块浏览器。首次打开、清空查询或按
 **Reset** 后，即可从新到旧浏览有保留文本的已完成块；输入文字后继续在命令和输出中搜索。
 查询为空时每块只显示一个代表行，搜索时保留具体输出行与匹配位置，`Enter` 定位，
 `Shift+Enter` 连续查看下一项，`Esc` 关闭。
 
 - **All / Failed / Success / Slow / Bookmarked / Unread / Background** 显示各类当前保留块的数量；
   `Tab` / `Shift+Tab` 遍历筛选。Success 只接受明确的成功退出状态，未知状态不计入成功。
-- **Unread** 使用阅读栏同一条阅读进度：查看历史时新完成的块保留为未读，**Go live** 回到底部并
+- **Unread** 使用标题栏同一条阅读进度：查看历史时新完成的块保留为未读，点击 **Reading** 状态胶囊回到底部并
   标记已看到的完成块。筛选计数对应保留的块，不是查询命中的文本行数；没有保留文本的块、Scope
   排除的文本和索引预算外的较旧块可能不出现在结果列表中。
 - **All / Cmd / Out** 限制搜索与浏览的文本范围；大小写、正则、全词和书签操作继续可用。
@@ -1133,20 +1133,27 @@ the profile be selected again for a retry.
 
 ### Block reading workspace
 
-Block Mode keeps a single-line reading strip above the terminal (36px at the
-default font size, growing only when larger text needs it). Narrow windows move
-the controls into **Actions** instead of adding rows; Escape dismisses that menu
-without sending input to the shell. Selection changes keep the terminal height
-stable. **Browse** opens
-cross-block search; **Details** opens a bounded, read-only snapshot of the selected
-(or newest) retained block. Details show command and working-directory capture,
+Block Mode shows its reading state in the workspace header instead of a separate
+toolbar row, so the terminal keeps that height and selection changes never
+reflow it. A status pill reads **Live · N blocks** (green dot; click to browse
+and search blocks) or **Reading · N selected · N new** (accent dot; click to go
+live). While reading, **‹ / ›**, **Details** and **Review selection** appear next
+to it. Narrow windows move these controls into **Actions**; Escape dismisses that
+menu without sending input to the shell. **Details** opens a bounded, read-only
+snapshot of the selected (or newest) retained block. Details show command and working-directory capture,
 exit/duration, lifecycle evidence, row retention, and text-output provenance.
 Large previews are explicitly clipped; images remain in the terminal grid.
 
 **‹ / ›** retrace up to 64 block visits in this pane. They use stable block IDs and
 skip evicted records. Reading a selected block pins the viewport even if it began
 at the live edge. New retained completions are counted without pulling the reader
-to the bottom. **Go live** explicitly clears block selection and resumes following.
+to the bottom. Going live (the Reading pill) explicitly clears block selection and
+resumes following.
+
+Finished cards select with a left click on their prompt row (Shift extends,
+Ctrl+Shift toggles); the focused selection gets an accent outline and glow. When
+the first row has blank room after the result badge, the card shows **copy**
+(copies the whole block) and **⋯** (the block menu, also on right click).
 Scrolling and normal terminal input retain their established behavior.
 
 **Review selection** (also Ctrl+Shift+I or Enter on a selected block) opens a

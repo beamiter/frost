@@ -207,6 +207,8 @@ impl MouseButton {
 pub enum BlockMouseAction {
     /// Plain single press on the card's prompt/header row.
     Replace,
+    /// Left press on the card's copy affordance.
+    Copy,
     /// Shift+single press anywhere in the completed card.
     Range,
     /// Ctrl+Shift+single press anywhere in the completed card.
@@ -396,6 +398,34 @@ fn chat_card_radius(
 }
 
 /// Chat exposes only read-only context actions; Shift-drag remains text selection.
+/// Blank cells the app reserves after a badge for the copy/menu affordances.
+pub const BLOCK_ACTION_CELLS: usize = 6;
+
+/// Copy and menu affordance rectangles at the right end of a card's first
+/// row, and the right edge left for the badge. Shared by paint and hit-test.
+fn block_action_geometry(
+    text_right: f32,
+    card_inset: f32,
+    row_y: f32,
+    cw: f32,
+    ch: f32,
+) -> (Rectangle, Rectangle, f32) {
+    let icon = (ch - 2.0).max(8.0);
+    let gap = (cw * 0.5).max(2.0);
+    let right = text_right - card_inset - 4.0;
+    let more = Rectangle {
+        x: right - icon,
+        y: row_y + (ch - icon) / 2.0,
+        width: icon,
+        height: icon,
+    };
+    let copy = Rectangle {
+        x: more.x - gap - icon,
+        ..more
+    };
+    (copy, more, copy.x - gap)
+}
+
 fn chat_card_mouse_action(button: MouseButton, completed: bool) -> Option<BlockMouseAction> {
     (completed && button == MouseButton::Right).then_some(BlockMouseAction::Menu)
 }
@@ -497,6 +527,9 @@ pub struct BlockPaintRow {
     /// Right-aligned first-row badge (text, color). Only set when the cells
     /// it covers are blank — the app checks before asking for it.
     pub badge: Option<(String, Color)>,
+    /// Copy and menu affordances after the badge. Only set when the app has
+    /// verified `BLOCK_ACTION_CELLS` more blank cells on this row.
+    pub actions: bool,
     /// Host-owned collapse affordance. Summary rows never participate in
     /// links, terminal text selection, cursor placement, or app mouse mode.
     pub collapsed_summary: Option<CollapsedSummaryPaint>,
@@ -747,9 +780,17 @@ fn block_card_visual(
             BlockCardKind::Unknown => (alpha(foreground, 0.03), alpha(foreground, 0.08), 1.0),
         }
     };
-    // Live/hover state remains legible through tint and borders, without
-    // floating shadows separating command output from the shared canvas.
-    let shadow = Shadow::default();
+    // History, live and hover states stay flat. Only the focused selection
+    // carries a soft accent glow so it reads as the active card.
+    let shadow = if segment.selection_active {
+        Shadow {
+            color: alpha(accent, 0.38),
+            offset: iced::Vector::ZERO,
+            blur_radius: 14.0,
+        }
+    } else {
+        Shadow::default()
+    };
     BlockCardVisual {
         background: alpha(background, opacity),
         border,
@@ -3604,6 +3645,15 @@ mod tests {
         let selected = block_card_visual(failed_segment, fg, accent, true, 1.0);
         assert_eq!(selected.border_width, 2.0);
         assert!((selected.border.a - 0.92).abs() < f32::EPSILON);
+        assert!(
+            selected.shadow.blur_radius > 0.0,
+            "the focused selection glows"
+        );
+        assert_eq!(
+            block_card_shadow(segment(false, true), selected.shadow).blur_radius,
+            0.0,
+            "a clipped selection still never paints a shadow cap"
+        );
         assert_eq!(
             (selected.background.r, selected.background.b),
             (accent.r, accent.b)
@@ -4777,7 +4827,85 @@ impl<Message> TermWidget<'_, Message> {
                 } else {
                     BLOCK_CARD_INSET
                 };
-                let right = text_right - card_inset - 4.0;
+                let mut right = text_right - card_inset - 4.0;
+                if block.actions {
+                    let (copy, more, badge_right) =
+                        block_action_geometry(text_right, card_inset, y, cw, ch);
+                    right = badge_right;
+                    let hover = cursor.position_over(bounds);
+                    let ink = |rect: Rectangle| {
+                        let hot = hover.is_some_and(|point| rect.contains(point));
+                        Color {
+                            a: if hot { 0.95 } else { 0.62 },
+                            ..self.theme.terminal_foreground()
+                        }
+                    };
+                    for rect in [copy, more] {
+                        if hover.is_some_and(|point| rect.contains(point)) {
+                            renderer.fill_quad(
+                                Quad {
+                                    bounds: rect,
+                                    border: Border {
+                                        color: Color::TRANSPARENT,
+                                        width: 0.0,
+                                        radius: 4.0.into(),
+                                    },
+                                    shadow: Shadow::default(),
+                                    snap: true,
+                                },
+                                Background::Color(Color {
+                                    a: 0.12,
+                                    ..self.theme.terminal_foreground()
+                                }),
+                            );
+                        }
+                    }
+                    // Copy: two overlapping rounded squares.
+                    let unit = (copy.width * 0.42).max(4.0);
+                    for (dx, dy) in [(0.30, 0.18), (0.16, 0.36)] {
+                        renderer.fill_quad(
+                            Quad {
+                                bounds: Rectangle {
+                                    x: copy.x + copy.width * dx,
+                                    y: copy.y + copy.height * dy,
+                                    width: unit,
+                                    height: unit,
+                                },
+                                border: Border {
+                                    color: ink(copy),
+                                    width: 1.2,
+                                    radius: 1.5.into(),
+                                },
+                                shadow: Shadow::default(),
+                                snap: true,
+                            },
+                            Background::Color(Color::TRANSPARENT),
+                        );
+                    }
+                    // Menu: three dots.
+                    let dot = (more.width * 0.14).max(2.0);
+                    for index in 0..3 {
+                        renderer.fill_quad(
+                            Quad {
+                                bounds: Rectangle {
+                                    x: more.x + more.width * (0.22 + 0.28 * index as f32)
+                                        - dot / 2.0,
+                                    y: more.y + (more.height - dot) / 2.0,
+                                    width: dot,
+                                    height: dot,
+                                },
+                                border: Border {
+                                    color: Color::TRANSPARENT,
+                                    width: 0.0,
+                                    radius: (dot / 2.0).into(),
+                                },
+                                shadow: Shadow::default(),
+                                snap: true,
+                            },
+                            Background::Color(ink(more)),
+                        );
+                    }
+                }
                 renderer.fill_quad(
                     Quad {
                         bounds: Rectangle {
@@ -5717,7 +5845,39 @@ where
                         return;
                     }
                 }
-                let block = if !self.chat_rows.is_empty() {
+                let action_hit = (button == MouseButton::Left && count == 1 && finalized)
+                    .then(|| block_row.filter(|row| row.actions && row.badge.is_some()))
+                    .flatten()
+                    .and_then(|_| {
+                        let card_inset = if self.block_compact {
+                            BLOCK_CARD_COMPACT_INSET
+                        } else {
+                            BLOCK_CARD_INSET
+                        };
+                        let text_right =
+                            bounds.x + bounds.width - self.metrics.padding - SCROLLBAR_WIDTH;
+                        let (copy, more, _) = block_action_geometry(
+                            text_right,
+                            card_inset,
+                            self.row_y(bounds, row),
+                            self.metrics.cell_w,
+                            self.metrics.cell_h,
+                        );
+                        if copy.contains(pos) {
+                            Some(BlockMouseAction::Copy)
+                        } else if more.contains(pos) {
+                            Some(BlockMouseAction::Menu)
+                        } else {
+                            None
+                        }
+                    });
+                // Chat bubbles keep their menu-only cards. Block cards select
+                // from their header row like the non-projected Block surface.
+                let block = if action_hit.is_some() {
+                    action_hit
+                } else if !self.chat_rows.is_empty()
+                    && self.terminal_mode != crate::config::TerminalMode::Block
+                {
                     chat_card_mouse_action(button, finalized)
                 } else if finalized && block_row.is_some_and(|row| row.native_header.is_some()) {
                     native_header_action(button, pos.x, bounds, self.metrics, shift, ctrl)

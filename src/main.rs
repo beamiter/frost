@@ -9411,14 +9411,11 @@ impl Frost {
         )
     }
 
+    /// Reading status and controls live in the workspace header, so the
+    /// terminal no longer reserves a separate toolbar row. Selecting a block or
+    /// entering Reading therefore never reflows the PTY.
     fn block_reading_bar_height(&self) -> f32 {
-        if !self.block_reading_bar_visible() {
-            return 0.0;
-        }
-        // One line at every width. Reserve the actual text line plus control
-        // and container padding, so narrowing a pane or selecting a block
-        // never grows the toolbar and reflows the terminal underneath it.
-        ui_typography::row_height(self.effective_font_size(), 36.0, 14.0)
+        0.0
     }
 
     fn block_reading_bar_compact(&self) -> bool {
@@ -14072,6 +14069,8 @@ impl Frost {
             sess.block_selection.retain(&ids);
             match action {
                 BlockMouseAction::Replace => sess.block_selection.click(&ids, id, false, false),
+                // Copy targets exactly the clicked card, as if it were selected.
+                BlockMouseAction::Copy => sess.block_selection.activate(&ids, id),
                 BlockMouseAction::Range => sess.block_selection.click(&ids, id, false, true),
                 BlockMouseAction::Toggle => sess.block_selection.click(&ids, id, true, true),
                 BlockMouseAction::Collapse => {
@@ -14102,6 +14101,9 @@ impl Frost {
             sess.refresh();
             if close_block_search {
                 self.close_block_search();
+            }
+            if action == BlockMouseAction::Copy {
+                return self.block_copy_block_task();
             }
             return Task::none();
         }
@@ -15417,16 +15419,22 @@ impl Frost {
 
         match result {
             Ok(copied) => {
+                let plural = if copied.block_count == 1 { "" } else { "s" };
                 let noun = match mode {
-                    block_mode::SelectedClipboardMode::Commands => "command",
-                    block_mode::SelectedClipboardMode::Outputs => "output",
-                    block_mode::SelectedClipboardMode::Blocks => "block",
+                    block_mode::SelectedClipboardMode::Commands => format!(" command{plural}"),
+                    block_mode::SelectedClipboardMode::Outputs => format!(" output{plural}"),
+                    // "selected block block" read as a stutter.
+                    block_mode::SelectedClipboardMode::Blocks => String::new(),
                 };
                 self.push_toast(
                     format!(
-                        "Copied {} selected block {noun}{}",
+                        "Copied {} selected block{}{noun}",
                         copied.block_count,
-                        if copied.block_count == 1 { "" } else { "s" }
+                        if matches!(mode, block_mode::SelectedClipboardMode::Blocks) {
+                            plural
+                        } else {
+                            ""
+                        }
                     ),
                     ToastKind::Success,
                 );
@@ -23680,9 +23688,16 @@ impl Frost {
     }
 
     /// Persistent navigation for the active pane, outside the projected grid.
-    fn block_reading_bar(&self) -> Element<'_, Message> {
+    /// Block reading status and navigation, hosted by the workspace header.
+    /// The pill reports Live/Reading; when reading it returns to the live
+    /// prompt, otherwise it browses blocks. Back/forward and details appear
+    /// only while reading; narrow panes keep every action in one menu.
+    fn block_reading_header(&self) -> Option<Element<'_, Message>> {
+        if !self.block_reading_bar_visible() {
+            return None;
+        }
         let sess = &self.sessions[self.active];
-        let font_size = self.effective_font_size();
+        let font_size = ui_typography::reference_role_size(10.5, self.chrome_font_size());
         let compact = self.block_reading_bar_compact();
         let session_id = sess.id;
         let reading = if sess.transcript_canvas.enabled() {
@@ -23693,182 +23708,159 @@ impl Frost {
         let unseen = sess
             .block_reading
             .unseen(sess.terminal.command_zones.iter().map(|z| z.id));
+        let live_ids: Vec<_> = sess.terminal.command_zones.iter().map(|z| z.id).collect();
         let status = if reading {
             format!(
                 "Reading · {} selected · {unseen} new",
                 sess.block_selection.len()
             )
         } else {
-            format!("Live · {} blocks", sess.terminal.command_zones.len())
+            format!("Live · {} blocks", live_ids.len())
         };
-        let control = |label: &'static str, help: &'static str, message, enabled: bool| {
-            let ghost = self.ghost_btn_style();
-            let button = button(text(label).size(font_size))
-                .on_press_maybe(enabled.then_some(message))
-                .padding([3, 7])
-                .style(move |theme, status| {
-                    let mut style = ghost(theme, status);
-                    if status == button::Status::Disabled {
-                        style.text_color.a *= 0.4;
-                    }
-                    style
-                });
-            tooltip(
-                button,
-                text(help).size(font_size),
-                tooltip::Position::Bottom,
-            )
-            .delay(std::time::Duration::from_millis(500))
-            .gap(4)
-            .padding(6)
-            .style(self.popup_style())
-        };
-        let live_ids: Vec<_> = sess.terminal.command_zones.iter().map(|z| z.id).collect();
-        let content: Element<'_, Message> = if sess.terminal.is_alt_buffer_active() {
-            tooltip(
-                container(
-                    text("Block review paused · alternate screen")
-                        .size(font_size)
-                        .wrapping(text::Wrapping::None)
-                        .color(self.c_text_dim()),
-                )
-                .width(Length::Fill)
-                .clip(true),
-                text("Return to the shell to review retained blocks.").size(font_size),
-                tooltip::Position::Bottom,
-            )
-            .delay(std::time::Duration::from_millis(500))
-            .gap(4)
-            .padding(6)
-            .style(self.popup_style())
-            .into()
-        } else {
-            let status_label = if compact {
-                if reading {
-                    if sess.block_selection.is_empty() {
-                        format!("Reading · {unseen} new")
-                    } else {
-                        format!("{} selected", sess.block_selection.len())
-                    }
+        let status_label = if compact {
+            if reading {
+                if sess.block_selection.is_empty() {
+                    format!("Reading · {unseen} new")
                 } else {
-                    format!("Live · {}", live_ids.len())
+                    format!("{} selected", sess.block_selection.len())
                 }
             } else {
-                status.clone()
-            };
-            let status = tooltip(
-                container(
-                    text(status_label)
-                        .size(font_size)
-                        .wrapping(text::Wrapping::None)
-                        .color(if reading {
-                            self.c_text()
-                        } else {
-                            self.c_text_dim()
-                        }),
+                format!("Live · {}", live_ids.len())
+            }
+        } else {
+            status.clone()
+        };
+        let popup = theme::popup_style(&self.theme);
+        let help =
+            move |content: Element<'static, Message>, help: String| -> Element<'static, Message> {
+                tooltip(
+                    content,
+                    text(help).size(font_size),
+                    tooltip::Position::Bottom,
                 )
-                .width(Length::Fill)
-                .clip(true),
-                text(status).size(font_size),
-                tooltip::Position::Bottom,
-            )
-            .delay(std::time::Duration::from_millis(500))
-            .gap(4)
-            .padding(6)
-            .style(self.popup_style());
-            let back = sess.block_reading.can_navigate(&live_ids, true);
-            let forward = sess.block_reading.can_navigate(&live_ids, false);
-            let has_blocks = !live_ids.is_empty();
-            let has_selection = !sess.block_selection.is_empty();
-            let mut bar = row![status].spacing(4).align_y(iced::Alignment::Center);
-            if compact {
-                // All enabled operations remain reachable without wrapping or
-                // reserving a second row. The app owns keyboard/IME dismissal.
-                let mut actions = Vec::new();
-                if back {
-                    actions.push("Back");
-                }
-                if forward {
-                    actions.push("Forward");
-                }
-                if has_blocks {
-                    actions.extend(["Browse", "Details"]);
-                }
-                if has_selection {
-                    actions.push("Review selection");
-                }
-                if reading {
-                    actions.push("Go live");
-                }
-                if !actions.is_empty() {
-                    bar = bar.push(widget_identity_scope::scope(
-                        self.block_reading_menu_epoch.clone(),
-                        pick_list(actions, None::<&str>, move |action| {
-                            Message::BlockReadingMenuAction(session_id, action)
-                        })
-                        .menu_style(self.popup_menu_style())
-                        .on_open(Message::BlockReadingMenuOpened(session_id))
-                        .on_close(Message::BlockReadingMenuClosed)
-                        .placeholder("Actions")
-                        .text_size(font_size)
-                        .padding([3, 7])
-                        .style(move |_, status| {
-                            let mut style = theme::popup_picker_style(&self.theme, status);
-                            style.placeholder_color = self.c_text();
-                            style
-                        }),
-                    ));
-                }
+                .delay(std::time::Duration::from_millis(500))
+                .gap(4)
+                .padding(6)
+                .style(move |_| popup)
+                .into()
+            };
+        let dot_color = if reading {
+            native_shell::header_accent()
+        } else {
+            native_shell::header_live()
+        };
+        let dot = container(Space::new().width(7).height(7)).style(move |_| container::Style {
+            background: Some(dot_color.into()),
+            border: iced::Border {
+                radius: 3.5.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let pill = button(
+            row![
+                dot,
+                text(status_label)
+                    .size(font_size)
+                    .wrapping(text::Wrapping::None)
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+        )
+        .on_press(if reading {
+            Message::BlockGoLive
+        } else {
+            Message::BlockBrowse
+        })
+        .padding([4, 10])
+        .style(native_shell::header_pill_style(reading));
+        let mut controls = row![help(
+            pill.into(),
+            if reading {
+                format!("{status} · return to the live prompt")
             } else {
-                bar = bar
-                    .push(control(
-                        "‹",
-                        "Back",
-                        Message::BlockReadingNavigate(true),
-                        back,
-                    ))
-                    .push(control(
-                        "›",
-                        "Forward",
-                        Message::BlockReadingNavigate(false),
-                        forward,
-                    ))
-                    .push(control(
-                        "Browse",
-                        "Browse and search blocks",
-                        Message::BlockBrowse,
-                        has_blocks,
-                    ))
-                    .push(control(
-                        "Details",
-                        "Review active block",
-                        Message::BlockReviewOpen,
-                        has_blocks,
-                    ));
-                if has_selection {
-                    bar = bar.push(control(
-                        "Review selection",
-                        "Review selected blocks",
-                        Message::BlockReviewSelected,
-                        true,
-                    ));
-                }
-                bar = bar.push(control(
-                    "Go live",
-                    "Return to the live prompt",
-                    Message::BlockGoLive,
-                    reading,
+                format!("{status} · browse and search blocks")
+            },
+        )]
+        .spacing(4)
+        .align_y(iced::Alignment::Center);
+        let back = sess.block_reading.can_navigate(&live_ids, true);
+        let forward = sess.block_reading.can_navigate(&live_ids, false);
+        let has_blocks = !live_ids.is_empty();
+        let has_selection = !sess.block_selection.is_empty();
+        if compact {
+            let mut actions = Vec::new();
+            if back {
+                actions.push("Back");
+            }
+            if forward {
+                actions.push("Forward");
+            }
+            if has_blocks {
+                actions.extend(["Browse", "Details"]);
+            }
+            if has_selection {
+                actions.push("Review selection");
+            }
+            if reading {
+                actions.push("Go live");
+            }
+            if !actions.is_empty() {
+                controls = controls.push(widget_identity_scope::scope(
+                    self.block_reading_menu_epoch.clone(),
+                    pick_list(actions, None::<&str>, move |action| {
+                        Message::BlockReadingMenuAction(session_id, action)
+                    })
+                    .menu_style(self.popup_menu_style())
+                    .on_open(Message::BlockReadingMenuOpened(session_id))
+                    .on_close(Message::BlockReadingMenuClosed)
+                    .placeholder("Actions")
+                    .text_size(font_size)
+                    .padding([3, 7])
+                    .style(move |_, status| {
+                        let mut style = theme::popup_picker_style(&self.theme, status);
+                        style.placeholder_color = self.c_text();
+                        style
+                    }),
                 ));
             }
-            bar.into()
-        };
-        container(content)
-            .padding([4, 10])
-            .width(Length::Fill)
-            .height(Length::Fixed(self.block_reading_bar_height()))
-            .align_y(iced::Alignment::Center)
-            .style(self.chrome_bar_style())
-            .into()
+        } else if reading {
+            let control = |label: &'static str, tip: &'static str, message| {
+                help(
+                    button(text(label).size(font_size))
+                        .on_press(message)
+                        .padding([3, 8])
+                        .style(native_shell::header_outlined_style())
+                        .into(),
+                    tip.into(),
+                )
+            };
+            if back {
+                controls = controls.push(control("‹", "Back", Message::BlockReadingNavigate(true)));
+            }
+            if forward {
+                controls = controls.push(control(
+                    "›",
+                    "Forward",
+                    Message::BlockReadingNavigate(false),
+                ));
+            }
+            if has_blocks {
+                controls = controls.push(control(
+                    "Details",
+                    "Review active block",
+                    Message::BlockReviewOpen,
+                ));
+            }
+            if has_selection {
+                controls = controls.push(control(
+                    "Review selection",
+                    "Review selected blocks",
+                    Message::BlockReviewSelected,
+                ));
+            }
+        }
+        Some(controls.into())
     }
 
     fn block_details_snapshot(
@@ -25483,12 +25475,24 @@ impl Frost {
                     clock,
                 ))
             };
-            for badge in badges {
-                let needed = badge.chars().count() + inset;
-                if block_mode::badge_fits(cells.iter().map(Self::block_badge_cell_char), needed) {
-                    row.badge = Some((badge, color));
-                    break;
-                }
+            // Prefer the most detailed badge that also leaves room for the
+            // copy/menu affordances; otherwise keep the badge alone.
+            let badges: Vec<String> = badges.collect();
+            let fits = |needed: usize| {
+                block_mode::badge_fits(cells.iter().map(Self::block_badge_cell_char), needed)
+            };
+            let with_actions = badges.iter().find(|badge| {
+                self.config.is_block_mode()
+                    && fits(badge.chars().count() + inset + terminal_view::BLOCK_ACTION_CELLS)
+            });
+            if let Some(badge) = with_actions {
+                row.badge = Some((badge.clone(), color));
+                row.actions = true;
+            } else if let Some(badge) = badges
+                .iter()
+                .find(|badge| fits(badge.chars().count() + inset))
+            {
+                row.badge = Some((badge.clone(), color));
             }
         }
 
@@ -27192,12 +27196,8 @@ impl Frost {
         // translated native surface so prompt paint and IME share the same
         // origin as the PTY budget, including in Block presentation.
         let panes_body = self.reference_terminal_surface(panes_body);
-        let panes_body = terminal_panes_body(
-            self.block_reading_bar_visible().then(|| {
-                self.font_zoom_region(font_zoom::Group::Content, self.block_reading_bar())
-            }),
-            panes_body,
-        );
+        // Reading status/navigation is part of the workspace header.
+        let panes_body = terminal_panes_body(None, panes_body);
         let body = container(panes_body)
             .width(Length::Fill)
             .height(Length::Fill);
