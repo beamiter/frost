@@ -35348,12 +35348,21 @@ mod tests {
             x: 0.0,
             y: 0.0,
         };
-        let mut rejected = vec![
-            (command, 0),
-            (command, 39),
-            (usize::MAX, 0),
-            (0, usize::MAX),
-        ];
+        assert_eq!(real, 0, "left-aligned commands retain native column zero");
+        let mut rejected: Vec<_> = (0..40)
+            .filter(|&col| {
+                projection
+                    .view_to_raw(terminal::ViewportCell { row: command, col })
+                    .is_none()
+            })
+            .map(|col| (command, col))
+            .collect();
+        assert!(
+            !rejected.is_empty(),
+            "the short command must leave synthetic capsule padding"
+        );
+        rejected.extend([(usize::MAX, 0), (0, usize::MAX)]);
+        let rejected_before_synthetic_rows = rejected.len();
         for row in 0..projection.cells().len() {
             if (0..40).all(|col| {
                 projection
@@ -35364,7 +35373,7 @@ mod tests {
             }
         }
         assert!(
-            rejected.len() > 7,
+            rejected.len() > rejected_before_synthetic_rows + 3,
             "fixture includes every synthetic row role"
         );
         for (row, col) in rejected {

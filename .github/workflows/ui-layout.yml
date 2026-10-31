@@ -58,6 +58,7 @@ jobs:
           set -euo pipefail
           suites=(
             chat_mode::tests::
+            tests::chat_
             terminal::chat_projection::tests::
             native_input_surface::tests::
             terminal_view::chat_capsule_geometry_tests::
