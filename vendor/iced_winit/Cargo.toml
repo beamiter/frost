@@ -138,3 +138,8 @@ priority = -1
 
 [lints.rustdoc]
 broken_intra_doc_links = "forbid"
+
+[target.'cfg(target_os = "linux")'.dependencies.wgpu-hal]
+version = "=27.0.4"
+default-features = false
+features = ["vulkan"]

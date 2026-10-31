@@ -785,6 +785,12 @@ async fn run_instance<P>(
                         let physical_size = window.state.physical_size();
                         let mut logical_size = window.state.logical_size();
 
+                        if window.raw.defer_native_frame() {
+                            // Keep the published snapshot stable until scene
+                            // feedback. Its completion wakes this deferred draw.
+                            continue;
+                        }
+
                         if physical_size.width == 0 || physical_size.height == 0
                         {
                             continue;
@@ -983,16 +989,36 @@ async fn run_instance<P>(
                         window.draw_preedit();
 
                         let present_span = debug::present(id);
-                        match current_compositor.present(
+                        let feedback = presentation_observer::prepare(id).or_else(|| {
+                            window.raw.native_frame_feedback_requested().then(presentation_observer::next_serial).flatten()
+                        });
+                        let began = std::cell::Cell::new(false);
+                        let mut present = || current_compositor.present(
                             &mut window.renderer,
                             &mut window.surface,
                             window.state.viewport(),
                             window.state.background_color(),
-                            || window.raw.pre_present_notify(),
-                        ) {
+                            || {
+                                if let Some(serial) = feedback {
+                                    began.set(window.raw.begin_native_frame_feedback(serial, physical_size.width, physical_size.height));
+                                }
+                                window.raw.pre_present_notify();
+                            },
+                        );
+                        #[cfg(target_os = "linux")]
+                        let (result, published) = if feedback.is_some() {
+                            wgpu_hal::vulkan::publication::observe(present)
+                        } else { (present(), false) };
+                        #[cfg(not(target_os = "linux"))]
+                        let (result, published) = (present(), false);
+                        if let Some(serial) = feedback {
+                            let known = result.is_ok() && began.get() && published;
+                            window.raw.finish_native_frame_feedback(serial, known);
+                            if !known { presentation_observer::cancel(id, serial); }
+                        }
+                        match result {
                             Ok(()) => {
                                 present_span.finish();
-                                presentation_observer::submitted(id);
                             }
                             Err(error) => match error {
                                 compositor::SurfaceError::OutOfMemory => {
@@ -1066,6 +1092,11 @@ async fn run_instance<P>(
                         else {
                             continue;
                         };
+
+                        if let winit::event::WindowEvent::NativeFramePresented { serial } = window_event {
+                            presentation_observer::presented(id, serial);
+                            continue;
+                        }
 
                         // Observe native identity before conversion discards
                         // synthetic focus snapshots. Only real key presses

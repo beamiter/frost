@@ -2,11 +2,11 @@
 //! Only an explicitly previewed and approved selection may join a dialogue request.
 //! NativePresented means successful native submission, NOT GPU completion/scanout.
 use crate::{Frost, Message};
+use companion_host::{self as shared, atlas, Placement, Rect, Request};
 use iced::widget::{
     button, canvas, checkbox, column, container, pick_list, row, scrollable, text, text_input,
 };
 use iced::{Color, Element, Length, Point, Rectangle};
-use jterm_core::companion_host::{self as shared, atlas, Placement, Rect, Request};
 use std::hash::{Hash, Hasher};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug)]
 pub(crate) enum Event {
     Wake,
-    ForceClose,
+    ForceClose(u64),
+    KeepOpen(u64),
     Geometry(Rectangle),
     PreviewPose(String),
     PreviewMood(String),
@@ -35,6 +36,7 @@ pub(crate) enum Event {
     Submit(u64),
     CancelDialogue(String),
     ReplySeen(String),
+    DialogueSave(String, u64),
     SelectionCapture(u64),
     SelectionReview(u64),
     SelectionApprove(String, u64),
@@ -101,20 +103,34 @@ impl Submission {
         self.cleared_tree.store(0, Ordering::Release);
         self.body_tree.store(0, Ordering::Release);
     }
-    fn presented(&self) -> bool {
-        let serial = self.cleared_tree.load(Ordering::Acquire);
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.cleared_tree.load(Ordering::Acquire),
+            self.body_tree.load(Ordering::Acquire),
+        )
+    }
+    fn needs_feedback(&self) -> bool {
+        (self.pending.load(Ordering::Acquire)
+            && self.cleared_tree.load(Ordering::Acquire) > self.after.load(Ordering::Acquire))
+            || (self.body_pending.load(Ordering::Acquire)
+                && self.body_tree.load(Ordering::Acquire) > self.body_after.load(Ordering::Acquire))
+    }
+    fn presented_snapshot(&self, (serial, body): (u64, u64)) -> bool {
         let retired = serial > self.after.load(Ordering::Acquire)
             && self.pending.swap(false, Ordering::AcqRel);
         if retired {
             self.submitted.store(serial, Ordering::Release);
         }
-        let body = self.body_tree.load(Ordering::Acquire);
         let appeared = body > self.body_after.load(Ordering::Acquire)
             && self.body_pending.swap(false, Ordering::AcqRel);
         if appeared {
             self.body_submitted.store(body, Ordering::Release);
         }
         retired || appeared
+    }
+    #[cfg(test)]
+    fn presented(&self) -> bool {
+        self.presented_snapshot(self.snapshot())
     }
 }
 fn task_reference(host: &str, pane: usize, task: u64) -> String {
@@ -159,9 +175,9 @@ pub(crate) struct Eva {
     wake: Wake,
     submission: Arc<Submission>,
     registration: Option<iced_winit::presentation_observer::Registration>,
-    retirement_armed: bool,
+    retirement_armed: Option<(shared::Token, u64)>,
     generation: u64,
-    connection_generation: u64,
+    admission_generation: u64,
     drawn_token: Option<shared::Token>,
     action_started: Instant,
     last_pose: String,
@@ -178,6 +194,10 @@ pub(crate) struct Eva {
     animation_generation: u64,
     closed: bool,
     pub closing: bool,
+    close_guarded: bool,
+    close_paused_for_work: bool,
+    close_ui_revision: u64,
+    cancel_key: shared::CancelKeyLease,
     force_close: bool,
     task_revision: u64,
     running_task: Option<(usize, bool)>,
@@ -188,6 +208,7 @@ pub(crate) struct Eva {
     input_focused: bool,
     draft: String,
     dialogue: Option<(String, shared::ContextRef)>,
+    dialogue_save: shared::DialogueSave,
     dialogue_status: String,
     dialogue_reply: String,
     projects: std::collections::BTreeMap<String, String>,
@@ -237,9 +258,9 @@ impl Eva {
             wake,
             submission: Arc::new(Submission::default()),
             registration: None,
-            retirement_armed: false,
+            retirement_armed: None,
             generation: 1,
-            connection_generation: 0,
+            admission_generation: 0,
             drawn_token: None,
             action_started: Instant::now(),
             last_pose: String::new(),
@@ -256,6 +277,10 @@ impl Eva {
             animation_generation: 0,
             closed: false,
             closing: false,
+            close_guarded: false,
+            close_paused_for_work: false,
+            close_ui_revision: 0,
+            cancel_key: Default::default(),
             force_close: false,
             task_revision: 0,
             running_task: None,
@@ -266,6 +291,7 @@ impl Eva {
             input_focused: false,
             draft: String::new(),
             dialogue: None,
+            dialogue_save: Default::default(),
             dialogue_status: "Offline dialogue; no terminal text attached".into(),
             dialogue_reply: String::new(),
             projects: Default::default(),
@@ -302,11 +328,15 @@ impl Eva {
         let submission = self.submission.clone();
         let signal = self.wake.signal.clone();
         let before = self.submission.clone();
-        self.registration = Some(iced_winit::presentation_observer::register(
+        let capture = self.submission.clone();
+        self.registration = Some(iced_winit::presentation_observer::register_with_receipt(
             id,
             move || before.begin_draw(),
-            move || {
-                if submission.presented() {
+            move || capture.needs_feedback().then(|| capture.snapshot()),
+            move |native_serial, snapshot| {
+                let accepted = submission.presented_snapshot(snapshot);
+                log::debug!(target: "eva_native_host", "native host receipt native_pass={native_serial} cleared_frame={} body_frame={} accepted={accepted}", snapshot.0, snapshot.1);
+                if accepted {
                     signal.send_modify(|n| *n = n.wrapping_add(1));
                 }
             },
@@ -343,28 +373,32 @@ impl Eva {
                 .body_pending
                 .store(self.drawn_token.is_some(), Ordering::Release);
         }
-        let connection = self.host.gate.connection_generation();
-        if connection != self.connection_generation {
-            self.connection_generation = connection;
+        let connection = self.host.gate.admission_generation();
+        if connection != self.admission_generation {
+            self.admission_generation = connection;
             self.metadata = None;
             self.running_task = None;
             self.context = None;
             self.clear_consents();
             self.memory_review = None;
-            self.retirement_armed = false;
+            self.retirement_armed = None;
             if self.closing {
                 self.send(Request::Withdraw);
             }
         }
-        if !self.host.gate.pending_retirement() {
-            self.retirement_armed = false;
-        }
-        if self.host.gate.pending_retirement() && !self.retirement_armed {
-            self.retirement_armed = true;
-            self.submission
-                .after
-                .store(self.generation, Ordering::Release);
-            self.submission.pending.store(true, Ordering::Release);
+        let retirement = self
+            .host
+            .gate
+            .pending_retirement_boundary()
+            .map(|(token, after)| (token.clone(), after));
+        if self.retirement_armed != retirement {
+            self.retirement_armed = retirement;
+            if self.retirement_armed.is_some() {
+                self.submission
+                    .after
+                    .store(self.generation, Ordering::Release);
+                self.submission.pending.store(true, Ordering::Release);
+            }
         }
         while let Some(reply) = self.host.take_dialogue() {
             if let shared::Reply::Dialogue {
@@ -374,6 +408,8 @@ impl Eva {
                 reply,
             } = reply
             {
+                self.dialogue_save
+                    .observe(&turn_id, &context, &status, reply.as_deref());
                 if self.dialogue.as_ref() == Some(&(turn_id.clone(), context.clone())) {
                     self.dialogue_status = format!("{} · source {}", status, context.pane_id);
                     if let Some(reply) = reply {
@@ -511,6 +547,7 @@ impl Eva {
         }
     }
     fn clear_consents(&mut self) {
+        self.dialogue_save.clear();
         self.selection_preview = None;
         self.selection_review = None;
         self.selection_approved = None;
@@ -663,8 +700,16 @@ impl Eva {
                     });
                 }
             }
-            Event::ForceClose => {
-                self.force_close = true;
+            Event::ForceClose(revision) => {
+                if self.closing && !self.close_paused_for_work && revision == self.close_ui_revision
+                {
+                    self.force_close = true;
+                }
+            }
+            Event::KeepOpen(revision) => {
+                if self.closing && self.close_guarded && revision == self.close_ui_revision {
+                    self.keep_window_open();
+                }
             }
             Event::Quiet(quiet) => self.send(Request::Comfort {
                 quiet,
@@ -684,6 +729,7 @@ impl Eva {
                         self.dialogue_reply.clear();
                         self.dialogue_status = "Submitted; not yet answered".into();
                         let text = std::mem::take(&mut self.draft);
+                        self.dialogue_save.begin(&turn_id, &context, &text);
                         let approved_selection = self
                             .selection_approved
                             .take()
@@ -694,6 +740,19 @@ impl Eva {
                             text,
                             approved_selection,
                         });
+                    }
+                }
+            }
+            Event::DialogueSave(turn, revision) => {
+                if let Some(context) = self.context.as_ref().filter(|c| c.revision == revision) {
+                    if let Some(scope) = self.memory_scope() {
+                        match self.dialogue_save.proposal(&turn, context, scope) {
+                            Ok(change) => self.propose(change),
+                            Err(reason) => self.memory_status = reason.into(),
+                        }
+                    } else {
+                        self.memory_status =
+                            "Choose the current task/project or explicitly choose Global.".into();
                     }
                 }
             }
@@ -822,6 +881,8 @@ impl Eva {
     }
     pub fn request_close(&mut self) {
         if !self.closing {
+            self.close_ui_revision = self.close_ui_revision.saturating_add(1);
+            self.force_close = false;
             self.closing = true;
             self.cached = None;
             self.deadline = None;
@@ -829,8 +890,73 @@ impl Eva {
             self.send(Request::Withdraw);
         }
     }
+    pub fn request_guarded_close(&mut self) {
+        if self.close_paused_for_work {
+            self.close_ui_revision = self.close_ui_revision.saturating_add(1);
+        }
+        self.close_guarded = true;
+        self.close_paused_for_work = false;
+        self.request_close();
+    }
+    pub fn guarded_close_waiting(&self) -> bool {
+        self.closing && self.close_guarded && !self.close_paused_for_work
+    }
+    pub fn pause_close_for_work(&mut self) {
+        if self.closing && self.close_guarded && !self.close_paused_for_work {
+            // Keep the exact in-flight withdrawal/proof. Ending the new work
+            // must not itself authorize a GUI exit.
+            self.close_paused_for_work = true;
+            self.close_ui_revision = self.close_ui_revision.saturating_add(1);
+        }
+    }
+    pub fn allow_final_session_close(&mut self) {
+        self.close_ui_revision = self.close_ui_revision.saturating_add(1);
+        // The final pane has its own process confirmation/completion path.
+        self.close_guarded = false;
+        self.close_paused_for_work = false;
+    }
+    pub fn keep_window_open(&mut self) {
+        self.close_ui_revision = self.close_ui_revision.saturating_add(1);
+        self.closing = false;
+        self.close_guarded = false;
+        self.close_paused_for_work = false;
+        self.force_close = false;
+        self.cached = None;
+        self.deadline = None;
+        // Preserve the actual in-flight Submission and retirement token.
+        self.host.cancel_withdrawal();
+    }
+    pub fn route_close_escape(&mut self, event: &iced::keyboard::Event, focused: bool) -> bool {
+        use iced::keyboard::{key::Named, Event, Key};
+        match event {
+            Event::KeyPressed {
+                key: Key::Named(Named::Escape),
+                repeat,
+                ..
+            } => match self.cancel_key.press(self.guarded_close_waiting(), *repeat) {
+                shared::CancelKeyAction::Cancel => {
+                    self.keep_window_open();
+                    return true;
+                }
+                shared::CancelKeyAction::Suppress => return true,
+                shared::CancelKeyAction::Pass => {}
+            },
+            Event::KeyReleased {
+                key: Key::Named(Named::Escape),
+                ..
+            } => return self.cancel_key.release(focused),
+            Event::KeyPressed { .. } => self.cancel_key.other_input(),
+            _ => {}
+        }
+        false
+    }
+    pub fn cancel_key_focus_lost(&mut self) {
+        self.cancel_key.focus_lost();
+    }
     pub fn ready_to_close(&self) -> bool {
-        self.closing && (self.force_close || self.host.gate.withdrawal_accepted())
+        self.closing
+            && !self.close_paused_for_work
+            && (self.force_close || self.host.gate.withdrawal_accepted())
     }
     pub fn close(&mut self) {
         self.closed = true;
@@ -889,7 +1015,9 @@ impl Drop for Eva {
 }
 impl Frost {
     pub(crate) fn eva_closing(&self) -> bool {
-        self.eva.as_ref().is_some_and(|e| e.closing)
+        self.eva
+            .as_ref()
+            .is_some_and(|e| e.closing && !e.close_paused_for_work)
     }
     pub(crate) fn eva_input_owns_keys(&self) -> bool {
         self.eva.as_ref().is_some_and(|e| e.input_focused)
@@ -911,6 +1039,9 @@ impl Frost {
         }
     }
     pub(crate) fn eva_event(&mut self, event: Event) {
+        if matches!(event, Event::KeepOpen(_)) && self.eva_closing() {
+            self.native_enter_ownership.lock().claim_held();
+        }
         match event {
             Event::SelectionCapture(rev) => {
                 let selection = self
@@ -1113,6 +1244,7 @@ impl Frost {
         if (eva.host.gate.quiet() || eva.host.gate.night()) && motion == atlas::Motion::Full {
             motion = atlas::Motion::Calm;
         }
+        let mut task_observation = None;
         if running != eva.running_task {
             if let Some((id, true)) = running {
                 eva.task_revision = eva.task_revision.saturating_add(1);
@@ -1120,7 +1252,7 @@ impl Frost {
                     eva.task_ids.insert(id, eva.task_revision);
                 }
                 let task = *eva.task_ids.entry(id).or_insert(eva.task_revision);
-                eva.send(Request::TaskObservation {
+                task_observation = Some(Request::TaskObservation {
                     task_id: task_reference(eva.host.gate.host_id(), id, task),
                     context_revision: eva.task_revision,
                     status: shared::TaskStatus::Running,
@@ -1129,9 +1261,18 @@ impl Frost {
             eva.running_task = running;
         }
         eva.sync_context(running.map(|(id, _)| id));
+        // Re-admission clears the daemon's context. The new task context must
+        // reach it before the first fact; otherwise that fact is rejected and
+        // the unchanged local running-task cache would prevent a retry.
+        if let Some(observation) = task_observation {
+            eva.send(observation);
+        }
         let input = eva.input_until.is_some_and(|until| Instant::now() < until) || unsafe_input;
         let safe = eligible && !input && slot_size.is_some();
-        eva.slot_size = if eligible && !input { slot_size } else { None };
+        // Reserve layout while an inspector field owns input. Painting and
+        // offered geometry remain gated by `safe`; typing must not remove the
+        // canvas and replace the focused field's retained widget state.
+        eva.slot_size = slot_size;
         let slot = eva.geometry.filter(|r| {
             slot_size.is_some_and(|(w, h)| {
                 (r.width - w as f64).abs() < 1. && (r.height - h as f64).abs() < 1.
@@ -1215,10 +1356,11 @@ impl Frost {
             text(eva.host.gate.status()).size(11)
         ]
         .spacing(6);
+        let mut avatar = column![].spacing(6);
         if let Some((width, height)) = eva.slot_size {
             // The unpainted slot can establish geometry before residence is granted.
             // Only the authorized cached frame paints; it is never an offline fallback.
-            card = card.push(
+            avatar = avatar.push(
                 canvas::Canvas::new(Glyphs {
                     frame: eva.cached.as_ref(),
                     submission: Some(&eva.submission),
@@ -1232,14 +1374,23 @@ impl Frost {
                 .width(width)
                 .height(height),
             );
-            if let Some(frame) = eva.cached.as_ref() {
-                card = card.push(text(frame.accessible_label.clone()).size(11));
-            }
+            avatar = avatar.push(
+                text(
+                    eva.cached
+                        .as_ref()
+                        .map_or(" ", |frame| frame.accessible_label.as_str()),
+                )
+                .size(11),
+            );
         }
+        // Transient glyph/error children stay inside fixed parent positions;
+        // neither an admission change nor a hidden body may reset Ask Eva.
+        card = card.push(avatar);
+        let mut controls = column![].spacing(6);
         if let Some(error) = eva.host.gate.operation_error() {
-            card = card.push(text(error.to_string()).size(11));
+            controls = controls.push(text(error.to_string()).size(11));
         }
-        card = card.push(self.eva_controls());
+        card = card.push(controls.push(self.eva_controls()));
         card = card
             .push(
                 text_input("Ask Eva — never sent to the shell", &eva.draft)
@@ -1330,15 +1481,28 @@ impl Frost {
         )
     }
     fn eva_controls(&self) -> Element<'_, Message> {
-        row![
+        let mut controls = row![
             button(text("Follow")).on_press(Message::Eva(Event::Intent(Intent::Follow))),
             button(text("Stay")).on_press(Message::Eva(Event::Intent(Intent::Stay))),
             button(text("Hide")).on_press(Message::Eva(Event::Intent(Intent::Hide))),
             button(text("Recall")).on_press(Message::Eva(Event::Intent(Intent::Recall)))
-        ]
-        .spacing(4)
-        .wrap()
-        .into()
+        ];
+        if let Some(eva) = self
+            .eva
+            .as_ref()
+            .filter(|eva| eva.closing && eva.close_guarded)
+        {
+            controls = controls.push(crate::widget_identity_scope::scope_key(
+                eva.close_ui_revision,
+                button(text(if eva.close_paused_for_work {
+                    "Keep window open"
+                } else {
+                    "Keep window open · Esc"
+                }))
+                .on_press(Message::Eva(Event::KeepOpen(eva.close_ui_revision))),
+            ));
+        }
+        controls.spacing(4).wrap().into()
     }
     pub(crate) fn eva_settings(&self) -> Element<'_, Message> {
         let skin =
@@ -1524,6 +1688,9 @@ impl Frost {
             }
             controls = controls
                 .push(text("Scoped memory — explicit review before every change"))
+                .push(button(text("Review saving this exchange")).on_press_maybe(
+                    eva.dialogue_save.turn_id().map(|id| Message::Eva(Event::DialogueSave(id.into(), context_revision)))
+                ))
                 .push(
                     checkbox(eva.memory_global)
                         .label("Manage GLOBAL scope explicitly (otherwise task; not model-memory consent)")
@@ -1570,14 +1737,16 @@ impl Frost {
                             "{}: {} · revision {}",
                             entry.key, entry.value, entry.revision
                         ))
-                        .size(12),
+                        .size(12)
+                        .width(Length::Fill),
                         button(text("Delete…")).on_press(Message::Eva(Event::MemoryDelete(
                             entry.id,
                             entry.revision,
                             context_revision
                         )))
                     ]
-                    .spacing(4),
+                    .spacing(4)
+                    .width(Length::Fill),
                 );
             }
             if eva.memory_next.is_some() {
@@ -1592,7 +1761,8 @@ impl Frost {
                             "Review source {} · {:?} · digest {}",
                             context.pane_id, review.change, review.digest
                         ))
-                        .size(12),
+                        .size(12)
+                        .width(Length::Fill),
                     )
                     .push(
                         row![
@@ -1614,16 +1784,49 @@ impl Frost {
     }
     pub(crate) fn eva_witness<'a>(&'a self, root: Element<'a, Message>) -> Element<'a, Message> {
         if let Some(eva) = self.eva.as_ref() {
-            let root = if eva.closing {
-                let panel=container(column![text("Closing Frost — withdrawing shared Eva"),text(eva.host.gate.status().to_string()),text("Waiting for a real cleared-frame submission and daemon receipt. No timeout is treated as proof.").size(13),button(text("Close anyway — Eva recovery may be blocked")).on_press(Message::Eva(Event::ForceClose))].spacing(12)).padding(24).style(container::rounded_box);
-                iced::widget::stack![
-                    root,
-                    iced::widget::opaque(container(panel).center(Length::Fill))
-                ]
-                .into()
+            let overlay: Option<Element<'a, Message>> = if eva.closing && !eva.close_paused_for_work
+            {
+                let mut content=column![text("Closing Frost"),text(eva.host.gate.status().to_string()),text("Eva is leaving this window. Closing before it finishes may keep it from appearing in another window.").size(13)];
+                if eva.close_guarded {
+                    content = content.push(
+                        button(text(if eva.close_paused_for_work {
+                            "Keep window open"
+                        } else {
+                            "Keep window open · Esc"
+                        }))
+                        .on_press(Message::Eva(Event::KeepOpen(eva.close_ui_revision))),
+                    );
+                }
+                let panel = container(
+                    content
+                        .push(
+                            button(text("Close anyway"))
+                                .on_press(Message::Eva(Event::ForceClose(eva.close_ui_revision))),
+                        )
+                        .spacing(12),
+                )
+                .padding(24)
+                .style(container::rounded_box);
+                let panel = crate::widget_identity_scope::scope_key(eva.close_ui_revision, panel);
+                Some(iced::widget::opaque(container(panel).center(Length::Fill)).into())
+            } else if eva.closing && eva.close_guarded && eva.close_paused_for_work {
+                let panel = container(
+                    row![
+                        text("Work is still running. Finish it, or keep this window open."),
+                        button(text("Keep window open"))
+                            .on_press(Message::Eva(Event::KeepOpen(eva.close_ui_revision))),
+                    ]
+                    .spacing(12)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding(12)
+                .style(container::rounded_box);
+                let panel = crate::widget_identity_scope::scope_key(eva.close_ui_revision, panel);
+                Some(container(panel).center_x(Length::Fill).padding(48).into())
             } else {
-                root
+                None
             };
+            let root = crate::widget_identity_scope::transient_overlay(root, overlay);
             let witness = Witness {
                 serial: eva.generation,
                 clear: eva.host.gate.token().is_none(),
@@ -1910,28 +2113,8 @@ mod tests {
             std::fs::write(dir.join("frost-eva-native-atlas.txt"),"Actual Iced tiny-skia glyph raster, native BGRA-premultiplied converted to straight RGBA for PNG. Columns: cat fox robot ghost cursor beetle night stardust. Rows: idle blink peek sit curl_up stretch retreat walk listen speak guard_failure celebrate_briefly look_at. Static; seed=0; elapsed_ms=0; 240x242 logical px; scale=1. Not WGPU/window/compositor/IME evidence. Atlas is implementation-derived, not source raster extraction.").unwrap();
         }
     }
-    #[test]
-    fn native_hook_is_after_success_not_iced_frames_and_window_scoped() {
-        let shell = include_str!("../vendor/iced_winit/src/lib.rs");
-        let hook = shell
-            .split_once("match current_compositor.present(")
-            .unwrap()
-            .1;
-        let success = hook
-            .split_once("Ok(()) => {")
-            .unwrap()
-            .1
-            .split_once("Err(error)")
-            .unwrap()
-            .0;
-        assert!(success.contains("presentation_observer::submitted(id)"));
-        let owner = include_str!("main.rs");
-        assert_eq!(owner.matches("subs.push(eva.subscription())").count(), 1);
-        assert!(owner.contains(".then(eva_companion::Eva::new)"));
-        let module = include_str!("eva_companion.rs");
-        assert!(module.contains("impl Drop for Eva"));
-        assert!(module.contains("self.registration = None"));
-    }
+    // Exact native ordering and registration lifetime are tested by the
+    // production-source harness and real X11 matrix, not source-text searches.
     #[test]
     fn shared_eva_is_opt_in_and_settings_round_trip() {
         let config = crate::config::Config::default();
@@ -2013,6 +2196,20 @@ mod tests {
         assert!(!s.presented());
         assert_eq!(s.body_submitted.load(Ordering::Acquire), 0);
         assert!(s.body_pending.load(Ordering::Acquire));
+    }
+    #[test]
+    fn delayed_snapshot_cannot_be_relabelled_as_a_new_clear_frame() {
+        let s = Submission::default();
+        s.after.store(7, Ordering::Release);
+        s.pending.store(true, Ordering::Release);
+        s.cleared_tree.store(8, Ordering::Release);
+        let old = s.snapshot();
+        s.after.store(9, Ordering::Release);
+        s.cleared_tree.store(12, Ordering::Release);
+        assert!(!s.presented_snapshot(old));
+        assert!(s.pending.load(Ordering::Acquire));
+        assert!(s.presented_snapshot(s.snapshot()));
+        assert_eq!(s.submitted.load(Ordering::Acquire), 12);
     }
     #[test]
     fn receipt_and_old_frame_are_not_retirement() {

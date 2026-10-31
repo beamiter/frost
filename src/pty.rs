@@ -596,6 +596,7 @@ mod unix_pty {
     pub struct Pty {
         master: RawFd,
         child_pid: i32,
+        session: companion_host::pty_session::PtySession,
         exit_code_cached: Option<i32>,
         lifecycle: ChildLifecycle,
     }
@@ -984,6 +985,9 @@ mod unix_pty {
                     Ok(Pty {
                         master,
                         child_pid: fork_result as i32,
+                        session: companion_host::pty_session::PtySession::capture(
+                            fork_result as i32,
+                        ),
                         exit_code_cached: None,
                         lifecycle: ChildLifecycle::Running,
                     })
@@ -993,6 +997,10 @@ mod unix_pty {
 
         pub fn get_child_pid(&self) -> i32 {
             self.child_pid
+        }
+
+        pub fn session_activity(&self) -> companion_host::pty_session::Activity {
+            self.session.activity()
         }
 
         pub fn master_fd(&self) -> RawFd {
@@ -1229,6 +1237,9 @@ mod unix_pty {
             if let Some(code) = self.exit_code_cached {
                 return Ok(code);
             }
+            // The wait owner retains the zombie anchor through this bounded
+            // drain, including jobs in other process groups of the session.
+            self.session.drain_after_exit()?;
             // SAFETY: WNOWAIT kept child_pid unreaped, so its process-group ID
             // cannot be recycled between this signal and the waitpid below.
             let killed = unsafe { libc::kill(-self.child_pid, libc::SIGKILL) };
@@ -2069,6 +2080,10 @@ mod windows_pty {
 
         pub fn is_alive(&self) -> bool {
             false
+        }
+
+        pub fn session_activity(&self) -> companion_host::pty_session::Activity {
+            companion_host::pty_session::Activity::Unknown
         }
 
         pub fn terminate(&mut self) -> Result<()> {

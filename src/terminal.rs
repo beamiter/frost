@@ -4637,6 +4637,25 @@ impl TerminalState {
     /// Existing terminal observations only; no new input ledger or protocol state.
     /// Check cheap dirty/pending facts before the existing bounded prompt capture.
     pub(crate) fn live_activity_facts(&self) -> crate::organism_activity::ActivityFacts {
+        self.activity_facts()
+            .with_prompt_ready(|| self.agent_prompt_status().is_ready())
+    }
+
+    /// Close admission asks whether work has returned to a clean semantic
+    /// prompt. A right prompt (for example jsh's elapsed duration) is terminal
+    /// decoration, not accepted user input or a running builtin. Agent approval
+    /// deliberately retains its stricter whole-input capture above.
+    pub(crate) fn window_close_prompt_ready(&self) -> bool {
+        !self.use_alt_buffer
+            && self
+                .activity_facts()
+                .with_prompt_ready(|| {
+                    matches!(self.current_zone_state, ZoneState::CommandStarted(_, _))
+                })
+                .prompt_ready
+    }
+
+    fn activity_facts(&self) -> crate::organism_activity::ActivityFacts {
         crate::organism_activity::ActivityFacts {
             running: self.is_command_running(),
             prompt_ready: false,
@@ -4648,7 +4667,6 @@ impl TerminalState {
             agent_armed: self.armed_agent_execution.is_some(),
             agent_active: self.active_agent_execution.is_some(),
         }
-        .with_prompt_ready(|| self.agent_prompt_status().is_ready())
     }
 
     pub fn agent_prompt_status(&self) -> AgentPromptStatus {
@@ -15519,6 +15537,65 @@ mod tests {
         );
         terminal.process_input(b"\r\n\x1b]133;C\x07");
         assert_eq!(terminal.agent_prompt_status(), AgentPromptStatus::Busy);
+    }
+
+    #[test]
+    fn window_close_prompt_accepts_right_decoration_without_authorizing_agent() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        assert!(!terminal.window_close_prompt_ready());
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07");
+        assert!(!terminal.window_close_prompt_ready());
+        terminal.process_input(
+            b"\x1b]133;D;130\x07\r\n\x1b]133;A\x07$ \x1b]133;B\x07\x1b[30G4.9s\x1b[3G",
+        );
+        assert_eq!(
+            terminal.agent_prompt_status(),
+            super::AgentPromptStatus::InputNotEmpty
+        );
+        assert!(
+            !terminal.live_activity_facts().prompt_ready,
+            "the former close predicate mistook the right decoration for command input"
+        );
+        assert!(terminal.window_close_prompt_ready());
+        assert_eq!(
+            terminal.agent_prompt_status(),
+            super::AgentPromptStatus::InputNotEmpty,
+            "window closing must not authorize model/Agent input"
+        );
+        terminal.process_input(b"\x1b[?1049h");
+        assert!(
+            !terminal.window_close_prompt_ready(),
+            "alternate screen is not an idle prompt"
+        );
+    }
+
+    #[test]
+    fn window_close_prompt_keeps_unseen_submit_and_typeahead_owned() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(terminal.window_close_prompt_ready());
+        terminal.note_user_input(b"read value\r");
+        assert!(
+            !terminal.window_close_prompt_ready(),
+            "submit must block before its echo or C"
+        );
+        terminal.process_input(b"read value\r\n\x1b]133;C\x07");
+        assert!(
+            !terminal.window_close_prompt_ready(),
+            "a same-root builtin is still work"
+        );
+        terminal.note_user_input(b"queued");
+        terminal.process_input(b"\x1b]133;D;0\x07\r\n\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(
+            !terminal.window_close_prompt_ready(),
+            "typeahead survives the new prompt before echo"
+        );
+        terminal.note_user_input(b"\x03");
+        terminal.process_input(b"^C\r\n\x1b]133;A\x07$ \x1b]133;B\x07\x1b[30G4.9s\x1b[3G");
+        assert!(
+            terminal.window_close_prompt_ready(),
+            "real cancellation and a fresh prompt clear input ownership"
+        );
     }
 
     #[test]

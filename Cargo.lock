@@ -679,7 +679,6 @@ dependencies = [
 [[package]]
 name = "companion-client"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa569540091524d637a7115b64c587b9177a55b"
 dependencies = [
  "companion-protocol",
  "libc",
@@ -698,9 +697,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "companion-host"
+version = "0.1.0"
+dependencies = [
+ "companion-client",
+ "companion-core",
+ "companion-protocol",
+ "eva-character-atlas",
+ "libc",
+ "uuid",
+]
+
+[[package]]
 name = "companion-protocol"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa569540091524d637a7115b64c587b9177a55b"
 dependencies = [
  "serde",
  "serde_json",
@@ -1276,6 +1286,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "companion-host",
  "cosmic-text",
  "crossbeam-channel",
  "dirs",
@@ -1813,6 +1824,7 @@ dependencies = [
  "tracing",
  "wasm-bindgen-futures",
  "web-sys",
+ "wgpu-hal",
  "window_clipboard",
  "winit",
 ]
@@ -4595,8 +4607,6 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "27.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b21cb61c57ee198bc4aff71aeadff4cbb80b927beb912506af9c780d64313ce"
 dependencies = [
  "android_system_properties",
  "arrayvec",

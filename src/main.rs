@@ -798,7 +798,7 @@ fn finalized_block_at_viewport_row(
             };
         }
         terminal::ProjectedRowKind::Padding | terminal::ProjectedRowKind::BlockSpacer { .. } => {
-            return None
+            return None;
         }
         terminal::ProjectedRowKind::Raw => {}
     }
@@ -2143,8 +2143,7 @@ fn block_search_bookmark_button_help(bookmarked: bool, stale: bool) -> &'static 
     }
 }
 
-const BLOCK_SEARCH_KEYBOARD_HELP: &str =
-    "Ctrl+Shift+B toggle bookmark on selected result · F5 refresh · Tab filter · Ctrl+I case · Ctrl+R regex · Ctrl+W whole word · \
+const BLOCK_SEARCH_KEYBOARD_HELP: &str = "Ctrl+Shift+B toggle bookmark on selected result · F5 refresh · Tab filter · Ctrl+I case · Ctrl+R regex · Ctrl+W whole word · \
      ↑↓ select · Enter reveal · Shift+Enter step · Ctrl+U clear · Ctrl+Shift+U reset · Esc close";
 
 fn block_search_bookmarks_have_indexed_text(
@@ -3269,7 +3268,9 @@ fn sidebar_terminal_entry_copy(location: &remote_fs::FsLocation) -> (String, Str
             let endpoint = jterm_core::review_input::safe_inline_display(&endpoint, 256);
             (
                 "SSH terminal\n(login shell)".to_string(),
-                format!("Open a plain interactive SSH login to {endpoint}; current SSH options are retained"),
+                format!(
+                    "Open a plain interactive SSH login to {endpoint}; current SSH options are retained"
+                ),
             )
         }
     }
@@ -5204,6 +5205,10 @@ struct Session {
     ime_identity: Arc<()>,
     terminal: TerminalState,
     pty: Pty,
+    /// Explicit argv owns this PTY as work, even if its root child is the
+    /// foreground group. This comes from spawn admission, never a tab title.
+    command_owned: bool,
+    shell_identity: companion_host::shell_identity::ShellIdentity,
     master_fd: RawFd,
     reader_fd: Arc<OwnedFd>,
     watch_source: organism_watch::SourceAuthority,
@@ -5646,17 +5651,25 @@ impl Session {
             .chain(extra_env.iter().copied())
             .collect();
         let session_id = jsh_session_id(id, command_argv);
+        let shell_program = command_argv
+            .is_none()
+            .then(|| pty::resolved_shell_identity(config.shell.as_deref(), cwd))
+            .flatten();
         let pty = Pty::new_with_cwd_env(
             cols,
             rows,
             cwd,
             session_id.as_deref(),
-            config.shell.as_deref(),
+            shell_program.as_deref().or(config.shell.as_deref()),
             command_argv,
             &child_env,
         )
         .map_err(|error| anyhow::anyhow!("cannot create terminal session: {error}"))?;
         let master_fd = pty.master_fd();
+        let shell_identity = companion_host::shell_identity::ShellIdentity::capture(
+            pty.get_child_pid(),
+            shell_program.as_deref().map(std::path::Path::new),
+        );
         let reader_fd = unsafe { libc::fcntl(master_fd, libc::F_DUPFD_CLOEXEC, 0) };
         if reader_fd < 0 {
             return Err(anyhow::anyhow!(
@@ -5690,6 +5703,8 @@ impl Session {
             ime_identity: Arc::new(()),
             terminal,
             pty,
+            command_owned: command_argv.is_some(),
+            shell_identity,
             master_fd,
             reader_fd,
             watch_source: organism_watch::SourceAuthority::default(),
@@ -6188,6 +6203,59 @@ impl Session {
     /// and the chrome shows the transcript as read-only.
     fn transcript_read_only(&self) -> bool {
         user_input_blocked(self.hold_after_exit)
+    }
+
+    /// Current PTY ownership admits every ordinary close path. Process names
+    /// are display metadata and cannot decide whether a command is idle.
+    fn close_blocker(&self) -> Option<&'static str> {
+        if self.transcript_read_only() {
+            return None;
+        }
+        let child = self.pty.get_child_pid();
+        let foreground = jterm_core::process::tty_foreground_pgid(self.master_fd);
+        match foreground {
+            Some(group) if group != child => {
+                return Some(
+                    "A foreground process is still running. Stop it or close its tab before closing this window.",
+                );
+            }
+            _ => {}
+        }
+        #[cfg(target_os = "linux")]
+        match jterm_core::process::process_stat_result(child) {
+            Ok(state) if !state.is_live() => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            _ => {}
+        }
+        if foreground == Some(child) && !self.command_owned {
+            if !self.shell_identity.matches_current_program() {
+                return Some("The shell was replaced by a command. Stop it or close its tab before closing this window.");
+            }
+            match self.pty.session_activity() {
+                companion_host::pty_session::Activity::Busy => return Some(
+                    "A background process is still attached. Stop it or close its tab before closing this window.",
+                ),
+                companion_host::pty_session::Activity::Unknown => return Some(
+                    "Cannot verify attached terminal work. Check the session or close its tab explicitly.",
+                ),
+                companion_host::pty_session::Activity::Idle => {}
+            }
+            if self.terminal.window_close_prompt_ready() {
+                return None;
+            }
+            log::debug!(target: "terminal_close", "close held: root={child} prompt={:?} activity={:?}",
+                self.terminal.agent_prompt_status(), self.terminal.live_activity_facts());
+            return Some(if self.terminal.has_prompt_marks() {
+                "Terminal work or unfinished input is still present. Return to an empty prompt or close its tab explicitly."
+            } else {
+                "Shell activity is unavailable. Exit this shell or close its tab explicitly before closing this window."
+            });
+        }
+        Some(if self.command_owned {
+            "A terminal command is still running. Stop it or close its tab before closing this window."
+        } else {
+            "Cannot verify that a terminal is idle. Check its work before closing this window."
+        })
     }
 
     fn chat_backlog(&self) -> chat_mode::InputBacklog {
@@ -10019,6 +10087,9 @@ impl Frost {
             // are away, leaving a zombie whose cwd link is already gone, so
             // signalling first would persist the last session with no
             // directory at all and reopen it somewhere else next launch.
+            if let Some(eva) = self.eva.as_mut() {
+                eva.allow_final_session_close();
+            }
             let exit = self.exit_flushing_durable_state();
             let _ = self.sessions[0].pty.terminate();
             return exit;
@@ -10137,9 +10208,25 @@ impl Frost {
     }
 
     fn busy_session_name(&self, index: usize) -> Option<String> {
+        let session = self.sessions.get(index)?;
+        session.close_blocker()?;
+        Some(session.fg_proc().unwrap_or_else(|| {
+            if session.command_owned {
+                "terminal command"
+            } else {
+                "terminal work"
+            }
+            .into()
+        }))
+    }
+
+    /// Close admission uses the current kernel PTY group, not the tab label's
+    /// cached process name. An unreadable live terminal is not proof of idle.
+    fn window_close_blocker(&self) -> Option<(usize, &'static str)> {
         self.sessions
-            .get(index)
-            .and_then(|session| session.fg_proc_cache.clone().or_else(|| session.fg_proc()))
+            .iter()
+            .enumerate()
+            .find_map(|(index, session)| session.close_blocker().map(|reason| (index, reason)))
     }
 
     /// Public entry point for close requests originating from user actions.
@@ -10193,17 +10280,18 @@ impl Frost {
                     .map(move |message| Message::EmbeddedVim(id, Box::new(message)))
             }));
         }
-        if let Some((index, process)) = (0..self.sessions.len())
-            .find_map(|index| self.busy_session_name(index).map(|name| (index, name)))
-        {
+        if let Some((index, reason)) = self.window_close_blocker() {
+            if let Some(eva) = self.eva.as_mut() {
+                eva.pause_close_for_work();
+            }
             self.focus_session(index);
             self.relayout();
             self.refresh_active_context();
-            self.push_toast(
-                format!("{process} is still running — close its tab first"),
-                ToastKind::Warning,
-            );
+            self.push_toast(reason.to_owned(), ToastKind::Warning);
             return Task::none();
+        }
+        if let Some(eva) = self.eva.as_mut() {
+            eva.request_guarded_close();
         }
         self.exit_flushing_durable_state()
     }
@@ -12539,8 +12627,12 @@ impl Frost {
         // The instruction never interpolates command or output text: both are
         // untrusted PTY evidence and travel only inside the framed context.
         let prompt = match intent {
-            FailedBlockAgentIntent::Fix => "Fix the attached failed command. Diagnose the root cause from its captured output and propose the smallest safe fix; every command you propose is reviewed before it runs.",
-            FailedBlockAgentIntent::Explain => "Explain the attached failed command: identify the root cause, cite the relevant evidence in its captured output, and propose the smallest safe next step. Do not propose changes unless I ask.",
+            FailedBlockAgentIntent::Fix => {
+                "Fix the attached failed command. Diagnose the root cause from its captured output and propose the smallest safe fix; every command you propose is reviewed before it runs."
+            }
+            FailedBlockAgentIntent::Explain => {
+                "Explain the attached failed command: identify the root cause, cite the relevant evidence in its captured output, and propose the smallest safe next step. Do not propose changes unless I ask."
+            }
         };
         match self
             .agent
@@ -16336,6 +16428,16 @@ impl Frost {
             );
         }
         self.sync_eva();
+        if self
+            .eva
+            .as_ref()
+            .is_some_and(|eva| eva.guarded_close_waiting())
+        {
+            if let Some((_, reason)) = self.window_close_blocker() {
+                self.eva.as_mut().unwrap().pause_close_for_work();
+                self.push_toast(reason.to_owned(), ToastKind::Warning);
+            }
+        }
         if self.eva.as_ref().is_some_and(|eva| eva.ready_to_close()) {
             return Task::batch([task, self.exit_flushing_durable_state()]);
         }
@@ -17444,10 +17546,10 @@ impl Frost {
                 }
             }
             Message::AiSuggestionInsert(generation) => {
-                return self.insert_ai_suggestion(generation)
+                return self.insert_ai_suggestion(generation);
             }
             Message::AiSuggestionRegenerate(generation) => {
-                return self.regenerate_ai_suggestion(generation)
+                return self.regenerate_ai_suggestion(generation);
             }
             Message::AiSuggestionDismiss(generation) => {
                 if self
@@ -18261,6 +18363,18 @@ impl Frost {
                         .task_for_terminal_session(&session_key)
                         .is_some();
                     let exit_code = self.sessions[index].pty.exited_code();
+                    if exit_code.is_none() {
+                        // Observed parent exit is not completed session cleanup.
+                        // Retry asynchronously; id/fd matching above prevents a
+                        // late retry from closing a replacement session.
+                        return Task::perform(
+                            async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                (id, fd, _code)
+                            },
+                            |(id, fd, code)| Message::PtyExited(id, fd, code),
+                        );
+                    }
                     let feedback = agent_task_ui::task_terminal_exit_feedback(
                         &mut self.task_manager,
                         &session_key,
@@ -18278,6 +18392,16 @@ impl Frost {
                 }
             }
             Message::OverlayEscape(event) => {
+                if self.eva_closing() {
+                    self.native_enter_ownership.lock().claim_held();
+                }
+                if self
+                    .eva
+                    .as_mut()
+                    .is_some_and(|eva| eva.route_close_escape(&event, self.focused))
+                {
+                    return Task::none();
+                }
                 // Re-deliver only while something on screen owns Escape; with
                 // no overlay open this must stay a no-op rather than falling
                 // through to `encode_key` and reaching the child process.
@@ -18316,6 +18440,21 @@ impl Frost {
                 return self.update(Message::Key(event));
             }
             Message::Key(event) => {
+                if self.eva_closing() {
+                    // Keep a held dialog Enter owned across cancellation;
+                    // later repeats must not execute the restored prompt.
+                    self.native_enter_ownership.lock().claim_held();
+                }
+                if let Some(eva) = self.eva.as_mut() {
+                    if eva.route_close_escape(&event, self.focused) {
+                        return Task::none();
+                    }
+                    if eva.guarded_close_waiting()
+                        && matches!(event, keyboard::Event::KeyPressed { .. })
+                    {
+                        return Task::none();
+                    }
+                }
                 if self.terminal_ime.claim_enter(&event) {
                     self.native_enter_ownership.lock().claim_pressed();
                     return Task::none();
@@ -18361,7 +18500,7 @@ impl Frost {
                         use keyboard::{key::Named, Key};
                         match key {
                             Key::Named(Named::Escape) => {
-                                return self.update(Message::ReferenceToolsClose)
+                                return self.update(Message::ReferenceToolsClose);
                             }
                             Key::Named(Named::ArrowDown | Named::Tab) if !modifiers.shift() => {
                                 self.reference_tools_selection = Some((selected + 1) % 3)
@@ -18370,7 +18509,7 @@ impl Frost {
                                 self.reference_tools_selection = Some((selected + 2) % 3)
                             }
                             Key::Named(Named::Enter) if !repeat => {
-                                return self.update(Message::ReferenceToolsChoose(selected))
+                                return self.update(Message::ReferenceToolsChoose(selected));
                             }
                             _ => {}
                         }
@@ -19331,6 +19470,11 @@ impl Frost {
                 }
             }
             Message::Focus(f) => {
+                if !f {
+                    if let Some(eva) = self.eva.as_mut() {
+                        eva.cancel_key_focus_lost();
+                    }
+                }
                 if !f {
                     self.font_wheel.clear();
                     self.remote_host_editor.retire();
@@ -21174,7 +21318,7 @@ impl Frost {
             Message::BlockReviewCopy => return self.copy_block_review(),
             Message::BlockReviewCompare => return self.block_compare_selected_task(true),
             Message::BlockReviewExport(format) => {
-                return self.block_export_selected_task(format, true)
+                return self.block_export_selected_task(format, true);
             }
             Message::BlockComparisonFinished(result) => self.finish_block_comparison(result),
             Message::BlockComparisonCopy => return self.copy_block_comparison(),
@@ -23752,18 +23896,64 @@ impl Frost {
         };
         let body = format!(
             "Command\n{}\n\nWorking directory\n{}\n\nResult\n{}\nDuration: {}\nFinished (Unix ms): {}\n\nProvenance\n{}\nCommand: {}{}\nRows: {}\nOutput source: {}\n\nOutput (text preview; images remain in the terminal)\n{}",
-            block_review::preview(zone.command.as_deref().unwrap_or(if zone.command_truncated { "Command unavailable" } else { "No command: background output" }), 65536),
-            block_review::preview(zone.cwd.as_deref().unwrap_or("Not reported"), 8192), status,
-            zone.duration_ms.map(|ms| format!("{ms} ms")).unwrap_or_else(|| "Not reported".into()),
-            zone.finished_at_ms.map(|ms| ms.to_string()).unwrap_or_else(|| "Not reported".into()),
+            block_review::preview(
+                zone.command
+                    .as_deref()
+                    .unwrap_or(if zone.command_truncated {
+                        "Command unavailable"
+                    } else {
+                        "No command: background output"
+                    }),
+                65536
+            ),
+            block_review::preview(zone.cwd.as_deref().unwrap_or("Not reported"), 8192),
+            status,
+            zone.duration_ms
+                .map(|ms| format!("{ms} ms"))
+                .unwrap_or_else(|| "Not reported".into()),
+            zone.finished_at_ms
+                .map(|ms| ms.to_string())
+                .unwrap_or_else(|| "Not reported".into()),
             block_mode::lifecycle_detail(zone.start_mark_seen, zone.completion_provenance),
-            if zone.command_exact { "Exact shell metadata" } else { "Reconstructed / not exact" },
-            if zone.command_truncated { "; TRUNCATED or unavailable, cannot recall" } else { "" },
-            if zone.rows_evicted { "Evicted; retained snapshot may still be available" } else { "Retained" },
-            if zone.captured_output.is_some() { "Finalization snapshot" } else if zone.captured_output_evicted { "Snapshot evicted; live rows used only if retained" } else { "Live retained rows / no text capture" },
+            if zone.command_exact {
+                "Exact shell metadata"
+            } else {
+                "Reconstructed / not exact"
+            },
+            if zone.command_truncated {
+                "; TRUNCATED or unavailable, cannot recall"
+            } else {
+                ""
+            },
+            if zone.rows_evicted {
+                "Evicted; retained snapshot may still be available"
+            } else {
+                "Retained"
+            },
+            if zone.captured_output.is_some() {
+                "Finalization snapshot"
+            } else if zone.captured_output_evicted {
+                "Snapshot evicted; live rows used only if retained"
+            } else {
+                "Live retained rows / no text capture"
+            },
             match terminal.zone_output_export_capped(id) {
-                Some(terminal::ZoneOutputExport::Available { text, truncated }) => format!("Capture: {}\nPreview: {}\n\n{}", if truncated { "TRUNCATED by terminal budget" } else { "Available retained text" }, if text.len() > 65536 { "Clipped to 64 KiB; copy/export retains the available capture" } else { "Retained text shown below" }, block_review::preview(&text, 65536)),
-                Some(terminal::ZoneOutputExport::Unavailable) => "Unavailable: captured output was evicted".into(),
+                Some(terminal::ZoneOutputExport::Available { text, truncated }) => format!(
+                    "Capture: {}\nPreview: {}\n\n{}",
+                    if truncated {
+                        "TRUNCATED by terminal budget"
+                    } else {
+                        "Available retained text"
+                    },
+                    if text.len() > 65536 {
+                        "Clipped to 64 KiB; copy/export retains the available capture"
+                    } else {
+                        "Retained text shown below"
+                    },
+                    block_review::preview(&text, 65536)
+                ),
+                Some(terminal::ZoneOutputExport::Unavailable) =>
+                    "Unavailable: captured output was evicted".into(),
                 _ => "No non-blank text output captured".into(),
             }
         );
@@ -23898,11 +24088,22 @@ impl Frost {
                 )
             ));
         }
-        let body = format!("{} selected block(s), in terminal order.{}\n{}\nInsertion uses the current prompt folder; it does not change to the original folders shown below.\n\nSources\n{}\nCommands (safe display)\n{}",
-            sess.block_selection.len(), if sess.block_selection.len() > 128 { " Only the first 128 are shown." } else { "" },
-            if bracketed { "Insert places commands in the editable prompt. It does not run them." }
-            else { "Bracketed paste is disabled: ONLY THE FIRST LOGICAL LINE will be inserted. Nothing is run." },
-            sources, preview);
+        let body = format!(
+            "{} selected block(s), in terminal order.{}\n{}\nInsertion uses the current prompt folder; it does not change to the original folders shown below.\n\nSources\n{}\nCommands (safe display)\n{}",
+            sess.block_selection.len(),
+            if sess.block_selection.len() > 128 {
+                " Only the first 128 are shown."
+            } else {
+                ""
+            },
+            if bracketed {
+                "Insert places commands in the editable prompt. It does not run them."
+            } else {
+                "Bracketed paste is disabled: ONLY THE FIRST LOGICAL LINE will be inserted. Nothing is run."
+            },
+            sources,
+            preview
+        );
         self.block_review = Some(BlockReview {
             session_id: sess.id,
             ids,
@@ -32557,6 +32758,13 @@ impl Frost {
                 } else if captured_key_is_enter_release(&event)
                     || matches!(
                         &event,
+                        keyboard::Event::KeyReleased {
+                            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                            ..
+                        }
+                    )
+                    || matches!(
+                        &event,
                         keyboard::Event::KeyReleased { key, .. }
                             if block_search_is_bookmark_key(key)
                     )
@@ -33824,7 +34032,28 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
                     // chance to repaint between very large bursts.
                     const COALESCE_CAP: usize = 1 << 20; // 1 MiB per message
                     let mut buf = vec![0u8; 65536];
+                    let mut parent_probe_at = std::time::Instant::now();
                     loop {
+                        if std::time::Instant::now() >= parent_probe_at {
+                            if matches!(
+                                Pty::wait_fd_or_shutdown(reader_raw, shutdown_raw, 0),
+                                Ok(ReaderPoll::Shutdown)
+                            ) {
+                                break;
+                            }
+                            if publish_observed_parent_exit(
+                                id,
+                                fd,
+                                reader_raw,
+                                child_pid,
+                                &mut tx,
+                                &mut watch_source,
+                            ) {
+                                break;
+                            }
+                            parent_probe_at =
+                                std::time::Instant::now() + std::time::Duration::from_millis(200);
+                        }
                         match Pty::wait_fd_or_shutdown(reader_raw, shutdown_raw, 200) {
                             Ok(ReaderPoll::Shutdown) => break,
                             Ok(ReaderPoll::Timeout) => continue,
@@ -33930,6 +34159,59 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
             }
         },
     )
+}
+
+/// A descendant may keep the slave open indefinitely after its parent exits.
+/// Observe the owned parent independently of EOF, retaining its wait status for
+/// the UI's session drain/reap. Preserve a bounded readable tail before Exit.
+fn publish_observed_parent_exit(
+    id: usize,
+    fd: RawFd,
+    reader_raw: RawFd,
+    child_pid: i32,
+    tx: &mut iced::futures::channel::mpsc::Sender<Message>,
+    watch_source: &mut organism_watch::SourceWriter,
+) -> bool {
+    use iced::futures::SinkExt;
+    let code = match Pty::observe_child_exit(child_pid) {
+        Ok(Some(code)) => code,
+        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => -1,
+        Ok(None) | Err(_) => return false,
+    };
+    const CAP: usize = 1 << 20;
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 65536];
+    let mut first_read = None;
+    while output.len() < CAP {
+        let available = buffer.len().min(CAP - output.len());
+        let count = unsafe { libc::read(reader_raw, buffer.as_mut_ptr().cast(), available) };
+        if count > 0 {
+            first_read.get_or_insert_with(std::time::Instant::now);
+            output.extend_from_slice(&buffer[..count as usize]);
+        } else if count < 0
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {
+            continue;
+        } else {
+            break;
+        }
+    }
+    if output.len() == CAP {
+        log::warn!("PTY natural-exit tail reached 1 MiB; remaining output may be omitted");
+    }
+    if !output.is_empty()
+        && iced::futures::executor::block_on(tx.send(Message::PtyOutput(
+            id,
+            fd,
+            output,
+            first_read.and_then(|at| watch_source.stamp(at)),
+        )))
+        .is_err()
+    {
+        return true;
+    }
+    let _ = iced::futures::executor::block_on(tx.send(Message::PtyExited(id, fd, code)));
+    true
 }
 
 /// Outcome of riding out a PTY hangup in the reader thread.
@@ -34233,7 +34515,7 @@ fn encode_key(
                         mods,
                         app_cursor,
                         enh.report_all_keys,
-                    )
+                    );
                 }
             };
             if alt {
@@ -34539,6 +34821,114 @@ mod block_browser_tests;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn close_role_tracks_real_command_owned_pty_until_child_exit() {
+        use std::time::{Duration, Instant};
+        let mut config = super::Config::default();
+        config.shell = Some("/bin/sh".into());
+        config.vim9.auto_gui = false;
+        let mut interactive = super::Session::spawn(&config, 0, 80, 24, Some("/tmp")).unwrap();
+        let argv = vec!["/bin/sleep".into(), "30".into()];
+        let mut command =
+            super::Session::spawn_argv(&config, 1, 80, 24, Some("/tmp"), Some(&argv)).unwrap();
+        for session in [&interactive, &command] {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while jterm_core::process::tty_foreground_pgid(session.master_fd)
+                != Some(session.pty.get_child_pid())
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "real PTY root never gained foreground"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(!interactive.command_owned);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while interactive.pty.session_activity() != companion_host::pty_session::Activity::Idle {
+            assert!(
+                Instant::now() < deadline,
+                "fixture shell still has attached startup work"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            interactive.close_blocker().is_some(),
+            "an uninstrumented live shell does not prove idle"
+        );
+        interactive
+            .terminal
+            .process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(interactive.close_blocker().is_none());
+        interactive.terminal.note_user_input(b"read value\r");
+        assert!(
+            interactive.close_blocker().is_some(),
+            "accepted submit cannot race the C marker"
+        );
+        interactive
+            .terminal
+            .process_input(b"read value\r\n\x1b]133;C\x07");
+        assert!(
+            interactive.close_blocker().is_some(),
+            "a builtin can execute in the shell's own foreground group"
+        );
+        interactive.terminal.process_input(b"\x1b]133;D;0\x07");
+        assert!(interactive.close_blocker().is_some());
+        interactive
+            .terminal
+            .process_input(b"\r\n\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(interactive.close_blocker().is_none());
+        let fd = interactive.master_fd;
+        interactive.master_fd = -1;
+        assert!(
+            interactive.close_blocker().is_some(),
+            "unreadable live PTY is not idle"
+        );
+        interactive.master_fd = fd;
+        assert!(command.command_owned);
+        command.fg_proc_cache = Some("sh".into());
+        assert!(
+            command.close_blocker().is_some(),
+            "a root command is work regardless of its tab label"
+        );
+        let pid = command.pty.get_child_pid();
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while command.pty.is_alive() {
+            assert!(Instant::now() < deadline, "fixture command did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(command.close_blocker().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn close_checks_actual_exec_even_with_a_forged_empty_prompt() {
+        use std::time::{Duration, Instant};
+        let mut config = super::Config::default();
+        config.shell = Some("/bin/sh".into());
+        config.vim9.auto_gui = false;
+        let mut session = super::Session::spawn(&config, 0, 80, 24, Some("/tmp")).unwrap();
+        session.pty.write(b"exec /bin/sleep 30\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let sleep = std::fs::canonicalize("/bin/sleep").unwrap();
+        let executable = format!("/proc/{}/exe", session.pty.get_child_pid());
+        while std::fs::read_link(&executable).ok().as_ref() != Some(&sleep) {
+            assert!(Instant::now() < deadline, "real exec did not replace shell");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!session.shell_identity.matches_current_program());
+        session
+            .terminal
+            .process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(session.terminal.agent_prompt_status().is_ready());
+        assert!(
+            session.close_blocker().is_some(),
+            "PTY output cannot make the exec process an idle shell"
+        );
+    }
+
     #[test]
     fn blocks_navigator_auto_hides_only_for_immersive_sessions() {
         use super::{block_reading_bar_should_show as visible, immersive_block_command as tui};
@@ -35446,7 +35836,9 @@ mod tests {
             .0
             .contains("config_save_feedback(self.config_dirty, self.config_write_blocked)"));
         let subscription = source.split_once("    fn subscription(&self)").unwrap().1;
-        assert!(subscription.contains("iced::time::every(std::time::Duration::from_millis(1500)).map(|_| Message::ConfigTick)"));
+        assert!(subscription.contains(
+            "iced::time::every(std::time::Duration::from_millis(1500)).map(|_| Message::ConfigTick)"
+        ));
         let tick = source
             .split_once("            Message::ConfigTick => {")
             .unwrap()
@@ -38835,8 +39227,10 @@ mod tests {
                 *ctrl = true;
             }
             sync_embedded_body_modifiers(&mut press, keyboard::Modifiers::SHIFT);
-            assert!(matches!(press, MouseInput::Press { row: 7, col: 11, count: actual, shift: true, alt: false, ctrl: false, .. } if actual == count),
-                "first focus must update stale child modifiers without losing click count or coordinates");
+            assert!(
+                matches!(press, MouseInput::Press { row: 7, col: 11, count: actual, shift: true, alt: false, ctrl: false, .. } if actual == count),
+                "first focus must update stale child modifiers without losing click count or coordinates"
+            );
         }
     }
 
@@ -43727,6 +44121,73 @@ mod tests {
 
         drop(pty);
         let _ = std::fs::remove_file(script_path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parent_exit_is_observed_while_background_slave_stays_open_and_tail_is_preserved() {
+        use iced::futures::StreamExt;
+        let root = std::env::temp_dir().join(format!("frost-open-slave-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let helper = root.join("child.py");
+        let marker = root.join("pid");
+        std::fs::write(&helper, format!("import os,signal,time\nfrom pathlib import Path\nos.setpgrp()\nsignal.signal(signal.SIGHUP,signal.SIG_IGN)\nPath({:?}).write_text(str(os.getpid()))\nwhile True:time.sleep(1)\n", marker)).unwrap();
+        let quote = jterm_core::process::shell_single_quote;
+        let command = format!("/usr/bin/python3 {} & while [ ! -s {} ]; do sleep .01; done; printf retained-tail; exit 7",
+                              quote(&helper.to_string_lossy()), quote(&marker.to_string_lossy()));
+        let argv = vec!["/bin/sh".into(), "-c".into(), command];
+        let mut pty = Pty::new_with_cwd(80, 24, Some("/tmp"), None, None, Some(&argv)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while Pty::observe_child_exit(pty.get_child_pid()).unwrap() != Some(7) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let job: i32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+        assert!(jterm_core::process::process_stat(job).is_some_and(|state| state.is_live()));
+        let fd = pty.master_fd();
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        assert!(unsafe { libc::poll(&mut poll, 1, 0) } >= 0);
+        assert_eq!(
+            poll.revents & libc::POLLHUP,
+            0,
+            "background child really keeps the slave open"
+        );
+        let (mut tx, mut rx) = iced::futures::channel::mpsc::channel(4);
+        assert!(publish_observed_parent_exit(
+            77,
+            fd,
+            fd,
+            pty.get_child_pid(),
+            &mut tx,
+            &mut organism_watch::SourceAuthority::default().start()
+        ));
+        match iced::futures::executor::block_on(rx.next()).unwrap() {
+            Message::PtyOutput(77, actual_fd, bytes, _) => {
+                assert_eq!(actual_fd, fd);
+                assert_eq!(bytes, b"retained-tail");
+            }
+            other => panic!("final parent output missing before exit: {other:?}"),
+        }
+        assert!(
+            matches!(iced::futures::executor::block_on(rx.next()), Some(Message::PtyExited(77, actual_fd, 7)) if actual_fd == fd)
+        );
+        assert_eq!(
+            Pty::observe_child_exit(pty.get_child_pid()).unwrap(),
+            Some(7),
+            "reader never reaps the anchor"
+        );
+        while pty.exited_code().is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(pty.exited_code(), Some(7));
+        assert!(!jterm_core::process::process_stat(job).is_some_and(|state| state.is_live()));
+        drop(pty);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
