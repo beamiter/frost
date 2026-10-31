@@ -26783,11 +26783,18 @@ impl Frost {
                 } else {
                     self.pane_view(*session)
                 };
-                let framed: Element<'_, Message> = container(body)
-                    .style(self.pane_frame_style(focused))
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into();
+                // The docked prompt is drawn beyond the native history bounds.
+                // Even an unstyled Container skips that draw when its own
+                // bounds miss the input clip. Only split panes need a frame.
+                let framed: Element<'_, Message> = if !split && self.config.is_card_mode() {
+                    body
+                } else {
+                    container(body)
+                        .style(self.pane_frame_style(focused))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                };
                 let direction = self.sessions.get(*session).and_then(|session| {
                     self.tab_split_drop
                         .filter(|drop| drop.target_session_id == session.id)

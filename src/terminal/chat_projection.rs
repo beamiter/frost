@@ -364,9 +364,12 @@ impl TerminalState {
                     }
                 }
             }
-            let status_zone = (role == ChatRole::Output && absolute < active_start)
-                .then(|| zone_index.map(|index| zones[index].id))
-                .flatten();
+            // Block already paints its status in the command header. Reserving
+            // Chat's footer there adds a second empty row between every card.
+            let status_zone =
+                (key.command_bubbles && role == ChatRole::Output && absolute < active_start)
+                    .then(|| zone_index.map(|index| zones[index].id))
+                    .flatten();
             // Reserve the same host-only role header while output is still
             // running. Adding it only after OSC D moves every native output
             // row down at completion, even when no terminal cells changed.
@@ -575,6 +578,7 @@ mod tests {
     fn block_docks_the_native_prompt_and_keeps_completed_commands_left_aligned() {
         let mut terminal = TerminalState::new(40, 18);
         command(&mut terminal, "echo hello", "hello");
+        command(&mut terminal, "echo again", "again");
         prompt(&mut terminal);
         let grid = terminal.grid.to_vec();
         let cursor = terminal.get_cursor_pos();
@@ -589,6 +593,12 @@ mod tests {
                 .find(|row| row.role == ChatRole::Command)
                 .unwrap();
             assert_eq!(command.left_col > 0, bubbles);
+            let next_prompt = terminal.command_zones[1].prompt_start;
+            let previous_output = terminal.raw_row_id_at_absolute(next_prompt - 1).unwrap();
+            let next_prompt = terminal.raw_row_id_at_absolute(next_prompt).unwrap();
+            let previous_bottom = view.raw_row_view_bounds(previous_output).unwrap().1;
+            let next_top = view.raw_row_view_bounds(next_prompt).unwrap().0;
+            assert_eq!(next_top - previous_bottom - 1, if bubbles { 2 } else { 1 });
             assert!(view
                 .chat_rows()
                 .iter()

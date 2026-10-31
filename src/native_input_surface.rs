@@ -37,7 +37,13 @@ pub(crate) struct DockMetrics {
 
 /// Short prompts may use less decoration, never fewer native rows. Longer
 /// drafts retain the original 8px padding and bounded scrolling behavior.
-pub(crate) fn dock_metrics(rows: usize, cell_height: f32, cap: f32) -> DockMetrics {
+/// Trailing rows reserve blank space below the input, including when capped.
+pub(crate) fn dock_metrics(
+    rows: usize,
+    cell_height: f32,
+    cap: f32,
+    trailing_rows: usize,
+) -> DockMetrics {
     let rows = rows.max(1);
     let body_height = rows as f32 * cell_height;
     let vertical_padding = if rows <= 2 && body_height <= INPUT_STRIP_HEIGHT {
@@ -45,14 +51,15 @@ pub(crate) fn dock_metrics(rows: usize, cell_height: f32, cap: f32) -> DockMetri
     } else {
         8.0
     };
-    let decorated_height = body_height + 2.0 * vertical_padding;
+    let trailing_height = trailing_rows as f32 * cell_height;
+    let decorated_height = body_height + 2.0 * vertical_padding + trailing_height;
     let input_height = decorated_height.max(INPUT_STRIP_HEIGHT).min(cap);
     let visible_rows = if decorated_height <= input_height {
         // All requested rows fit. Avoid losing a row to a rounded float
         // division at the exact two-row boundary.
         rows
     } else {
-        ((input_height - 2.0 * vertical_padding) / cell_height)
+        ((input_height - 2.0 * vertical_padding - trailing_height) / cell_height)
             .floor()
             .max(1.0) as usize
     };
@@ -643,7 +650,7 @@ mod tests {
 
     #[test]
     fn two_default_rows_fit_the_reference_strip_without_losing_a_row() {
-        let metrics = dock_metrics(2, 16.8, 180.0);
+        let metrics = dock_metrics(2, 16.8, 180.0, 0);
         assert_eq!(metrics.input_height, 44.0);
         assert_eq!(metrics.visible_rows, 2);
         assert!(metrics.vertical_padding < 8.0);
@@ -652,7 +659,7 @@ mod tests {
 
     #[test]
     fn a_short_prompt_keeps_its_existing_padding() {
-        let metrics = dock_metrics(1, 16.8, 180.0);
+        let metrics = dock_metrics(1, 16.8, 180.0, 0);
         assert_eq!(metrics.input_height, 44.0);
         assert_eq!(metrics.vertical_padding, 8.0);
         assert_eq!(metrics.visible_rows, 1);
@@ -661,32 +668,38 @@ mod tests {
     #[test]
     fn two_row_float_boundaries_keep_both_cells_and_caret_inside_the_clip() {
         for cell_height in [14.4_f32, 16.2, 16.8, 17.1, 18.6, 21.6, 22.0] {
-            let metrics = dock_metrics(2, cell_height, 180.0);
-            assert_eq!(metrics.input_height, 44.0, "{cell_height}");
-            assert_eq!(metrics.visible_rows, 2, "{cell_height}");
-            let (_, clip) = clips(
-                Rectangle {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 702.0,
-                    height: 550.0,
-                },
-                metrics.input_height,
-            );
-            for row in 0..2 {
-                let cell_top = clip.y + metrics.vertical_padding + row as f32 * cell_height;
-                assert!(cell_top >= clip.y, "cell {row}/{cell_height}");
-                assert!(
-                    cell_top + cell_height <= clip.y + clip.height,
-                    "cell/caret {row}/{cell_height}"
+            for trailing_rows in [0, 2] {
+                let metrics = dock_metrics(2, cell_height, 180.0, trailing_rows);
+                assert_eq!(
+                    metrics.input_height,
+                    44.0 + trailing_rows as f32 * cell_height,
+                    "{cell_height}"
                 );
+                assert_eq!(metrics.visible_rows, 2, "{cell_height}");
+                let (_, clip) = clips(
+                    Rectangle {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 702.0,
+                        height: 550.0,
+                    },
+                    metrics.input_height,
+                );
+                for row in 0..2 {
+                    let cell_top = clip.y + metrics.vertical_padding + row as f32 * cell_height;
+                    assert!(cell_top >= clip.y, "cell {row}/{cell_height}");
+                    assert!(
+                        cell_top + (1 + trailing_rows) as f32 * cell_height <= clip.y + clip.height,
+                        "cell/caret and trailing space {row}/{cell_height}"
+                    );
+                }
             }
         }
     }
 
     #[test]
     fn larger_physical_cells_grow_instead_of_being_clipped() {
-        let metrics = dock_metrics(2, 24.0, 180.0);
+        let metrics = dock_metrics(2, 24.0, 180.0, 0);
         assert_eq!(metrics.input_height, 64.0);
         assert_eq!(metrics.vertical_padding, 8.0);
         assert_eq!(metrics.visible_rows, 2);
@@ -694,17 +707,25 @@ mod tests {
 
     #[test]
     fn multiline_and_capped_drafts_keep_the_original_budget_and_last_row() {
-        let multiline = dock_metrics(4, 16.8, 180.0);
+        let multiline = dock_metrics(4, 16.8, 180.0, 0);
         assert_eq!(multiline.input_height, 4.0 * 16.8 + 16.0);
         assert_eq!(multiline.vertical_padding, 8.0);
         assert_eq!(multiline.visible_rows, 4);
 
-        let capped = dock_metrics(100, 16.8, 180.0);
+        let capped = dock_metrics(100, 16.8, 180.0, 0);
         assert_eq!(capped.input_height, 180.0);
         assert_eq!(capped.vertical_padding, 8.0);
         assert_eq!(capped.visible_rows, 9);
         let cursor = 99_usize;
         let visible_start = (cursor + 1).saturating_sub(capped.visible_rows);
         assert!(visible_start <= cursor && cursor < visible_start + capped.visible_rows);
+
+        // Capped Block drafts scroll earlier so their final visible caret
+        // still has two full blank rows before the tools row.
+        let block = dock_metrics(100, 16.8, 180.0, 2);
+        let visible_start = (cursor + 1).saturating_sub(block.visible_rows);
+        let caret_bottom = block.vertical_padding + (cursor - visible_start + 1) as f32 * 16.8;
+        assert!(caret_bottom + 2.0 * 16.8 <= block.input_height);
+        assert_eq!(block.input_height, capped.input_height);
     }
 }

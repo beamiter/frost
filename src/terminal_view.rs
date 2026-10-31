@@ -1359,6 +1359,11 @@ impl<'a, Message> TermWidget<'a, Message> {
         self.chat_rows = rows;
         self.chat_projection = projection;
         self.on_chat_submit = submit.map(|message| Box::new(move || message.clone()) as _);
+        // Dock paint/IME bounds also need this origin before history has an
+        // overscan row. A taller composer can extend beyond the native child.
+        self.canvas.dock_start = rows
+            .iter()
+            .position(|row| row.role == crate::chat_mode::ChatRole::Composer);
         self
     }
 
@@ -6511,6 +6516,35 @@ mod mode_gesture_tests {
         Submit,
         CanvasScroll(f64, bool),
         CanvasPause,
+    }
+
+    #[test]
+    fn dock_presentation_keeps_prompt_visible_beyond_native_bounds_without_overscan() {
+        use crate::chat_mode::{ChatRole, ChatRow};
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = Theme::default();
+        let mut rows = [ChatRow::default(); 8];
+        for row in &mut rows[4..] {
+            row.role = ChatRole::Composer;
+        }
+        let widget = fixture(&projection, &theme, TerminalMode::Block, 0)
+            .chat_rows(&rows, Some(&projection), None)
+            .shared_shell();
+        assert!(!widget.canvas.head);
+        let native = Rectangle::with_size(Size::new(600.0, 40.0));
+        let input = Rectangle {
+            y: widget.row_y(native, 4),
+            height: 80.0,
+            ..native
+        };
+        assert!(native.intersection(&input).is_none());
+        let presented = widget.prompt_presentation_bounds(native, &input);
+        assert_eq!(presented.intersection(&input), Some(input));
+        let caret = Point::new(60.0, widget.row_y(presented, 5) + 1.0);
+        assert!(presented.contains(caret) && input.contains(caret));
+        assert_eq!(widget.cell_at(caret, presented).1, 5);
+        assert_eq!(widget.row_y(native, 5), widget.row_y(presented, 5));
     }
 
     #[test]

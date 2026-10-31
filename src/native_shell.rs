@@ -2065,6 +2065,7 @@ impl Frost {
             rows,
             self.metrics.cell_h,
             cap,
+            if self.config.is_block_mode() { 2 } else { 0 },
         ))
     }
 
