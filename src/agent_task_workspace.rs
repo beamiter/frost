@@ -283,7 +283,14 @@ impl crate::Frost {
     }
 
     pub(crate) fn task_composer_open(&mut self) {
-        if !self.config.experimental_task_sidebar || self.task_panel.pending_creation.is_some() {
+        if !self.config.experimental_task_sidebar {
+            self.push_toast(
+                "Tasks are hidden in Settings. Enable the Tasks dashboard to create a task.",
+                crate::ToastKind::Info,
+            );
+            return;
+        }
+        if self.task_panel.pending_creation.is_some() {
             return;
         }
         self.task_panel.retire_panel_callbacks();

@@ -23,7 +23,7 @@ cosmic-text = "=0.19.0"
 iced_winit = { version = "=0.14.0", default-features = false }
 libc = "0.2"
 # Shared core is developed beside the four native frontends.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "974ccad203375032fe87706caecab39ad516c238" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "589a26658f548ec96ff60a53ea65804901ed5c7b" }
 tokio = { version = "1", features = ["rt", "sync"] }
 anyhow = "1.0"
 log = "0.4"
@@ -81,7 +81,7 @@ wayland-client = { path = "vendor/wayland-client" }
 
 [dev-dependencies]
 iced_tiny_skia = { version = "=0.14.1", features = ["geometry"] }
-jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "974ccad203375032fe87706caecab39ad516c238" }
+jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "589a26658f548ec96ff60a53ea65804901ed5c7b" }
 
 [patch."https://github.com/beamiter/jcompanion.git"]
 companion-protocol = { path = "vendor/companion-protocol" }

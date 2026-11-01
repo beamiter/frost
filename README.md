@@ -8,6 +8,12 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 
 默认工作区采用紧凑布局：42px 顶栏、48px 工具轨、38px 单行标题和 44px 工具栏，减少边框与留白，把空间还给真实终端；终端字号和输入法仍由原生终端管理。较大的 UI 字号会单独增高相应控件。尺寸、原生视口预算及验证范围见 [紧凑工作区说明](docs/compact-shell.md)。
 
+## Agent Workspace
+
+左侧常驻会话导航统一列出 CLI 会话、共享 API 对话、任务和普通终端。点击后在中央打开对应的真实终端或原生对话；API 草稿、历史、置顶和阅读位置由共享存储管理。CLI 会话可用 **Ctrl+]** 脱离，并在另一终端界面重新连接同一受管 PTY。任务视图默认开启，显式关闭配置仍保留。
+
+Codex 任务提供受来源校验的 **Resume native** 和历史分页；Claude 原生任务支持同一 provider session 的多轮继续。原生任务仍由当前 app 进程管理，终端 fallback 不声明转移同一原生会话。完整边界、冲突处理与验证方法见 [Agent Workspace guide](docs/agent-workspace.md)。
+
 ## 原生 Vim9 IDE
 
 在 Frost 的本地交互式命令提示符直接运行 `vim 文件`，会在当前 GUI 的原标签页内显示原生 buffer 编辑器；文件参数、`+行号`、当前目录与退出码继续遵循 Vim。退出 Vim 后回到发起命令的 shell。普通模式和插入模式下，滚轮按悬停的 Vim 分屏滚动，触摸板保留小数行增量；GUI 在等待 Vim 确认前即可按像素移动文字，并用确认帧重定位剩余小数位移；状态行和其他分屏保持固定。`virtualedit=block` 或自定义鼠标点击映射不会关闭像素滚动。`[vim9] auto_gui = false` 可关闭自动进入，`smooth_scroll = false` 可关闭离散滚轮动画，触摸板仍保留像素精度。`JTERM_VIM9_AUTO_GUI=0 vim 文件` 可临时使用原终端显示。批处理和重定向输入仍使用普通 Vim。
@@ -750,7 +756,7 @@ command_correction_enabled = false
 # 实验性 Tasks 面板（侧栏 "Tasks" 页）：为失败命令块选择 Codex/Claude/
 # OpenCode/Kimi，创建独立 Git worktree 任务；Codex/Claude 可选原生会话，
 # OpenCode/Kimi 走 PTY。与云端 AI 授权相互独立。
-experimental_task_sidebar = false
+experimental_task_sidebar = true
 # Create task 优先推荐的 provider（codex / claude / opencode / kimi）
 preferred_agent_provider = "codex"
 ```
@@ -794,7 +800,7 @@ preferred_agent_provider = "codex"
 
 ### 实验性 Tasks 面板（多 Agent）
 
-开启 `experimental_task_sidebar` 后，失败命令块的右键菜单会出现 **Create task**：
+`experimental_task_sidebar` 默认开启；显式设为 false 可隐藏任务视图。开启后，失败命令块的右键菜单会出现 **Create task**：
 frost 打开 Tasks 侧栏让你选择 **Codex / Claude / OpenCode / Kimi**，再为该命令创建独立的
 Git worktree（位于 `~/.local/share/frost/agent-tasks/`）并登记任务卡片。
 
@@ -826,8 +832,8 @@ Git worktree（位于 `~/.local/share/frost/agent-tasks/`）并登记任务卡�
   失败时可 **Open Kimi** 回退到 PTY。
 - **OpenCode**：**Start …** 与 **Open …** 都走 PATH 上的 CLI（PTY 兼容路径）。
 
-**Start Claude 会跳过 Claude 自身的权限审批；Start Kimi 使用自动工具权限模式。**
-二者都可自动运行工具，并访问当前用户账户有权访问的文件。独立 Git worktree 不是安全沙箱，
+**Start Claude 保留 Claude 自身的权限检查；被拒绝的工具需要在 Terminal 处理交互审批。Start Kimi 使用自动工具权限模式。**
+Kimi 可自动运行工具，并访问当前用户账户有权访问的文件。独立 Git worktree 不是安全沙箱，
 不能限制它们只能读写该目录。Tasks 卡片在启动按钮旁持续显示此边界。**Open …** 由 CLI 自己
 处理交互提示，也不代表额外的文件系统隔离。
 
@@ -845,7 +851,7 @@ Git worktree（位于 `~/.local/share/frost/agent-tasks/`）并登记任务卡�
 并在启动线程前校验 effective config，拒绝任何继承的 MCP、hooks、插件、应用、项目信任或
 托管配置来源。审批策略固定为 `never`：托管审批请求只完整展示并只能 **Deny**。
 每个 turn 结束后会话停在 **Ready for review**：可以发送有界评审反馈在同一线程上开始顺序后续
-turn（最多 32 个），或选择 **Finish Codex** 结束会话。一个回合完成后会话不可恢复、不可重启。
+turn（最多 32 个），或选择 **Finish Codex** 结束会话。干净 Finish 后，在当前 app runtime 仍保留来源证明时，可用 **Resume native** 恢复相同线程与私有 profile；不承诺 app 重启后的原生会话恢复。
 
 隔离与回收：provider 运行在描述符固定的独立 worktree 和瞬态 user-systemd cgroup
 （需要 **cgroup v2** 与可用的 systemd 用户会话）中；`/tmp` 不在可写根内，工具子进程获得
@@ -1266,9 +1272,10 @@ keeping the previous search.
 
 Use **Pin session** to keep a conversation in the default empty-search view,
 **Pinned only** to narrow the library, and **Previously resumed** or the
-**Recently resumed** sort to return to work you actually opened. Pins and resume
-receipts are shared with the other native terminals through a private user-state
-file and survive restarting the app. Provider transcripts are never changed.
+**Recently resumed** sort to inspect legacy recorded resume history. Pins now use
+the shared source-qualified workspace database; new workspace activity appears in
+the sidebar's recent conversations and managed runtime state. The legacy resume
+receipts remain available for migration. Provider transcripts are never changed.
 
 Selecting a session checks its directory and agent installation in the
 background. When the latest scan observed another Codex/Claude process already

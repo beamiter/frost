@@ -827,6 +827,9 @@ impl Frost {
     }
 
     fn reference_navigation(&self) -> Element<'_, Message> {
+        if !jterm_core::reference_conversation::fixture_enabled() {
+            return self.workspace_navigation();
+        }
         use jterm_core::reference_conversation as model;
         let fixture = model::fixture_enabled();
         let cwd = self.reference_cwd();
@@ -1198,6 +1201,50 @@ impl Frost {
 
     fn reference_header(&self) -> Element<'_, Message> {
         let layout = self.reference_layout();
+        if self.ai_chats.is_open || self.agent_sessions.workspace_task.is_some() {
+            let (title, subtitle) = if self.ai_chats.is_open {
+                (
+                    self.ai_chats.store.active_title().to_owned(),
+                    "API conversation".to_owned(),
+                )
+            } else {
+                self.agent_sessions
+                    .workspace_task
+                    .and_then(|id| self.task_manager.get(id))
+                    .map(|task| {
+                        (
+                            task.title.clone(),
+                            format!("{} · {}", task.provider.display_name(), task.status.label()),
+                        )
+                    })
+                    .unwrap_or_else(|| ("Agent task".into(), String::new()))
+            };
+            return container(
+                row![
+                    column![
+                        self.chrome_label(title, 14.0, false, true),
+                        self.chrome_label(subtitle, 10.0, true, false)
+                    ]
+                    .spacing(3),
+                    Space::new().width(Length::Fill),
+                    button(self.chrome_label("New", 10.0, false, false)).on_press(
+                        if self.ai_chats.is_open {
+                            Message::AiChatsNewChat
+                        } else {
+                            Message::TaskComposerOpen
+                        }
+                    ),
+                    button(self.chrome_label("Context", 10.0, false, false))
+                        .on_press(Message::ReferenceInspectorToggle)
+                ]
+                .align_y(iced::Alignment::Center)
+                .spacing(8),
+            )
+            .padding([8, 18])
+            .height(layout.header.height)
+            .width(Length::Fill)
+            .into();
+        }
         let name = if jterm_core::reference_conversation::fixture_enabled() {
             jterm_core::reference_conversation::acceptance_fixture().title
         } else {
@@ -2375,7 +2422,22 @@ impl Frost {
             left: (ring.x - layout.center.x - 3.0).max(0.0),
             ..iced::Padding::ZERO
         });
-        let center = container(
+        // A resumed CLI owns its input even before it enters the alternate
+        // screen. Its central PTY must never gain a second Send/Stop bar.
+        let cli_owns_input = self.sessions.get(self.active).is_some_and(|session| {
+            session.terminal.is_alt_buffer_active() || self.agent_sessions.owns_terminal(session.id)
+        });
+        let center_content: Element<'_, Message> = if self.ai_chats.is_open
+            || self.agent_sessions.workspace_task.is_some()
+            || cli_owns_input
+        {
+            column![
+                self.font_zoom_region(font_zoom::Group::Chrome, self.reference_header()),
+                pane
+            ]
+            .height(Length::Fill)
+            .into()
+        } else {
             stack![
                 column![
                     self.font_zoom_region(font_zoom::Group::Chrome, self.reference_header()),
@@ -2385,18 +2447,20 @@ impl Frost {
                 .height(Length::Fill),
                 glow
             ]
-            .height(Length::Fill),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(|theme| {
-            panel(
-                theme,
-                color::CANVAS,
-                color::DARK_BORDER,
-                glass::PANEL_RADIUS,
-            )
-        });
+            .height(Length::Fill)
+            .into()
+        };
+        let center = container(center_content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|theme| {
+                panel(
+                    theme,
+                    color::CANVAS,
+                    color::DARK_BORDER,
+                    glass::PANEL_RADIUS,
+                )
+            });
         let mut body = row![column![
             self.font_zoom_region(font_zoom::Group::Chrome, self.reference_rail()),
             Space::new().height(navigation_bottom)

@@ -1,11 +1,11 @@
 //! Native session-library state. Discovery and resume validation live in core.
 use jterm_core::agent_sessions::{
     validate_session_batch_tag, validate_session_details, AgentSession, SessionArchiveFilter,
-    SessionBatchAction, SessionCatalog, SessionLaunch, SessionLibraryFilter, SessionLibraryStore,
-    SessionPreflight, SessionPreflightState, SessionProjectSummary, SessionProvider, SessionQuery,
-    SessionScanner, SessionSearchIndex, SessionSort, SessionStatus, SESSION_ALIAS_MAX_BYTES,
-    SESSION_BATCH_LIMIT, SESSION_QUERY_MAX_BYTES, SESSION_RESUME_ANYWAY_DELAY, SESSION_TAG_LIMIT,
-    SESSION_TAG_MAX_BYTES,
+    SessionBatchAction, SessionCatalog, SessionLaunch, SessionLibraryFilter,
+    SessionLibrarySnapshot, SessionLibraryStore, SessionPreflight, SessionPreflightState,
+    SessionProjectSummary, SessionProvider, SessionQuery, SessionScanner, SessionSearchIndex,
+    SessionSort, SessionStatus, SESSION_ALIAS_MAX_BYTES, SESSION_BATCH_LIMIT,
+    SESSION_QUERY_MAX_BYTES, SESSION_RESUME_ANYWAY_DELAY, SESSION_TAG_LIMIT, SESSION_TAG_MAX_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -38,6 +38,29 @@ fn batch_tag_problem(tag: &str) -> Option<String> {
 }
 
 pub(crate) type SessionKey = (SessionProvider, String);
+type OpenSessionKey = (SessionProvider, String, PathBuf);
+
+fn open_session_key(session: &AgentSession) -> OpenSessionKey {
+    (
+        session.provider,
+        session.id.clone(),
+        crate::workspace_sessions_bridge::source_profile(session),
+    )
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceSessionRef {
+    epoch: u64,
+    session: AgentSession,
+}
+
+fn same_launch_target(left: &AgentSession, right: &AgentSession) -> bool {
+    left.provider == right.provider
+        && left.id == right.id
+        && left.source == right.source
+        && left.cwd == right.cwd
+        && left.archived == right.archived
+}
 
 pub(crate) fn session_key(session: &AgentSession) -> SessionKey {
     (session.provider, session.id.clone())
@@ -116,6 +139,13 @@ impl OrganizationEditor {
 
 pub(crate) struct SessionLibrary {
     pub open: bool,
+    pub(crate) workspace_pending: bool,
+    pub(crate) workspace_task: Option<jterm_core::agent_task::TaskId>,
+    catalog_epoch: u64,
+    pub(crate) workspace: crate::workspace_sessions_bridge::WorkspaceSessions,
+    workspace_source: Option<OpenSessionKey>,
+    workspace_enabled: bool,
+    metadata: SessionLibrarySnapshot,
     pub catalog: SessionCatalog,
     pub scanner: SessionScanner,
     pub query: String,
@@ -160,7 +190,7 @@ pub(crate) struct SessionLibrary {
     /// a background refresh never replaces it with another conversation.
     pub selected: Option<SessionKey>,
     pub notice: Option<String>,
-    pub bindings: HashMap<SessionKey, usize>,
+    bindings: HashMap<OpenSessionKey, usize>,
     /// Periodic background refresh continues the explicit refresh made when
     /// the manager opens; it stops when the manager closes.
     auto_refresh: bool,
@@ -168,13 +198,180 @@ pub(crate) struct SessionLibrary {
 
 impl Default for SessionLibrary {
     fn default() -> Self {
-        Self::with_store(SessionLibraryStore::new())
+        let mut state = Self::with_store(SessionLibraryStore::new());
+        state.workspace_enabled = true;
+        state
     }
 }
 impl SessionLibrary {
+    pub(crate) fn owns_terminal(&self, terminal_id: usize) -> bool {
+        self.bindings.values().any(|id| *id == terminal_id)
+    }
+
+    pub(crate) fn metadata(&self) -> &SessionLibrarySnapshot {
+        if self.workspace_enabled && !self.workspace.rows.is_empty() {
+            &self.metadata
+        } else {
+            self.store.snapshot()
+        }
+    }
+    pub(crate) fn refresh_workspace_metadata(&mut self) {
+        self.metadata = self
+            .workspace
+            .projection(&self.catalog, self.store.snapshot());
+        self.reconcile();
+    }
+    fn shared_target(&self, key: &SessionKey) -> Result<AgentSession, String> {
+        if self.workspace_source.is_some() {
+            if let Some(session) = self
+                .selected_session()
+                .filter(|session| session_key(session) == *key)
+            {
+                return Ok(session.clone());
+            }
+        }
+        let matches: Vec<_> = self
+            .catalog
+            .sessions
+            .iter()
+            .filter(|session| session_key(session) == *key)
+            .collect();
+        if matches.len() != 1 {
+            return Err("Choose the exact source in the workspace sidebar before organizing this conversation.".into());
+        }
+        Ok(matches[0].clone())
+    }
+    pub(crate) fn shared_pin(&mut self, key: &SessionKey, pinned: bool) -> Result<(), String> {
+        let target = self.shared_target(key)?;
+        self.workspace.set_pinned(&target, pinned)
+    }
+    pub(crate) fn shared_archive(
+        &mut self,
+        key: &SessionKey,
+        archived: bool,
+    ) -> Result<(), String> {
+        let target = self.shared_target(key)?;
+        self.workspace.set_archived(&target, archived)
+    }
+    fn shared_details(&mut self, key: &SessionKey, title: &str, tags: &str) -> Result<(), String> {
+        let target = self.shared_target(key)?;
+        self.workspace.set_details(&target, title, tags)
+    }
+    fn shared_batch(
+        &mut self,
+        keys: &[SessionKey],
+        action: &SessionBatchAction,
+    ) -> Result<usize, String> {
+        let sessions = keys
+            .iter()
+            .map(|key| self.shared_target(key))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.workspace.apply_batch(&sessions, action)
+    }
+    fn organization_busy(&self) -> bool {
+        if self.workspace_enabled {
+            self.workspace.busy()
+        } else {
+            self.store.is_saving()
+        }
+    }
+    fn organization_error(&self) -> Option<&str> {
+        if self.workspace_enabled {
+            self.workspace.notice.as_deref()
+        } else {
+            self.store.error()
+        }
+    }
+    fn workspace_visible(&self) -> Vec<usize> {
+        if SessionSearchIndex::query_error(&self.query).is_some() {
+            return Vec::new();
+        }
+        let mut result: Vec<_> = self
+            .catalog
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| {
+                let row = self.workspace.row(session);
+                let archived = session.archived || row.is_some_and(|row| row.archived);
+                let archive = match self.archive {
+                    SessionArchiveFilter::Active => !archived,
+                    SessionArchiveFilter::Archived => archived,
+                    SessionArchiveFilter::All => true,
+                };
+                archive
+                    && self
+                        .provider
+                        .is_none_or(|provider| provider == session.provider)
+                    && self.status.is_none_or(|status| status == session.status)
+                    && (!self.live_only
+                        || self
+                            .workspace
+                            .row(session)
+                            .is_some_and(|row| row.runtime.is_live())
+                        || self
+                            .catalog
+                            .live_processes
+                            .iter()
+                            .any(|p| p.provider == session.provider && p.id == session.id))
+                    && (!self.pinned_only || self.workspace.pinned(session))
+                    && self
+                        .project_selection
+                        .as_deref()
+                        .or({
+                            if self.project_only {
+                                self.project.as_deref()
+                            } else {
+                                None
+                            }
+                        })
+                        .is_none_or(|project| session.cwd.starts_with(project))
+                    && row.map_or_else(
+                        || session.matches_query(&self.query),
+                        |row| row.matches(&self.query),
+                    )
+            })
+            .map(|(index, _)| index)
+            .collect();
+        result.sort_by(|&a, &b| {
+            self.workspace
+                .pinned(&self.catalog.sessions[b])
+                .cmp(&self.workspace.pinned(&self.catalog.sessions[a]))
+                .then(
+                    self.catalog.sessions[b]
+                        .updated_at_ms
+                        .cmp(&self.catalog.sessions[a].updated_at_ms),
+                )
+        });
+        result
+    }
+    pub(crate) fn workspace_reference_current(&self, reference: &WorkspaceSessionRef) -> bool {
+        self.catalog_epoch == reference.epoch
+            && self
+                .workspace_visible()
+                .iter()
+                .any(|&index| same_launch_target(&self.catalog.sessions[index], &reference.session))
+    }
+
+    pub(crate) fn pin_workspace_session(&mut self, reference: &WorkspaceSessionRef) {
+        if !self.workspace_reference_current(reference) {
+            return;
+        }
+        let session = &reference.session;
+        let pinned = !self.workspace.pinned(session);
+        self.notice = self.workspace.set_pinned(session, pinned).err();
+    }
+
     fn with_store(store: SessionLibraryStore) -> Self {
         Self {
             open: false,
+            workspace_pending: false,
+            workspace_task: None,
+            catalog_epoch: 0,
+            workspace: Default::default(),
+            workspace_source: None,
+            workspace_enabled: false,
+            metadata: Default::default(),
             catalog: SessionCatalog::default(),
             scanner: SessionScanner::new(),
             query: String::new(),
@@ -289,12 +486,13 @@ impl SessionLibrary {
             self.replace_catalog(catalog);
         }
         if self.store.poll() {
-            self.reconcile();
+            self.refresh_workspace_metadata();
         }
         // The user's own change settled. The selection is never retargeted;
         // if the change took it out of the view, say so and where it went.
-        if let Some((key, change)) = self.own_change.take_if(|_| !self.store.is_saving()) {
-            if self.store.error().is_none()
+        let organization_busy = self.organization_busy();
+        if let Some((key, change)) = self.own_change.take_if(|_| !organization_busy) {
+            if self.organization_error().is_none()
                 && self.selected.as_ref() == Some(&key)
                 && self.selected_position().is_none()
             {
@@ -303,15 +501,15 @@ impl SessionLibrary {
         }
         // `is_saving` covers only this window's own writes until `poll`
         // acknowledges them; the periodic read-only reload never counts.
-        if self.bulk_saving && !self.store.is_saving() {
+        if self.bulk_saving && !self.organization_busy() {
             self.bulk_saving = false;
-            self.bulk_notice = Some(self.store.error().map(str::to_owned).unwrap_or_else(|| {
-                format!("Saved changes for {} conversations.", self.bulk_saved_count)
-            }));
+            self.bulk_notice = Some(self.organization_error().map(str::to_owned).unwrap_or_else(
+                || format!("Saved changes for {} conversations.", self.bulk_saved_count),
+            ));
             self.retire_bulk();
         }
-        if self.editor.as_ref().is_some_and(|editor| editor.saving) && !self.store.is_saving() {
-            if let Some(error) = self.store.error() {
+        if self.editor.as_ref().is_some_and(|editor| editor.saving) && !self.organization_busy() {
+            if let Some(error) = self.organization_error().map(str::to_owned) {
                 if let Some(editor) = &mut self.editor {
                     editor.saving = false;
                     editor.notice = Some(error.to_owned());
@@ -325,8 +523,7 @@ impl SessionLibrary {
         // Measured from the end of the previous scan: a scan slower than the
         // interval never triggers back-to-back rescans, and the library file
         // is reloaded only alongside a scan that actually starts.
-        if self.open && self.auto_refresh && self.scanner.refresh_if_idle_for(AUTO_REFRESH_INTERVAL)
-        {
+        if self.auto_refresh && self.scanner.refresh_if_idle_for(AUTO_REFRESH_INTERVAL) {
             self.store.refresh();
         }
         old_page != self.page
@@ -336,6 +533,7 @@ impl SessionLibrary {
         if self.catalog == catalog {
             return false;
         }
+        self.catalog_epoch = self.catalog_epoch.wrapping_add(1);
         self.catalog = catalog;
         self.search_index = SessionSearchIndex::new(&self.catalog);
         self.codex_count = self
@@ -389,6 +587,19 @@ impl SessionLibrary {
     /// The selected conversation while it is listed. A hidden selection
     /// returns `None`, which disables resume, copy and organization.
     pub fn selected_session(&self) -> Option<&AgentSession> {
+        if let Some(source) = &self.workspace_source {
+            if self
+                .selected
+                .as_ref()
+                .is_some_and(|key| key.0 == source.0 && key.1 == source.1)
+            {
+                return self
+                    .workspace_visible()
+                    .into_iter()
+                    .map(|index| &self.catalog.sessions[index])
+                    .find(|session| open_session_key(session) == *source);
+            }
+        }
         let key = self.selected.as_ref()?;
         self.visible_sessions(0..self.visible.len())
             .find(|session| session.provider == key.0 && session.id == key.1)
@@ -441,7 +652,7 @@ impl SessionLibrary {
 
     fn project_query(&mut self) {
         self.query_error = SessionSearchIndex::query_error(&self.query);
-        self.projects = self.search_index.projects(self.store.snapshot());
+        self.projects = self.search_index.projects(self.metadata());
         self.visible = self.search_index.query_with_library(
             &SessionQuery {
                 text: &self.query,
@@ -455,7 +666,7 @@ impl SessionLibrary {
                 }),
                 sort: self.sort,
             },
-            self.store.snapshot(),
+            self.metadata(),
             SessionLibraryFilter {
                 pinned_only: self.pinned_only,
                 recent_only: self.recent_only,
@@ -497,6 +708,9 @@ impl SessionLibrary {
     /// whether the resume may be armed.
     pub(crate) fn admit_resume(&mut self, session: &AgentSession) -> bool {
         let key = session_key(session);
+        if jterm_core::agent_workspace::managed_session_running(session) {
+            return true;
+        }
         let Some(text) = self.catalog.resume_conflict(session) else {
             self.resume_warning = None;
             return true;
@@ -666,7 +880,12 @@ impl SessionLibrary {
         {
             return;
         }
-        match self.store.apply_batch(&reference.keys, action) {
+        let result = if self.workspace_enabled {
+            self.shared_batch(&reference.keys, &action)
+        } else {
+            self.store.apply_batch(&reference.keys, action)
+        };
+        match result {
             Ok(count) => {
                 if let Some(selected) = self
                     .selected
@@ -695,7 +914,7 @@ impl SessionLibrary {
             return;
         };
         let title = session.title.clone();
-        let facts = self.store.snapshot().facts(key.0, &key.1);
+        let facts = self.metadata().facts(key.0, &key.1);
         let alias = facts.alias.unwrap_or_default().to_owned();
         let tags = facts.tags.join(", ");
         self.cancel_confirmation();
@@ -764,10 +983,13 @@ impl SessionLibrary {
         }
         let alias = editor.alias.clone();
         let tags = editor.tags.clone();
-        match self
-            .store
-            .set_details(reference.key.0, &reference.key.1, &alias, &tags)
-        {
+        let result = if self.workspace_enabled {
+            self.shared_details(&reference.key, &alias, &tags)
+        } else {
+            self.store
+                .set_details(reference.key.0, &reference.key.1, &alias, &tags)
+        };
+        match result {
             Ok(()) => {
                 if let Some(editor) = self.editor.as_mut() {
                     editor.saving = true;
@@ -919,11 +1141,346 @@ fn hashtags(tags: &[String]) -> String {
 }
 
 impl super::Frost {
+    pub(crate) fn activate_workspace_session(&mut self, reference: WorkspaceSessionRef) {
+        let state = &mut self.agent_sessions;
+        if !state.workspace_reference_current(&reference) {
+            return;
+        }
+        state.cancel_confirmation();
+        state.selected = Some(session_key(&reference.session));
+        state.workspace_source = Some(open_session_key(&reference.session));
+        if !state
+            .selected_session()
+            .is_some_and(|session| same_launch_target(session, &reference.session))
+        {
+            state.notice = Some(
+                "This source changed. Refresh the conversation list before opening it.".into(),
+            );
+            return;
+        }
+        state.workspace_pending = true;
+        self.resume_agent_session(&session_key(&reference.session));
+    }
+
+    pub(crate) fn workspace_navigation(&self) -> iced::Element<'_, super::Message> {
+        use super::Message as M;
+        use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
+        use iced::Length;
+        let state = &self.agent_sessions;
+        let size = self.chrome_font_size();
+        let mut list = column![
+            row![
+                text("Agent Workspace").size(size),
+                Space::new().width(Length::Fill),
+                button(text("＋").size(size)).on_press(M::AiChatsNewChat)
+            ]
+            .spacing(4),
+            row![
+                button(text("Terminal").size(size - 1.0)).on_press(M::WorkspaceNewTerminal),
+                button(text("Task").size(size - 1.0)).on_press(M::TaskComposerOpen),
+                button(text("⋯").size(size)).on_press(M::AgentSessionsToggle)
+            ]
+            .spacing(4),
+            text_input("Search conversations…", &state.query)
+                .on_input(M::AgentSessionsQuery)
+                .size(size),
+        ]
+        .spacing(8);
+        let project = state
+            .project_selection
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "All projects".into());
+        list = list.push(
+            button(text(format!("{project} ▾")).size(size))
+                .on_press(M::AgentSessionsProjectsToggle)
+                .width(Length::Fill),
+        );
+        if state.show_projects {
+            list = list.push(
+                button(text("All projects").size(size))
+                    .on_press(M::WorkspaceProject(None))
+                    .style(button::text),
+            );
+            for project in &state.projects {
+                list = list.push(
+                    button(text(project.root.to_string_lossy().into_owned()).size(size - 1.0))
+                        .on_press(M::WorkspaceProject(Some(project.root.clone())))
+                        .style(button::text),
+                );
+            }
+        }
+        list = list.push(
+            row![
+                button(text("All").size(size - 1.0))
+                    .on_press(M::AgentSessionsClear)
+                    .style(button::text),
+                button(text("Running").size(size - 1.0))
+                    .on_press(M::AgentSessionsLive(!state.live_only))
+                    .style(if state.live_only {
+                        button::primary
+                    } else {
+                        button::text
+                    }),
+                button(text("Needs you").size(size - 1.0))
+                    .on_press(M::AgentSessionsStatus(
+                        if state.status == Some(SessionStatus::Waiting) {
+                            None
+                        } else {
+                            Some(SessionStatus::Waiting)
+                        }
+                    ))
+                    .style(if state.status == Some(SessionStatus::Waiting) {
+                        button::primary
+                    } else {
+                        button::text
+                    }),
+            ]
+            .spacing(2),
+        );
+        if let Some(notice) = state
+            .notice
+            .as_ref()
+            .or(state.workspace.notice.as_ref())
+            .or(state.query_error.as_ref())
+        {
+            list = list.push(text(notice).size(size - 1.0).style(text::danger));
+        }
+        if state.pending_confirm.is_some() {
+            list = list.push(text("Checking conversation…").size(size - 1.0));
+        }
+        let mut group = None;
+        let visible = state.workspace_visible();
+        for &index in &visible {
+            let session = &state.catalog.sessions[index];
+            let pinned = state.workspace.pinned(session);
+            if group != Some(pinned) {
+                group = Some(pinned);
+                list = list.push(
+                    text(if pinned {
+                        "PINNED"
+                    } else {
+                        "RECENT CONVERSATIONS"
+                    })
+                    .size(size - 2.0)
+                    .style(text::secondary),
+                );
+            }
+            let binding = state.bindings.get(&open_session_key(session)).copied();
+            let selected = !self.ai_chats.is_open
+                && state.workspace_task.is_none()
+                && binding.is_some_and(|id| {
+                    self.sessions
+                        .get(self.active)
+                        .is_some_and(|session| session.id == id)
+                });
+            let title = state.workspace.title(session);
+            let reference = WorkspaceSessionRef {
+                epoch: state.catalog_epoch,
+                session: session.clone(),
+            };
+            let row = row![
+                button(text(if pinned { "★" } else { "☆" }).size(size))
+                    .on_press(M::WorkspacePin(reference.clone()))
+                    .style(button::text),
+                button(
+                    column![
+                        text(crate::review_text::visible_bounded(title, 90)).size(size),
+                        text(format!(
+                            "{} · {}",
+                            session.provider.label(),
+                            if binding.is_some() {
+                                "Open terminal"
+                            } else {
+                                "Ready to resume"
+                            }
+                        ))
+                        .size(size - 2.0)
+                        .style(text::secondary)
+                    ]
+                    .spacing(3)
+                )
+                .on_press(M::WorkspaceOpenSession(reference))
+                .width(Length::Fill)
+                .style(if selected {
+                    button::primary
+                } else {
+                    button::text
+                }),
+            ]
+            .spacing(2);
+            list = list.push(row);
+        }
+        if visible.is_empty() {
+            list = list.push(
+                text(if state.scanner.is_scanning() {
+                    "Discovering local sessions…"
+                } else {
+                    "No CLI conversations match"
+                })
+                .size(size - 1.0)
+                .style(text::secondary),
+            );
+        }
+        list = list.push(
+            text("API CONVERSATIONS")
+                .size(size - 2.0)
+                .style(text::secondary),
+        );
+        let query = state.query.trim().to_lowercase();
+        for chat in self.ai_chats.workspace.rows.iter().filter(|chat| {
+            !chat.archived
+                && (!state.live_only || chat.runtime.is_live())
+                && (state.status != Some(SessionStatus::Waiting)
+                    || matches!(
+                        chat.runtime,
+                        jterm_core::agent_workspace::RuntimeState::Failed
+                            | jterm_core::agent_workspace::RuntimeState::Conflict
+                    ))
+                && state
+                    .project_selection
+                    .as_ref()
+                    .is_none_or(|project| std::path::Path::new(&chat.cwd).starts_with(project))
+                && (query.is_empty()
+                    || format!("{} {}", chat.title, chat.preview)
+                        .to_lowercase()
+                        .contains(&query))
+        }) {
+            let selected = self.ai_chats.is_open
+                && self
+                    .ai_chats
+                    .workspace
+                    .id_for(self.ai_chats.store.active_id())
+                    == Some(&chat.id);
+            list = list.push(
+                row![
+                    button(text(if chat.pinned { "★" } else { "☆" }).size(size))
+                        .on_press(M::WorkspaceApiPin(chat.id.clone(), !chat.pinned))
+                        .style(button::text),
+                    button(
+                        column![
+                            text(&chat.title).size(size),
+                            text("API conversation")
+                                .size(size - 2.0)
+                                .style(text::secondary)
+                        ]
+                        .spacing(3),
+                    )
+                    .on_press(M::WorkspaceApi(chat.id.clone()))
+                    .width(Length::Fill)
+                    .style(if selected {
+                        button::primary
+                    } else {
+                        button::text
+                    })
+                ]
+                .spacing(2),
+            );
+        }
+        if self.config.experimental_task_sidebar {
+            list = list.push(
+                text("TASK CONVERSATIONS")
+                    .size(size - 2.0)
+                    .style(text::secondary),
+            );
+            for task in self.task_manager.tasks().iter().filter(|task| {
+                use jterm_core::agent_task::TaskStatus;
+                task.status != TaskStatus::Archived
+                    && (!state.live_only
+                        || matches!(
+                            task.status,
+                            TaskStatus::Starting
+                                | TaskStatus::Working
+                                | TaskStatus::WaitingForApproval
+                        ))
+                    && (state.status != Some(SessionStatus::Waiting)
+                        || matches!(
+                            task.status,
+                            TaskStatus::WaitingForApproval
+                                | TaskStatus::WaitingForHuman
+                                | TaskStatus::ReadyForReview
+                                | TaskStatus::Failed
+                        ))
+            }) {
+                if !query.is_empty() && !task.title.to_lowercase().contains(&query) {
+                    continue;
+                }
+                if state
+                    .project_selection
+                    .as_ref()
+                    .is_some_and(|project| project != &task.repo_root)
+                {
+                    continue;
+                }
+                list = list.push(
+                    button(
+                        column![
+                            text(crate::review_text::visible_bounded(&task.title, 90)).size(size),
+                            text(format!(
+                                "{} · {}",
+                                task.provider.display_name(),
+                                task.status.label()
+                            ))
+                            .size(size - 2.0)
+                            .style(text::secondary)
+                        ]
+                        .spacing(3),
+                    )
+                    .on_press(M::WorkspaceTask(task.id))
+                    .width(Length::Fill)
+                    .style(if state.workspace_task == Some(task.id) {
+                        button::primary
+                    } else {
+                        button::text
+                    }),
+                );
+            }
+        }
+        list = list.push(text("TERMINALS").size(size - 2.0).style(text::secondary));
+        for (index, session) in self.sessions.iter().enumerate() {
+            if state.bindings.values().any(|&id| id == session.id) {
+                continue;
+            }
+            let title = self
+                .tabs
+                .iter()
+                .position(|tab| tab.contains(index))
+                .map(|tab| self.tab_label(tab))
+                .unwrap_or_else(|| "Terminal".into());
+            let selected =
+                !self.ai_chats.is_open && state.workspace_task.is_none() && self.active == index;
+            list = list.push(
+                button(text(title).size(size))
+                    .on_press(M::WorkspaceTerminal(session.id))
+                    .width(Length::Fill)
+                    .style(if selected {
+                        button::primary
+                    } else {
+                        button::text
+                    }),
+            );
+        }
+        container(
+            scrollable(list)
+                .id(iced::widget::Id::new("workspace-session-navigation"))
+                .height(Length::Fill),
+        )
+        .padding(12)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
     /// The live tab this window already resumed for one conversation.
     fn agent_session_tab(&self, key: &SessionKey) -> Option<usize> {
+        let session = self
+            .agent_sessions
+            .selected_session()
+            .filter(|session| session_key(session) == *key)?;
         self.agent_sessions
             .bindings
-            .get(key)
+            .get(&open_session_key(session))
             .copied()
             .and_then(|id| self.session_index_by_id(id))
             .filter(|index| !self.sessions[*index].hold_after_exit)
@@ -932,7 +1489,9 @@ impl super::Frost {
     /// Resume (or switch to) the conversation an action was rendered for.
     /// A stale request for another or hidden identity does nothing.
     pub(crate) fn resume_agent_session(&mut self, key: &SessionKey) {
-        if !self.agent_sessions.open || self.agent_sessions.editing() {
+        if (!self.agent_sessions.open && !self.agent_sessions.workspace_pending)
+            || self.agent_sessions.editing()
+        {
             return;
         }
         let Some(session) = self
@@ -955,6 +1514,9 @@ impl super::Frost {
             }
             self.record_resumed_agent_session(session.provider, &session.id);
             self.agent_sessions.close();
+            self.agent_sessions.workspace_pending = false;
+            self.agent_sessions.workspace_task = None;
+            self.ai_chats.close(self.config.ai_redact_secrets);
             self.relayout();
             self.refresh_active_context();
             return;
@@ -963,6 +1525,8 @@ impl super::Frost {
         // explains the conflict; the next explicit request (Resume anyway)
         // for this exact identity proceeds.
         if !self.agent_sessions.admit_resume(&session) {
+            self.agent_sessions.open = true;
+            self.agent_sessions.workspace_pending = false;
             return;
         }
         self.agent_sessions.sync_preflight();
@@ -972,7 +1536,9 @@ impl super::Frost {
     }
 
     pub(crate) fn finish_pending_agent_resume(&mut self) {
-        if !self.agent_sessions.open || self.agent_sessions.editing() {
+        if (!self.agent_sessions.open && !self.agent_sessions.workspace_pending)
+            || self.agent_sessions.editing()
+        {
             self.agent_sessions.pending_confirm = None;
             return;
         }
@@ -1006,6 +1572,8 @@ impl super::Frost {
         // another CLI on this conversation: that needs the same explicit
         // confirmation as a conflict known before arming.
         if !self.agent_sessions.admit_resume(&session) {
+            self.agent_sessions.open = true;
+            self.agent_sessions.workspace_pending = false;
             return;
         }
         self.agent_sessions.pending_confirm = None;
@@ -1049,21 +1617,23 @@ impl super::Frost {
         }
     }
 
-    fn record_resumed_agent_session(&mut self, provider: SessionProvider, id: &str) {
-        if let Err(error) = self.agent_sessions.store.record_resumed(provider, id) {
-            self.push_toast(
-                format!("Could not save recent-session history: {error}"),
-                super::ToastKind::Warning,
-            );
-        }
+    fn record_resumed_agent_session(&mut self, _provider: SessionProvider, _id: &str) {
+        self.agent_sessions.workspace.refresh();
     }
 
     fn launch_checked_agent_session(
         &mut self,
         session: AgentSession,
-        key: SessionKey,
-        launch: SessionLaunch,
+        _key: SessionKey,
+        _launch: SessionLaunch,
     ) {
+        let launch = match jterm_core::agent_workspace::managed_launch(&session) {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.agent_sessions.abandon_resume(Some(error));
+                return;
+            }
+        };
         let Some(cwd) = launch.cwd.to_str() else {
             self.agent_sessions
                 .abandon_resume(Some("The session directory is not valid UTF-8".into()));
@@ -1079,7 +1649,9 @@ impl super::Frost {
             Some(&argv),
         ) {
             Ok(terminal) => {
-                self.agent_sessions.bindings.insert(key, terminal.id);
+                self.agent_sessions
+                    .bindings
+                    .insert(open_session_key(&session), terminal.id);
                 self.record_resumed_agent_session(session.provider, &session.id);
                 self.session_diagnostic = None;
                 self.next_id += 1;
@@ -1091,13 +1663,16 @@ impl super::Frost {
                 self.tabs[self.active_tab].title = Some(format!(
                     "{} · {}",
                     session.provider.label(),
-                    self.agent_sessions.store.snapshot().display_title(
+                    self.agent_sessions.metadata().display_title(
                         session.provider,
                         &session.id,
                         &session.title,
                     ),
                 ));
                 self.agent_sessions.close();
+                self.agent_sessions.workspace_pending = false;
+                self.agent_sessions.workspace_task = None;
+                self.ai_chats.close(self.config.ai_redact_secrets);
                 self.agent_sessions.notice = None;
                 self.relayout();
                 self.refresh_active_context();
@@ -1350,7 +1925,7 @@ impl super::Frost {
                     }),
             );
         }
-        let library = state.store.snapshot();
+        let library = state.metadata();
         let matching = state.visible.len();
         let batch_reference = state.batch_reference();
         let mut list = column![].spacing(5);
@@ -1361,7 +1936,7 @@ impl super::Frost {
             let selected = state.selected.as_ref() == Some(&key);
             let here = state
                 .bindings
-                .get(&key)
+                .get(&open_session_key(session))
                 .and_then(|id| self.session_index_by_id(*id))
                 .is_some();
             // One identity lookup for every personal fact on this row.
@@ -2048,6 +2623,34 @@ impl super::Frost {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_click_rejects_replaced_source_and_hidden_rows() {
+        let first = session(SessionProvider::Codex, "exact-id", "First source");
+        let mut state = library();
+        state.replace_catalog(catalog(vec![first.clone()]));
+        let reference = WorkspaceSessionRef {
+            epoch: state.catalog_epoch,
+            session: first.clone(),
+        };
+        assert!(state.workspace_reference_current(&reference));
+        state.set_query("no matching conversation".into());
+        assert!(!state.workspace_reference_current(&reference));
+        state.set_query(String::new());
+        let mut replacement = first;
+        replacement.source = PathBuf::from("/another/profile/session.jsonl");
+        state.replace_catalog(catalog(vec![replacement]));
+        assert!(!state.workspace_reference_current(&reference));
+    }
+
+    #[test]
+    fn workspace_live_binding_includes_provider_source() {
+        let first = session(SessionProvider::Codex, "same-native-id", "First source");
+        let mut second = first.clone();
+        second.source = PathBuf::from("/another/profile/session.jsonl");
+        assert_ne!(open_session_key(&first), open_session_key(&second));
+        assert!(!same_launch_target(&first, &second));
+    }
+
     use super::*;
     use std::time::Instant;
     fn session(provider: SessionProvider, id: &str, title: &str) -> AgentSession {
@@ -2661,7 +3264,11 @@ mod tests {
         assert!(finish.contains("self.agent_sessions.abandon_resume(None);"));
         assert!(finish.contains("self.agent_sessions.abandon_resume(Some(error));"));
         let launch = body("fn launch_checked_agent_session(");
-        assert_eq!(launch.matches("abandon_resume(Some(").count(), 2);
+        assert_eq!(
+            launch.matches("abandon_resume(Some(").count(),
+            3,
+            "the managed-launch validation has its own guarded failure exit"
+        );
     }
 
     #[test]

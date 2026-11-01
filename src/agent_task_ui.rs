@@ -376,7 +376,7 @@ pub(crate) fn dashboard_filter_label(
 /// Visible before starting a print-mode provider; a worktree is not containment.
 pub(crate) fn native_start_notice(provider: AgentProvider) -> Option<&'static str> {
     match provider {
-        AgentProvider::Claude => Some("Claude skips its own permission prompts and can automatically run tools with your user account's file access. This worktree is not a sandbox."),
+        AgentProvider::Claude => Some("Claude native turns keep the CLI permission checks. If a tool requires approval, open the task in Terminal to review it."),
         AgentProvider::Kimi => Some("Kimi uses automatic tool permission and can run tools with your user account's file access. This worktree is not a sandbox."),
         AgentProvider::Codex | AgentProvider::OpenCode => None,
     }
@@ -740,6 +740,7 @@ pub(crate) struct TaskPanel {
     pub(crate) dashboard_sort: crate::agent_task::DashboardSort,
     /// Draft review feedback for the selected task's next native turn.
     pub(crate) follow_up: String,
+    pub(crate) follow_up_editor: iced::widget::text_editor::Content,
     follow_up_epoch: Arc<()>,
     follow_up_notice: Option<&'static str>,
     draft_discard_confirmation: Option<Arc<()>>,
@@ -775,6 +776,7 @@ impl TaskPanel {
             dashboard_repo: None,
             dashboard_sort: crate::agent_task::DashboardSort::default(),
             follow_up: String::new(),
+            follow_up_editor: iced::widget::text_editor::Content::new(),
             follow_up_epoch: Arc::new(()),
             follow_up_notice: None,
             draft_discard_confirmation: None,
@@ -968,6 +970,7 @@ impl TaskPanel {
             self.follow_up = draft;
             self.follow_up_notice = notice;
         }
+        self.follow_up_editor = iced::widget::text_editor::Content::with_text(&self.follow_up);
         self.selected = task_id;
         self.inspector_open = task_id.is_some();
         self.retire_follow_up();
@@ -1160,6 +1163,7 @@ impl TaskPanel {
 
     pub(crate) fn clear_follow_up(&mut self) {
         self.follow_up = String::new();
+        self.follow_up_editor = iced::widget::text_editor::Content::new();
         self.follow_up_notice = None;
     }
 
@@ -1212,6 +1216,9 @@ impl TaskPanel {
             .chars()
             .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'));
         self.follow_up = bound_follow_up(raw);
+        if self.follow_up_editor.text() != self.follow_up {
+            self.follow_up_editor = iced::widget::text_editor::Content::with_text(&self.follow_up);
+        }
         self.follow_up_notice = if clean_bytes > NATIVE_AGENT_FOLLOW_UP_MAX_BYTES {
             Some("Input truncated to the byte limit; review before sending.")
         } else if controls_removed {
@@ -1549,13 +1556,12 @@ mod tests {
     fn print_provider_notice_discloses_permissions_without_promising_a_sandbox() {
         use super::{native_start_notice, AgentProvider};
         let claude = native_start_notice(AgentProvider::Claude).unwrap();
-        assert!(claude.contains("skips its own permission prompts"));
+        assert!(claude.contains("keep the CLI permission checks"));
+        assert!(claude.contains("Terminal"));
         let kimi = native_start_notice(AgentProvider::Kimi).unwrap();
         assert!(kimi.contains("automatic tool permission"));
-        for notice in [claude, kimi] {
-            assert!(notice.contains("user account's file access"));
-            assert!(notice.contains("not a sandbox"));
-        }
+        assert!(kimi.contains("user account's file access"));
+        assert!(kimi.contains("not a sandbox"));
         assert_eq!(native_start_notice(AgentProvider::Codex), None);
         assert_eq!(native_start_notice(AgentProvider::OpenCode), None);
     }
@@ -1949,23 +1955,25 @@ mod tests {
             .unwrap();
         let guard = send.find("task_follow_up_is_current").unwrap();
         let take = send.find("begin_follow_up_send").unwrap();
-        let dispatch = send.find("prompt_codex").unwrap();
+        let dispatch = send.find("prompt_native").unwrap();
         let clear = send
             .find("Ok(()) => self.task_panel.clear_follow_up()")
             .unwrap();
         assert!(guard < take && take < dispatch && dispatch < clear);
         let input = source
-            .split("Message::TaskFollowUpInput(reference, value) => {")
+            .split("Message::TaskFollowUpEditorAction(reference, action) => {")
             .nth(1)
             .unwrap()
-            .split("Message::TaskFollowUpSend")
+            .split("Message::AiChatsComposerAction")
             .next()
             .unwrap();
         assert!(
             input.find("task_follow_up_is_current").unwrap()
                 < input.find("edit_follow_up").unwrap()
         );
-        assert!(source.contains("Message::TaskFollowUpInput(input_reference.clone(), value)"));
+        assert!(
+            source.contains("Message::TaskFollowUpEditorAction(input_reference.clone(), action)")
+        );
         assert!(source.contains("Message::TaskFollowUpSend(reference)"));
         let direct_assignment = regex::Regex::new(r"self\.task_panel\.selected\s*=[^=]").unwrap();
         assert!(direct_assignment.is_match("self.task_panel.selected = Some(id);"));
@@ -2654,7 +2662,7 @@ mod tests {
         // block selection is skipped; app commands, chrome shortcuts and
         // scrolling run as usual; and a hard stop precedes the PTY write.
         let owner = keys
-            .find("let task_input = self.task_input_owns_keys();")
+            .find("let task_input = self.task_input_owns_keys()")
             .unwrap();
         let dropped = keys
             .find(".is_some_and(|command| command_targets_terminal(&command))")

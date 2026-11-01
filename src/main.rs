@@ -96,6 +96,8 @@ mod widget_identity_scope;
 mod workflow_focus;
 mod workflow_picker;
 mod workflows;
+mod workspace_chat_bridge;
+mod workspace_sessions_bridge;
 
 use std::hash::Hash;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -4477,6 +4479,9 @@ fn resolve_optional_font(family: Option<&str>) -> Option<iced::Font> {
 }
 
 fn main() -> iced::Result {
+    if let Some(code) = jterm_core::agent_workspace::run_embedded_if_requested() {
+        std::process::exit(code);
+    }
     // Shared jterm_core modules brand themselves per app (env prefixes,
     // prompt strings) from this identity.
     jterm_core::identity::init(jterm_core::identity::AppIdentity {
@@ -4624,7 +4629,6 @@ enum Message {
     // Persistent AI chats library (ported from anvil's AI panel) and inline
     // AI command generation (ported from anvil's `?` palette flow).
     /// Composer edit of the viewed chat's draft.
-    AiChatsInput(String),
     AiChatsSubmit,
     AiChatsStop,
     AiChatsRetry,
@@ -4633,12 +4637,10 @@ enum Message {
     /// One finished chat request (stale tokens dropped).
     AiChatsResult(ai_chat_store::RequestToken, Result<String, String>),
     AiChatsNewChat,
-    AiChatsSelect(u64),
     AiChatsSearchInput(String),
     AiChatsShowLibrary,
     AiChatsShowChat,
     /// Rename-editor edit of the viewed chat's title.
-    AiChatsTitleInput(String),
     AiChatsToggleArchive,
     /// Two-step delete: the first press arms, the second confirms.
     AiChatsDelete,
@@ -4689,9 +4691,9 @@ enum Message {
     TaskCreateWithProvider(std::sync::Arc<()>, agent_task::AgentProvider),
     TaskCreateProviderCancel(std::sync::Arc<()>),
     TaskStartNative(agent_task::TaskId),
+    TaskLoadHistory(agent_task::TaskId, bool),
     TaskCancelNative(agent_task::TaskId),
     TaskFinishNative(agent_task::TaskId),
-    TaskFollowUpInput(agent_task_ui::TaskFollowUpRef, String),
     TaskFollowUpSend(agent_task_ui::TaskFollowUpRef),
     TaskRequestDiscardSavedDrafts(std::sync::Arc<()>),
     TaskCancelDiscardSavedDrafts(std::sync::Arc<()>),
@@ -4707,6 +4709,29 @@ enum Message {
     TaskFocusValidation(agent_task::TaskId),
     /// Open a coding-agent CLI in a new tab at the active pane cwd.
     AgentLaunch(agent_task::AgentProvider),
+    WorkspaceOpenSession(agent_sessions::WorkspaceSessionRef),
+    WorkspacePin(agent_sessions::WorkspaceSessionRef),
+    WorkspaceApi(jterm_core::agent_workspace::ConversationId),
+    WorkspaceApiReload(jterm_core::agent_workspace::ConversationId),
+    WorkspaceApiUseShared(jterm_core::agent_workspace::ConversationId),
+    WorkspaceApiPin(jterm_core::agent_workspace::ConversationId, bool),
+    WorkspaceTerminal(usize),
+    WorkspaceNewTerminal,
+    WorkspaceTask(agent_task::TaskId),
+    WorkspaceProject(Option<std::path::PathBuf>),
+    AiChatsComposerAction(
+        workspace_chat_bridge::ChatRef,
+        iced::widget::text_editor::Action,
+    ),
+    AiChatsSend(workspace_chat_bridge::ChatRef),
+    WorkspaceApiScrolled(workspace_chat_bridge::ChatRef, f64),
+    WorkspaceApiHistory(workspace_chat_bridge::ChatRef),
+    WorkspaceApiTitle(workspace_chat_bridge::ChatRef, String),
+    WorkspaceApiAction(workspace_chat_bridge::ChatRef, &'static str),
+    TaskFollowUpEditorAction(
+        agent_task_ui::TaskFollowUpRef,
+        iced::widget::text_editor::Action,
+    ),
     AgentSessionsToggle,
     AgentSessionsSurface,
     AgentSessionsClose,
@@ -5651,11 +5676,11 @@ impl Session {
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .chain(extra_env.iter().copied())
             .collect();
-        let session_id = jsh_session_id(id, command_argv);
         let shell_program = command_argv
             .is_none()
             .then(|| pty::resolved_shell_identity(config.shell.as_deref(), cwd))
             .flatten();
+        let session_id = jsh_session_id(id, command_argv);
         let pty = Pty::new_with_cwd_env(
             cols,
             rows,
@@ -7257,7 +7282,7 @@ impl Frost {
             eva_preview_pose: jterm_core::companion_host::atlas::Pose::Idle,
             eva_preview_mood: jterm_core::companion_host::atlas::Mood::Neutral,
             reference_inspector_tab: native_shell::InspectorTab::Agent,
-            reference_inspector_open: true,
+            reference_inspector_open: false,
             reference_inspector_drawer: false,
             reference_tools_selection: None,
             vim9_tabs: Default::default(),
@@ -7438,6 +7463,9 @@ impl Frost {
         app.relayout();
         // The file tree carries a snapshot of the configured remote hosts.
         app.sidebar.set_hosts(app.config.remote_hosts.clone());
+        app.agent_sessions.refresh();
+        app.ai_chats
+            .load_workspace_library(app.config.ai_redact_secrets);
         // frost prefers jsh as its shell, so it is worth noticing when the
         // machine has none or an old one. Nothing is installed without an
         // explicit click.
@@ -8036,7 +8064,7 @@ impl Frost {
             && !self.palette.is_open
             && self.reference_tools_selection.is_none()
             && !native_input_surface::ai_surface_active(
-                self.ai_chats.is_open,
+                self.ai_chats.is_open || self.agent_sessions.workspace_task.is_some(),
                 self.ai_ask.is_some(),
             )
             && !self.config_panel_open
@@ -8085,7 +8113,7 @@ impl Frost {
             && !self.palette.is_open
             && self.reference_tools_selection.is_none()
             && !native_input_surface::ai_surface_active(
-                self.ai_chats.is_open,
+                self.ai_chats.is_open || self.agent_sessions.workspace_task.is_some(),
                 self.ai_ask.is_some(),
             )
             && !self.config_panel_open
@@ -17475,13 +17503,20 @@ impl Frost {
                 self.config_dirty = true;
             }
             // ===== AI chats library + inline AI command generation =====
-            Message::AiChatsInput(draft) => self.ai_chats.set_draft(draft),
             Message::AiChatsSubmit => {
                 if let Some(request) = self.ai_chats.submit(&self.config) {
                     return self.ai_chats_request_task(request);
                 }
             }
-            Message::AiChatsStop => self.ai_chats.stop(self.config.ai_redact_secrets),
+            Message::AiChatsStop => {
+                if !self
+                    .ai_chats
+                    .workspace
+                    .cancel_queued(self.ai_chats.store.active_id())
+                {
+                    self.ai_chats.stop(self.config.ai_redact_secrets);
+                }
+            }
             Message::AiChatsRetry => {
                 if let Some(request) = self.ai_chats.retry(&self.config) {
                     return self.ai_chats_request_task(request);
@@ -17497,11 +17532,9 @@ impl Frost {
                 self.ai_chats.persist(self.config.ai_redact_secrets);
             }
             Message::AiChatsNewChat => {
-                self.ai_chats.new_chat(self.config.ai_redact_secrets);
-                return iced::widget::operation::focus(AI_CHATS_INPUT_ID.clone());
-            }
-            Message::AiChatsSelect(id) => {
-                self.ai_chats.select_chat(id, self.config.ai_redact_secrets);
+                self.ai_chats.open(&self.config);
+                self.agent_sessions.workspace_task = None;
+                self.ai_chats.workspace.create();
                 return iced::widget::operation::focus(AI_CHATS_INPUT_ID.clone());
             }
             Message::AiChatsSearchInput(query) => self.ai_chats.set_search(query),
@@ -17513,7 +17546,6 @@ impl Frost {
                 self.ai_chats.page = ai_chats::ChatsPage::Chat;
                 return iced::widget::operation::focus(AI_CHATS_INPUT_ID.clone());
             }
-            Message::AiChatsTitleInput(title) => self.ai_chats.rename(title),
             Message::AiChatsToggleArchive => {
                 self.ai_chats.toggle_archive(self.config.ai_redact_secrets);
             }
@@ -17699,6 +17731,14 @@ impl Frost {
                     &reference,
                 );
             }
+            Message::TaskLoadHistory(task_id, reset) => {
+                if self.task_inspector_visible(task_id) {
+                    if let Err(error) = self.agent_runtime.load_native_history(task_id, reset) {
+                        self.push_toast(error.to_string(), ToastKind::Warning);
+                    }
+                    self.task_panel.request_prompt_poll();
+                }
+            }
             Message::TaskStartNative(task_id) => {
                 if self.task_inspector_visible(task_id) {
                     self.task_start_native(task_id);
@@ -17742,6 +17782,149 @@ impl Frost {
                 }
             }
             Message::AgentLaunch(provider) => self.agent_launch_in_tab(provider),
+            Message::WorkspaceApiPin(id, pinned) => self.ai_chats.workspace.pin(id, pinned),
+            Message::WorkspaceApiUseShared(id) => {
+                self.ai_chats.workspace.reload_shared_draft(id);
+            }
+            Message::WorkspaceApiReload(id) => {
+                self.ai_chats.workspace.reload_keep_local(id);
+            }
+            Message::WorkspaceApi(id) => {
+                self.agent_sessions.workspace_task = None;
+                self.agent_sessions.workspace_pending = false;
+                self.agent_sessions.cancel_confirmation();
+                self.ai_chats.open(&self.config);
+                self.ai_chats.workspace.open(id);
+            }
+            Message::WorkspacePin(reference) => {
+                self.agent_sessions.pin_workspace_session(&reference)
+            }
+            Message::WorkspaceOpenSession(reference) => {
+                self.activate_workspace_session(reference);
+            }
+            Message::WorkspaceNewTerminal => {
+                self.ai_chats.close(self.config.ai_redact_secrets);
+                self.agent_sessions.workspace_task = None;
+                self.agent_sessions.workspace_pending = false;
+                self.agent_sessions.cancel_confirmation();
+                return self
+                    .dispatch_command(keybindings::Command::SessionNew)
+                    .unwrap_or_else(Task::none);
+            }
+            Message::WorkspaceTerminal(id) => {
+                if let Some(index) = self.session_index_by_id(id) {
+                    self.ai_chats.close(self.config.ai_redact_secrets);
+                    self.agent_sessions.workspace_task = None;
+                    self.agent_sessions.workspace_pending = false;
+                    self.agent_sessions.cancel_confirmation();
+                    self.focus_session(index);
+                    self.relayout();
+                    self.refresh_active_context();
+                }
+            }
+            Message::WorkspaceTask(id) => {
+                if self.task_manager.get(id).is_some() {
+                    self.ai_chats.close(self.config.ai_redact_secrets);
+                    self.agent_sessions.workspace_task = Some(id);
+                    self.agent_sessions.workspace_pending = false;
+                    self.agent_sessions.cancel_confirmation();
+                    self.task_panel.select(Some(id));
+                }
+            }
+            Message::WorkspaceProject(project) => {
+                self.agent_sessions.project_only = false;
+                self.agent_sessions.project_selection = project;
+                self.agent_sessions.apply_filters();
+            }
+            Message::WorkspaceApiTitle(reference, title) => {
+                if self.ai_chats.is_open
+                    && self
+                        .ai_chats
+                        .workspace
+                        .accepts(reference, self.ai_chats.store.active_id())
+                {
+                    self.ai_chats.rename(title);
+                }
+            }
+            Message::WorkspaceApiAction(reference, action) => {
+                if self.ai_chats.is_open
+                    && self
+                        .ai_chats
+                        .workspace
+                        .accepts(reference, self.ai_chats.store.active_id())
+                {
+                    let message = match action {
+                        "stop" => Message::AiChatsStop,
+                        "retry" => Message::AiChatsRetry,
+                        "archive" => Message::AiChatsToggleArchive,
+                        "delete" => Message::AiChatsDelete,
+                        _ => return Task::none(),
+                    };
+                    return self.update(message);
+                }
+            }
+            Message::WorkspaceApiHistory(reference) => {
+                if self.ai_chats.is_open
+                    && self
+                        .ai_chats
+                        .workspace
+                        .accepts(reference, self.ai_chats.store.active_id())
+                {
+                    self.ai_chats.workspace.load_history(reference.chat_id);
+                }
+            }
+            Message::WorkspaceApiScrolled(reference, position) => {
+                if self.ai_chats.is_open
+                    && self
+                        .ai_chats
+                        .workspace
+                        .accepts(reference, self.ai_chats.store.active_id())
+                {
+                    self.ai_chats
+                        .workspace
+                        .remember_read(reference.chat_id, position);
+                }
+            }
+            Message::AiChatsSend(reference) => {
+                if self.ai_chats.is_open
+                    && self
+                        .ai_chats
+                        .workspace
+                        .accepts(reference, self.ai_chats.store.active_id())
+                {
+                    return self.update(Message::AiChatsSubmit);
+                }
+            }
+            Message::TaskFollowUpEditorAction(reference, action) => {
+                if self.task_follow_up_is_current(&reference) {
+                    self.task_panel.follow_up_editor.perform(action);
+                    let value = self.task_panel.follow_up_editor.text();
+                    self.task_panel
+                        .edit_follow_up(&reference, reference.completed_turns, value);
+                    if self.task_panel.follow_up_editor.text() != self.task_panel.follow_up {
+                        self.task_panel.follow_up_editor =
+                            iced::widget::text_editor::Content::with_text(
+                                &self.task_panel.follow_up,
+                            );
+                    }
+                }
+            }
+            Message::AiChatsComposerAction(reference, action) => {
+                if self.ai_chats.is_open
+                    && self
+                        .ai_chats
+                        .workspace
+                        .accepts(reference, self.ai_chats.store.active_id())
+                {
+                    self.ai_chats.composer.perform(action);
+                    self.ai_chats.set_draft(self.ai_chats.composer.text());
+                    if self.ai_chats.composer.text() != self.ai_chats.store.active_draft() {
+                        self.ai_chats.composer = iced::widget::text_editor::Content::with_text(
+                            self.ai_chats.store.active_draft(),
+                        );
+                    }
+                }
+            }
             Message::AgentSessionsToggle => {
                 if self.agent_sessions.open {
                     self.agent_sessions.close();
@@ -17784,12 +17967,11 @@ impl Frost {
                     return Task::none();
                 }
                 self.agent_sessions.cancel_confirmation();
-                let pinned = !self
+                let pinned = !self.agent_sessions.metadata().is_pinned(provider, &id);
+                match self
                     .agent_sessions
-                    .store
-                    .snapshot()
-                    .is_pinned(provider, &id);
-                match self.agent_sessions.store.set_pinned(provider, &id, pinned) {
+                    .shared_pin(&(provider, id.clone()), pinned)
+                {
                     // Unpinning can take it out of Pinned only (or an
                     // `is:pinned` search); say so if it does.
                     Ok(()) if !pinned => self
@@ -17812,15 +17994,10 @@ impl Frost {
                     return Task::none();
                 }
                 self.agent_sessions.cancel_confirmation();
-                let archived = !self
-                    .agent_sessions
-                    .store
-                    .snapshot()
-                    .is_archived(provider, &id);
+                let archived = !self.agent_sessions.metadata().is_archived(provider, &id);
                 match self
                     .agent_sessions
-                    .store
-                    .set_archived(provider, &id, archived)
+                    .shared_archive(&(provider, id.clone()), archived)
                 {
                     Ok(()) => self.agent_sessions.note_own_change(
                         (provider, id),
@@ -17900,6 +18077,14 @@ impl Frost {
                 let old_error = self.agent_sessions.store.error().map(str::to_owned);
                 let was_editing = self.agent_sessions.editing();
                 let scroll = self.agent_sessions.poll();
+                {
+                    let state = &mut self.agent_sessions;
+                    if state.store.is_loaded()
+                        && state.workspace.sync(&state.catalog, state.store.snapshot())
+                    {
+                        state.refresh_workspace_metadata();
+                    }
+                }
                 self.finish_pending_agent_resume();
                 if !self.agent_sessions.open
                     && self.agent_sessions.store.error() != old_error.as_deref()
@@ -17917,8 +18102,25 @@ impl Frost {
                         iced::widget::operation::focus(AGENT_SESSIONS_INPUT_ID.clone()),
                     ]);
                 }
+                let requests = self.ai_chats.drive_workspace(&self.config);
+                let mut jobs = requests
+                    .into_iter()
+                    .map(|request| self.ai_chats_request_task(request))
+                    .collect::<Vec<_>>();
+                if let Some((id, position)) = self.ai_chats.restore_read.take() {
+                    jobs.push(iced::widget::operation::snap_to(
+                        iced::widget::Id::from(format!("workspace-api-transcript-{id}")),
+                        iced::widget::operation::RelativeOffset {
+                            x: 0.0,
+                            y: 1.0 - position,
+                        },
+                    ));
+                }
                 if scroll {
-                    return self.agent_sessions_scroll_task();
+                    jobs.push(self.agent_sessions_scroll_task());
+                }
+                if !jobs.is_empty() {
+                    return Task::batch(jobs);
                 }
             }
             Message::AgentSessionsCapturedNavigation(event) => {
@@ -17988,12 +18190,6 @@ impl Frost {
             Message::TaskDiscardSavedDrafts(reference) => {
                 self.task_panel.discard_saved_drafts(&reference);
             }
-            Message::TaskFollowUpInput(reference, value) => {
-                if self.task_follow_up_is_current(&reference) {
-                    self.task_panel
-                        .edit_follow_up(&reference, reference.completed_turns, value);
-                }
-            }
             Message::TaskFollowUpSend(reference) => {
                 if !self.task_follow_up_is_current(&reference) {
                     return Task::none();
@@ -18006,7 +18202,7 @@ impl Frost {
                 };
                 // The task and immutable draft are admitted together before
                 // calling the existing core authorization/consent boundary.
-                match self.agent_runtime.prompt_codex(
+                match self.agent_runtime.prompt_native(
                     &self.task_manager,
                     reference.task_id,
                     &text,
@@ -27247,7 +27443,16 @@ impl Frost {
         // AI command-suggestion card shares the correction card's layer and
         // review-first idiom (above the panels, like the correction card).
         let body: Element<'_, Message> = if self.ai_chats.is_open {
-            stack![body, self.ai_chats_panel()].into()
+            container(self.ai_chats_panel())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if let Some(task_id) = self.agent_sessions.workspace_task {
+            if let Some(task) = self.task_manager.get(task_id) {
+                scrollable(self.task_card(task)).height(Length::Fill).into()
+            } else {
+                body
+            }
         } else {
             body
         };
@@ -29698,6 +29903,12 @@ impl Frost {
     /// A filtered-out selection or list-only narrow dock retains its draft,
     /// but cannot authorize a delayed action from the previous card.
     fn task_inspector_visible(&self, task_id: agent_task::TaskId) -> bool {
+        if self.agent_sessions.workspace_task == Some(task_id) {
+            return self.config.experimental_task_sidebar
+                && !self.agent_sessions.open
+                && !self.ai_chats.is_open
+                && self.task_manager.get(task_id).is_some();
+        }
         self.config.experimental_task_sidebar
             && self.tasks_surface_visible()
             && !self.agent_sessions.open
@@ -29729,7 +29940,7 @@ impl Frost {
             && self.task_manager.has_active_agent_event_stream(task.id)
             && task.status == agent_task::TaskStatus::ReadyForReview
             && task.runtime_kind == agent_task::TaskRuntimeKind::Native
-            && matches!(task.provider, agent_task::AgentProvider::Codex)
+            && self.agent_runtime.can_prompt_native(task.id)
     }
 
     /// Keep Tasks dock geometry and keyboard ownership in sync for every
@@ -31239,6 +31450,56 @@ impl Frost {
                     .size(self.chrome_font_size())
                     .style(text::secondary),
             );
+            if task.provider == agent_task::AgentProvider::Codex {
+                let mut history_actions =
+                    row![text("Saved conversation history").size(self.chrome_font_size())]
+                        .spacing(6);
+                let mut refresh = button(text("Refresh history").size(self.chrome_font_size()));
+                if !snapshot.history_loading && running {
+                    refresh = refresh.on_press(Message::TaskLoadHistory(task.id, true));
+                }
+                history_actions = history_actions.push(refresh);
+                if snapshot.history_cursor.is_some() {
+                    let mut earlier = button(text("Load earlier").size(self.chrome_font_size()));
+                    if !snapshot.history_loading && running {
+                        earlier = earlier.on_press(Message::TaskLoadHistory(task.id, false));
+                    }
+                    history_actions = history_actions.push(earlier);
+                }
+                evidence = evidence.push(history_actions);
+                if snapshot.history_loading {
+                    evidence = evidence.push(
+                        text("Loading history…")
+                            .size(self.chrome_font_size())
+                            .style(text::secondary),
+                    );
+                }
+                for turn in snapshot.persisted_history.iter() {
+                    let saved = column![
+                        text(format!("Saved turn · {}", turn.status))
+                            .size(self.chrome_font_size())
+                            .style(text::secondary),
+                        text("You")
+                            .size(self.chrome_font_size())
+                            .style(text::secondary),
+                        text(crate::review_text::visible_bounded(
+                            &turn.user_text,
+                            64 * 1024
+                        ))
+                        .size(self.chrome_font_size()),
+                        text("Agent")
+                            .size(self.chrome_font_size())
+                            .style(text::secondary),
+                        text(crate::review_text::visible_bounded(
+                            &turn.agent_text,
+                            128 * 1024
+                        ))
+                        .size(self.chrome_font_size()),
+                    ]
+                    .spacing(6);
+                    evidence = evidence.push(container(saved).padding(8).width(Length::Fill));
+                }
+            }
             if !snapshot.agent_text.is_empty() {
                 let truncated = if snapshot.agent_text_truncated {
                     " (compacted)"
@@ -31388,6 +31649,14 @@ impl Frost {
         let share_context = agent_task_ui::prompt_policy(&self.config).share_command_context;
         let terminal_can_offer = task.brief.is_none() || share_context;
         let mut actions = row![].spacing(6);
+        if self.agent_runtime.can_resume_codex(task.id) && !hidden {
+            let mut resume =
+                button(text("Resume native").size(self.chrome_font_size())).style(button::primary);
+            if share_context {
+                resume = resume.on_press(Message::TaskStartNative(task.id));
+            }
+            actions = actions.push(resume);
+        }
         if preparing {
             actions = actions.push(
                 text("Preparing…")
@@ -31426,7 +31695,7 @@ impl Frost {
                     .on_press(Message::TaskCancelNative(task.id)),
             );
             if task.status == TaskStatus::ReadyForReview
-                && matches!(task.provider, agent_task::AgentProvider::Codex)
+                && self.agent_runtime.can_prompt_native(task.id)
             {
                 actions = actions.push(
                     button(text(format!("Finish {provider_name}")).size(self.chrome_font_size()))
@@ -31467,7 +31736,7 @@ impl Frost {
             && stream_active
             && task.status == TaskStatus::ReadyForReview
             && task.runtime_kind == TaskRuntimeKind::Native
-            && matches!(task.provider, agent_task::AgentProvider::Codex)
+            && self.agent_runtime.can_prompt_native(task.id)
         {
             let completed_turns = snapshot
                 .as_deref()
@@ -31477,18 +31746,22 @@ impl Frost {
                 .task_panel
                 .follow_up_reference(task.id, completed_turns);
             let input_reference = reference.clone();
-            let input = text_input(
-                "Review feedback for the next turn…",
-                &self.task_panel.follow_up,
-            )
-            .on_input(move |value| Message::TaskFollowUpInput(input_reference.clone(), value))
-            .size(self.chrome_font_size());
+            let input = iced::widget::text_editor(&self.task_panel.follow_up_editor)
+                .placeholder("Review feedback for the next turn…")
+                .height(Length::Fixed(self.chrome_font_size() * 1.4 * 3.0 + 16.0))
+                .on_action(move |action| {
+                    Message::TaskFollowUpEditorAction(input_reference.clone(), action)
+                })
+                .size(self.chrome_font_size());
             let mut send = button(text("Send turn").size(self.chrome_font_size()));
             if agent_task_ui::native_follow_up_can_send(&self.task_panel.follow_up, completed_turns)
             {
                 send = send.on_press(Message::TaskFollowUpSend(reference));
             }
-            card = card.push(row![input, send].spacing(6));
+            card = card
+                .push(input)
+                .push(Space::new().height(self.chrome_font_size() * 1.4))
+                .push(send);
             card = card.push(
                 text(self.task_panel.follow_up_feedback(completed_turns))
                     .size(self.chrome_font_size())
@@ -32212,6 +32485,13 @@ impl Frost {
         use ai_chats::ChatsPage;
 
         let chats = &self.ai_chats;
+        if chats.workspace.opening() {
+            return container(
+                text("Loading shared conversation…").size(self.effective_font_size()),
+            )
+            .padding(24)
+            .into();
+        }
         let header = row![
             text("AI Chats").size(self.effective_font_size()),
             text(if chats.provider_label.is_empty() {
@@ -32240,9 +32520,30 @@ impl Frost {
             ChatsPage::Library => self.ai_chats_library_page(),
         };
 
-        let inner = container(column![header, page].spacing(8))
-            .width(Length::Fixed(560.0))
-            .height(Length::Fixed(520.0))
+        let mut contents = column![header, page].spacing(8);
+        if let Some(notice) = &chats.workspace.notice {
+            contents = contents.push(
+                text(notice)
+                    .size(self.effective_font_size())
+                    .style(text::danger),
+            );
+            if let Some(id) = chats.workspace.id_for(chats.store.active_id()) {
+                contents = contents.push(
+                    button(
+                        text("Keep my draft · reload shared history")
+                            .size(self.effective_font_size()),
+                    )
+                    .on_press(Message::WorkspaceApiReload(id.clone())),
+                );
+                contents = contents.push(
+                    button(text("Use shared draft").size(self.effective_font_size()))
+                        .on_press(Message::WorkspaceApiUseShared(id.clone())),
+                );
+            }
+        }
+        let inner = container(contents)
+            .width(Length::Fill)
+            .height(Length::Fill)
             .padding(12)
             .style(self.popup_style());
         container(inner)
@@ -32259,14 +32560,46 @@ impl Frost {
     fn ai_chats_chat_page(&self) -> Element<'_, Message> {
         let chats = &self.ai_chats;
         let store = &chats.store;
-        let busy = store.active_request_token().is_some();
+        let busy =
+            store.active_request_token().is_some() || chats.workspace.is_pending(store.active_id());
         let archived = store.active_archived();
+        let chat_ref = chats.workspace.reference(store.active_id());
 
         let title = text_input("Chat title", &chats.title_draft)
-            .on_input(Message::AiChatsTitleInput)
+            .on_input(move |title| Message::WorkspaceApiTitle(chat_ref, title))
             .size(self.effective_font_size());
 
         let mut transcript = column![].spacing(8);
+        if chats.workspace.can_load_history(store.active_id()) {
+            let mut load = button(
+                text(if chats.workspace.history_loading(store.active_id()) {
+                    "Loading earlier messages…"
+                } else {
+                    "Load earlier messages"
+                })
+                .size(self.effective_font_size()),
+            );
+            if !chats.workspace.history_loading(store.active_id()) {
+                load = load.on_press(Message::WorkspaceApiHistory(chat_ref));
+            }
+            transcript = transcript.push(load);
+        }
+        for message in chats.workspace.older_messages(store.active_id()) {
+            transcript = transcript.push(
+                column![
+                    text(if message.role == "user" {
+                        "You"
+                    } else {
+                        "Assistant"
+                    })
+                    .size(self.effective_font_size())
+                    .style(text::secondary),
+                    text(crate::ai_chats::display_chat_turn(&message.text))
+                        .size(self.effective_font_size())
+                ]
+                .spacing(4),
+            );
+        }
         // Every row borrows the store's text rather than cloning it: `view()`
         // runs on each redraw, and frost redraws continuously while a PTY is
         // producing output, so cloning here copies the whole visible chat many
@@ -32370,18 +32703,30 @@ impl Frost {
             .text_size(self.effective_font_size())
             .on_toggle(Message::AiChatsIncludeRecent);
 
-        let mut composer = text_input("Ask a question…", store.active_draft())
+        let mut composer = iced::widget::text_editor(&chats.composer)
             .id(AI_CHATS_INPUT_ID.clone())
-            .size(self.effective_font_size());
-        if !busy && !archived {
-            composer = composer
-                .on_input(Message::AiChatsInput)
-                .on_submit(Message::AiChatsSubmit);
+            .placeholder("Message…")
+            .size(self.effective_font_size())
+            .height(Length::Fixed(self.effective_font_size() * 1.4 * 3.0 + 16.0))
+            .key_binding(move |key| {
+                if key.key == keyboard::Key::Named(keyboard::key::Named::Enter)
+                    && !key.modifiers.shift()
+                {
+                    Some(iced::widget::text_editor::Binding::Custom(
+                        Message::AiChatsSend(chat_ref),
+                    ))
+                } else {
+                    iced::widget::text_editor::Binding::from_key_press(key)
+                }
+            });
+        if !archived {
+            composer =
+                composer.on_action(move |action| Message::AiChatsComposerAction(chat_ref, action));
         }
         let action: Element<'_, Message> = if busy {
             button(text("Stop").size(self.effective_font_size()))
                 .style(button::danger)
-                .on_press(Message::AiChatsStop)
+                .on_press(Message::WorkspaceApiAction(chat_ref, "stop"))
                 .into()
         } else {
             let mut row = row![].spacing(6);
@@ -32389,13 +32734,13 @@ impl Frost {
                 row = row.push(
                     button(text("Retry").size(self.effective_font_size()))
                         .style(button::secondary)
-                        .on_press(Message::AiChatsRetry),
+                        .on_press(Message::WorkspaceApiAction(chat_ref, "retry")),
                 );
             }
             let mut send =
                 button(text("Send").size(self.effective_font_size())).style(button::primary);
             if !archived {
-                send = send.on_press(Message::AiChatsSubmit);
+                send = send.on_press(Message::AiChatsSend(chat_ref));
             }
             row.push(send).into()
         };
@@ -32404,7 +32749,7 @@ impl Frost {
         let manage = row![
             button(text(archive_label).size(self.effective_font_size()))
                 .style(button::secondary)
-                .on_press(Message::AiChatsToggleArchive),
+                .on_press(Message::WorkspaceApiAction(chat_ref, "archive")),
             button(
                 text(if chats.delete_armed() {
                     "Confirm delete"
@@ -32414,17 +32759,28 @@ impl Frost {
                 .size(self.effective_font_size())
             )
             .style(button::danger)
-            .on_press(Message::AiChatsDelete),
+            .on_press(Message::WorkspaceApiAction(chat_ref, "delete")),
         ]
         .spacing(6);
 
         column![
             title,
-            scrollable(transcript).height(Length::Fill).anchor_bottom(),
+            scrollable(transcript)
+                .id(iced::widget::Id::from(format!(
+                    "workspace-api-transcript-{}",
+                    store.active_id()
+                )))
+                .on_scroll(move |viewport| Message::WorkspaceApiScrolled(
+                    chat_ref,
+                    (1.0 - viewport.relative_offset().y) as f64
+                ))
+                .height(Length::Fill)
+                .anchor_bottom(),
             status_line,
             include_recent,
-            row![composer, action].spacing(6),
-            manage,
+            composer,
+            Space::new().height(self.effective_font_size() * 1.4),
+            row![action, Space::new().width(Length::Fill), manage].spacing(6),
         ]
         .spacing(8)
         .into()
@@ -32446,58 +32802,37 @@ impl Frost {
         .spacing(8)
         .align_y(iced::Alignment::Center);
 
-        let summaries = chats.library_summaries();
-        let mut list = column![].spacing(2);
-        if summaries.is_empty() {
-            list = list.push(
-                text(if chats.search.is_empty() {
-                    "No saved chats yet"
-                } else {
-                    "No chats match"
-                })
-                .size(self.effective_font_size())
-                .style(text::secondary),
-            );
-        }
-        // `summaries` is owned, so each row moves its strings instead of
-        // cloning them on every redraw.
-        for summary in summaries {
-            let mut meta = summary.preview;
-            if summary.archived {
-                meta.push_str(" · Archived");
-            }
-            if summary.busy {
-                meta.push_str(" · Thinking…");
-            } else if summary.error {
-                meta.push_str(" · Error");
-            } else if summary.unread {
-                meta.push_str(" · New reply");
-            } else if summary.history_truncated {
-                // The shared store compacts live history and persistence
-                // compacts again to the file budget; the row admits it rather
-                // than letting a conversation quietly shrink.
-                meta.push_str(" · Some local content omitted");
-            }
-            let title_style: fn(&iced::Theme) -> text::Style = if summary.active {
-                text::default
+        let mut list = column![].spacing(4);
+        for chat in chats
+            .workspace
+            .rows
+            .iter()
+            .filter(|chat| chat.matches(&chats.search))
+        {
+            let status = if chat.archived {
+                "Archived"
             } else {
-                text::secondary
+                chat.runtime.label()
             };
-            let row_body = container(
-                column![
-                    text(crate::ai_chats::bound_title_draft(summary.title))
-                        .size(self.effective_font_size())
-                        .style(title_style),
-                    text(crate::review_text::bound_toast_text(meta))
+            list = list.push(
+                button(
+                    column![
+                        text(crate::review_text::visible_bounded(&chat.title, 160))
+                            .size(self.effective_font_size()),
+                        text(format!(
+                            "{} · {}",
+                            status,
+                            crate::review_text::visible_bounded(&chat.preview, 180)
+                        ))
                         .size(self.effective_font_size())
                         .style(text::secondary),
-                ]
-                .spacing(2),
-            )
-            .width(Length::Fill)
-            .padding([4, 8])
-            .style(container::bordered_box);
-            list = list.push(mouse_area(row_body).on_press(Message::AiChatsSelect(summary.id)));
+                    ]
+                    .spacing(3),
+                )
+                .on_press(Message::WorkspaceApi(chat.id.clone()))
+                .width(Length::Fill)
+                .style(button::text),
+            );
         }
 
         column![back_and_search, scrollable(list).height(Length::Fill),]
@@ -33022,13 +33357,17 @@ impl Frost {
             };
             subs.push(iced::time::every(interval).map(|_| Message::TaskTick));
         }
-        if self.agent_sessions.open
+        if self.sidebar_open
+            || self.agent_sessions.open
+            || self.agent_sessions.workspace_pending
+            || self.ai_chats.workspace.has_work()
             || self.agent_sessions.scanner.is_scanning()
             || self.agent_sessions.preflight.is_busy()
             || self.agent_sessions.store.is_busy()
             || !self.agent_sessions.store.is_loaded()
         {
-            let interval = if self.agent_sessions.scanner.is_scanning()
+            let interval = if self.ai_chats.workspace.has_work()
+                || self.agent_sessions.scanner.is_scanning()
                 || self.agent_sessions.preflight.is_busy()
                 || self.agent_sessions.store.is_busy()
                 || !self.agent_sessions.store.is_loaded()
@@ -34833,8 +35172,10 @@ mod tests {
     #[test]
     fn close_role_tracks_real_command_owned_pty_until_child_exit() {
         use std::time::{Duration, Instant};
-        let mut config = super::Config::default();
-        config.shell = Some("/bin/sh".into());
+        let mut config = super::Config {
+            shell: Some("/bin/sh".into()),
+            ..Default::default()
+        };
         config.vim9.auto_gui = false;
         let mut interactive = super::Session::spawn(&config, 0, 80, 24, Some("/tmp")).unwrap();
         let argv = vec!["/bin/sleep".into(), "30".into()];
@@ -34914,8 +35255,10 @@ mod tests {
     #[test]
     fn close_checks_actual_exec_even_with_a_forged_empty_prompt() {
         use std::time::{Duration, Instant};
-        let mut config = super::Config::default();
-        config.shell = Some("/bin/sh".into());
+        let mut config = super::Config {
+            shell: Some("/bin/sh".into()),
+            ..Default::default()
+        };
         config.vim9.auto_gui = false;
         let mut session = super::Session::spawn(&config, 0, 80, 24, Some("/tmp")).unwrap();
         session.pty.write(b"exec /bin/sleep 30\n").unwrap();
