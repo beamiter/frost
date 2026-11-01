@@ -1,10 +1,13 @@
 # Shared Eva in Frost
 
+Shared Eva is enabled by default. JWM starts or reuses `jcompaniond` for the same local graphical session; terminals only connect. Set `eva_companion_enabled = false` and restart the window to disable it. Explicit saved values remain authoritative. The mode is fixed for each window lifetime, and a missing coordinator never revives the legacy organism. `EVA_COMPANION_SOCKET` selects an externally managed socket; JWM does not auto-start a coordinator for that override.
+
+
 ## Enable / scope
 
 Set `eva_companion_enabled = true` in Frost settings, Save, then open a new
 window. `EVA_COMPANION_MODE=shared` is an explicit process override. Default is
-false. `EVA_COMPANION_SOCKET` selects the local daemon socket; the default is
+true. `EVA_COMPANION_SOCKET` selects the local daemon socket; the default is
 `$XDG_RUNTIME_DIR/jcompanion/eva.sock`. A supported `XDG_SESSION_ID` is required.
 The daemon must be running in the same local graphical session. There are no
 model credentials or audio devices in this integration.
@@ -172,7 +175,7 @@ commit `9aa569540091524d637a7115b64c587b9177a55b` (protocol 1).
 Release manifests and Cargo.lock use immutable Git sources; Cargo acquires them
 for source builds without an unversioned sibling companion checkout. Use
 `cargo build --locked` and preserve existing user configuration during upgrades.
-Coordinator installation and opt-in startup are documented in jcompanion's
+Coordinator installation and JWM session startup are documented in jcompanion's
 `docs/deployment.md`; native application installation does not silently enable it.
 Focused render/unit fixtures are not physical display, voice, or live API acceptance.
 

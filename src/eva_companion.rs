@@ -2283,21 +2283,26 @@ mod tests {
     // Exact native ordering and registration lifetime are tested by the
     // production-source harness and real X11 matrix, not source-text searches.
     #[test]
-    fn shared_eva_is_opt_in_and_settings_round_trip() {
+    fn shared_eva_defaults_on_and_settings_round_trip() {
         let config = crate::config::Config::default();
-        assert!(!config.eva_companion_enabled);
+        assert!(config.eva_companion_enabled);
+        assert!(
+            crate::config::Config::from_toml("")
+                .unwrap()
+                .eva_companion_enabled
+        );
         let mut config = config;
-        config.eva_companion_enabled = true;
+        config.eva_companion_enabled = false;
         config.eva_companion_skin = "fox".into();
         config.eva_companion_high_contrast = true;
         let encoded = toml::to_string(&config).unwrap();
         let restored: crate::config::Config = toml::from_str(&encoded).unwrap();
-        assert!(restored.eva_companion_enabled);
+        assert!(!restored.eva_companion_enabled);
         assert_eq!(restored.eva_companion_skin, "fox");
         assert!(restored.eva_companion_high_contrast);
         let example: crate::config::Config =
             toml::from_str(include_str!("../config.toml.example")).unwrap();
-        assert!(!example.eva_companion_enabled);
+        assert!(example.eva_companion_enabled);
         assert_eq!(example.eva_companion_skin, "cat");
     }
     #[test]
