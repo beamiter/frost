@@ -31746,11 +31746,21 @@ impl Frost {
                 .task_panel
                 .follow_up_reference(task.id, completed_turns);
             let input_reference = reference.clone();
+            let send_reference = reference.clone();
             let input = iced::widget::text_editor(&self.task_panel.follow_up_editor)
                 .placeholder("Review feedback for the next turn…")
                 .height(Length::Fixed(self.chrome_font_size() * 1.4 * 3.0 + 16.0))
                 .on_action(move |action| {
                     Message::TaskFollowUpEditorAction(input_reference.clone(), action)
+                })
+                .key_binding(move |key| {
+                    if ai_chats::composer_submit_key(&key, false) {
+                        Some(iced::widget::text_editor::Binding::Custom(
+                            Message::TaskFollowUpSend(send_reference.clone()),
+                        ))
+                    } else {
+                        iced::widget::text_editor::Binding::from_key_press(key)
+                    }
                 })
                 .size(self.chrome_font_size());
             let mut send = button(text("Send turn").size(self.chrome_font_size()));
@@ -32705,13 +32715,15 @@ impl Frost {
 
         let mut composer = iced::widget::text_editor(&chats.composer)
             .id(AI_CHATS_INPUT_ID.clone())
-            .placeholder("Message…")
+            .placeholder(if self.config.ai_chat_send_on_enter {
+                "Message (Enter to send, Shift+Enter for a new line)"
+            } else {
+                "Message (Enter for a new line, Ctrl+Enter to send)"
+            })
             .size(self.effective_font_size())
             .height(Length::Fixed(self.effective_font_size() * 1.4 * 3.0 + 16.0))
             .key_binding(move |key| {
-                if key.key == keyboard::Key::Named(keyboard::key::Named::Enter)
-                    && !key.modifiers.shift()
-                {
+                if ai_chats::composer_submit_key(&key, self.config.ai_chat_send_on_enter) {
                     Some(iced::widget::text_editor::Binding::Custom(
                         Message::AiChatsSend(chat_ref),
                     ))

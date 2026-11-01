@@ -81,7 +81,13 @@ impl NativeEnterOwnership {
     fn observe(&mut self, id: Id, event: &WindowEvent) -> bool {
         match event {
             WindowEvent::Focused(true) => self.focused = Some(id),
-            WindowEvent::Focused(false) if self.focused == Some(id) => self.focused = None,
+            WindowEvent::Focused(false) if self.focused == Some(id) => {
+                self.focused = None;
+                if let Some(state) = self.windows.get_mut(&id) {
+                    state.ime = ImeReturn::default();
+                }
+            }
+            WindowEvent::Ime(event) => self.windows.entry(id).or_default().ime.observe(event),
             WindowEvent::Destroyed => {
                 self.windows.remove(&id);
                 if self.focused == Some(id) {
@@ -110,6 +116,13 @@ impl NativeEnterOwnership {
                     *is_synthetic,
                     is_enter,
                 );
+                // This observer runs before Iced dispatches widget messages.
+                // Subscription-level suppression arrives too late to stop a
+                // composer custom binding from submitting on candidate Return.
+                if state.ime.key(event.state.is_pressed(), is_enter) && !is_synthetic {
+                    state.native.claim_pressed();
+                    return true;
+                }
                 // Iced delivers widget messages before subscription key messages.
                 // Keep a count until each forwarded Enter press is acknowledged,
                 // even if native key-up arrived before that delivery.
@@ -128,8 +141,47 @@ impl NativeEnterOwnership {
 #[derive(Default)]
 struct WindowEnterState {
     native: EnterState,
+    ime: ImeReturn,
     pending: HashMap<PhysicalKey, usize>,
     pending_owned: HashMap<PhysicalKey, usize>,
+}
+
+#[derive(Default)]
+struct ImeReturn {
+    composing: bool,
+    confirmation_pending: bool,
+}
+
+impl ImeReturn {
+    fn observe(&mut self, event: &iced_winit::winit::event::Ime) {
+        use iced_winit::winit::event::Ime;
+        match event {
+            Ime::Preedit(text, _) => {
+                self.composing = !text.is_empty();
+                self.confirmation_pending |= self.composing;
+            }
+            Ime::Commit(_) => {
+                self.composing = false;
+                self.confirmation_pending = true;
+            }
+            // A backend can disable IME after committing but before delivering
+            // the confirming key. Keep that Return owned until release.
+            Ime::Disabled => self.composing = false,
+            Ime::Enabled => {}
+        }
+    }
+
+    fn key(&mut self, pressed: bool, enter: bool) -> bool {
+        if enter {
+            if pressed {
+                return self.composing || self.confirmation_pending;
+            }
+            self.confirmation_pending = false;
+        } else if pressed {
+            self.confirmation_pending = false;
+        }
+        false
+    }
 }
 
 impl WindowEnterState {
@@ -210,6 +262,34 @@ impl EnterState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_return_is_owned_before_widgets_until_its_physical_release() {
+        use iced_winit::winit::event::Ime;
+        let mut ime = ImeReturn::default();
+        ime.observe(&Ime::Preedit("中文".into(), Some((0, 6))));
+        assert!(ime.key(true, true));
+        ime.observe(&Ime::Preedit(String::new(), None));
+        ime.observe(&Ime::Commit("中文".into()));
+        assert!(ime.key(true, true)); // A queued repeat still belongs to IME.
+        assert!(!ime.key(false, true));
+        assert!(!ime.key(true, true)); // A fresh explicit send can proceed.
+    }
+
+    #[test]
+    fn commit_before_return_and_cancelled_composition_cannot_submit() {
+        use iced_winit::winit::event::Ime;
+        let mut ime = ImeReturn::default();
+        ime.observe(&Ime::Commit("文".into()));
+        ime.observe(&Ime::Disabled);
+        assert!(ime.key(true, true));
+        ime.key(false, true);
+        ime.observe(&Ime::Preedit("文".into(), None));
+        ime.observe(&Ime::Preedit(String::new(), None));
+        assert!(ime.key(true, true));
+        ime.key(false, true);
+        assert!(!ime.key(true, true));
+    }
     const MAIN: PhysicalKey = PhysicalKey::Code(KeyCode::Enter);
     const PAD: PhysicalKey = PhysicalKey::Code(KeyCode::NumpadEnter);
 

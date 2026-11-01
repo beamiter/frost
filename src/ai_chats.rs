@@ -48,6 +48,21 @@ const CHATS_FILE_BUDGET: usize = jterm_core::ai::MAX_CONVERSATION_SNAPSHOT_JSON_
 /// The "include recent shell context" slice, same as the sources.
 const RECENT_CONTEXT_ENTRIES: usize = 5;
 
+/// Unfocused editors must never turn a terminal's Return into an API send.
+pub(crate) fn composer_submit_key(
+    key: &iced::widget::text_editor::KeyPress,
+    enter_sends: bool,
+) -> bool {
+    matches!(
+        key.status,
+        iced::widget::text_editor::Status::Focused { .. }
+    ) && key.key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
+        && !key.modifiers.shift()
+        && !key.modifiers.alt()
+        && !key.modifiers.logo()
+        && (key.modifiers.control() || enter_sends)
+}
+
 pub(crate) fn chats_path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("frost").join("ai_chats.json"))
 }
@@ -943,6 +958,37 @@ fn draft_without_retry_message(retry: &str, draft: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composer_send_chord_requires_the_current_editor_focus() {
+        use iced::keyboard::{key, Key, Modifiers};
+        use iced::widget::text_editor::{KeyPress, Status};
+        let mut press = KeyPress {
+            key: Key::Named(key::Named::Enter),
+            modified_key: Key::Named(key::Named::Enter),
+            physical_key: key::Physical::Code(key::Code::Enter),
+            modifiers: Modifiers::empty(),
+            text: None,
+            status: Status::Focused { is_hovered: false },
+        };
+        assert!(!composer_submit_key(&press, false));
+        assert!(composer_submit_key(&press, true));
+        press.modifiers = Modifiers::CTRL;
+        assert!(composer_submit_key(&press, false));
+        for status in [Status::Active, Status::Hovered, Status::Disabled] {
+            press.status = status;
+            assert!(!composer_submit_key(&press, true));
+        }
+        press.status = Status::Focused { is_hovered: true };
+        for modifiers in [
+            Modifiers::SHIFT,
+            Modifiers::CTRL | Modifiers::ALT,
+            Modifiers::LOGO,
+        ] {
+            press.modifiers = modifiers;
+            assert!(!composer_submit_key(&press, true));
+        }
+    }
 
     struct ScratchDir(PathBuf);
 

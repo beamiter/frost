@@ -68,6 +68,11 @@ struct Size {
     height: f32,
 }
 mod config {
+    #[derive(Default)]
+    pub struct Config {
+        pub sidebar_width: Option<f32>,
+        pub inspector_width: Option<f32>,
+    }
     pub fn default_remote_hosts() -> Vec<crate::jterm_core::jsh_remote::RemoteHostConfig> {
         vec![crate::jterm_core::jsh_remote::RemoteHostConfig {
             name: "test host".into(),
@@ -325,6 +330,7 @@ impl DropIntentInvalidation {
 }
 
 struct TerminalApp {
+    config: config::Config,
     win_size: Size,
     reference_inspector_open: bool,
     reference_inspector_drawer: bool,
@@ -355,6 +361,9 @@ struct TerminalApp {
     queued_loads: usize,
 }
 impl TerminalApp {
+    fn chrome_font_size(&self) -> f32 {
+        14.0
+    }
     fn set_sidebar_notice(&mut self, _: String, _: bool) {
         self.mutations += 1
     }
@@ -420,6 +429,7 @@ fn setup() -> Rc<RefCell<TerminalApp>> {
         sidebar_panel: SidebarPanel::Tabs,
     };
     Rc::new(RefCell::new(TerminalApp {
+        config: config::Config::default(),
         win_size: Size { width: 1356.0, height: 704.0 },
         reference_inspector_open: true,
         reference_inspector_drawer: false,
@@ -798,15 +808,15 @@ fn actual_glass_inspector_boundaries_and_hidden_navigation_are_not_legacy_geomet
     a.win_size = Size { width: 1612.0, height: 976.0 };
     a.sidebar_open = true;
     let layout = a.reference_layout();
-    assert_eq!(layout.titlebar.height, 69.0);
-    assert_eq!(layout.center.x, 342.0);
-    assert_eq!(layout.center.width, 902.0);
-    assert_eq!(layout.composer.width, 892.0);
+    assert_eq!(layout.titlebar.height, 42.0);
+    assert_eq!(layout.center.x, 266.0);
+    assert_eq!(layout.center.width, 1056.0);
+    assert_eq!(layout.composer.width, 1000.0);
     a.reference_inspector_open = false;
     let hidden = a.reference_layout();
-    assert_eq!(hidden.center.width - layout.center.width, 360.0);
+    assert_eq!(hidden.center.width - layout.center.width, 290.0);
     assert_eq!(hidden.header.width, hidden.center.width);
-    assert_eq!(hidden.composer.width - layout.composer.width, 360.0);
+    assert_eq!(hidden.composer.width - layout.composer.width, 290.0);
 }
 
 #[test]

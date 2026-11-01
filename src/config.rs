@@ -184,6 +184,11 @@ pub struct Config {
     #[serde(default)]
     pub ai_enabled: bool,
 
+    /// API composer: Enter inserts a newline by default; Ctrl+Enter sends.
+    /// Opt in to Enter-to-send (Shift+Enter keeps inserting a newline).
+    #[serde(default)]
+    pub ai_chat_send_on_enter: bool,
+
     /// Remote destinations for the host picker (Ctrl+Shift+S). Grammar,
     /// validation and the argv a tab runs are the family-shared
     /// `jterm_core::jsh_remote::RemoteHostConfig`. A file with no key at all
@@ -705,6 +710,7 @@ impl Default for Config {
             ascii_organism_care_enabled: false,
             jsh_update_check: default_jsh_update_check(),
             ai_enabled: false,
+            ai_chat_send_on_enter: false,
             remote_hosts: default_remote_hosts(),
             ai_provider: default_ai_provider(),
             ai_base_url: default_ai_base_url(),

@@ -105,10 +105,14 @@ pub(crate) fn prepare(id: window::Id) -> Option<u64> {
 }
 pub(crate) fn next_serial() -> Option<u64> {
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-        value.checked_add(1)
-    })
-    .ok()
+    let mut value = NEXT.load(Ordering::Relaxed);
+    loop {
+        let next = value.checked_add(1)?;
+        match NEXT.compare_exchange_weak(value, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(previous) => return Some(previous),
+            Err(current) => value = current,
+        }
+    }
 }
 pub(crate) fn cancel(id: window::Id, serial: u64) {
     if let Some(observer) = observers().lock().unwrap().get_mut(&id) {

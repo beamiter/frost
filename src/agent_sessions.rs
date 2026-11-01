@@ -303,7 +303,11 @@ impl SessionLibrary {
                     && self
                         .provider
                         .is_none_or(|provider| provider == session.provider)
-                    && self.status.is_none_or(|status| status == session.status)
+                    && self.status.is_none_or(|status| {
+                        status == session.status
+                            && (status != SessionStatus::Waiting
+                                || row.is_some_and(|row| row.runtime.is_live()))
+                    })
                     && (!self.live_only
                         || self
                             .workspace
@@ -2672,6 +2676,18 @@ mod tests {
             sessions,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn historical_waiting_is_readable_without_becoming_current_attention() {
+        let mut recorded = session(SessionProvider::Codex, "old-waiting", "Saved approval");
+        recorded.status = SessionStatus::Waiting;
+        let mut state = library();
+        state.replace_catalog(catalog(vec![recorded]));
+        assert_eq!(state.workspace_visible().len(), 1);
+        state.status = Some(SessionStatus::Waiting);
+        state.apply_filters();
+        assert!(state.workspace_visible().is_empty());
     }
     fn library() -> SessionLibrary {
         SessionLibrary::with_store(SessionLibraryStore::with_path(
