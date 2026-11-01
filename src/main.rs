@@ -1,3 +1,4 @@
+mod agent_cli;
 use crate::theme::ThemeExt as _;
 pub(crate) use jterm_core::char_width;
 use jterm_core::click_cursor;

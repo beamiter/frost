@@ -640,6 +640,8 @@ mod unix_pty {
             command_argv: Option<&[String]>,
             extra_env: &[(&str, &str)],
         ) -> Result<Self> {
+            let inline_command = command_argv.map(crate::agent_cli::inline_argv);
+            let command_argv = inline_command.as_deref();
             // Reject malformed explicit commands before openpty: returning
             // from the later argv builder would otherwise leak both raw fds.
             if command_argv.is_some_and(|argv| argv.is_empty()) {
@@ -836,7 +838,7 @@ mod unix_pty {
                 // pointers and execve's.
                 let env_cstrings =
                     match jterm_core::child_env::envp(&child_env_options(), extra_env) {
-                        Ok(block) => block,
+                        Ok(block) => crate::agent_cli::environment(block),
                         Err(error) => {
                             libc::close(master);
                             libc::close(slave);

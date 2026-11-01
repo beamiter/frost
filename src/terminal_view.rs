@@ -857,6 +857,7 @@ struct State {
     mode_epoch: u64,
     dragging: bool,
     scrollbar_dragging: bool,
+    scrollbar_grab_offset: f32,
     /// Ordinary presses published to the app layer, independently per button.
     /// Right/middle do not arm
     /// text dragging, but their release must still follow the press across a
@@ -906,6 +907,7 @@ impl Default for State {
             mode_epoch: 0,
             dragging: false,
             scrollbar_dragging: false,
+            scrollbar_grab_offset: 0.0,
             published_presses: [false; 3],
             consumed_presses: [false; 3],
             last_click: None,
@@ -1780,14 +1782,13 @@ impl<'a, Message> TermWidget<'a, Message> {
         Some((track_top, track_h, x, thumb_y, thumb_h))
     }
 
-    /// Map a pointer y-coordinate (centering the thumb on the cursor) to an
-    /// absolute scrollback offset.
-    fn offset_from_y(&self, y: f32, bounds: Rectangle) -> usize {
+    /// Map a pointer y-coordinate to history while preserving its grab point.
+    fn offset_from_y(&self, y: f32, bounds: Rectangle, grab_offset: f32) -> usize {
         let Some((track_top, track_h, _, _, thumb_h)) = self.scrollbar_geometry(bounds) else {
             return 0;
         };
         let usable = (track_h - thumb_h).max(1.0);
-        let rel = (y - track_top - thumb_h / 2.0).clamp(0.0, usable);
+        let rel = (y - track_top - grab_offset.clamp(0.0, thumb_h)).clamp(0.0, usable);
         let frac = 1.0 - rel / usable;
         (frac * self.scrollback_len as f32).round() as usize
     }
@@ -2961,6 +2962,23 @@ mod tests {
             }
             widget.organism_body = None;
             assert!(!widget.organism_walking(Some(&initial), &state, None));
+        });
+    }
+
+    #[test]
+    fn scrollbar_drag_keeps_grab_point_and_reaches_both_history_edges() {
+        with_native_body(|widget, bounds| {
+            widget.scrollback_len = 200;
+            widget.scroll_offset = 0;
+            widget.scrollbar_always = true;
+            let (top, height, _, thumb_y, thumb_height) =
+                widget.scrollbar_geometry(bounds).unwrap();
+            for grab in [1.0, thumb_height / 2.0, thumb_height - 1.0] {
+                assert_eq!(widget.offset_from_y(thumb_y + grab, bounds, grab), 0);
+                assert_eq!(widget.offset_from_y(top + grab, bounds, grab), 200);
+                assert_eq!(widget.offset_from_y(top - 100.0, bounds, grab), 200);
+                assert_eq!(widget.offset_from_y(top + height + 100.0, bounds, grab), 0);
+            }
         });
     }
 
@@ -5711,11 +5729,18 @@ where
                 // Grabbing the scrollbar gutter starts a scroll drag, not a
                 // text selection.
                 if button == MouseButton::Left {
-                    if let Some((_, _, sb_x, _, _)) = self.scrollbar_geometry(bounds) {
+                    if let Some((_, _, sb_x, thumb_y, thumb_h)) = self.scrollbar_geometry(bounds) {
                         if pos.x >= sb_x {
+                            state.scrollbar_grab_offset =
+                                if (thumb_y..=thumb_y + thumb_h).contains(&pos.y) {
+                                    pos.y - thumb_y
+                                } else {
+                                    thumb_h / 2.0
+                                };
                             state.scrollbar_dragging = true;
                             state.published_presses[MouseButton::Left.slot()] = false;
-                            let offset = self.offset_from_y(pos.y, bounds);
+                            let offset =
+                                self.offset_from_y(pos.y, bounds, state.scrollbar_grab_offset);
                             shell.publish(on_mouse(MouseInput::ScrollTo { offset }));
                             shell.capture_event();
                             return;
@@ -5936,8 +5961,9 @@ where
                     return;
                 }
                 if state.scrollbar_dragging {
-                    let offset = self.offset_from_y(pos.y, bounds);
+                    let offset = self.offset_from_y(pos.y, bounds, state.scrollbar_grab_offset);
                     shell.publish(on_mouse(MouseInput::ScrollTo { offset }));
+                    shell.capture_event();
                     return;
                 }
                 if !state.dragging {
@@ -6018,6 +6044,7 @@ where
                 if button == MouseButton::Left {
                     if state.scrollbar_dragging {
                         state.scrollbar_dragging = false;
+                        shell.capture_event();
                         return;
                     }
                     // Only a press that armed the drag pipeline emits a
@@ -6252,6 +6279,7 @@ mod focus_state_tests {
             mode_epoch: 0,
             dragging: true,
             scrollbar_dragging: true,
+            scrollbar_grab_offset: 0.0,
             published_presses: [true; 3],
             consumed_presses: [true; 3],
             last_click: Some((Instant::now(), 3, 2)),
