@@ -1975,7 +1975,7 @@ impl Frost {
                 .padding(24)
                 .style(container::rounded_box);
                 let panel = crate::widget_identity_scope::scope_key(eva.close_ui_revision, panel);
-                Some(iced::widget::opaque(container(panel).center(Length::Fill)).into())
+                Some(iced::widget::opaque(container(panel).center(Length::Fill)))
             } else if eva.closing && eva.close_guarded && eva.close_paused_for_work {
                 let panel = container(
                     row![
@@ -2245,7 +2245,14 @@ mod tests {
                     Color::TRANSPARENT,
                 );
                 assert!(
-                    pixels.data().chunks_exact(4).filter(|p| p[3] > 0).count() > 100,
+                    pixels
+                        .data()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .filter(|p| p[3] > 0)
+                        .count()
+                        > 100,
                     "missing native glyph raster: {} {}",
                     skin.key(),
                     pose.key()
@@ -2253,18 +2260,20 @@ mod tests {
                 // Iced tiny-skia targets softbuffer's BGRA-premultiplied layout;
                 // a PNG is straight RGBA. Preserve the actual native colors.
                 let mut rgba = pixels.data().to_vec();
-                for pixel in rgba.chunks_exact_mut(4) {
+                for pixel in rgba.as_chunks_mut::<4>().0 {
                     pixel.swap(0, 2);
                     let alpha = pixel[3] as u32;
-                    if alpha > 0 {
-                        for c in &mut pixel[..3] {
-                            *c = ((*c as u32 * 255 + alpha / 2) / alpha).min(255) as u8;
+                    for c in &mut pixel[..3] {
+                        if let Some(value) = (*c as u32 * 255 + alpha / 2).checked_div(alpha) {
+                            *c = value.min(255) as u8;
                         }
                     }
                 }
                 if skin == atlas::Skin::Fox {
                     assert!(
-                        rgba.chunks_exact(4)
+                        rgba.as_chunks::<4>()
+                            .0
+                            .iter()
                             .any(|p| p[3] > 100 && p[0] as u16 > p[2] as u16 + 20),
                         "Fox native palette must remain orange, not BGR-blue"
                     );

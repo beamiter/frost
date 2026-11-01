@@ -245,7 +245,7 @@ pub struct Config {
     /// Show the provider-neutral Tasks dashboard. This is independent from
     /// cloud-AI consent because local Agent CLIs and task bookkeeping do not
     /// inherently send terminal context off-machine.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub experimental_task_sidebar: bool,
 
     /// Preferred coding-agent CLI for Create task / quick-launch hints
@@ -622,6 +622,10 @@ fn default_rows() -> usize {
     30
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_theme() -> String {
     "dark".to_string()
 }
@@ -713,7 +717,7 @@ impl Default for Config {
             agent_max_turns: default_agent_max_turns(),
             ai_share_command_context: false,
             command_correction_enabled: false,
-            experimental_task_sidebar: false,
+            experimental_task_sidebar: true,
             preferred_agent_provider: default_preferred_agent_provider(),
             font_size: default_font_size(),
             chrome_font_size: Some(default_font_size()),
@@ -2429,9 +2433,11 @@ mod tests {
     }
 
     #[test]
-    fn task_dashboard_and_context_sharing_default_off() {
+    fn task_dashboard_defaults_on_without_enabling_context_sharing() {
         let config = Config::from_toml("").expect("empty config parses");
-        assert!(!config.experimental_task_sidebar);
+        assert!(config.experimental_task_sidebar);
+        let disabled = Config::from_toml("experimental_task_sidebar = false\n").unwrap();
+        assert!(!disabled.experimental_task_sidebar);
         assert!(!config.ai_share_command_context);
         assert!(config.ai_redact_secrets);
         assert_eq!(config.preferred_agent_provider, "codex");

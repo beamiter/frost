@@ -95,7 +95,11 @@ pub(crate) struct ChatRequest {
 
 pub(crate) struct AiChatsUi {
     pub(crate) is_open: bool,
+    pub(crate) composer: iced::widget::text_editor::Content,
     pub(crate) store: ChatStore,
+    pub(crate) workspace: crate::workspace_chat_bridge::WorkspaceChats,
+    redact_secrets: bool,
+    pub(crate) restore_read: Option<(u64, f32)>,
     /// Where this panel's library lives. Resolved once at construction so
     /// every read and write answers to the same path (and so tests can point
     /// a panel at a fixture instead of the user's real config directory).
@@ -140,7 +144,11 @@ impl AiChatsUi {
     fn with_path(owns_persistence: bool, path: Option<PathBuf>) -> Self {
         Self {
             is_open: false,
+            composer: iced::widget::text_editor::Content::new(),
             store: ai_chat_store::new_store(),
+            workspace: Default::default(),
+            redact_secrets: true,
+            restore_read: None,
             path,
             persist_state: PersistState::Unloaded,
             owns_persistence,
@@ -163,7 +171,69 @@ impl AiChatsUi {
     /// resolve the provider label. The caller gates `ai_enabled` with a toast,
     /// so a broken provider still opens the panel and explains itself in
     /// place (anvil's restored-panel behavior).
+    pub(crate) fn load_workspace_library(&mut self, redact: bool) {
+        self.redact_secrets = redact;
+        if self.persist_state == PersistState::Unloaded {
+            if let Some(path) = self.path.clone() {
+                self.restore_from_path(&path);
+            }
+        }
+        let namespace = format!(
+            "frost:{}",
+            self.path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
+        self.workspace
+            .start(&mut self.store, &namespace, self.redact_secrets);
+    }
+
+    pub(crate) fn drive_workspace(&mut self, config: &Config) -> Vec<ChatRequest> {
+        let mut requests = Vec::new();
+        for effect in self
+            .workspace
+            .drive(&mut self.store, config.ai_redact_secrets)
+        {
+            match effect {
+                crate::workspace_chat_bridge::Effect::SyncDraft(id) => {
+                    if self.store.active_id() == id {
+                        self.composer = iced::widget::text_editor::Content::with_text(
+                            self.store.active_draft(),
+                        );
+                    }
+                }
+                crate::workspace_chat_bridge::Effect::Activate(id) => {
+                    self.store.select_chat(id);
+                    self.restore_read =
+                        Some((id, self.workspace.read_position(id).unwrap_or(1.0) as f32));
+                    self.sync_title_draft();
+                    self.is_open = true;
+                    self.page = ChatsPage::Chat;
+                }
+                crate::workspace_chat_bridge::Effect::Submit {
+                    chat_id,
+                    text,
+                    clear_draft,
+                } => {
+                    let selected = self.store.active_id();
+                    self.store.select_chat(chat_id);
+                    if let Some(request) = self.begin_request(config, text, clear_draft) {
+                        self.workspace.bind(request.token, clear_draft);
+                        requests.push(request);
+                    } else {
+                        self.workspace.refuse_dispatch(chat_id);
+                    }
+                    self.store.select_chat(selected);
+                    self.sync_title_draft();
+                }
+            }
+        }
+        requests
+    }
+
     pub(crate) fn open(&mut self, config: &Config) {
+        self.redact_secrets = config.ai_redact_secrets;
         self.is_open = true;
         self.page = ChatsPage::Chat;
         self.confirm_delete = false;
@@ -197,6 +267,7 @@ impl AiChatsUi {
     /// Close the panel. In-flight requests keep running into the store (and
     /// persist on completion) so closing never loses a reply.
     pub(crate) fn close(&mut self, redact: bool) {
+        self.workspace.leave();
         self.is_open = false;
         self.confirm_delete = false;
         self.persist(redact);
@@ -322,6 +393,7 @@ impl AiChatsUi {
             return;
         }
         if self.store.set_active_draft(draft) {
+            self.workspace.changed(&self.store);
             self.dirty = true;
         }
     }
@@ -357,13 +429,6 @@ impl AiChatsUi {
             return;
         }
         self.search = query;
-    }
-
-    pub(crate) fn library_summaries(&self) -> Vec<jterm_core::ai::ChatSummary> {
-        if library_search_is_unsafe(&self.search) {
-            return Vec::new();
-        }
-        self.store.summaries_filtered(&self.search)
     }
 
     pub(crate) fn include_recent(&self, chat_id: u64) -> bool {
@@ -496,7 +561,12 @@ impl AiChatsUi {
             return None;
         }
         let text = self.store.active_draft().trim().to_string();
-        self.begin_request(config, text, true)
+        if self.workspace.is_shared(self.store.active_id()) {
+            self.workspace.submit(&self.store, text);
+            None
+        } else {
+            self.begin_request(config, text, true)
+        }
     }
 
     /// Stop the active chat's in-flight request, restoring its message into
@@ -508,6 +578,7 @@ impl AiChatsUi {
         if let Some(cancellation) = self.in_flight.remove(&token) {
             cancellation.cancel();
         }
+        self.workspace.cancel(token);
         if self
             .store
             .cancel_request(token, STOPPED_STATUS.to_string())
@@ -523,6 +594,18 @@ impl AiChatsUi {
     pub(crate) fn retry(&mut self, config: &Config) -> Option<ChatRequest> {
         let chat_id = self.store.active_id();
         let text = self.retry_payloads.get(&chat_id)?.clone();
+        if self.workspace.is_shared(chat_id) {
+            if !self.store.active_draft().trim().is_empty()
+                && self.store.active_draft().trim() != text.trim()
+            {
+                self.set_notice("Your newer draft was kept. Send or clear it before retrying the failed message.");
+                return None;
+            }
+            self.store.set_active_draft(text.clone());
+            self.sync_title_draft();
+            self.workspace.submit(&self.store, text);
+            return None;
+        }
         let remaining = draft_without_retry_message(&text, self.store.active_draft());
         let original = self.store.active_draft().to_string();
         self.store.set_active_draft(remaining);
@@ -557,6 +640,12 @@ impl AiChatsUi {
         }
         match result {
             Ok(answer) => {
+                let durable = if self.redact_secrets {
+                    jterm_core::redact::redact_secrets(answer.trim())
+                } else {
+                    answer.trim().to_owned()
+                };
+                self.workspace.complete(token, &durable);
                 if self
                     .store
                     .complete_success(token, answer.trim().to_string())
@@ -567,6 +656,7 @@ impl AiChatsUi {
                 }
             }
             Err(error) => {
+                self.workspace.cancel(token);
                 let error = jterm_core::review_input::safe_inline_display(&error, 2 * 1024);
                 // Keep the streamed evidence visible beside the recorded
                 // error; the store has already rolled the message back into
@@ -597,6 +687,7 @@ impl AiChatsUi {
             .map(|(_, text)| text.as_str())
     }
 
+    #[cfg(test)]
     pub(crate) fn new_chat(&mut self, redact: bool) {
         match self.store.new_chat() {
             Ok(_) => {
@@ -614,18 +705,6 @@ impl AiChatsUi {
         }
     }
 
-    pub(crate) fn select_chat(&mut self, id: u64, redact: bool) {
-        if self.store.select_chat(id) {
-            self.confirm_delete = false;
-            self.interrupted_partial = None;
-            self.sync_title_draft();
-            self.notice.clear();
-            self.dirty = true;
-            self.persist(redact);
-        }
-        self.page = ChatsPage::Chat;
-    }
-
     /// The rename editor types into `title_draft`; the store normalizes every
     /// change into its own title (whitespace collapse, spoof replacement,
     /// 80-char/256-byte bounds). The iced field is truncated to the same
@@ -640,13 +719,30 @@ impl AiChatsUi {
         }
         self.title_draft = title;
         if self.store.rename_active(&self.title_draft) {
+            self.workspace.changed(&self.store);
             self.dirty = true;
         }
     }
 
     pub(crate) fn toggle_archive(&mut self, redact: bool) {
+        if self.workspace.is_pending(self.store.active_id()) {
+            return;
+        }
+        let archived_id = self.store.active_id();
         match self.store.toggle_archive_active() {
             Ok(_) => {
+                self.workspace.changed_id(&self.store, archived_id);
+                if self.workspace.is_shared(archived_id)
+                    && !self.workspace.is_shared(self.store.active_id())
+                {
+                    if let Some(next) = self.workspace.rows.iter().find(|row| {
+                        !row.archived && self.workspace.id_for(archived_id) != Some(&row.id)
+                    }) {
+                        self.workspace.open(next.id.clone());
+                    } else {
+                        self.workspace.create();
+                    }
+                }
                 self.confirm_delete = false;
                 self.interrupted_partial = None;
                 self.sync_title_draft();
@@ -681,6 +777,10 @@ impl AiChatsUi {
             return;
         }
         self.confirm_delete = false;
+        if self.workspace.is_shared(self.store.active_id()) {
+            self.workspace.delete(self.store.active_id());
+            return;
+        }
         match self.store.delete_active() {
             Ok(outcome) => {
                 let id = outcome.deleted_chat_id;
@@ -721,6 +821,10 @@ impl AiChatsUi {
     }
 
     fn sync_title_draft(&mut self) {
+        if self.composer.text() != self.store.active_draft() {
+            self.composer =
+                iced::widget::text_editor::Content::with_text(self.store.active_draft());
+        }
         self.title_draft = self.store.active_title().to_string();
     }
 }
