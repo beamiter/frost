@@ -14,9 +14,16 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+fn companion_button<'a>(label: iced::widget::Text<'a>) -> iced::widget::Button<'a, Message> {
+    button(label.size(11))
+        .padding([5, 8])
+        .style(crate::native_shell::header_outlined_style())
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Event {
     Wake,
+    ToggleDetails,
     ForceClose(u64),
     KeepOpen(u64),
     Geometry(Rectangle),
@@ -210,6 +217,7 @@ pub(crate) struct Eva {
     context: Option<shared::ContextRef>,
     context_revision: u64,
     input_focused: bool,
+    details_open: bool,
     draft: String,
     dialogue: Option<(String, shared::ContextRef)>,
     dialogue_save: shared::DialogueSave,
@@ -299,6 +307,7 @@ impl Eva {
             context: None,
             context_revision: 0,
             input_focused: false,
+            details_open: false,
             draft: String::new(),
             dialogue: None,
             dialogue_save: Default::default(),
@@ -1164,6 +1173,12 @@ impl Frost {
                 self.config.eva_companion_enabled = v;
                 self.config_dirty = true;
             }
+            Event::ToggleDetails => {
+                if let Some(eva) = self.eva.as_mut() {
+                    eva.details_open = !eva.details_open;
+                    eva.input_focused = false;
+                }
+            }
             Event::Skin(v) => {
                 if atlas::Skin::from_key(&v).is_some() {
                     if let Some(eva) = self.eva.as_mut() {
@@ -1260,8 +1275,9 @@ impl Frost {
         };
         // Dedicated inspector slot: measure its actual native Canvas bounds below.
         // Reserve no terminal/document rows. Tiny/narrow inspectors have no slot.
+        let details_open = self.eva.as_ref().is_some_and(|eva| eva.details_open);
         let slot_size = inspector.and_then(|r| {
-            let height = r.height - header - 400.;
+            let height = r.height - header - if details_open { 400. } else { 96. };
             let width = r.width - 24.;
             if width >= 240. && height >= 242. {
                 Some((240., 242.))
@@ -1411,10 +1427,16 @@ impl Frost {
             .dialogue
             .as_ref()
             .map_or(String::new(), |(id, _)| id.clone());
-        let mut card = column![
-            text("Eva · shared companion").size(13),
-            text(eva.host.gate.status()).size(11)
+        let mut card = column![row![
+            text("Eva").size(12).width(Length::Fill),
+            companion_button(text(if eva.details_open {
+                "Close"
+            } else {
+                "Talk / settings"
+            }))
+            .on_press(Message::Eva(Event::ToggleDetails))
         ]
+        .align_y(iced::Alignment::Center),]
         .spacing(6);
         let mut avatar = column![].spacing(6);
         if let Some((width, height)) = eva.slot_size {
@@ -1446,6 +1468,9 @@ impl Frost {
         // Transient glyph/error children stay inside fixed parent positions;
         // neither an admission change nor a hidden body may reset Ask Eva.
         card = card.push(avatar);
+        if !eva.details_open {
+            return container(card).padding(12).width(Length::Fill).into();
+        }
         let mut controls = column![].spacing(6);
         if let Some(error) = eva.host.gate.operation_error() {
             controls = controls.push(text(error.to_string()).size(11));
@@ -1453,15 +1478,17 @@ impl Frost {
         card = card.push(controls.push(self.eva_controls()));
         card = card
             .push(
-                text_input("Ask Eva — never sent to the shell", &eva.draft)
+                text_input("Ask Eva", &eva.draft)
+                    .size(12)
+                    .style(|_, status| crate::theme::popup_input_style(&self.theme, status))
                     .on_input(|v| Message::Eva(Event::Draft(v)))
                     .on_submit(Message::Eva(Event::Submit(context_revision))),
             )
             .push(
                 row![
-                    button(text("Send to Eva"))
+                    companion_button(text("Send to Eva"))
                         .on_press(Message::Eva(Event::Submit(context_revision))),
-                    button(text("Cancel reply"))
+                    companion_button(text("Cancel reply"))
                         .on_press(Message::Eva(Event::CancelDialogue(turn.clone())))
                 ]
                 .spacing(4),
@@ -1474,7 +1501,7 @@ impl Frost {
                 && s.terminal.has_text_selection()
         });
         card = card.push(
-            button(text("Preview current selection (local only)")).on_press_maybe(
+            companion_button(text("Preview current selection (local only)")).on_press_maybe(
                 can_select.then_some(Message::Eva(Event::SelectionCapture(context_revision))),
             ),
         );
@@ -1491,7 +1518,7 @@ impl Frost {
                 )
                 .push(scrollable(text(selected.clone()).size(12)).height(90))
                 .push(
-                    button(text("Request review of this exact snapshot"))
+                    companion_button(text("Request review of this exact snapshot"))
                         .on_press(Message::Eva(Event::SelectionReview(origin.revision))),
                 );
         }
@@ -1499,7 +1526,7 @@ impl Frost {
             card = card
                 .push(text("Approve once: attach only to the next explicit Send to Eva").size(11))
                 .push(
-                    button(text("Approve exact selection once")).on_press(Message::Eva(
+                    companion_button(text("Approve exact selection once")).on_press(Message::Eva(
                         Event::SelectionApprove(
                             evidence.consent_id.clone(),
                             evidence.context.revision,
@@ -1518,7 +1545,7 @@ impl Frost {
             || eva.selection_approved.is_some()
         {
             card = card.push(
-                button(text("Discard selected context"))
+                companion_button(text("Discard selected context"))
                     .on_press(Message::Eva(Event::SelectionCancel)),
             );
         }
@@ -1527,25 +1554,26 @@ impl Frost {
         }
         if !eva.dialogue_reply.is_empty() {
             card = card.push(
-                button(text("Acknowledge displayed reply"))
+                companion_button(text("Acknowledge displayed reply"))
                     .on_press(Message::Eva(Event::ReplySeen(turn.clone()))),
             );
         }
-        card = card.push(button(text("Eva settings / memory")).on_press(
+        card = card.push(companion_button(text("Eva settings / memory")).on_press(
             Message::ReferenceCommand(crate::keybindings::Command::ConfigOpen),
         ));
         crate::agent_task_ui::report_input_focus(
-            container(card).padding(12).width(Length::Fill),
+            scrollable(container(card).padding(12).width(Length::Fill))
+                .height((self.win_size.height * 0.65).clamp(180.0, 660.0)),
             eva.input_focused,
             |v| Message::Eva(Event::InputFocus(v)),
         )
     }
     fn eva_controls(&self) -> Element<'_, Message> {
         let mut controls = row![
-            button(text("Follow")).on_press(Message::Eva(Event::Intent(Intent::Follow))),
-            button(text("Stay")).on_press(Message::Eva(Event::Intent(Intent::Stay))),
-            button(text("Hide")).on_press(Message::Eva(Event::Intent(Intent::Hide))),
-            button(text("Recall")).on_press(Message::Eva(Event::Intent(Intent::Recall)))
+            companion_button(text("Follow")).on_press(Message::Eva(Event::Intent(Intent::Follow))),
+            companion_button(text("Stay")).on_press(Message::Eva(Event::Intent(Intent::Stay))),
+            companion_button(text("Hide")).on_press(Message::Eva(Event::Intent(Intent::Hide))),
+            companion_button(text("Recall")).on_press(Message::Eva(Event::Intent(Intent::Recall)))
         ];
         if let Some(eva) = self
             .eva
@@ -1554,7 +1582,7 @@ impl Frost {
         {
             controls = controls.push(crate::widget_identity_scope::scope_key(
                 eva.close_ui_revision,
-                button(text(if eva.close_paused_for_work {
+                companion_button(text(if eva.close_paused_for_work {
                     "Keep window open"
                 } else {
                     "Keep window open · Esc"
@@ -1637,7 +1665,7 @@ impl Frost {
                     .on_input(|v| Message::Eva(Event::ProjectDraft(v))),
                 )
                 .push(
-                    button(text("Assign project / new task scope / clear approvals"))
+                    companion_button(text("Assign project / new task scope / clear approvals"))
                         .on_press(Message::Eva(Event::ProjectAssign(context_revision))),
                 )
                 .push(
@@ -1649,18 +1677,18 @@ impl Frost {
                     "Archived memory management — never adopts tasks or enables model retrieval",
                 ))
                 .push(row![
-                    button(text("Discover archived scopes"))
+                    companion_button(text("Discover archived scopes"))
                         .on_press(Message::Eva(Event::ScopeDiscover(None))),
-                    button(text("More scopes")).on_press_maybe(
+                    companion_button(text("More scopes")).on_press_maybe(
                         eva.scope_next
                             .clone()
                             .map(|n| Message::Eva(Event::ScopeDiscover(Some(n))))
                     )
                 ]);
             controls = controls.push(row![
-                button(text("Discover stored memory scopes"))
+                companion_button(text("Discover stored memory scopes"))
                     .on_press(Message::Eva(Event::StoredScopeDiscover(None))),
-                button(text("More stored scopes")).on_press_maybe(
+                companion_button(text("More stored scopes")).on_press_maybe(
                     eva.stored_scope_next
                         .clone()
                         .map(|after| Message::Eva(Event::StoredScopeDiscover(Some(after))))
@@ -1668,35 +1696,37 @@ impl Frost {
             ]);
             for scope in &eva.stored_scopes {
                 controls = controls.push(
-                    button(text(format!("Review stored scope {scope:?}"))).on_press(Message::Eva(
-                        Event::ScopeReview(scope.clone(), context_revision),
-                    )),
+                    companion_button(text(format!("Review stored scope {scope:?}"))).on_press(
+                        Message::Eva(Event::ScopeReview(scope.clone(), context_revision)),
+                    ),
                 );
             }
             for item in &eva.task_scopes {
-                controls =
-                    controls
-                        .push(
-                            text(format!(
-                                "Task {} · owner {}",
-                                item.task_id, item.owner_host_id
-                            ))
-                            .size(11),
-                        )
-                        .push(button(text("Review task management access")).on_press(
+                controls = controls
+                    .push(
+                        text(format!(
+                            "Task {} · owner {}",
+                            item.task_id, item.owner_host_id
+                        ))
+                        .size(11),
+                    )
+                    .push(
+                        companion_button(text("Review task management access")).on_press(
                             Message::Eva(Event::ScopeReview(
                                 shared::MemoryScope::Task(item.task_id.clone()),
                                 context_revision,
                             )),
-                        ));
+                        ),
+                    );
                 if let Some(project) = &item.project_id {
-                    controls =
-                        controls.push(button(text(format!("Review project: {project}"))).on_press(
+                    controls = controls.push(
+                        companion_button(text(format!("Review project: {project}"))).on_press(
                             Message::Eva(Event::ScopeReview(
                                 shared::MemoryScope::Project(project.clone()),
                                 context_revision,
                             )),
-                        ));
+                        ),
+                    );
                 }
             }
             controls = controls
@@ -1710,7 +1740,7 @@ impl Frost {
                         .on_toggle(|v| Message::Eva(Event::ArchiveProject(v))),
                 )
                 .push(
-                    button(text("Review exact archived scope")).on_press(Message::Eva(
+                    companion_button(text("Review exact archived scope")).on_press(Message::Eva(
                         Event::ScopeReview(
                             if eva.archive_project {
                                 shared::MemoryScope::Project(eva.archive_draft.trim().into())
@@ -1731,9 +1761,13 @@ impl Frost {
                         .size(12),
                     )
                     .push(
-                        button(text("Approve exact management scope")).on_press(Message::Eva(
-                            Event::ScopeApprove(id.clone(), digest.clone(), context.revision),
-                        )),
+                        companion_button(text("Approve exact management scope")).on_press(
+                            Message::Eva(Event::ScopeApprove(
+                                id.clone(),
+                                digest.clone(),
+                                context.revision,
+                            )),
+                        ),
                     );
             }
             if eva.managed_scope.is_some() || eva.scope_review.is_some() {
@@ -1742,7 +1776,7 @@ impl Frost {
                         text(format!("Selected archived scope: {:?}", eva.managed_scope)).size(12),
                     )
                     .push(
-                        button(text("Dismiss / return to current scope"))
+                        companion_button(text("Dismiss / return to current scope"))
                             .on_press(Message::Eva(Event::ScopeCurrent)),
                     );
             }
@@ -1773,11 +1807,11 @@ impl Frost {
                 ))
                 .push(
                     row![
-                        button(text("Load history")).on_press_maybe(
+                        companion_button(text("Load history")).on_press_maybe(
                             (!history.pending())
                                 .then_some(Message::Eva(Event::HistoryLoad(false, context_revision)))
                         ),
-                        button(text("Older")).on_press_maybe(
+                        companion_button(text("Older")).on_press_maybe(
                             history
                                 .can_load_older()
                                 .then_some(Message::Eva(Event::HistoryLoad(true, context_revision)))
@@ -1792,16 +1826,16 @@ impl Frost {
             }
             controls = controls
                 .push(text("Scoped memory — explicit review before every change"))
-                .push(button(text("Review saving this exchange")).on_press_maybe(
+                .push(companion_button(text("Review saving this exchange")).on_press_maybe(
                     eva.dialogue_save.turn_id().map(|id| Message::Eva(Event::DialogueSave(id.into(), context_revision)))
                 ))
                 .push(
                     row![
-                        button(text("Review saving Eva's last spoken reply")).on_press_maybe(
+                        companion_button(text("Review saving Eva's last spoken reply")).on_press_maybe(
                             (!eva.host.voice_text.pending())
                                 .then_some(Message::Eva(Event::VoiceTextReview(context_revision)))
                         ),
-                        button(text("Forget Eva's retained spoken text")).on_press_maybe(
+                        companion_button(text("Forget Eva's retained spoken text")).on_press_maybe(
                             (!eva.host.voice_text.pending())
                                 .then_some(Message::Eva(Event::VoiceTextForget(context_revision)))
                         ),
@@ -1840,8 +1874,8 @@ impl Frost {
                 )
                 .push(
                     row![
-                        button(text("View / refresh")).on_press(Message::Eva(Event::MemoryList)),
-                        button(text("Clear scope…"))
+                        companion_button(text("View / refresh")).on_press(Message::Eva(Event::MemoryList)),
+                        companion_button(text("Clear scope…"))
                             .on_press(Message::Eva(Event::MemoryClear(context_revision)))
                     ]
                     .spacing(4),
@@ -1860,7 +1894,7 @@ impl Frost {
                         .on_input(|v| Message::Eva(Event::MemoryValue(v))),
                 )
                 .push(
-                    button(text("Propose save / edit…"))
+                    companion_button(text("Propose save / edit…"))
                         .on_press(Message::Eva(Event::MemorySave(context_revision))),
                 )
                 .push(text(eva.memory_status.clone()).size(12));
@@ -1873,11 +1907,9 @@ impl Frost {
                         ))
                         .size(12)
                         .width(Length::Fill),
-                        button(text("Delete…")).on_press(Message::Eva(Event::MemoryDelete(
-                            entry.id,
-                            entry.revision,
-                            context_revision
-                        )))
+                        companion_button(text("Delete…")).on_press(Message::Eva(
+                            Event::MemoryDelete(entry.id, entry.revision, context_revision)
+                        ))
                     ]
                     .spacing(4)
                     .width(Length::Fill),
@@ -1885,7 +1917,8 @@ impl Frost {
             }
             if eva.memory_next.is_some() {
                 controls = controls.push(
-                    button(text("Next memory page")).on_press(Message::Eva(Event::MemoryMore)),
+                    companion_button(text("Next memory page"))
+                        .on_press(Message::Eva(Event::MemoryMore)),
                 );
             }
             if let Some((context, review)) = &eva.memory_review {
@@ -1900,14 +1933,14 @@ impl Frost {
                     )
                     .push(
                         row![
-                            button(text("Approve exact change")).on_press(Message::Eva(
+                            companion_button(text("Approve exact change")).on_press(Message::Eva(
                                 Event::MemoryApprove(
                                     review.id,
                                     review.digest.clone(),
                                     context.revision
                                 )
                             )),
-                            button(text("Cancel review"))
+                            companion_button(text("Cancel review"))
                                 .on_press(Message::Eva(Event::MemoryCancel))
                         ]
                         .spacing(4),
@@ -1923,7 +1956,7 @@ impl Frost {
                 let mut content=column![text("Closing Frost"),text(eva.host.gate.status().to_string()),text("Eva is leaving this window. Closing before it finishes may keep it from appearing in another window.").size(13)];
                 if eva.close_guarded {
                     content = content.push(
-                        button(text(if eva.close_paused_for_work {
+                        companion_button(text(if eva.close_paused_for_work {
                             "Keep window open"
                         } else {
                             "Keep window open · Esc"
@@ -1934,7 +1967,7 @@ impl Frost {
                 let panel = container(
                     content
                         .push(
-                            button(text("Close anyway"))
+                            companion_button(text("Close anyway"))
                                 .on_press(Message::Eva(Event::ForceClose(eva.close_ui_revision))),
                         )
                         .spacing(12),
@@ -1947,7 +1980,7 @@ impl Frost {
                 let panel = container(
                     row![
                         text("Work is still running. Finish it, or keep this window open."),
-                        button(text("Keep window open"))
+                        companion_button(text("Keep window open"))
                             .on_press(Message::Eva(Event::KeepOpen(eva.close_ui_revision))),
                     ]
                     .spacing(12)
