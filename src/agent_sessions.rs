@@ -1461,7 +1461,7 @@ impl super::Frost {
         }
         list = list.push(text("TERMINALS").size(size - 2.0).style(text::secondary));
         for (index, session) in self.sessions.iter().enumerate() {
-            if state.bindings.values().any(|&id| id == session.id) {
+            if visible && state.bindings.values().any(|&id| id == session.id) {
                 continue;
             }
             let title = self
