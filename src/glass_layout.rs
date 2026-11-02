@@ -31,7 +31,6 @@ pub struct Rect {
 }
 
 impl Rect {
-    #[cfg(test)]
     pub fn right(self) -> f32 {
         self.x + self.width
     }
@@ -429,7 +428,7 @@ mod tests {
     fn custom_panel_widths_keep_one_native_grid_budget_and_restore_after_hide_or_narrowing() {
         let requested = (Some(420.0), Some(500.0));
         let wide = Layout::with_panels(1800.0, 976.0, requested.0, requested.1, true, true);
-        assert_eq!(wide.navigation.unwrap().width, 420.0);
+        assert_eq!(wide.navigation.unwrap().width, 360.0);
         assert_eq!(wide.inspector.unwrap().width, 500.0);
         for (width, left, right) in [
             (1180.0, true, true),
@@ -490,16 +489,16 @@ mod tests {
             Some(Rect {
                 x: 48.0,
                 y: 42.0,
-                width: 216.0,
+                width: 280.0,
                 height: 934.0
             })
         );
         assert_eq!(
             p.center,
             Rect {
-                x: 266.0,
+                x: 330.0,
                 y: 42.0,
-                width: 1056.0,
+                width: 992.0,
                 height: 924.0
             }
         );
@@ -515,18 +514,18 @@ mod tests {
         assert_eq!(
             p.composer,
             Rect {
-                x: 294.0,
+                x: 358.0,
                 y: 930.0,
-                width: 1000.0,
+                width: 936.0,
                 height: 36.0
             }
         );
         assert_eq!(
             p.raw_rect(0.0, 0.0, false),
             Rect {
-                x: 294.0,
+                x: 358.0,
                 y: 101.0,
-                width: 1000.0,
+                width: 936.0,
                 height: 821.0
             }
         );
@@ -653,6 +652,20 @@ mod tests {
                     budget.raw.height + 0.001 >= visible * 0.55,
                     "short-window editor consumed the protected native viewport"
                 );
+            }
+        }
+    }
+    #[test]
+    fn chrome_text_size_never_changes_navigation_docking_admission() {
+        for width in [0.0, 480.0, 540.0, 589.0, 590.0, 700.0, 1180.0, 1612.0] {
+            for height in [0.0, 400.0, 640.0, 976.0] {
+                let base = Layout::with_panels(width, height, Some(312.0), Some(470.0), true, true);
+                for font in [8.0, 14.0, 24.0, 40.0, 72.0] {
+                    assert_eq!(
+                        base.with_chrome_font_size(font).navigation.is_some(),
+                        base.navigation.is_some()
+                    );
+                }
             }
         }
     }

@@ -86,6 +86,10 @@ def build_harness():
         "fn suppress_armed_sidebar_retry(",
     ]
     methods = [
+        "fn toggle_reference_navigation_drawer(",
+        "fn reconcile_reference_navigation_drawer(",
+        "fn reference_navigation_drawer_required(",
+        "fn reference_navigation_drawer_visible(",
         "fn reference_inspector_visible(",
         "fn files_surface_visible(",
         "fn cancel_sidebar_remote_follow(",

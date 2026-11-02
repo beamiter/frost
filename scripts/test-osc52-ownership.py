@@ -38,7 +38,16 @@ close = item(source, 'fn close_session(')
 assert 'self.sessions.remove(index)' in close
 assert 'self.release_host_clipboard_read(closed_id, closed_fd)' in close
 assert 'self.next_id =' not in source  # runtime IDs never reset/reuse
-assert source.count('self.next_id += 1;') == 8
+# Every successful terminal allocation advances the same monotonic source.
+# Keep this audited list explicit when a new attach-only view is introduced.
+allocators = (
+    'new_session_at', 'install_or_update_jsh', 'execute_tab_menu_action',
+    'split', 'connect_remote_profile', 'agent_launch_in_tab',
+    'task_open_terminal', 'open_owned_validation_terminal', 'task_start_validation',
+)
+assert source.count('self.next_id += 1;') == len(allocators)
+for name in allocators:
+    assert item(source, 'fn ' + name + '(').count('self.next_id += 1;') == 1, name
 for body in (helpers, methods, callback, query):
     assert 'log::' not in body and 'debug_log!' not in body
 fixture = (root / 'scripts/osc52_ownership_harness.rs').read_text()

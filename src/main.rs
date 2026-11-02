@@ -97,6 +97,7 @@ mod workflow_focus;
 mod workflow_picker;
 mod workflows;
 mod workspace_chat_bridge;
+mod workspace_navigation_surface;
 mod workspace_sessions_bridge;
 mod workspace_visibility;
 
@@ -4575,6 +4576,8 @@ enum Message {
     Eva(eva_companion::Event),
     ReferenceInspector(native_shell::InspectorTab),
     ReferenceInspectorToggle,
+    ReferenceNavigationToggle,
+    ReferenceNavigationClose,
     SidebarResize(sidebar_resize::Side, sidebar_resize::Action),
     ReferenceCommand(keybindings::Command),
     ReferencePalette,
@@ -4877,7 +4880,6 @@ enum Message {
     /// Global mouse-up: clear `dragging_tab` if a drag was started but the
     /// release happened outside any tab.
     TabDragCancel,
-    ToggleSidebar,
     SetSidebarPanel(SidebarPanel),
     SetTabPosition(config::TabPosition),
     SidebarInsertPath(std::path::PathBuf),
@@ -6877,6 +6879,7 @@ struct Frost {
     reference_inspector_tab: native_shell::InspectorTab,
     reference_inspector_open: bool,
     reference_inspector_drawer: bool,
+    reference_navigation_drawer: bool,
     reference_tools_selection: Option<usize>,
     vim9_tabs: std::collections::HashMap<usize, vim9_ide::Ide>,
     config: Config,
@@ -7287,6 +7290,7 @@ impl Frost {
             reference_inspector_tab: native_shell::InspectorTab::Agent,
             reference_inspector_open: false,
             reference_inspector_drawer: false,
+            reference_navigation_drawer: false,
             reference_tools_selection: None,
             vim9_tabs: Default::default(),
             terminal_interaction_mode: config.effective_terminal_mode(),
@@ -7944,8 +7948,36 @@ impl Frost {
         self.sidebar_open
     }
 
+    fn toggle_reference_navigation_drawer(&mut self) {
+        self.reference_navigation_drawer = !self.reference_navigation_drawer;
+    }
+
+    fn reconcile_reference_navigation_drawer(&mut self) {
+        if !self.reference_navigation_drawer_required() {
+            self.reference_navigation_drawer = false;
+        }
+    }
+
+    fn reference_navigation_drawer_required(&self) -> bool {
+        glass_layout::Layout::with_panels(
+            self.win_size.width,
+            self.win_size.height,
+            self.config.sidebar_width,
+            self.config.inspector_width,
+            true,
+            self.reference_inspector_open,
+        )
+        .navigation
+        .is_none()
+    }
+
+    fn reference_navigation_drawer_visible(&self) -> bool {
+        self.reference_navigation_drawer && self.reference_navigation_drawer_required()
+    }
+
     fn reference_inspector_visible(&self) -> bool {
-        self.reference_layout().inspector.is_some() || self.reference_inspector_drawer
+        (self.reference_layout().inspector.is_some() || self.reference_inspector_drawer)
+            && !self.reference_navigation_drawer_visible()
     }
 
     /// Reflow the existing sessions after an inspector geometry change without
@@ -8062,10 +8094,11 @@ impl Frost {
     }
 
     fn terminal_input_active(&self) -> bool {
-        !self
-            .sessions
-            .get(self.active)
-            .is_some_and(|s| self.vim9_tabs.contains_key(&s.id))
+        !self.reference_navigation_drawer_visible()
+            && !self
+                .sessions
+                .get(self.active)
+                .is_some_and(|s| self.vim9_tabs.contains_key(&s.id))
             && !self.search.is_open
             && !self.search_replace.is_open
             && !self.agent_sessions.open
@@ -8115,7 +8148,8 @@ impl Frost {
     /// Search is intentionally non-modal for scrolling/selection. The remaining
     /// overlays block pointer actions from reaching panes underneath them.
     fn terminal_mouse_active(&self) -> bool {
-        self.sidebar_resize.is_none()
+        !self.reference_navigation_drawer_visible()
+            && self.sidebar_resize.is_none()
             && !self.search_replace.is_open
             && !self.agent_sessions.open
             && !self.palette.is_open
@@ -11995,7 +12029,9 @@ impl Frost {
     /// is deliberately absent: its input has no Escape owner, so forwarding
     /// there would send a stray ESC to the foreground program.
     fn overlay_owns_escape(&self) -> bool {
-        self.reference_tools_selection.is_some()
+        (self.reference_navigation_drawer_visible()
+            && !self.native_enter_ownership.lock().ime_composing())
+            || self.reference_tools_selection.is_some()
             || self.block_clear_confirm.is_some()
             || self.block_reading_menu.is_some()
             || self.tab_close_confirm.is_some()
@@ -16621,6 +16657,20 @@ impl Frost {
                 }
             }
             Message::SidebarResize(side, action) => self.resize_sidebar(side, action),
+            Message::ReferenceNavigationToggle => {
+                if self.reference_navigation_drawer_required() {
+                    // View presentation only: no task retirement, Hidden-mode
+                    // change, provider action, or persistent width write.
+                    self.native_enter_ownership.lock().claim_held();
+                    self.toggle_reference_navigation_drawer();
+                } else {
+                    return self.toggle_sidebar();
+                }
+            }
+            Message::ReferenceNavigationClose => {
+                self.native_enter_ownership.lock().claim_held();
+                self.reference_navigation_drawer = false;
+            }
             Message::ReferenceInspectorToggle => {
                 self.finish_sidebar_resize();
                 self.trace_reference_inspector("toggle-before");
@@ -16630,6 +16680,7 @@ impl Frost {
                 self.sidebar_hovered = false;
                 self.invalidate_sidebar_remote_follow_intent();
                 let show = !self.reference_inspector_visible();
+                self.reference_navigation_drawer = false;
                 self.reference_inspector_open = show;
                 self.reference_inspector_drawer =
                     show && self.reference_layout().inspector.is_none();
@@ -16647,6 +16698,7 @@ impl Frost {
                 self.sidebar_hovered = false;
                 self.invalidate_sidebar_remote_follow_intent();
                 self.reference_inspector_tab = tab;
+                self.reference_navigation_drawer = false;
                 self.reference_inspector_open = true;
                 self.reference_inspector_drawer = self.reference_layout().inspector.is_none();
                 self.sync_reference_inspector_geometry();
@@ -17540,6 +17592,7 @@ impl Frost {
                 self.ai_chats.persist(self.config.ai_redact_secrets);
             }
             Message::AiChatsNewChat => {
+                self.reference_navigation_drawer = false;
                 self.ai_chats.open(&self.config);
                 self.agent_sessions.workspace_task = None;
                 self.ai_chats.workspace.create();
@@ -17842,6 +17895,7 @@ impl Frost {
                 self.ai_chats.workspace.reload_keep_local(id);
             }
             Message::WorkspaceApi(id) => {
+                self.reference_navigation_drawer = false;
                 self.agent_sessions.workspace_task = None;
                 self.agent_sessions.workspace_pending = false;
                 self.agent_sessions.cancel_confirmation();
@@ -17855,6 +17909,7 @@ impl Frost {
                 self.activate_workspace_session(reference);
             }
             Message::WorkspaceNewTerminal => {
+                self.reference_navigation_drawer = false;
                 self.ai_chats.close(self.config.ai_redact_secrets);
                 self.agent_sessions.workspace_task = None;
                 self.agent_sessions.workspace_pending = false;
@@ -17865,6 +17920,7 @@ impl Frost {
             }
             Message::WorkspaceTerminal(id) => {
                 if let Some(index) = self.session_index_by_id(id) {
+                    self.reference_navigation_drawer = false;
                     self.ai_chats.close(self.config.ai_redact_secrets);
                     self.agent_sessions.workspace_task = None;
                     self.agent_sessions.workspace_pending = false;
@@ -17881,6 +17937,7 @@ impl Frost {
                     return iced::Task::none();
                 }
                 if self.task_manager.get(id).is_some() {
+                    self.reference_navigation_drawer = false;
                     self.ai_chats.close(self.config.ai_redact_secrets);
                     self.agent_sessions.workspace_task = Some(id);
                     self.agent_sessions.workspace_pending = false;
@@ -18816,6 +18873,23 @@ impl Frost {
                     // Enter ownership persists through the action's dismissal.
                     return Task::none();
                 }
+                if self.reference_navigation_drawer_visible() {
+                    if matches!(
+                        &event,
+                        keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                            repeat: false,
+                            ..
+                        }
+                    ) && !self.native_enter_ownership.lock().ime_composing()
+                    {
+                        self.reference_navigation_drawer = false;
+                        return iced::widget::operation::focus(iced::widget::Id::new(
+                            "frost-terminal-input-owner",
+                        ));
+                    }
+                    return Task::none();
+                }
                 // Iced's pick_list handles pointer input only. Own every key
                 // while our Actions popup is visible, especially Escape, which
                 // otherwise becomes a stray readline prefix in the shell.
@@ -19743,6 +19817,7 @@ impl Frost {
                     self.effective_font_size(),
                 );
                 self.win_size = size;
+                self.reconcile_reference_navigation_drawer();
                 self.dock_width = self.reference_inspector_width();
                 self.sync_organism_geometry();
                 let term_h = self.term_height();
@@ -20041,7 +20116,6 @@ impl Frost {
                     }
                 }
             }
-            Message::ToggleSidebar => return self.toggle_sidebar(),
             Message::SetSidebarPanel(panel) => {
                 if self.sidebar_panel != panel {
                     self.task_panel.retire_panel_callbacks();
@@ -30030,6 +30104,9 @@ impl Frost {
         // starts in the workspace, where tasks that need the user are listed.
         self.task_panel.set_show_hidden(false);
         self.invalidate_sidebar_remote_follow_intent();
+        if open {
+            self.reference_navigation_drawer = false;
+        }
         self.reference_inspector_open = open;
         self.reference_inspector_drawer = open && self.reference_layout().inspector.is_none();
         if open {

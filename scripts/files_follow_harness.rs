@@ -334,6 +334,7 @@ struct TerminalApp {
     win_size: Size,
     reference_inspector_open: bool,
     reference_inspector_drawer: bool,
+    reference_navigation_drawer: bool,
     reference_inspector_tab: native_shell::InspectorTab,
     sidebar: sidebar::Sidebar,
     sidebar_follow_pending: Option<SidebarRemoteFollow>,
@@ -433,6 +434,7 @@ fn setup() -> Rc<RefCell<TerminalApp>> {
         win_size: Size { width: 1356.0, height: 704.0 },
         reference_inspector_open: true,
         reference_inspector_drawer: false,
+        reference_navigation_drawer: false,
         reference_inspector_tab: native_shell::InspectorTab::Agent,
         sidebar,
         sidebar_follow_pending: Some(pending),
@@ -809,14 +811,56 @@ fn actual_glass_inspector_boundaries_and_hidden_navigation_are_not_legacy_geomet
     a.sidebar_open = true;
     let layout = a.reference_layout();
     assert_eq!(layout.titlebar.height, 42.0);
-    assert_eq!(layout.center.x, 266.0);
-    assert_eq!(layout.center.width, 1056.0);
-    assert_eq!(layout.composer.width, 1000.0);
+    assert_eq!(layout.center.x, 330.0);
+    assert_eq!(layout.center.width, 992.0);
+    assert_eq!(layout.composer.width, 936.0);
     a.reference_inspector_open = false;
     let hidden = a.reference_layout();
     assert_eq!(hidden.center.width - layout.center.width, 290.0);
     assert_eq!(hidden.header.width, hidden.center.width);
     assert_eq!(hidden.composer.width - layout.composer.width, 290.0);
+}
+
+#[test]
+fn navigation_drawer_preserves_pending_follow_preferences_and_right_page_across_resize() {
+    for dock_preference in [false, true] {
+        let app = pending_files_surface();
+        let mut a = app.borrow_mut();
+        a.sidebar_open = dock_preference;
+        a.config.sidebar_width = Some(312.0);
+        a.config.inspector_width = Some(470.0);
+        a.reference_inspector_open = true;
+        a.reference_inspector_drawer = true;
+        a.reference_inspector_tab = native_shell::InspectorTab::Files;
+        let pending_epoch = a.sidebar_follow_intent_epoch;
+        a.win_size.width = 540.0;
+        assert!(a.reference_navigation_drawer_required());
+        a.toggle_reference_navigation_drawer();
+        assert!(a.reference_navigation_drawer_visible());
+        assert!(!a.reference_inspector_visible());
+        assert!(!a.files_surface_visible());
+        assert!(a.reference_inspector_drawer, "right drawer preference must survive presentation masking");
+        let mut expected_open = true;
+        for width in [589.0, 590.0, 700.0, 1180.0, 1612.0, 540.0] {
+            a.win_size.width = width;
+            a.reconcile_reference_navigation_drawer();
+            expected_open &= width < 590.0;
+            assert_eq!(a.reference_navigation_drawer_visible(), expected_open);
+            assert_eq!(a.reference_inspector_visible(), !expected_open);
+            assert_eq!(a.sidebar_open, dock_preference);
+            assert_eq!(a.config.sidebar_width, Some(312.0));
+            assert_eq!(a.config.inspector_width, Some(470.0));
+            assert_eq!(a.reference_inspector_tab, native_shell::InspectorTab::Files);
+            assert_eq!(a.sidebar_follow_intent_epoch, pending_epoch);
+            assert!(a.sidebar_follow_pending.is_some());
+        }
+        assert!(!a.reference_navigation_drawer_visible(), "narrowing again must not reopen an old transient drawer");
+        assert!(a.files_surface_visible());
+        a.toggle_reference_navigation_drawer();
+        a.fixture_drawer_tab(native_shell::InspectorTab::Files);
+        assert!(!a.reference_navigation_drawer, "explicit right drawer action takes presentation ownership");
+        assert!(a.files_surface_visible());
+    }
 }
 
 #[test]

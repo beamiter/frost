@@ -1537,6 +1537,7 @@ impl super::Frost {
                     Some("The open terminal is no longer available".into());
                 return;
             }
+            self.reference_navigation_drawer = false;
             self.record_resumed_agent_session(session.provider, &session.id);
             self.agent_sessions.close();
             self.agent_sessions.workspace_pending = false;
@@ -1655,6 +1656,7 @@ impl super::Frost {
             .and_then(|id| self.session_index_by_id(*id))
         {
             self.focus_session(index);
+            self.reference_navigation_drawer = false;
             self.agent_sessions.workspace_task = None;
             self.ai_chats.close(self.config.ai_redact_secrets);
             self.relayout();
@@ -1698,6 +1700,7 @@ impl super::Frost {
             Some(&argv),
         ) {
             Ok(terminal) => {
+                self.reference_navigation_drawer = false;
                 self.agent_sessions
                     .bindings
                     .insert(open_session_key(&session), terminal.id);

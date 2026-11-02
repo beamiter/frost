@@ -353,6 +353,19 @@ impl Frost {
         .with_chrome_font_size(self.chrome_font_size())
     }
 
+    fn reference_navigation_width(&self) -> f32 {
+        self.reference_layout().navigation.map_or_else(
+            || {
+                self.config
+                    .sidebar_width
+                    .and_then(crate::glass_layout::sidebar_width)
+                    .unwrap_or(crate::glass_shell_tokens::NAVIGATION_WIDTH)
+                    .min((self.win_size.width - self.reference_layout().rail.right()).max(0.0))
+            },
+            |panel| panel.width,
+        )
+    }
+
     pub(crate) fn reference_inspector_width(&self) -> f32 {
         self.reference_layout().inspector.map_or_else(
             || {
@@ -759,7 +772,11 @@ impl Frost {
         let mut rail = column![].spacing(6).align_x(iced::Alignment::Center);
         for (key, title) in jterm_core::reference_conversation::RAIL_NAVIGATION {
             let (action, selected) = match key {
-                "workspace" => (Message::ToggleSidebar, self.sidebar_open),
+                "workspace" => (
+                    Message::ReferenceNavigationToggle,
+                    self.reference_layout().navigation.is_some()
+                        || self.reference_navigation_drawer_visible(),
+                ),
                 "folder" => (
                     Message::ReferenceInspector(InspectorTab::Files),
                     self.reference_inspector_tab == InspectorTab::Files,
@@ -773,7 +790,9 @@ impl Frost {
                 _ => unreachable!("shared rail key"),
             };
             let title = if key == "workspace" {
-                if self.sidebar_open {
+                if self.reference_layout().navigation.is_some()
+                    || self.reference_navigation_drawer_visible()
+                {
                     "Hide left sidebar"
                 } else {
                     "Show left sidebar"
@@ -1182,11 +1201,7 @@ impl Frost {
             footer,
         ])
         .padding([0.0, shell::NAVIGATION_PADDING])
-        .width(
-            self.reference_layout()
-                .navigation
-                .map_or(0.0, |nav| nav.width),
-        )
+        .width(self.reference_navigation_width())
         .height(Length::Fill)
         .style(|theme| {
             panel(
@@ -2468,31 +2483,27 @@ impl Frost {
         .width(layout.rail.width)
         .height(Length::Fill)]
         .height(Length::Fill);
-        if let Some(nav) = layout.navigation {
-            body = body.push(
-                column![
-                    self.font_zoom_region(font_zoom::Group::Chrome, self.reference_navigation()),
-                    Space::new().height(navigation_bottom)
-                ]
-                .width(nav.width)
+        body = body.push(
+            column![Space::new().height(Length::Fill)]
+                .width(layout.navigation.map_or(0.0, |nav| nav.width))
                 .height(Length::Fill),
-            );
-        }
-        body = body.push(if layout.navigation.is_some() {
+        );
+        body = body.push(
             column![
                 Space::new().height(glass::MAIN_TOP - glass::TOPBAR_HEIGHT),
                 self.reference_resize_grip(
                     crate::sidebar_resize::Side::Navigation,
-                    glass::LEFT_GAP
+                    if layout.navigation.is_some() {
+                        glass::LEFT_GAP
+                    } else {
+                        0.0
+                    },
                 ),
                 Space::new().height(main_bottom)
             ]
             .width(glass::LEFT_GAP)
-            .height(Length::Fill)
-            .into()
-        } else {
-            Element::from(Space::new().width(glass::LEFT_GAP))
-        });
+            .height(Length::Fill),
+        );
         body = body.push(
             column![
                 Space::new().height(glass::MAIN_TOP - glass::TOPBAR_HEIGHT),
@@ -2543,7 +2554,7 @@ impl Frost {
             .height(Length::Fill)
             .into();
         let (dismiss, inspector): (Element<'_, Message>, Element<'_, Message>) =
-            if layout.inspector.is_none() && self.reference_inspector_drawer {
+            if layout.inspector.is_none() && self.reference_inspector_visible() {
                 let dismiss = container(
                     button(Space::new().width(Length::Fill).height(Length::Fill))
                         .on_press(Message::ReferenceInspectorToggle)
@@ -2557,6 +2568,7 @@ impl Frost {
                 )
                 .padding(iced::Padding {
                     top: layout.titlebar.height,
+                    left: layout.rail.right(),
                     ..iced::Padding::ZERO
                 })
                 .width(Length::Fill)
@@ -2588,6 +2600,54 @@ impl Frost {
             };
         // Constant base index preserves the native terminal/model through toggles.
         let workspace = crate::native_popup_surface::layers(workspace, dismiss, inspector);
+        let drawer = self.reference_navigation_drawer_visible();
+        let navigation_width = self.reference_navigation_width();
+        let navigation = self.font_zoom_region(
+            font_zoom::Group::Chrome,
+            opaque(
+                container(self.reference_navigation())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(|theme| {
+                        panel(
+                            theme,
+                            color::NAVIGATION,
+                            color::DARK_BORDER,
+                            glass::PANEL_RADIUS,
+                        )
+                    }),
+            ),
+        );
+        let backdrop = button(Space::new().width(Length::Fill).height(Length::Fill))
+            .on_press(Message::ReferenceNavigationClose)
+            .padding(0)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_, _| button::Style {
+                background: Some(Color::from_rgba(0.02, 0.04, 0.09, 0.18).into()),
+                ..Default::default()
+            });
+        let workspace = crate::workspace_navigation_surface::surface(
+            workspace,
+            backdrop.into(),
+            navigation,
+            crate::workspace_navigation_surface::Placement {
+                panel: iced::Rectangle {
+                    x: layout.rail.right(),
+                    y: layout.rail.y,
+                    width: navigation_width,
+                    height: layout.rail.height,
+                },
+                backdrop: iced::Rectangle {
+                    x: layout.rail.right(),
+                    y: layout.titlebar.height,
+                    width: (self.win_size.width - layout.rail.right()).max(0.0),
+                    height: (self.win_size.height - layout.titlebar.height).max(0.0),
+                },
+                visible: layout.navigation.is_some() || drawer,
+                drawer,
+            },
+        );
         let (dismiss, menu): (Element<'_, Message>, Element<'_, Message>) =
             if self.reference_tools_selection.is_some() {
                 let dismiss = button(Space::new().width(Length::Fill).height(Length::Fill))

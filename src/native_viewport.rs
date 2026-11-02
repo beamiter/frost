@@ -42,7 +42,7 @@ mod tests {
         let raw = raw_rect(layout.center, 0.0, 0.0);
         assert_eq!(
             (raw.x, raw.y, raw.width, raw.height),
-            (320.0, 107.0, 702.0, 506.0)
+            (363.0, 107.0, 659.0, 506.0)
         );
         assert_eq!(raw.y + raw.height, layout.composer.y);
         assert_eq!(INPUT_STRIP_HEIGHT + TOOLS_HEIGHT, 80.0);

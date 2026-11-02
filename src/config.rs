@@ -1379,7 +1379,7 @@ mod tests {
         let custom =
             super::Config::from_toml("sidebar_width = 400.0\ninspector_width = 490.0").unwrap();
         let reloaded = super::Config::from_toml(&toml::to_string(&custom).unwrap()).unwrap();
-        assert_eq!(reloaded.sidebar_width, Some(400.0));
+        assert_eq!(reloaded.sidebar_width, Some(360.0));
         assert_eq!(reloaded.inspector_width, Some(490.0));
         let bounded =
             super::Config::from_toml("sidebar_width = -1.0\ninspector_width = 99999.0").unwrap();

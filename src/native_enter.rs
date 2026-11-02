@@ -29,6 +29,13 @@ pub(crate) struct NativeEnterOwnership {
 }
 
 impl NativeEnterOwnership {
+    /// Native observation precedes Iced's captured text-input Escape delivery.
+    pub(crate) fn ime_composing(&self) -> bool {
+        self.focused
+            .and_then(|id| self.windows.get(&id))
+            .is_some_and(|window| window.ime.composing)
+    }
+
     pub(crate) fn claim_held(&mut self) {
         if let Some(state) = self.focused.and_then(|id| self.windows.get_mut(&id)) {
             state.native.claim_pressed();
@@ -520,5 +527,34 @@ mod tests {
             assert!(!state.acknowledge(MAIN));
         }
         assert!(state.pending.is_empty());
+    }
+    #[test]
+    fn drawer_escape_guard_reads_native_composition_before_captured_widget_delivery() {
+        let mut ownership = NativeEnterOwnership::default();
+        let id = Id::unique();
+        ownership.observe(id, &WindowEvent::Focused(true));
+        ownership.observe(
+            id,
+            &WindowEvent::Ime(iced_winit::winit::event::Ime::Preedit(
+                "中".into(),
+                Some((0, 3)),
+            )),
+        );
+        assert!(ownership.ime_composing());
+        ownership.observe(
+            id,
+            &WindowEvent::Ime(iced_winit::winit::event::Ime::Commit("中".into())),
+        );
+        assert!(!ownership.ime_composing());
+        ownership.observe(
+            id,
+            &WindowEvent::Ime(iced_winit::winit::event::Ime::Preedit(
+                "文".into(),
+                Some((0, 3)),
+            )),
+        );
+        assert!(ownership.ime_composing());
+        ownership.observe(id, &WindowEvent::Focused(false));
+        assert!(!ownership.ime_composing());
     }
 }
