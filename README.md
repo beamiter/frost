@@ -1462,3 +1462,5 @@ transcripts.
 Codex 的兼容入口仅加入子进程 PATH；用户自己的 alias/function 仍有优先权。
 `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=0 claude` 可显式使用 Claude 全屏模式；
 用 `JTERM_AGENT_SCROLLBACK=0` 启动终端可关闭上述兼容默认值。
+
+Click the **Agent Workspace** heading to show or hide the conversation group. This preserves terminal navigation and the active conversation; `agent_workspace_enabled` is saved in config and defaults to `true`. Background sessions keep running.

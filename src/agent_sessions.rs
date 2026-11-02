@@ -141,6 +141,7 @@ pub(crate) struct SessionLibrary {
     pub open: bool,
     pub(crate) workspace_pending: bool,
     pub(crate) workspace_task: Option<jterm_core::agent_task::TaskId>,
+    pub(crate) workspace_scroll: crate::workspace_visibility::ScrollBookmark,
     catalog_epoch: u64,
     pub(crate) workspace: crate::workspace_sessions_bridge::WorkspaceSessions,
     workspace_source: Option<OpenSessionKey>,
@@ -371,6 +372,7 @@ impl SessionLibrary {
             open: false,
             workspace_pending: false,
             workspace_task: None,
+            workspace_scroll: Default::default(),
             catalog_epoch: 0,
             workspace: Default::default(),
             workspace_source: None,
@@ -1172,273 +1174,289 @@ impl super::Frost {
         use iced::Length;
         let state = &self.agent_sessions;
         let size = self.chrome_font_size();
-        let mut list = column![
-            row![
-                text("Agent Workspace").size(size),
-                Space::new().width(Length::Fill),
-                button(text("＋").size(size)).on_press(M::AiChatsNewChat)
-            ]
-            .spacing(4),
-            row![
-                button(text("Terminal").size(size - 1.0)).on_press(M::WorkspaceNewTerminal),
-                button(text("Task").size(size - 1.0)).on_press(M::TaskComposerOpen),
-                button(text("⋯").size(size)).on_press(M::AgentSessionsToggle)
-            ]
-            .spacing(4),
-            text_input("Search conversations…", &state.query)
-                .on_input(M::AgentSessionsQuery)
-                .size(size),
-        ]
+        let visible = self.config.agent_workspace_enabled;
+        let mut list = column![button(
+            text(if visible {
+                "▾ Agent Workspace"
+            } else {
+                "▸ Agent Workspace"
+            })
+            .size(size)
+        )
+        .on_press(M::AgentWorkspaceToggle)
+        .width(Length::Fill)
+        .style(button::text)]
         .spacing(8);
-        let project = state
-            .project_selection
-            .as_ref()
-            .and_then(|path| path.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "All projects".into());
-        list = list.push(
-            button(text(format!("{project} ▾")).size(size))
-                .on_press(M::AgentSessionsProjectsToggle)
-                .width(Length::Fill),
-        );
-        if state.show_projects {
+        if visible {
+            list = list
+                .push(row![
+                    Space::new().width(Length::Fill),
+                    button(text("＋").size(size)).on_press(M::AiChatsNewChat)
+                ])
+                .push(
+                    row![
+                        button(text("Terminal").size(size - 1.0)).on_press(M::WorkspaceNewTerminal),
+                        button(text("Task").size(size - 1.0)).on_press(M::TaskComposerOpen),
+                        button(text("⋯").size(size)).on_press(M::AgentSessionsToggle)
+                    ]
+                    .spacing(4),
+                )
+                .push(
+                    text_input("Search conversations…", &state.query)
+                        .on_input(M::AgentSessionsQuery)
+                        .size(size),
+                );
+            let project = state
+                .project_selection
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "All projects".into());
             list = list.push(
-                button(text("All projects").size(size))
-                    .on_press(M::WorkspaceProject(None))
-                    .style(button::text),
+                button(text(format!("{project} ▾")).size(size))
+                    .on_press(M::AgentSessionsProjectsToggle)
+                    .width(Length::Fill),
             );
-            for project in &state.projects {
+            if state.show_projects {
                 list = list.push(
-                    button(text(project.root.to_string_lossy().into_owned()).size(size - 1.0))
-                        .on_press(M::WorkspaceProject(Some(project.root.clone())))
+                    button(text("All projects").size(size))
+                        .on_press(M::WorkspaceProject(None))
                         .style(button::text),
                 );
+                for project in &state.projects {
+                    list = list.push(
+                        button(text(project.root.to_string_lossy().into_owned()).size(size - 1.0))
+                            .on_press(M::WorkspaceProject(Some(project.root.clone())))
+                            .style(button::text),
+                    );
+                }
             }
-        }
-        list = list.push(
-            row![
-                button(text("All").size(size - 1.0))
-                    .on_press(M::AgentSessionsClear)
-                    .style(button::text),
-                button(text("Running").size(size - 1.0))
-                    .on_press(M::AgentSessionsLive(!state.live_only))
-                    .style(if state.live_only {
-                        button::primary
-                    } else {
-                        button::text
-                    }),
-                button(text("Needs you").size(size - 1.0))
-                    .on_press(M::AgentSessionsStatus(
-                        if state.status == Some(SessionStatus::Waiting) {
-                            None
-                        } else {
-                            Some(SessionStatus::Waiting)
-                        }
-                    ))
-                    .style(if state.status == Some(SessionStatus::Waiting) {
-                        button::primary
-                    } else {
-                        button::text
-                    }),
-            ]
-            .spacing(2),
-        );
-        if let Some(notice) = state
-            .notice
-            .as_ref()
-            .or(state.workspace.notice.as_ref())
-            .or(state.query_error.as_ref())
-        {
-            list = list.push(text(notice).size(size - 1.0).style(text::danger));
-        }
-        if state.pending_confirm.is_some() {
-            list = list.push(text("Checking conversation…").size(size - 1.0));
-        }
-        let mut group = None;
-        let visible = state.workspace_visible();
-        for &index in &visible {
-            let session = &state.catalog.sessions[index];
-            let pinned = state.workspace.pinned(session);
-            if group != Some(pinned) {
-                group = Some(pinned);
-                list = list.push(
-                    text(if pinned {
-                        "PINNED"
-                    } else {
-                        "RECENT CONVERSATIONS"
-                    })
-                    .size(size - 2.0)
-                    .style(text::secondary),
-                );
-            }
-            let binding = state.bindings.get(&open_session_key(session)).copied();
-            let selected = !self.ai_chats.is_open
-                && state.workspace_task.is_none()
-                && binding.is_some_and(|id| {
-                    self.sessions
-                        .get(self.active)
-                        .is_some_and(|session| session.id == id)
-                });
-            let title = state.workspace.title(session);
-            let reference = WorkspaceSessionRef {
-                epoch: state.catalog_epoch,
-                session: session.clone(),
-            };
-            let row = row![
-                button(text(if pinned { "★" } else { "☆" }).size(size))
-                    .on_press(M::WorkspacePin(reference.clone()))
-                    .style(button::text),
-                button(
-                    column![
-                        text(crate::review_text::visible_bounded(title, 90)).size(size),
-                        text(format!(
-                            "{} · {}",
-                            session.provider.label(),
-                            if binding.is_some() {
-                                "Open terminal"
-                            } else {
-                                "Ready to resume"
-                            }
-                        ))
-                        .size(size - 2.0)
-                        .style(text::secondary)
-                    ]
-                    .spacing(3)
-                )
-                .on_press(M::WorkspaceOpenSession(reference))
-                .width(Length::Fill)
-                .style(if selected {
-                    button::primary
-                } else {
-                    button::text
-                }),
-            ]
-            .spacing(2);
-            list = list.push(row);
-        }
-        if visible.is_empty() {
-            list = list.push(
-                text(if state.scanner.is_scanning() {
-                    "Discovering local sessions…"
-                } else {
-                    "No CLI conversations match"
-                })
-                .size(size - 1.0)
-                .style(text::secondary),
-            );
-        }
-        list = list.push(
-            text("API CONVERSATIONS")
-                .size(size - 2.0)
-                .style(text::secondary),
-        );
-        let query = state.query.trim().to_lowercase();
-        for chat in self.ai_chats.workspace.rows.iter().filter(|chat| {
-            !chat.archived
-                && (!state.live_only || chat.runtime.is_live())
-                && (state.status != Some(SessionStatus::Waiting)
-                    || matches!(
-                        chat.runtime,
-                        jterm_core::agent_workspace::RuntimeState::Failed
-                            | jterm_core::agent_workspace::RuntimeState::Conflict
-                    ))
-                && state
-                    .project_selection
-                    .as_ref()
-                    .is_none_or(|project| std::path::Path::new(&chat.cwd).starts_with(project))
-                && (query.is_empty()
-                    || format!("{} {}", chat.title, chat.preview)
-                        .to_lowercase()
-                        .contains(&query))
-        }) {
-            let selected = self.ai_chats.is_open
-                && self
-                    .ai_chats
-                    .workspace
-                    .id_for(self.ai_chats.store.active_id())
-                    == Some(&chat.id);
             list = list.push(
                 row![
-                    button(text(if chat.pinned { "★" } else { "☆" }).size(size))
-                        .on_press(M::WorkspaceApiPin(chat.id.clone(), !chat.pinned))
+                    button(text("All").size(size - 1.0))
+                        .on_press(M::AgentSessionsClear)
+                        .style(button::text),
+                    button(text("Running").size(size - 1.0))
+                        .on_press(M::AgentSessionsLive(!state.live_only))
+                        .style(if state.live_only {
+                            button::primary
+                        } else {
+                            button::text
+                        }),
+                    button(text("Needs you").size(size - 1.0))
+                        .on_press(M::AgentSessionsStatus(
+                            if state.status == Some(SessionStatus::Waiting) {
+                                None
+                            } else {
+                                Some(SessionStatus::Waiting)
+                            }
+                        ))
+                        .style(if state.status == Some(SessionStatus::Waiting) {
+                            button::primary
+                        } else {
+                            button::text
+                        }),
+                ]
+                .spacing(2),
+            );
+            if let Some(notice) = state
+                .notice
+                .as_ref()
+                .or(state.workspace.notice.as_ref())
+                .or(state.query_error.as_ref())
+            {
+                list = list.push(text(notice).size(size - 1.0).style(text::danger));
+            }
+            if state.pending_confirm.is_some() {
+                list = list.push(text("Checking conversation…").size(size - 1.0));
+            }
+            let mut group = None;
+            let visible = state.workspace_visible();
+            for &index in &visible {
+                let session = &state.catalog.sessions[index];
+                let pinned = state.workspace.pinned(session);
+                if group != Some(pinned) {
+                    group = Some(pinned);
+                    list = list.push(
+                        text(if pinned {
+                            "PINNED"
+                        } else {
+                            "RECENT CONVERSATIONS"
+                        })
+                        .size(size - 2.0)
+                        .style(text::secondary),
+                    );
+                }
+                let binding = state.bindings.get(&open_session_key(session)).copied();
+                let selected = !self.ai_chats.is_open
+                    && state.workspace_task.is_none()
+                    && binding.is_some_and(|id| {
+                        self.sessions
+                            .get(self.active)
+                            .is_some_and(|session| session.id == id)
+                    });
+                let title = state.workspace.title(session);
+                let reference = WorkspaceSessionRef {
+                    epoch: state.catalog_epoch,
+                    session: session.clone(),
+                };
+                let row = row![
+                    button(text(if pinned { "★" } else { "☆" }).size(size))
+                        .on_press(M::WorkspacePin(reference.clone()))
                         .style(button::text),
                     button(
                         column![
-                            text(&chat.title).size(size),
-                            text("API conversation")
-                                .size(size - 2.0)
-                                .style(text::secondary)
+                            text(crate::review_text::visible_bounded(title, 90)).size(size),
+                            text(format!(
+                                "{} · {}",
+                                session.provider.label(),
+                                if binding.is_some() {
+                                    "Open terminal"
+                                } else {
+                                    "Ready to resume"
+                                }
+                            ))
+                            .size(size - 2.0)
+                            .style(text::secondary)
                         ]
-                        .spacing(3),
+                        .spacing(3)
                     )
-                    .on_press(M::WorkspaceApi(chat.id.clone()))
+                    .on_press(M::WorkspaceOpenSession(reference))
                     .width(Length::Fill)
                     .style(if selected {
                         button::primary
                     } else {
                         button::text
-                    })
+                    }),
                 ]
-                .spacing(2),
-            );
-        }
-        if self.config.experimental_task_sidebar {
+                .spacing(2);
+                list = list.push(row);
+            }
+            if visible.is_empty() {
+                list = list.push(
+                    text(if state.scanner.is_scanning() {
+                        "Discovering local sessions…"
+                    } else {
+                        "No CLI conversations match"
+                    })
+                    .size(size - 1.0)
+                    .style(text::secondary),
+                );
+            }
             list = list.push(
-                text("TASK CONVERSATIONS")
+                text("API CONVERSATIONS")
                     .size(size - 2.0)
                     .style(text::secondary),
             );
-            for task in self.task_manager.tasks().iter().filter(|task| {
-                use jterm_core::agent_task::TaskStatus;
-                task.status != TaskStatus::Archived
-                    && (!state.live_only
-                        || matches!(
-                            task.status,
-                            TaskStatus::Starting
-                                | TaskStatus::Working
-                                | TaskStatus::WaitingForApproval
-                        ))
+            let query = state.query.trim().to_lowercase();
+            for chat in self.ai_chats.workspace.rows.iter().filter(|chat| {
+                !chat.archived
+                    && (!state.live_only || chat.runtime.is_live())
                     && (state.status != Some(SessionStatus::Waiting)
                         || matches!(
-                            task.status,
-                            TaskStatus::WaitingForApproval
-                                | TaskStatus::WaitingForHuman
-                                | TaskStatus::ReadyForReview
-                                | TaskStatus::Failed
+                            chat.runtime,
+                            jterm_core::agent_workspace::RuntimeState::Failed
+                                | jterm_core::agent_workspace::RuntimeState::Conflict
                         ))
+                    && state
+                        .project_selection
+                        .as_ref()
+                        .is_none_or(|project| std::path::Path::new(&chat.cwd).starts_with(project))
+                    && (query.is_empty()
+                        || format!("{} {}", chat.title, chat.preview)
+                            .to_lowercase()
+                            .contains(&query))
             }) {
-                if !query.is_empty() && !task.title.to_lowercase().contains(&query) {
-                    continue;
-                }
-                if state
-                    .project_selection
-                    .as_ref()
-                    .is_some_and(|project| project != &task.repo_root)
-                {
-                    continue;
-                }
+                let selected = self.ai_chats.is_open
+                    && self
+                        .ai_chats
+                        .workspace
+                        .id_for(self.ai_chats.store.active_id())
+                        == Some(&chat.id);
                 list = list.push(
-                    button(
-                        column![
-                            text(crate::review_text::visible_bounded(&task.title, 90)).size(size),
-                            text(format!(
-                                "{} · {}",
-                                task.provider.display_name(),
-                                task.status.label()
-                            ))
-                            .size(size - 2.0)
-                            .style(text::secondary)
-                        ]
-                        .spacing(3),
-                    )
-                    .on_press(M::WorkspaceTask(task.id))
-                    .width(Length::Fill)
-                    .style(if state.workspace_task == Some(task.id) {
-                        button::primary
-                    } else {
-                        button::text
-                    }),
+                    row![
+                        button(text(if chat.pinned { "★" } else { "☆" }).size(size))
+                            .on_press(M::WorkspaceApiPin(chat.id.clone(), !chat.pinned))
+                            .style(button::text),
+                        button(
+                            column![
+                                text(&chat.title).size(size),
+                                text("API conversation")
+                                    .size(size - 2.0)
+                                    .style(text::secondary)
+                            ]
+                            .spacing(3),
+                        )
+                        .on_press(M::WorkspaceApi(chat.id.clone()))
+                        .width(Length::Fill)
+                        .style(if selected {
+                            button::primary
+                        } else {
+                            button::text
+                        })
+                    ]
+                    .spacing(2),
                 );
+            }
+            if self.config.experimental_task_sidebar {
+                list = list.push(
+                    text("TASK CONVERSATIONS")
+                        .size(size - 2.0)
+                        .style(text::secondary),
+                );
+                for task in self.task_manager.tasks().iter().filter(|task| {
+                    use jterm_core::agent_task::TaskStatus;
+                    task.status != TaskStatus::Archived
+                        && (!state.live_only
+                            || matches!(
+                                task.status,
+                                TaskStatus::Starting
+                                    | TaskStatus::Working
+                                    | TaskStatus::WaitingForApproval
+                            ))
+                        && (state.status != Some(SessionStatus::Waiting)
+                            || matches!(
+                                task.status,
+                                TaskStatus::WaitingForApproval
+                                    | TaskStatus::WaitingForHuman
+                                    | TaskStatus::ReadyForReview
+                                    | TaskStatus::Failed
+                            ))
+                }) {
+                    if !query.is_empty() && !task.title.to_lowercase().contains(&query) {
+                        continue;
+                    }
+                    if state
+                        .project_selection
+                        .as_ref()
+                        .is_some_and(|project| project != &task.repo_root)
+                    {
+                        continue;
+                    }
+                    list = list.push(
+                        button(
+                            column![
+                                text(crate::review_text::visible_bounded(&task.title, 90))
+                                    .size(size),
+                                text(format!(
+                                    "{} · {}",
+                                    task.provider.display_name(),
+                                    task.status.label()
+                                ))
+                                .size(size - 2.0)
+                                .style(text::secondary)
+                            ]
+                            .spacing(3),
+                        )
+                        .on_press(M::WorkspaceTask(task.id))
+                        .width(Length::Fill)
+                        .style(if state.workspace_task == Some(task.id) {
+                            button::primary
+                        } else {
+                            button::text
+                        }),
+                    );
+                }
             }
         }
         list = list.push(text("TERMINALS").size(size - 2.0).style(text::secondary));
@@ -1468,6 +1486,9 @@ impl super::Frost {
         container(
             scrollable(list)
                 .id(iced::widget::Id::new("workspace-session-navigation"))
+                .on_scroll(move |viewport| {
+                    M::AgentWorkspaceScrolled(visible, viewport.absolute_offset().y)
+                })
                 .height(Length::Fill),
         )
         .padding(12)

@@ -98,6 +98,7 @@ mod workflow_picker;
 mod workflows;
 mod workspace_chat_bridge;
 mod workspace_sessions_bridge;
+mod workspace_visibility;
 
 use std::hash::Hash;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -4718,6 +4719,8 @@ enum Message {
     WorkspaceTerminal(usize),
     WorkspaceNewTerminal,
     WorkspaceTask(agent_task::TaskId),
+    AgentWorkspaceToggle,
+    AgentWorkspaceScrolled(bool, f32),
     WorkspaceProject(Option<std::path::PathBuf>),
     AiChatsComposerAction(
         workspace_chat_bridge::ChatRef,
@@ -17805,6 +17808,26 @@ impl Frost {
                 }
             }
             Message::AgentLaunch(provider) => self.agent_launch_in_tab(provider),
+            Message::AgentWorkspaceToggle => {
+                self.native_enter_ownership.lock().claim_held();
+                self.config.agent_workspace_enabled = !self.config.agent_workspace_enabled;
+                let visible = self.config.agent_workspace_enabled;
+                self.agent_sessions.workspace_scroll.toggled(visible);
+                self.config_dirty = true;
+                if let Some(y) = self.agent_sessions.workspace_scroll.restore_offset(visible) {
+                    return iced::widget::operation::scroll_to(
+                        iced::widget::Id::new("workspace-session-navigation"),
+                        iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
+                    );
+                }
+            }
+            Message::AgentWorkspaceScrolled(rendered_expanded, offset) => {
+                self.agent_sessions.workspace_scroll.record(
+                    rendered_expanded,
+                    self.config.agent_workspace_enabled,
+                    offset,
+                );
+            }
             Message::WorkspaceApiPin(id, pinned) => self.ai_chats.workspace.pin(id, pinned),
             Message::WorkspaceApiUseShared(id) => {
                 self.ai_chats.workspace.reload_shared_draft(id);

@@ -297,6 +297,10 @@ pub struct Config {
     /// responsive glass defaults; narrow windows do not rewrite preferences.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar_width: Option<f32>,
+
+    /// Collapse the Agent Workspace group without changing any active conversation.
+    #[serde(default = "default_true")]
+    pub agent_workspace_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inspector_width: Option<f32>,
 
@@ -737,6 +741,7 @@ impl Default for Config {
             tab_position: TabPosition::default(),
             scrollback_lines: default_scrollback_lines(),
             sidebar_width: None,
+            agent_workspace_enabled: true,
             inspector_width: None,
             initial_width: default_initial_width(),
             initial_height: default_initial_height(),
@@ -1355,6 +1360,17 @@ pub fn create_default_config() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_workspace_enabled_defaults_on_and_round_trips_hidden_without_resizing() {
+        let mut config = super::Config::from_toml("").unwrap();
+        assert!(config.agent_workspace_enabled);
+        config.agent_workspace_enabled = false;
+        config.sidebar_width = Some(312.0);
+        let restored = super::Config::from_toml(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(!restored.agent_workspace_enabled);
+        assert_eq!(restored.sidebar_width, Some(312.0));
+    }
+
     #[test]
     fn sidebar_width_preferences_default_safely_normalize_and_round_trip() {
         let legacy = super::Config::from_toml("").unwrap();
