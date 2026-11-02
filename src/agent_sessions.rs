@@ -138,9 +138,18 @@ impl OrganizationEditor {
 }
 
 pub(crate) struct SessionLibrary {
+    pub(crate) context: crate::workspace_context::ContextEditor,
+    pub(crate) review: crate::workspace_review::WorkspaceReview,
+    pub(crate) remote: crate::workspace_remote_ui::RemotePanel,
+    pub(crate) context_inputs: crate::workspace_inspector::ContextInputs,
+    pub(crate) context_input_focused: bool,
+    pub(crate) menu_open: bool,
+    pub(crate) menu_epoch: u64,
+    pub(crate) tools: crate::workspace_tools::WorkspaceTools,
     pub open: bool,
     pub(crate) workspace_pending: bool,
     pub(crate) workspace_task: Option<jterm_core::agent_task::TaskId>,
+    pub(crate) task_read_positions: HashMap<jterm_core::agent_task::TaskId, f32>,
     pub(crate) workspace_scroll: crate::workspace_visibility::ScrollBookmark,
     catalog_epoch: u64,
     pub(crate) workspace: crate::workspace_sessions_bridge::WorkspaceSessions,
@@ -283,10 +292,62 @@ impl SessionLibrary {
             self.store.error()
         }
     }
+    fn workspace_filter(&self) -> jterm_core::agent_workspace::WorkspaceFilter {
+        let mut query = self.query.clone();
+        if let Some(provider) = self.provider {
+            query.push_str(&format!(
+                " provider:{}",
+                provider.label().to_ascii_lowercase()
+            ));
+        }
+        if self.status == Some(SessionStatus::Waiting) {
+            query.push_str(" is:attention");
+        }
+        if self.pinned_only {
+            query.push_str(" is:pinned");
+        }
+        if self.archive == SessionArchiveFilter::Archived {
+            query.push_str(" is:archived");
+        }
+        if let Some(project) = self
+            .project_selection
+            .as_deref()
+            .or_else(|| self.project_only.then(|| self.project.as_deref()).flatten())
+        {
+            let quoted = serde_json::to_string(&project.to_string_lossy()).unwrap_or_default();
+            query.push_str(&format!(" project:{quoted}"));
+        }
+        jterm_core::agent_workspace::WorkspaceFilter {
+            query,
+            live_only: self.live_only,
+            include_archived: self.archive != SessionArchiveFilter::Active,
+            ..Default::default()
+        }
+    }
+
+    fn workspace_search_query(&self) -> String {
+        if self.query.trim().is_empty() {
+            return String::new();
+        }
+        let mut query = self.workspace_filter().query;
+        if self.live_only {
+            query.push_str(" is:live");
+        }
+        query
+    }
+
     fn workspace_visible(&self) -> Vec<usize> {
-        if SessionSearchIndex::query_error(&self.query).is_some() {
+        let filter = self.workspace_filter();
+        if filter.query_error().is_some() {
             return Vec::new();
         }
+        let query_archived = jterm_core::agent_workspace::WorkspaceQuery::parse(&filter.query)
+            .is_ok_and(|query| query.includes_archived());
+        let matching: HashSet<_> = filter
+            .project(&self.workspace.rows.values().cloned().collect::<Vec<_>>())
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
         let mut result: Vec<_> = self
             .catalog
             .sessions
@@ -296,7 +357,7 @@ impl SessionLibrary {
                 let row = self.workspace.row(session);
                 let archived = session.archived || row.is_some_and(|row| row.archived);
                 let archive = match self.archive {
-                    SessionArchiveFilter::Active => !archived,
+                    SessionArchiveFilter::Active => !archived || query_archived,
                     SessionArchiveFilter::Archived => archived,
                     SessionArchiveFilter::All => true,
                 };
@@ -305,9 +366,11 @@ impl SessionLibrary {
                         .provider
                         .is_none_or(|provider| provider == session.provider)
                     && self.status.is_none_or(|status| {
-                        status == session.status
-                            && (status != SessionStatus::Waiting
-                                || row.is_some_and(|row| row.runtime.is_live()))
+                        if status == SessionStatus::Waiting {
+                            row.is_some_and(|row| row.attention().is_some())
+                        } else {
+                            status == session.status
+                        }
                     })
                     && (!self.live_only
                         || self
@@ -333,7 +396,7 @@ impl SessionLibrary {
                         .is_none_or(|project| session.cwd.starts_with(project))
                     && row.map_or_else(
                         || session.matches_query(&self.query),
-                        |row| row.matches(&self.query),
+                        |row| matching.contains(&row.id),
                     )
             })
             .map(|(index, _)| index)
@@ -369,9 +432,18 @@ impl SessionLibrary {
 
     fn with_store(store: SessionLibraryStore) -> Self {
         Self {
+            tools: Default::default(),
+            context: Default::default(),
+            review: Default::default(),
+            remote: Default::default(),
+            context_inputs: Default::default(),
+            context_input_focused: false,
+            menu_open: false,
+            menu_epoch: 0,
             open: false,
             workspace_pending: false,
             workspace_task: None,
+            task_read_positions: HashMap::new(),
             workspace_scroll: Default::default(),
             catalog_epoch: 0,
             workspace: Default::default(),
@@ -475,6 +547,12 @@ impl SessionLibrary {
             return false;
         }
         self.query = query;
+        let search_query = self.workspace_search_query();
+        self.tools.set_search(
+            &search_query,
+            None,
+            self.archive != SessionArchiveFilter::Active,
+        );
         self.apply_filters();
         true
     }
@@ -487,6 +565,19 @@ impl SessionLibrary {
     }
 
     pub fn poll(&mut self) -> bool {
+        self.context.poll();
+        self.review.poll();
+        self.remote.reader.poll();
+        if let Some(draft) = self.context.draft() {
+            self.context_inputs.sync(draft);
+        }
+        let search_query = self.workspace_search_query();
+        self.tools.set_search(
+            &search_query,
+            None,
+            self.archive != SessionArchiveFilter::Active,
+        );
+        self.tools.poll();
         let old_page = self.page;
         if let Some(catalog) = self.scanner.poll() {
             self.replace_catalog(catalog);
@@ -1146,7 +1237,193 @@ fn hashtags(tags: &[String]) -> String {
         .join("  ")
 }
 
+fn workspace_navigation_key(value: impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+// Keyed Column diffs its children directly. When an async catalog inserts a
+// scoped row before a text header, that row may receive the old header's tree.
+// A homogeneous Column boundary restores Tree::diff's tag checks beneath it;
+// the inner scope still retains or retires state by the full conversation ID.
+fn workspace_navigation_child<
+    'a,
+    Message: 'a,
+    Theme: 'a,
+    Renderer: iced::advanced::Renderer + 'a,
+>(
+    child: impl Into<iced::Element<'a, Message, Theme, Renderer>>,
+) -> iced::Element<'a, Message, Theme, Renderer> {
+    iced::widget::Column::with_children([child.into()])
+        .width(iced::Length::Fill)
+        .into()
+}
+
+pub(crate) fn workspace_task_namespace() -> String {
+    format!(
+        "frost:{}",
+        super::Config::config_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "default".into())
+    )
+}
+
 impl super::Frost {
+    /// Preserve the host's factual task, validation and ownership projection.
+    /// Unhosted local tasks reuse the same core dashboard classification.
+    pub(crate) fn workspace_task_rows(
+        &self,
+    ) -> Vec<(
+        jterm_core::agent_task::TaskId,
+        jterm_core::agent_workspace::WorkspaceRow,
+    )> {
+        let namespace = workspace_task_namespace();
+        self.task_manager
+            .tasks()
+            .iter()
+            .filter_map(|task| {
+                let row = self.agent_runtime.workspace_row(task.id).or_else(|| {
+                    jterm_core::agent_workspace::WorkspaceRow::from_task(
+                        &namespace,
+                        task,
+                        jterm_core::agent_task::DashboardActivity {
+                            has_agent_terminal: self
+                                .agent_runtime
+                                .hosted_terminal(task.id)
+                                .is_some(),
+                            has_validation_terminal: self
+                                .agent_runtime
+                                .hosted_validation_terminal(task.id)
+                                .is_some(),
+                            has_active_agent_stream: self
+                                .task_manager
+                                .has_active_agent_event_stream(task.id),
+                            native_preparing: self.agent_runtime.has_preparing(task.id),
+                        },
+                    )
+                    .ok()
+                })?;
+                Some((task.id, row))
+            })
+            .collect()
+    }
+
+    /// The current conversation, never the last terminal hidden behind a chat.
+    pub(crate) fn workspace_selected_row(
+        &self,
+    ) -> Option<jterm_core::agent_workspace::WorkspaceRow> {
+        if self.ai_chats.is_open {
+            let id = self
+                .ai_chats
+                .workspace
+                .id_for(self.ai_chats.store.active_id())
+                .cloned()?;
+            return self
+                .ai_chats
+                .workspace
+                .rows
+                .iter()
+                .find(|row| row.id == id)
+                .cloned();
+        }
+        if let Some(id) = self.agent_sessions.workspace_task {
+            return self
+                .workspace_task_rows()
+                .into_iter()
+                .find(|(task, _)| *task == id)
+                .map(|(_, row)| row);
+        }
+        let active = self.sessions.get(self.active)?;
+        let session = self
+            .agent_sessions
+            .catalog
+            .sessions
+            .iter()
+            .find(|session| {
+                self.agent_sessions.bindings.get(&open_session_key(session)) == Some(&active.id)
+            })?;
+        self.agent_sessions.workspace.row(session).cloned()
+    }
+
+    pub(crate) fn workspace_has_conversation(&self) -> bool {
+        self.ai_chats.is_open
+            || self.agent_sessions.workspace_task.is_some()
+            || self.workspace_selected_row().is_some()
+    }
+
+    pub(crate) fn workspace_evidence_can_open(&self) -> bool {
+        use jterm_core::agent_workspace::{ConversationKind, SearchSource};
+        let tools = &self.agent_sessions.tools;
+        let (Some(hit), Some(document)) = (&tools.selected_hit, &tools.document) else {
+            return false;
+        };
+        if hit.source == SearchSource::ImportedHistory
+            || document.conversation != hit.row.id
+            || document.event_id != hit.anchor.event_id
+            || document.revision != hit.anchor.revision
+        {
+            return false;
+        }
+        match hit.row.kind {
+            ConversationKind::Api => true,
+            ConversationKind::Task => {
+                self.config.experimental_task_sidebar
+                    && self
+                        .workspace_task_rows()
+                        .iter()
+                        .any(|(_, row)| row.id == hit.row.id)
+            }
+            ConversationKind::Cli => self.agent_sessions.catalog.sessions.iter().any(|session| {
+                self.agent_sessions
+                    .workspace
+                    .row(session)
+                    .is_some_and(|row| row.id == hit.row.id)
+            }),
+        }
+    }
+
+    pub(crate) fn workspace_evidence_action(&mut self) -> Option<super::Message> {
+        if !self.workspace_evidence_can_open() {
+            return None;
+        }
+        let hit = self.agent_sessions.tools.selected_hit.clone()?;
+        let action = match hit.row.kind {
+            jterm_core::agent_workspace::ConversationKind::Api => {
+                super::Message::WorkspaceApi(hit.row.id)
+            }
+            jterm_core::agent_workspace::ConversationKind::Task => {
+                let (id, _) = self
+                    .workspace_task_rows()
+                    .into_iter()
+                    .find(|(_, row)| row.id == hit.row.id)?;
+                super::Message::WorkspaceTask(id)
+            }
+            jterm_core::agent_workspace::ConversationKind::Cli => {
+                let session = self
+                    .agent_sessions
+                    .catalog
+                    .sessions
+                    .iter()
+                    .find(|session| {
+                        self.agent_sessions
+                            .workspace
+                            .row(session)
+                            .is_some_and(|row| row.id == hit.row.id)
+                    })?
+                    .clone();
+                self.agent_sessions.clear_filters();
+                super::Message::WorkspaceOpenSession(WorkspaceSessionRef {
+                    epoch: self.agent_sessions.catalog_epoch,
+                    session,
+                })
+            }
+        };
+        self.agent_sessions.tools.close_document();
+        Some(action)
+    }
+
     pub(crate) fn activate_workspace_session(&mut self, reference: WorkspaceSessionRef) {
         let state = &mut self.agent_sessions;
         if !state.workspace_reference_current(&reference) {
@@ -1170,9 +1447,30 @@ impl super::Frost {
 
     pub(crate) fn workspace_navigation(&self) -> iced::Element<'_, super::Message> {
         use super::Message as M;
-        use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
+        use iced::widget::{
+            button, column, container, pick_list, row, scrollable, text, text_input,
+        };
         use iced::Length;
+        use jterm_core::agent_workspace::WorkspaceAction as Action;
         let state = &self.agent_sessions;
+        let filter = state.workspace_filter();
+        let workspace_error = filter.query_error();
+        let task_rows = self.workspace_task_rows();
+        let needs_count = state
+            .workspace
+            .rows
+            .values()
+            .chain(self.ai_chats.workspace.rows.iter())
+            .filter(|row| row.attention().is_some())
+            .count()
+            + if self.config.experimental_task_sidebar {
+                task_rows
+                    .iter()
+                    .filter(|(_, row)| row.attention().is_some())
+                    .count()
+            } else {
+                0
+            };
         let size = self.chrome_font_size();
         let visible = self.config.agent_workspace_enabled;
         let mut list = column![button(
@@ -1189,20 +1487,56 @@ impl super::Frost {
         .spacing(8);
         if visible {
             list = list
-                .push(row![
-                    Space::new().width(Length::Fill),
-                    button(text("＋").size(size)).on_press(M::AiChatsNewChat)
-                ])
-                .push(
+                .push(crate::widget_identity_scope::scope_key(
+                    ("workspace-menus", state.menu_epoch),
                     row![
-                        button(text("Terminal").size(size - 1.0)).on_press(M::WorkspaceNewTerminal),
-                        button(text("Task").size(size - 1.0)).on_press(M::TaskComposerOpen),
-                        button(text("⋯").size(size)).on_press(M::AgentSessionsToggle)
+                        pick_list(
+                            [
+                                Action::NewApiChat.label(),
+                                Action::NewTask.label(),
+                                Action::NewTerminal.label()
+                            ],
+                            None::<&str>,
+                            |choice| {
+                                M::WorkspaceMenuChoice(Box::new(
+                                    if choice == Action::NewApiChat.label() {
+                                        M::AiChatsNewChat
+                                    } else if choice == Action::NewTask.label() {
+                                        M::TaskComposerOpen
+                                    } else {
+                                        M::WorkspaceNewTerminal
+                                    },
+                                ))
+                            }
+                        )
+                        .placeholder("New")
+                        .text_size(size)
+                        .on_open(M::WorkspaceMenu(true))
+                        .on_close(M::WorkspaceMenu(false)),
+                        pick_list(
+                            [
+                                "Overview and queue",
+                                "Session details",
+                                "Remote workspace (read-only)"
+                            ],
+                            None::<&str>,
+                            |choice| M::WorkspaceMenuChoice(Box::new(match choice {
+                                "Overview and queue" =>
+                                    M::ReferenceInspector(crate::native_shell::InspectorTab::Run),
+                                "Remote workspace (read-only)" => M::WorkspaceRemoteOpen,
+                                _ => M::AgentSessionsToggle,
+                            }))
+                        )
+                        .placeholder("More")
+                        .text_size(size)
+                        .on_open(M::WorkspaceMenu(true))
+                        .on_close(M::WorkspaceMenu(false)),
                     ]
-                    .spacing(4),
-                )
+                    .spacing(6)
+                    .wrap(),
+                ))
                 .push(
-                    text_input("Search conversations…", &state.query)
+                    text_input("Search · provider:codex status:review", &state.query)
                         .on_input(M::AgentSessionsQuery)
                         .size(size),
                 );
@@ -1243,7 +1577,7 @@ impl super::Frost {
                         } else {
                             button::text
                         }),
-                    button(text("Needs you").size(size - 1.0))
+                    button(text(format!("Needs you · {needs_count}")).size(size - 1.0))
                         .on_press(M::AgentSessionsStatus(
                             if state.status == Some(SessionStatus::Waiting) {
                                 None
@@ -1263,13 +1597,65 @@ impl super::Frost {
                 .notice
                 .as_ref()
                 .or(state.workspace.notice.as_ref())
-                .or(state.query_error.as_ref())
+                .or(workspace_error.as_ref())
             {
-                list = list.push(text(notice).size(size - 1.0).style(text::danger));
+                list = list.push(text(notice.clone()).size(size - 1.0).style(text::danger));
             }
             if state.pending_confirm.is_some() {
                 list = list.push(text("Checking conversation…").size(size - 1.0));
             }
+            if !state.tools.query().is_empty() {
+                list = list.push(
+                    text("HISTORY MATCHES")
+                        .size(size - 2.0)
+                        .style(text::secondary),
+                );
+                if state.tools.searching() {
+                    list = list.push(text("Searching saved evidence…").size(size - 1.0));
+                }
+                if let Some(notice) = &state.tools.notice {
+                    list = list.push(text(notice).size(size - 1.0).style(text::danger));
+                }
+                for hit in &state.tools.page.hits {
+                    list = list.push(crate::widget_identity_scope::scope_key(
+                        ("workspace-evidence", hit.row.id.clone(), hit.anchor.clone()),
+                        button(
+                            column![
+                                text(crate::review_text::visible_bounded(&hit.row.title, 100))
+                                    .size(size),
+                                text(hit.source.label())
+                                    .size(size - 2.0)
+                                    .style(text::secondary),
+                                text(crate::review_text::visible_bounded(&hit.snippet, 220))
+                                    .size(size - 1.0),
+                            ]
+                            .spacing(3),
+                        )
+                        .on_press(M::WorkspaceSearchOpen(hit.clone()))
+                        .width(Length::Fill)
+                        .style(button::text),
+                    ));
+                }
+                if !state.tools.searching() {
+                    list = list.push(
+                        text(state.tools.page.coverage.label())
+                            .size(size - 2.0)
+                            .style(text::secondary),
+                    );
+                    if state.tools.page.hits.is_empty() {
+                        list = list
+                            .push(text("No indexed history matches this query.").size(size - 1.0));
+                    }
+                }
+                if state.tools.page.next_before.is_some() {
+                    list = list.push(
+                        button(text("More history matches").size(size - 1.0)).on_press_maybe(
+                            (!state.tools.search_loading).then_some(M::WorkspaceSearchMore),
+                        ),
+                    );
+                }
+            }
+            let mut conversations = iced::widget::keyed::Column::new().spacing(8);
             let mut group = None;
             let visible = state.workspace_visible();
             for &index in &visible {
@@ -1277,14 +1663,17 @@ impl super::Frost {
                 let pinned = state.workspace.pinned(session);
                 if group != Some(pinned) {
                     group = Some(pinned);
-                    list = list.push(
-                        text(if pinned {
-                            "PINNED"
-                        } else {
-                            "RECENT CONVERSATIONS"
-                        })
-                        .size(size - 2.0)
-                        .style(text::secondary),
+                    conversations = conversations.push(
+                        workspace_navigation_key(("group", pinned)),
+                        workspace_navigation_child(
+                            text(if pinned {
+                                "PINNED"
+                            } else {
+                                "RECENT CONVERSATIONS"
+                            })
+                            .size(size - 2.0)
+                            .style(text::secondary),
+                        ),
                     );
                 }
                 let binding = state.bindings.get(&open_session_key(session)).copied();
@@ -1296,6 +1685,11 @@ impl super::Frost {
                             .is_some_and(|session| session.id == id)
                     });
                 let title = state.workspace.title(session);
+                let presentation = state.workspace.row(session).map(|row| row.presentation());
+                let status_label = presentation
+                    .as_ref()
+                    .map(|p| p.status_label.as_str())
+                    .unwrap_or("Indexing history");
                 let reference = WorkspaceSessionRef {
                     epoch: state.catalog_epoch,
                     session: session.clone(),
@@ -1307,17 +1701,9 @@ impl super::Frost {
                     button(
                         column![
                             text(crate::review_text::visible_bounded(title, 90)).size(size),
-                            text(format!(
-                                "{} · {}",
-                                session.provider.label(),
-                                if binding.is_some() {
-                                    "Open terminal"
-                                } else {
-                                    "Ready to resume"
-                                }
-                            ))
-                            .size(size - 2.0)
-                            .style(text::secondary)
+                            text(format!("{} · {}", session.provider.label(), status_label))
+                                .size(size - 2.0)
+                                .style(text::secondary)
                         ]
                         .spacing(3)
                     )
@@ -1330,42 +1716,44 @@ impl super::Frost {
                     }),
                 ]
                 .spacing(2);
-                list = list.push(row);
-            }
-            if visible.is_empty() {
-                list = list.push(
-                    text(if state.scanner.is_scanning() {
-                        "Discovering local sessions…"
-                    } else {
-                        "No CLI conversations match"
-                    })
-                    .size(size - 1.0)
-                    .style(text::secondary),
+                conversations = conversations.push(
+                    workspace_navigation_key(("cli", open_session_key(session))),
+                    workspace_navigation_child(crate::widget_identity_scope::scope_key(
+                        ("workspace-cli", open_session_key(session)),
+                        row,
+                    )),
                 );
             }
-            list = list.push(
-                text("API CONVERSATIONS")
-                    .size(size - 2.0)
-                    .style(text::secondary),
+            if visible.is_empty() {
+                conversations = conversations.push(
+                    workspace_navigation_key("empty-cli"),
+                    workspace_navigation_child(
+                        text(if state.scanner.is_scanning() {
+                            "Discovering local sessions…"
+                        } else {
+                            "No CLI conversations match"
+                        })
+                        .size(size - 1.0)
+                        .style(text::secondary),
+                    ),
+                );
+            }
+            conversations = conversations.push(
+                workspace_navigation_key("api-header"),
+                workspace_navigation_child(
+                    text("API CONVERSATIONS")
+                        .size(size - 2.0)
+                        .style(text::secondary),
+                ),
             );
-            let query = state.query.trim().to_lowercase();
-            for chat in self.ai_chats.workspace.rows.iter().filter(|chat| {
-                !chat.archived
-                    && (!state.live_only || chat.runtime.is_live())
-                    && (state.status != Some(SessionStatus::Waiting)
-                        || matches!(
-                            chat.runtime,
-                            jterm_core::agent_workspace::RuntimeState::Failed
-                                | jterm_core::agent_workspace::RuntimeState::Conflict
-                        ))
+            let api_rows = filter.project(&self.ai_chats.workspace.rows);
+            for chat in api_rows.iter().filter(|chat| {
+                true && (!state.live_only || chat.runtime.is_live())
+                    && (state.status != Some(SessionStatus::Waiting) || chat.attention().is_some())
                     && state
                         .project_selection
                         .as_ref()
                         .is_none_or(|project| std::path::Path::new(&chat.cwd).starts_with(project))
-                    && (query.is_empty()
-                        || format!("{} {}", chat.title, chat.preview)
-                            .to_lowercase()
-                            .contains(&query))
             }) {
                 let selected = self.ai_chats.is_open
                     && self
@@ -1373,91 +1761,94 @@ impl super::Frost {
                         .workspace
                         .id_for(self.ai_chats.store.active_id())
                         == Some(&chat.id);
-                list = list.push(
-                    row![
-                        button(text(if chat.pinned { "★" } else { "☆" }).size(size))
-                            .on_press(M::WorkspaceApiPin(chat.id.clone(), !chat.pinned))
-                            .style(button::text),
-                        button(
-                            column![
-                                text(&chat.title).size(size),
-                                text("API conversation")
-                                    .size(size - 2.0)
-                                    .style(text::secondary)
-                            ]
-                            .spacing(3),
-                        )
-                        .on_press(M::WorkspaceApi(chat.id.clone()))
-                        .width(Length::Fill)
-                        .style(if selected {
-                            button::primary
-                        } else {
-                            button::text
-                        })
-                    ]
-                    .spacing(2),
+                let presentation = chat.presentation();
+                conversations = conversations.push(
+                    workspace_navigation_key(("api", &chat.id.0)),
+                    workspace_navigation_child(crate::widget_identity_scope::scope_key(
+                        ("workspace-api", chat.id.clone()),
+                        row![
+                            button(text(if chat.pinned { "★" } else { "☆" }).size(size))
+                                .on_press(M::WorkspaceApiPin(chat.id.clone(), !chat.pinned))
+                                .style(button::text),
+                            button(
+                                column![
+                                    text(chat.title.clone()).size(size),
+                                    text(presentation.status_label)
+                                        .size(size - 2.0)
+                                        .style(text::secondary)
+                                ]
+                                .spacing(3),
+                            )
+                            .on_press(M::WorkspaceApi(chat.id.clone()))
+                            .width(Length::Fill)
+                            .style(if selected {
+                                button::primary
+                            } else {
+                                button::text
+                            })
+                        ]
+                        .spacing(2),
+                    )),
                 );
             }
             if self.config.experimental_task_sidebar {
-                list = list.push(
-                    text("TASK CONVERSATIONS")
-                        .size(size - 2.0)
-                        .style(text::secondary),
+                conversations = conversations.push(
+                    workspace_navigation_key("task-header"),
+                    workspace_navigation_child(
+                        text("TASK CONVERSATIONS")
+                            .size(size - 2.0)
+                            .style(text::secondary),
+                    ),
                 );
-                for task in self.task_manager.tasks().iter().filter(|task| {
-                    use jterm_core::agent_task::TaskStatus;
-                    task.status != TaskStatus::Archived
-                        && (!state.live_only
-                            || matches!(
-                                task.status,
-                                TaskStatus::Starting
-                                    | TaskStatus::Working
-                                    | TaskStatus::WaitingForApproval
-                            ))
+                let projected_tasks = filter.project(
+                    &task_rows
+                        .iter()
+                        .map(|(_, row)| row.clone())
+                        .collect::<Vec<_>>(),
+                );
+                for task in projected_tasks.iter().filter(|task| {
+                    true && (!state.live_only || task.runtime.is_live())
                         && (state.status != Some(SessionStatus::Waiting)
-                            || matches!(
-                                task.status,
-                                TaskStatus::WaitingForApproval
-                                    | TaskStatus::WaitingForHuman
-                                    | TaskStatus::ReadyForReview
-                                    | TaskStatus::Failed
-                            ))
+                            || task.attention().is_some())
+                        && state.project_selection.as_ref().is_none_or(|project| {
+                            std::path::Path::new(&task.cwd).starts_with(project)
+                        })
                 }) {
-                    if !query.is_empty() && !task.title.to_lowercase().contains(&query) {
+                    let Some(task_id) = task.facts.task_id else {
                         continue;
-                    }
-                    if state
-                        .project_selection
-                        .as_ref()
-                        .is_some_and(|project| project != &task.repo_root)
-                    {
-                        continue;
-                    }
-                    list = list.push(
-                        button(
-                            column![
-                                text(crate::review_text::visible_bounded(&task.title, 90))
-                                    .size(size),
-                                text(format!(
-                                    "{} · {}",
-                                    task.provider.display_name(),
-                                    task.status.label()
-                                ))
-                                .size(size - 2.0)
-                                .style(text::secondary)
-                            ]
-                            .spacing(3),
-                        )
-                        .on_press(M::WorkspaceTask(task.id))
-                        .width(Length::Fill)
-                        .style(if state.workspace_task == Some(task.id) {
-                            button::primary
-                        } else {
-                            button::text
-                        }),
+                    };
+                    let presentation = task.presentation();
+                    conversations = conversations.push(
+                        workspace_navigation_key(("task", &task.id.0)),
+                        workspace_navigation_child(crate::widget_identity_scope::scope_key(
+                            ("workspace-task", task.id.clone()),
+                            button(
+                                column![
+                                    text(crate::review_text::visible_bounded(&task.title, 90))
+                                        .size(size),
+                                    text(format!(
+                                        "{} · {}",
+                                        task.provider, presentation.status_label
+                                    ))
+                                    .size(size - 2.0)
+                                    .style(text::secondary),
+                                ]
+                                .spacing(3),
+                            )
+                            .on_press(M::WorkspaceTask(task_id))
+                            .width(Length::Fill)
+                            .style(
+                                if state.workspace_task == Some(task_id) {
+                                    button::primary
+                                } else {
+                                    button::text
+                                },
+                            ),
+                        )),
                     );
                 }
             }
+            list = list.push(conversations.width(Length::Fill));
         }
         list = list.push(text("TERMINALS").size(size - 2.0).style(text::secondary));
         for (index, session) in self.sessions.iter().enumerate() {
@@ -3811,5 +4202,57 @@ mod tests {
         }
         assert_eq!(seen, SessionSort::ALL);
         assert_eq!(library.sort, SessionSort::ALL[0]);
+    }
+}
+
+#[cfg(test)]
+mod workspace_navigation_tree_tests {
+    use super::{workspace_navigation_child, workspace_navigation_key};
+    use iced::advanced::{layout, widget::Tree};
+    use iced::widget::{button, keyed, text};
+    use iced::{Element, Size};
+
+    fn view(conversations: &[&str]) -> Element<'static, String, iced::Theme, ()> {
+        let mut rows = keyed::Column::new()
+            .push(
+                1_u64,
+                workspace_navigation_child(text("No CLI conversations")),
+            )
+            .push(2, workspace_navigation_child(text("API CONVERSATIONS")));
+        for conversation in conversations {
+            rows = rows.push(
+                workspace_navigation_key(("api", conversation)),
+                workspace_navigation_child(crate::widget_identity_scope::scope_key(
+                    ("workspace-api", (*conversation).to_owned()),
+                    button(text((*conversation).to_owned())).on_press((*conversation).to_owned()),
+                )),
+            );
+        }
+        rows.push(3, workspace_navigation_child(text("TASK CONVERSATIONS")))
+            .into()
+    }
+
+    #[test]
+    fn workspace_navigation_hydration_reconciles_different_widget_kinds() {
+        let mut tree = Tree::new(view(&[]).as_widget());
+        // The async host catalog inserts scoped rows before an existing plain
+        // header. Keyed Column can reuse that header's tree for the new row.
+        for conversations in [
+            vec!["api-a", "api-b"],
+            vec!["api-b", "api-a"],
+            vec!["api-b"],
+            vec![],
+            vec!["api-c"],
+        ] {
+            let mut element = view(&conversations);
+            tree.diff(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &(),
+                &layout::Limits::new(Size::ZERO, Size::new(300.0, 600.0)),
+            );
+            assert_eq!(tree.children.len(), conversations.len() + 3);
+            assert_eq!(node.children().len(), conversations.len() + 3);
+        }
     }
 }

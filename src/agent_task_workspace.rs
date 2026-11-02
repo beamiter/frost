@@ -311,6 +311,43 @@ impl crate::Frost {
         self.set_task_panel_open(true);
     }
 
+    pub(crate) fn open_task_handoff(
+        &mut self,
+        packet: &jterm_core::agent_workspace::WorkspaceHandoff,
+    ) -> Result<(), String> {
+        if !self.config.experimental_task_sidebar {
+            return Err("Enable Tasks in Settings before creating a task draft.".into());
+        }
+        if self.task_panel.pending_creation.is_some() {
+            return Err(
+                "Wait for the current task creation to finish. The handoff is retained.".into(),
+            );
+        }
+        let provider = AgentProvider::from_config_value(&packet.target_provider)
+            .ok_or_else(|| "This target has no native task adapter.".to_string())?;
+        if packet.body.len() > GOAL_LIMIT {
+            return Err("The handoff must fit within 16 KiB.".into());
+        }
+        if self.task_panel.composer.as_ref().is_some_and(|draft| {
+            draft.busy
+                || !draft.title.trim().is_empty()
+                || !draft.goal.text().trim().is_empty()
+                || !draft.validation.trim().is_empty()
+        }) {
+            return Err("An existing task draft is retained. Finish or discard it before creating this handoff.".into());
+        }
+        self.task_composer_open();
+        if let Some(draft) = self.task_panel.composer.as_mut() {
+            draft.retire_reference();
+            draft.project = packet.cwd.clone();
+            draft.title = packet.title.clone();
+            draft.goal = text_editor::Content::with_text(&packet.body);
+            draft.provider = provider;
+            draft.notice = None;
+        }
+        Ok(())
+    }
+
     pub(crate) fn task_composer_create(&mut self, reference: Arc<()>) {
         if !self.task_composer_visible() || self.task_panel.pending_creation.is_some() {
             return;

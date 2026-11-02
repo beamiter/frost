@@ -14,6 +14,8 @@ pub(crate) enum InspectorTab {
     Agent,
     Context,
     Files,
+    Changes,
+    Run,
 }
 
 #[derive(Clone, Debug)]
@@ -1236,12 +1238,25 @@ impl Frost {
             };
             return container(
                 row![
-                    column![
-                        self.chrome_label(title, 14.0, false, true),
-                        self.chrome_label(subtitle, 10.0, true, false)
-                    ]
-                    .spacing(3),
-                    Space::new().width(Length::Fill),
+                    tooltip(
+                        container(
+                            column![
+                                self.chrome_label(title.clone(), 14.0, false, true)
+                                    .width(Length::Fill)
+                                    .wrapping(text::Wrapping::None),
+                                self.chrome_label(subtitle, 10.0, true, false)
+                                    .width(Length::Fill)
+                                    .wrapping(text::Wrapping::None)
+                            ]
+                            .spacing(3)
+                            .width(Length::Fill),
+                        )
+                        .width(Length::Fill)
+                        .clip(true),
+                        self.chrome_label(title, 10.0, false, true),
+                        tooltip::Position::Bottom,
+                    )
+                    .style(self.popup_style()),
                     button(self.chrome_label("New", 10.0, false, false)).on_press(
                         if self.ai_chats.is_open {
                             Message::AiChatsNewChat
@@ -1250,7 +1265,7 @@ impl Frost {
                         }
                     ),
                     button(self.chrome_label("Context", 10.0, false, false))
-                        .on_press(Message::ReferenceInspectorToggle)
+                        .on_press(Message::ReferenceInspector(InspectorTab::Context))
                 ]
                 .align_y(iced::Alignment::Center)
                 .spacing(8),
@@ -1988,14 +2003,25 @@ impl Frost {
 
     fn reference_inspector(&self) -> Element<'_, Message> {
         let width = self.reference_inspector_width();
+        let workspace = (self.workspace_inspector_active()
+            || matches!(
+                self.reference_inspector_tab,
+                InspectorTab::Changes | InspectorTab::Run
+            ))
+            && self.reference_inspector_tab != InspectorTab::Files;
+        let selected_tab = if workspace && self.reference_inspector_tab == InspectorTab::Agent {
+            InspectorTab::Run
+        } else {
+            self.reference_inspector_tab
+        };
         let tab_width = ((width - 12.0 - 28.0 - 24.0) / 3.0).clamp(1.0, shell::INSPECTOR_TAB_WIDTH);
         let tab = |name: &'static str, value| {
             let content: Element<'_, Message> = if self.chrome_font_size() > 16.0 {
                 vector_icon(
                     match value {
-                        InspectorTab::Agent => Icon::from_key("agent"),
+                        InspectorTab::Agent | InspectorTab::Run => Icon::from_key("agent"),
                         InspectorTab::Context => Icon::PanelRight,
-                        InspectorTab::Files => Icon::Files,
+                        InspectorTab::Files | InspectorTab::Changes => Icon::Files,
                     },
                     rgb(color::CHROME_TEXT),
                     16.0,
@@ -2011,16 +2037,30 @@ impl Frost {
                         self.chrome_font_size(),
                     ))
                     .padding([4, 5])
-                    .style(control(self.reference_inspector_tab == value, false)),
+                    .style(control(selected_tab == value, false)),
                 self.chrome_label(name, 10.0, false, false),
                 tooltip::Position::Bottom,
             )
         };
         let header = container(
             row![
-                tab("Agent", InspectorTab::Agent),
+                tab(
+                    if workspace { "Changes" } else { "Agent" },
+                    if workspace {
+                        InspectorTab::Changes
+                    } else {
+                        InspectorTab::Agent
+                    }
+                ),
                 tab("Context", InspectorTab::Context),
-                tab("Files", InspectorTab::Files),
+                tab(
+                    if workspace { "Run" } else { "Files" },
+                    if workspace {
+                        InspectorTab::Run
+                    } else {
+                        InspectorTab::Files
+                    }
+                ),
                 Space::new().width(Length::Fill),
                 tooltip(
                     button(vector_icon(Icon::Close, rgb(color::CHROME_MUTED), 14.0))
@@ -2039,13 +2079,19 @@ impl Frost {
         .height(72.0_f32.min(self.reference_layout().header.height))
         .padding([2, 6])
         .align_y(iced::Alignment::Center);
-        let body: Element<'_, Message> = match self.reference_inspector_tab {
+        let body: Element<'_, Message> = match selected_tab {
+            InspectorTab::Changes | InspectorTab::Run => self.workspace_inspector(selected_tab),
             InspectorTab::Files => mouse_area(
                 self.font_zoom_region(font_zoom::Group::Chrome, self.sidebar_files_view()),
             )
             .on_enter(Message::SidebarHover(true))
             .on_exit(Message::SidebarHover(false))
             .into(),
+            InspectorTab::Context if workspace => agent_task_ui::report_input_focus(
+                self.workspace_inspector(selected_tab),
+                self.agent_sessions.context_input_focused,
+                Message::WorkspaceContextFocus,
+            ),
             InspectorTab::Context => self.reference_context_inspector(),
             InspectorTab::Agent
                 if self.config.experimental_task_sidebar
@@ -2074,16 +2120,23 @@ impl Frost {
                 }
             }
         };
+        let drawer = self.reference_layout().inspector.is_none();
         container(column![header, body].height(Length::Fill))
             .width(width)
             .height(Length::Fill)
-            .style(|theme| {
-                panel(
+            .style(move |theme| {
+                let mut style = panel(
                     theme,
                     color::INSPECTOR,
                     color::DARK_BORDER,
                     shell::CARD_RADIUS,
-                )
+                );
+                if drawer {
+                    // The drawer covers a live canvas. Keep that canvas from
+                    // showing through material fields and their reading space.
+                    style.background = Some(rgb(color::INSPECTOR).into());
+                }
+                style
             })
             .into()
     }

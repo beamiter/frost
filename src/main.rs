@@ -97,8 +97,14 @@ mod workflow_focus;
 mod workflow_picker;
 mod workflows;
 mod workspace_chat_bridge;
+mod workspace_context;
+mod workspace_inspector;
 mod workspace_navigation_surface;
+mod workspace_remote;
+mod workspace_remote_ui;
+mod workspace_review;
 mod workspace_sessions_bridge;
+mod workspace_tools;
 mod workspace_visibility;
 
 use std::hash::Hash;
@@ -4724,6 +4730,32 @@ enum Message {
     WorkspaceTerminal(usize),
     WorkspaceNewTerminal,
     WorkspaceTask(agent_task::TaskId),
+    WorkspaceTaskAttention(agent_task::TaskId, agent_task::ApprovalId),
+    WorkspaceTaskScrolled(agent_task::TaskId, f32),
+    WorkspaceSearchOpen(jterm_core::agent_workspace::WorkspaceSearchHit),
+    WorkspaceSearchMore,
+    WorkspaceSearchClose,
+    WorkspaceEvidenceOpen,
+    WorkspaceContext(
+        jterm_core::agent_workspace::ConversationId,
+        workspace_inspector::ContextAction,
+    ),
+    WorkspaceContextEdit(
+        jterm_core::agent_workspace::ConversationId,
+        workspace_inspector::ContextInputKey,
+        iced::widget::text_editor::Action,
+    ),
+    WorkspaceReview(
+        jterm_core::agent_workspace::ConversationId,
+        workspace_inspector::ReviewAction,
+    ),
+    WorkspaceRefresh,
+    WorkspaceContextFocus(bool),
+    WorkspaceMenu(bool),
+    WorkspaceMenuChoice(Box<Message>),
+    WorkspaceRemoteOpen,
+    WorkspaceRemoteClose,
+    WorkspaceRemoteAction(u64, workspace_remote_ui::RemoteAction),
     AgentWorkspaceToggle,
     AgentWorkspaceScrolled(bool, f32),
     WorkspaceProject(Option<std::path::PathBuf>),
@@ -7382,12 +7414,9 @@ impl Frost {
             ai_suggestion: None,
             ai_suggestion_generation: 0,
             task_manager: agent_task::TaskManager::new(),
-            agent_runtime: agent_task::AgentRuntimeManager::hosted(format!(
-                "frost:{}",
-                Config::config_path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "default".into())
-            )),
+            agent_runtime: agent_task::AgentRuntimeManager::hosted(
+                agent_sessions::workspace_task_namespace(),
+            ),
             task_panel: agent_task_ui::TaskPanel::new(),
             keybindings: keybindings_load.bindings,
             config_panel_open: false,
@@ -8145,6 +8174,8 @@ impl Frost {
             && !self.search.is_open
             && !self.search_replace.is_open
             && !self.agent_sessions.open
+            && !self.agent_sessions.remote.open
+            && !self.agent_sessions.menu_open
             && !self.palette.is_open
             && self.reference_tools_selection.is_none()
             && !native_input_surface::ai_surface_active(
@@ -8169,6 +8200,7 @@ impl Frost {
             && self.sidebar_dialog.is_none()
             && self.sidebar_delete_confirm.is_none()
             && !self.sidebar_files_focused
+            && !self.workspace_context_owns_keys()
             && !self.task_input_owns_keys()
             && !self.eva_input_owns_keys()
             && !self.eva_closing()
@@ -8195,6 +8227,8 @@ impl Frost {
             && self.sidebar_resize.is_none()
             && !self.search_replace.is_open
             && !self.agent_sessions.open
+            && !self.agent_sessions.remote.open
+            && !self.agent_sessions.menu_open
             && !self.palette.is_open
             && self.reference_tools_selection.is_none()
             && !native_input_surface::ai_surface_active(
@@ -12093,6 +12127,8 @@ impl Frost {
             || self.tab_switcher.is_some()
             || self.remote_picker.is_some()
             || self.agent_sessions.open
+            || self.agent_sessions.remote.open
+            || self.agent_sessions.menu_open
             || self.history_picker.is_some()
             || self.workflow_overlay.is_some()
             || self.block_search.is_some()
@@ -18016,6 +18052,76 @@ impl Frost {
                     self.refresh_active_context();
                 }
             }
+            Message::WorkspaceMenu(open) => {
+                self.agent_sessions.menu_open = open;
+                if !open {
+                    self.agent_sessions.menu_epoch = self.agent_sessions.menu_epoch.wrapping_add(1);
+                }
+                self.native_enter_ownership.lock().claim_held();
+            }
+            Message::WorkspaceMenuChoice(action) => {
+                self.agent_sessions.menu_open = false;
+                self.agent_sessions.menu_epoch = self.agent_sessions.menu_epoch.wrapping_add(1);
+                self.native_enter_ownership.lock().claim_held();
+                return self.update(*action);
+            }
+            Message::WorkspaceRemoteOpen => {
+                self.agent_sessions.remote.open = true;
+                self.reference_navigation_drawer = false;
+                self.native_enter_ownership.lock().claim_held();
+            }
+            Message::WorkspaceRemoteClose => {
+                self.agent_sessions.remote.open = false;
+                self.native_enter_ownership.lock().claim_held();
+            }
+            Message::WorkspaceRemoteAction(generation, action) => {
+                self.workspace_remote_action(generation, action)
+            }
+            Message::WorkspaceContext(id, action) => self.workspace_context_action(id, action),
+            Message::WorkspaceContextEdit(id, key, action) => {
+                self.workspace_context_edit(id, key, action)
+            }
+            Message::WorkspaceReview(id, action) => self.workspace_review_action(id, action),
+            Message::WorkspaceRefresh => self.agent_sessions.review.refresh(),
+            Message::WorkspaceContextFocus(focused) => {
+                self.agent_sessions.context_input_focused = focused
+            }
+            Message::WorkspaceSearchOpen(hit) => {
+                self.agent_sessions.tools.open_hit(hit);
+                self.reference_navigation_drawer = false;
+                self.reference_inspector_tab = native_shell::InspectorTab::Context;
+                self.reference_inspector_open = true;
+                self.reference_inspector_drawer = self.reference_layout().inspector.is_none();
+                self.sync_reference_inspector_geometry();
+            }
+            Message::WorkspaceSearchMore => self.agent_sessions.tools.load_more(),
+            Message::WorkspaceSearchClose => self.agent_sessions.tools.close_document(),
+            Message::WorkspaceEvidenceOpen => {
+                if let Some(action) = self.workspace_evidence_action() {
+                    return self.update(action);
+                }
+            }
+            Message::WorkspaceTaskAttention(id, approval) => {
+                let current = self.agent_runtime.shared_snapshot(id).is_some_and(|view| {
+                    view.pending_approvals
+                        .iter()
+                        .any(|item| item.id == approval)
+                });
+                if current {
+                    self.agent_sessions.task_read_positions.insert(id, 0.0);
+                    let task = self.update(Message::WorkspaceTask(id));
+                    self.reference_inspector_drawer = false;
+                    self.sync_reference_inspector_geometry();
+                    return task;
+                }
+            }
+            Message::WorkspaceTaskScrolled(id, offset) => {
+                if self.agent_sessions.workspace_task == Some(id) && offset.is_finite() {
+                    self.agent_sessions
+                        .task_read_positions
+                        .insert(id, offset.max(0.0));
+                }
+            }
             Message::WorkspaceTask(id) => {
                 self.agent_runtime.select_hosted_view(Some(id));
                 if let Some(session) = self.agent_runtime.hosted_terminal(id).cloned() {
@@ -18030,6 +18136,38 @@ impl Frost {
                     self.agent_sessions.cancel_confirmation();
                     self.agent_runtime.select_hosted_view(Some(id));
                     self.task_panel.select(Some(id));
+                    if let Some(row) = self.agent_runtime.workspace_row(id) {
+                        if let Some(attention) = row.attention() {
+                            if attention
+                                == jterm_core::agent_workspace::WorkspaceAttention::Approval
+                            {
+                                self.agent_sessions.task_read_positions.insert(id, 0.0);
+                                self.reference_inspector_drawer = false;
+                            } else {
+                                self.reference_inspector_tab = if attention
+                                    == jterm_core::agent_workspace::WorkspaceAttention::Review
+                                {
+                                    native_shell::InspectorTab::Changes
+                                } else {
+                                    native_shell::InspectorTab::Run
+                                };
+                                self.reference_inspector_open = true;
+                                self.reference_inspector_drawer =
+                                    self.reference_layout().inspector.is_none();
+                            }
+                            self.sync_reference_inspector_geometry();
+                        }
+                    }
+                    let y = self
+                        .agent_sessions
+                        .task_read_positions
+                        .get(&id)
+                        .copied()
+                        .unwrap_or(0.0);
+                    return iced::widget::operation::scroll_to(
+                        iced::widget::Id::new("workspace-task-transcript"),
+                        iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
+                    );
                 }
             }
             Message::WorkspaceProject(project) => {
@@ -18275,6 +18413,7 @@ impl Frost {
                 self.agent_sessions.notice = None;
             }
             Message::AgentSessionsTick => {
+                self.sync_workspace_inspector();
                 let old_error = self.agent_sessions.store.error().map(str::to_owned);
                 let was_editing = self.agent_sessions.editing();
                 let scroll = self.agent_sessions.poll();
@@ -18881,6 +19020,37 @@ impl Frost {
                 return self.update(Message::Key(event));
             }
             Message::Key(event) => {
+                if self.agent_sessions.menu_open {
+                    self.native_enter_ownership.lock().claim_held();
+                    if matches!(
+                        &event,
+                        keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                            repeat: false,
+                            ..
+                        }
+                    ) {
+                        self.agent_sessions.menu_open = false;
+                        self.agent_sessions.menu_epoch =
+                            self.agent_sessions.menu_epoch.wrapping_add(1);
+                    }
+                    return Task::none();
+                }
+                if self.agent_sessions.remote.open {
+                    self.native_enter_ownership.lock().claim_held();
+                    if matches!(
+                        &event,
+                        keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                            repeat: false,
+                            ..
+                        }
+                    ) && !self.native_enter_ownership.lock().ime_composing()
+                    {
+                        self.agent_sessions.remote.open = false;
+                    }
+                    return Task::none();
+                }
                 if self.eva_closing() {
                     // Keep a held dialog Enter owned across cancellation;
                     // later repeats must not execute the restored prompt.
@@ -19343,6 +19513,7 @@ impl Frost {
                     // work. Escape (consumed by the field) or a click
                     // elsewhere returns the keyboard.
                     let task_input = self.task_input_owns_keys()
+                        || self.workspace_context_owns_keys()
                         || self.eva_input_owns_keys()
                         || self.eva_closing();
                     if task_input
@@ -27711,7 +27882,15 @@ impl Frost {
                 .into()
         } else if let Some(task_id) = self.agent_sessions.workspace_task {
             if let Some(task) = self.task_manager.get(task_id) {
-                scrollable(self.task_card(task)).height(Length::Fill).into()
+                crate::widget_identity_scope::scope_key(
+                    ("workspace-task-transcript", task_id),
+                    scrollable(self.task_card(task))
+                        .id(iced::widget::Id::new("workspace-task-transcript"))
+                        .on_scroll(move |viewport| {
+                            Message::WorkspaceTaskScrolled(task_id, viewport.absolute_offset().y)
+                        })
+                        .height(Length::Fill),
+                )
             } else {
                 body
             }
@@ -27736,6 +27915,11 @@ impl Frost {
         let root: Element<'_, Message> = self.reference_workspace(body);
         let root: Element<'_, Message> = if self.agent_sessions.open {
             stack![root, self.agent_sessions_view()].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if self.agent_sessions.remote.open {
+            stack![root, self.workspace_remote_view()].into()
         } else {
             root
         };
@@ -32103,8 +32287,8 @@ impl Frost {
             );
         }
 
-        // Review feedback starts another sequential turn on the live native
-        // Codex session (Claude/Kimi MVP is one-shot print mode).
+        // Review feedback starts a sequential turn only when the live native
+        // adapter and current control lease report that capability.
         if running
             && stream_active
             && task.status == TaskStatus::ReadyForReview
@@ -32898,7 +33082,8 @@ impl Frost {
             .padding(24)
             .into();
         }
-        let header = row![
+        let compact = self.reference_layout().center.width < 560.0;
+        let heading = row![
             text("AI Chats").size(self.effective_font_size()),
             text(if chats.provider_label.is_empty() {
                 "not configured".to_string()
@@ -32906,8 +33091,13 @@ impl Frost {
                 chats.provider_label.clone()
             })
             .size(self.effective_font_size())
+            .width(Length::Fill)
             .style(text::secondary),
-            Space::new().width(Length::Fill),
+        ]
+        .spacing(8)
+        .width(Length::Fill)
+        .align_y(iced::Alignment::Center);
+        let controls = row![
             button(text("Chats").size(self.effective_font_size()))
                 .style(button::secondary)
                 .on_press(Message::AiChatsShowLibrary),
@@ -32920,6 +33110,14 @@ impl Frost {
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center);
+        let header: Element<'_, Message> = if compact {
+            column![heading, controls].spacing(6).into()
+        } else {
+            row![heading, controls]
+                .spacing(8)
+                .align_y(iced::Alignment::Center)
+                .into()
+        };
 
         let page: Element<'_, Message> = match chats.page {
             ChatsPage::Chat => self.ai_chats_chat_page(),
@@ -32960,9 +33158,8 @@ impl Frost {
     }
 
     /// The viewed chat: title editor, transcript, status, consent-gated
-    /// recent-context toggle, and the composer row. The composer is
-    /// single-line like the Agent panel's; the store keeps the draft so
-    /// switching chats never loses it.
+    /// recent-context toggle, and the multiline composer. The store keeps
+    /// each draft independently when the viewed conversation changes.
     fn ai_chats_chat_page(&self) -> Element<'_, Message> {
         let chats = &self.ai_chats;
         let store = &chats.store;
@@ -33171,6 +33368,14 @@ impl Frost {
         ]
         .spacing(6);
 
+        let footer: Element<'_, Message> = if self.reference_layout().center.width < 420.0 {
+            column![action, manage].spacing(6).into()
+        } else {
+            row![action, Space::new().width(Length::Fill), manage]
+                .spacing(6)
+                .into()
+        };
+
         column![
             title,
             scrollable(transcript)
@@ -33188,7 +33393,7 @@ impl Frost {
             include_recent,
             composer,
             Space::new().height(self.effective_font_size() * 1.4),
-            row![action, Space::new().width(Length::Fill), manage].spacing(6),
+            footer,
         ]
         .spacing(8)
         .into()
@@ -33767,6 +33972,15 @@ impl Frost {
             subs.push(iced::time::every(interval).map(|_| Message::TaskTick));
         }
         if self.sidebar_open
+            || self.agent_sessions.remote.open
+            || self.reference_inspector_visible()
+            || self.agent_sessions.context.loading()
+            || self.agent_sessions.context.saving()
+            || self.agent_sessions.context.building()
+            || self.agent_sessions.tools.searching()
+            || self.agent_sessions.tools.document_loading
+            || self.agent_sessions.review.report_loading
+            || self.agent_sessions.review.queue_saving
             || self.agent_sessions.open
             || self.agent_sessions.workspace_pending
             || self.ai_chats.workspace.has_work()
@@ -33776,6 +33990,14 @@ impl Frost {
             || !self.agent_sessions.store.is_loaded()
         {
             let interval = if self.ai_chats.workspace.has_work()
+                || self.agent_sessions.remote.open
+                || self.agent_sessions.context.loading()
+                || self.agent_sessions.context.saving()
+                || self.agent_sessions.context.building()
+                || self.agent_sessions.tools.searching()
+                || self.agent_sessions.tools.document_loading
+                || self.agent_sessions.review.report_loading
+                || self.agent_sessions.review.queue_saving
                 || self.agent_sessions.scanner.is_scanning()
                 || self.agent_sessions.preflight.is_busy()
                 || self.agent_sessions.store.is_busy()

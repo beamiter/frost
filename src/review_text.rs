@@ -275,11 +275,22 @@ pub(crate) fn bound_foreground_process_name(name: impl AsRef<str>) -> Option<Str
 }
 
 pub(crate) fn visible_bounded(text: &str, max_bytes: usize) -> String {
+    visible_bounded_with_lines(text, max_bytes, false)
+}
+
+/// Preserve paragraph breaks in a read-only document while retaining the
+/// same control-character escaping and output byte limit as metadata labels.
+pub(crate) fn visible_multiline_bounded(text: &str, max_bytes: usize) -> String {
+    visible_bounded_with_lines(text, max_bytes, true)
+}
+
+fn visible_bounded_with_lines(text: &str, max_bytes: usize, multiline: bool) -> String {
     let mut visible = String::with_capacity(text.len().min(max_bytes));
     let mut truncated = false;
     for character in text.chars() {
-        if !character.is_control()
-            && !jterm_core::review_input::is_visual_spoofing_character(character)
+        if (multiline && character == '\n')
+            || (!character.is_control()
+                && !jterm_core::review_input::is_visual_spoofing_character(character))
         {
             if character.len_utf8() > max_bytes.saturating_sub(visible.len()) {
                 truncated = true;
@@ -465,6 +476,15 @@ mod tests {
                 Err(ReviewTextError::VisualSpoof)
             );
         }
+    }
+
+    #[test]
+    fn multiline_evidence_preserves_paragraphs_without_hiding_controls() {
+        let shown = visible_multiline_bounded("第一行\nsafe\u{202e}\ttext", 64);
+        assert!(shown.starts_with("第一行\nsafe"));
+        assert!(shown.contains("\\u{202E}\\ttext"));
+        assert!(visible_multiline_bounded("第一行\n第二行", 8).len() <= 8);
+        assert_eq!(visible_bounded("first\nsecond", 32), "first\\nsecond");
     }
 
     #[test]
