@@ -1457,6 +1457,9 @@ transcripts.
 本地终端默认让 Claude 使用 classic renderer，并让 Codex 使用
 `--no-alt-screen`，将会话输出保留在主屏历史中。可拖动右侧滑轨向上阅读、
 向下回到最新输出；滚动范围受终端的 scrollback 容量限制。
+活动中的 Claude/Codex 会话可直接用 `PageUp` / `PageDown` 翻页，每页保留两行
+上下文；滚轮有连续过渡，触控板保留小于一行的移动量，右侧滑轨可直接拖动。
+向上阅读时新输出不会抢走阅读位置。全屏应用继续使用自身的按键和鼠标协议。
 新会话、任务终端和恢复的会话采用相同设置，不改写 CLI 配置文件。
 
 Codex 的兼容入口仅加入子进程 PATH；用户自己的 alias/function 仍有优先权。

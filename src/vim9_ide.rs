@@ -2259,6 +2259,9 @@ impl Ide {
                 }
             }
             MouseInput::ScrollTo { offset } => s.set_scroll_offset(offset),
+            MouseInput::ScrollToExact { offset } => {
+                s.set_scroll_offset(offset.max(0.0).floor() as usize)
+            }
         }
         if let Some(s) = &mut self.session {
             s.refresh();

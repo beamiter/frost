@@ -1699,7 +1699,14 @@ impl super::Frost {
             Some(cwd),
             Some(&argv),
         ) {
-            Ok(terminal) => {
+            Ok(mut terminal) => {
+                // The host attachment executable is Frost itself. The checked
+                // provider identity, rather than that wrapper's basename, owns
+                // this Codex/Claude transcript's local reading controls.
+                terminal.inline_agent_launch = matches!(
+                    session.provider,
+                    SessionProvider::Codex | SessionProvider::Claude
+                );
                 self.reference_navigation_drawer = false;
                 self.agent_sessions
                     .bindings

@@ -193,6 +193,17 @@ impl TranscriptCanvas {
 
     /// Explicit navigation, editing and scrollbar grabs are immediate. Their
     /// destination must not inherit an older wheel or live-follow trajectory.
+    pub fn seek(&mut self, rows: f64) {
+        if !rows.is_finite() {
+            return;
+        }
+        self.parked = false;
+        self.motion.jump_to(rows * ROW);
+        self.following = self.motion.position() == 0.0;
+        self.applied_row = self.row();
+        self.frame = None;
+    }
+
     pub fn navigate(&mut self, row: usize) {
         self.parked = false;
         self.motion.jump_to(row as f64 * ROW);
@@ -535,6 +546,20 @@ mod tests {
         assert_eq!(canvas.position_rows(), 10.375);
         assert!(!canvas.animating());
         assert!(!canvas.following());
+    }
+
+    #[test]
+    fn absolute_scrollbar_seek_retires_motion_and_preserves_fraction() {
+        let mut canvas = TranscriptCanvas::default();
+        canvas.reconcile(0, 200, 20, 80);
+        canvas.scroll(30.0, false, Instant::now());
+        canvas.seek(17.375);
+        assert_eq!(canvas.position_rows(), 17.375);
+        assert_eq!(canvas.row(), 17);
+        assert!(!canvas.following());
+        assert!(!canvas.animating());
+        canvas.seek(0.0);
+        assert!(canvas.following());
     }
 
     #[test]

@@ -240,3 +240,51 @@ fn canvas_chat_keeps_native_cards_through_separately_received_completion_and_pro
         ProjectionMode::Bypass
     );
 }
+
+#[test]
+fn native_canvas_overscan_preserves_raw_cells_provenance_and_pty_size() {
+    for block_mode in [false, true] {
+        let mut terminal = TerminalState::new(32, 8);
+        for index in 0..48 {
+            terminal.process_input(format!("marker {index:03} 界\r\n").as_bytes());
+        }
+        let policy = ProjectionPolicy::new();
+        let dimensions = (terminal.grid.rows(), terminal.grid.cols());
+        for offset in [0, 1, 12, terminal.scrollback_len()] {
+            terminal.set_scroll_offset(offset);
+            let base = terminal.get_projected_viewport(block_mode);
+            let canvas = terminal.canvas_viewport(&base, &policy);
+            assert!(canvas.has_canvas_head());
+            assert_eq!(&canvas.cells()[1..], base.cells());
+            assert_eq!(canvas.max_scroll_offset(), base.max_scroll_offset());
+            assert_eq!(canvas.scroll_offset(), base.scroll_offset());
+            assert_eq!(terminal.scroll_offset, offset);
+            terminal.start_selection_in_projection(&canvas, (1, 0), SelectionMode::Normal);
+            terminal.update_selection_in_projection(&canvas, (1, 9));
+            let copied = terminal.copy_selection();
+            terminal.clear_text_selection();
+            terminal.start_selection_in_projection(&base, (0, 0), SelectionMode::Normal);
+            terminal.update_selection_in_projection(&base, (0, 9));
+            assert_eq!(terminal.copy_selection(), copied);
+            terminal.clear_text_selection();
+            assert_eq!((terminal.grid.rows(), terminal.grid.cols()), dimensions);
+            for row in 0..base.cells().len() {
+                assert_eq!(
+                    canvas.view_document_row(row + 1),
+                    base.view_document_row(row)
+                );
+                for col in 0..32 {
+                    assert_eq!(
+                        canvas.view_to_raw(ViewportCell { row: row + 1, col }),
+                        base.view_to_raw(ViewportCell { row, col })
+                    );
+                }
+            }
+        }
+        terminal.process_input(b"\x1b[?1049h");
+        let alternate = terminal.get_projected_viewport(block_mode);
+        assert!(!terminal
+            .canvas_viewport(&alternate, &policy)
+            .has_canvas_head());
+    }
+}

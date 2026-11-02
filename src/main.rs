@@ -1036,7 +1036,9 @@ impl TerminalClickTracker {
                 self.selection_press = None;
                 self.tracker.release()
             }
-            MouseInput::Wheel { .. } | MouseInput::ScrollTo { .. } => {
+            MouseInput::Wheel { .. }
+            | MouseInput::ScrollTo { .. }
+            | MouseInput::ScrollToExact { .. } => {
                 if self.pending.is_some() {
                     self.invalidate_caret();
                 }
@@ -5239,6 +5241,8 @@ struct Session {
     /// Explicit argv owns this PTY as work, even if its root child is the
     /// foreground group. This comes from spawn admission, never a tab title.
     command_owned: bool,
+    /// Exact user/task launch argv identifies a direct agent without shell OSC.
+    inline_agent_launch: bool,
     shell_identity: companion_host::shell_identity::ShellIdentity,
     master_fd: RawFd,
     reader_fd: Arc<OwnedFd>,
@@ -5735,6 +5739,17 @@ impl Session {
             terminal,
             pty,
             command_owned: command_argv.is_some(),
+            inline_agent_launch: command_argv
+                .map(crate::immersive_command::reading_agent_argv)
+                .unwrap_or_else(|| {
+                    config
+                        .shell
+                        .as_deref()
+                        .or(shell_program.as_deref())
+                        .is_some_and(|program| {
+                            crate::immersive_command::reading_agent_argv(&[program.to_owned()])
+                        })
+                }),
             shell_identity,
             master_fd,
             reader_fd,
@@ -5893,6 +5908,18 @@ impl Session {
         )
     }
 
+    fn reading_agent(&self) -> bool {
+        !self.terminal.is_alt_buffer_active()
+            && std::env::var_os("JTERM_AGENT_SCROLLBACK").as_deref()
+                != Some(std::ffi::OsStr::new("0"))
+            && self
+                .terminal
+                .running_command_text()
+                .or(self.fg_proc_cache.as_deref())
+                .map(crate::immersive_command::reading_agent_command)
+                .unwrap_or(self.inline_agent_launch)
+    }
+
     fn refresh(&mut self) {
         if !self.block_selection.is_empty() || self.terminal.has_text_selection() {
             self.transcript_canvas.cancel();
@@ -5949,9 +5976,10 @@ impl Session {
         {
             self.block_reading.seen_through = self.terminal.command_zones.back().map(|z| z.id);
         }
-        if self.projection_block_mode
-            && self.projection.mode() == terminal::ProjectionMode::Transformed
-            && !self.terminal.is_alt_buffer_active()
+        if !self.terminal.is_alt_buffer_active()
+            && ((self.projection_block_mode
+                && self.projection.mode() == terminal::ProjectionMode::Transformed)
+                || self.reading_agent())
         {
             self.transcript_canvas.reconcile(
                 self.projection.scroll_offset(),
@@ -5961,9 +5989,13 @@ impl Session {
             );
             let row = self.transcript_canvas.row();
             if row != self.projection.scroll_offset() {
-                self.projection_view_state.set_offset(row, &self.projection);
+                if self.projection.mode() == terminal::ProjectionMode::Transformed {
+                    self.projection_view_state.set_offset(row, &self.projection);
+                } else {
+                    self.terminal.set_scroll_offset(row);
+                }
                 self.projection = self.terminal.get_projected_viewport_with_state(
-                    true,
+                    self.projection_block_mode,
                     &self.projection_policy,
                     &mut self.projection_view_state,
                 );
@@ -5983,7 +6015,9 @@ impl Session {
             self.transcript_canvas.disable();
         }
         let raw_cursor = self.terminal.get_cursor_pos();
-        if self.projection.mode() == terminal::ProjectionMode::Transformed {
+        if self.projection.mode() == terminal::ProjectionMode::Transformed
+            || self.projection.has_canvas_head()
+        {
             let absolute_row = self.terminal.scrollback_len().saturating_add(raw_cursor.0);
             let mapped = self
                 .terminal
@@ -14333,7 +14367,9 @@ impl Frost {
                     None,
                 )
             }
-            MouseInput::ScrollTo { .. } => (false, source_session_id, None),
+            MouseInput::ScrollTo { .. } | MouseInput::ScrollToExact { .. } => {
+                (false, source_session_id, None)
+            }
         };
 
         // Click-to-place-cursor acts on release, so that a drag which happens
@@ -14546,6 +14582,23 @@ impl Frost {
             MouseInput::ScrollTo { offset } => {
                 sess.set_scroll_offset(offset);
             }
+            MouseInput::ScrollToExact { offset } => {
+                if offset.is_finite() {
+                    let row = offset.max(0.0).floor() as usize;
+                    if sess.transcript_canvas.enabled() {
+                        sess.projection_view_state.release_reading_position();
+                        if sess.projection.mode() == terminal::ProjectionMode::Transformed {
+                            sess.projection_view_state.set_offset(row, &sess.projection);
+                        } else {
+                            sess.terminal.set_scroll_offset(row);
+                        }
+                        sess.transcript_canvas.seek(offset);
+                        sess.refresh();
+                    } else {
+                        sess.set_scroll_offset(row);
+                    }
+                }
+            }
         }
         Task::none()
     }
@@ -14555,15 +14608,32 @@ impl Frost {
     fn handle_scroll_shortcut(&mut self, key: &keyboard::Key, mods: keyboard::Modifiers) -> bool {
         use keyboard::key::Named;
         use keyboard::Key;
-        if !mods.shift() {
+        if mods.control() || mods.alt() || mods.logo() || !self.terminal_input_active() {
             return false;
         }
         let Some(sess) = self.sessions.get_mut(self.active) else {
             return false;
         };
-        // Page by the active pane's own row count, not the whole window — when
-        // split, a pane is shorter than `self.rows`.
-        let page = sess.terminal.grid.rows().saturating_sub(1).max(1) as isize;
+        let page_key = matches!(key, Key::Named(Named::PageUp | Named::PageDown));
+        if !mods.shift() && !(page_key && sess.reading_agent()) {
+            return false;
+        }
+        // Retain two context rows between pages of the same continuous session.
+        let page = sess.terminal.grid.rows().saturating_sub(2).max(1) as isize;
+        if page_key && sess.transcript_canvas.enabled() {
+            let delta = if matches!(key, Key::Named(Named::PageUp)) {
+                page
+            } else {
+                -page
+            };
+            if sess
+                .transcript_canvas
+                .scroll(delta as f64, false, std::time::Instant::now())
+            {
+                sess.refresh();
+            }
+            return true;
+        }
         match key {
             Key::Named(Named::PageUp) => sess.scroll(page),
             Key::Named(Named::PageDown) => sess.scroll(-page),
@@ -19657,7 +19727,9 @@ impl Frost {
             Message::MousePane(session_id, input) => {
                 if matches!(
                     input,
-                    MouseInput::Press { .. } | MouseInput::ScrollTo { .. }
+                    MouseInput::Press { .. }
+                        | MouseInput::ScrollTo { .. }
+                        | MouseInput::ScrollToExact { .. }
                 ) {
                     if let Some(index) = self.session_index_by_id(session_id) {
                         self.sessions[index].transcript_canvas.cancel();
@@ -26267,7 +26339,7 @@ impl Frost {
         .transcript_canvas(
             &sess.transcript_canvas,
             sess.projection.has_canvas_head(),
-            sess.terminal.is_mouse_enabled(),
+            sess.terminal.is_mouse_enabled() && !sess.reading_agent(),
             move |rows, precise| {
                 Message::TranscriptScroll(session_id, transcript_epoch, rows, precise)
             },
@@ -35592,6 +35664,111 @@ mod tests {
             session.close_blocker().is_some(),
             "PTY output cannot make the exec process an idle shell"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inline_agent_direct_resume_uses_exact_launch_without_shell_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("frost-inline-launch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let program = root.join("codex");
+        let recorded_args = root.join("argv");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexec /bin/sleep 30\n",
+                recorded_args.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for configured_shell in [false, true] {
+            let _ = std::fs::remove_file(&recorded_args);
+            let mut config = super::Config::default();
+            config.vim9.auto_gui = false;
+            let argv = vec![
+                program.to_string_lossy().into_owned(),
+                "resume".into(),
+                "fixture-id".into(),
+            ];
+            let mut session = if configured_shell {
+                config.shell = Some(program.to_string_lossy().into_owned());
+                super::Session::spawn(&config, 0, 40, 10, Some("/tmp")).unwrap()
+            } else {
+                super::Session::spawn_argv(&config, 0, 40, 10, Some("/tmp"), Some(&argv)).unwrap()
+            };
+            assert!(session.terminal.running_command_text().is_none());
+            assert!(session.fg_proc_cache.is_none());
+            assert!(session.inline_agent_launch);
+            assert!(session.reading_agent());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if std::fs::read_to_string(&recorded_args)
+                    .ok()
+                    .is_some_and(|args| args.lines().any(|arg| arg == "--no-alt-screen"))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "direct CLI must receive inline renderer default"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            session.projection_block_mode = false;
+            session
+                .terminal
+                .process_input(b"direct resume transcript\r\n");
+            session.refresh();
+            assert!(session.transcript_canvas.enabled());
+            assert!(session.projection.has_canvas_head());
+            drop(session);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inline_agent_native_canvas_preserves_fractional_reader_during_output() {
+        let mut config = super::Config {
+            shell: Some("/bin/sh".into()),
+            ..Default::default()
+        };
+        config.vim9.auto_gui = false;
+        let mut session = super::Session::spawn(&config, 0, 40, 10, Some("/tmp")).unwrap();
+        session.fg_proc_cache = Some("codex".into());
+        session.projection_block_mode = false;
+        for index in 0..40 {
+            session
+                .terminal
+                .process_input(format!("marker {index:03}\r\n").as_bytes());
+        }
+        session.refresh();
+        assert!(session.transcript_canvas.enabled());
+        assert!(session.projection.has_canvas_head());
+        session
+            .transcript_canvas
+            .scroll(0.25, true, std::time::Instant::now());
+        session.refresh();
+        let top = session
+            .projection
+            .view_to_raw(super::terminal::ViewportCell { row: 1, col: 0 });
+        session.terminal.process_input(b"streamed next row\r\n");
+        session.refresh();
+        assert!(!session.transcript_canvas.following());
+        assert!((session.transcript_canvas.fraction() - 0.25).abs() < 1e-6);
+        assert_eq!(
+            session
+                .projection
+                .view_to_raw(super::terminal::ViewportCell { row: 1, col: 0 }),
+            top
+        );
+        session.terminal.process_input(b"\x1b[?1049h");
+        session.refresh();
+        assert!(!session.transcript_canvas.enabled());
+        assert!(!session.projection.has_canvas_head());
     }
 
     #[test]

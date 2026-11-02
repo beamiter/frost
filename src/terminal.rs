@@ -12343,10 +12343,77 @@ impl TerminalState {
         viewport: &std::sync::Arc<ProjectedViewport>,
         policy: &ProjectionPolicy,
     ) -> std::sync::Arc<ProjectedViewport> {
-        if viewport.mode != ProjectionMode::Transformed || viewport.canvas_head {
+        if viewport.canvas_head || self.use_alt_buffer {
             return std::sync::Arc::clone(viewport);
         }
         let cols = self.grid.row_len().max(1);
+        if viewport.mode != ProjectionMode::Transformed {
+            // Keep one genuine predecessor row for fractional native scrolling.
+            // The child PTY retains its exact grid dimensions and cursor space.
+            let offset = self.scroll_offset;
+            let predecessor = (offset < viewport.max_scroll_offset()).then(|| {
+                self.scroll_offset = offset + 1;
+                let previous =
+                    self.get_projected_viewport(viewport.mode == ProjectionMode::Identity);
+                self.scroll_offset = offset;
+                previous
+            });
+            let mut canvas = viewport.as_ref().clone();
+            let mut cells = Vec::with_capacity(viewport.cells.len() + 1);
+            cells.push(
+                predecessor
+                    .as_ref()
+                    .map_or_else(|| self.blank_line(cols), |p| p.cells[0].clone()),
+            );
+            cells.extend(viewport.cells.iter().cloned());
+            let mut provenance = ProjectedProvenance {
+                origin_spans: Vec::new(),
+                row_sources: vec![predecessor
+                    .as_ref()
+                    .and_then(|p| p.provenance.row_sources[0])],
+            };
+            if let Some(previous) = &predecessor {
+                provenance.origin_spans.extend(
+                    previous
+                        .provenance
+                        .origin_spans
+                        .iter()
+                        .filter(|span| span.view_row == 0)
+                        .copied(),
+                );
+            }
+            provenance
+                .row_sources
+                .extend(viewport.provenance.row_sources.iter().copied());
+            provenance
+                .origin_spans
+                .extend(
+                    viewport
+                        .provenance
+                        .origin_spans
+                        .iter()
+                        .map(|span| OriginSpan {
+                            view_row: span.view_row + 1,
+                            ..*span
+                        }),
+                );
+            let (spans, rows) = Self::projection_indexes(&provenance);
+            canvas.cells = std::sync::Arc::new(cells);
+            let mut wrapped = vec![predecessor.as_ref().is_some_and(|p| p.row_wrapped[0])];
+            wrapped.extend(viewport.row_wrapped.iter().copied());
+            canvas.row_wrapped = std::sync::Arc::new(wrapped);
+            canvas.row_kinds = std::sync::Arc::new(vec![ProjectedRowKind::Raw; canvas.cells.len()]);
+            canvas.provenance = std::sync::Arc::new(provenance);
+            canvas.raw_span_index = std::sync::Arc::new(spans);
+            canvas.raw_row_index = std::sync::Arc::new(rows);
+            canvas.document_start = viewport
+                .document_start
+                .saturating_sub(usize::from(predecessor.is_some()));
+            canvas.top_padding = usize::from(predecessor.is_none());
+            canvas.canvas_head = true;
+            canvas.identity_fast_path = false;
+            return std::sync::Arc::new(canvas);
+        }
         let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
             return std::sync::Arc::clone(viewport);
         };
@@ -12491,7 +12558,18 @@ impl TerminalState {
                 self.projection_plan_cache = None;
                 state.last_plan_key = None;
             }
-            return self.get_projected_viewport(block_mode);
+            if state.reading_hold
+                && self.scroll_offset == 0
+                && state.held_history_revision != self.history_revision
+            {
+                self.restore_identity_scroll_from_projection(state);
+            }
+            let viewport = self.get_projected_viewport(block_mode);
+            if state.reading_hold {
+                state.top_anchor = Self::projected_top_anchor(&viewport);
+                state.held_history_revision = self.history_revision;
+            }
+            return viewport;
         }
         if policy.is_identity() {
             if state.last_plan_key.is_some() {
@@ -12820,10 +12898,16 @@ impl TerminalState {
         projection: &ProjectedViewport,
         viewport_row: usize,
     ) -> usize {
-        self.scrollback
-            .len()
-            .saturating_sub(projection.scroll_offset())
-            + viewport_row
+        projection
+            .view_document_row(viewport_row)
+            .unwrap_or_else(|| {
+                self.scrollback
+                    .len()
+                    .saturating_sub(projection.scroll_offset())
+                    .saturating_add(
+                        viewport_row.saturating_sub(usize::from(projection.canvas_head)),
+                    )
+            })
     }
 
     #[allow(dead_code)]

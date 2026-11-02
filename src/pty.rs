@@ -640,7 +640,21 @@ mod unix_pty {
             command_argv: Option<&[String]>,
             extra_env: &[(&str, &str)],
         ) -> Result<Self> {
-            let inline_command = command_argv.map(crate::agent_cli::inline_argv);
+            // A CLI selected as the configured terminal program is still a
+            // direct agent launch, rather than a login shell. Route its exact
+            // argv through the same inline defaults as task/resume launches.
+            let configured_agent = command_argv
+                .is_none()
+                .then(|| {
+                    configured_shell.and_then(|program| {
+                        let argv = vec![program.to_owned()];
+                        crate::immersive_command::reading_agent_argv(&argv).then_some(argv)
+                    })
+                })
+                .flatten();
+            let inline_command = command_argv
+                .or(configured_agent.as_deref())
+                .map(crate::agent_cli::inline_argv);
             let command_argv = inline_command.as_deref();
             // Reject malformed explicit commands before openpty: returning
             // from the later argv builder would otherwise leak both raw fds.

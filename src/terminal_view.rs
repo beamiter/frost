@@ -297,6 +297,10 @@ pub enum MouseInput {
     ScrollTo {
         offset: usize,
     },
+    /// Absolute row coordinate including its sub-row fraction on a canvas.
+    ScrollToExact {
+        offset: f64,
+    },
 }
 
 /// A Kitty-graphics image to paint: a cached RGBA handle plus its grid-cell
@@ -1784,13 +1788,29 @@ impl<'a, Message> TermWidget<'a, Message> {
 
     /// Map a pointer y-coordinate to history while preserving its grab point.
     fn offset_from_y(&self, y: f32, bounds: Rectangle, grab_offset: f32) -> usize {
+        self.exact_offset_from_y(y, bounds, grab_offset).round() as usize
+    }
+
+    fn exact_offset_from_y(&self, y: f32, bounds: Rectangle, grab_offset: f32) -> f64 {
         let Some((track_top, track_h, _, _, thumb_h)) = self.scrollbar_geometry(bounds) else {
-            return 0;
+            return 0.0;
         };
         let usable = (track_h - thumb_h).max(1.0);
         let rel = (y - track_top - grab_offset.clamp(0.0, thumb_h)).clamp(0.0, usable);
         let frac = 1.0 - rel / usable;
-        (frac * self.scrollback_len as f32).round() as usize
+        f64::from(frac) * self.scrollback_len as f64
+    }
+
+    fn scrollbar_input(&self, y: f32, bounds: Rectangle, grab_offset: f32) -> MouseInput {
+        if self.canvas_position.is_some() {
+            MouseInput::ScrollToExact {
+                offset: self.exact_offset_from_y(y, bounds, grab_offset),
+            }
+        } else {
+            MouseInput::ScrollTo {
+                offset: self.offset_from_y(y, bounds, grab_offset),
+            }
+        }
     }
 
     /// Register a callback that maps grid mouse interactions to messages.
@@ -2979,6 +2999,29 @@ mod tests {
                 assert_eq!(widget.offset_from_y(top - 100.0, bounds, grab), 200);
                 assert_eq!(widget.offset_from_y(top + height + 100.0, bounds, grab), 0);
             }
+        });
+    }
+
+    #[test]
+    fn canvas_scrollbar_seek_keeps_the_exact_fraction_and_grab_point() {
+        with_native_body(|widget, bounds| {
+            widget.scrollback_len = 200;
+            widget.canvas_position = Some(17.375);
+            widget.scrollbar_always = true;
+            let (top, height, _, thumb_y, thumb_height) =
+                widget.scrollbar_geometry(bounds).unwrap();
+            let grab = thumb_height * 0.25;
+            assert!(
+                (widget.exact_offset_from_y(thumb_y + grab, bounds, grab) - 17.375).abs() < 0.001
+            );
+            assert!(
+                matches!(widget.scrollbar_input(thumb_y + grab, bounds, grab), super::MouseInput::ScrollToExact { offset } if (offset - 17.375).abs() < 0.001)
+            );
+            assert_eq!(widget.exact_offset_from_y(top + grab, bounds, grab), 200.0);
+            assert_eq!(
+                widget.exact_offset_from_y(top + height + 100.0, bounds, grab),
+                0.0
+            );
         });
     }
 
@@ -5739,9 +5782,11 @@ where
                                 };
                             state.scrollbar_dragging = true;
                             state.published_presses[MouseButton::Left.slot()] = false;
-                            let offset =
-                                self.offset_from_y(pos.y, bounds, state.scrollbar_grab_offset);
-                            shell.publish(on_mouse(MouseInput::ScrollTo { offset }));
+                            shell.publish(on_mouse(self.scrollbar_input(
+                                pos.y,
+                                bounds,
+                                state.scrollbar_grab_offset,
+                            )));
                             shell.capture_event();
                             return;
                         }
@@ -5961,8 +6006,11 @@ where
                     return;
                 }
                 if state.scrollbar_dragging {
-                    let offset = self.offset_from_y(pos.y, bounds, state.scrollbar_grab_offset);
-                    shell.publish(on_mouse(MouseInput::ScrollTo { offset }));
+                    shell.publish(on_mouse(self.scrollbar_input(
+                        pos.y,
+                        bounds,
+                        state.scrollbar_grab_offset,
+                    )));
                     shell.capture_event();
                     return;
                 }
