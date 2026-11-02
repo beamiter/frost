@@ -30513,7 +30513,13 @@ impl Frost {
         task_id: agent_task::TaskId,
         role: agent_task::TaskTerminalRole,
     ) {
-        if !self.task_inspector_visible(task_id) {
+        if !agent_task_ui::task_focus_allowed(
+            self.task_inspector_visible(task_id),
+            self.agent_sessions
+                .workspace_task
+                .or(self.task_panel.selected),
+            task_id,
+        ) {
             return;
         }
         if role == agent_task::TaskTerminalRole::Validation {
