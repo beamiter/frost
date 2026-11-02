@@ -747,7 +747,7 @@ pub(crate) struct TaskPanel {
     follow_up_drafts: std::collections::HashMap<TaskId, (String, Option<&'static str>)>,
     follow_up_versions: std::collections::HashMap<TaskId, u64>,
     hosted_followups: std::collections::HashMap<String, (TaskId, u64, String)>,
-    pub(crate) owned_validation_tabs: std::collections::HashMap<String, u64>,
+    pub(crate) owned_validation_tabs: std::collections::HashMap<String, usize>,
     pub(crate) pending_creation: Option<PendingTaskCreation>,
     /// Failed-block context waiting for an explicit provider choice.
     pub(crate) provider_picker: Option<TaskProviderPicker>,

@@ -17692,6 +17692,7 @@ impl Frost {
                 }
             }
             Message::TaskHide(task_id) => {
+                if self.task_panel.show_hidden || !self.task_inspector_visible(task_id) { return Task::none(); }
                 if self.agent_runtime.conversation_id(task_id).is_some() {
                     if let Err(error) = self.agent_runtime.mutate_hosted_task(
                         task_id,
@@ -17719,6 +17720,7 @@ impl Frost {
                     .set_show_hidden(show && self.config.experimental_task_sidebar);
             }
             Message::TaskRestore(task_id) => {
+                if !self.task_panel.show_hidden || !self.task_inspector_visible(task_id) { return Task::none(); }
                 if self.agent_runtime.conversation_id(task_id).is_some() {
                     if let Err(error) = self.agent_runtime.mutate_hosted_task(
                         task_id,
@@ -18328,6 +18330,7 @@ impl Frost {
                 }
             }
             Message::TaskMarkComplete(task_id) => {
+                if !self.task_inspector_visible(task_id) { return Task::none(); }
                 if self.agent_runtime.conversation_id(task_id).is_some() {
                     if let Err(error) = self.agent_runtime.mutate_hosted_task(
                         task_id,
@@ -30443,8 +30446,8 @@ impl Frost {
                 self.task_panel
                     .resolve_hosted_follow_up(&outcome.receipt, outcome.result.is_ok());
             }
-            for (_, terminal) in self.agent_runtime.take_owned_terminal_launches() {
-                self.open_owned_validation_terminal(terminal);
+            for (task_id, terminal) in self.agent_runtime.take_owned_terminal_launches() {
+                if selected == Some(task_id) { self.open_owned_validation_terminal(terminal); }
             }
             for (_, session) in self.agent_runtime.take_terminal_handoffs() {
                 self.open_hosted_native_terminal(session);
@@ -30884,7 +30887,7 @@ impl Frost {
                             &live_terminals,
                         )
                     }),
-                    has_validation_terminal: task.is_some_and(|task| {
+                    has_validation_terminal: self.agent_runtime.hosted_validation_terminal(id).is_some() || task.is_some_and(|task| {
                         agent_task_ui::task_terminal_is_live(
                             task,
                             agent_task::TaskTerminalRole::Validation,
@@ -31957,7 +31960,9 @@ impl Frost {
                     .on_press(Message::TaskDiffOpen(task.id)),
             );
             if task.validation.status != TaskValidationStatus::Running
-                && task.validation_command().is_some()
+                && (if self.agent_runtime.conversation_id(task.id).is_some() {
+                    self.agent_runtime.can_start_hosted_validation(task.id)
+                } else { task.validation_command().is_some() })
             {
                 review = review.push(
                     button(text("Run validation").size(self.chrome_font_size()))
