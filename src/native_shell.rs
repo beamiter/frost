@@ -2608,13 +2608,21 @@ impl Frost {
                 container(self.reference_navigation())
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .style(|theme| {
-                        panel(
+                    .style(move |theme| {
+                        let mut style = panel(
                             theme,
                             color::NAVIGATION,
                             color::DARK_BORDER,
                             glass::PANEL_RADIUS,
-                        )
+                        );
+                        if drawer {
+                            // This surface covers live controls. Window glass
+                            // opacity must not make those controls look active
+                            // inside the navigation drawer.
+                            let [r, g, b] = color::NAVIGATION;
+                            style.background = Some(Color::from_rgb8(r, g, b).into());
+                        }
+                        style
                     }),
             ),
         );

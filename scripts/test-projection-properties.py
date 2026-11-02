@@ -20,14 +20,14 @@ def between(start, end):
     return source[source.index(start):source.index(end)]
 
 
-def item(marker):
-    start = source.index(marker)
-    opening = source.index('{', start)
+def item(marker, text=source):
+    start = text.index(marker)
+    opening = text.index('{', start)
     depth, end = 1, opening + 1
     while depth:
-        depth += (source[end] == '{') - (source[end] == '}')
+        depth += (text[end] == '{') - (text[end] == '}')
         end += 1
-    return source[start:end]
+    return text[start:end]
 
 
 code = '#![allow(dead_code)]\nuse smallvec::SmallVec;\n'
@@ -46,9 +46,15 @@ start = source.index('#[derive(Debug)]\nstruct ProjectedLine')
 end = source.index('\n}', source.index('impl ProjectedSelectionEndpoint {', start)) + 2
 code += source[start:end]
 chat = (ROOT / 'src/chat_mode.rs').read_text()
-start = chat.rfind('#[derive', 0, chat.index('pub enum ChatRole'))
-end = chat.index('/// Short commands', start)
-code += '\nmod chat_mode {\n' + chat[start:end] + '\n}\n'
+# Paint metadata is the only Chat dependency of these kernels. Extract the
+# actual declarations independently of nearby comments or unrelated controls.
+code += '\nmod chat_mode {\n'
+for marker in ['pub enum ChatRole {', 'pub struct ChatRow {']:
+    declaration = item(marker, chat)
+    start = chat.rfind('#[derive', 0, chat.index(marker))
+    assert start >= 0, marker
+    code += chat[start:chat.index(marker)] + declaration + '\n'
+code += '}\n'
 code += '''
 struct TerminalState { scrollback: VecDeque<ScrollbackLine>, grid: TerminalGrid }
 impl TerminalState {
@@ -68,7 +74,8 @@ assert 'copy_projected_cells(plan, selection, &self.scrollback, &self.grid)' in 
 with tempfile.TemporaryDirectory(prefix='frost-projection-') as temp:
     path = Path(temp)
     (path / 'src').mkdir()
-    (path / 'src/lib.rs').write_text(code)
+    library = path / 'src/lib.rs'
+    library.write_text(code)
     (path / 'Cargo.toml').write_text('''[package]
 name = "frost-projection-properties"
 version = "0.0.0"
@@ -80,4 +87,28 @@ opt-level = 1
 ''')
     command = [os.environ.get('CARGO', 'cargo'), 'test', '--manifest-path', str(path / 'Cargo.toml'), '-j', '1', '--', '--nocapture']
     subprocess.run(command, check=True)
+    # The independent tagged-cell/text oracle must reject real kernel regressions,
+    # not just compile the extracted declarations. Mutate only the temporary crate;
+    # production source, properties, corpus and expected values stay untouched.
+    mutants = [
+        ('lost-source-column',
+         'col: self.raw_col_start + cell.col - self.view_col_start,',
+         'col: self.raw_col_start,'),
+        ('copied-wide-continuation',
+         'if !cell.flags.wide_continuation() {\n                        result.push(cell.character);',
+         'if true {\n                        result.push(cell.character);'),
+    ]
+    for name, original, mutated in mutants:
+        assert code.count(original) == 1 and original != mutated, name
+        library.write_text(code.replace(original, mutated, 1))
+        env = os.environ.copy()
+        env['FROST_PROJECTION_CASE'] = '0'
+        env['FROST_PROJECTION_STEPS'] = '16'
+        result = subprocess.run(command[:-2] + [
+            'projection_properties::seeded_projection_ten_thousand_sequences',
+            '--', '--exact', '--nocapture'], env=env, capture_output=True, text=True)
+        assert result.returncode != 0 and 'test result: FAILED' in result.stdout, (
+            name, result.stdout, result.stderr)
+        assert 'seeded_projection_ten_thousand_sequences ... FAILED' in result.stdout, name
+        print('Compiled projection kernel mutant rejected by unchanged oracle: ' + name)
 print('Real projection kernel properties passed; no parser, window or clipboard provider was used.')
