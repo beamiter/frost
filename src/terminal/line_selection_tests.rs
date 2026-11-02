@@ -107,6 +107,8 @@ fn install(terminal: &mut TerminalState, plan: ProjectionPlan) {
         policy_revision: plan.policy_revision,
         policy_ids: Default::default(),
         block_spacing: false,
+        retain_identity_canvas: false,
+        inline_scope_floor: None,
         spacing_boundaries: Default::default(),
         chrome_boundaries: Default::default(),
         chrome_tail_rows: 0,

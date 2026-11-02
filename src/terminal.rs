@@ -1664,6 +1664,24 @@ impl ProjectionPlan {
         }
     }
 
+    fn retain_source_suffix(&mut self, floor: usize) {
+        for row in &mut self.rows {
+            row.raw_slices
+                .retain(|slice| slice.source.absolute_row >= floor);
+            row.row_source = row
+                .row_source
+                .filter(|source| source.raw_absolute_row >= floor);
+        }
+        let retained_start = self
+            .rows
+            .iter()
+            .position(|row| !row.raw_slices.is_empty() || row.row_source.is_some())
+            .unwrap_or(self.rows.len());
+        self.rows.drain(..retained_start);
+        self.raw_slice_count = self.rows.iter().map(|row| row.raw_slices.len()).sum();
+        self.rebuild_raw_row_placements();
+    }
+
     fn rebuild_raw_row_placements(&mut self) {
         for placement in &mut self.raw_rows {
             placement.first_view_row = None;
@@ -2270,6 +2288,8 @@ pub struct ProjectionPolicy {
     revision: u64,
     collapsed: BTreeSet<u64>,
     block_spacing: bool,
+    retain_identity_canvas: bool,
+    inline_scope_floor: Option<usize>,
     native_chrome: bool,
     organism_rows: usize,
     chat: bool,
@@ -2282,6 +2302,8 @@ impl Default for ProjectionPolicy {
             revision: 1,
             collapsed: BTreeSet::new(),
             block_spacing: false,
+            retain_identity_canvas: false,
+            inline_scope_floor: None,
             native_chrome: false,
             organism_rows: 0,
             chat: false,
@@ -2301,7 +2323,19 @@ impl ProjectionPolicy {
     }
 
     pub fn is_identity(&self) -> bool {
-        self.collapsed.is_empty() && !self.block_spacing && !self.native_chrome && !self.chat
+        !self.retain_identity_canvas
+            && self.collapsed.is_empty()
+            && !self.block_spacing
+            && !self.native_chrome
+            && !self.chat
+    }
+
+    fn scoped_identity(floor: usize) -> Self {
+        Self {
+            retain_identity_canvas: true,
+            inline_scope_floor: Some(floor),
+            ..Self::default()
+        }
     }
 
     /// Spacing is a display transform, never a PTY resize or a raw blank line.
@@ -2451,6 +2485,9 @@ pub struct ProjectedViewport {
 #[cfg(test)]
 #[path = "terminal/canvas_tests.rs"]
 mod canvas_tests;
+#[cfg(test)]
+#[path = "terminal/cli_scope_tests.rs"]
+mod cli_scope_tests;
 
 #[allow(dead_code)] // Transformed accessors are consumed by the P1 UI wiring slice.
 impl ProjectedViewport {
@@ -2651,6 +2688,8 @@ struct ProjectedViewportCacheKey {
     policy_revision: u64,
     policy_ids: SmallVec<[u64; 4]>,
     block_spacing: bool,
+    retain_identity_canvas: bool,
+    inline_scope_floor: Option<usize>,
     spacing_boundaries: SmallVec<[RawRowId; 4]>,
     chrome_boundaries: SmallVec<[ChromeBoundary; 4]>,
     chrome_tail_rows: usize,
@@ -2672,6 +2711,8 @@ struct ProjectionPlanCacheKey {
     policy_revision: u64,
     policy_ids: SmallVec<[u64; 4]>,
     block_spacing: bool,
+    retain_identity_canvas: bool,
+    inline_scope_floor: Option<usize>,
     spacing_boundaries: SmallVec<[RawRowId; 4]>,
     chrome_boundaries: SmallVec<[ChromeBoundary; 4]>,
     chrome_tail_rows: usize,
@@ -3606,6 +3647,8 @@ pub struct TerminalState {
     /// real rows in behind it.
     provisional_alt_snapshot: Option<(usize, u64)>,
     max_scrollback: usize,
+    inline_cli_launch_floor: Option<usize>,
+    inline_cli_command_scope: Option<(u64, usize)>,
     use_alt_buffer: bool,
     disable_alt_screen: bool,
     viewport_pixel_width: u32,
@@ -4011,6 +4054,8 @@ impl TerminalState {
             full_screen_scroll_revision: 0,
             provisional_alt_snapshot: None,
             max_scrollback: 10000,
+            inline_cli_launch_floor: None,
+            inline_cli_command_scope: None,
             use_alt_buffer: false,
             disable_alt_screen: false,
             viewport_pixel_width: (cols as u32).saturating_mul(8),
@@ -5372,6 +5417,19 @@ impl TerminalState {
                         });
                     }
                     self.watch_generation = self.watch_generation.and_then(|n| n.checked_add(1));
+                    self.inline_cli_command_scope = self
+                        .current_command_text
+                        .as_deref()
+                        .filter(|command| {
+                            std::env::var_os("JTERM_AGENT_SCROLLBACK").as_deref()
+                                != Some(std::ffi::OsStr::new("0"))
+                                && crate::immersive_command::reading_agent_command(command)
+                        })
+                        .and_then(|_| {
+                            self.watch_generation
+                                .map(|generation| (generation, absolute_row))
+                        });
+
                     self.watch_batch.starts = self.watch_batch.starts.saturating_add(1).min(2);
                     self.watch_batch.boundary = true;
                     self.current_zone_state =
@@ -6046,6 +6104,9 @@ impl TerminalState {
     /// that prefix once the viewport is back at the bottom, so the app's request
     /// still lands without interrupting the read.
     fn erase_saved_lines(&mut self) {
+        if self.use_alt_buffer && self.inline_cli_owner_active() {
+            return;
+        }
         if self.scroll_offset > 0 {
             self.pending_saved_line_purge = self.scrollback.len();
             return;
@@ -6073,6 +6134,9 @@ impl TerminalState {
     /// Apply a deferred [`Self::erase_saved_lines`] once the viewport follows
     /// the live bottom again.
     fn settle_pending_saved_line_purge(&mut self) {
+        if self.use_alt_buffer && self.inline_cli_owner_active() {
+            return;
+        }
         if self.pending_saved_line_purge > 0 && self.scroll_offset == 0 {
             self.purge_saved_lines(self.pending_saved_line_purge);
         }
@@ -6145,6 +6209,12 @@ impl TerminalState {
         if count == 0 {
             return;
         }
+        if let Some(floor) = &mut self.inline_cli_launch_floor {
+            *floor = floor.saturating_sub(count);
+        }
+        if let Some((_, floor)) = &mut self.inline_cli_command_scope {
+            *floor = floor.saturating_sub(count);
+        }
         self.rebase_raw_selection_after_prefix_trim(count);
         // Rows the cap (or any other trim) already dropped are rows a deferred
         // ED 3 must no longer count, or settling it would eat live content.
@@ -6216,6 +6286,12 @@ impl TerminalState {
     fn on_scrollback_rows_inserted(&mut self, count: usize) {
         if count == 0 {
             return;
+        }
+        if let Some(floor) = &mut self.inline_cli_launch_floor {
+            *floor = floor.saturating_add(count);
+        }
+        if let Some((_, floor)) = &mut self.inline_cli_command_scope {
+            *floor = floor.saturating_add(count);
         }
         if let Some(selection) = self.selection.as_mut() {
             selection.anchor.0 = selection.anchor.0.saturating_add(count);
@@ -8020,6 +8096,9 @@ impl TerminalState {
         allow_alt_buffer: bool,
         dedupe_snapshot: bool,
     ) -> usize {
+        if self.inline_cli_owner_active() {
+            return 0;
+        }
         if (self.use_alt_buffer && !allow_alt_buffer) || self.grid.rows() == 0 {
             return 0;
         }
@@ -8072,6 +8151,10 @@ impl TerminalState {
     /// the top still reaches scrollback through the scroll-region path, so a TUI
     /// whose transcript scrolls stays fully scrollable.
     fn archive_alt_screen_frame(&mut self) {
+        if self.inline_cli_owner_active() {
+            return;
+        }
+
         // A reader holding a scrolled-back viewport owns the history: never
         // rewrite it underneath them for a frame that is still on screen. The
         // snapshot stays provisional so returning to the bottom can still
@@ -8229,7 +8312,8 @@ impl TerminalState {
 
         // Compress the removed line directly from the grid slice before mutating,
         // avoiding a per-line Vec allocation from get_row.
-        let allow_alt_scrollback = self.use_alt_buffer && self.sync_output_active;
+        let allow_alt_scrollback =
+            self.use_alt_buffer && self.sync_output_active && !self.inline_cli_owner_active();
         let scrollback_line =
             if scrolls_off_screen_top && (!self.use_alt_buffer || allow_alt_scrollback) {
                 Some(ScrollbackLine::compress_with_raw_row_id(
@@ -9500,6 +9584,9 @@ impl TerminalState {
             'J' => {
                 match params.first().copied().unwrap_or(0) {
                     0 => {
+                        if self.cursor_row == 0 && self.cursor_col == 0 {
+                            self.inline_cli_screen_erased();
+                        }
                         // Clear from cursor to end of display
                         for col in self.cursor_col..self.grid.row_len() {
                             self.clear_cell(self.cursor_row, col);
@@ -10202,6 +10289,8 @@ impl TerminalState {
         // blocks whose text is gone.
         self.cleared_blocks = None;
         self.current_zone_state = ZoneState::default();
+        self.inline_cli_command_scope = None;
+        self.inline_cli_launch_floor = self.inline_cli_launch_floor.map(|_| 0);
         self.chat_native_takeover = false;
         self.current_command_start_col = None;
         self.current_command_extent_row = None;
@@ -10287,6 +10376,7 @@ impl TerminalState {
 
     /// Erase the whole screen WITHOUT moving the cursor (ED / CSI 2 J).
     fn clear_screen_no_home(&mut self) {
+        self.inline_cli_screen_erased();
         if self.sync_output_active {
             if self.use_alt_buffer {
                 // The alternate screen holds no document, only the screen the
@@ -10665,14 +10755,60 @@ impl TerminalState {
     }
 
     /// Set the absolute scrollback offset (0 = live view at bottom), clamped.
-    /// In alternate screen, this is allowed only when a synchronized full-screen
-    /// app has produced local history snapshots.
+    /// Alternate-screen applications own their viewport; primary history is
+    /// never exposed through their host scrollbar.
     pub fn set_scroll_offset(&mut self, offset: usize) {
-        if self.use_alt_buffer && self.scrollback.is_empty() {
+        if self.use_alt_buffer {
+            self.scroll_offset = 0;
             return;
         }
         self.scroll_offset = offset.min(self.scrollback.len());
         self.settle_pending_saved_line_purge();
+    }
+
+    /// Known direct/configured/managed CLI launches are armed before ingest.
+    pub fn set_inline_cli_launch(&mut self, enabled: bool) {
+        self.inline_cli_launch_floor = (enabled
+            && std::env::var_os("JTERM_AGENT_SCROLLBACK").as_deref()
+                != Some(std::ffi::OsStr::new("0")))
+        .then_some(self.scrollback.len());
+    }
+
+    fn inline_cli_owner_floor(&self) -> Option<usize> {
+        if matches!(self.current_zone_state, ZoneState::OutputStarted(..)) {
+            return self
+                .inline_cli_command_scope
+                .filter(|(generation, _)| Some(*generation) == self.watch_generation)
+                .map(|(_, floor)| floor);
+        }
+        self.inline_cli_launch_floor
+    }
+
+    pub(crate) fn inline_cli_owner_active(&self) -> bool {
+        self.inline_cli_owner_floor().is_some()
+    }
+
+    pub fn inline_cli_scope_floor(&self) -> Option<usize> {
+        (!self.use_alt_buffer)
+            .then(|| self.inline_cli_owner_floor())
+            .flatten()
+    }
+
+    fn inline_cli_screen_erased(&mut self) {
+        if self.inline_cli_scope_floor().is_none() {
+            return;
+        }
+        if let Some((_, floor)) = &mut self.inline_cli_command_scope {
+            *floor = (*floor).min(self.scrollback.len());
+        }
+        if let Some(floor) = &mut self.inline_cli_launch_floor {
+            *floor = (*floor).min(self.scrollback.len());
+        }
+    }
+
+    fn inline_cli_projection_policy(&self) -> Option<ProjectionPolicy> {
+        self.inline_cli_scope_floor()
+            .map(ProjectionPolicy::scoped_identity)
     }
 
     pub fn set_max_scrollback(&mut self, max_scrollback: usize) {
@@ -11381,14 +11517,16 @@ impl TerminalState {
         }
         if let Some((cached_key, plan)) = &self.projection_plan_cache {
             if *cached_key == key {
-                return plan.has_transforms().then(|| std::sync::Arc::clone(plan));
+                return (policy.retain_identity_canvas || plan.has_transforms())
+                    .then(|| std::sync::Arc::clone(plan));
             }
         }
         if let Some(plan) = self.advance_spaced_projection_plan(&key) {
-            return plan.has_transforms().then_some(plan);
+            return (policy.retain_identity_canvas || plan.has_transforms()).then_some(plan);
         }
         let collapses = self.resolved_collapses(policy);
-        if collapses.is_empty()
+        if !policy.retain_identity_canvas
+            && collapses.is_empty()
             && key.spacing_boundaries.is_empty()
             && key.chrome_boundaries.is_empty()
             && key.chat.is_none()
@@ -11405,6 +11543,9 @@ impl TerminalState {
                 .splice_block_spacing(&key.spacing_boundaries)
                 .splice_native_chrome(&key.chrome_boundaries, key.chrome_tail_rows, key.rows)
         };
+        if let Some(floor) = policy.inline_scope_floor {
+            plan.retain_source_suffix(floor);
+        }
         // Cache an ineffective plan too: a proven prompt can still share a
         // reflowed row, and idle redraws must not repeatedly rebuild history.
         plan.plan_revision = self.next_projection_plan_revision;
@@ -11416,7 +11557,7 @@ impl TerminalState {
         }
         let plan = std::sync::Arc::new(plan);
         self.projection_plan_cache = Some((key, std::sync::Arc::clone(&plan)));
-        plan.has_transforms().then_some(plan)
+        (policy.retain_identity_canvas || plan.has_transforms()).then_some(plan)
     }
 
     /// Reuse unchanged history during ordinary streaming in the default
@@ -11438,7 +11579,9 @@ impl TerminalState {
             .history_len
             .checked_add(scrolled)?
             .checked_sub(key.history_len)?;
-        if old.chat.is_some()
+        if old.inline_scope_floor.is_some()
+            || key.inline_scope_floor.is_some()
+            || old.chat.is_some()
             || key.chat.is_some()
             || scrolled == 0
             || scrolled > old.rows
@@ -11634,6 +11777,8 @@ impl TerminalState {
             policy_revision: policy.revision(),
             policy_ids: policy.ids(),
             block_spacing: policy.block_spacing,
+            retain_identity_canvas: policy.retain_identity_canvas,
+            inline_scope_floor: policy.inline_scope_floor,
             spacing_boundaries: self.block_spacing_boundaries(policy.block_spacing),
             chrome_boundaries: self.native_chrome_boundaries(policy),
             chrome_tail_rows: self.native_chrome_tail_rows(policy),
@@ -11917,6 +12062,9 @@ impl TerminalState {
         // projected selection can never cross this boundary, while an
         // existing raw selection remains valid and must be preserved.
         self.projected_selection = None;
+        if self.use_alt_buffer {
+            self.scroll_offset = 0;
+        }
         let rows = self.grid.rows();
         let cols = if rows > 0 { self.grid.row_len() } else { 80 };
         let mode = if block_mode && !self.use_alt_buffer {
@@ -11936,6 +12084,8 @@ impl TerminalState {
             policy_revision: 0,
             policy_ids: SmallVec::new(),
             block_spacing: false,
+            retain_identity_canvas: false,
+            inline_scope_floor: None,
             spacing_boundaries: SmallVec::new(),
             chrome_boundaries: SmallVec::new(),
             chrome_tail_rows: 0,
@@ -12020,7 +12170,11 @@ impl TerminalState {
             policy_revision: 0,
             policy_ids: std::sync::Arc::from([]),
             block_spacing: false,
-            document_rows: self.scrollback.len().saturating_add(rows),
+            document_rows: if self.use_alt_buffer {
+                rows
+            } else {
+                self.scrollback.len().saturating_add(rows)
+            },
             document_start: self.viewport_absolute_start(),
             top_padding: 0,
             effective_collapsed: std::sync::Arc::new(BTreeSet::new()),
@@ -12249,6 +12403,10 @@ impl TerminalState {
         policy: &ProjectionPolicy,
         view_scroll_offset: usize,
     ) -> std::sync::Arc<ProjectedViewport> {
+        let scoped_policy = self.inline_cli_projection_policy();
+        let policy = scoped_policy.as_ref().unwrap_or(policy);
+        let block_mode = block_mode || scoped_policy.is_some();
+
         if !block_mode
             || self.use_alt_buffer
             || policy.is_identity()
@@ -12271,6 +12429,8 @@ impl TerminalState {
             policy_revision: policy.revision(),
             policy_ids: policy.ids(),
             block_spacing: policy.block_spacing,
+            retain_identity_canvas: policy.retain_identity_canvas,
+            inline_scope_floor: policy.inline_scope_floor,
             spacing_boundaries: self.block_spacing_boundaries(policy.block_spacing),
             chrome_boundaries: self.native_chrome_boundaries(policy),
             chrome_tail_rows: self.native_chrome_tail_rows(policy),
@@ -12343,6 +12503,9 @@ impl TerminalState {
         viewport: &std::sync::Arc<ProjectedViewport>,
         policy: &ProjectionPolicy,
     ) -> std::sync::Arc<ProjectedViewport> {
+        let scoped_policy = self.inline_cli_projection_policy();
+        let policy = scoped_policy.as_ref().unwrap_or(policy);
+
         if viewport.canvas_head || self.use_alt_buffer {
             return std::sync::Arc::clone(viewport);
         }
@@ -12537,6 +12700,10 @@ impl TerminalState {
         policy: &ProjectionPolicy,
         state: &mut ProjectionViewState,
     ) -> std::sync::Arc<ProjectedViewport> {
+        let scoped_policy = self.inline_cli_projection_policy();
+        let policy = scoped_policy.as_ref().unwrap_or(policy);
+        let block_mode = block_mode || scoped_policy.is_some();
+
         if !block_mode
             || self.use_alt_buffer
             || (policy.chat && self.chat_plan_key(policy).is_none())
@@ -12707,6 +12874,9 @@ impl TerminalState {
         state: &mut ProjectionViewState,
         origin: RawCellOrigin,
     ) -> bool {
+        let scoped_policy = self.inline_cli_projection_policy();
+        let policy = scoped_policy.as_ref().unwrap_or(policy);
+
         if policy.is_identity() || self.use_alt_buffer {
             let Some(absolute) = self.retained_absolute_for_raw(origin.row) else {
                 return false;
@@ -12751,6 +12921,9 @@ impl TerminalState {
         state: &mut ProjectionViewState,
         zone_id: u64,
     ) -> bool {
+        let scoped_policy = self.inline_cli_projection_policy();
+        let policy = scoped_policy.as_ref().unwrap_or(policy);
+
         if policy.is_identity() || self.use_alt_buffer {
             return false;
         }
@@ -12784,6 +12957,9 @@ impl TerminalState {
     }
 
     pub fn get_visible_cells(&mut self) -> std::sync::Arc<Vec<Vec<TerminalCell>>> {
+        if self.use_alt_buffer {
+            self.scroll_offset = 0;
+        }
         if let Some((cached_version, cached_offset, ref cells, _)) = self.visible_cells_cache {
             if cached_version == self.grid_version && cached_offset == self.scroll_offset {
                 return std::sync::Arc::clone(cells);
@@ -12946,9 +13122,11 @@ impl TerminalState {
     }
 
     fn projection_plan_key_matches_current_source(&self, key: &ProjectionPlanCacheKey) -> bool {
-        key.chat
-            .as_ref()
-            .is_none_or(|chat| self.chat_key_is_current(chat))
+        key.inline_scope_floor == self.inline_cli_scope_floor()
+            && key
+                .chat
+                .as_ref()
+                .is_none_or(|chat| self.chat_key_is_current(chat))
             && key.history_revision == self.history_revision
             && key.row_identity_revision == self.grid.identity_revision
             && key.rows == self.grid.rows()
@@ -13825,10 +14003,10 @@ impl TerminalState {
     }
 
     pub fn scroll(&mut self, lines: isize) {
-        // Don't scroll ordinary alternate-screen apps (less, vim, git log, etc.).
-        // Synchronized TUIs such as Codex may archive snapshots into local
-        // scrollback, in which case wheel/scrollbar navigation should work.
-        if self.use_alt_buffer && self.scrollback.is_empty() {
+        // Native alternate-screen apps own scrolling, irrespective of whether
+        // primary history or legacy synchronized snapshots are retained.
+        if self.use_alt_buffer {
+            self.scroll_offset = 0;
             return;
         }
 
@@ -13946,7 +14124,9 @@ impl TerminalState {
         // reader invalidates the viewport's distance-from-bottom anchor. Keep
         // the old-width rows (the viewport materializer pads/crops them safely)
         // until the user returns to the live bottom, then normalize once.
-        if self.scroll_offset > 0 {
+        if self.scroll_offset > 0 || self.inline_cli_owner_active() {
+            // Keep dense source coordinates stable for this live execution.
+            // The retained projection still performs width-aware lazy reflow.
             return false;
         }
         let old_scrollback_len = self.scrollback.len();
@@ -18448,7 +18628,7 @@ mod tests {
         let history = terminal.scrollback_len();
         terminal.scroll(4);
         let reading_at = terminal.scroll_offset;
-        assert!(reading_at > 0, "fixture must leave the viewport in history");
+        assert_eq!(reading_at, 0, "the alternate app owns its live grid");
 
         // codex-cli re-renders its transcript with exactly this pair.
         terminal.process_input(b"\x1b[H\x1b[3J");
@@ -18617,7 +18797,7 @@ mod tests {
     }
 
     #[test]
-    fn synchronized_alt_screen_snapshots_can_be_scrolled() {
+    fn synchronized_alt_screen_snapshots_are_not_a_live_host_viewport() {
         let mut terminal = TerminalState::new(12, 3);
 
         terminal.process_input(b"\x1b[?1049h");
@@ -18630,8 +18810,8 @@ mod tests {
         terminal.process_input(b"second page\r\nbeta\r\ndone ");
         terminal.process_input(b"\x1b[?2026l");
 
-        // Each frame supersedes the previous one: the alternate screen holds a
-        // scrollable copy of what it shows, not one copy per repaint.
+        // Non-CLI legacy snapshots still supersede one another, but they never
+        // expose primary scrollback while the alternate app owns the screen.
         assert_eq!(
             terminal.scrollback_len(),
             3,
@@ -18639,7 +18819,11 @@ mod tests {
         );
 
         terminal.scroll(3);
-        assert!(terminal.scroll_offset > 0);
+        assert_eq!(terminal.scroll_offset, 0);
+        assert_eq!(
+            terminal.get_projected_viewport(false).max_scroll_offset(),
+            0
+        );
         let visible = terminal.get_visible_cells();
         let text = visible
             .iter()
@@ -18717,7 +18901,7 @@ mod tests {
     }
 
     #[test]
-    fn alt_screen_frames_leave_a_scrolled_back_reader_untouched() {
+    fn alt_screen_frames_never_borrow_a_primary_history_viewport() {
         let mut terminal = TerminalState::new(16, 3);
         for index in 0..12 {
             terminal.process_input(format!("hist-{index}\r\n").as_bytes());
@@ -18728,7 +18912,7 @@ mod tests {
         terminal.scroll(4);
         let reading_at = terminal.scroll_offset;
         let history = terminal.scrollback_len();
-        assert!(reading_at > 0, "fixture must leave the viewport in history");
+        assert_eq!(reading_at, 0, "the alternate app owns its live grid");
 
         for frame in 1..50 {
             terminal.process_input(b"\x1b[?2026h\x1b[1;1H");
@@ -18743,12 +18927,19 @@ mod tests {
         );
         assert_eq!(
             terminal.scroll_offset, reading_at,
-            "the reader's viewport must not move"
+            "ALT must not acquire a primary history offset"
         );
+        let view = terminal.get_projected_viewport(false);
+        assert_eq!(view.max_scroll_offset(), 0);
+        assert!(view.cells()[0]
+            .iter()
+            .map(|cell| cell.character)
+            .collect::<String>()
+            .starts_with("frame 049"));
     }
 
     #[test]
-    fn reading_history_and_returning_leaves_one_alt_screen_snapshot() {
+    fn alt_navigation_attempts_do_not_strand_extra_snapshots() {
         let mut terminal = TerminalState::new(16, 3);
         for index in 0..12 {
             terminal.process_input(format!("hist-{index}\r\n").as_bytes());
@@ -18757,7 +18948,7 @@ mod tests {
         terminal.process_input(b"\x1b[?2026h\x1b[1;1Hframe zero\x1b[?2026l");
         let settled = terminal.scrollback_len();
 
-        // Scroll away, let the app paint, then come back — repeatedly.
+        // Host scroll attempts remain local no-ops while ALT owns the screen.
         for cycle in 0..5 {
             terminal.scroll(4);
             terminal.process_input(b"\x1b[?2026h\x1b[1;1H");

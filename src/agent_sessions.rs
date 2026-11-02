@@ -1707,6 +1707,10 @@ impl super::Frost {
                     session.provider,
                     SessionProvider::Codex | SessionProvider::Claude
                 );
+                terminal
+                    .terminal
+                    .set_inline_cli_launch(terminal.inline_agent_launch);
+                terminal.refresh();
                 self.reference_navigation_drawer = false;
                 self.agent_sessions
                     .bindings

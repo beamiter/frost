@@ -5714,7 +5714,19 @@ impl Session {
         }
         // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` returned a fresh owned descriptor.
         let reader_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(reader_fd) });
+        let inline_agent_launch = command_argv
+            .map(crate::immersive_command::reading_agent_argv)
+            .unwrap_or_else(|| {
+                config
+                    .shell
+                    .as_deref()
+                    .or(shell_program.as_deref())
+                    .is_some_and(|program| {
+                        crate::immersive_command::reading_agent_argv(&[program.to_owned()])
+                    })
+            });
         let mut terminal = TerminalState::new(cols, rows);
+        terminal.set_inline_cli_launch(inline_agent_launch);
         terminal.set_max_scrollback(config.scrollback_lines);
         terminal.set_disable_alt_screen(config.disable_alt_screen);
         let mut projection_policy = ProjectionPolicy::new();
@@ -5739,17 +5751,7 @@ impl Session {
             terminal,
             pty,
             command_owned: command_argv.is_some(),
-            inline_agent_launch: command_argv
-                .map(crate::immersive_command::reading_agent_argv)
-                .unwrap_or_else(|| {
-                    config
-                        .shell
-                        .as_deref()
-                        .or(shell_program.as_deref())
-                        .is_some_and(|program| {
-                            crate::immersive_command::reading_agent_argv(&[program.to_owned()])
-                        })
-                }),
+            inline_agent_launch,
             shell_identity,
             master_fd,
             reader_fd,
@@ -5909,15 +5911,7 @@ impl Session {
     }
 
     fn reading_agent(&self) -> bool {
-        !self.terminal.is_alt_buffer_active()
-            && std::env::var_os("JTERM_AGENT_SCROLLBACK").as_deref()
-                != Some(std::ffi::OsStr::new("0"))
-            && self
-                .terminal
-                .running_command_text()
-                .or(self.fg_proc_cache.as_deref())
-                .map(crate::immersive_command::reading_agent_command)
-                .unwrap_or(self.inline_agent_launch)
+        self.terminal.inline_cli_scope_floor().is_some()
     }
 
     fn refresh(&mut self) {
@@ -6424,12 +6418,27 @@ impl Session {
             |byte| self.pty.write(byte),
         );
         if accepted {
+            self.note_cli_keyboard_input(&bytes, true);
             self.terminal.note_user_input(&bytes);
             if displayed.kind() == chat_mode::ControlKind::Submit {
                 self.terminal.note_chat_submit();
             }
         }
         accepted
+    }
+
+    /// An admitted application key leaves host reading/selection ownership.
+    /// Keep protocol replies and mouse reports on their existing writer path:
+    /// those are not permission to move a reader back to the live application.
+    fn note_cli_keyboard_input(&mut self, bytes: &[u8], accepted: bool) {
+        if !accepted || bytes.is_empty() || !self.terminal.inline_cli_owner_active() {
+            return;
+        }
+        self.block_selection.clear();
+        self.terminal.clear_text_selection();
+        self.terminal.scroll_to_bottom();
+        self.projection_view_state.scroll_to_bottom();
+        self.transcript_canvas.navigate(0);
     }
 
     /// Queue data in-order and make one non-blocking drain attempt. Returns false
@@ -11410,11 +11419,15 @@ impl Frost {
             }
             if let Some(sess) = self.sessions.get_mut(self.active) {
                 // A PTY-bound keystroke dismisses the block selection.
-                sess.block_selection.clear();
-                sess.terminal.scroll_to_bottom();
-                sess.transcript_canvas.navigate(0);
-                sess.projection_view_state.scroll_to_bottom();
-                if sess.write_pty(bytes)
+                if !sess.terminal.inline_cli_owner_active() {
+                    sess.block_selection.clear();
+                    sess.terminal.scroll_to_bottom();
+                    sess.transcript_canvas.navigate(0);
+                    sess.projection_view_state.scroll_to_bottom();
+                }
+                let accepted = sess.write_pty(bytes);
+                sess.note_cli_keyboard_input(bytes, accepted);
+                if accepted
                     && !sess.managed_remote
                     && self.organism.is_local(sess.id)
                     && !matches!(
@@ -13664,11 +13677,14 @@ impl Frost {
                             return false;
                         }
                         // Preserve the same selection, scrolling and refresh effects.
-                        sess.block_selection.clear();
-                        sess.terminal.scroll_to_bottom();
-                        sess.transcript_canvas.navigate(0);
-                        sess.projection_view_state.scroll_to_bottom();
+                        if !sess.terminal.inline_cli_owner_active() {
+                            sess.block_selection.clear();
+                            sess.terminal.scroll_to_bottom();
+                            sess.transcript_canvas.navigate(0);
+                            sess.projection_view_state.scroll_to_bottom();
+                        }
                         let written = sess.write_pty(bytes);
+                        sess.note_cli_keyboard_input(bytes, written);
                         sess.refresh();
                         written
                     },
@@ -19529,11 +19545,14 @@ impl Frost {
                         } else {
                             // Typing into the shell dismisses the block selection
                             // (any PTY-bound key, not Escape specifically).
-                            sess.block_selection.clear();
-                            sess.terminal.scroll_to_bottom();
-                            sess.transcript_canvas.navigate(0);
-                            sess.projection_view_state.scroll_to_bottom();
+                            if !sess.terminal.inline_cli_owner_active() {
+                                sess.block_selection.clear();
+                                sess.terminal.scroll_to_bottom();
+                                sess.transcript_canvas.navigate(0);
+                                sess.projection_view_state.scroll_to_bottom();
+                            }
                             let accepted = sess.write_pty(&bytes);
+                            sess.note_cli_keyboard_input(&bytes, accepted);
                             if accepted
                                 && self.config.is_chat_mode()
                                 && no_modifier
@@ -19606,11 +19625,15 @@ impl Frost {
                         } else {
                             // PTY-bound input dismisses the block selection, same
                             // as `encode_key` and the paste paths.
-                            sess.block_selection.clear();
-                            sess.terminal.scroll_to_bottom();
-                            sess.transcript_canvas.navigate(0);
-                            sess.projection_view_state.scroll_to_bottom();
-                            if sess.write_pty(text.as_bytes())
+                            if !sess.terminal.inline_cli_owner_active() {
+                                sess.block_selection.clear();
+                                sess.terminal.scroll_to_bottom();
+                                sess.transcript_canvas.navigate(0);
+                                sess.projection_view_state.scroll_to_bottom();
+                            }
+                            let accepted = sess.write_pty(text.as_bytes());
+                            sess.note_cli_keyboard_input(text.as_bytes(), accepted);
+                            if accepted
                                 && !sess.managed_remote
                                 && self.organism.is_local(sess.id)
                                 && !matches!(
@@ -35731,6 +35754,66 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn inline_agent_admitted_key_releases_copied_history_and_modal_anchor() {
+        let mut config = super::Config {
+            shell: Some("/bin/sh".into()),
+            ..Default::default()
+        };
+        config.vim9.auto_gui = false;
+        let mut session = super::Session::spawn(&config, 0, 40, 10, Some("/tmp")).unwrap();
+        session.projection_block_mode = false;
+        session.terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07codex\r\n\x1b]133;C;cmdline_url=codex\x07",
+        );
+        for row in 0..60 {
+            session
+                .terminal
+                .process_input(format!("CLI{row:04}\r\n").as_bytes());
+        }
+        session.refresh();
+        session.set_scroll_offset(session.projection.max_scroll_offset());
+        session.terminal.start_selection_in_projection(
+            &session.projection,
+            (1, 0),
+            super::terminal::SelectionMode::Normal,
+        );
+        session
+            .terminal
+            .update_selection_in_projection(&session.projection, (1, 6));
+        assert_eq!(
+            session.terminal.copy_selection().as_deref(),
+            Some("CLI0000")
+        );
+        session.set_scroll_offset(0); // dragging to live doesn't dismiss copied text
+        assert!(session.terminal.has_text_selection());
+        assert!(!session.transcript_canvas.following());
+        session.note_cli_keyboard_input(b"\x14", false);
+        session.note_cli_keyboard_input(b"", true);
+        session.refresh();
+        assert!(session.terminal.has_text_selection());
+        assert!(!session.transcript_canvas.following());
+        // Mouse/protocol traffic never invokes the application-key transition.
+        assert!(session.write_pty(b"\x1b[<64;1;1M"));
+        session.refresh();
+        assert!(session.terminal.has_text_selection());
+        for key in [b"\x14".as_slice(), b"q".as_slice()] {
+            let admitted = session.write_pty(key);
+            assert!(admitted);
+            session.note_cli_keyboard_input(key, admitted);
+            session.refresh();
+            assert!(!session.terminal.has_text_selection());
+            assert!(session.transcript_canvas.following());
+            session.terminal.process_input(
+                b"\x1b[?2026h\x1b[H\x1b[2Jnew native view\r\nactive prompt\x1b[?2026l",
+            );
+            session.refresh();
+            assert_eq!(session.projection.scroll_offset(), 0);
+            assert!(session.transcript_canvas.following());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn inline_agent_native_canvas_preserves_fractional_reader_during_output() {
         let mut config = super::Config {
             shell: Some("/bin/sh".into()),
@@ -35740,6 +35823,9 @@ mod tests {
         let mut session = super::Session::spawn(&config, 0, 40, 10, Some("/tmp")).unwrap();
         session.fg_proc_cache = Some("codex".into());
         session.projection_block_mode = false;
+        session.terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07codex\r\n\x1b]133;C;cmdline_url=codex\x07",
+        );
         for index in 0..40 {
             session
                 .terminal
