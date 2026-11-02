@@ -474,11 +474,7 @@ pub(crate) fn conversation_view(
                     .spacing(9)
                     .align_y(iced::Alignment::Center),
                 )
-                .align_right(Length::Fill)
-                .padding(iced::Padding {
-                    right: shell::USER_BUBBLE_RIGHT - shell::COMPOSER_INSET - 24.0 - 9.0,
-                    ..iced::Padding::ZERO
-                }),
+                .align_left(Length::Fill),
             );
         } else {
             let mut parts = column![row![

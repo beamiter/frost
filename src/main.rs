@@ -29566,44 +29566,26 @@ impl Frost {
     fn ai_chats_request_task(&mut self, request: ai_chats::ChatRequest) -> Task<Message> {
         let ai_chats::ChatRequest {
             token,
-            client,
-            system,
-            history,
-            cancellation,
+            request,
+            observer,
         } = request;
-        if self.config.ai_stream {
-            let (tx, rx) = iced::futures::channel::mpsc::unbounded::<Message>();
-            std::thread::spawn(move || {
-                let mut on_delta = |fragment: &str| {
-                    let _ = tx.unbounded_send(Message::AiChatsDelta(token, fragment.to_string()));
-                };
-                let result = client
-                    .send_turns_streaming_cancellable(
-                        Some(&system),
-                        &history,
-                        &cancellation,
-                        &mut on_delta,
-                    )
-                    .map_err(|error| error.to_string());
-                let _ = tx.unbounded_send(Message::AiChatsResult(token, result));
-            });
-            return Task::stream(rx);
-        }
-        Task::perform(
-            async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    client
-                        .send_turns_blocking_cancellable(Some(&system), &history, &cancellation)
-                        .map_err(|error| error.to_string())
-                })
-                .await;
-                match result {
-                    Ok(result) => result,
-                    Err(error) => Err(format!("AI worker task failed: {error}")),
-                }
-            },
-            move |result| Message::AiChatsResult(token, result),
-        )
+        let (tx, rx) = iced::futures::channel::mpsc::channel::<Message>(32);
+        std::thread::spawn(move || {
+            let mut tx = tx;
+            let result = jterm_core::agent_workspace::HostedApiClient::new().execute(
+                request,
+                &observer,
+                &mut |preview| {
+                    let _ = tx.try_send(Message::AiChatsDelta(token, preview.to_owned()));
+                },
+            );
+            // Bounded backpressure stays on the observer worker.
+            let _ = iced::futures::executor::block_on(iced::futures::SinkExt::send(
+                &mut tx,
+                Message::AiChatsResult(token, result),
+            ));
+        });
+        Task::stream(rx)
     }
 
     /// Open the inline "Ask AI" request overlay. The sources reach this flow

@@ -26,14 +26,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use jterm_core::ai::{AiCancellationToken, AiClient, ConversationSnapshot, Turn};
+use jterm_core::agent_workspace::{ApiLaunch, ApiObservation, ApiObservationToken, ApiRequest};
+use jterm_core::ai::ConversationSnapshot;
 use jterm_core::command_history;
 
 use crate::agent;
 use crate::ai_chat_store::{self, ChatStatus, ChatStore, ChatStoreError, RequestToken};
 use crate::config::Config;
 
-pub(crate) const STOPPED_STATUS: &str = "Response stopped. You can retry when ready.";
 /// One-line library filter budget, matching the other overlay queries so a
 /// paste cannot grow the iced field without bound.
 pub(crate) const MAX_SEARCH_BYTES: usize = jterm_core::workflows::MAX_PICKER_QUERY_BYTES;
@@ -102,10 +102,8 @@ pub(crate) enum ChatsPage {
 /// background task (mirrors `agent::ModelRequest`).
 pub(crate) struct ChatRequest {
     pub(crate) token: RequestToken,
-    pub(crate) client: AiClient,
-    pub(crate) system: String,
-    pub(crate) history: Vec<Turn>,
-    pub(crate) cancellation: AiCancellationToken,
+    pub(crate) request: ApiRequest,
+    pub(crate) observer: ApiObservationToken,
 }
 
 pub(crate) struct AiChatsUi {
@@ -135,7 +133,7 @@ pub(crate) struct AiChatsUi {
     pub(crate) notice: String,
     pub(crate) provider_label: String,
     include_recent: HashMap<u64, bool>,
-    in_flight: HashMap<RequestToken, AiCancellationToken>,
+    in_flight: HashMap<RequestToken, ApiObservation>,
     /// Per-chat text of the last failed or stopped composer turn, for Retry.
     retry_payloads: HashMap<u64, String>,
     /// One stable system prompt per chat, assigned on its first request.
@@ -225,6 +223,23 @@ impl AiChatsUi {
                     self.sync_title_draft();
                     self.is_open = true;
                     self.page = ChatsPage::Chat;
+                }
+                crate::workspace_chat_bridge::Effect::Observe { chat_id, job } => {
+                    self.retry_payloads.insert(chat_id, job.user_text.clone());
+                    if let Ok(token) = self.store.observe_turn(chat_id, job.user_text) {
+                        let observation = ApiObservation::default();
+                        let observer = observation.token();
+                        self.in_flight.insert(token, observation);
+                        requests.push(ChatRequest {
+                            token,
+                            observer,
+                            request: ApiRequest::Observe {
+                                id: job.id,
+                                epoch: job.epoch,
+                                view: uuid::Uuid::new_v4().to_string(),
+                            },
+                        });
+                    }
                 }
                 crate::workspace_chat_bridge::Effect::Submit {
                     chat_id,
@@ -505,6 +520,14 @@ impl AiChatsUi {
                 return None;
             }
         };
+        if self
+            .workspace
+            .launch_receipt(self.store.active_id())
+            .is_none()
+        {
+            self.set_notice("Open this conversation from the shared sidebar before sending. Your draft is kept.");
+            return None;
+        }
         let provider = crate::review_text::bound_provider_label(client.display_name());
         self.provider_label = provider.clone();
         let start =
@@ -549,8 +572,24 @@ impl AiChatsUi {
             .entry(chat_id)
             .or_insert(new_system)
             .clone();
-        let cancellation = AiCancellationToken::new();
-        self.in_flight.insert(start.token, cancellation.clone());
+        let Some(receipt) = self.workspace.launch_receipt(chat_id) else {
+            let _ = self.store.complete_error(
+                start.token,
+                "Wait for shared submission authorization".into(),
+            );
+            return None;
+        };
+        let launch =
+            match ApiLaunch::new(receipt, &client, Some(system), &history, config.ai_stream) {
+                Ok(launch) => launch,
+                Err(error) => {
+                    let _ = self.store.complete_error(start.token, error);
+                    return None;
+                }
+            };
+        let observation = ApiObservation::default();
+        let observer = observation.token();
+        self.in_flight.insert(start.token, observation);
         self.retry_payloads.insert(chat_id, text);
         self.interrupted_partial = None;
         if clear_draft {
@@ -563,10 +602,8 @@ impl AiChatsUi {
         self.dirty = true;
         Some(ChatRequest {
             token: start.token,
-            client,
-            system,
-            history,
-            cancellation,
+            request: ApiRequest::Start(launch),
+            observer,
         })
     }
 
@@ -586,21 +623,12 @@ impl AiChatsUi {
 
     /// Stop the active chat's in-flight request, restoring its message into
     /// the composer draft (the store's pending-as-draft rollback).
-    pub(crate) fn stop(&mut self, redact: bool) {
-        let Some(token) = self.store.active_request_token() else {
-            return;
-        };
-        if let Some(cancellation) = self.in_flight.remove(&token) {
-            cancellation.cancel();
-        }
-        self.workspace.cancel(token);
-        if self
-            .store
-            .cancel_request(token, STOPPED_STATUS.to_string())
-            .is_some()
-        {
-            self.dirty = true;
-            self.persist(redact);
+    pub(crate) fn stop(&mut self, _redact: bool) {
+        if let Some(token) = self.store.active_request_token() {
+            if let Some(observation) = self.in_flight.get(&token) {
+                observation.cancel();
+                self.notice = "Stopping the background response…".into();
+            }
         }
     }
 
@@ -643,7 +671,7 @@ impl AiChatsUi {
         if !self.in_flight.contains_key(&token) {
             return false;
         }
-        self.store.push_delta(token, text) == Some(true)
+        self.store.replace_partial(token, text) == Some(true)
     }
 
     /// A worker finished. Stale tokens (stop/replace raced the reply) are
@@ -661,11 +689,7 @@ impl AiChatsUi {
                     answer.trim().to_owned()
                 };
                 self.workspace.complete(token, &durable);
-                if self
-                    .store
-                    .complete_success(token, answer.trim().to_string())
-                    .is_some()
-                {
+                if self.store.complete_success(token, answer).is_some() {
                     self.retry_payloads.remove(&token.chat_id);
                     self.interrupted_partial = None;
                 }
@@ -1025,7 +1049,9 @@ mod tests {
     /// A panel that can never touch the user's real library: no path, and not
     /// the persistence owner.
     fn fresh_panel() -> AiChatsUi {
-        AiChatsUi::with_path(false, None)
+        let mut panel = AiChatsUi::with_path(false, None);
+        panel.workspace.authorize_fixture(panel.store.active_id());
+        panel
     }
 
     /// A panel that owns persistence at a fixture path, as the first instance
@@ -1247,11 +1273,13 @@ mod tests {
         assert_eq!(panel.store.active_draft(), "");
         assert_eq!(panel.store.active_history().len(), 1);
         // The session prompt embeds the question; the system prompt is stable.
-        assert!(request
-            .history
-            .last()
+        let ApiRequest::Start(launch) = request.request else {
+            panic!("new host launch required")
+        };
+        let wire = serde_json::to_value(launch).unwrap();
+        assert!(wire["turns"].as_array().unwrap().last().unwrap()["text"]
+            .as_str()
             .unwrap()
-            .text
             .contains("why is chmod recursive"));
         assert!(panel.has_retry());
     }
@@ -1262,6 +1290,11 @@ mod tests {
         panel.set_draft("retry me".into());
         let request = panel.submit(&ai_config()).unwrap();
         panel.stop(false);
+        assert!(
+            panel.store.is_active_busy(),
+            "Stop waits for host cleanup acknowledgement"
+        );
+        panel.complete(request.token, Err("Response cancelled".into()));
         assert_eq!(panel.store.active_draft(), "retry me");
         assert!(panel.store.active_history().is_empty());
         assert!(panel.has_retry());
@@ -1339,7 +1372,7 @@ mod tests {
     fn delete_is_two_step_and_archive_blocks_while_busy() {
         let mut panel = fresh_panel();
         panel.set_draft("busy chat".into());
-        let _request = panel.submit(&ai_config()).unwrap();
+        let request = panel.submit(&ai_config()).unwrap();
         panel.toggle_archive(false);
         assert!(
             panel.notice.contains("Stop this response"),
@@ -1347,6 +1380,8 @@ mod tests {
             panel.notice
         );
         panel.stop(false);
+        assert!(panel.store.is_active_busy());
+        panel.complete(request.token, Err("Response cancelled".into()));
         panel.toggle_archive(false);
         // Archiving the only chat yields the active slot to a fresh writable
         // chat while the original stays archived.
