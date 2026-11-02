@@ -5,8 +5,8 @@ use crate::glass_shell_tokens as token;
 pub const INPUT_STRIP_HEIGHT: f32 = 44.0;
 pub const MAX_INPUT_HEIGHT: f32 = 180.0;
 pub const MIN_CENTER_WIDTH: f32 = 300.0;
-pub const MIN_SIDEBAR_WIDTH: f32 = 180.0;
-pub const MAX_SIDEBAR_WIDTH: f32 = 480.0;
+pub const MIN_SIDEBAR_WIDTH: f32 = 240.0;
+pub const MAX_SIDEBAR_WIDTH: f32 = 360.0;
 pub const MIN_INSPECTOR_WIDTH: f32 = 260.0;
 pub const MAX_INSPECTOR_WIDTH: f32 = 520.0;
 

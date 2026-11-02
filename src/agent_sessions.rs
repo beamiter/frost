@@ -1625,6 +1625,30 @@ impl super::Frost {
         self.agent_sessions.workspace.refresh();
     }
 
+    pub(crate) fn open_hosted_native_terminal(&mut self, session: AgentSession) {
+        let key = open_session_key(&session);
+        if let Some(index) = self
+            .agent_sessions
+            .bindings
+            .get(&key)
+            .and_then(|id| self.session_index_by_id(*id))
+        {
+            self.focus_session(index);
+            self.agent_sessions.workspace_task = None;
+            self.ai_chats.close(self.config.ai_redact_secrets);
+            self.relayout();
+            self.refresh_active_context();
+            return;
+        }
+        match jterm_core::agent_workspace::managed_launch(&session) {
+            Ok(launch) => {
+                let key = session_key(&session);
+                self.launch_checked_agent_session(session, key, launch);
+            }
+            Err(error) => self.push_toast(error, super::ToastKind::Warning),
+        }
+    }
+
     fn launch_checked_agent_session(
         &mut self,
         session: AgentSession,

@@ -7332,7 +7332,12 @@ impl Frost {
             ai_suggestion: None,
             ai_suggestion_generation: 0,
             task_manager: agent_task::TaskManager::new(),
-            agent_runtime: agent_task::AgentRuntimeManager::new(),
+            agent_runtime: agent_task::AgentRuntimeManager::hosted(format!(
+                "frost:{}",
+                Config::config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "default".into())
+            )),
             task_panel: agent_task_ui::TaskPanel::new(),
             keybindings: keybindings_load.bindings,
             config_panel_open: false,
@@ -17684,6 +17689,15 @@ impl Frost {
                 }
             }
             Message::TaskHide(task_id) => {
+                if self.agent_runtime.conversation_id(task_id).is_some() {
+                    if let Err(error) = self.agent_runtime.mutate_hosted_task(
+                        task_id,
+                        jterm_core::agent_workspace::NativeTaskMutation::Archive,
+                    ) {
+                        self.push_toast(error.to_string(), ToastKind::Warning);
+                    }
+                    return Task::none();
+                }
                 // The Hidden view offers Restore only.
                 if self.task_panel.show_hidden || !self.task_inspector_visible(task_id) {
                     return Task::none();
@@ -17702,6 +17716,15 @@ impl Frost {
                     .set_show_hidden(show && self.config.experimental_task_sidebar);
             }
             Message::TaskRestore(task_id) => {
+                if self.agent_runtime.conversation_id(task_id).is_some() {
+                    if let Err(error) = self.agent_runtime.mutate_hosted_task(
+                        task_id,
+                        jterm_core::agent_workspace::NativeTaskMutation::Restore,
+                    ) {
+                        self.push_toast(error.to_string(), ToastKind::Warning);
+                    }
+                    return Task::none();
+                }
                 if !self.task_panel.show_hidden || !self.task_inspector_visible(task_id) {
                     return Task::none();
                 }
@@ -17823,11 +17846,17 @@ impl Frost {
                 }
             }
             Message::WorkspaceTask(id) => {
+                self.agent_runtime.select_hosted_view(Some(id));
+                if let Some(session) = self.agent_runtime.hosted_terminal(id).cloned() {
+                    self.open_hosted_native_terminal(session);
+                    return iced::Task::none();
+                }
                 if self.task_manager.get(id).is_some() {
                     self.ai_chats.close(self.config.ai_redact_secrets);
                     self.agent_sessions.workspace_task = Some(id);
                     self.agent_sessions.workspace_pending = false;
                     self.agent_sessions.cancel_confirmation();
+                    self.agent_runtime.select_hosted_view(Some(id));
                     self.task_panel.select(Some(id));
                 }
             }
@@ -18200,16 +18229,30 @@ impl Frost {
                 else {
                     return Task::none();
                 };
+                let Some(receipt) = self
+                    .task_panel
+                    .begin_hosted_follow_up(reference.task_id, &text)
+                else {
+                    return Task::none();
+                };
                 // The task and immutable draft are admitted together before
                 // calling the existing core authorization/consent boundary.
-                match self.agent_runtime.prompt_native(
+                match self.agent_runtime.prompt_native_tracked(
                     &self.task_manager,
                     reference.task_id,
                     &text,
                     agent_task_ui::prompt_policy(&self.config),
+                    receipt.clone(),
                 ) {
-                    Ok(()) => self.task_panel.clear_follow_up(),
-                    Err(error) => self.push_toast(error.to_string(), ToastKind::Warning),
+                    Ok(()) => {
+                        if !self.agent_runtime.needs_host_poll() {
+                            self.task_panel.resolve_hosted_follow_up(&receipt, true);
+                        }
+                    }
+                    Err(error) => {
+                        self.task_panel.resolve_hosted_follow_up(&receipt, false);
+                        self.push_toast(error.to_string(), ToastKind::Warning);
+                    }
                 }
                 // The parked Ready phase does not ask for fast polling; show
                 // the new turn starting without waiting for the slow tick.
@@ -18262,6 +18305,15 @@ impl Frost {
                 }
             }
             Message::TaskMarkComplete(task_id) => {
+                if self.agent_runtime.conversation_id(task_id).is_some() {
+                    if let Err(error) = self.agent_runtime.mutate_hosted_task(
+                        task_id,
+                        jterm_core::agent_workspace::NativeTaskMutation::Complete,
+                    ) {
+                        self.push_toast(error.to_string(), ToastKind::Warning);
+                    }
+                    return Task::none();
+                }
                 if !self.task_inspector_visible(task_id) {
                     return Task::none();
                 }
@@ -18274,6 +18326,15 @@ impl Frost {
                 if self.task_inspector_visible(task_id)
                     && self.task_panel.accepts_review(task_id, &reference)
                 {
+                    if self.agent_runtime.conversation_id(task_id).is_some() {
+                        if let Err(error) = self.agent_runtime.mutate_hosted_task(
+                            task_id,
+                            jterm_core::agent_workspace::NativeTaskMutation::AcceptReviewed,
+                        ) {
+                            self.push_toast(error.to_string(), ToastKind::Warning);
+                        }
+                        return Task::none();
+                    }
                     match self.task_manager.complete_after_manual_review(task_id) {
                         Ok(()) => self.push_toast("Reviewed work accepted", ToastKind::Success),
                         Err(error) => self.push_toast(error.to_string(), ToastKind::Warning),
@@ -30340,11 +30401,31 @@ impl Frost {
             }
         }
 
-        if self.agent_runtime.has_any_activity() {
+        if self.agent_runtime.has_any_activity() || self.agent_runtime.needs_host_poll() {
+            let selected = if self.ai_chats.is_open {
+                None
+            } else {
+                self.agent_sessions.workspace_task.or_else(|| {
+                    self.tasks_surface_visible()
+                        .then_some(self.task_panel.selected)
+                        .flatten()
+                })
+            };
+            self.agent_runtime.select_hosted_view(selected);
             let report = self.agent_runtime.poll(
                 &mut self.task_manager,
                 agent_task_ui::prompt_policy(&self.config),
             );
+            for outcome in self.agent_runtime.take_prompt_outcomes() {
+                self.task_panel
+                    .resolve_hosted_follow_up(&outcome.receipt, outcome.result.is_ok());
+            }
+            for (_, terminal) in self.agent_runtime.take_owned_terminal_launches() {
+                self.open_owned_validation_terminal(terminal);
+            }
+            for (_, session) in self.agent_runtime.take_terminal_handoffs() {
+                self.open_hosted_native_terminal(session);
+            }
             for issue in report.issues {
                 self.push_toast(
                     crate::review_text::visible_bounded(
@@ -30403,6 +30484,16 @@ impl Frost {
         ) {
             return;
         }
+        if role == agent_task::TaskTerminalRole::Validation {
+            if let Some(terminal) = self
+                .agent_runtime
+                .hosted_validation_terminal(task_id)
+                .cloned()
+            {
+                self.open_owned_validation_terminal(terminal);
+                return;
+            }
+        }
         let Some(index) = self.task_terminal_index(task_id, role) else {
             self.push_toast("Task terminal is no longer available", ToastKind::Info);
             return;
@@ -30426,6 +30517,15 @@ impl Frost {
     /// the retry of an exited task terminal (the new PTY atomically replaces
     /// the exited transcript binding; sticky provenance is preserved).
     fn task_open_terminal(&mut self, task_id: agent_task::TaskId) {
+        if self.agent_runtime.conversation_id(task_id).is_some()
+            && self.agent_runtime.can_continue_in_terminal(task_id)
+        {
+            if let Err(error) = self.agent_runtime.handoff_to_terminal(task_id) {
+                self.push_toast(error.to_string(), ToastKind::Warning);
+            }
+            return;
+        }
+
         if self.agent_runtime.has_preparing(task_id) {
             self.push_toast(
                 "Cancel native Agent preparation before starting a terminal",
@@ -30595,7 +30695,70 @@ impl Frost {
     /// terminal inside the isolated worktree. Preflight re-proves the Git
     /// registration and pins the cwd through an open directory descriptor
     /// before any PTY exists.
+    fn open_owned_validation_terminal(
+        &mut self,
+        terminal: jterm_core::agent_workspace::OwnedTerminalDescriptor,
+    ) {
+        let key = format!("{}:{}", terminal.id.0, terminal.epoch);
+        if let Some(index) = self
+            .task_panel
+            .owned_validation_tabs
+            .get(&key)
+            .copied()
+            .and_then(|id| self.session_index_by_id(id))
+        {
+            self.focus_session(index);
+            self.agent_sessions.workspace_task = None;
+            self.ai_chats.close(self.config.ai_redact_secrets);
+            self.relayout();
+            self.refresh_active_context();
+            return;
+        }
+        let launch = match jterm_core::agent_workspace::owned_terminal_launch(&terminal) {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.push_toast(error, ToastKind::Warning);
+                return;
+            }
+        };
+        let argv: Vec<_> = std::iter::once(launch.program).chain(launch.args).collect();
+        match Session::spawn_argv(
+            &self.config,
+            self.next_id,
+            self.cols,
+            self.rows,
+            launch.cwd.to_str(),
+            Some(&argv),
+        ) {
+            Ok(session) => {
+                // Attach-helper exit is view lifecycle only; the host owns the result.
+                self.task_panel
+                    .owned_validation_tabs
+                    .insert(key, session.id);
+                self.next_id += 1;
+                let insert = (self.active + 1).min(self.sessions.len());
+                self.sessions.insert(insert, session);
+                apply_theme_colors(&mut self.sessions[insert].terminal, &self.theme);
+                self.reindex_tabs_after_insert(insert);
+                self.open_tab_with(insert);
+                self.tabs[self.active_tab].title = Some(terminal.label);
+                self.agent_sessions.workspace_task = None;
+                self.ai_chats.close(self.config.ai_redact_secrets);
+                self.relayout();
+                self.refresh_active_context();
+                self.save_session_snapshot();
+            }
+            Err(error) => self.push_toast(error.to_string(), ToastKind::Warning),
+        }
+    }
+
     fn task_start_validation(&mut self, task_id: agent_task::TaskId) {
+        if self.agent_runtime.conversation_id(task_id).is_some() {
+            if let Err(error) = self.agent_runtime.start_hosted_validation(task_id) {
+                self.push_toast(error.to_string(), ToastKind::Warning);
+            }
+            return;
+        }
         if let Err(error) = self.task_manager.next_validation_attempt(task_id) {
             self.push_toast(error.to_string(), ToastKind::Warning);
             return;
@@ -33334,6 +33497,7 @@ impl Frost {
         let tasks_open =
             self.focused && self.config.experimental_task_sidebar && self.tasks_surface_visible();
         if self.agent_runtime.has_any_activity()
+            || self.agent_runtime.needs_host_poll()
             || self.task_panel.pending_creation.is_some()
             || self.task_panel.diff.state().loading
             || tasks_open

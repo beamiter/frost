@@ -745,6 +745,9 @@ pub(crate) struct TaskPanel {
     follow_up_notice: Option<&'static str>,
     draft_discard_confirmation: Option<Arc<()>>,
     follow_up_drafts: std::collections::HashMap<TaskId, (String, Option<&'static str>)>,
+    follow_up_versions: std::collections::HashMap<TaskId, u64>,
+    hosted_followups: std::collections::HashMap<String, (TaskId, u64, String)>,
+    pub(crate) owned_validation_tabs: std::collections::HashMap<String, u64>,
     pub(crate) pending_creation: Option<PendingTaskCreation>,
     /// Failed-block context waiting for an explicit provider choice.
     pub(crate) provider_picker: Option<TaskProviderPicker>,
@@ -781,6 +784,9 @@ impl TaskPanel {
             follow_up_notice: None,
             draft_discard_confirmation: None,
             follow_up_drafts: std::collections::HashMap::new(),
+            follow_up_versions: Default::default(),
+            hosted_followups: Default::default(),
+            owned_validation_tabs: Default::default(),
             pending_creation: None,
             provider_picker: None,
             composer: None,
@@ -1161,6 +1167,37 @@ impl TaskPanel {
         }
     }
 
+    pub(crate) fn begin_hosted_follow_up(&mut self, id: TaskId, text: &str) -> Option<String> {
+        if self
+            .hosted_followups
+            .values()
+            .any(|(task, _, _)| *task == id)
+        {
+            return None;
+        }
+        let receipt = uuid::Uuid::new_v4().to_string();
+        let version = *self.follow_up_versions.get(&id).unwrap_or(&0);
+        self.hosted_followups
+            .insert(receipt.clone(), (id, version, text.into()));
+        Some(receipt)
+    }
+    pub(crate) fn resolve_hosted_follow_up(&mut self, receipt: &str, accepted: bool) {
+        let Some((id, version, text)) = self.hosted_followups.remove(receipt) else {
+            return;
+        };
+        if !accepted || self.follow_up_versions.get(&id).copied().unwrap_or(0) != version {
+            return;
+        }
+        if self.selected == Some(id) && self.follow_up == text {
+            self.clear_follow_up();
+        } else if self
+            .follow_up_drafts
+            .get(&id)
+            .is_some_and(|(draft, _)| draft == &text)
+        {
+            self.follow_up_drafts.remove(&id);
+        }
+    }
     pub(crate) fn clear_follow_up(&mut self) {
         self.follow_up = String::new();
         self.follow_up_editor = iced::widget::text_editor::Content::new();
@@ -1215,7 +1252,14 @@ impl TaskPanel {
         let controls_removed = raw
             .chars()
             .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'));
-        self.follow_up = bound_follow_up(raw);
+        let next = bound_follow_up(raw);
+        if next != self.follow_up {
+            if let Some(id) = self.selected {
+                let revision = self.follow_up_versions.entry(id).or_default();
+                *revision = revision.wrapping_add(1);
+            }
+        }
+        self.follow_up = next;
         if self.follow_up_editor.text() != self.follow_up {
             self.follow_up_editor = iced::widget::text_editor::Content::with_text(&self.follow_up);
         }
@@ -1956,10 +2000,10 @@ mod tests {
         let guard = send.find("task_follow_up_is_current").unwrap();
         let take = send.find("begin_follow_up_send").unwrap();
         let dispatch = send.find("prompt_native").unwrap();
-        let clear = send
-            .find("Ok(()) => self.task_panel.clear_follow_up()")
-            .unwrap();
-        assert!(guard < take && take < dispatch && dispatch < clear);
+        let receipt = send.find("begin_hosted_follow_up").unwrap();
+        let resolve = send.find("resolve_hosted_follow_up").unwrap();
+        assert!(guard < take && take < receipt && receipt < dispatch && dispatch < resolve);
+        assert!(source.contains("take_prompt_outcomes"));
         let input = source
             .split("Message::TaskFollowUpEditorAction(reference, action) => {")
             .nth(1)
@@ -3089,5 +3133,40 @@ mod feedback_tests {
                 .contains("Agent session failed"));
             assert!(task_terminal_exit_feedback(&mut manager, "agent", code).is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod hosted_follow_up_receipt_tests {
+    use super::*;
+    #[test]
+    fn accepted_host_receipt_preserves_edited_back_and_unrelated_drafts() {
+        let mut panel = TaskPanel::new();
+        let a = TaskId::new();
+        let b = TaskId::new();
+        panel.select(Some(a));
+        panel.set_follow_up("same");
+        let first = panel.begin_hosted_follow_up(a, "same").unwrap();
+        panel.set_follow_up("changed");
+        panel.set_follow_up("same");
+        panel.resolve_hosted_follow_up(&first, true);
+        assert_eq!(panel.follow_up, "same");
+        let second = panel.begin_hosted_follow_up(a, "same").unwrap();
+        panel.select(Some(b));
+        panel.set_follow_up("B draft");
+        panel.resolve_hosted_follow_up(&second, true);
+        assert_eq!(panel.follow_up, "B draft");
+        panel.select(Some(a));
+        assert!(panel.follow_up.is_empty());
+    }
+    #[test]
+    fn rejected_or_uncertain_host_receipt_never_clears_the_draft() {
+        let mut panel = TaskPanel::new();
+        let a = TaskId::new();
+        panel.select(Some(a));
+        panel.set_follow_up("keep input");
+        let receipt = panel.begin_hosted_follow_up(a, "keep input").unwrap();
+        panel.resolve_hosted_follow_up(&receipt, false);
+        assert_eq!(panel.follow_up, "keep input");
     }
 }
