@@ -17692,7 +17692,9 @@ impl Frost {
                 }
             }
             Message::TaskHide(task_id) => {
-                if self.task_panel.show_hidden || !self.task_inspector_visible(task_id) { return Task::none(); }
+                if self.task_panel.show_hidden || !self.task_inspector_visible(task_id) {
+                    return Task::none();
+                }
                 if self.agent_runtime.conversation_id(task_id).is_some() {
                     if let Err(error) = self.agent_runtime.mutate_hosted_task(
                         task_id,
@@ -17720,7 +17722,9 @@ impl Frost {
                     .set_show_hidden(show && self.config.experimental_task_sidebar);
             }
             Message::TaskRestore(task_id) => {
-                if !self.task_panel.show_hidden || !self.task_inspector_visible(task_id) { return Task::none(); }
+                if !self.task_panel.show_hidden || !self.task_inspector_visible(task_id) {
+                    return Task::none();
+                }
                 if self.agent_runtime.conversation_id(task_id).is_some() {
                     if let Err(error) = self.agent_runtime.mutate_hosted_task(
                         task_id,
@@ -18330,7 +18334,9 @@ impl Frost {
                 }
             }
             Message::TaskMarkComplete(task_id) => {
-                if !self.task_inspector_visible(task_id) { return Task::none(); }
+                if !self.task_inspector_visible(task_id) {
+                    return Task::none();
+                }
                 if self.agent_runtime.conversation_id(task_id).is_some() {
                     if let Err(error) = self.agent_runtime.mutate_hosted_task(
                         task_id,
@@ -30447,10 +30453,14 @@ impl Frost {
                     .resolve_hosted_follow_up(&outcome.receipt, outcome.result.is_ok());
             }
             for (task_id, terminal) in self.agent_runtime.take_owned_terminal_launches() {
-                if selected == Some(task_id) { self.open_owned_validation_terminal(terminal); }
+                if selected == Some(task_id) {
+                    self.open_owned_validation_terminal(terminal);
+                }
             }
-            for (_, session) in self.agent_runtime.take_terminal_handoffs() {
-                self.open_hosted_native_terminal(session);
+            for (task_id, session) in self.agent_runtime.take_terminal_handoffs() {
+                if selected == Some(task_id) {
+                    self.open_hosted_native_terminal(session);
+                }
             }
             for issue in report.issues {
                 self.push_toast(
@@ -30503,11 +30513,7 @@ impl Frost {
         task_id: agent_task::TaskId,
         role: agent_task::TaskTerminalRole,
     ) {
-        if !agent_task_ui::task_focus_allowed(
-            self.config.experimental_task_sidebar && self.tasks_surface_visible(),
-            self.task_panel.selected,
-            task_id,
-        ) {
+        if !self.task_inspector_visible(task_id) {
             return;
         }
         if role == agent_task::TaskTerminalRole::Validation {
@@ -30887,13 +30893,17 @@ impl Frost {
                             &live_terminals,
                         )
                     }),
-                    has_validation_terminal: self.agent_runtime.hosted_validation_terminal(id).is_some() || task.is_some_and(|task| {
-                        agent_task_ui::task_terminal_is_live(
-                            task,
-                            agent_task::TaskTerminalRole::Validation,
-                            &live_terminals,
-                        )
-                    }),
+                    has_validation_terminal: self
+                        .agent_runtime
+                        .hosted_validation_terminal(id)
+                        .is_some()
+                        || task.is_some_and(|task| {
+                            agent_task_ui::task_terminal_is_live(
+                                task,
+                                agent_task::TaskTerminalRole::Validation,
+                                &live_terminals,
+                            )
+                        }),
                     has_active_agent_stream: self.task_manager.has_active_agent_event_stream(id),
                     native_preparing: self.agent_runtime.has_preparing(id),
                 }
@@ -31406,11 +31416,17 @@ impl Frost {
                     .size((self.chrome_font_size() - 1.0).max(9.0)),
             );
             row_content = row_content.push(
-                text(if task.requires_manual_review() {
-                    "Review: manual acceptance".to_owned()
-                } else {
-                    format!("Validation: {}", summary.validation_status.label())
-                })
+                text(
+                    if self
+                        .agent_runtime
+                        .hosted_manual_review(task.id)
+                        .unwrap_or_else(|| task.requires_manual_review())
+                    {
+                        "Review: manual acceptance".to_owned()
+                    } else {
+                        format!("Validation: {}", summary.validation_status.label())
+                    },
+                )
                 .size((self.chrome_font_size() - 2.0).max(9.0)),
             );
             if summary.activity.has_active_agent_stream || summary.activity.has_agent_terminal {
@@ -31594,8 +31610,12 @@ impl Frost {
                     .task_terminal_index(task.id, agent_task::TaskTerminalRole::Agent)
                     .is_some(),
                 has_validation_terminal: self
-                    .task_terminal_index(task.id, agent_task::TaskTerminalRole::Validation)
-                    .is_some(),
+                    .agent_runtime
+                    .hosted_validation_terminal(task.id)
+                    .is_some()
+                    || self
+                        .task_terminal_index(task.id, agent_task::TaskTerminalRole::Validation)
+                        .is_some(),
                 has_active_agent_stream: stream_active,
                 native_preparing: preparing,
             },
@@ -31795,11 +31815,15 @@ impl Frost {
         }
         let mut validation_output = button(text("Validation output").size(self.chrome_font_size()))
             .style(button::secondary);
-        if task
-            .validation
-            .terminal_session_id
-            .as_ref()
-            .is_some_and(|id| live_terminals.contains(id))
+        if self
+            .agent_runtime
+            .hosted_validation_terminal(task.id)
+            .is_some()
+            || task
+                .validation
+                .terminal_session_id
+                .as_ref()
+                .is_some_and(|id| live_terminals.contains(id))
         {
             validation_output = validation_output.on_press(Message::TaskFocusValidation(task.id));
         }
@@ -31950,6 +31974,16 @@ impl Frost {
             );
         }
 
+        if let Some(validation) = self.agent_runtime.hosted_validation_snapshot(task.id) {
+            if !validation.output.is_empty() {
+                card = card.push(text("Validation output history").size(self.chrome_font_size()));
+                card = card.push(
+                    scrollable(text(validation.output.clone()).size(self.chrome_font_size()))
+                        .height(160.0),
+                );
+            }
+        }
+
         // Review / validation / completion actions once the provider has
         // fully stopped.
         if task.status == TaskStatus::ReadyForReview && !stream_active {
@@ -31962,7 +31996,9 @@ impl Frost {
             if task.validation.status != TaskValidationStatus::Running
                 && (if self.agent_runtime.conversation_id(task.id).is_some() {
                     self.agent_runtime.can_start_hosted_validation(task.id)
-                } else { task.validation_command().is_some() })
+                } else {
+                    task.validation_command().is_some()
+                })
             {
                 review = review.push(
                     button(text("Run validation").size(self.chrome_font_size()))
@@ -31971,15 +32007,24 @@ impl Frost {
                 );
             }
             let mut complete = button(
-                text(if task.requires_manual_review() {
-                    "Accept reviewed work"
-                } else {
-                    "Mark complete"
-                })
+                text(
+                    if self
+                        .agent_runtime
+                        .hosted_manual_review(task.id)
+                        .unwrap_or_else(|| task.requires_manual_review())
+                    {
+                        "Accept reviewed work"
+                    } else {
+                        "Mark complete"
+                    },
+                )
                 .size(self.chrome_font_size()),
             )
             .style(button::primary);
-            if task.requires_manual_review()
+            if self
+                .agent_runtime
+                .hosted_manual_review(task.id)
+                .unwrap_or_else(|| task.requires_manual_review())
                 && task.validation.status == TaskValidationStatus::NotRun
             {
                 complete = complete.on_press(Message::TaskAcceptReviewed(
