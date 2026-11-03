@@ -2172,11 +2172,11 @@ impl Frost {
             .map(|(row, _)| row)
             .unwrap_or(dock);
         let rows = last_raw.max(session.cursor.0).saturating_sub(dock) + 1;
-        let cap = self.reference_layout().input_cap(
-            self.block_reading_bar_height(),
-            self.startup_recovery.banner_height(self.chrome_font_size()),
-        );
-        Some(crate::native_input_surface::dock_metrics(
+        let layout = self.reference_layout();
+        let reading_bar = self.block_reading_bar_height();
+        let recovery = self.startup_recovery.banner_height(self.chrome_font_size());
+        let cap = layout.input_cap(reading_bar, recovery);
+        let metrics = crate::native_input_surface::dock_metrics(
             if self.config.is_chat_mode() {
                 rows.max(3)
             } else {
@@ -2185,7 +2185,18 @@ impl Frost {
             self.metrics.cell_h,
             cap,
             if self.config.is_block_mode() { 2 } else { 1 },
-        ))
+        );
+        // Docking shrinks the PTY. The resized projection must still pass
+        // chat_plan_key's oversized-prompt guard; otherwise the dock vanishes,
+        // the PTY grows, and the same prompt docks again on the next update.
+        // Decide against the prospective budget before changing either one.
+        let raw = layout
+            .native_budget(reading_bar, recovery, Some(metrics.input_height))
+            .raw;
+        let (_, native_rows) = self
+            .metrics
+            .grid_size(raw.width - terminal_view::SCROLLBAR_WIDTH, raw.height);
+        (rows.saturating_add(2) < native_rows).then_some(metrics)
     }
 
     pub(crate) fn reference_native_budget(&self) -> crate::glass_layout::NativeBudget {

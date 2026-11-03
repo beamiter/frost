@@ -34,6 +34,10 @@ cell gutter and configured padding. The same rectangle feeds the PTY grid and
 native pane. Chat reserves the actual bounded input height above the 42px tools
 row, with one 6px history/input gap. Direct Block input and running/native
 passthrough keep the existing terminal owner; a second editor is not created.
+Before reserving input height, the shared Block/Chat dock checks that the
+resulting PTY still has enough rows for the prompt projection. Oversized prompts
+stay in the native terminal until they fit, so resize feedback cannot repeatedly
+create and remove the input strip.
 
 Larger configured UI text grows the top bar, header and tools row through
 `Layout::with_chrome_font_size`. The default compact geometry remains unchanged;
@@ -58,5 +62,8 @@ short windows whose previous draft is larger than the new allocation.
 
 The layout unit tests cover shared PTY/input budgets, panel collapse and width
 restoration, short windows, bounded multiline input, and enlarged UI text.
+After a release build, `python3 scripts/test-input-geometry.py` checks resize
+convergence using the real terminal parser, projection and input budget. It also
+verifies that removing the guard reproduces the oscillation, without using SSH.
 Native window, PTY and physical input checks remain separate acceptance gates;
 the headless geometry tests do not substitute for those checks.
