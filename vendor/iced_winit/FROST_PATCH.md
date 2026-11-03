@@ -15,3 +15,20 @@ Native recorder proof covers X11. X11-only and Wayland-only builds are checked s
 The R04 extension also modifies src/clipboard.rs and the Clipboard::Read Action branch in src/lib.rs. On Linux, it opts into window_clipboard's bounded owned provider and submits reads without waiting on the GUI thread. Cancellation follows the oneshot receiver; unavailable, oversized, expired, or cancelled reads resolve without clipboard text. Admission is capped at eight, and provider-enforced payload and decoded output limits are 1 MiB with an absolute three-second deadline. Clipboard contents are never logged.
 
 Synchronous core::Clipboard widget reads remain synchronous compatibility calls. Wayland compatibility reads pump only on the known winit run_app GUI reader outside a prepared-read guard; the provider worker never reads the shared socket. Existing window ownership and joined worker teardown are retained. The five provider patches retain locked upstream versions and licenses. Their default constructors retain legacy behavior. X11 connection initialization remains synchronous and no asynchronous request reconnects. Native hosted tests must cover both backends, cancellation, teardown, and unchanged strict delayed-owner UI latency fixtures before acceptance.
+
+## Presentation recovery after suspend
+
+`SurfaceError::Other` can represent a lost WGPU device. The shell replaces the
+compositor, all window renderers and their surfaces, while retaining native
+windows, widget state and application/PTY state. Old swapchains are dropped before
+replacement surfaces are configured. Pending native frame evidence is invalidated
+through the paired Winit patch; recovery itself never certifies a presentation.
+Lost/outdated surfaces retain their existing surface recovery path. Every failed
+presentation uses a 100 ms to 2 s capped retry delay, including redraws caused by
+input. Focus regain and de-occlusion request a fresh frame.
+
+`scripts/native-selection-recovery.py` uses a private Xvfb server and a test-only
+Vulkan loader proxy to inject device loss into the real acquire path. It checks
+newly painted output, drag-copy and unchanged shell/PTY identities across three
+recoveries. This does not simulate the laptop's power transition or certify the
+physical lock-screen compositor. The native-feedback harness covers retry pacing.

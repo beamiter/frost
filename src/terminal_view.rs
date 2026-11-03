@@ -876,6 +876,7 @@ struct State {
     /// deltas accumulate into whole-line scrolls instead of being lost.
     scroll_accum: f32,
     summary_press: Option<SummaryPress>,
+    header_drag_press: Option<(MouseInput, ProjectionKey)>,
     organism_pointer: organism_block::Pointer<OrganismBodyGeometry>,
     body_geometry: Option<OrganismBodyGeometry>,
     body_frame: u64,
@@ -918,6 +919,7 @@ impl Default for State {
             click_count: 0,
             scroll_accum: 0.0,
             summary_press: None,
+            header_drag_press: None,
             organism_pointer: organism_block::Pointer::default(),
             body_geometry: None,
             body_frame: 0,
@@ -5764,6 +5766,9 @@ where
                     _ => return,
                 };
                 if button == MouseButton::Left {
+                    state.header_drag_press = None;
+                }
+                if button == MouseButton::Left {
                     // A second press always supersedes an unfinished summary
                     // gesture, even if the release was lost outside the pane.
                     state.summary_press = None;
@@ -5974,7 +5979,7 @@ where
                 if button == MouseButton::Left {
                     state.dragging = !consumed;
                 }
-                shell.publish(on_mouse(MouseInput::Press {
+                let press = MouseInput::Press {
                     col,
                     row,
                     button,
@@ -5991,11 +5996,50 @@ where
                     link_revision: self.link_revision,
                     x: pos.x,
                     y: pos.y,
-                }));
+                };
+                // Clicking a completed command still selects its card. A drag
+                // from its real prompt text switches to native text selection;
+                // synthetic headers, buttons and modified card actions keep
+                // their exclusive control ownership.
+                if block == Some(BlockMouseAction::Replace)
+                    && block_row.is_some_and(|row| row.native_header.is_none())
+                    && !shift
+                    && !ctrl
+                    && !alt
+                {
+                    if let Some(key) = self.projection_key.clone() {
+                        let mut text_press = press;
+                        if let MouseInput::Press {
+                            block,
+                            block_zone_id,
+                            ..
+                        } = &mut text_press
+                        {
+                            *block = None;
+                            *block_zone_id = None;
+                        }
+                        state.header_drag_press = Some((text_press, key));
+                    }
+                }
+                shell.publish(on_mouse(press));
                 shell.capture_event();
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 let pos = cursor.position().unwrap_or(Point::new(bounds.x, bounds.y));
+                if let Some((press, key)) = state.header_drag_press.as_ref() {
+                    if self.projection_key.as_ref() != Some(key) {
+                        state.header_drag_press = None;
+                    } else if let MouseInput::Press { col, row, .. } = *press {
+                        if self.cell_at(pos, bounds) != (col, row) {
+                            let press = *press;
+                            state.header_drag_press = None;
+                            state.consumed_presses[MouseButton::Left.slot()] = false;
+                            state.published_presses[MouseButton::Left.slot()] = true;
+                            state.dragging = true;
+                            shell.publish(on_mouse(press));
+                        }
+                    }
+                }
                 if let Some(press) = state.summary_press.as_mut() {
                     let dx = pos.x - press.point.x;
                     let dy = pos.y - press.point.y;
@@ -6032,6 +6076,7 @@ where
                     _ => return,
                 };
                 if button == MouseButton::Left {
+                    state.header_drag_press = None;
                     if let Some(press) = state.summary_press.take() {
                         state.consumed_presses[button.slot()] = false;
                         state.published_presses[button.slot()] = false;
@@ -6334,6 +6379,7 @@ mod focus_state_tests {
             click_count: 3,
             scroll_accum: 0.75,
             summary_press: None,
+            header_drag_press: None,
             organism_pointer: organism_block::Pointer::default(),
             body_geometry: None,
             body_frame: 0,
@@ -6997,6 +7043,71 @@ mod mode_gesture_tests {
             last_app_cell: app.then_some((7, 2)),
             consumed: false,
         }
+    }
+
+    #[test]
+    fn completed_command_click_keeps_card_action_but_drag_selects_raw_text() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = Theme::default();
+        for drag in [false, true] {
+            let mut widget = fixture(&projection, &theme, TerminalMode::Block, 0);
+            widget.blocks[0].selectable = true;
+            widget.blocks[0].header_end_col = 40;
+            widget.blocks[0].zone_id = Some(7);
+            let mut retained = tree(&widget);
+            let point = Point::new(40.0, 10.0);
+            assert!(matches!(
+                send(&mut widget, &mut retained, press(), point).as_slice(),
+                [Output::Mouse(MouseInput::Press {
+                    block: Some(BlockMouseAction::Replace),
+                    ..
+                })]
+            ));
+            diff(&mut retained, &widget);
+            if drag {
+                let moved_to = Point::new(90.0, 10.0);
+                assert!(matches!(
+                    send(&mut widget, &mut retained, moved(moved_to), moved_to).as_slice(),
+                    [
+                        Output::Mouse(MouseInput::Press {
+                            block: None,
+                            col: 4,
+                            ..
+                        }),
+                        Output::Mouse(MouseInput::Drag { .. })
+                    ]
+                ));
+                assert!(matches!(
+                    send(&mut widget, &mut retained, release(), moved_to).as_slice(),
+                    [Output::Mouse(MouseInput::Release { .. })]
+                ));
+            } else {
+                assert!(send(&mut widget, &mut retained, release(), point).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn command_drag_cannot_restart_after_focus_loss() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = Theme::default();
+        let mut widget = fixture(&projection, &theme, TerminalMode::Block, 0);
+        widget.blocks[0].selectable = true;
+        widget.blocks[0].header_end_col = 40;
+        let mut retained = tree(&widget);
+        let point = Point::new(40.0, 10.0);
+        send(&mut widget, &mut retained, press(), point);
+        send(
+            &mut widget,
+            &mut retained,
+            Event::Window(iced::window::Event::Unfocused),
+            point,
+        );
+        let moved_to = Point::new(90.0, 10.0);
+        assert!(send(&mut widget, &mut retained, moved(moved_to), moved_to).is_empty());
+        assert!(send(&mut widget, &mut retained, release(), moved_to).is_empty());
     }
 
     #[test]

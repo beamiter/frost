@@ -35,6 +35,7 @@ pub mod presentation_observer;
 
 mod error;
 mod proxy;
+mod surface_recovery;
 mod window;
 
 pub use clipboard::Clipboard;
@@ -785,6 +786,11 @@ async fn run_instance<P>(
                         let physical_size = window.state.physical_size();
                         let mut logical_size = window.state.logical_size();
 
+                        if let Some(deadline) = window.surface_recovery.waiting_until(Instant::now()) {
+                            window.request_redraw(window::RedrawRequest::At(deadline));
+                            continue;
+                        }
+
                         if window.raw.defer_native_frame() {
                             // Keep the published snapshot stable until scene
                             // feedback. Its completion wakes this deferred draw.
@@ -812,7 +818,7 @@ async fn run_instance<P>(
                             layout_span.finish();
 
                             current_compositor.configure_surface(
-                                &mut window.surface,
+                                window.surface.as_mut().expect("Configured surface"),
                                 physical_size.width,
                                 physical_size.height,
                             );
@@ -995,7 +1001,7 @@ async fn run_instance<P>(
                         let began = std::cell::Cell::new(false);
                         let mut present = || current_compositor.present(
                             &mut window.renderer,
-                            &mut window.surface,
+                            window.surface.as_mut().expect("Configured surface"),
                             window.state.viewport(),
                             window.state.background_color(),
                             || {
@@ -1016,9 +1022,11 @@ async fn run_instance<P>(
                             window.raw.finish_native_frame_feedback(serial, known);
                             if !known { presentation_observer::cancel(id, serial); }
                         }
+                        let mut rebuild_graphics = false;
                         match result {
                             Ok(()) => {
                                 present_span.finish();
+                                window.surface_recovery.recovered();
                             }
                             Err(error) => match error {
                                 compositor::SurfaceError::OutOfMemory => {
@@ -1034,38 +1042,93 @@ async fn run_instance<P>(
                                         window.state.physical_size();
 
                                     if error == compositor::SurfaceError::Lost {
-                                        window.surface = current_compositor
+                                        // Destroy the old swapchain before allocating its replacement.
+                                        drop(window.surface.take());
+                                        window.raw.invalidate_native_frame_feedback();
+                                        window.surface = Some(current_compositor
                                             .create_surface(
                                                 window.raw.clone(),
                                                 physical_size.width,
                                                 physical_size.height,
-                                            );
+                                            ));
                                     } else {
                                         current_compositor.configure_surface(
-                                            &mut window.surface,
+                                            window.surface.as_mut().expect("Configured surface"),
                                             physical_size.width,
                                             physical_size.height,
                                         );
                                     }
 
-                                    window.raw.request_redraw();
+                                    let deadline = window.surface_recovery.failed(Instant::now());
+                                    window.request_redraw(window::RedrawRequest::At(deadline));
                                 }
                                 _ => {
                                     present_span.finish();
 
-                                    log::error!(
+                                    log::warn!(
                                         "Error {error:?} when \
                                         presenting surface."
                                     );
 
-                                    // Try rendering all windows again next frame.
-                                    for (_id, window) in
-                                        window_manager.iter_mut()
-                                    {
-                                        window.raw.request_redraw();
-                                    }
+                                    // WGPU also reports a lost device as Other. Reusing
+                                    // that device forever leaves the window showing the
+                                    // lock screen's stale backing pixels after suspend.
+                                    rebuild_graphics = error == compositor::SurfaceError::Other;
+                                    let deadline = window.surface_recovery.failed(Instant::now());
+                                    window.request_redraw(window::RedrawRequest::At(deadline));
                                 }
                             },
+                        }
+                        if rebuild_graphics {
+                            let raw = window.raw.clone();
+                            let (sender, receiver) = oneshot::channel();
+                            let display = display_handle.clone();
+                            let shell = Shell::new(proxy.clone());
+                            let wake_proxy = proxy.clone();
+                            let create = async move {
+                                let result = <P::Renderer as compositor::Default>::Compositor::new(
+                                    graphics_settings, display, raw, shell,
+                                ).await;
+                                let _ = sender.send(result);
+                                let (sender, _receiver) = oneshot::channel();
+                                wake_proxy.send_action(Action::Window(runtime::window::Action::GetLatest(sender)));
+                            };
+                            #[cfg(not(target_arch = "wasm32"))]
+                            runtime.block_on(create);
+                            #[cfg(target_arch = "wasm32")]
+                            wasm_bindgen_futures::spawn_local(create);
+
+                            match receiver.await.expect("Recreate compositor") {
+                                Ok(mut replacement) => {
+                                    // Keep native windows, UI state, application state and
+                                    // PTYs. Every GPU resource must belong to the new device.
+                                    for (_, window) in window_manager.iter_mut() {
+                                        drop(window.surface.take());
+                                        window.raw.invalidate_native_frame_feedback();
+                                    }
+                                    for (_, window) in window_manager.iter_mut() {
+                                        let size = window.state.physical_size();
+                                        window.renderer = replacement.create_renderer();
+                                        window.surface = Some(replacement.create_surface(
+                                            window.raw.clone(), size.width, size.height,
+                                        ));
+                                        window.surface_version = window.state.surface_version();
+                                        window.raw.request_redraw();
+                                    }
+                                    compositor = Some(replacement);
+                                    let caches = ManuallyDrop::into_inner(user_interfaces)
+                                        .into_iter().map(|(id, ui)| (id, ui.into_cache())).collect();
+                                    user_interfaces = ManuallyDrop::new(build_user_interfaces(
+                                        &program, &mut window_manager, caches,
+                                    ));
+                                    log::info!("Graphics device and window surfaces recovered");
+                                }
+                                Err(error) => {
+                                    // Retain the old state and retry on the paced deadline;
+                                    // a temporarily unavailable GPU must not kill the shell.
+                                    log::warn!("Could not recreate graphics compositor: {error}");
+                                }
+                            }
                         }
                     }
                     event::Event::WindowEvent {
@@ -1106,7 +1169,9 @@ async fn run_instance<P>(
                         }
 
                         match window_event {
-                            winit::event::WindowEvent::Resized(_) => {
+                            winit::event::WindowEvent::Resized(_)
+                            | winit::event::WindowEvent::Focused(true)
+                            | winit::event::WindowEvent::Occluded(false) => {
                                 window.raw.request_redraw();
                             }
                             winit::event::WindowEvent::ThemeChanged(theme) => {

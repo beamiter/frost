@@ -75,8 +75,9 @@ where
                 raw: window,
                 state,
                 exit_on_close_request,
-                surface,
+                surface: Some(surface),
                 surface_version,
+                surface_recovery: Default::default(),
                 renderer,
                 mouse_interaction: mouse::Interaction::None,
                 redraw_at: None,
@@ -167,8 +168,11 @@ where
     pub state: State<P>,
     pub exit_on_close_request: bool,
     pub mouse_interaction: mouse::Interaction,
-    pub surface: C::Surface,
+    // Taken and dropped before replacing a lost graphics device. Two live
+    // swapchains must never compete for the same native window.
+    pub surface: Option<C::Surface>,
     pub surface_version: u64,
+    pub(crate) surface_recovery: crate::surface_recovery::Recovery,
     pub renderer: P::Renderer,
     pub redraw_at: Option<Instant>,
     preedit: Option<Preedit<P::Renderer>>,

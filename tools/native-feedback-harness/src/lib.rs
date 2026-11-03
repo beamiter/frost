@@ -27,6 +27,9 @@ mod publication;
 // The observer only needs an opaque, hashable native window identity. The GUI
 // integration is exercised separately by the actual Frost/X11 acceptance run.
 pub mod core {
+    pub mod time {
+        pub use std::time::Instant;
+    }
     pub mod window {
         use std::sync::atomic::{AtomicU64, Ordering};
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -41,3 +44,6 @@ pub mod core {
 }
 #[path = "../../../vendor/iced_winit/src/presentation_observer.rs"]
 mod presentation_observer;
+
+#[path = "../../../vendor/iced_winit/src/surface_recovery.rs"]
+mod surface_recovery;

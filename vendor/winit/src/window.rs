@@ -657,6 +657,13 @@ impl Window {
         { false }
     }
 
+    /// Retire pending native presentation evidence when its graphics resources
+    /// are destroyed. Late feedback must not certify the replacement surface.
+    pub fn invalidate_native_frame_feedback(&self) {
+        #[cfg(x11_platform)]
+        self.window.maybe_queue_on_main(|w| w.invalidate_native_frame_feedback());
+    }
+
     /// Begin an opt-in JWM/X11 extended-counter frame, before native present.
     /// `finish_native_frame_feedback` requires exact producer publication evidence.
     /// Unsupported compositors/platforms return false.

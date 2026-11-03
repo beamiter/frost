@@ -559,6 +559,12 @@ impl Window {
             #[cfg(wayland_platform)] Self::Wayland(_) => false,
         }
     }
+    pub fn invalidate_native_frame_feedback(&self) {
+        match self {
+            #[cfg(x11_platform)] Self::X(window) => window.invalidate_native_frame_feedback(),
+            #[cfg(wayland_platform)] Self::Wayland(_) => {},
+        }
+    }
     pub fn begin_native_frame_feedback(&self, pass: u64, width: u32, height: u32) -> bool {
         match self {
             #[cfg(x11_platform)] Self::X(window) => window.begin_native_frame_feedback(pass, width, height),

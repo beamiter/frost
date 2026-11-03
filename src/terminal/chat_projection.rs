@@ -186,6 +186,7 @@ impl TerminalState {
     pub(super) fn chat_key_is_current(&self, key: &ChatPlanKey) -> bool {
         let mut policy = ProjectionPolicy::new();
         policy.chat = true;
+        policy.command_bubbles = key.command_bubbles;
         policy.organism_rows = key.companion_rows;
         self.chat_plan_key(&policy).as_ref() == Some(key)
     }
@@ -474,6 +475,51 @@ mod tests {
         state: &mut ProjectionViewState,
     ) -> std::sync::Arc<ProjectedViewport> {
         terminal.get_projected_viewport_with_state(true, &policy(), state)
+    }
+
+    #[test]
+    fn block_and_chat_composer_layouts_admit_native_text_selection() {
+        for bubbles in [false, true] {
+            let mut terminal = TerminalState::new(80, 24);
+            command(&mut terminal, "echo hello", "hello world");
+            prompt(&mut terminal);
+            terminal.process_input(b"draft");
+            let mut policy = policy();
+            policy.set_command_bubbles(bubbles);
+            let mut state = ProjectionViewState::new();
+            let view = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+            for (needle, expected) in [
+                ("$ echo hello", "echo"),
+                ("hello world", "hello"),
+                ("$ draft", "draft"),
+            ] {
+                let (row, col) = view
+                    .cells()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(row, cells)| {
+                        let text: String = cells.iter().map(|cell| cell.character).collect();
+                        text.find(needle)
+                            .map(|start| (row, start + needle.find(expected).unwrap()))
+                    })
+                    .expect("native command, output and draft must be visible");
+                terminal.start_selection_in_projection(&view, (row, col), SelectionMode::Normal);
+                terminal.update_selection_in_projection(&view, (row, col + expected.len() - 1));
+                assert_eq!(
+                    terminal.copy_selection().as_deref(),
+                    Some(expected),
+                    "bubbles={bubbles}"
+                );
+                terminal.select_word_in_projection(&view, row, col + 1);
+                assert_eq!(terminal.copy_selection().as_deref(), Some(expected));
+                terminal.select_line_in_projection(&view, row);
+                assert!(terminal.copy_selection().unwrap().contains(needle));
+            }
+            // Restoring policy parameters must not weaken source-revision checks.
+            terminal.process_input(b"\x1b[?1049h");
+            terminal.update_selection_in_projection(&view, (0, 0));
+            assert!(terminal.copy_selection().is_none());
+        }
     }
 
     #[test]
