@@ -270,7 +270,8 @@ impl Eva {
             signal,
         };
         let tx = wake.signal.clone();
-        let host = shared::SharedHost::from_env(
+        // Frost can open its own task composer for an approved handoff.
+        let host = shared::SharedHost::from_env_delegating(
             "frost",
             shared::RetirementCapability::NativePresented,
             move || {
@@ -1254,10 +1255,87 @@ impl Frost {
     }
     /// Safe slot is in the existing Agent inspector, not the document/PTY. It
     /// never covers composer, IME or approval UI; uncertain geometry hides.
+    /// Approved Eva handoffs open the task composer; what happened to them,
+    /// and the task runtime's own state for tasks created from them, is
+    /// reported back. Reports are facts, never commands to the task runtime.
+    fn sync_eva_handoffs(&mut self) {
+        let mut handoffs = Vec::new();
+        if let Some(eva) = self.eva.as_mut() {
+            while let Some(handoff) = eva.host.take_handoff() {
+                handoffs.push(handoff);
+            }
+        }
+        for handoff in handoffs {
+            let op = handoff.operation_id.clone();
+            let outcome = self.open_eva_handoff(handoff);
+            if let Some(eva) = self.eva.as_mut() {
+                match outcome {
+                    Ok(()) => eva.host.handoff_opened(&op),
+                    Err(reason) => eva.host.handoff_unavailable(&op, reason),
+                }
+            }
+            let (message, kind) = match outcome {
+                Ok(()) => (
+                    "Eva's task suggestion is in the composer. Review it before creating.",
+                    crate::ToastKind::Info,
+                ),
+                Err("agent_tasks_disabled") => (
+                    "Eva suggested an agent task, but Tasks are hidden in Settings.",
+                    crate::ToastKind::Info,
+                ),
+                Err("task_creation_busy") => (
+                    "Eva suggested an agent task; another task is still being created.",
+                    crate::ToastKind::Info,
+                ),
+                Err(_) => (
+                    "Eva suggested an agent task; your current task draft is kept.",
+                    crate::ToastKind::Info,
+                ),
+            };
+            self.push_toast(message, kind);
+        }
+        if let Some(op) = self.take_abandoned_eva_handoff() {
+            if let Some(eva) = self.eva.as_mut() {
+                eva.host.handoff_closed(&op);
+            }
+        }
+        let Some(eva) = self.eva.as_mut() else {
+            return;
+        };
+        let linked: Vec<String> = eva
+            .host
+            .handoffs
+            .linked_tasks()
+            .map(str::to_owned)
+            .collect();
+        for id in linked {
+            if let Some(task) = self
+                .task_manager
+                .tasks()
+                .iter()
+                .find(|task| task.id.to_string() == id)
+            {
+                eva.host.agent_task_status(
+                    &id,
+                    agent_state(task.status),
+                    agent_validation(task.validation.status),
+                );
+            }
+        }
+    }
+
+    /// The task runtime registered the task the user created from a handoff.
+    pub(crate) fn eva_handoff_created(&mut self, operation_id: &str, agent_task_id: &str) {
+        if let Some(eva) = self.eva.as_mut() {
+            eva.host.handoff_created(operation_id, agent_task_id);
+        }
+    }
+
     pub(crate) fn sync_eva(&mut self) {
         if self.eva.is_none() {
             return;
         }
+        self.sync_eva_handoffs();
         let inspector = self.reference_layout().inspector;
         let session = self.sessions.get(self.active);
         let selecting = session.is_some_and(|s| s.terminal.has_text_selection());
@@ -2088,6 +2166,36 @@ struct Witness {
     clear: bool,
     submission: Arc<Submission>,
 }
+fn agent_state(status: jterm_core::agent_task::TaskStatus) -> shared::AgentTaskState {
+    use jterm_core::agent_task::TaskStatus as T;
+    match status {
+        T::Created => shared::AgentTaskState::Created,
+        T::Starting => shared::AgentTaskState::Starting,
+        T::Working => shared::AgentTaskState::Working,
+        T::WaitingForApproval => shared::AgentTaskState::WaitingForApproval,
+        T::WaitingForHuman => shared::AgentTaskState::WaitingForHuman,
+        T::ReadyForReview => shared::AgentTaskState::ReadyForReview,
+        T::Completed => shared::AgentTaskState::Completed,
+        T::Failed => shared::AgentTaskState::Failed,
+        T::Cancelled => shared::AgentTaskState::Cancelled,
+        T::Archived => shared::AgentTaskState::Archived,
+    }
+}
+
+fn agent_validation(
+    status: jterm_core::agent_task::TaskValidationStatus,
+) -> shared::AgentValidation {
+    use jterm_core::agent_task::TaskValidationStatus as V;
+    match status {
+        V::NotRun => shared::AgentValidation::NotRun,
+        V::Running => shared::AgentValidation::Running,
+        V::Passed => shared::AgentValidation::Passed,
+        V::Failed => shared::AgentValidation::Failed,
+        V::Inconclusive => shared::AgentValidation::Inconclusive,
+        V::Cancelled => shared::AgentValidation::Cancelled,
+    }
+}
+
 impl canvas::Program<Message> for Witness {
     type State = ();
     fn draw(

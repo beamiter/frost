@@ -27,6 +27,9 @@ pub(crate) struct TaskComposer {
     pub(crate) shell: String,
     pub(crate) notice: Option<String>,
     pub(crate) busy: bool,
+    /// The approved Eva handoff this draft was opened for, if any. It grants
+    /// nothing; it only lets the created task (or a closed draft) be reported.
+    pub(crate) eva_operation: Option<String>,
     epoch: Arc<()>,
 }
 
@@ -48,8 +51,39 @@ impl TaskComposer {
             shell,
             notice: None,
             busy: false,
+            eva_operation: None,
             epoch: Arc::new(()),
         }
+    }
+
+    /// Why this draft cannot take an Eva handoff, as the identifier reported
+    /// back; an existing draft is never replaced.
+    pub(crate) fn eva_handoff_refusal(&self) -> Option<&'static str> {
+        (self.busy
+            || !self.title.trim().is_empty()
+            || !self.goal.text().trim().is_empty()
+            || !self.validation.trim().is_empty()
+            || self.eva_operation.is_some())
+        .then_some("task_draft_in_progress")
+    }
+
+    /// Prefill only the title and goal. Project, agent and validation stay the
+    /// composer's own defaults for the user to choose.
+    pub(crate) fn prefill_eva_handoff(&mut self, handoff: companion_host::AgentHandoff) {
+        self.retire_reference();
+        self.title = handoff.title;
+        self.goal = text_editor::Content::with_text(&handoff.goal);
+        self.eva_operation = Some(handoff.operation_id);
+        self.notice = None;
+    }
+
+    /// A handoff draft that was closed while not being created was abandoned.
+    /// The draft text is kept, as for any closed draft; only the link goes.
+    pub(crate) fn take_abandoned_eva(&mut self, open: bool) -> Option<String> {
+        if open || self.busy {
+            return None;
+        }
+        self.eva_operation.take()
     }
 
     pub(crate) fn reference(&self) -> Arc<()> {
@@ -333,6 +367,7 @@ impl crate::Frost {
                 || !draft.title.trim().is_empty()
                 || !draft.goal.text().trim().is_empty()
                 || !draft.validation.trim().is_empty()
+                || draft.eva_operation.is_some()
         }) {
             return Err("An existing task draft is retained. Finish or discard it before creating this handoff.".into());
         }
@@ -346,6 +381,44 @@ impl crate::Frost {
             draft.notice = None;
         }
         Ok(())
+    }
+
+    /// An approved Eva handoff opens the ordinary task composer prefilled.
+    /// The user still chooses project, agent and validation and creates the
+    /// task; starting the agent stays a separate action. Errors are the
+    /// reason reported back.
+    pub(crate) fn open_eva_handoff(
+        &mut self,
+        handoff: companion_host::AgentHandoff,
+    ) -> Result<(), &'static str> {
+        if !self.config.experimental_task_sidebar {
+            return Err("agent_tasks_disabled");
+        }
+        if self.task_panel.pending_creation.is_some() {
+            return Err("task_creation_busy");
+        }
+        if let Some(reason) = self
+            .task_panel
+            .composer
+            .as_ref()
+            .and_then(TaskComposer::eva_handoff_refusal)
+        {
+            return Err(reason);
+        }
+        self.task_composer_open();
+        let draft = self
+            .task_panel
+            .composer
+            .as_mut()
+            .ok_or("no_task_composer")?;
+        draft.prefill_eva_handoff(handoff);
+        Ok(())
+    }
+
+    /// The Eva operation of a handoff draft the user closed, once.
+    pub(crate) fn take_abandoned_eva_handoff(&mut self) -> Option<String> {
+        let open = self.task_panel.composer_open;
+        self.task_panel.composer.as_mut()?.take_abandoned_eva(open)
     }
 
     pub(crate) fn task_composer_create(&mut self, reference: Arc<()>) {

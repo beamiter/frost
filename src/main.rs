@@ -30,6 +30,8 @@ mod config;
 mod config_retry;
 mod debug;
 mod eva_companion;
+#[cfg(all(test, unix))]
+mod eva_handoff_tests;
 mod find_focus;
 mod fold_preview;
 mod font_zoom;
@@ -30735,6 +30737,14 @@ impl Frost {
                         // opened Hidden tasks while its worktree was prepared.
                         self.task_panel.set_show_hidden(false);
                         if authored {
+                            if let Some(op) = self
+                                .task_panel
+                                .composer
+                                .as_mut()
+                                .and_then(|composer| composer.eva_operation.take())
+                            {
+                                self.eva_handoff_created(&op, &task_id.to_string());
+                            }
                             self.task_panel.composer = None;
                             self.task_panel.composer_open = false;
                             self.task_panel.clear_dashboard_filters();
