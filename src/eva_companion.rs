@@ -45,6 +45,10 @@ pub(crate) enum Event {
     ReplySeen(String),
     NoticeSeen(String),
     NoticeDismiss(String),
+    ProposalApprove(String),
+    ProposalDecline(String),
+    WatchTask,
+    GoalStop(String),
     DialogueSave(String, u64),
     HistoryScope(String),
     HistoryLoad(bool, u64),
@@ -841,6 +845,17 @@ impl Eva {
             // The card shows a notice; the user confirms it was seen or closes it.
             Event::NoticeSeen(notice_id) => self.host.notice_displayed(&notice_id),
             Event::NoticeDismiss(notice_id) => self.host.dismiss_notice(&notice_id),
+            // Proposals change nothing until the user approves the exact text shown.
+            Event::ProposalApprove(id) => self.host.approve_proposal(&id),
+            Event::ProposalDecline(id) => self.host.decline_proposal(&id),
+            Event::WatchTask => {
+                if let Some(context) = self.context.clone() {
+                    if let Err(reason) = self.host.watch_task(&context) {
+                        self.host.proposals.local_status(reason);
+                    }
+                }
+            }
+            Event::GoalStop(goal_id) => self.host.cancel_goal(&goal_id),
             Event::CancelDialogue(expected) => {
                 if let Some((turn_id, _)) = self.dialogue.as_ref().filter(|(id, _)| id == &expected)
                 {
@@ -1569,6 +1584,42 @@ impl Frost {
                 ]
                 .spacing(6),
             );
+        }
+        if let Some(proposal) = eva.host.proposals.latest() {
+            card = card.push(text(shared::proposal::card_text(proposal)).size(12));
+            card = card.push(
+                row![
+                    companion_button(text("Approve")).on_press(Message::Eva(
+                        Event::ProposalApprove(proposal.proposal_id.clone())
+                    )),
+                    companion_button(text("Decline")).on_press(Message::Eva(
+                        Event::ProposalDecline(proposal.proposal_id.clone())
+                    )),
+                ]
+                .spacing(6),
+            );
+        }
+        let can_watch = eva.host.gate.proposals_supported()
+            && eva.context.as_ref().is_some_and(|c| c.task_id.is_some());
+        card = card.push(
+            companion_button(text("Tell me when this task finishes"))
+                .on_press_maybe(can_watch.then_some(Message::Eva(Event::WatchTask))),
+        );
+        for goal in eva.host.proposals.goals() {
+            card = card.push(
+                row![
+                    text(shared::proposal::goal_line(goal))
+                        .size(12)
+                        .width(Length::Fill),
+                    companion_button(text("Stop"))
+                        .on_press(Message::Eva(Event::GoalStop(goal.goal_id.clone()))),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+        if !eva.host.proposals.status().is_empty() {
+            card = card.push(text(eva.host.proposals.status().to_owned()).size(11));
         }
         if !eva.dialogue_reply.is_empty() {
             card = card.push(scrollable(text(eva.dialogue_reply.clone()).size(12)).height(80));
