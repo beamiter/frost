@@ -201,6 +201,7 @@ pub(crate) struct SessionLibrary {
     pub selected: Option<SessionKey>,
     pub notice: Option<String>,
     bindings: HashMap<OpenSessionKey, usize>,
+    desktop_bridge: Option<jterm_core::desktop_sessions::Bridge>,
     /// Periodic background refresh continues the explicit refresh made when
     /// the manager opens; it stops when the manager closes.
     auto_refresh: bool,
@@ -489,6 +490,7 @@ impl SessionLibrary {
             selected: None,
             notice: None,
             bindings: HashMap::new(),
+            desktop_bridge: None,
             auto_refresh: false,
         }
     }
@@ -4253,6 +4255,34 @@ mod workspace_navigation_tree_tests {
             );
             assert_eq!(tree.children.len(), conversations.len() + 3);
             assert_eq!(node.children().len(), conversations.len() + 3);
+        }
+    }
+}
+
+impl crate::Frost {
+    pub(crate) fn has_desktop_agent_sessions(&self)->bool{!self.agent_sessions.bindings.is_empty()}
+    pub(crate) fn sync_desktop_sessions(&mut self){
+        if self.agent_sessions.desktop_bridge.is_none(){
+            if self.agent_sessions.bindings.is_empty(){return;}
+            self.agent_sessions.desktop_bridge=Some(jterm_core::desktop_sessions::Bridge::new("frost",None,||{}));
+        }
+        let identities=self.agent_sessions.catalog.sessions.iter().filter_map(|session|{
+            let id=*self.agent_sessions.bindings.get(&open_session_key(session))?;
+            let index=self.session_index_by_id(id)?;
+            if self.sessions[index].hold_after_exit{return None;}
+            Some((jterm_core::desktop_sessions::Session::from_agent(session,id.to_string())?,index,id))
+        }).collect::<Vec<_>>();
+        self.agent_sessions.desktop_bridge.as_ref().unwrap().publish(identities.iter().map(|(s,_,_)|s.clone()).collect());
+        let requests=self.agent_sessions.desktop_bridge.as_ref().unwrap().poll();
+        for request in requests{
+            let success=if let Some((_,index,id))=identities.iter().find(|(s,_,_)|s.session_id==request.session_id&&s.pane_id==request.pane_id){
+                self.pane_zoomed=false;
+                if self.focus_session(*index) && self.sessions.get(self.active).is_some_and(|s|s.id==*id){
+                    self.reference_navigation_drawer=false;self.agent_sessions.close();self.agent_sessions.workspace_pending=false;self.agent_sessions.workspace_task=None;
+                    self.ai_chats.close(self.config.ai_redact_secrets);self.relayout();self.refresh_active_context();true
+                }else{false}
+            }else{false};
+            self.agent_sessions.desktop_bridge.as_ref().unwrap().acknowledge(request,success);
         }
     }
 }

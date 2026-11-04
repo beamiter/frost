@@ -16630,6 +16630,7 @@ impl Frost {
                 self.focused && active == Some(*id) && self.reference_tools_selection.is_none(),
             );
         }
+        self.sync_desktop_sessions();
         self.sync_eva();
         if self
             .eva
@@ -33659,6 +33660,9 @@ impl Frost {
                 })
             })
             .collect();
+        if self.has_desktop_agent_sessions() {
+            subs.push(iced::time::every(std::time::Duration::from_millis(250)).map(|_|Message::AgentSessionsTick));
+        }
         if let Some(eva) = self.eva.as_ref() {
             subs.push(eva.subscription());
         }
