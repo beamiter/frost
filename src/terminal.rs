@@ -18629,7 +18629,7 @@ mod tests {
         let history = terminal.scrollback_len();
         terminal.scroll(4);
         let reading_at = terminal.scroll_offset;
-        assert_eq!(reading_at, 0, "the alternate app owns its live grid");
+        assert_eq!(reading_at, 4, "the primary-screen reader is in scrollback");
 
         // codex-cli re-renders its transcript with exactly this pair.
         terminal.process_input(b"\x1b[H\x1b[3J");

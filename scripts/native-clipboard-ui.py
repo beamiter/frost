@@ -178,6 +178,7 @@ try:
     app = s.spawn([str(s.binary)], 'frost')
     m.wait_for(s.app_window, 'clipboard UI window')
     time.sleep(1)
+    s.select_terminal()
     s.text('cd ' + shlex.quote(str(out)))
     s.key('Return')
     identity = s.command('ui-ready')

@@ -141,6 +141,7 @@ pub(crate) struct SessionLibrary {
     pub(crate) context: crate::workspace_context::ContextEditor,
     pub(crate) review: crate::workspace_review::WorkspaceReview,
     pub(crate) remote: crate::workspace_remote_ui::RemotePanel,
+    pub(crate) missions: crate::workspace_mission::MissionPanel,
     pub(crate) context_inputs: crate::workspace_inspector::ContextInputs,
     pub(crate) context_input_focused: bool,
     pub(crate) menu_open: bool,
@@ -313,7 +314,7 @@ impl SessionLibrary {
         if let Some(project) = self
             .project_selection
             .as_deref()
-            .or_else(|| self.project_only.then(|| self.project.as_deref()).flatten())
+            .or_else(|| self.project_only.then_some(self.project.as_deref()).flatten())
         {
             let quoted = serde_json::to_string(&project.to_string_lossy()).unwrap_or_default();
             query.push_str(&format!(" project:{quoted}"));
@@ -437,6 +438,7 @@ impl SessionLibrary {
             context: Default::default(),
             review: Default::default(),
             remote: Default::default(),
+            missions: Default::default(),
             context_inputs: Default::default(),
             context_input_focused: false,
             menu_open: false,
@@ -570,6 +572,7 @@ impl SessionLibrary {
         self.context.poll();
         self.review.poll();
         self.remote.reader.poll();
+        self.missions.poll();
         if let Some(draft) = self.context.draft() {
             self.context_inputs.sync(draft);
         }
@@ -1472,7 +1475,8 @@ impl super::Frost {
                     .count()
             } else {
                 0
-            };
+            }
+            + state.missions.controller.needs_attention();
         let size = self.chrome_font_size();
         let visible = self.config.agent_workspace_enabled;
         let mut list = column![button(
@@ -1594,6 +1598,14 @@ impl super::Frost {
                         }),
                 ]
                 .spacing(2),
+            );
+            list = list.push(
+                button(text(format!(
+                    "Missions · {} need review",
+                    state.missions.controller.needs_attention()
+                )).size(size - 1.0))
+                .on_press(M::WorkspaceMission(crate::workspace_mission::MissionAction::Open))
+                .style(button::text),
             );
             if let Some(notice) = state
                 .notice
@@ -4260,29 +4272,74 @@ mod workspace_navigation_tree_tests {
 }
 
 impl crate::Frost {
-    pub(crate) fn has_desktop_agent_sessions(&self)->bool{!self.agent_sessions.bindings.is_empty()}
-    pub(crate) fn sync_desktop_sessions(&mut self){
-        if self.agent_sessions.desktop_bridge.is_none(){
-            if self.agent_sessions.bindings.is_empty(){return;}
-            self.agent_sessions.desktop_bridge=Some(jterm_core::desktop_sessions::Bridge::new("frost",None,||{}));
+    pub(crate) fn has_desktop_agent_sessions(&self) -> bool {
+        !self.agent_sessions.bindings.is_empty()
+    }
+    pub(crate) fn sync_desktop_sessions(&mut self) {
+        if self.agent_sessions.desktop_bridge.is_none() {
+            if self.agent_sessions.bindings.is_empty() {
+                return;
+            }
+            self.agent_sessions.desktop_bridge = Some(jterm_core::desktop_sessions::Bridge::new(
+                "frost",
+                None,
+                || {},
+            ));
         }
-        let identities=self.agent_sessions.catalog.sessions.iter().filter_map(|session|{
-            let id=*self.agent_sessions.bindings.get(&open_session_key(session))?;
-            let index=self.session_index_by_id(id)?;
-            if self.sessions[index].hold_after_exit{return None;}
-            Some((jterm_core::desktop_sessions::Session::from_agent(session,id.to_string())?,index,id))
-        }).collect::<Vec<_>>();
-        self.agent_sessions.desktop_bridge.as_ref().unwrap().publish(identities.iter().map(|(s,_,_)|s.clone()).collect());
-        let requests=self.agent_sessions.desktop_bridge.as_ref().unwrap().poll();
-        for request in requests{
-            let success=if let Some((_,index,id))=identities.iter().find(|(s,_,_)|s.session_id==request.session_id&&s.pane_id==request.pane_id){
-                self.pane_zoomed=false;
-                if self.focus_session(*index) && self.sessions.get(self.active).is_some_and(|s|s.id==*id){
-                    self.reference_navigation_drawer=false;self.agent_sessions.close();self.agent_sessions.workspace_pending=false;self.agent_sessions.workspace_task=None;
-                    self.ai_chats.close(self.config.ai_redact_secrets);self.relayout();self.refresh_active_context();true
-                }else{false}
-            }else{false};
-            self.agent_sessions.desktop_bridge.as_ref().unwrap().acknowledge(request,success);
+        let identities = self
+            .agent_sessions
+            .catalog
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                let id = *self
+                    .agent_sessions
+                    .bindings
+                    .get(&open_session_key(session))?;
+                let index = self.session_index_by_id(id)?;
+                if self.sessions[index].hold_after_exit {
+                    return None;
+                }
+                Some((
+                    jterm_core::desktop_sessions::Session::from_agent(session, id.to_string())?,
+                    index,
+                    id,
+                ))
+            })
+            .collect::<Vec<_>>();
+        self.agent_sessions
+            .desktop_bridge
+            .as_ref()
+            .unwrap()
+            .publish(identities.iter().map(|(s, _, _)| s.clone()).collect());
+        let requests = self.agent_sessions.desktop_bridge.as_ref().unwrap().poll();
+        for request in requests {
+            let success = if let Some((_, index, id)) = identities.iter().find(|(s, _, _)| {
+                s.session_id == request.session_id && s.pane_id == request.pane_id
+            }) {
+                self.pane_zoomed = false;
+                if self.focus_session(*index)
+                    && self.sessions.get(self.active).is_some_and(|s| s.id == *id)
+                {
+                    self.reference_navigation_drawer = false;
+                    self.agent_sessions.close();
+                    self.agent_sessions.workspace_pending = false;
+                    self.agent_sessions.workspace_task = None;
+                    self.ai_chats.close(self.config.ai_redact_secrets);
+                    self.relayout();
+                    self.refresh_active_context();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            self.agent_sessions
+                .desktop_bridge
+                .as_ref()
+                .unwrap()
+                .acknowledge(request, success);
         }
     }
 }

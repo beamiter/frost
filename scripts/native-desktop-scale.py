@@ -86,6 +86,7 @@ def main():
         app = smoke.spawn(command, 'frost-dpi')
         module.wait_for(smoke.app_window, 'owned Frost DPI window')
         time.sleep(1)
+        smoke.select_terminal()
         original = smoke.command('dpi-ready')
         def record(label):
             path = out / (label + '-stty.txt')

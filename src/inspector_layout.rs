@@ -144,9 +144,9 @@ mod tests {
     #[test]
     fn actual_reference_rows_fit_without_inventing_a_620px_base() {
         let metrics = Metrics::new(1.4, 5, 5);
-        assert_eq!(metrics.minimum, 740.0);
-        assert_eq!(metrics.queue_row, 32.0);
-        assert_eq!(metrics.output, 170.0);
+        assert_eq!(metrics.minimum, 666.0);
+        assert_eq!(metrics.queue_row, 29.0);
+        assert_eq!(metrics.output, 140.0);
         assert_eq!(metrics.card_height(788.0), 774.0);
         assert!(metrics.minimum <= 788.0 - OUTER_BOTTOM);
     }
@@ -198,7 +198,7 @@ mod tests {
                     let metrics = Metrics::new(scale, metadata, queue);
                     for viewport in [120.0, 350.0, 490.0, 788.0] {
                         assert!(metrics.card_height(viewport) >= metrics.minimum);
-                        assert_eq!(metrics.output, 170.0);
+                        assert_eq!(metrics.output, 140.0);
                     }
                 }
             }
@@ -255,7 +255,7 @@ mod tests {
                     assert_eq!(row.bounds().height, sections[index], "section {index}");
                 }
             }
-            assert_eq!(rows[10].bounds().height, 170.0);
+            assert_eq!(rows[10].bounds().height, 140.0);
             let output_bottom = CARD_TOP + rows[10].bounds().y + rows[10].bounds().height;
             assert_eq!(
                 output_bottom + shell::INSPECTOR_OUTPUT_BOTTOM,

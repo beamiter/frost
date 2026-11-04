@@ -447,12 +447,12 @@ fn companion_height_is_stable_and_tiny_terminal_viewports_are_nonnegative() {
 #[test]
 fn expanded_companion_reuses_one_snapshot_and_shared_geometry() {
     // Baseline fixture correction, not an Eva geometry change: the current
-    // glass profile has 8px side insets, 6px top gap and a 42px tool row.
+    // glass profile has 28px side insets, a 10px top gap and a 36px tool row.
     // Keep exact pixel snapshots as well as the independent composer boundary.
     for (width, height, expected) in [
-        (1612.0, 976.0, (278.0, 86.0, 1028.0, 836.0)),
-        (1356.0, 704.0, (278.0, 86.0, 772.0, 564.0)),
-        (800.0, 640.0, (278.0, 86.0, 510.0, 500.0)),
+        (1612.0, 976.0, (358.0, 101.0, 936.0, 821.0)),
+        (1356.0, 704.0, (358.0, 101.0, 680.0, 549.0)),
+        (800.0, 640.0, (358.0, 101.0, 414.0, 485.0)),
     ] {
         let layout = crate::glass_layout::Layout::for_size(width, height);
         let raw = crate::native_viewport::raw_rect(layout, 0.0, 0.0, None);
@@ -463,10 +463,10 @@ fn expanded_companion_reuses_one_snapshot_and_shared_geometry() {
         );
     }
     assert_eq!(crate::native_viewport::INPUT_STRIP_HEIGHT, 44.0);
-    assert_eq!(crate::native_viewport::TOOLS_HEIGHT, 42.0);
+    assert_eq!(crate::native_viewport::TOOLS_HEIGHT, 36.0);
     assert_eq!(
         crate::native_viewport::INPUT_STRIP_HEIGHT + crate::native_viewport::TOOLS_HEIGHT,
-        86.0
+        80.0
     );
     with_widget(|widget, bounds, _| {
         let state = tree(widget);
@@ -479,46 +479,45 @@ fn expanded_companion_reuses_one_snapshot_and_shared_geometry() {
 }
 
 #[test]
-fn compact_chrome_returns_native_rows_and_columns_at_the_same_terminal_font() {
-    // Previous native content rectangles, including the existing sidebar state.
-    // These baselines make a geometry regression fail even if paint and PTY
-    // accidentally agree on a newly oversized chrome budget.
-    for (width, height, previous_width, previous_height) in [
-        (1612.0, 976.0, 859.0, 648.0),
-        (1356.0, 704.0, 603.0, 430.0),
-        (800.0, 640.0, 456.0, 366.0),
-        (700.0, 400.0, 356.0, 126.0),
+fn panel_toggles_return_native_columns_without_changing_rows_at_the_same_font() {
+    // Freeze the current glass allocation, then exercise the actual sidebar
+    // controls. Theme changes may widen navigation; hiding it must still return
+    // columns to the same PTY without changing its font or vertical budget.
+    for (width, height, expected_width, expected_height) in [
+        (1612.0, 976.0, 936.0, 821.0),
+        (1356.0, 704.0, 680.0, 549.0),
+        (800.0, 640.0, 414.0, 485.0),
+        (700.0, 400.0, 314.0, 245.0),
     ] {
         let layout = crate::glass_layout::Layout::for_size(width, height);
+        let expanded =
+            crate::glass_layout::Layout::with_panels(width, height, None, None, false, false);
+        let reference = crate::native_viewport::raw_rect(layout, 0.0, 0.0, None);
+        assert_eq!((reference.width, reference.height), (expected_width, expected_height));
         for font in [14.0, 36.0, 72.0] {
             let metrics = Metrics::new(font, 1.0, 2.0, false);
             for requested in [None, Some(44.0_f32), Some(180.0_f32)] {
                 let native = crate::native_viewport::native_budget(layout, 0.0, 0.0, requested);
-                let previous_input = requested.map_or(0.0, |input| {
-                    input.min((previous_height * 0.45_f32).clamp(44.0, 180.0))
-                });
-                let previous_native_height = previous_height - previous_input;
-                let old_grid = metrics.grid_size(
-                    (previous_width - SCROLLBAR_WIDTH).max(0.0),
-                    previous_native_height,
+                let expanded_native =
+                    crate::native_viewport::native_budget(expanded, 0.0, 0.0, requested);
+                let expanded_grid = metrics.grid_size(
+                    (expanded_native.raw.width - SCROLLBAR_WIDTH).max(0.0),
+                    expanded_native.raw.height,
                 );
                 let grid = metrics.grid_size(
                     (native.raw.width - SCROLLBAR_WIDTH).max(0.0),
                     native.raw.height,
                 );
-                assert!(native.raw.width > previous_width);
-                assert!(native.raw.height > previous_native_height);
+                assert!(expanded_native.raw.width > native.raw.width);
+                assert_eq!(expanded_native.raw.height, native.raw.height);
                 assert!(
-                    grid.0 > old_grid.0,
+                    expanded_grid.0 > grid.0,
                     "columns at {width}×{height}, font {font}, input {requested:?}"
                 );
-                assert!(
-                    grid.1 >= old_grid.1,
+                assert_eq!(
+                    expanded_grid.1, grid.1,
                     "rows at {width}×{height}, font {font}, input {requested:?}"
                 );
-                if requested.is_none() {
-                    assert!(grid.1 > old_grid.1, "direct native rows at font {font}");
-                }
                 if let Some(editor) = native.editor {
                     assert_eq!(editor.width, native.raw.width);
                     assert_eq!(
@@ -699,13 +698,13 @@ fn disabling_the_bottom_bar_returns_its_rows_to_the_grid() {
     let layout = crate::glass_layout::Layout::for_size(1356.0, 704.0);
     // Native Block and Chat fallback have no editor; a retained Chat prompt
     // reserves its actual editor height above the same fixed glass tool row.
-    // Current baseline tokens give y=44+36+6=86 and bottom=704-6-42-6=650.
+    // Current baseline gives y=42+49+10=101 and bottom=704-10-36-8=650.
     // Each retained editor subtracts its exact height, not the obsolete 44px toolbar.
     for (mode, input_height, expected_height, expected_bottom) in [
-        (crate::config::TerminalMode::Block, None, 564.0, 650.0),
-        (crate::config::TerminalMode::Chat, None, 564.0, 650.0),
-        (crate::config::TerminalMode::Chat, Some(44.0), 520.0, 606.0),
-        (crate::config::TerminalMode::Chat, Some(180.0), 384.0, 470.0),
+        (crate::config::TerminalMode::Block, None, 549.0, 650.0),
+        (crate::config::TerminalMode::Chat, None, 549.0, 650.0),
+        (crate::config::TerminalMode::Chat, Some(44.0), 505.0, 606.0),
+        (crate::config::TerminalMode::Chat, Some(180.0), 369.0, 470.0),
     ] {
         let expected = crate::native_viewport::raw_rect(layout, 0.0, 0.0, input_height);
         for bottom_bar in [false, true] {

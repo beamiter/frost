@@ -699,6 +699,8 @@ printf '%s\t%s\t%s\n' "$$" "$PPID" "$(tty)" >> "$FROST_RECOVERY_SHELL_STARTS"
         require(self.app.poll() is None, 'Frost exited during startup')
         require((smoke.config.parent / 'instance.lock').read_text() == str(self.app.pid),
                 'Test process did not acquire the real first-instance lock')
+        time.sleep(1)
+        smoke.select_terminal()
         self.original = self.ready('original-ready')
         if self.name in LIMIT_CASES:
             self.verify_restored_shells()

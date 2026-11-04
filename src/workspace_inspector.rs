@@ -295,12 +295,18 @@ impl Frost {
             && self.reference_inspector_visible()
             && self.reference_inspector_tab == InspectorTab::Context
             && self.workspace_inspector_active()
-            && self.agent_sessions.tools.selected_hit.is_none()
+            && (self.agent_sessions.missions.open
+                || self.agent_sessions.tools.selected_hit.is_none())
     }
     pub(crate) fn workspace_inspector_active(&self) -> bool {
-        self.workspace_has_conversation() || self.agent_sessions.tools.selected_hit.is_some()
+        self.agent_sessions.missions.open
+            || self.workspace_has_conversation()
+            || self.agent_sessions.tools.selected_hit.is_some()
     }
     pub(crate) fn workspace_inspector(&self, tab: InspectorTab) -> Element<'_, Message> {
+        if self.agent_sessions.missions.open && tab == InspectorTab::Context {
+            return self.workspace_mission_view();
+        }
         let size = self.chrome_font_size();
         if tab == InspectorTab::Context && self.agent_sessions.tools.selected_hit.is_some() {
             return self.workspace_evidence();

@@ -116,6 +116,7 @@ try:
         app = s.spawn([str(s.binary)], case + '-frost')
         m.wait_for(s.app_window, case + ' window')
         time.sleep(1)
+        s.select_terminal()
         s.text('cd ' + shlex.quote(str(out)))
         s.key('Return')
         identity = s.command(case + '-ready')

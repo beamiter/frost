@@ -37,9 +37,10 @@ jobs:
       - name: Check native receipt sources
         run: |
           python3 tools/check-host-bundle.py
-          cargo fmt --manifest-path tools/native-feedback-harness/Cargo.toml -- --check
-          cargo test --locked --manifest-path tools/native-feedback-harness/Cargo.toml
-          cargo clippy --locked --manifest-path tools/native-feedback-harness/Cargo.toml --all-targets -- -D warnings
+          python3 tools/test-isolated-cargo.py
+          python3 scripts/isolated_cargo.py --manifest-path tools/native-feedback-harness/Cargo.toml fmt -- --check
+          python3 scripts/isolated_cargo.py --manifest-path tools/native-feedback-harness/Cargo.toml test --locked
+          python3 scripts/isolated_cargo.py --manifest-path tools/native-feedback-harness/Cargo.toml clippy --locked --all-targets -- -D warnings
 
   dependency-policy:
     name: Dependency policy

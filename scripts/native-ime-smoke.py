@@ -50,6 +50,7 @@ try:
     app = s.spawn([str(s.binary)], 'frost')
     m.wait_for(s.app_window, 'Frost IME fixture')
     time.sleep(2)
+    s.select_terminal()
     s.command('ime-ready')
     committed = out / 'ime-committed.txt'
     if a.foreground:

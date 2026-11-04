@@ -30,7 +30,7 @@ pub(crate) enum RemoteAction {
     Refresh,
     MoreCatalog,
     MoreSearch,
-    Hit(WorkspaceSearchHit),
+    Hit(Box<WorkspaceSearchHit>),
     CloseEvidence,
 }
 impl Frost {
@@ -75,7 +75,7 @@ impl Frost {
             RemoteAction::Refresh => panel.reader.refresh(),
             RemoteAction::MoreCatalog => panel.reader.load_more_catalog(),
             RemoteAction::MoreSearch => panel.reader.load_more_search(),
-            RemoteAction::Hit(hit) => panel.reader.open_hit(hit),
+            RemoteAction::Hit(hit) => panel.reader.open_hit(*hit),
             RemoteAction::CloseEvidence => panel.reader.clear_document(),
             _ => {
                 panel.reader.notice =
@@ -126,7 +126,7 @@ impl Frost {
                             ]
                             .spacing(3),
                         )
-                        .on_press(action(RemoteAction::Hit(hit.clone())))
+                        .on_press(action(RemoteAction::Hit(Box::new(hit.clone()))))
                         .width(Length::Fill)
                         .style(button::text),
                     );

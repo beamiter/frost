@@ -48,15 +48,15 @@ jobs:
           cp "$RUNNER_TEMP/frost-smithay-tests/source-identity.json" native-provider-artifacts/smithay-source-identity.json
           cp "$RUNNER_TEMP/frost-smithay-tests/Cargo.toml" native-provider-artifacts/smithay-workspace.toml
           cp scripts/provider-acceptance/smithay-tests.lock native-provider-artifacts/smithay-tests.lock
-          cargo build --locked --manifest-path scripts/provider-acceptance/Cargo.toml
-          cargo test --locked --manifest-path scripts/provider-acceptance/Cargo.toml -p clipboard_x11 --lib --no-run
-          cargo test --locked --manifest-path "$RUNNER_TEMP/frost-smithay-tests/Cargo.toml" -p smithay-clipboard --lib --no-run
+          python3 scripts/isolated_cargo.py --manifest-path scripts/provider-acceptance/Cargo.toml build --locked
+          python3 scripts/isolated_cargo.py --manifest-path scripts/provider-acceptance/Cargo.toml test --locked -p clipboard_x11 --lib --no-run
+          python3 scripts/isolated_cargo.py --manifest-path "$RUNNER_TEMP/frost-smithay-tests/Cargo.toml" test --locked -p smithay-clipboard --lib --no-run
           wayland-scanner client-header scripts/protocols/wlr-data-control-unstable-v1.xml "$RUNNER_TEMP/provider-owner/wlr-data-control-unstable-v1-client-protocol.h"
           wayland-scanner private-code scripts/protocols/wlr-data-control-unstable-v1.xml "$RUNNER_TEMP/provider-owner/wlr-data-control-unstable-v1-protocol.c"
           cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/provider-owner" scripts/native-clipboard-owner.c "$RUNNER_TEMP/provider-owner/wlr-data-control-unstable-v1-protocol.c" $(pkg-config --libs wayland-client) -o "$RUNNER_TEMP/provider-owner/owner"
           sha256sum scripts/provider-acceptance/target/debug/frost-provider-acceptance "$RUNNER_TEMP/provider-owner/owner" > native-provider-artifacts/binaries.sha256
-          cargo tree --locked --manifest-path scripts/provider-acceptance/Cargo.toml > native-provider-artifacts/cargo-tree.txt
-          cargo tree --locked --manifest-path "$RUNNER_TEMP/frost-smithay-tests/Cargo.toml" -e features > native-provider-artifacts/smithay-test-features.txt
+          python3 scripts/isolated_cargo.py --manifest-path scripts/provider-acceptance/Cargo.toml tree --locked > native-provider-artifacts/cargo-tree.txt
+          python3 scripts/isolated_cargo.py --manifest-path "$RUNNER_TEMP/frost-smithay-tests/Cargo.toml" tree --locked -e features > native-provider-artifacts/smithay-test-features.txt
           find "$RUNNER_TEMP/frost-smithay-tests/target/debug/deps" -maxdepth 1 -type f -name 'smithay_clipboard-*' -executable -exec sha256sum {} + > native-provider-artifacts/smithay-test-binaries.sha256
       - name: Run all six ignored native provider tests
         run: |
@@ -73,9 +73,9 @@ jobs:
           export FROST_X11_TEST_DISPLAY=:97
           for i in $(seq 1 50); do DISPLAY=:97 xdpyinfo >/dev/null 2>&1 && break; sleep .1; done
           DISPLAY=:97 xdpyinfo >/dev/null
-          timeout 90 cargo test --locked --manifest-path scripts/provider-acceptance/Cargo.toml -p clipboard_x11 --lib -- --ignored --test-threads=1 --nocapture 2>&1 | tee native-provider-artifacts/x11-tests.log
+          timeout 90 python3 scripts/isolated_cargo.py --manifest-path scripts/provider-acceptance/Cargo.toml test --locked -p clipboard_x11 --lib -- --ignored --test-threads=1 --nocapture 2>&1 | tee native-provider-artifacts/x11-tests.log
           grep -q '3 passed; 0 failed' native-provider-artifacts/x11-tests.log
-          timeout 30 cargo test --locked --manifest-path "$RUNNER_TEMP/frost-smithay-tests/Cargo.toml" -p smithay-clipboard --lib -- --ignored --test-threads=1 --nocapture 2>&1 | tee native-provider-artifacts/wayland-tests.log
+          timeout 30 python3 scripts/isolated_cargo.py --manifest-path "$RUNNER_TEMP/frost-smithay-tests/Cargo.toml" test --locked -p smithay-clipboard --lib -- --ignored --test-threads=1 --nocapture 2>&1 | tee native-provider-artifacts/wayland-tests.log
           grep -q '3 passed; 0 failed' native-provider-artifacts/wayland-tests.log
       - name: Exercise real winit host on disposable Sway
         run: |

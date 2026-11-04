@@ -28,6 +28,7 @@ try:
     app = s.spawn([str(s.binary)], 'frost')
     m.wait_for(s.app_window, 'Frost clipboard fixture')
     time.sleep(2)
+    s.select_terminal()
     s.command('ready')
     for index, delay in enumerate((0, 2)):
         ready, log = out / f'owner-{index}.ready', out / f'owner-{index}.jsonl'

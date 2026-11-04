@@ -101,6 +101,7 @@ mod workflows;
 mod workspace_chat_bridge;
 mod workspace_context;
 mod workspace_inspector;
+mod workspace_mission;
 mod workspace_navigation_surface;
 mod workspace_remote;
 mod workspace_remote_ui;
@@ -4759,6 +4760,7 @@ enum Message {
     WorkspaceRemoteOpen,
     WorkspaceRemoteClose,
     WorkspaceRemoteAction(u64, workspace_remote_ui::RemoteAction),
+    WorkspaceMission(workspace_mission::MissionAction),
     AgentWorkspaceToggle,
     AgentWorkspaceScrolled(bool, f32),
     WorkspaceProject(Option<std::path::PathBuf>),
@@ -16834,6 +16836,8 @@ impl Frost {
                 ));
             }
             Message::ReferenceInspector(tab) => {
+                self.agent_sessions.missions.open = false;
+                self.agent_sessions.context_input_focused = false;
                 self.finish_sidebar_resize();
                 self.task_panel.retire_panel_callbacks();
                 self.task_panel.input_focused = false;
@@ -18098,6 +18102,7 @@ impl Frost {
             Message::WorkspaceRemoteAction(generation, action) => {
                 self.workspace_remote_action(generation, action)
             }
+            Message::WorkspaceMission(action) => return self.workspace_mission_action(action),
             Message::WorkspaceContext(id, action) => self.workspace_context_action(id, action),
             Message::WorkspaceContextEdit(id, key, action) => {
                 self.workspace_context_edit(id, key, action)
@@ -18108,6 +18113,7 @@ impl Frost {
                 self.agent_sessions.context_input_focused = focused
             }
             Message::WorkspaceSearchOpen(hit) => {
+                self.agent_sessions.missions.open = false;
                 self.agent_sessions.tools.open_hit(hit);
                 self.reference_navigation_drawer = false;
                 self.reference_inspector_tab = native_shell::InspectorTab::Context;
@@ -18531,6 +18537,9 @@ impl Frost {
                 return self.agent_sessions_scroll_task();
             }
             Message::AgentSessionsStatus(status) => {
+                if status == Some(jterm_core::agent_sessions::SessionStatus::Waiting) {
+                    self.agent_sessions.missions.controller.refresh();
+                }
                 self.agent_sessions.status = status;
                 self.agent_sessions.apply_filters();
                 return self.agent_sessions_scroll_task();
@@ -33692,7 +33701,10 @@ impl Frost {
             })
             .collect();
         if self.has_desktop_agent_sessions() {
-            subs.push(iced::time::every(std::time::Duration::from_millis(250)).map(|_|Message::AgentSessionsTick));
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(250))
+                    .map(|_| Message::AgentSessionsTick),
+            );
         }
         if let Some(eva) = self.eva.as_ref() {
             subs.push(eva.subscription());
@@ -34008,6 +34020,8 @@ impl Frost {
         }
         if self.sidebar_open
             || self.agent_sessions.remote.open
+            || self.agent_sessions.missions.open
+            || self.agent_sessions.missions.controller.busy
             || self.reference_inspector_visible()
             || self.agent_sessions.context.loading()
             || self.agent_sessions.context.saving()
@@ -34026,6 +34040,7 @@ impl Frost {
         {
             let interval = if self.ai_chats.workspace.has_work()
                 || self.agent_sessions.remote.open
+                || self.agent_sessions.missions.controller.busy
                 || self.agent_sessions.context.loading()
                 || self.agent_sessions.context.saving()
                 || self.agent_sessions.context.building()

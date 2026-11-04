@@ -154,6 +154,15 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
         else:
             self.run(['grim', target])
 
+    def select_terminal(self):
+        # The workspace may initially show its API conversation. Use public
+        # keyboard navigation before this fixture's first shell input: the
+        # first Escape releases a focused editor, the second closes the view.
+        # Call only at startup with a disposable, idle shell; never retry a
+        # failed command or weaken the overlay's hidden-PTY input protection.
+        self.key('Escape')
+        self.key('Escape')
+
     def command(self, sentinel, paste=False):
         command = "printf '%s:%s:%s\\n' " + shlex.quote(sentinel) + ' "$$" "$(tty)" >> ' + shlex.quote(str(self.transcript))
         if paste:
@@ -219,6 +228,7 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
             time.sleep(2)
             assert app.poll() is None
             self.screenshot(mode + '-startup')
+            self.select_terminal()
             first_identity = self.command(mode + '-typed')
             self.command(mode + '-paste', paste=True)
             self.key('t', ('ctrl', 'shift'))

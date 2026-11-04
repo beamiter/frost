@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tomllib
+from isolated_cargo import run_cargo
 
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
@@ -52,7 +53,7 @@ report = {'status': 'pass', 'files': files, 'original_manifest_sha256': hashlib.
 # Other host-only consumers may legitimately add features to shared libc/rustix.
 host = next(line.split(': ', 1)[1] for line in subprocess.check_output(['rustc', '-vV'], text=True).splitlines() if line.startswith('host: '))
 def metadata(manifest):
-    return json.loads(subprocess.check_output(['cargo', 'metadata', '--locked', '--filter-platform', host, '--format-version', '1', '--manifest-path', str(manifest)], text=True))
+    return json.loads(run_cargo(manifest, ['metadata', '--locked', '--filter-platform', host, '--format-version', '1'], stdout=subprocess.PIPE, check=True, text=True).stdout)
 def features(data):
     packages = {p['id']: (p['name'], p['version']) for p in data['packages']}
     return {packages[n['id']]: sorted(n['features']) for n in data['resolve']['nodes']}

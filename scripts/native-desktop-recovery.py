@@ -33,6 +33,7 @@ def launch(label):
     proc = smoke.spawn([str(smoke.binary)], label)
     module.wait_for(smoke.app_window, 'application ' + label)
     time.sleep(2)
+    smoke.select_terminal()
     assert proc.poll() is None
     return proc
 
