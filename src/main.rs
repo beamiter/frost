@@ -4584,6 +4584,7 @@ fn main() -> iced::Result {
 #[derive(Debug, Clone)]
 enum Message {
     Eva(eva_companion::Event),
+    InputDockHoldExpired(u64),
     ReferenceInspector(native_shell::InspectorTab),
     ReferenceInspectorToggle,
     ReferenceNavigationToggle,
@@ -6959,6 +6960,8 @@ struct Frost {
     reference_navigation_drawer: bool,
     reference_tools_selection: Option<usize>,
     vim9_tabs: std::collections::HashMap<usize, vim9_ide::Ide>,
+    input_dock_hold: Option<native_shell::InputDockHold>,
+    input_dock_hold_generation: u64,
     config: Config,
     terminal_interaction_mode: config::TerminalMode,
     terminal_interaction_epoch: u64,
@@ -7370,6 +7373,8 @@ impl Frost {
             reference_navigation_drawer: false,
             reference_tools_selection: None,
             vim9_tabs: Default::default(),
+            input_dock_hold: None,
+            input_dock_hold_generation: 0,
             terminal_interaction_mode: config.effective_terminal_mode(),
             terminal_interaction_epoch: 0,
             terminal_pane_owners: None,
@@ -16598,6 +16603,19 @@ impl Frost {
             _ => true,
         };
         let task = self.update_message(message);
+        let input_hold = self.sync_input_dock_hold().map(|generation| {
+            Task::perform(
+                async move {
+                    tokio::time::sleep(native_shell::INPUT_DOCK_HOLD).await;
+                    generation
+                },
+                Message::InputDockHoldExpired,
+            )
+        });
+        let task = match input_hold {
+            Some(expiry) => Task::batch([task, expiry]),
+            None => task,
+        };
         let current_owner = self
             .sessions
             .get(self.active)
@@ -21328,6 +21346,9 @@ impl Frost {
             Message::OrganismSystemMotion(event) => {
                 let transition = self.organism_motion_control.observe(event);
                 self.apply_organism_motion_transition(transition);
+            }
+            Message::InputDockHoldExpired(generation) => {
+                self.expire_input_dock_hold(generation);
             }
             Message::OrganismTick(cause) => {
                 self.organism_wake_counts.record(&cause);

@@ -62,10 +62,16 @@ code += "impl Metrics {\n" + "\n".join(item(view, marker) for marker in [
     "pub fn new(", "fn block_gutter_width(", "pub fn grid_size("]) + "\n}\n"
 code += "mod native_input_surface {\n"
 code += "pub const INPUT_STRIP_HEIGHT: f32 = crate::glass_layout::INPUT_STRIP_HEIGHT;\n"
+code += "#[derive(Clone, Copy, Debug, PartialEq)]\n"
 code += item(surface, "pub(crate) struct DockMetrics {") + "\n"
 code += item(surface, "pub(crate) fn dock_metrics(") + "\n}\n"
+code += "#[derive(Clone, Copy, Debug)]\n" + item(native_shell, "pub(crate) struct InputDockHold {") + "\n"
+input_methods = "\n".join(item(native_shell, marker) for marker in [
+    "pub(crate) fn reference_input_metrics(", "fn held_input_metrics(",
+    "fn input_dock_hold_eligible(", "pub(crate) fn sync_input_dock_hold(",
+    "pub(crate) fn expire_input_dock_hold(", "fn live_input_metrics("])
 code += (ROOT / "scripts/input-geometry-harness.rs").read_text().replace(
-    "//!", "//").replace("// @input-metrics@", item(native_shell, "pub(crate) fn reference_input_metrics("))
+    "//!", "//").replace("// @input-metrics@", input_methods)
 
 with tempfile.TemporaryDirectory(prefix="frost-input-geometry-") as directory:
     out = Path(directory)
@@ -89,3 +95,20 @@ with tempfile.TemporaryDirectory(prefix="frost-input-geometry-") as directory:
     failed = subprocess.run([str(binary)], capture_output=True, text=True)
     assert failed.returncode != 0 and "input/PTY resize oscillation" in failed.stderr, failed.stderr
     print("PASS: removing the fix reproduces the input/PTY resize oscillation")
+    # Removing only the composer-row floor must bring back the one-row bash
+    # prompt loop: one row on the last PTY row, two rows one row higher.
+    floor = "\n            .max(terminal::CHAT_MIN_INPUT_ROWS);"
+    assert code.count(floor) == 1
+    source.write_text(code.replace(floor, ";"))
+    subprocess.run(command, check=True)
+    failed = subprocess.run([str(binary)], capture_output=True, text=True)
+    assert failed.returncode != 0 and "input/PTY resize oscillation" in failed.stderr, failed.stderr
+    print("PASS: removing the row floor reproduces the one-row prompt oscillation")
+    # Without the hold, every Enter collapses the input and resizes the PTY.
+    hold = "self.live_input_metrics()\n            .or_else(|| self.held_input_metrics())"
+    assert code.count(hold) == 1
+    source.write_text(code.replace(hold, "self.live_input_metrics()"))
+    subprocess.run(command, check=True)
+    failed = subprocess.run([str(binary)], capture_output=True, text=True)
+    assert failed.returncode != 0 and "command start resized the PTY" in failed.stderr, failed.stderr
+    print("PASS: removing the hold brings back the per-command input collapse")

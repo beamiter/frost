@@ -15,6 +15,8 @@ struct Surface<'a, Message> {
     dock: Option<Dock>,
     foreground_hint: String,
     native_height: f32,
+    /// Empty input strip kept for a command that just took the prompt.
+    held_input: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -29,6 +31,7 @@ pub(crate) struct Dock {
 // Surface includes this input strip and the separate tools row is below it.
 pub(crate) const INPUT_STRIP_HEIGHT: f32 = crate::native_viewport::INPUT_STRIP_HEIGHT;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct DockMetrics {
     pub input_height: f32,
     pub vertical_padding: f32,
@@ -78,7 +81,7 @@ pub(crate) fn dock_metrics(
 
 impl<Message> Surface<'_, Message> {
     fn input_height(&self) -> f32 {
-        self.dock.map_or(0.0, |dock| dock.input_height)
+        self.dock.map_or(self.held_input, |dock| dock.input_height)
     }
     fn input_layout_index(&self) -> usize {
         usize::from(self.dock.is_some())
@@ -103,6 +106,25 @@ pub(crate) fn surface<'a, Message: 'a>(
         dock,
         foreground_hint: foreground_hint.into(),
         native_height,
+        held_input: 0.0,
+    })
+}
+
+/// The native terminal while a just-started command runs below a prompt's
+/// input strip. The strip keeps its height and stays empty; the terminal keeps
+/// every key, pointer and IME event, exactly as with no dock.
+pub(crate) fn held_surface<'a, Message: 'a>(
+    terminal: Element<'a, Message>,
+    input_height: f32,
+    native_height: f32,
+) -> Element<'a, Message> {
+    Element::new(Surface {
+        terminal,
+        history: None,
+        dock: None,
+        foreground_hint: String::new(),
+        native_height,
+        held_input: input_height,
     })
 }
 
@@ -223,7 +245,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         let (history_clip, input_clip) = clips(layout.bounds(), self.input_height());
         if let Some(clip) = history_clip.intersection(viewport) {
             renderer.with_layer(clip, |renderer| {
-                if self.dock.is_some() {
+                if self.dock.is_some() || self.held_input > 0.0 {
                     renderer.fill_quad(
                         renderer::Quad {
                             bounds: history_clip,

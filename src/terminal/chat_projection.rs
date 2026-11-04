@@ -4,7 +4,8 @@ use crate::chat_mode::{resolve_surface, ChatRole, ChatRow, ChatSessionState, Cha
 
 // The compact shared composer reserves two real editable rows initially.
 // Occupied/multiline input still grows from actual cells and cursor extent.
-const CHAT_MIN_INPUT_ROWS: usize = 2;
+// The grid end can cut this padding short, so the dock applies it again.
+pub(crate) const CHAT_MIN_INPUT_ROWS: usize = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ChatPlanKey {

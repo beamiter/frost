@@ -38,6 +38,17 @@ Before reserving input height, the shared Block/Chat dock checks that the
 resulting PTY still has enough rows for the prompt projection. Oversized prompts
 stay in the native terminal until they fit, so resize feedback cannot repeatedly
 create and remove the input strip.
+The dock measures at least the projection's two-row composer minimum. The grid
+end can cut that padding short: a one-row prompt (bash over SSH) on the last PTY
+row would otherwise measure one row, and the same prompt one row higher two rows.
+Docking moves the prompt between those positions, so the input would keep
+switching heights.
+When a command takes the prompt, the input strip keeps its height, empty, for
+up to 300ms (`INPUT_DOCK_HOLD`). A quick command's next prompt docks into the
+same strip, so one Enter neither flashes the input away nor resizes the PTY
+twice. A longer command gets the full pane when the hold expires; fullscreen,
+mouse and image applications get it at once. The terminal keeps every key,
+pointer and IME event during the hold.
 
 Larger configured UI text grows the top bar, header and tools row through
 `Layout::with_chrome_font_size`. The default compact geometry remains unchanged;
@@ -63,7 +74,10 @@ short windows whose previous draft is larger than the new allocation.
 The layout unit tests cover shared PTY/input budgets, panel collapse and width
 restoration, short windows, bounded multiline input, and enlarged UI text.
 After a release build, `python3 scripts/test-input-geometry.py` checks resize
-convergence using the real terminal parser, projection and input budget. It also
-verifies that removing the guard reproduces the oscillation, without using SSH.
+convergence using the real terminal parser, projection and input budget,
+including a one-row bash prompt pushed to the last PTY row by command output,
+and a quick command held from Enter to its next prompt. It also verifies that
+removing either guard brings back its oscillation and removing the hold brings
+back the per-command collapse, without using SSH.
 Native window, PTY and physical input checks remain separate acceptance gates;
 the headless geometry tests do not substitute for those checks.

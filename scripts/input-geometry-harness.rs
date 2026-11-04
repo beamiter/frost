@@ -28,6 +28,8 @@ struct Session {
     terminal: TerminalState,
     projection: Arc<ProjectedViewport>,
     cursor: (usize, usize),
+    // Bytes the remote shell writes after a SIGWINCH at its prompt.
+    winch_redraw: Option<&'static [u8]>,
 }
 impl Session {
     fn transcript_read_only(&self) -> bool {
@@ -54,6 +56,10 @@ struct Frost {
     metrics: Metrics,
     startup_recovery: Recovery,
     layout: glass_layout::Layout,
+    input_dock_hold: Option<InputDockHold>,
+    input_dock_hold_generation: u64,
+    // The harness stands in for the expiry timer update() schedules.
+    pending_expiry: Option<u64>,
 }
 impl Frost {
     fn is_split(&self) -> bool {
@@ -101,6 +107,7 @@ fn fixture(
         terminal,
         projection,
         cursor: (0, 0),
+        winch_redraw: None,
     };
     session.refresh(&policy, &mut state);
     (
@@ -112,10 +119,64 @@ fn fixture(
             metrics,
             startup_recovery: Recovery,
             layout,
+            input_dock_hold: None,
+            input_dock_hold_generation: 0,
+            pending_expiry: None,
         },
         policy,
         state,
     )
+}
+
+/// jsh-remote's bash fallback (`integration.bash`) on a host jsh cannot be
+/// deployed to: PS1 is wrapped in A/B, PS0 is C, PROMPT_COMMAND prints D and
+/// OSC 7. Unlike jsh, the prompt is a single row.
+const BASH_PROMPT: &[u8] = b"\x1b]133;A\x07\x1b]0;ubuntu@ubuntu: ~\x07\x1b[01;32mubuntu@ubuntu\x1b[00m:\x1b[01;34m~\x1b[00m$ \x1b]133;B\x07";
+/// readline's redisplay after SIGWINCH: CR, clear the line, repaint PS1.
+const BASH_WINCH: &[u8] = b"\r\x1b[K\x1b]133;A\x07\x1b]0;ubuntu@ubuntu: ~\x07\x1b[01;32mubuntu@ubuntu\x1b[00m:\x1b[01;34m~\x1b[00m$ \x1b]133;B\x07";
+
+fn bash_fixture(
+    chat: bool,
+    height: f32,
+    font: f32,
+) -> (Frost, ProjectionPolicy, ProjectionViewState) {
+    let (mut app, policy, mut state) = fixture(chat, height, font, 1);
+    let session = &mut app.sessions[0];
+    let mut terminal = TerminalState::new(
+        session.terminal.get_dimensions().0,
+        session.terminal.get_dimensions().1,
+    );
+    terminal.process_input(
+        b"\x1b]133;A\x07local$ \x1b]133;B\x07ssh robot\r\n\x1b]133;C\x07Connected\r\n",
+    );
+    terminal.process_input(b"\x1b]7;file://ubuntu/home/ubuntu\x07");
+    terminal.process_input(BASH_PROMPT);
+    session.terminal = terminal;
+    session.winch_redraw = Some(BASH_WINCH);
+    session.refresh(&policy, &mut state);
+    (app, policy, state)
+}
+
+/// Run one remote command whose output scrolls the screen, so the next
+/// one-row prompt lands on the last PTY row.
+fn bash_command_fills_screen(
+    app: &mut Frost,
+    policy: &ProjectionPolicy,
+    state: &mut ProjectionViewState,
+) {
+    let session = &mut app.sessions[0];
+    let rows = session.terminal.get_dimensions().1;
+    session.terminal.process_input(b"ls -la\r\n\x1b]133;C\x07");
+    for line in 0..rows * 2 {
+        session
+            .terminal
+            .process_input(format!("-rw-r--r-- 1 ubuntu ubuntu 220 file{line}\r\n").as_bytes());
+    }
+    session
+        .terminal
+        .process_input(b"\x1b]133;D;0\x07\x1b]7;file://ubuntu/home/ubuntu\x07");
+    session.terminal.process_input(BASH_PROMPT);
+    session.refresh(policy, state);
 }
 
 fn resize_pass(
@@ -123,6 +184,10 @@ fn resize_pass(
     policy: &ProjectionPolicy,
     state: &mut ProjectionViewState,
 ) -> bool {
+    // update() syncs the hold before the PTY budget, after every message.
+    if let Some(generation) = app.sync_input_dock_hold() {
+        app.pending_expiry = Some(generation);
+    }
     let input = app
         .reference_input_metrics()
         .map(|metrics| metrics.input_height);
@@ -134,6 +199,13 @@ fn resize_pass(
     let changed = dimensions != session.terminal.get_dimensions();
     if changed {
         session.terminal.on_resize(dimensions.0, dimensions.1);
+        // readline repaints only while it owns the prompt, not under a command.
+        if let Some(redraw) = session
+            .winch_redraw
+            .filter(|_| session.terminal.live_prompt_row().is_some())
+        {
+            session.terminal.process_input(redraw);
+        }
     }
     session.refresh(policy, state);
     changed
@@ -211,5 +283,127 @@ fn main() {
             first_height
         );
     }
+    // A one-row bash prompt measured one row on the last PTY row but two rows
+    // when a blank row sat below it. Docking moves it between those states, so
+    // after a command filled the screen the input alternated heights forever.
+    for chat in [false, true] {
+        for height in (320..=900).step_by(3) {
+            for font in [10.0, 13.0, 14.0, 24.0] {
+                let (mut app, policy, mut state) = bash_fixture(chat, height as f32, font);
+                assert_settles(&mut app, &policy, &mut state);
+                let Some(connected) = app.reference_input_metrics() else {
+                    continue;
+                };
+                bash_command_fills_screen(&mut app, &policy, &mut state);
+                assert_settles(&mut app, &policy, &mut state);
+                let filled = app
+                    .reference_input_metrics()
+                    .expect("one-row bash prompt still docks");
+                assert_eq!(
+                    filled.input_height, connected.input_height,
+                    "prompt position must not change the input height ({height}px, {font}pt)"
+                );
+                // Typing at the bottom prompt redraws only the edited cells.
+                app.sessions[0].terminal.process_input(b"ls");
+                app.sessions[0].refresh(&policy, &mut state);
+                assert!(!resize_pass(&mut app, &policy, &mut state));
+            }
+        }
+    }
+    // A quick command keeps the input strip from Enter to its next prompt,
+    // including a shell that writes D and the next A/B in separate reads.
+    for chat in [false, true] {
+        for height in [320.0, 480.0, 683.0, 704.0, 800.0] {
+            for font in [10.0, 13.0, 24.0] {
+                let (mut app, policy, mut state) = bash_fixture(chat, height, font);
+                assert_settles(&mut app, &policy, &mut state);
+                let Some(docked) = app.reference_input_metrics() else {
+                    continue;
+                };
+                let dimensions = app.sessions[0].terminal.get_dimensions();
+                let rows = dimensions.1;
+                let step =
+                    |app: &mut Frost, state: &mut ProjectionViewState, bytes: &[u8], what: &str| {
+                        app.sessions[0].terminal.process_input(bytes);
+                        app.sessions[0].refresh(&policy, state);
+                        assert!(
+                            !resize_pass(app, &policy, state),
+                            "{what} resized the PTY ({height}px, {font}pt)"
+                        );
+                        assert_eq!(app.sessions[0].terminal.get_dimensions(), dimensions);
+                        assert_eq!(
+                            app.reference_input_metrics().map(|m| m.input_height),
+                            Some(docked.input_height),
+                            "{what} changed the input height"
+                        );
+                    };
+                step(&mut app, &mut state, b"ls -la", "typing");
+                step(&mut app, &mut state, b"\r\n", "accepted Enter");
+                step(&mut app, &mut state, b"\x1b]133;C\x07", "command start");
+                let expiry = app
+                    .pending_expiry
+                    .take()
+                    .expect("command start arms the hold");
+                for line in 0..rows * 2 {
+                    step(
+                        &mut app,
+                        &mut state,
+                        format!("drwxr-xr-x {line}\r\n").as_bytes(),
+                        "output",
+                    );
+                }
+                step(
+                    &mut app,
+                    &mut state,
+                    b"\x1b]133;D;0\x07\x1b]7;file://ubuntu/home/ubuntu\x07",
+                    "D before A",
+                );
+                step(&mut app, &mut state, BASH_PROMPT, "next prompt");
+                // The quick command's timer fires after its prompt docked.
+                app.expire_input_dock_hold(expiry);
+                assert!(!resize_pass(&mut app, &policy, &mut state));
+                assert!(app.reference_input_metrics().is_some());
+
+                // A long command collapses the input once its hold expires.
+                step(
+                    &mut app,
+                    &mut state,
+                    b"sleep 10\r\n\x1b]133;C\x07",
+                    "command start",
+                );
+                let expiry = app.pending_expiry.take().unwrap();
+                app.expire_input_dock_hold(expiry);
+                assert!(
+                    resize_pass(&mut app, &policy, &mut state),
+                    "expiry returns the rows"
+                );
+                assert!(app.reference_input_metrics().is_none());
+                app.sessions[0]
+                    .terminal
+                    .process_input(b"\x1b]133;D;0\x07\x1b]7;file://ubuntu/home/ubuntu\x07");
+                app.sessions[0].terminal.process_input(BASH_PROMPT);
+                app.sessions[0].refresh(&policy, &mut state);
+                assert_settles(&mut app, &policy, &mut state);
+                assert_eq!(
+                    app.reference_input_metrics().map(|m| m.input_height),
+                    Some(docked.input_height)
+                );
+
+                // A fullscreen application gets the pane immediately.
+                let docked_rows = app.sessions[0].terminal.get_dimensions().1;
+                app.sessions[0]
+                    .terminal
+                    .process_input(b"vim\r\n\x1b]133;C\x07\x1b[?1049h\x1b[H\x1b[2J");
+                app.sessions[0].refresh(&policy, &mut state);
+                assert!(resize_pass(&mut app, &policy, &mut state));
+                assert!(app.reference_input_metrics().is_none());
+                assert!(app.sessions[0].terminal.get_dimensions().1 > docked_rows);
+            }
+        }
+    }
     println!("PASS: SSH prompt, multiline edits, resize convergence, Block/Chat, short windows and font zoom");
+    println!(
+        "PASS: a quick command keeps the input strip and PTY size from Enter to its next prompt"
+    );
+    println!("PASS: one-row bash prompt keeps one input height mid-screen and on the last PTY row");
 }

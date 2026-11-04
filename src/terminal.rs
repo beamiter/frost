@@ -1,4 +1,5 @@
 mod chat_projection;
+pub(crate) use chat_projection::CHAT_MIN_INPUT_ROWS;
 #[cfg(all(test, target_os = "linux"))]
 mod chat_pty_tests;
 #[cfg(test)]

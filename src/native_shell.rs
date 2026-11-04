@@ -41,6 +41,21 @@ fn rgb(value: [u8; 3]) -> Color {
     shell::rgba(value, 1.0)
 }
 
+/// How long a command that just took the prompt keeps its input strip. Most
+/// commands print the next prompt well within this, so one Enter no longer
+/// collapses the input, grows the PTY and shrinks it back a frame later.
+/// Longer commands get the full native pane once it passes.
+pub(crate) const INPUT_DOCK_HOLD: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The active prompt's last docked input. `generation` is set once a command
+/// takes the prompt; only the expiry message of that generation ends the hold.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InputDockHold {
+    pub session_id: usize,
+    pub metrics: crate::native_input_surface::DockMetrics,
+    pub generation: Option<u64>,
+}
+
 pub(crate) fn composer_border_color() -> Color {
     rgb(color::LIGHT_BORDER).scale_alpha(0.6)
 }
@@ -2144,6 +2159,79 @@ impl Frost {
     pub(crate) fn reference_input_metrics(
         &self,
     ) -> Option<crate::native_input_surface::DockMetrics> {
+        self.live_input_metrics()
+            .or_else(|| self.held_input_metrics())
+    }
+
+    /// A command that just took the prompt keeps the input strip until its
+    /// next prompt docks, a TUI takes the pane, or the hold expires.
+    fn held_input_metrics(&self) -> Option<crate::native_input_surface::DockMetrics> {
+        let hold = self.input_dock_hold?;
+        hold.generation?;
+        (self.sessions.get(self.active)?.id == hold.session_id && self.input_dock_hold_eligible())
+            .then_some(hold.metrics)
+    }
+
+    /// The prompt left the input while the transcript is still the chat plan:
+    /// a command running on the primary screen, or the gap between D and the
+    /// next A. Fullscreen and mouse applications get the pane immediately, and
+    /// a prompt too tall to dock is not held either.
+    fn input_dock_hold_eligible(&self) -> bool {
+        if !self.config.is_card_mode() || self.is_split() {
+            return false;
+        }
+        let Some(session) = self.sessions.get(self.active) else {
+            return false;
+        };
+        let rows = session.projection.chat_rows();
+        !session.transcript_read_only()
+            && !self.vim9_tabs.contains_key(&session.id)
+            && !session.terminal.chat_session_state().alternate_screen
+            && !rows.is_empty()
+            && !rows
+                .iter()
+                .any(|row| row.role == crate::chat_mode::ChatRole::Composer)
+    }
+
+    /// Runs after every update, before the PTY budget sync. Returns the
+    /// generation to expire after INPUT_DOCK_HOLD when a hold starts.
+    pub(crate) fn sync_input_dock_hold(&mut self) -> Option<u64> {
+        let active = self.sessions.get(self.active).map(|session| session.id);
+        if let Some(metrics) = self.live_input_metrics() {
+            self.input_dock_hold = active.map(|session_id| InputDockHold {
+                session_id,
+                metrics,
+                generation: None,
+            });
+            return None;
+        }
+        let hold = self.input_dock_hold.take()?;
+        if Some(hold.session_id) != active || !self.input_dock_hold_eligible() {
+            return None;
+        }
+        if hold.generation.is_some() {
+            self.input_dock_hold = Some(hold);
+            return None;
+        }
+        self.input_dock_hold_generation = self.input_dock_hold_generation.wrapping_add(1);
+        let generation = self.input_dock_hold_generation;
+        self.input_dock_hold = Some(InputDockHold {
+            generation: Some(generation),
+            ..hold
+        });
+        Some(generation)
+    }
+
+    pub(crate) fn expire_input_dock_hold(&mut self, generation: u64) {
+        if self
+            .input_dock_hold
+            .is_some_and(|hold| hold.generation == Some(generation))
+        {
+            self.input_dock_hold = None;
+        }
+    }
+
+    fn live_input_metrics(&self) -> Option<crate::native_input_surface::DockMetrics> {
         if !self.config.is_card_mode() || self.is_split() {
             return None;
         }
@@ -2171,7 +2259,14 @@ impl Frost {
             })
             .map(|(row, _)| row)
             .unwrap_or(dock);
-        let rows = last_raw.max(session.cursor.0).saturating_sub(dock) + 1;
+        // The projection pads a live composer to CHAT_MIN_INPUT_ROWS only
+        // while the grid has a row below the prompt. Counting that padding
+        // made a one-row prompt (bash over SSH) one row tall on the last PTY
+        // row and two rows tall one row higher. Docking moves the prompt
+        // between those cases, so the input switched heights on every
+        // update. Apply the floor here so only the prompt decides the height.
+        let rows = (last_raw.max(session.cursor.0).saturating_sub(dock) + 1)
+            .max(terminal::CHAT_MIN_INPUT_ROWS);
         let layout = self.reference_layout();
         let reading_bar = self.block_reading_bar_height();
         let recovery = self.startup_recovery.banner_height(self.chrome_font_size());
@@ -2242,6 +2337,14 @@ impl Frost {
             .iter()
             .position(|row| row.role == crate::chat_mode::ChatRole::Composer)
         else {
+            if self.held_input_metrics().is_some() {
+                let budget = self.reference_native_budget();
+                return crate::native_input_surface::held_surface(
+                    terminal,
+                    budget.input_height,
+                    budget.raw.height,
+                );
+            }
             return direct!();
         };
         let margin = if session.transcript_canvas.enabled() && session.projection.has_canvas_head()
