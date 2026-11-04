@@ -43,6 +43,8 @@ pub(crate) enum Event {
     Submit(u64),
     CancelDialogue(String),
     ReplySeen(String),
+    NoticeSeen(String),
+    NoticeDismiss(String),
     DialogueSave(String, u64),
     HistoryScope(String),
     HistoryLoad(bool, u64),
@@ -836,6 +838,9 @@ impl Eva {
                     }
                 }
             }
+            // The card shows a notice; the user confirms it was seen or closes it.
+            Event::NoticeSeen(notice_id) => self.host.notice_displayed(&notice_id),
+            Event::NoticeDismiss(notice_id) => self.host.dismiss_notice(&notice_id),
             Event::CancelDialogue(expected) => {
                 if let Some((turn_id, _)) = self.dialogue.as_ref().filter(|(id, _)| id == &expected)
                 {
@@ -1427,8 +1432,11 @@ impl Frost {
             .dialogue
             .as_ref()
             .map_or(String::new(), |(id, _)| id.clone());
+        let notice = eva.host.notices.latest();
         let mut card = column![row![
-            text("Eva").size(12).width(Length::Fill),
+            text(if notice.is_some() { "Eva •" } else { "Eva" })
+                .size(12)
+                .width(Length::Fill),
             companion_button(text(if eva.details_open {
                 "Close"
             } else {
@@ -1547,6 +1555,19 @@ impl Frost {
             card = card.push(
                 companion_button(text("Discard selected context"))
                     .on_press(Message::Eva(Event::SelectionCancel)),
+            );
+        }
+        // Proactive notice (negotiated only). Its offer is a label; nothing here runs it.
+        if let Some(notice) = notice {
+            card = card.push(text(shared::notice::card_text(notice)).size(12));
+            card = card.push(
+                row![
+                    companion_button(text("Acknowledge notice"))
+                        .on_press(Message::Eva(Event::NoticeSeen(notice.notice_id.clone()))),
+                    companion_button(text("Dismiss notice"))
+                        .on_press(Message::Eva(Event::NoticeDismiss(notice.notice_id.clone()))),
+                ]
+                .spacing(6),
             );
         }
         if !eva.dialogue_reply.is_empty() {
