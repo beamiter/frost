@@ -54,6 +54,8 @@ jobs:
       - name: Build the actual native binary
         id: vim9-build
         run: cargo build --bin frost --locked
+      - name: Check native X11 capture pixel contracts
+        run: /usr/bin/python3 scripts/test-native-x11-capture.py
       - name: Native XTest window acceptance
         env:
           WGPU_BACKEND: gl

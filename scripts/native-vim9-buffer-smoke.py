@@ -14,6 +14,7 @@ import subprocess
 import time
 
 from PIL import Image, ImageChops, ImageGrab
+from native_x11_capture import X11StripCapture
 
 
 def wait_for(probe, label, process, timeout=25):
@@ -107,6 +108,7 @@ def main():
     env.pop("GVIMINIT", None)
     env.pop("JTERM_VIM9_BIN", None)
     log = (out / "application.log").open("w")
+    wheel_capture = None
     app = subprocess.Popen([str(args.binary.resolve()), "--ide", str(source)], env=env, stdout=log, stderr=log)
     def xdo(*parts):
         result = subprocess.run(["xdotool", *map(str, parts)], env=env, text=True, capture_output=True, timeout=4)
@@ -281,9 +283,11 @@ def main():
                int(geometry["X"]) + int(geometry["WIDTH"]), int(geometry["Y"]) + int(geometry["HEIGHT"]))
         wheel_images = []
         def wheel_y(name):
-            # XCB memory capture avoids ImageMagick process/PNG latency inside
-            # the 100 ms gesture. Encode artifacts after sampling has finished.
-            image = ImageGrab.grab(bbox=box, xdisplay=env["DISPLAY"]).convert("RGB")
+            # The first full frame establishes the exact colored source line.
+            # Timed reads then retain an X11 connection and capture only that
+            # line's 64-pixel column, with the full original vertical extent.
+            image = (wheel_capture.capture() if wheel_capture is not None else
+                     ImageGrab.grab(bbox=box, xdisplay=env["DISPLAY"]).convert("RGB"))
             wheel_images.append((name, image))
             mask = None
             for channel, value in zip(image.split(), (0x30, 0x40, 0x50)):
@@ -292,14 +296,34 @@ def main():
             bounds = mask.getbbox()
             return bounds[1] if bounds is not None else None
         def trace_notch(prefix, mode):
+            nonlocal wheel_capture
             xdo("mousemove", "--window", window, "200", "200")
             start_y = wait_for(lambda: wheel_y(prefix + "-before"), "painted wheel source highlight", app)
+            if wheel_capture is None:
+                full = wheel_images[-1][1]
+                matches = [x for x in range(full.width)
+                           if full.getpixel((x, start_y)) == (0x30, 0x40, 0x50)]
+                assert matches, "Full frame has no observed wheel highlight"
+                left = matches[0]
+                right = min(left + 64, matches[-1] + 1)
+                strip = (box[0] + left, box[1], box[0] + right, box[3])
+                wheel_capture = X11StripCapture(env["DISPLAY"], strip)
+                # Compare independent whole-frame and strip observations before
+                # injecting any wheel input. No synthetic positions are used.
+                assert wheel_y(prefix + "-strip-baseline") == start_y
+                report["wheel_capture"] = {"root_box": strip, "window_box": box,
+                    "source_rgb": [0x30, 0x40, 0x50], "baseline_y": start_y,
+                    "method": "retained X11 root-window XGetImage"}
             before_ack = state().get("render", {}).get("scroll_ack", 0)
             started = time.monotonic()
             xdo("click", "--delay", "0", "5")
             trace = []
-            for index in range(8):
-                trace.append([round(time.monotonic() - started, 4), wheel_y(prefix + "-step-" + str(index))])
+            # Observe one notch for the same bounded ~350 ms window, now at
+            # native frame cadence rather than eight expensive full captures.
+            # This is a single gesture, never a retry until an assertion passes.
+            while time.monotonic() - started < 0.35:
+                trace.append([round(time.monotonic() - started, 4),
+                              wheel_y(prefix + "-step-" + str(len(trace)))])
                 time.sleep(0.008)
             report["wheel_attempt_" + mode] = {"start_y": start_y, "trace": trace,
                                                "before_ack": before_ack, "after_state": state()}
@@ -638,6 +662,8 @@ def main():
         (out / "failure-state.json").write_text(json.dumps(report, indent=2) + "\n")
         raise
     finally:
+        if wheel_capture is not None:
+            wheel_capture.close()
         if app.poll() is None:
             app.send_signal(signal.SIGCONT)
             app.terminate()
