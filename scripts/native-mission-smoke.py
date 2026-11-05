@@ -119,15 +119,20 @@ def main():
             pointer_command('scroll ' + str(amount))
         time.sleep(.2)
 
-    def observe(label):
+    def observe(label, control=False):
         nonlocal sequence
         sequence += 1
         move(1279, 450)
         name = f'{sequence:03d}-{label}'
         smoke.screenshot(name)
         source = out / (name + '.ocr.png')
+        # Blue native buttons have dark text, unlike the light body labels.
+        # A fixed luminance split preserves their glyphs; neither text nor
+        # click coordinates are inferred from the expected control.
+        transform = ['-threshold', '25%'] if control else ['-negate']
+        scale = 3 if control else 2
         smoke.run(['convert', str(out / (name + '.png')), '-colorspace', 'Gray',
-                   '-negate', '-resize', '200%', str(source)], capture_output=True)
+                   *transform, '-resize', f'{scale * 100}%', str(source)], capture_output=True)
         raw = smoke.run(['tesseract', str(source), 'stdout', '--psm', '11', 'tsv'],
                         text=True, capture_output=True).stdout
         (out / (name + '.tsv')).write_text(raw)
@@ -135,22 +140,22 @@ def main():
                 if r['level'] == '5' and r['text'].strip()]
         for row in rows:
             for key in ('left', 'top', 'width', 'height'):
-                row[key] = str(round(int(row[key]) / 2))
+                row[key] = str(round(int(row[key]) / scale))
         return name, rows
 
-    def locate(text, label, direction=1, unique=True):
+    def locate(text, label, direction=1, unique=True, control=False):
         for attempt in range(7):
-            name, rows = observe(label)
+            name, rows = observe(label, control)
             bounds = phrase(rows, text, unique)
             if bounds:
-                (out / (name + '.target.json')).write_text(json.dumps({'text': text, 'bounds': bounds}))
+                (out / (name + '.target.json')).write_text(json.dumps({'text': text, 'bounds': bounds, 'profile': 'button-luminance' if control else 'body-inverse'}))
                 return bounds
             if attempt < 6:
                 scroll(3 * direction)
         raise AssertionError('Exact visible Mission control not found: ' + text)
 
     def press(text, label, direction=1):
-        left, top, right, bottom = locate(text, label, direction)
+        left, top, right, bottom = locate(text, label, direction, control=True)
         click((left + right) // 2, (top + bottom) // 2)
 
     def fill(label, value):
@@ -196,6 +201,7 @@ def main():
         press('Create Mission', 'create-mission')
         saved, _ = runner.wait_for(stored, 'visible Mission creation persisted')
         assert saved['title'] == 'FrostMissionFixture' and saved['revision'] == 1
+        assert saved['goal'] == 'Inspect exact local commits without claiming delivery'
         assert [Path(r['path']) for r in saved['repositories']] == checkouts
         result['mission_id'] = saved['id']
         result['assertions'].append('Native labelled inputs created exactly one five-repository host plan')
