@@ -311,11 +311,11 @@ impl SessionLibrary {
         if self.archive == SessionArchiveFilter::Archived {
             query.push_str(" is:archived");
         }
-        if let Some(project) = self
-            .project_selection
-            .as_deref()
-            .or_else(|| self.project_only.then_some(self.project.as_deref()).flatten())
-        {
+        if let Some(project) = self.project_selection.as_deref().or_else(|| {
+            self.project_only
+                .then_some(self.project.as_deref())
+                .flatten()
+        }) {
             let quoted = serde_json::to_string(&project.to_string_lossy()).unwrap_or_default();
             query.push_str(&format!(" project:{quoted}"));
         }
@@ -1600,11 +1600,16 @@ impl super::Frost {
                 .spacing(2),
             );
             list = list.push(
-                button(text(format!(
-                    "Missions · {} need review",
-                    state.missions.controller.needs_attention()
-                )).size(size - 1.0))
-                .on_press(M::WorkspaceMission(crate::workspace_mission::MissionAction::Open))
+                button(
+                    text(format!(
+                        "Missions · {} need review",
+                        state.missions.controller.needs_attention()
+                    ))
+                    .size(size - 1.0),
+                )
+                .on_press(M::WorkspaceMission(
+                    crate::workspace_mission::MissionAction::Open,
+                ))
                 .style(button::text),
             );
             if let Some(notice) = state

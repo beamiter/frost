@@ -1,7 +1,9 @@
 //! Native Mission inspector over the shared host controller.
 //! A renderer edits plans and reads receipts; it never asserts delivery success.
 use crate::{native_shell::InspectorTab, Frost, Message};
-use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_editor, text_input};
+use iced::widget::{
+    button, checkbox, column, container, row, scrollable, text, text_editor, text_input,
+};
 use iced::{Element, Length, Task};
 use jterm_core::agent_workspace::{
     ConversationId, ConversationKind, MissionWorkbench, WorkspaceMission,
@@ -143,7 +145,10 @@ impl MissionPanel {
             plan.evidence_after_ms = selected.evidence_after_ms;
             plan == selected
         });
-        if self.draft.as_ref().is_none_or(|draft| draft.id != selected.id)
+        if self
+            .draft
+            .as_ref()
+            .is_none_or(|draft| draft.id != selected.id)
             || !self.dirty()
             || matches_saved_edit
         {
@@ -212,8 +217,8 @@ impl Frost {
     pub(crate) fn workspace_mission_action(&mut self, action: MissionAction) -> Task<Message> {
         if matches!(action, MissionAction::Open) {
             self.agent_sessions.missions.open = true;
-            self.agent_sessions.missions.only_attention =
-                self.agent_sessions.status == Some(jterm_core::agent_sessions::SessionStatus::Waiting);
+            self.agent_sessions.missions.only_attention = self.agent_sessions.status
+                == Some(jterm_core::agent_sessions::SessionStatus::Waiting);
             self.agent_sessions.missions.controller.refresh();
             self.agent_sessions.context_input_focused = false;
             self.reference_navigation_drawer = false;
@@ -256,7 +261,9 @@ impl Frost {
             }
             MissionAction::NewToggle => panel.new_open = !panel.new_open,
             MissionAction::NewTitle(value) if ready && panel.new_open => panel.new_title = value,
-            MissionAction::NewGoal(action) if ready && panel.new_open => panel.new_goal.perform(action),
+            MissionAction::NewGoal(action) if ready && panel.new_open => {
+                panel.new_goal.perform(action)
+            }
             MissionAction::NewPath(index, value) if ready && panel.new_open => {
                 if let Some((_, path)) = panel.new_paths.get_mut(index) {
                     *path = value;
@@ -268,7 +275,9 @@ impl Frost {
                     .iter()
                     .map(|(name, path)| (name.clone(), PathBuf::from(path)))
                     .collect();
-                panel.controller.create(&panel.new_title, &panel.new_goal.text(), &paths);
+                panel
+                    .controller
+                    .create(&panel.new_title, &panel.new_goal.text(), &paths);
                 panel.sync();
             }
             MissionAction::Edit(reference, edit) => panel.edit(&reference, edit),
@@ -317,10 +326,15 @@ impl Frost {
                 button(text("Refresh").size(size)).on_press(action(MissionAction::Refresh)),
                 button(text("Back").size(size)).on_press(action(MissionAction::Close)),
                 button(text("New Mission").size(size)).on_press(action(MissionAction::NewToggle)),
-            ].spacing(6).wrap(),
-            checkbox(panel.only_attention).label("Needs you: unfinished repositories")
-                .size(size).on_toggle(move |value| action(MissionAction::NeedsYou(value))),
-        ].spacing(10);
+            ]
+            .spacing(6)
+            .wrap(),
+            checkbox(panel.only_attention)
+                .label("Needs you: unfinished repositories")
+                .size(size)
+                .on_toggle(move |value| action(MissionAction::NeedsYou(value))),
+        ]
+        .spacing(10);
         if panel.controller.busy {
             body = body.push(text("Reading the host…").size(size).style(text::secondary));
         }
@@ -330,21 +344,36 @@ impl Frost {
         for mission in &panel.controller.missions {
             body = body.push(
                 button(text(visible(&mission.title)).size(size))
-                    .on_press_maybe((ready && !dirty).then(|| action(MissionAction::Select(mission.id.clone()))))
-                    .style(if panel.draft.as_ref().is_some_and(|draft| draft.id == mission.id) {
-                        button::primary
-                    } else {
-                        button::text
-                    }),
+                    .on_press_maybe(
+                        (ready && !dirty)
+                            .then(|| action(MissionAction::Select(mission.id.clone()))),
+                    )
+                    .style(
+                        if panel
+                            .draft
+                            .as_ref()
+                            .is_some_and(|draft| draft.id == mission.id)
+                        {
+                            button::primary
+                        } else {
+                            button::text
+                        },
+                    ),
             );
         }
         if panel.new_open {
             let mut form = column![
                 text("New five-repository Mission").size(size + 1.0),
-                input("Title", &panel.new_title, size, ready, move |value| action(MissionAction::NewTitle(value))),
+                input("Title", &panel.new_title, size, ready, move |value| action(
+                    MissionAction::NewTitle(value)
+                )),
                 text("Acceptance goal").size(size - 1.0),
-            ].spacing(7);
-            let mut editor = text_editor(&panel.new_goal).size(size).height(size * 4.5 + 24.0).padding(10);
+            ]
+            .spacing(7);
+            let mut editor = text_editor(&panel.new_goal)
+                .size(size)
+                .height(size * 4.5 + 24.0)
+                .padding(10);
             if ready {
                 editor = editor.on_action(move |value| action(MissionAction::NewGoal(value)));
             }
@@ -354,26 +383,45 @@ impl Frost {
                     action(MissionAction::NewPath(index, value))
                 }));
             }
-            form = form.push(text("Enter each absolute checkout or task worktree path.").size(size - 1.0))
-                .push(button(text("Create Mission").size(size))
-                    .on_press_maybe((ready && !dirty).then_some(action(MissionAction::Create))));
+            form = form
+                .push(text("Enter each absolute checkout or task worktree path.").size(size - 1.0))
+                .push(
+                    button(text("Create Mission").size(size))
+                        .on_press_maybe((ready && !dirty).then_some(action(MissionAction::Create))),
+                );
             body = body.push(form);
         }
         let Some(draft) = &panel.draft else {
-            return container(scrollable(body.push(text("Select a saved plan or create a Mission.").size(size))))
-                .padding(12).height(Length::Fill).into();
+            return container(scrollable(
+                body.push(text("Select a saved plan or create a Mission.").size(size)),
+            ))
+            .padding(12)
+            .height(Length::Fill)
+            .into();
         };
         let reference = MissionRef::from(draft);
         let edit_ref = reference.clone();
-        body = body.push(text(format!("Plan revision {}", draft.revision)).size(size - 1.0))
+        body = body
+            .push(text(format!("Plan revision {}", draft.revision)).size(size - 1.0))
             .push(input("Title", &draft.title, size, ready, move |value| {
-                action(MissionAction::Edit(edit_ref.clone(), MissionEdit::Title(value)))
+                action(MissionAction::Edit(
+                    edit_ref.clone(),
+                    MissionEdit::Title(value),
+                ))
             }))
             .push(text("Acceptance goal").size(size - 1.0));
         let goal_ref = reference.clone();
-        let mut editor = text_editor(&panel.goal).size(size).height(size * 4.5 + 24.0).padding(10);
+        let mut editor = text_editor(&panel.goal)
+            .size(size)
+            .height(size * 4.5 + 24.0)
+            .padding(10);
         if ready {
-            editor = editor.on_action(move |value| action(MissionAction::Edit(goal_ref.clone(), MissionEdit::Goal(value))));
+            editor = editor.on_action(move |value| {
+                action(MissionAction::Edit(
+                    goal_ref.clone(),
+                    MissionEdit::Goal(value),
+                ))
+            });
         }
         body = body.push(editor);
         let environment_ref = reference.clone();
@@ -385,33 +433,68 @@ impl Frost {
             body = body.push(text("Unsaved edits: save or reload before selecting another plan or inspecting delivery.")
                 .size(size).style(text::warning));
         }
-        if panel.saved.as_ref().is_some_and(|saved| saved.revision != draft.revision) {
+        if panel
+            .saved
+            .as_ref()
+            .is_some_and(|saved| saved.revision != draft.revision)
+        {
             body = body.push(text("The shared revision changed. Your draft is retained; compare it before reloading.")
                 .size(size).style(text::warning));
         }
-        body = body.push(row![
-            button(text("Save plan").size(size)).on_press_maybe((ready && dirty).then(|| action(MissionAction::Save(reference.clone())))),
-            button(text("Reload saved").size(size)).on_press_maybe((ready && dirty).then(|| action(MissionAction::Reload(reference.clone())))),
-            button(text("Inspect delivery").size(size)).on_press_maybe((ready && !dirty).then(|| action(MissionAction::Inspect(reference.clone())))),
-            button(text("Use observed commits").size(size)).on_press_maybe((ready && !dirty && panel.controller.report.is_some()).then(|| action(MissionAction::Adopt(reference.clone())))),
-        ].spacing(6).wrap());
-        if let Some(selected) = self.workspace_selected_row().filter(|row| row.kind == ConversationKind::Task) {
-            body = body.push(button(text("Link selected task run").size(size))
-                .on_press_maybe((ready && !dirty).then(|| action(MissionAction::Link(reference.clone(), selected.id)))));
+        body = body.push(
+            row![
+                button(text("Save plan").size(size)).on_press_maybe(
+                    (ready && dirty).then(|| action(MissionAction::Save(reference.clone())))
+                ),
+                button(text("Reload saved").size(size)).on_press_maybe(
+                    (ready && dirty).then(|| action(MissionAction::Reload(reference.clone())))
+                ),
+                button(text("Inspect delivery").size(size)).on_press_maybe(
+                    (ready && !dirty).then(|| action(MissionAction::Inspect(reference.clone())))
+                ),
+                button(text("Use observed commits").size(size)).on_press_maybe(
+                    (ready && !dirty && panel.controller.report.is_some())
+                        .then(|| action(MissionAction::Adopt(reference.clone())))
+                ),
+            ]
+            .spacing(6)
+            .wrap(),
+        );
+        if let Some(selected) = self
+            .workspace_selected_row()
+            .filter(|row| row.kind == ConversationKind::Task)
+        {
+            body = body.push(
+                button(text("Link selected task run").size(size)).on_press_maybe(
+                    (ready && !dirty)
+                        .then(|| action(MissionAction::Link(reference.clone(), selected.id))),
+                ),
+            );
         }
-        let report = panel.controller.report.as_ref().filter(|report| report.id == draft.id && report.revision == draft.revision && !dirty);
+        let report =
+            panel.controller.report.as_ref().filter(|report| {
+                report.id == draft.id && report.revision == draft.revision && !dirty
+            });
         if let Some(report) = report {
             body = body.push(text(report.state.label()).size(size + 1.0));
             for error in &report.errors {
                 body = body.push(text(visible(error)).size(size).style(text::danger));
             }
         } else {
-            body = body.push(text("Delivery has not been inspected for this plan revision.").size(size));
+            body = body
+                .push(text("Delivery has not been inspected for this plan revision.").size(size));
         }
         let task_rows = self.workspace_task_rows();
         for repository in &draft.repositories {
-            let observed = report.and_then(|report| report.repositories.iter().find(|entry| entry.identity.matches(&repository.identity)));
-            if panel.only_attention && observed.is_some_and(WorkspaceMissionRepositoryReport::complete) {
+            let observed = report.and_then(|report| {
+                report
+                    .repositories
+                    .iter()
+                    .find(|entry| entry.identity.matches(&repository.identity))
+            });
+            if panel.only_attention
+                && observed.is_some_and(WorkspaceMissionRepositoryReport::complete)
+            {
                 continue;
             }
             let name = repository.identity.full_name.clone();
@@ -424,34 +507,95 @@ impl Frost {
             let path = repository.path.to_string_lossy().into_owned();
             let mut section = column![
                 text(visible(&name)).size(size + 1.0),
-                input_owned("Checkout / task worktree", path, size, ready, move |value| action(MissionAction::Edit(path_ref.clone(), MissionEdit::Path(path_name.clone(), value)))),
-                input("Target branch ref", &repository.target_ref, size, ready, move |value| action(MissionAction::Edit(target_ref.clone(), MissionEdit::Target(target_name.clone(), value)))),
-                input("Required checks (comma-separated)", panel.checks.get(&name).map_or("", String::as_str), size, ready, move |value| action(MissionAction::Edit(checks_ref.clone(), MissionEdit::Checks(checks_name.clone(), value)))),
+                input_owned(
+                    "Checkout / task worktree",
+                    path,
+                    size,
+                    ready,
+                    move |value| action(MissionAction::Edit(
+                        path_ref.clone(),
+                        MissionEdit::Path(path_name.clone(), value)
+                    ))
+                ),
+                input(
+                    "Target branch ref",
+                    &repository.target_ref,
+                    size,
+                    ready,
+                    move |value| action(MissionAction::Edit(
+                        target_ref.clone(),
+                        MissionEdit::Target(target_name.clone(), value)
+                    ))
+                ),
+                input(
+                    "Required checks (comma-separated)",
+                    panel.checks.get(&name).map_or("", String::as_str),
+                    size,
+                    ready,
+                    move |value| action(MissionAction::Edit(
+                        checks_ref.clone(),
+                        MissionEdit::Checks(checks_name.clone(), value)
+                    ))
+                ),
                 detail("Baseline", &repository.baseline, size),
-                detail("Candidate", repository.candidate.as_deref().unwrap_or("Not selected"), size),
-                detail("Required core pin", repository.required_core_pin.as_deref().unwrap_or("Not required"), size),
-            ].spacing(7);
+                detail(
+                    "Candidate",
+                    repository.candidate.as_deref().unwrap_or("Not selected"),
+                    size
+                ),
+                detail(
+                    "Required core pin",
+                    repository
+                        .required_core_pin
+                        .as_deref()
+                        .unwrap_or("Not required"),
+                    size
+                ),
+            ]
+            .spacing(7);
             if let Some(receipt) = observed {
                 section = section.push(receipt_view(receipt, size));
             } else {
                 section = section.push(text("No receipt for this revision.").size(size));
             }
             for linked in &repository.tasks {
-                let task = task_rows.iter().find(|(_, row)| row.id == linked.conversation);
-                let label = task.map(|(_, row)| format!("Execution: {} · {}", visible(&row.title), row.presentation().status_label))
-                    .unwrap_or_else(|| format!("Execution: task {} · catalog unavailable", linked.task_id));
-                section = section.push(text(label).size(size - 1.0))
-                    .push(detail("Linked run", &linked.run_id, size))
-                    .push(button(text("Open linked task").size(size))
-                        .on_press_maybe(task.is_some().then(|| action(MissionAction::OpenTask(linked.conversation.clone())))));
+                let task = task_rows
+                    .iter()
+                    .find(|(_, row)| row.id == linked.conversation);
+                let label = task
+                    .map(|(_, row)| {
+                        format!(
+                            "Execution: {} · {}",
+                            visible(&row.title),
+                            row.presentation().status_label
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        format!("Execution: task {} · catalog unavailable", linked.task_id)
+                    });
+                section =
+                    section
+                        .push(text(label).size(size - 1.0))
+                        .push(detail("Linked run", &linked.run_id, size))
+                        .push(button(text("Open linked task").size(size)).on_press_maybe(
+                            task.is_some().then(|| {
+                                action(MissionAction::OpenTask(linked.conversation.clone()))
+                            }),
+                        ));
             }
-            body = body.push(container(section).padding(10).style(container::bordered_box));
+            body = body.push(
+                container(section)
+                    .padding(10)
+                    .style(container::bordered_box),
+            );
         }
         body = body.push(text("Receipts describe the last host observation. Inspect again after new commits, remote updates or validation. Task execution, acceptance and publication remain separate.")
             .size(size - 1.0).style(text::secondary));
         crate::widget_identity_scope::scope_key(
             ("mission-inspector", draft.id.clone()),
-            container(scrollable(body).height(Length::Fill)).padding(12).height(Length::Fill),
+            container(scrollable(body).height(Length::Fill))
+                .padding(12)
+                .height(Length::Fill),
         )
     }
 }
@@ -460,41 +604,94 @@ fn visible(value: &str) -> String {
     crate::review_text::visible_bounded(value, 4096)
 }
 
-fn input<'a>(label: &str, value: &str, size: f32, enabled: bool, callback: impl Fn(String) -> Message + 'a) -> Element<'a, Message> {
+fn input<'a>(
+    label: &str,
+    value: &str,
+    size: f32,
+    enabled: bool,
+    callback: impl Fn(String) -> Message + 'a,
+) -> Element<'a, Message> {
     input_owned(label, value.to_owned(), size, enabled, callback)
 }
 
-fn input_owned<'a>(label: &str, value: String, size: f32, enabled: bool, callback: impl Fn(String) -> Message + 'a) -> Element<'a, Message> {
+fn input_owned<'a>(
+    label: &str,
+    value: String,
+    size: f32,
+    enabled: bool,
+    callback: impl Fn(String) -> Message + 'a,
+) -> Element<'a, Message> {
     let mut control = text_input("", &value).size(size);
     if enabled {
         control = control.on_input(callback);
     }
-    column![text(label.to_owned()).size(size - 1.0), control].spacing(3).into()
+    column![text(label.to_owned()).size(size - 1.0), control]
+        .spacing(3)
+        .into()
 }
 
 fn detail(label: &str, value: &str, size: f32) -> Element<'static, Message> {
-    text(format!("{label}: {}", visible(value))).size(size - 1.0).into()
+    text(format!("{label}: {}", visible(value)))
+        .size(size - 1.0)
+        .into()
 }
 
-fn receipt_view(receipt: &WorkspaceMissionRepositoryReport, size: f32) -> Element<'static, Message> {
+fn receipt_view(
+    receipt: &WorkspaceMissionRepositoryReport,
+    size: f32,
+) -> Element<'static, Message> {
     let observed = receipt.observed.is_some();
-    let stage = |label, passed| detail(label, if passed { "Confirmed" } else { "Unconfirmed" }, size);
+    let stage = |label, passed| {
+        detail(
+            label,
+            if passed { "Confirmed" } else { "Unconfirmed" },
+            size,
+        )
+    };
     let mut body = column![
-        detail("Changed files", if !observed { "Not inspected" } else if receipt.modified { "Changes observed" } else { "No changes observed" }, size),
+        detail(
+            "Changed files",
+            if !observed {
+                "Not inspected"
+            } else if receipt.modified {
+                "Changes observed"
+            } else {
+                "No changes observed"
+            },
+            size
+        ),
         stage("Candidate committed", receipt.committed),
         stage("Remote candidate receipt", receipt.pushed),
         stage("Merged into target ref", receipt.integrated),
         stage("This candidate validated", receipt.validated),
         stage("Core dependency pins", receipt.pins_current),
-    ].spacing(4);
+    ]
+    .spacing(4);
     if let Some(local) = &receipt.observed {
-        body = body.push(detail("Observed HEAD", &local.head, size))
+        body = body
+            .push(detail("Observed HEAD", &local.head, size))
             .push(detail("Fingerprint", &local.fingerprint, size))
-            .push(detail("Working tree", if local.dirty { "Dirty input" } else { "Clean" }, size))
-            .push(detail("Observed at (Unix ms)", &local.observed_at_ms.to_string(), size));
+            .push(detail(
+                "Working tree",
+                if local.dirty { "Dirty input" } else { "Clean" },
+                size,
+            ))
+            .push(detail(
+                "Observed at (Unix ms)",
+                &local.observed_at_ms.to_string(),
+                size,
+            ));
     }
     for check in &receipt.checks {
-        body = body.push(detail(&format!("Validation · {} · {}", visible(&check.check_name), visible(&check.environment)), check.status.label(), size));
+        body = body.push(detail(
+            &format!(
+                "Validation · {} · {}",
+                visible(&check.check_name),
+                visible(&check.environment)
+            ),
+            check.status.label(),
+            size,
+        ));
         if let Some(reason) = &check.detail {
             body = body.push(text(visible(reason)).size(size - 1.0));
         }

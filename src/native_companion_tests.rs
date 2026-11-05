@@ -493,7 +493,10 @@ fn panel_toggles_return_native_columns_without_changing_rows_at_the_same_font() 
         let expanded =
             crate::glass_layout::Layout::with_panels(width, height, None, None, false, false);
         let reference = crate::native_viewport::raw_rect(layout, 0.0, 0.0, None);
-        assert_eq!((reference.width, reference.height), (expected_width, expected_height));
+        assert_eq!(
+            (reference.width, reference.height),
+            (expected_width, expected_height)
+        );
         for font in [14.0, 36.0, 72.0] {
             let metrics = Metrics::new(font, 1.0, 2.0, false);
             for requested in [None, Some(44.0_f32), Some(180.0_f32)] {
