@@ -148,9 +148,7 @@ metrics_start = apply.index('self.metrics = Metrics::with_font(')
 metrics_assignment = apply[metrics_start:apply.index(';', metrics_start) + 1]
 replacements = {
     'toolbar-constants': '\n'.join(constant(profile, name) for name in [
-        'COMPOSER_CONTROL_LEFT', 'COMPOSER_CONTROL_RIGHT', 'COMPOSER_PLUS_WIDTH',
-        'COMPOSER_TERMINAL_WIDTH', 'COMPOSER_TOOLS_WIDTH', 'COMPOSER_SEND_WIDTH',
-        'METADATA_GAP', 'COMPOSER_TERMINAL_MIN_AVAILABLE']),
+        'COMPOSER_CONTROL_LEFT', 'COMPOSER_CONTROL_RIGHT', 'METADATA_GAP']),
     'constants': '\n'.join([constant(view, name) for name in ['SCROLLBAR_WIDTH', 'BLOCK_GUTTER_WIDTH']]
                            + [constant(terminal, name) for name in ['MAX_TERMINAL_COLS', 'MAX_TERMINAL_ROWS']]
                            + [constant(main, 'PANE_HEADER_H')]),

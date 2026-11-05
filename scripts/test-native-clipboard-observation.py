@@ -3,7 +3,7 @@
 import unittest
 from unittest.mock import patch
 
-from native_clipboard_observation import locate_find_input, observe_exact_word
+from native_clipboard_observation import live_prompt_target, locate_find_input, observe_exact_word
 
 
 class ExactObservationTests(unittest.TestCase):
@@ -41,6 +41,13 @@ class ExactObservationTests(unittest.TestCase):
                       b'P5\n1 1\n255\n\x00'):
             with self.subTest(length=len(frame)):
                 self.assertRaises(AssertionError, locate_find_input, frame)
+
+    def test_primary_target_requires_unique_visible_live_prompt(self):
+        row = dict(text='FROST_SMOKE>', conf='91', top='782', left='371', width='102', height='13')
+        self.assertEqual(live_prompt_target([row]), (497, 788))
+        for rows in ([], [row, row], [dict(row, top='120')], [dict(row, conf='20')],
+                     [dict(row, text='FROST_SMOKES')]):
+            self.assertRaises(AssertionError, live_prompt_target, rows)
 
     def test_blink_frame_is_retained_before_exact_frame(self):
         artifacts, observations = [], []

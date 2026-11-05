@@ -89,14 +89,9 @@ def main():
         smoke.select_terminal()
         original = smoke.command('dpi-ready')
         def record(label):
-            path = out / (label + '-stty.txt')
-            smoke.text('__frost_grid ' + label)
-            smoke.key('Return')
-            identity = smoke.command(label)
-            geometry.require(identity == original, 'Native DPI input replaced original shell')
-            rows, cols = map(int, path.read_text().split())
-            pid, tty = identity.split(':', 1)
-            return {'pid': int(pid), 'tty': tty, 'rows': rows, 'cols': cols}
+            shell = smoke.grid_record(label)
+            geometry.require(f"{shell['pid']}:{shell['tty']}" == original, 'Native DPI input replaced original shell')
+            return shell
         result['records'] = geometry.run_sequence(smoke, app.pid, probe, record)
         smoke.close_app(app)
         geometry.require(hashlib.sha256(binary.read_bytes()).hexdigest() == binary_sha,

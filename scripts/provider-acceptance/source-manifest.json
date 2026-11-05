@@ -1,5 +1,5 @@
 {
-  "production_manifest_sha256": "34c901a8697b6747ba36f8c02c766dac278e26385be3afedcaa55bf8f767ad0d",
+  "production_manifest_sha256": "0f90da23780cb9e3e55ba7da75d5aa7f8228778550febb3dde1f2e3d1d370366",
   "files": [
     {
       "path": "vendor/window_clipboard/.cargo_vcs_info.json",
@@ -271,7 +271,7 @@
     },
     {
       "path": "scripts/native-desktop-smoke.py",
-      "sha256": "61746e7f4806f6f640dd4a08b3d7f82d9ef1444fa0cfc63096219fbd5b549af5"
+      "sha256": "cd5df8cac572352b6dd49d01b7fdba394ae97f1d974b3ce6b8df2e3c4c717d5a"
     },
     {
       "path": "scripts/native-clipboard-owner.c",

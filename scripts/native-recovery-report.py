@@ -121,14 +121,16 @@ def capture_ocr(png, run):
 
     Dark 14px text was invisible to raw psm11 in the first hosted capture.
     Invert to dark-on-light, enlarge before binarizing to preserve antialiasing,
-    then remove the dark-theme background. Never crop or synthesize text.
+    then remove dark-theme backgrounds and panel borders. The same fixed 50%
+    threshold retains the light native labels without merging a border into
+    the readiness token. Never crop, rewrite tokens, or synthesize text.
     """
     require(png_extent(png) == SCREEN,
             'Unexpected desktop capture extent; refusing guessed pointer coordinates')
     processed = png.with_suffix('.ocr.png')
     command = ['convert', str(png), '-colorspace', 'Gray', '-negate',
                '-filter', 'Lanczos', '-resize', f'{OCR_SCALE * 100}%',
-               '-threshold', '80%', str(processed)]
+               '-threshold', '50%', str(processed)]
     run(command, capture_output=True)
     require(png_extent(processed) == tuple(value * OCR_SCALE for value in SCREEN),
             'OCR preprocessing changed the expected coordinate transform')

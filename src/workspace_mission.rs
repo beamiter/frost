@@ -453,7 +453,7 @@ impl Frost {
                     (ready && !dirty).then(|| action(MissionAction::Inspect(reference.clone())))
                 ),
                 button(text("Use observed commits").size(size)).on_press_maybe(
-                    (ready && !dirty && panel.controller.report_for(&draft.id).is_some())
+                    (ready && !dirty && panel.controller.can_adopt_candidates())
                         .then(|| action(MissionAction::Adopt(reference.clone())))
                 ),
             ]

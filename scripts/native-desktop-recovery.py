@@ -81,12 +81,9 @@ try:
     if args.backend == 'wayland':
         probe = scale_geometry.build_probe(out / 'production-geometry')
         def record_grid(label):
-            record = out / (label + '-stty.txt')
-            identity = execute('__frost_grid ' + label, label)
-            assert identity == restored_first, 'Scaling changed the active session'
-            rows, cols = map(int, record.read_text().split())
-            pid, tty = identity.split(':', 1)
-            return {'rows': rows, 'cols': cols, 'pid': int(pid), 'tty': tty}
+            shell = smoke.grid_record(label)
+            assert f"{shell['pid']}:{shell['tty']}" == restored_first, 'Scaling changed the active session'
+            return shell
         dimensions = scale_geometry.run_sequence(smoke, second.pid, probe, record_grid)
         result['scaling'] = dimensions
         result['assertions'].append('Wayland 1/1.25/1.5/2/1: exact production viewport/font PTY geometry, native panel edges and same-shell reset')

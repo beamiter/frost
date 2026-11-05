@@ -19,21 +19,7 @@ pub const COMPOSER_INSET: f32 = glass::TERMINAL_INSET_LEFT;
 pub const COMPOSER_CONTROL_LEFT: f32 = 6.0;
 pub const COMPOSER_CONTROL_RIGHT: f32 = 6.0;
 pub const COMPOSER_CONTROL_BOTTOM: f32 = 5.0;
-pub const COMPOSER_PLUS_WIDTH: f32 = 26.0;
-pub const COMPOSER_TERMINAL_WIDTH: f32 = 76.0;
-pub const COMPOSER_TOOLS_WIDTH: f32 = 68.0;
-pub const COMPOSER_SEND_WIDTH: f32 = 26.0;
 pub const METADATA_GAP: f32 = glass::TOOL_GAP;
-// Charge the actual controls, outer padding and every fixed gap. These are
-// unscaled widths; dividing the available width by font_scale is conservative
-// for the unscaled Plus/Send/gaps and exact at the reference UI size.
-pub const COMPOSER_TERMINAL_MIN_AVAILABLE: f32 = COMPOSER_CONTROL_LEFT
-    + COMPOSER_CONTROL_RIGHT
-    + COMPOSER_PLUS_WIDTH
-    + COMPOSER_TERMINAL_WIDTH
-    + COMPOSER_TOOLS_WIDTH
-    + COMPOSER_SEND_WIDTH
-    + 3.0 * METADATA_GAP;
 pub const MODE_CONTROL_MIN_WIDTH: f32 = 52.0;
 pub const SEARCH_WIDTH: f32 = 400.0;
 pub const SEARCH_CENTER_OFFSET: f32 = 0.0;

@@ -12,7 +12,7 @@ import shlex
 import subprocess
 import time
 
-from native_clipboard_observation import capture_find_text, observe_exact_word
+from native_clipboard_observation import live_prompt_target, capture_find_text, observe_exact_word
 
 p = argparse.ArgumentParser(description=__doc__)
 for name in ('runner', 'binary', 'owner', 'pointer', 'output'):
@@ -220,7 +220,9 @@ try:
     clipboard_latency = external(b'FROSTPRIMARY')
     result['cases'].append({'name': 'idle-terminal-primary-and-copy', 'status': 'pass', 'primary_seconds': primary_latency, 'clipboard_seconds': clipboard_latency})
     proc, control, log = owner('primary-read', b'printf ok > primary-result', selection='primary')
-    click(600, 600, 'middle')
+    target = live_prompt_target(words('primary-paste-target'))
+    (out / 'primary-paste-target.json').write_text(json.dumps({'live_prompt_target': target}))
+    click(*target, 'middle')
     m.wait_for(lambda: any(e['phase'] == 'complete' for e in events(log)), 'PRIMARY transfer')
     exact_pending_line(b'printf ok > primary-result', 'primary-pasted-before-enter')
     s.key('Return')

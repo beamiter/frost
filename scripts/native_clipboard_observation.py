@@ -103,3 +103,17 @@ def observe_exact_word(capture, label, expected, observations, timeout=5):
         if tokens.count(expected) == 1:
             return
     raise AssertionError({'expected_unique_word': expected, 'observations': observations})
+
+
+def live_prompt_target(rows, width=1280, height=900):
+    """Find the fixture's actual lower input prompt, not a transcript row."""
+    prompts = [row for row in rows if row['text'] == 'FROST_SMOKE>'
+               and float(row['conf']) >= 80 and int(row['top']) > height // 2]
+    if len(prompts) != 1:
+        raise AssertionError({'unique_live_prompt_required': prompts})
+    row = prompts[0]
+    x = int(row['left']) + int(row['width']) + 24
+    y = int(row['top']) + int(row['height']) // 2
+    if not (0 <= x < width and height // 2 < y < height):
+        raise AssertionError('Live prompt escaped the native frame')
+    return x, y

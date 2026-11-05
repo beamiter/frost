@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import select
 from pathlib import Path
 import shlex
 import subprocess
@@ -65,7 +66,7 @@ __frost_smoke_prompt() {
     if [[ ${__frost_smoke_seen:-0} == 1 ]]; then printf '\e]133;D;%s\a' "$status"; fi
     __frost_smoke_seen=1
 }
-__frost_grid() { stty size > "$FROST_SMOKE_GRID_DIR/$1-stty.txt"; }
+__frost_grid() { printf '%s %s %s\n' "$$" "$(tty)" "$(stty size)" > "$FROST_SMOKE_GRID_DIR/$1-stty.txt"; }
 PROMPT_COMMAND=__frost_smoke_prompt
 PS0=$'\e]133;C\a'
 PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
@@ -133,8 +134,8 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
             # Glass edge checks composite source RGBA over this observation,
             # never infer the background or expected panel color from the app.
             self.screenshot('desktop-backdrop')
-            ppm = self.run(['convert', str(self.out / 'desktop-backdrop.png'),
-                            '-strip', '-depth', '8', 'ppm:-'], capture_output=True).stdout
+            ppm = self.run(['grim', '-t', 'ppm', '-'], capture_output=True).stdout
+            (self.out / 'desktop-backdrop.ppm').write_bytes(ppm)
             header = re.match(br'P6\s+(\d+)\s+(\d+)\s+255\s', ppm)
             assert header and tuple(map(int, header.groups())) == (1280, 900)
             data = ppm[header.end():]
@@ -268,15 +269,55 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
             else:
                 pointer = self.env.get('FROST_SMOKE_POINTER')
                 assert pointer, 'Wayland graceful close requires the public protocol pointer'
-                reply = self.run([pointer], input=f'click {x} {y} 1280 900\n',
-                                 text=True, capture_output=True).stdout
-                assert reply.splitlines() == ['ready', 'done'], reply
+                # A one-shot pointer can withdraw seat capability before the
+                # application drains its button-release event. Keep this public
+                # protocol device alive until the whole fixture is cleaned up.
+                proc = getattr(self, '_close_pointer', None)
+                if proc is None:
+                    log = open(self.out / 'close-pointer.log', 'w')
+                    self.logs.append(log)
+                    proc = subprocess.Popen([pointer], env=self.env, stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE, stderr=log, bufsize=0)
+                    self.processes.append(proc)
+                    self._close_pointer = proc
+                    self.pointer_reply(proc, 'ready')
+                assert proc.poll() is None, 'Close pointer disappeared'
+                proc.stdin.write(f'click {x} {y} 1280 900\n'.encode())
+                proc.stdin.flush()
+                self.pointer_reply(proc, 'done')
             (self.out / (name + '.json')).write_text(json.dumps({
                 'visible_warning': 'Eva disconnected', 'action': 'Close anyway',
                 'button_center': [x, y]}, indent=2))
         app.wait(timeout=20)
         assert app.returncode == 0, app.returncode
         return {'requested': requested, 'approved': approved, 'exited': time.monotonic()}
+
+    @staticmethod
+    def pointer_reply(proc, expected):
+        data = bytearray()
+        deadline = time.monotonic() + 5
+        while not data.endswith(b'\n'):
+            remaining = deadline - time.monotonic()
+            assert remaining > 0 and select.select([proc.stdout], [], [], remaining)[0], 'Close pointer timeout'
+            chunk = os.read(proc.stdout.fileno(), 1)
+            assert chunk, 'Close pointer EOF'
+            data.extend(chunk)
+            assert len(data) <= 64, 'Invalid close pointer response'
+        assert data == (expected + '\n').encode(), data
+
+    def grid_record(self, label):
+        assert re.fullmatch(r'dpi-[0-9]+', label), label
+        path = self.out / (label + '-stty.txt')
+        assert not path.exists(), 'DPI observation must not reuse a previous receipt'
+        # A bounded command fits the two-row fixture prompt even at 200% DPI.
+        # Record identity and stty in this same command; a second long sentinel
+        # would grow the input dock before the matching native screenshot.
+        self.text('__frost_grid ' + label)
+        self.key('Return')
+        wait_for(lambda: path.exists() and path.read_text().endswith('\n'), 'exact DPI shell record')
+        pid, tty, rows, cols = path.read_text().split()
+        assert re.fullmatch(r'/dev/pts/[0-9]+', tty), tty
+        return {'pid': int(pid), 'tty': tty, 'rows': int(rows), 'cols': int(cols)}
 
     def command(self, sentinel, paste=False):
         command = "printf '%s:%s:%s\\n' " + shlex.quote(sentinel) + ' "$$" "$(tty)" >> ' + shlex.quote(str(self.transcript))
