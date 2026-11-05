@@ -6,9 +6,12 @@ clipboard contents are synthetic. Failure retains logs/screenshots/transcripts.
 This is functional smoke, not an IME, hardware GPU, or latency certification.
 """
 import argparse
+import csv
+import io
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -154,14 +157,96 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
         else:
             self.run(['grim', target])
 
+    def observe_frame(self, label):
+        # Screenshots and OCR are read-only observations, never app messages.
+        self._frame_number = getattr(self, '_frame_number', 0) + 1
+        name = f'{label}-{self._frame_number:03d}'
+        self.screenshot(name)
+        tsv = self.run(['tesseract', str(self.out / (name + '.png')), 'stdout',
+                        '--psm', '11', 'tsv'], text=True, capture_output=True).stdout
+        (self.out / (name + '.tsv')).write_text(tsv)
+        rows = [row for row in csv.DictReader(io.StringIO(tsv), delimiter='\t',
+                quoting=csv.QUOTE_NONE) if row['level'] == '5' and row['text'].strip()]
+        return name, rows
+
+    @staticmethod
+    def surface_state(rows):
+        text = ' '.join(row['text'] for row in rows)
+        api = re.search(r'\bAPI conversation\b', text, re.I) is not None
+        terminal = (re.search(r'\bWorkspace\s*/', text) is not None
+                    and re.search(r'\b(?:Block|Chat) session\b', text) is not None)
+        if api == terminal:
+            return None
+        return 'api' if api else 'terminal'
+
     def select_terminal(self):
-        # The workspace may initially show its API conversation. Use public
-        # keyboard navigation before this fixture's first shell input: the
-        # first Escape releases a focused editor, the second closes the view.
-        # Call only at startup with a disposable, idle shell; never retry a
-        # failed command or weaken the overlay's hidden-PTY input protection.
-        self.key('Escape')
-        self.key('Escape')
+        # A new HOME opens an API conversation, but later mode/restart cases
+        # may already show the terminal. Escape closes the API in one press;
+        # another Escape reaches Bash readline and changes the next key into
+        # a meta command. Observe the visible owner before sending any input.
+        observed = []
+        def observe():
+            name, rows = self.observe_frame('terminal-owner')
+            state = self.surface_state(rows)
+            observed.append({'frame': name, 'state': state})
+            return state
+        initial = wait_for(observe, 'visible API or terminal surface')
+        if initial == 'api':
+            self.key('Escape')
+            wait_for(lambda: observe() == 'terminal', 'API closed and terminal visible')
+        (self.out / f'terminal-owner-{self._frame_number:03d}.json').write_text(
+            json.dumps({'initial': initial, 'escape_presses': int(initial == 'api'),
+                        'observations': observed}, indent=2))
+
+    @staticmethod
+    def close_button(rows):
+        text = ' '.join(row['text'] for row in rows)
+        # The headless fixture has no Eva host. Only acknowledge this precise
+        # visible disconnected-Eva warning, never a running-job or other modal.
+        if not all(value in text for value in ('Closing Frost', 'Eva disconnected',
+                                                'Close anyway')):
+            return None
+        matches = []
+        for left, right in zip(rows, rows[1:]):
+            if left['text'] != 'Close' or right['text'] != 'anyway':
+                continue
+            if any(left[key] != right[key] for key in
+                   ('page_num', 'block_num', 'par_num', 'line_num')):
+                continue
+            x = int(left['left'])
+            y = min(int(left['top']), int(right['top']))
+            width = int(right['left']) + int(right['width']) - x
+            height = max(int(left['height']), int(right['height']))
+            matches.append((x + width // 2, y + height // 2))
+        return matches[0] if len(matches) == 1 else None
+
+    def close_app(self, app):
+        if self.backend == 'x11':
+            self.key('F4', ('alt',))
+        else:
+            self.run(['swaymsg', '[app_id="io.github.beamiter.frost"]', 'kill'])
+        def closed_or_dialog():
+            if app.poll() is not None:
+                return 'closed'
+            name, rows = self.observe_frame('graceful-close')
+            button = self.close_button(rows)
+            return (name, button) if button else None
+        result = wait_for(closed_or_dialog, 'application exit or disconnected Eva close dialog')
+        if result != 'closed':
+            name, (x, y) = result
+            if self.backend == 'x11':
+                self.run(['xdotool', 'mousemove', '--sync', str(x), str(y), 'click', '1'])
+            else:
+                pointer = self.env.get('FROST_SMOKE_POINTER')
+                assert pointer, 'Wayland graceful close requires the public protocol pointer'
+                reply = self.run([pointer], input=f'click {x} {y} 1280 900\n',
+                                 text=True, capture_output=True).stdout
+                assert reply.splitlines() == ['ready', 'done'], reply
+            (self.out / (name + '.json')).write_text(json.dumps({
+                'visible_warning': 'Eva disconnected', 'action': 'Close anyway',
+                'button_center': [x, y]}, indent=2))
+        app.wait(timeout=20)
+        assert app.returncode == 0, app.returncode
 
     def command(self, sentinel, paste=False):
         command = "printf '%s:%s:%s\\n' " + shlex.quote(sentinel) + ' "$$" "$(tty)" >> ' + shlex.quote(str(self.transcript))

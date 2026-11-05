@@ -735,12 +735,7 @@ printf '%s\t%s\t%s\n' "$$" "$PPID" "$(tty)" >> "$FROST_RECOVERY_SHELL_STARTS"
             if self.name == 'blocked':
                 self.check_original_unchanged('post-Dismiss tab creation and autosave ticks', wait=True)
         smoke.screenshot('before-graceful-close')
-        if self.args.backend == 'x11':
-            smoke.key('F4', ('alt',))
-        else:
-            smoke.run(['swaymsg', f'[con_id={self.window}]', 'kill'])
-        self.app.wait(timeout=20)
-        require(self.app.returncode == 0, f'Frost did not close gracefully: {self.app.returncode}')
+        smoke.close_app(self.app)
         if self.name == 'blocked':
             self.check_original_unchanged('graceful close with a writable directory')
         else:

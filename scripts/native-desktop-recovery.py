@@ -38,12 +38,7 @@ def launch(label):
     return proc
 
 def close(proc):
-    if args.backend == 'x11':
-        smoke.key('F4', ('alt',))
-    else:
-        smoke.run(['swaymsg', '[app_id="io.github.beamiter.frost"]', 'kill'])
-    proc.wait(timeout=20)
-    assert proc.returncode == 0, proc.returncode
+    smoke.close_app(proc)
 
 def read_pwd(label):
     path = out / (label + '-pwd.txt')
