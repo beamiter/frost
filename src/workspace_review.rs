@@ -313,7 +313,7 @@ impl WorkspaceReview {
                 self.report_loading = false;
                 match result {
                     Ok(WorkspaceReply::Result { report }) if report.conversation == id => {
-                        self.report = Some(report);
+                        self.report = Some(*report);
                         self.notice = None;
                     }
                     Err(error) => self.notice = Some(format!("Result evidence: {error}")),
