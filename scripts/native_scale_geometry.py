@@ -288,6 +288,8 @@ def run_sequence(smoke, app_pid, probe, record_shell, *, recovery=False):
         production = expected(probe, client['width'], client['height'], recovery=recovery, environ=smoke.env)
         # Expected geometry is computed BEFORE actual stty, never calibrated by it.
         shell = record_shell(label)
+        (smoke.out / (label + '-observation.json')).write_text(json.dumps({
+            'scale': scale, 'native': before, 'production': production, 'shell': shell}, indent=2))
         require([shell['cols'], shell['rows']] == production['grid'],
                 'Actual PTY differs from production viewport/font grid at scale ' + str(scale))
         smoke.screenshot(label)

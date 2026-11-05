@@ -88,6 +88,7 @@ pub(crate) struct WorkspaceChats {
     pub(crate) rows: Vec<WorkspaceRow>,
     pub(crate) notice: Option<String>,
     imported: bool,
+    view_open: bool,
     selection: u64,
     last_refresh: Instant,
     read_pending: HashMap<u64, (f64, Instant)>,
@@ -114,6 +115,7 @@ impl Default for WorkspaceChats {
             rows: Vec::new(),
             notice: None,
             imported: false,
+            view_open: false,
             selection: 0,
             last_refresh: Instant::now() - Duration::from_secs(10),
             read_pending: HashMap::new(),
@@ -124,6 +126,12 @@ impl Default for WorkspaceChats {
 }
 
 impl WorkspaceChats {
+    /// Background migration must not turn a terminal into an API surface.
+    /// Capture the native view's current visibility before draining replies.
+    pub(crate) fn set_view_open(&mut self, open: bool) {
+        self.view_open = open;
+    }
+
     fn send(&mut self, command: Command, pending: Pending) -> bool {
         match self.client.send(command) {
             Ok(request) => {
@@ -581,7 +589,10 @@ impl WorkspaceChats {
                             })
                             .and_then(|snapshot| snapshot.to_json().ok());
                         if now.as_ref() == Some(before) {
-                            if mapping.legacy_id == active_before && self.selection == 0 {
+                            if self.view_open
+                                && mapping.legacy_id == active_before
+                                && self.selection == 0
+                            {
                                 open_imported = Some(mapping.id.clone());
                             }
                             let _ = store.evict_imported_legacy_chat(mapping.legacy_id);
@@ -1556,8 +1567,15 @@ mod tests {
     }
 
     #[test]
-    fn import_ack_opens_only_an_unchanged_active_placeholder() {
-        for (edited, moved) in [(false, false), (true, false), (false, true)] {
+    fn import_ack_opens_only_a_visible_unchanged_active_placeholder() {
+        for (visible, edited, moved) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, false, true),
+            (true, false, true),
+        ] {
             let mut store = ChatStore::default();
             let old = store.active_id();
             let before = ConversationSnapshot::from_chats(
@@ -1573,6 +1591,7 @@ mod tests {
                 ),
                 ..Default::default()
             };
+            bridge.set_view_open(visible);
             bridge.pending.insert(
                 950,
                 Pending::Import {
@@ -1600,7 +1619,7 @@ mod tests {
                 .pending
                 .values()
                 .any(|p| matches!(p, Pending::Open { .. }));
-            assert_eq!(opening, !edited && !moved);
+            assert_eq!(opening, visible && !edited && !moved);
             if edited {
                 assert_eq!(store.active_draft(), "typed during migration");
             }

@@ -13,6 +13,7 @@ import json
 import os
 import re
 import select
+import struct
 from pathlib import Path
 import shlex
 import subprocess
@@ -66,7 +67,7 @@ __frost_smoke_prompt() {
     if [[ ${__frost_smoke_seen:-0} == 1 ]]; then printf '\e]133;D;%s\a' "$status"; fi
     __frost_smoke_seen=1
 }
-__frost_grid() { printf '%s %s %s\n' "$$" "$(tty)" "$(stty size)" > "$FROST_SMOKE_GRID_DIR/$1-stty.txt"; }
+g() { printf '%s %s %s\n' "$$" "$(tty)" "$(stty size)" > "$FROST_SMOKE_GRID_DIR/$1-stty.txt"; }
 PROMPT_COMMAND=__frost_smoke_prompt
 PS0=$'\e]133;C\a'
 PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
@@ -181,10 +182,26 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
         name = f'{label}-{self._frame_number:03d}'
         self.screenshot(name)
         source = self.out / (name + '.png')
+        offset_x = offset_y = 0
         if enhanced:
+            # Only the centered close modal is relevant to this observation.
+            # Keep the full raw frame, and record the bounded crop transform.
+            # Whole-screen OCR of 32 sidebar rows can both lose the actual
+            # modal and spend longer than the clipboard's 3-second deadline.
+            header = source.read_bytes()[:24]
+            assert header[:8] == b'\x89PNG\r\n\x1a\n', 'Expected raw PNG frame'
+            width, height = struct.unpack('>II', header[16:24])
+            crop_w, crop_h = width * 3 // 5, height * 3 // 10
+            offset_x, offset_y = (width - crop_w) // 2, (height - crop_h) // 2
             source = self.out / (name + '.ocr.png')
-            self.run(['convert', str(self.out / (name + '.png')), '-colorspace', 'Gray',
-                      '-negate', '-resize', '300%', str(source)], capture_output=True)
+            crop = f'{crop_w}x{crop_h}+{offset_x}+{offset_y}'
+            self.run(['convert', str(self.out / (name + '.png')), '-crop', crop, '+repage',
+                      '-colorspace', 'Gray', '-negate', '-resize', '300%', str(source)],
+                     capture_output=True)
+            (self.out / (name + '.ocr-transform.json')).write_text(json.dumps({
+                'raw_frame': name + '.png', 'crop': [offset_x, offset_y, crop_w, crop_h],
+                'scale': 3, 'required_text': ['Closing Frost', 'Eva disconnected', 'Close anyway']
+            }, indent=2))
         tsv = self.run(['tesseract', str(source), 'stdout',
                         '--psm', '11', 'tsv'], text=True, capture_output=True).stdout
         (self.out / (name + '.tsv')).write_text(tsv)
@@ -194,6 +211,8 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
             for row in rows:
                 for field in ('left', 'top', 'width', 'height'):
                     row[field] = str(round(int(row[field]) / 3))
+                row['left'] = str(int(row['left']) + offset_x)
+                row['top'] = str(int(row['top']) + offset_y)
         return name, rows
 
     @staticmethod
@@ -206,10 +225,10 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
             return None
         return 'api' if api else 'terminal'
 
-    def select_terminal(self):
-        # A new HOME opens an API conversation, but later mode/restart cases
-        # may already show the terminal. Escape closes the API in one press;
-        # another Escape reaches Bash readline and changes the next key into
+    def select_terminal(self, require_terminal=False):
+        # Background import must leave a fresh launch on its terminal. Other
+        # scenarios may intentionally open an API; Escape closes it once.
+        # Another Escape reaches Bash readline and changes the next key into
         # a meta command. Observe the visible owner before sending any input.
         observed = []
         def observe():
@@ -218,11 +237,17 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
             observed.append({'frame': name, 'state': state})
             return state
         initial = wait_for(observe, 'visible API or terminal surface')
+        if require_terminal and initial != 'terminal':
+            (self.out / f'terminal-owner-{self._frame_number:03d}.json').write_text(
+                json.dumps({'initial': initial, 'escape_presses': 0,
+                            'required_terminal': True, 'observations': observed}, indent=2))
+            raise AssertionError('Background chat migration opened the API view')
         if initial == 'api':
             self.key('Escape')
             wait_for(lambda: observe() == 'terminal', 'API closed and terminal visible')
         (self.out / f'terminal-owner-{self._frame_number:03d}.json').write_text(
             json.dumps({'initial': initial, 'escape_presses': int(initial == 'api'),
+                        'required_terminal': require_terminal,
                         'observations': observed}, indent=2))
 
     @staticmethod
@@ -320,10 +345,10 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
         assert re.fullmatch(r'dpi-[0-9]+', label), label
         path = self.out / (label + '-stty.txt')
         assert not path.exists(), 'DPI observation must not reuse a previous receipt'
-        # A bounded command fits the two-row fixture prompt even at 200% DPI.
+        # This short fixture command fits with the prompt at 200% DPI (27 columns).
         # Record identity and stty in this same command; a second long sentinel
         # would grow the input dock before the matching native screenshot.
-        self.text('__frost_grid ' + label)
+        self.text('g ' + label)
         self.key('Return')
         wait_for(lambda: path.exists() and path.read_text().endswith('\n'), 'exact DPI shell record')
         pid, tty, rows, cols = path.read_text().split()
@@ -395,7 +420,7 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
             time.sleep(2)
             assert app.poll() is None
             self.screenshot(mode + '-startup')
-            self.select_terminal()
+            self.select_terminal(require_terminal=True)
             first_identity = self.command(mode + '-typed')
             self.command(mode + '-paste', paste=True)
             self.key('t', ('ctrl', 'shift'))

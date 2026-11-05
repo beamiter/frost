@@ -203,6 +203,7 @@ impl AiChatsUi {
     }
 
     pub(crate) fn drive_workspace(&mut self, config: &Config) -> Vec<ChatRequest> {
+        self.workspace.set_view_open(self.is_open);
         let mut requests = Vec::new();
         for effect in self
             .workspace
