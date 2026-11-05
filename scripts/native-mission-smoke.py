@@ -37,6 +37,11 @@ def phrase(rows, text, unique=True):
     return found[0] if found and (not unique or len(found) == 1) else None
 
 
+def ready_control(rows, text, bounds):
+    busy = any(phrase(rows, label) for label in ('Reading the host...', 'Reading the host…'))
+    return not busy and phrase(rows, text) == bounds
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True, type=Path)
@@ -161,8 +166,19 @@ def main():
         raise AssertionError('Exact visible Mission control not found: ' + text)
 
     def press(text, label, direction=1):
-        left, top, right, bottom = locate(text, label, direction, control=True)
-        click((left + right) // 2, (top + bottom) // 2)
+        # A saved host row may precede its UI readback. Require a second
+        # settled visible frame before one click; never retry the click itself.
+        for _ in range(7):
+            bounds = locate(text, label, direction, control=True)
+            name, rows = observe(label + '-settled', control=True)
+            if ready_control(rows, text, bounds):
+                (out / (name + '.target.json')).write_text(json.dumps(
+                    {'text': text, 'bounds': bounds, 'settled': True}))
+                left, top, right, bottom = bounds
+                click((left + right) // 2, (top + bottom) // 2)
+                return
+            time.sleep(.2)
+        raise AssertionError('Mission control did not settle before input: ' + text)
 
     def fill(label, value):
         left, top, right, bottom = locate(label, 'field-' + label.replace('/', '-'))
@@ -249,6 +265,7 @@ def main():
         press('Use observed commits', 'reject-historical-adoption')
         time.sleep(1)
         assert stored()[0]['revision'] == 2, 'Refresh allowed stale candidate adoption'
+        locate('Plan revision 2', 'disabled-click-kept-drawer-open', direction=-1)
         result['assertions'].append('Refresh retired adoption permission; clicking the historical control could not write revision 3')
         scroll(-20)
         fill('Title', 'UnsavedMissionTitle')

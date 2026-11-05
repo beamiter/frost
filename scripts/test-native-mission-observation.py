@@ -24,3 +24,11 @@ assert module.phrase(rows('FrostMissionFixture') + rows('FrostMissionFixture', l
 assert module.phrase(rows('FrostMissionFixture') + rows('FrostMissionFixture', line='2'),
                      'FrostMissionFixture', unique=False) is not None
 print('Mission exact controls and five negative/duplicate observation contracts passed')
+
+assert module.ready_control(control, 'Use observed commits', (10, 50, 99, 65))
+assert not module.ready_control(control, 'Use observed commits', (10, 70, 99, 85))
+assert not module.ready_control(control + rows('Reading the host...', line='2'),
+                                'Use observed commits', (10, 50, 99, 65))
+assert not module.ready_control(control + rows('Reading the host…', line='2'),
+                                'Use observed commits', (10, 50, 99, 65))
+print('Busy and moving controls cannot receive a native click')

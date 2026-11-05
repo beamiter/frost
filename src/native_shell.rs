@@ -2729,27 +2729,33 @@ impl Frost {
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
-        let (dismiss, inspector): (Element<'_, Message>, Element<'_, Message>) =
-            if layout.inspector.is_none() && self.reference_inspector_visible() {
-                let dismiss = container(
-                    button(Space::new().width(Length::Fill).height(Length::Fill))
-                        .on_press(Message::ReferenceInspectorToggle)
-                        .padding(0)
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .style(|_, _| button::Style {
-                            background: Some(Color::from_rgba(0.02, 0.04, 0.09, 0.18).into()),
-                            ..Default::default()
-                        }),
-                )
-                .padding(iced::Padding {
-                    top: layout.titlebar.height + recovery_height,
-                    left: layout.rail.right(),
-                    ..iced::Padding::ZERO
-                })
-                .width(Length::Fill)
-                .height(Length::Fill);
-                let inspector = container(
+        let (dismiss, inspector): (Element<'_, Message>, Element<'_, Message>) = if layout
+            .inspector
+            .is_none()
+            && self.reference_inspector_visible()
+        {
+            let dismiss = container(
+                button(Space::new().width(Length::Fill).height(Length::Fill))
+                    .on_press(Message::ReferenceInspectorToggle)
+                    .padding(0)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(|_, _| button::Style {
+                        background: Some(Color::from_rgba(0.02, 0.04, 0.09, 0.18).into()),
+                        ..Default::default()
+                    }),
+            )
+            .padding(iced::Padding {
+                top: layout.titlebar.height + recovery_height,
+                left: layout.rail.right(),
+                ..iced::Padding::ZERO
+            })
+            .width(Length::Fill)
+            .height(Length::Fill);
+            let inspector = container(
+                // Disabled controls and empty drawer space must not
+                // activate the dismiss layer or terminal underneath.
+                opaque(
                     row![
                         self.reference_resize_grip(
                             crate::sidebar_resize::Side::Inspector,
@@ -2758,22 +2764,23 @@ impl Frost {
                         self.font_zoom_region(font_zoom::Group::Chrome, self.reference_inspector()),
                     ]
                     .width(self.reference_inspector_width() + glass::INSPECTOR_GAP),
-                )
-                .padding(iced::Padding {
-                    top: layout.center.y + recovery_height,
-                    right: glass::OUTER_RIGHT,
-                    bottom: main_bottom,
-                    ..iced::Padding::ZERO
-                })
-                .align_right(Length::Fill)
-                .height(Length::Fill);
-                (dismiss.into(), inspector.into())
-            } else {
-                (
-                    Space::new().width(0).height(0).into(),
-                    Space::new().width(0).height(0).into(),
-                )
-            };
+                ),
+            )
+            .padding(iced::Padding {
+                top: layout.center.y + recovery_height,
+                right: glass::OUTER_RIGHT,
+                bottom: main_bottom,
+                ..iced::Padding::ZERO
+            })
+            .align_right(Length::Fill)
+            .height(Length::Fill);
+            (dismiss.into(), inspector.into())
+        } else {
+            (
+                Space::new().width(0).height(0).into(),
+                Space::new().width(0).height(0).into(),
+            )
+        };
         // Constant base index preserves the native terminal/model through toggles.
         let workspace = crate::native_popup_surface::layers(workspace, dismiss, inspector);
         let drawer = self.reference_navigation_drawer_visible();
