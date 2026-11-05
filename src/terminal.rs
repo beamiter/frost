@@ -3,6 +3,8 @@ pub(crate) use chat_projection::CHAT_MIN_INPUT_ROWS;
 #[cfg(all(test, target_os = "linux"))]
 mod chat_pty_tests;
 #[cfg(test)]
+mod cli_scope_tests;
+#[cfg(test)]
 mod line_selection_tests;
 #[cfg(test)]
 mod projection_properties;
@@ -2486,9 +2488,6 @@ pub struct ProjectedViewport {
 #[cfg(test)]
 #[path = "terminal/canvas_tests.rs"]
 mod canvas_tests;
-#[cfg(test)]
-#[path = "terminal/cli_scope_tests.rs"]
-mod cli_scope_tests;
 
 #[allow(dead_code)] // Transformed accessors are consumed by the P1 UI wiring slice.
 impl ProjectedViewport {
