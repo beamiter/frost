@@ -82,6 +82,7 @@ def main():
               'binary_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest(),
               'fixture_heads': heads, 'assertions': [],
               'not_covered': ['real five-repository delivery', 'CI evidence ingestion', 'physical GPU']}
+    started = time.monotonic()
     pointer = None
     app = None
     sequence = 0
@@ -105,7 +106,13 @@ def main():
 
     def move(x, y):
         if args.backend == 'x11':
-            smoke.run(['xdotool', 'mousemove', '--sync', str(x), str(y)])
+            location = smoke.run(['xdotool', 'getmouselocation', '--shell'],
+                                 text=True, capture_output=True).stdout
+            current = dict(line.split('=', 1) for line in location.splitlines() if '=' in line)
+            # xdotool --sync waits for motion; issuing it at the existing
+            # position can spend its entire wait budget without any movement.
+            if (int(current['X']), int(current['Y'])) != (x, y):
+                smoke.run(['xdotool', 'mousemove', '--sync', str(x), str(y)])
         else:
             pointer_command(f'move {x} {y} 1280 900')
 
@@ -268,12 +275,12 @@ def main():
         locate('Plan revision 2', 'disabled-click-kept-drawer-open', direction=-1)
         result['assertions'].append('Refresh retired adoption permission; clicking the historical control could not write revision 3')
         scroll(-20)
-        fill('Title', 'UnsavedMissionTitle')
+        fill('Title', 'Unsaved draft')
         locate('Unsaved edits:', 'unsaved-warning')
         scroll(-20)
         press('Refresh', 'refresh-with-draft')
         time.sleep(1)
-        locate('UnsavedMissionTitle', 'draft-preserved')
+        locate('Unsaved draft', 'draft-preserved')
         assert stored()[0]['title'] == 'FrostMissionFixture'
         press('Reload saved', 'reload-saved-plan')
         time.sleep(1)
@@ -297,6 +304,7 @@ def main():
     finally:
         smoke.close()
         temp.cleanup()
+        result['elapsed_seconds'] = time.monotonic() - started
         (out / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
 
 
