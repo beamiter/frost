@@ -250,6 +250,17 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
     def close_app(self, app):
         requested = time.monotonic()
         approved = requested
+        # Previous cases may leave the cursor over this same dialog button.
+        # Park it before observing text; never infer obscured button wording.
+        if self.backend == 'x11':
+            self.run(['xdotool', 'mousemove', '--sync', '1279', '450'])
+        else:
+            proc = getattr(self, '_close_pointer', None)
+            if proc is not None:
+                assert proc.poll() is None, 'Close pointer disappeared'
+                proc.stdin.write(b'move 1279 450 1280 900\n')
+                proc.stdin.flush()
+                self.pointer_reply(proc, 'done')
         if self.backend == 'x11':
             self.key('F4', ('alt',))
         else:

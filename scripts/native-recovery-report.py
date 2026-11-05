@@ -41,7 +41,7 @@ PRESERVED = 'The original saved session was preserved before repairs are saved.'
 PAUSED = ('The original saved session could not be preserved. Automatic session saving '
           'is paused for this run; terminals remain usable.')
 SCREEN = (1280, 900)
-OCR_SCALE = 2
+OCR_SCALE = 3
 AUTOSAVE_OBSERVATION_SECONDS = 3.2  # Two existing 1500 ms ConfigTick intervals.
 SUITE_BUDGET_SECONDS = 240  # Leave time for cleanup inside the 5-minute CI step.
 
@@ -119,18 +119,16 @@ def png_extent(path):
 def capture_ocr(png, run):
     """One fixed pipeline for every case; no phrase-specific image adaptation.
 
-    Dark 14px text was invisible to raw psm11 in the first hosted capture.
-    Invert to dark-on-light, enlarge before binarizing to preserve antialiasing,
-    then remove dark-theme backgrounds and panel borders. The same fixed 50%
-    threshold retains the light native labels without merging a border into
-    the readiness token. Never crop, rewrite tokens, or synthesize text.
+    Dark 14px text is unreliable at native resolution. Invert to dark-on-light
+    and enlarge threefold while retaining antialiasing. Binarization can merge
+    small letter counters (Automatic) or nearby panel edges into the token.
+    Never crop, rewrite tokens, or synthesize text.
     """
     require(png_extent(png) == SCREEN,
             'Unexpected desktop capture extent; refusing guessed pointer coordinates')
     processed = png.with_suffix('.ocr.png')
     command = ['convert', str(png), '-colorspace', 'Gray', '-negate',
-               '-filter', 'Lanczos', '-resize', f'{OCR_SCALE * 100}%',
-               '-threshold', '50%', str(processed)]
+               '-filter', 'Lanczos', '-resize', f'{OCR_SCALE * 100}%', str(processed)]
     run(command, capture_output=True)
     require(png_extent(processed) == tuple(value * OCR_SCALE for value in SCREEN),
             'OCR preprocessing changed the expected coordinate transform')
@@ -947,7 +945,7 @@ class PureTests(unittest.TestCase):
         original = dict(self.words(['Dismiss'])[0], left=201, top=101, width=121, height=31)
         mapped = original_coordinates([original])[0]
         self.assertEqual([mapped[key] for key in ('left', 'top', 'width', 'height')],
-                         [100, 50, 61, 16])
+                         [67, 33, 41, 11])
         self.assertEqual(mapped['processed_box'], [201, 101, 121, 31])
         for key in ('text', 'confidence', 'line'):
             self.assertEqual(mapped[key], original[key])
