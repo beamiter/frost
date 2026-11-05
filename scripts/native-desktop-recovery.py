@@ -82,7 +82,7 @@ try:
         probe = scale_geometry.build_probe(out / 'production-geometry')
         def record_grid(label):
             record = out / (label + '-stty.txt')
-            identity = execute('stty size > ' + shlex.quote(str(record)), label)
+            identity = execute('__frost_grid ' + label, label)
             assert identity == restored_first, 'Scaling changed the active session'
             rows, cols = map(int, record.read_text().split())
             pid, tty = identity.split(':', 1)

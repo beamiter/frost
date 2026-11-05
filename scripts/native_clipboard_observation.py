@@ -24,7 +24,12 @@ def locate_find_input(ppm):
     def border(x, y):
         offset = (y * width + x) * 3
         red, green, blue = pixels[offset:offset + 3]
-        return 112 <= red <= 224 and max(red, green, blue) - min(red, green, blue) <= 8
+        neutral = 112 <= red <= 224 and max(red, green, blue) - min(red, green, blue) <= 8
+        # Current Iced focused input uses the exact accent-blue border. Keep
+        # the independent 220px rectangle and unique-control checks unchanged.
+        focused = all(abs(actual - expected) <= 2 for actual, expected in
+                      zip((red, green, blue), (68, 126, 255)))
+        return neutral or focused
 
     runs = {}
     for y in range(height):
@@ -35,7 +40,7 @@ def locate_find_input(ppm):
                 start = x
             if not selected and start is not None:
                 # Rounded/antialiased corners remove one pixel at either end.
-                if x - start == 218:
+                if x - start in (216, 218):
                     runs.setdefault((start, x - 1), []).append(y)
                 start = None
     rectangles = set()
@@ -44,7 +49,8 @@ def locate_find_input(ppm):
             for bottom in rows:
                 if not 22 <= bottom - top + 1 <= 36:
                     continue
-                x, end = left - 1, right + 1
+                inset = (220 - (right - left + 1)) // 2
+                x, end = left - inset, right + inset
                 if x < 0 or end >= width:
                     continue
                 samples = list(range(top + 4, bottom - 3))

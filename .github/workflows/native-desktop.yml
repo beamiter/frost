@@ -69,6 +69,11 @@ jobs:
         run: |
           mkdir -p native-smoke-artifacts
           { uname -a; rustc -Vv; dpkg-query -W xvfb sway wtype wl-clipboard libvulkan1 mesa-vulkan-drivers fonts-dejavu-core fonts-noto-cjk openbox; sway --version; fc-match monospace; git rev-parse HEAD; } > native-smoke-artifacts/environment.txt
+      - name: Check production-derived native geometry oracle
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          export FROST_SCALE_PROBE="$(PYTHONPATH=scripts python3 -c 'import native_scale_geometry as g; print(g.build_probe("native-smoke-artifacts/geometry-contract"))')"
+          python3 scripts/test-native-scale-geometry.py
       - name: Build public Wayland pointer for observed close dialogs
         if: steps.install.outcome == 'success'
         run: |

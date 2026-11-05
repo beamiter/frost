@@ -453,7 +453,7 @@ impl Frost {
                     (ready && !dirty).then(|| action(MissionAction::Inspect(reference.clone())))
                 ),
                 button(text("Use observed commits").size(size)).on_press_maybe(
-                    (ready && !dirty && panel.controller.report.is_some())
+                    (ready && !dirty && panel.controller.report_for(&draft.id).is_some())
                         .then(|| action(MissionAction::Adopt(reference.clone())))
                 ),
             ]
@@ -471,10 +471,10 @@ impl Frost {
                 ),
             );
         }
-        let report =
-            panel.controller.report.as_ref().filter(|report| {
-                report.id == draft.id && report.revision == draft.revision && !dirty
-            });
+        let report = panel
+            .controller
+            .report_for(&draft.id)
+            .filter(|report| report.id == draft.id && report.revision == draft.revision && !dirty);
         if let Some(report) = report {
             body = body.push(text(report.state.label()).size(size + 1.0));
             for error in &report.errors {
@@ -681,6 +681,38 @@ fn receipt_view(
                 &local.observed_at_ms.to_string(),
                 size,
             ));
+    }
+    for (label, remote) in [
+        (
+            "Last pushed observation",
+            receipt.pushed_observation.as_ref(),
+        ),
+        (
+            "Last integration observation",
+            receipt
+                .integration_observation
+                .as_ref()
+                .map(|value| &value.remote),
+        ),
+    ] {
+        if let Some(remote) = remote {
+            body = body
+                .push(detail(label, &remote.repository.full_name, size))
+                .push(detail("Remote ref", &remote.ref_name, size))
+                .push(detail("Remote HEAD", &remote.head, size))
+                .push(detail(
+                    "Remote observed at (Unix ms)",
+                    &remote.observed_at_ms.to_string(),
+                    size,
+                ));
+        }
+    }
+    if let Some(integration) = &receipt.integration_observation {
+        body = body.push(detail(
+            "Observed integration candidate",
+            &integration.candidate,
+            size,
+        ));
     }
     for check in &receipt.checks {
         body = body.push(detail(

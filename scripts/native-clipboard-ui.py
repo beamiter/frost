@@ -242,9 +242,7 @@ try:
     assert closed['monotonic'] - request['monotonic'] < 5
     s.screenshot('widget-stalled-recovered')
     start = time.monotonic()
-    s.run(['swaymsg', '[app_id="io.github.beamiter.frost"]', 'kill'])
-    app.wait(timeout=5)
-    assert app.returncode == 0
+    s.close_app(app)
     result['cases'].append({'name': 'legacy-stall-then-teardown', 'status': 'pass', 'window_close_seconds': time.monotonic() - start, 'events': trace})
     stop(proc, control)
     result['status'] = 'pass'

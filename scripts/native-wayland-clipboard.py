@@ -161,11 +161,9 @@ try:
             wait_event(log, 'complete')
         elif case == 'teardown':
             keyboard.stdin.close()
-            closing = time.monotonic()
-            s.run(['swaymsg', '[app_id="io.github.beamiter.frost"]', 'kill'])
-            app.wait(timeout=5)
-            assert app.returncode == 0
-            entry['window_close_seconds'] = time.monotonic() - closing
+            close = s.close_app(app)
+            entry['close_observation'] = close
+            entry['window_close_seconds'] = close['exited'] - close['approved']
             assert entry['window_close_seconds'] < 1.5, 'window close waited for transfer timeout'
             closed = wait_event(log, 'reader-closed')
             entry['request_to_pipe_close_seconds'] = closed['monotonic'] - request['monotonic']
@@ -234,9 +232,7 @@ try:
         if case != 'teardown':
             assert s.command(case + '-identity') == identity
             s.screenshot(case + '-completed')
-            s.run(['swaymsg', '[app_id="io.github.beamiter.frost"]', 'kill'])
-            app.wait(timeout=5)
-            assert app.returncode == 0
+            s.close_app(app)
         (control / 'stop').touch()
         proc.wait(timeout=5)
         assert proc.returncode == 0

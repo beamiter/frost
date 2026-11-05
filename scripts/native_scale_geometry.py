@@ -37,7 +37,7 @@ def item(source, signature):
 
 
 def constant(source, name):
-    matches = re.findall(r'^(?:pub )?const ' + name + r':[^;]+;', source, re.M)
+    matches = re.findall(r'^(?:pub(?:\(crate\))? )?const ' + name + r':[^;]+;', source, re.M)
     require(len(matches) == 1, 'Ambiguous production constant: ' + name)
     return matches[0]
 
@@ -50,7 +50,9 @@ def build_probe(output, deps=None, rustc=None):
     rustc = str(rustc or shutil.which('rustc') or 'rustc')
     sources = {name: (ROOT / name).read_text() for name in
                ('src/main.rs', 'src/native_shell.rs', 'src/terminal_view.rs',
-                'src/native_viewport.rs', 'src/terminal.rs', 'src/ui_typography.rs')}
+                'src/glass_native_viewport.rs', 'src/terminal.rs', 'src/ui_typography.rs',
+                'src/native_input_surface.rs', 'src/terminal/chat_projection.rs',
+                'src/glass_layout.rs', 'src/glass_shell_tokens.rs', 'src/glass_profile.rs')}
     core_root = Path(subprocess.check_output(['python3', str(ROOT / 'scripts/shared-core-path.py'), str(ROOT)], text=True).strip())
     core = (core_root / 'src/reference_shell.rs').resolve(strict=True)
     hashes = {name: hashlib.sha256(text.encode()).hexdigest() for name, text in sources.items()}
@@ -63,15 +65,24 @@ def build_probe(output, deps=None, rustc=None):
     font_end = terminal.index('/// A missing named font', font_start)
     methods = '\n'.join(item(sources[name], signature) for name, signature in (
         ('src/native_shell.rs', 'pub(crate) fn reference_layout('),
+        ('src/native_shell.rs', 'pub(crate) fn reference_input_metrics('),
+        ('src/native_shell.rs', 'fn live_input_metrics('),
+        ('src/native_shell.rs', 'pub(crate) fn reference_native_budget('),
         ('src/main.rs', 'fn term_width('),
         ('src/main.rs', 'fn term_height('),
         ('src/main.rs', 'fn block_reading_bar_height(')))
     body = (ROOT / 'scripts/native_scale_harness.rs').read_text()
     replacements = {
         'core-path': json.dumps(str(core)),
-        'viewport-path': json.dumps(str((ROOT / 'src/native_viewport.rs').resolve())),
+        'viewport-path': json.dumps(str((ROOT / 'src/glass_native_viewport.rs').resolve())),
+        'layout-path': json.dumps(str((ROOT / 'src/glass_layout.rs').resolve())),
+        'tokens-path': json.dumps(str((ROOT / 'src/glass_shell_tokens.rs').resolve())),
+        'profile-path': json.dumps(str((ROOT / 'src/glass_profile.rs').resolve())),
+        'dock-type': '#[derive(Clone, Copy, Debug, PartialEq)]\n' + item(sources['src/native_input_surface.rs'], 'pub(crate) struct DockMetrics {'),
+        'dock-metrics': item(sources['src/native_input_surface.rs'], 'pub(crate) fn dock_metrics('),
+        'min-input-rows': constant(sources['src/terminal/chat_projection.rs'], 'CHAT_MIN_INPUT_ROWS'),
         'typography-path': json.dumps(str((ROOT / 'src/ui_typography.rs').resolve())),
-        'metrics': item(terminal, 'pub struct Metrics {') + '\n' + item(terminal, 'impl Metrics {'),
+        'metrics': '#[derive(Clone, Copy, Debug)]\n' + item(terminal, 'pub struct Metrics {') + '\n' + item(terminal, 'impl Metrics {'),
         'font-system': terminal[font_start:font_end],
         'font-advance': item(terminal, 'fn measure_mono_ascii_advance('),
         'terminal-constants': '\n'.join(constant(terminal, key) for key in ('SCROLLBAR_WIDTH', 'BLOCK_GUTTER_WIDTH')),
@@ -190,7 +201,7 @@ def owned_geometry(outputs, tree, pid, scale):
             'node_id': node['id'], 'pid': pid}
 
 
-def verify_shell_pixels(ppm, native, production):
+def verify_shell_pixels(ppm, native, production, backdrop):
     """Check actually rendered panel edges, independently of PTY/grid reports.
 
     Narrow strips avoid labels/icons; vertical votes tolerate only isolated
@@ -220,7 +231,12 @@ def verify_shell_pixels(ppm, native, production):
             count += all(abs(data[offset + channel] - color[channel]) <= 2 for channel in range(3))
         return count / len(ys)
 
-    palette, rail = production['palette'], production['rail_width']
+    require(len(backdrop) == 3 and all(type(v) is int and 0 <= v <= 255 for v in backdrop),
+            'Missing independently captured compositor backdrop')
+    palette = {name: [round(c * rgba[3] / 255 + bg * (1 - rgba[3] / 255))
+                     for c, bg in zip(rgba[:3], backdrop)]
+               for name, rgba in production['palette'].items()}
+    rail = production['rail_width']
     observations = {'rail': vote(3, palette['rail'])}
     require(observations['rail'] >= .75, 'Native rail missing or incorrect geometry')
     nav, inspector = production['navigation_width'], production['inspector_width']
@@ -279,7 +295,7 @@ def run_sequence(smoke, app_pid, probe, record_shell, *, recovery=False):
         require(before == after, 'Native layout changed during grid/frame observation')
         png = smoke.out / (label + '.png')
         ppm = smoke.run(['convert', str(png), '-strip', '-depth', '8', 'ppm:-'], capture_output=True).stdout
-        pixels = verify_shell_pixels(ppm, before, production)
+        pixels = verify_shell_pixels(ppm, before, production, smoke.desktop_backdrop)
         record = {'scale': scale, 'native': before, 'production': production, 'shell': shell,
                   'native_shell_pixels_verified': pixels['passed'], 'pixel_evidence': pixels,
                   'raw_png': png.name, 'raw_png_sha256': hashlib.sha256(png.read_bytes()).hexdigest()}

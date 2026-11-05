@@ -47,3 +47,12 @@ assert module.Smoke.close_button(rows('Closing Frost Work is still running Close
 assert module.Smoke.close_button(rows('Eva disconnected Close anyway')) is None
 assert module.Smoke.close_button(warning + rows('Close anyway', line='2')) is None
 print('Native visible-owner navigation and exact disconnected-close observation passed')
+
+# The recovery banner moves the column body. Absolute native overlays must
+# reserve that same height, or the real recovery/preservation text is covered.
+source = (Path(__file__).resolve().parents[1] / 'src/native_shell.rs').read_text()
+workspace = ''.join(source.split('    pub(crate) fn reference_workspace', 1)[1].split())
+for contract in ('y:layout.rail.y+recovery_height',
+                 'height:(layout.rail.height-recovery_height).max(0.0)',
+                 'top:layout.center.y+recovery_height'):
+    assert contract in workspace, contract

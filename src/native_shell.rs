@@ -1433,13 +1433,20 @@ impl Frost {
         // Use the rendered composer's inner surface, including sidebar toggles,
         // rather than the original layout's cached composer rectangle.
         let composer_width = self.reference_layout().composer.width;
-        let available = composer_width / font_scale;
         let label_size = 11.0;
         let terminal_width = 84.0 * font_scale;
         let tools_width = 82.0 * font_scale;
-        let square = control_height + 4.0;
-        // Actions on the right: attach, ask AI and send.
-        let trailing = 3.0 * square + 2.0 * shell::METADATA_GAP;
+        // Icon-only actions contain fixed-size vectors, so their width does
+        // not need to grow with text zoom. Preserve their full clickable
+        // height while leaving room for the input on narrow windows.
+        let square = 30.0;
+        let gap = shell::METADATA_GAP + 2.0;
+        let trailing = 3.0 * square + 8.0 + 2.0 * gap;
+        let fixed = shell::COMPOSER_CONTROL_LEFT
+            + shell::COMPOSER_CONTROL_RIGHT
+            + trailing
+            + shell::METADATA_GAP;
+        let show_terminal = composer_width >= fixed + terminal_width + gap + square;
         let caption = |title: &'static str, fg: [u8; 3]| {
             self.chrome_label(title, label_size, false, true)
                 .color(rgb(fg))
@@ -1448,7 +1455,7 @@ impl Frost {
         let mut tools = row![]
             .spacing(shell::METADATA_GAP + 2.0)
             .align_y(iced::Alignment::Center);
-        if available >= shell::COMPOSER_TERMINAL_MIN_AVAILABLE {
+        if show_terminal {
             tools = tools.push(
                 button(
                     row![
@@ -1486,12 +1493,13 @@ impl Frost {
         }
         let tools_title = jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[4];
         let tools_icon_only = composer_width
-            < shell::COMPOSER_CONTROL_LEFT
-                + shell::COMPOSER_CONTROL_RIGHT
-                + terminal_width
+            < fixed
                 + tools_width
-                + trailing
-                + 3.0 * shell::METADATA_GAP;
+                + if show_terminal {
+                    terminal_width + gap
+                } else {
+                    0.0
+                };
         let mut tools_contents = row![local_icon(
             LocalIcon::Sliders,
             rgb(color::CANVAS_MUTED),
@@ -2534,6 +2542,7 @@ impl Frost {
     ) -> Element<'a, Message> {
         use crate::glass_shell_tokens as glass;
         let layout = self.reference_layout();
+        let recovery_height = self.startup_recovery.banner_height(self.chrome_font_size());
         let budget = self.reference_native_budget();
         let main_bottom = (self.win_size.height - layout.center.bottom()).max(0.0);
         let navigation_bottom = (self.win_size.height - layout.rail.bottom()).max(0.0);
@@ -2734,7 +2743,7 @@ impl Frost {
                         }),
                 )
                 .padding(iced::Padding {
-                    top: layout.titlebar.height,
+                    top: layout.titlebar.height + recovery_height,
                     left: layout.rail.right(),
                     ..iced::Padding::ZERO
                 })
@@ -2751,7 +2760,7 @@ impl Frost {
                     .width(self.reference_inspector_width() + glass::INSPECTOR_GAP),
                 )
                 .padding(iced::Padding {
-                    top: layout.center.y,
+                    top: layout.center.y + recovery_height,
                     right: glass::OUTER_RIGHT,
                     bottom: main_bottom,
                     ..iced::Padding::ZERO
@@ -2809,15 +2818,16 @@ impl Frost {
             crate::workspace_navigation_surface::Placement {
                 panel: iced::Rectangle {
                     x: layout.rail.right(),
-                    y: layout.rail.y,
+                    y: layout.rail.y + recovery_height,
                     width: navigation_width,
-                    height: layout.rail.height,
+                    height: (layout.rail.height - recovery_height).max(0.0),
                 },
                 backdrop: iced::Rectangle {
                     x: layout.rail.right(),
-                    y: layout.titlebar.height,
+                    y: layout.titlebar.height + recovery_height,
                     width: (self.win_size.width - layout.rail.right()).max(0.0),
-                    height: (self.win_size.height - layout.titlebar.height).max(0.0),
+                    height: (self.win_size.height - layout.titlebar.height - recovery_height)
+                        .max(0.0),
                 },
                 visible: layout.navigation.is_some() || drawer,
                 drawer,

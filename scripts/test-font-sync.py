@@ -102,7 +102,7 @@ def braced_item(source, marker):
 
 
 def constant(source, name):
-    matches = re.findall(r'^(?:pub )?const ' + name + r':[^;]+;', source, re.MULTILINE)
+    matches = re.findall(r'^(?:pub(?:\(crate\))? )?const ' + name + r':[^;]+;', source, re.MULTILINE)
     assert len(matches) == 1, name
     return matches[0]
 
@@ -119,24 +119,24 @@ assert presenter.index('return terminal;') < presenter.index('macro_rules! direc
 assert presenter.count('return direct!();') == 5
 assert 'crate::native_input_surface::surface(' in presenter
 assert 'tree.children[0].diff(self.terminal.as_widget())' in function(input_surface, 'diff')
-assert 'self.dock.map_or(0.0, |dock| dock.input_height)' in function(input_surface, 'input_height')
+assert 'self.dock.map_or(self.held_input, |dock| dock.input_height)' in function(input_surface, 'input_height')
 tools = function(native_shell, 'reference_tools')
 assert 'self.reference_layout().composer.width' in tools
-# Baseline contract correction: the unchanged glass toolbar now contains Plus,
-# optional Terminal, responsive Tools and Send/Interrupt. Secondary/model choices
-# are not separate toolbar controls, so their old width-token checks were stale.
-# Assert the actual font-scaled admission and full exact icon-only budget instead.
+# Match the actual current toolbar, including fixed-size vector actions and
+# the optional text labels. The executable budget below exercises these exact
+# expressions across content widths and independent chrome-font scales.
 compact_tools = re.sub(r'\s+', '', tools)
-assert 'letavailable=composer_width/font_scale;' in compact_tools
-assert 'ifavailable>=shell::COMPOSER_TERMINAL_MIN_AVAILABLE{' in compact_tools
-assert ('leticon_only=title==jterm_core::reference_conversation::COMPOSER_TOOL_NAMES[4]'
-        '&&composer_width<shell::COMPOSER_CONTROL_LEFT+shell::COMPOSER_CONTROL_RIGHT'
-        '+shell::COMPOSER_PLUS_WIDTH+shell::COMPOSER_SEND_WIDTH+width*font_scale'
-        '+2.0*shell::METADATA_GAP;') in compact_tools
-assert '.width(ificon_only{32.0}else{width*font_scale})' in compact_tools
-assert 'if !icon_only {' in tools and 'if icon_only {' in tools
-for requirement in ['Message::NewSession', 'Message::ReferenceFocusTerminal',
-                    'Message::ReferenceToolsToggle', 'chat_mode::press_control(arrow, action)']:
+for expression in [
+    'letsquare=30.0;', 'letgap=shell::METADATA_GAP+2.0;',
+    'lettrailing=3.0*square+8.0+2.0*gap;',
+    'letfixed=shell::COMPOSER_CONTROL_LEFT+shell::COMPOSER_CONTROL_RIGHT+trailing+shell::METADATA_GAP;',
+    'letshow_terminal=composer_width>=fixed+terminal_width+gap+square;',
+    'lettools_icon_only=composer_width<fixed+tools_width+ifshow_terminal{terminal_width+gap}else{0.0};',
+    '.width(iftools_icon_only{square}else{tools_width})',
+]:
+    assert expression in compact_tools, expression
+for requirement in ['Message::ReferenceFocusTerminal', 'Message::ReferenceToolsToggle',
+                    'chat_mode::press_control(arrow, action)']:
     assert requirement in tools, requirement
 native_chat = (ROOT / 'src/chat_mode.rs').read_text()
 code += ('mod chat_mode { pub use crate::core_chat_mode::*;\n'
@@ -163,13 +163,21 @@ replacements = {
                                ['effective_chrome_font_size', 'set_content_font_size', 'clamp_font_size']),
     'banner': function(main, 'banner_height'),
     'apply-metrics': metrics_assignment,
+    'input-hold-type': '#[derive(Clone, Copy, Debug)]\n' + braced_item(native_shell, 'pub(crate) struct InputDockHold {'),
+    'min-input-rows': constant((ROOT / 'src/terminal/chat_projection.rs').read_text(), 'CHAT_MIN_INPUT_ROWS'),
     'dock-metrics': ('pub(crate) const INPUT_STRIP_HEIGHT: f32 = crate::native_viewport::INPUT_STRIP_HEIGHT;\n'
+                     + '#[derive(Clone, Copy, Debug, PartialEq)]\n'
                      + braced_item(input_surface, 'pub(crate) struct DockMetrics {') + '\n'
                      + braced_item(input_surface, 'pub(crate) fn dock_metrics(')),
     'app-methods': '\n'.join(function(source, name) for source, name in
                             [(main, 'effective_font_size'), (main, 'chrome_font_size'),
                              (native_shell, 'reference_layout'),
                              (native_shell, 'reference_input_metrics'),
+                             (native_shell, 'live_input_metrics'),
+                             (native_shell, 'held_input_metrics'),
+                             (native_shell, 'input_dock_hold_eligible'),
+                             (native_shell, 'sync_input_dock_hold'),
+                             (native_shell, 'expire_input_dock_hold'),
                              (native_shell, 'reference_native_budget'),
                              (main, 'refresh_glass_grid_dimensions'),
                              (main, 'block_reading_bar_height'), (main, 'term_width'),
@@ -191,7 +199,8 @@ for name in ['no_dock_allocates_no_editor_or_phantom_floating_gap',
              'a_short_prompt_keeps_its_existing_padding',
              'two_row_float_boundaries_keep_both_cells_and_caret_inside_the_clip',
              'larger_physical_cells_grow_instead_of_being_clipped',
-             'multiline_and_capped_drafts_keep_the_original_budget_and_last_row']:
+             'multiline_and_capped_drafts_keep_the_original_budget_and_last_row',
+             'three_row_chat_editor_retains_clearance_without_clipping_a_zoomed_caret']:
     code += '#[test]\n' + function(input_surface, name) + '\n'
 code += '}\n'
 # These temporary mutants must COMPILE and then fail the executable numerical
@@ -200,13 +209,13 @@ assert metrics_new.count('font_size * 1.2 * line_spacing') == 1
 assert term_height.count('self.block_reading_bar_height()') == 1
 assert chrome_getter.count('self.config.effective_chrome_font_size()') == 1
 assert metrics_assignment.count('self.effective_font_size()') == 1
-input_metrics = function(native_shell, 'reference_input_metrics')
-assert input_metrics.count('            rows,') == 1
+input_metrics = function(native_shell, 'live_input_metrics')
+assert input_metrics.count('rows.max(3)') == 1
 assert term_height.count('.map(|metrics| metrics.input_height)') == 1
 mutants = [
     ('fixed-content-cell-height', metrics_new,
      metrics_new.replace('font_size * 1.2 * line_spacing', '14.0 * 1.2 * line_spacing')),
-    ('fixed-reading-strip-height', term_height,
+    ('obsolete-reading-strip-height', term_height,
      term_height.replace('self.block_reading_bar_height()',
                          'if self.block_reading_bar_visible() { 36.0 } else { 0.0 }')),
     ('metrics-caller-coupled-to-chrome', metrics_assignment,
@@ -217,7 +226,7 @@ mutants = [
      term_height.replace('.map(|metrics| metrics.input_height)',
                          '.map(|_| native_viewport::INPUT_STRIP_HEIGHT)')),
     ('discard-real-multiline-input-rows', input_metrics,
-     input_metrics.replace('            rows,', '            1,')),
+     input_metrics.replace('rows.max(3)', '1')),
 ]
 assert all(code.count(original) == 1 for _, original, _ in mutants)
 with tempfile.TemporaryDirectory(prefix='frost-font-sync-') as directory:

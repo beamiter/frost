@@ -49,7 +49,7 @@ class Smoke:
                             ('XDG_DATA_HOME', '.local/share'), ('XDG_STATE_HOME', '.local/state'),
                             ('XDG_CACHE_HOME', '.cache')]:
             self.env[key] = str(home / suffix)
-        self.env.update(FROST_SMOKE_SHELL_TRACE=str(out / 'synthetic-shell-trace.log'), XDG_RUNTIME_DIR=str(runtime), LIBGL_ALWAYS_SOFTWARE='1',
+        self.env.update(FROST_SMOKE_SHELL_TRACE=str(out / 'synthetic-shell-trace.log'), FROST_SMOKE_GRID_DIR=str(out), XDG_RUNTIME_DIR=str(runtime), LIBGL_ALWAYS_SOFTWARE='1',
                         WGPU_BACKEND='vulkan', RUST_LOG='warn,iced_wgpu::window::compositor=info')
         config = home / '.config/frost'
         config.mkdir(parents=True)
@@ -65,6 +65,7 @@ __frost_smoke_prompt() {
     if [[ ${__frost_smoke_seen:-0} == 1 ]]; then printf '\e]133;D;%s\a' "$status"; fi
     __frost_smoke_seen=1
 }
+__frost_grid() { stty size > "$FROST_SMOKE_GRID_DIR/$1-stty.txt"; }
 PROMPT_COMMAND=__frost_smoke_prompt
 PS0=$'\e]133;C\a'
 PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
@@ -127,6 +128,22 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
             self.env['SWAYSOCK'] = str(ipc)
             assert server.poll() is None
         time.sleep(1)
+        if self.backend == 'wayland':
+            # Measure the empty private compositor before launching Frost.
+            # Glass edge checks composite source RGBA over this observation,
+            # never infer the background or expected panel color from the app.
+            self.screenshot('desktop-backdrop')
+            ppm = self.run(['convert', str(self.out / 'desktop-backdrop.png'),
+                            '-strip', '-depth', '8', 'ppm:-'], capture_output=True).stdout
+            header = re.match(br'P6\s+(\d+)\s+(\d+)\s+255\s', ppm)
+            assert header and tuple(map(int, header.groups())) == (1280, 900)
+            data = ppm[header.end():]
+            samples = [list(data[(y * 1280 + x) * 3:(y * 1280 + x) * 3 + 3])
+                       for x in (10, 320, 960, 1270) for y in (10, 200, 700, 890)]
+            assert all(color == samples[0] for color in samples), samples
+            self.desktop_backdrop = samples[0]
+            (self.out / 'desktop-backdrop.json').write_text(json.dumps({
+                'rgb': self.desktop_backdrop, 'samples': samples, 'captured_before_app': True}))
 
     def key(self, key, modifiers=()):
         if self.backend == 'x11':
@@ -157,16 +174,25 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
         else:
             self.run(['grim', target])
 
-    def observe_frame(self, label):
+    def observe_frame(self, label, enhanced=False):
         # Screenshots and OCR are read-only observations, never app messages.
         self._frame_number = getattr(self, '_frame_number', 0) + 1
         name = f'{label}-{self._frame_number:03d}'
         self.screenshot(name)
-        tsv = self.run(['tesseract', str(self.out / (name + '.png')), 'stdout',
+        source = self.out / (name + '.png')
+        if enhanced:
+            source = self.out / (name + '.ocr.png')
+            self.run(['convert', str(self.out / (name + '.png')), '-colorspace', 'Gray',
+                      '-negate', '-resize', '300%', str(source)], capture_output=True)
+        tsv = self.run(['tesseract', str(source), 'stdout',
                         '--psm', '11', 'tsv'], text=True, capture_output=True).stdout
         (self.out / (name + '.tsv')).write_text(tsv)
         rows = [row for row in csv.DictReader(io.StringIO(tsv), delimiter='\t',
                 quoting=csv.QUOTE_NONE) if row['level'] == '5' and row['text'].strip()]
+        if enhanced:
+            for row in rows:
+                for field in ('left', 'top', 'width', 'height'):
+                    row[field] = str(round(int(row[field]) / 3))
         return name, rows
 
     @staticmethod
@@ -221,6 +247,8 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
         return matches[0] if len(matches) == 1 else None
 
     def close_app(self, app):
+        requested = time.monotonic()
+        approved = requested
         if self.backend == 'x11':
             self.key('F4', ('alt',))
         else:
@@ -228,12 +256,13 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
         def closed_or_dialog():
             if app.poll() is not None:
                 return 'closed'
-            name, rows = self.observe_frame('graceful-close')
+            name, rows = self.observe_frame('graceful-close', enhanced=True)
             button = self.close_button(rows)
             return (name, button) if button else None
         result = wait_for(closed_or_dialog, 'application exit or disconnected Eva close dialog')
         if result != 'closed':
             name, (x, y) = result
+            approved = time.monotonic()
             if self.backend == 'x11':
                 self.run(['xdotool', 'mousemove', '--sync', str(x), str(y), 'click', '1'])
             else:
@@ -247,6 +276,7 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
                 'button_center': [x, y]}, indent=2))
         app.wait(timeout=20)
         assert app.returncode == 0, app.returncode
+        return {'requested': requested, 'approved': approved, 'exited': time.monotonic()}
 
     def command(self, sentinel, paste=False):
         command = "printf '%s:%s:%s\\n' " + shlex.quote(sentinel) + ' "$$" "$(tty)" >> ' + shlex.quote(str(self.transcript))

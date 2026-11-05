@@ -666,7 +666,7 @@ class Case:
         with (home / '.bash_profile').open('a') as profile:
             profile.write(r'''
 r07() { printf '%s\t%s\t%s\t%s\n' "$1" "$$" "$(tty)" "$(stty size)" >> "$FROST_RECOVERY_RECORD"; }
-r07_ready() { printf '\106\122\117\123\124\122\105\103\117\126\105\122\131\122\105\101\104\131\n'; }
+r07_ready() { printf '\n\106\122\117\123\124\122\105\103\117\126\105\122\131\122\105\101\104\131\n\n'; }
 ''')
             if self.name in LIMIT_CASES:
                 write_new_private(self.shell_starts, b'')

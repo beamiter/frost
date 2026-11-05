@@ -31,12 +31,15 @@ class ExactGeometry(unittest.TestCase):
                                       'cols': prod['grid'][0], 'rows': prod['grid'][1]}})
         return records
 
-    def test_actual_production_collapse_and_measurement(self):
+    def test_actual_production_panels_collapse_and_measurement(self):
         records = self.sequence()
         self.assertEqual([(r['production']['navigation_width'], r['production']['inspector_width'])
-                          for r in records], [(237, 306), (237, 0), (237, 0), (0, 0), (237, 306)])
+                          for r in records], [(280, 0)] * 5)
         self.assertTrue(all(r['production']['metrics']['mono_advance_exact'] for r in records))
-        self.assertGreater(records[3]['shell']['cols'], records[2]['shell']['cols'])
+        self.assertLess(records[3]['shell']['cols'], records[2]['shell']['cols'])
+        narrow = g.expected(self.probe, 540, 423)
+        self.assertEqual(narrow['navigation_width'], 0)
+        self.assertGreater(narrow['grid'][0], records[3]['shell']['cols'])
         g.assert_sequence(records)
 
     def test_wrong_grid_shell_reset_or_missing_pixels_rejected(self):
@@ -83,15 +86,18 @@ class ExactGeometry(unittest.TestCase):
         native={'physical':[width,height], 'scale':1, 'client':{'x':0,'y':0,'width':width,'height':height},
                 'output_rect':{'x':0,'y':0,'width':width,'height':height}}
         def ppm(nav,inspector):
-            colors=prod['palette']; data=bytearray()
-            row=b''.join(bytes(colors['rail'] if x<55 else colors['navigation'] if x<55+nav
+            colors={name: [round(c * rgba[3] / 255 + 63 * (1 - rgba[3] / 255))
+                          for c in rgba[:3]] for name, rgba in prod['palette'].items()}; data=bytearray()
+            row=b''.join(bytes(colors['rail'] if x<prod['rail_width'] else colors['navigation'] if x<prod['rail_width']+nav
                                else colors['inspector'] if x>=width-inspector else [250,251,255])
                          for x in range(width))
             for _ in range(height):data+=row
             return f'P6\n{width} {height}\n255\n'.encode()+data
-        g.verify_shell_pixels(ppm(237,0),native,prod)
-        for pixels in [ppm(0,0),ppm(237,306),ppm(100,0)]:
-            with self.assertRaises(AssertionError):g.verify_shell_pixels(pixels,native,prod)
+        g.verify_shell_pixels(ppm(280,0),native,prod,[63,63,63])
+        with self.assertRaises(AssertionError):
+            g.verify_shell_pixels(ppm(280,0),native,prod,[0,0,0])
+        for pixels in [ppm(0,0),ppm(280,288),ppm(100,0)]:
+            with self.assertRaises(AssertionError):g.verify_shell_pixels(pixels,native,prod,[63,63,63])
 
 
 if __name__ == '__main__': unittest.main()

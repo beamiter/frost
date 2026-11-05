@@ -90,7 +90,7 @@ def main():
         original = smoke.command('dpi-ready')
         def record(label):
             path = out / (label + '-stty.txt')
-            smoke.text('stty size > ' + shlex.quote(str(path)))
+            smoke.text('__frost_grid ' + label)
             smoke.key('Return')
             identity = smoke.command(label)
             geometry.require(identity == original, 'Native DPI input replaced original shell')
@@ -98,9 +98,7 @@ def main():
             pid, tty = identity.split(':', 1)
             return {'pid': int(pid), 'tty': tty, 'rows': rows, 'cols': cols}
         result['records'] = geometry.run_sequence(smoke, app.pid, probe, record)
-        smoke.run(['swaymsg', '[app_id="io.github.beamiter.frost"]', 'kill'])
-        app.wait(timeout=20)
-        geometry.require(app.returncode == 0, 'DPI app did not close gracefully')
+        smoke.close_app(app)
         geometry.require(hashlib.sha256(binary.read_bytes()).hexdigest() == binary_sha,
                          'Frozen app binary changed during native DPI run')
         geometry.require(smoke.config.read_bytes() == config_before, 'DPI input changed the configured font/UI contract')
