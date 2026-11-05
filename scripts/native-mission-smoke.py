@@ -80,6 +80,7 @@ def main():
     pointer = None
     app = None
     sequence = 0
+    window_bounds = None
 
     def pointer_command(command):
         nonlocal pointer
@@ -111,7 +112,11 @@ def main():
         time.sleep(.15)
 
     def scroll(amount):
-        move(1150, 450)
+        assert window_bounds is not None
+        # Scroll over the inspector's scrollbar gutter, never the multiline
+        # goal editor: that child correctly consumes its own wheel input.
+        move(window_bounds['x'] + window_bounds['width'] - 16,
+             window_bounds['y'] + window_bounds['height'] // 2)
         if args.backend == 'x11':
             smoke.run(['xdotool', 'click', '--repeat', str(abs(amount)), '--delay', '60',
                        '5' if amount > 0 else '4'])
@@ -127,9 +132,10 @@ def main():
         smoke.screenshot(name)
         source = out / (name + '.ocr.png')
         # Blue native buttons have dark text, unlike the light body labels.
-        # A fixed luminance split preserves their glyphs; neither text nor
+        # The split lies between observed disabled ink and blue background,
+        # and preserves both enabled and disabled glyphs. Neither text nor
         # click coordinates are inferred from the expected control.
-        transform = ['-threshold', '25%'] if control else ['-negate']
+        transform = ['-threshold', '22%'] if control else ['-negate']
         scale = 3 if control else 2
         smoke.run(['convert', str(out / (name + '.png')), '-colorspace', 'Gray',
                    *transform, '-resize', f'{scale * 100}%', str(source)], capture_output=True)
@@ -187,7 +193,22 @@ def main():
         smoke.config.write_text('shell="/bin/bash"\nterminal_mode="block"\nrestore_session=false\n'
                                 'initial_width=1100\ninitial_height=760\n')
         app = smoke.spawn([str(smoke.binary)], 'frost-mission')
-        runner.wait_for(smoke.app_window, 'Mission application window')
+        window = runner.wait_for(smoke.app_window, 'Mission application window')
+        if args.backend == 'x11':
+            assert int(smoke.run(['xdotool', 'getwindowpid', str(window)],
+                                 text=True, capture_output=True).stdout) == app.pid
+            geometry = smoke.run(['xdotool', 'getwindowgeometry', '--shell', str(window)],
+                                 text=True, capture_output=True).stdout
+            native = dict(line.split('=', 1) for line in geometry.splitlines() if '=' in line)
+            window_bounds = {key: int(native[key.upper()]) for key in ('x', 'y', 'width', 'height')}
+        else:
+            import native_scale_geometry
+            outputs = json.loads(smoke.run(['swaymsg', '-t', 'get_outputs', '-r'],
+                                           text=True, capture_output=True).stdout)
+            tree = json.loads(smoke.run(['swaymsg', '-t', 'get_tree', '-r'],
+                                        text=True, capture_output=True).stdout)
+            window_bounds = native_scale_geometry.owned_geometry(outputs, tree, app.pid, 1)['client']
+        result['native_window'] = window_bounds
         time.sleep(2)
         smoke.select_terminal(require_terminal=True)
         press('Missions', 'open-missions')
@@ -246,7 +267,11 @@ def main():
         smoke.close_app(app)
         result['status'] = 'pass'
     except BaseException as error:
-        result['error'] = repr(error)
+        result.update(status='fail', error=repr(error))
+        try:
+            result['failure_saved_state'] = stored()
+        except Exception:
+            pass
         try:
             smoke.screenshot('failure-before-cleanup')
         except Exception:
