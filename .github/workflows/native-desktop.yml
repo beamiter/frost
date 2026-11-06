@@ -34,9 +34,20 @@ jobs:
             bash "scripts/materialize-shared-core.sh"
           fi
       - name: Install official desktop and build packages
+        timeout-minutes: 6
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y \
+          # The runner's Azure mirror stalled large fonts/Mesa downloads until
+          # the whole native job expired. Keep Ubuntu's signed packages and
+          # exact dependency list, but prefer its official HTTPS archives.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            printf 'https://archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://security.ubuntu.com/ubuntu/\tpriority:2\n' \
+              | sudo tee /etc/apt/apt-mirrors.txt
+          else
+            echo "::notice::APT mirror list absent; retaining configured sources with bounded retries/timeouts."
+          fi
+          apt_network=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_network[@]}" update
+          sudo apt-get "${apt_network[@]}" install --no-install-recommends -y \
             pkg-config libfontconfig1-dev libwayland-dev libx11-dev libx11-xcb-dev \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxcursor-dev libxi-dev libxrandr-dev libxkbcommon-dev \
