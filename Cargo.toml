@@ -72,6 +72,8 @@ cryoglyph = { path = "vendor/cryoglyph" }
 iced_winit = { path = "vendor/iced_winit" }
 # Preserve ordered native input through stalled subscription consumers.
 iced_futures = { path = "vendor/iced_futures" }
+# Replace unmaintained pin-utils with checked pin-project-lite projections.
+wasmtimer = { path = "vendor/wasmtimer" }
 window_clipboard = { path = "vendor/window_clipboard" }
 clipboard_wayland = { path = "vendor/clipboard_wayland" }
 clipboard_x11 = { path = "vendor/clipboard_x11" }

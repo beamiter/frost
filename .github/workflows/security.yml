@@ -7,8 +7,10 @@ on:
       - Cargo.toml
       - Cargo.lock
       - .cargo/audit.toml
+      - deny.toml
       - scripts/security-check.sh
       - vendor/cryoglyph/**
+      - vendor/wasmtimer/**
       - .github/workflows/security.yml
   push:
     branches: [master]
@@ -16,8 +18,10 @@ on:
       - Cargo.toml
       - Cargo.lock
       - .cargo/audit.toml
+      - deny.toml
       - scripts/security-check.sh
       - vendor/cryoglyph/**
+      - vendor/wasmtimer/**
       - .github/workflows/security.yml
   schedule:
     - cron: "29 4 * * 1"
@@ -74,5 +78,48 @@ jobs:
           cargo audit --version | grep -Eq \
             "[[:space:]]${CARGO_AUDIT_VERSION}$"
 
-      - name: Audit the locked dependency graph
-        run: scripts/security-check.sh --audit
+      - name: Audit the locked dependency graphs
+        run: |
+          scripts/security-check.sh --audit
+          cargo audit --deny warnings --file vendor/wasmtimer/Cargo.lock
+
+  wasmtimer:
+    name: Patched WebAssembly timers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: "3"
+      CARGO_TARGET_DIR: target/wasmtimer
+      CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+      # Must match wasm-bindgen in vendor/wasmtimer/Cargo.lock.
+      WASM_BINDGEN_VERSION: "0.2.127"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cache/wasm-bindgen-target
+          key: wasm-bindgen-${{ env.WASM_BINDGEN_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install the matching WebAssembly test runner
+        run: |
+          node --version
+          CARGO_TARGET_DIR="$HOME/.cache/wasm-bindgen-target" \
+            cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
+
+      - name: Check optional features and run timer regressions on WebAssembly
+        run: |
+          cargo check --locked -p iced_futures --target wasm32-unknown-unknown
+          cargo check --manifest-path vendor/wasmtimer/Cargo.toml --locked \
+            --target wasm32-unknown-unknown --no-default-features
+          cargo test --manifest-path vendor/wasmtimer/Cargo.toml --locked \
+            --target wasm32-unknown-unknown --all-features

@@ -16825,13 +16825,13 @@ impl Frost {
                 self.sidebar_hovered = false;
                 self.invalidate_sidebar_remote_follow_intent();
                 let show = !self.reference_inspector_visible();
-                if !show {
-                    self.agent_sessions.missions.close();
-                }
                 self.reference_navigation_drawer = false;
                 self.reference_inspector_open = show;
                 self.reference_inspector_drawer =
                     show && self.reference_layout().inspector.is_none();
+                if !show {
+                    self.agent_sessions.missions.close();
+                }
                 self.sync_reference_inspector_geometry();
                 self.trace_reference_inspector("toggle-after");
                 return iced::widget::operation::focus(iced::widget::Id::new(
