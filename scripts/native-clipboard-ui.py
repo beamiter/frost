@@ -188,9 +188,11 @@ try:
     s.key('f', ('ctrl', 'shift'))
     s.key('v', ('ctrl',))
     m.wait_for(lambda: any(e['phase'] == 'complete' for e in events(log)), 'widget clipboard transfer')
-    # Observe successive actual frames: the blinking insertion caret can be
-    # recognized as an extra letter. Never replay paste or alter the field to
-    # make OCR pass, and retain every original frame/TSV, including failures.
+    # Select once for the copy already required below. Iced renders a selection
+    # instead of an insertion caret, so OCR need not sample the blink-off phase.
+    # This does not change the text or replay paste. Preserve exact OCR and
+    # every original frame/TSV, then independently check the copied bytes.
+    s.key('a', ('ctrl',))
     widget_observations = []
     try:
         observe_exact_word(widget_words, 'widget-pasted', 'FROSTWIDGET', widget_observations)
@@ -198,7 +200,6 @@ try:
         (out / 'widget-observations.json').write_text(json.dumps(widget_observations, indent=2))
     # Remove the original source before copying: it must not satisfy the idle read.
     stop(proc, control)
-    s.key('a', ('ctrl',))
     s.key('c', ('ctrl',))
     latency = external(b'FROSTWIDGET')
     result['cases'].append({'name': 'legacy-widget-paste-and-idle-copy', 'status': 'pass', 'external_read_seconds': latency, 'events': events(log)})

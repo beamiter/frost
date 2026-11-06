@@ -1,4 +1,4 @@
-"""Read-only exact OCR observations across the widget's cursor blink cycle."""
+"""Read-only exact OCR observations of the actual Find widget."""
 import csv
 import io
 import json
@@ -98,9 +98,10 @@ def observe_exact_word(capture, label, expected, observations, timeout=5):
         rows = capture(artifact)
         tokens = [row['text'] for row in rows]
         observations.append({'artifact': artifact, 'words': tokens})
-        # Preserve the existing exact, unique-token requirement. In particular,
-        # a caret-suffixed word must not be normalized into the expected word.
-        if tokens.count(expected) == 1:
+        # The entire control must contain one exact token. Extra text must fail
+        # whether OCR joins it to the expected word or puts it in another box.
+        # Never normalize a caret-like suffix into the expected word.
+        if tokens == [expected]:
             return
     raise AssertionError({'expected_unique_word': expected, 'observations': observations})
 

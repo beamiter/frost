@@ -15,6 +15,7 @@ import time
 
 from PIL import Image, ImageChops, ImageGrab
 from native_x11_capture import X11StripCapture
+from native_vim_snapshot import FixtureSnapshotReader, validate_geometry
 
 
 def wait_for(probe, label, process, timeout=25):
@@ -89,8 +90,10 @@ def main():
         "return ''\n"
         "endfunction\n"
         "inoremap <silent> <F8> <Cmd>call NativeFixtureComplete()<CR>\n"
+        "let g:native_fixture_sample_seq = 0\n"
         "function! NativeFixtureState(timer) abort\n"
-        f"call writefile([json_encode({{'termguicolors': &termguicolors, 'mode': mode(), 'cmdline': get(g:, 'native_fixture_cmdline', ''), 'pumvisible': pumvisible(), 'selected': get(complete_info(['selected']), 'selected', -1), 'windows': winnr('$'), 'quickfix_size': len(getqflist()), 'quickfix_title': get(getqflist({{'title': 1}}), 'title', ''), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'topline': line('w0'), 'text': getline('.'), 'completion_line': getline(2), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
+        "let g:native_fixture_sample_seq += 1\n"
+        f"call writefile([json_encode({{'sample_seq': g:native_fixture_sample_seq, 'termguicolors': &termguicolors, 'mode': mode(), 'cmdline': get(g:, 'native_fixture_cmdline', ''), 'pumvisible': pumvisible(), 'selected': get(complete_info(['selected']), 'selected', -1), 'windows': winnr('$'), 'quickfix_size': len(getqflist()), 'quickfix_title': get(getqflist({{'title': 1}}), 'title', ''), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'topline': line('w0'), 'text': getline('.'), 'completion_line': getline(2), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
         f"call rename({quoted(str(state_file) + '.tmp')}, {quoted(state_file)})\n"
         "endfunction\n"
         "call timer_start(60, function('NativeFixtureState'), {'repeat': -1})\n",
@@ -115,11 +118,15 @@ def main():
         if result.returncode and parts[0] != "search":
             raise RuntimeError("xdotool " + " ".join(map(str, parts)) + ": " + result.stderr)
         return result
+    state_reader = FixtureSnapshotReader(state_file, validate_geometry)
     def state():
-        try:
-            return json.loads(state_file.read_text())
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
+        return state_reader.poll() or {}
+    def fresh_state(label):
+        return state_reader.fresh(app, label)
+    def geometry_observation(predicate):
+        # Each geometry decision and its returned record use the same sample.
+        snapshot = state()
+        return snapshot if snapshot and predicate(snapshot) else None
     def capture(name):
         image = out / f"{name}.png"
         subprocess.run(["import", "-window", str(window), str(image)], env=env, check=True, timeout=5)
@@ -253,7 +260,7 @@ def main():
             report["empty_project_search"] = "passed"
             command("call setqflist([], 'r', {'title': '', 'items': []})")
             wait_for(lambda: state().get("quickfix_title") == "", "quickfix fixture cleared", app)
-            before_dock_close = state()
+            before_dock_close = fresh_state("complete geometry before closing tool dock")
             xdo("key", "ctrl+shift+j")
             # Closing the tool dock resizes the PTY asynchronously. Do not
             # inject the wheel fixture's Ex command while Vim handles SIGWINCH.
@@ -458,7 +465,7 @@ def main():
             mask = part if mask is None else ImageChops.multiply(mask, part)
         menu_bounds = mask.getbbox()
         assert menu_bounds is not None
-        menu_rows = state()["render"]["completion"]["view"]["rows"]
+        menu_rows = fresh_state("complete completion geometry")["render"]["completion"]["view"]["rows"]
         click_x = (menu_bounds[0] + menu_bounds[2]) // 2
         click_y = int(menu_bounds[1] + (menu_bounds[3] - menu_bounds[1]) * 1.5 / menu_rows)
         xdo("mousemove", "--window", window, click_x, click_y)
@@ -504,10 +511,11 @@ def main():
             regions = color_regions("buffer-first")
             assert regions["x_regions"][0][0] < 80, "Project panel reserved default space"
             assert regions["y_regions"][0][0] < 80, "Toolbar/tabs reserved default space"
-            original_grid = (state()["screen_columns"], state()["screen_rows"])
+            original_state = fresh_state("complete buffer-first geometry")
+            original_grid = (original_state["screen_columns"], original_state["screen_rows"])
             xdo("key", "ctrl+shift+e")
             files_grid = wait_for(
-                lambda: state() if state().get("screen_columns", original_grid[0]) < original_grid[0] else None,
+                lambda: geometry_observation(lambda sample: sample["screen_columns"] < original_grid[0]),
                 "explicit project panel takes columns", app)
             wait_for(lambda: native_geometry("project-panel-open-native", files_grid["screen_columns"], files_grid["screen_rows"]),
                      "native buffer presents the project-panel geometry", app)
@@ -518,7 +526,7 @@ def main():
                      "native buffer presents the restored project geometry", app)
             xdo("key", "ctrl+shift+j")
             tools_grid = wait_for(
-                lambda: state() if state().get("screen_rows", original_grid[1]) < original_grid[1] else None,
+                lambda: geometry_observation(lambda sample: sample["screen_rows"] < original_grid[1]),
                 "explicit tool panel takes rows", app)
             wait_for(lambda: native_geometry("tool-panel-open-native", tools_grid["screen_columns"], tools_grid["screen_rows"]),
                      "native buffer presents the tool-panel geometry", app)
@@ -527,11 +535,13 @@ def main():
                      "closing tool panel returns rows", app)
             wait_for(lambda: native_geometry("tool-panel-closed-native", *original_grid),
                      "native buffer presents the restored tool geometry", app)
+            restored_state = fresh_state("complete restored buffer-first geometry")
+            assert (restored_state["screen_columns"], restored_state["screen_rows"]) == original_grid
             report["buffer_first_chrome"] = {
                 "default_grid": list(original_grid),
                 "project_columns": files_grid["screen_columns"],
                 "tool_rows": tools_grid["screen_rows"],
-                "restored_grid": [state()["screen_columns"], state()["screen_rows"]],
+                "restored_grid": [restored_state["screen_columns"], restored_state["screen_rows"]],
             }
         xdo("key", "Escape")
         xdo("type", "--clearmodifiers", "--delay", "20", "ggIsaved_native_")
@@ -585,9 +595,11 @@ def main():
         xdo("key", "ctrl+s")
         wait_for(lambda: source.read_text(encoding="utf-8") == original, "save split undo", app)
         report["split_edit_save_undo"] = "passed"
-        before_resize = (state()["screen_columns"], state()["screen_rows"])
+        resize_state = fresh_state("complete geometry before window resize")
+        before_resize = (resize_state["screen_columns"], resize_state["screen_rows"])
         xdo("windowsize", window, 1100, 820)
-        resized = wait_for(lambda: state() if (state().get("screen_columns"), state().get("screen_rows")) != before_resize else None,
+        resized = wait_for(lambda: geometry_observation(
+            lambda sample: (sample["screen_columns"], sample["screen_rows"]) != before_resize),
                            "Vim acknowledged resized PTY geometry", app)
         report["window_resize"] = {"before": list(before_resize),
                                    "after": [resized["screen_columns"], resized["screen_rows"]]}
@@ -600,7 +612,7 @@ def main():
         command("normal! 0")
         report["balanced_split_rgb"] = wait_for(
             lambda: native_splits("balanced-splits", 2, 2), "balanced native Vim splits", app)
-        before_zoom = state()["screen_columns"]
+        before_zoom = fresh_state("complete geometry before font zoom")["screen_columns"]
         first_region = report["balanced_split_rgb"]
         xdo("mousemove", "--window", window,
             first_region["x_regions"][0][0] + 12, first_region["y_regions"][0][0] + 30)
@@ -609,7 +621,7 @@ def main():
             xdo("click", 4)
         finally:
             xdo("keyup", "ctrl")
-        zoomed = wait_for(lambda: state() if state().get("screen_columns", before_zoom) < before_zoom else None,
+        zoomed = wait_for(lambda: geometry_observation(lambda sample: sample["screen_columns"] < before_zoom),
                           "editor font zoom changed Vim geometry", app)
         report["font_zoom"] = {"before_columns": before_zoom, "after_columns": zoomed["screen_columns"]}
         report["zoomed_split_rgb"] = wait_for(
@@ -625,11 +637,11 @@ def main():
                            else None, "explicit clipped-CJK compatibility reason", app)
         wait_for(lambda: color_count("clipped-cjk") == 0, "clipped CJK uses compatibility pixels", app)
         report["clipped_cjk_fallback"] = clipped
-        assert state()["leftcol"] == 1
+        assert fresh_state("complete clipped-CJK state")["leftcol"] == 1
         command("normal! 0")
         report["clipped_cjk_recovery_rgb"] = wait_for(
             lambda: native_splits("clipped-cjk-recovered", 2, 2), "native RGB restored after CJK boundary scroll", app)
-        assert state()["leftcol"] == 0
+        assert fresh_state("complete recovered CJK state")["leftcol"] == 0
         # A supported split layout must still fail closed for unsupported
         # decorations in any participating window and recover afterwards.
         command("setlocal list")
@@ -641,7 +653,7 @@ def main():
         command("only")
         wait_for(lambda: state().get("windows") == 1, "single Vim window", app)
         report["restored_rgb_pixels"] = wait_for(lambda: color_count("restored") > 30 and color_count("restored"), "native RGB restored", app)
-        report["vim_state"] = state()
+        report["vim_state"] = fresh_state("complete final Vim state")
         assert report["vim_state"]["termguicolors"] == 0
         command("qa")
         app.wait(timeout=10)
@@ -658,7 +670,11 @@ def main():
                     color_count("failure")
                 except (OSError, subprocess.SubprocessError) as error:
                     report["failure_screenshot_error"] = str(error)
-        report["vim_state"] = state()
+        try:
+            report["vim_state"] = state()
+        except (AssertionError, OSError) as error:
+            report["vim_state_error"] = str(error)
+        report["fixture_sample"] = state_reader.diagnostic()
         (out / "failure-state.json").write_text(json.dumps(report, indent=2) + "\n")
         raise
     finally:

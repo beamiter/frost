@@ -24,6 +24,9 @@ import tarfile
 import tempfile
 import time
 
+from native_vim_snapshot import (FixtureSnapshotReader, require_unchanged_quickfix,
+                                 validate_quickfix)
+
 
 def require(condition: bool, message: str) -> None:
     if not condition:
@@ -118,7 +121,8 @@ def preserve_failure(root: Path, window: int | None, error: BaseException, elaps
     report = {'error': repr(error), 'elapsed_seconds': elapsed, 'window': window,
               'legacy_observations': {name: read(root / name) for name in
                                       ('ready', 'mode', 'current', 'position', 'modified', 'windows', 'buffers')},
-              'vim_state': read(root / 'diagnostic-state.json')}
+              'vim_state': read(root / 'diagnostic-state.json'),
+              'quickfix_raw': read(root / 'quickfix.json')}
     try:
         report['x11'] = x11_input_state()
     except Exception as capture_error:
@@ -263,11 +267,13 @@ def main() -> None:
             f'autocmd TextChanged,TextChangedI,BufWritePost * call writefile([string(&modified)], {vim_string(modified)})\n'
             # Channel callbacks can move the actual cursor without immediately
             # firing CursorMoved. Sample Vim's real position independently.
+            'let g:frost_fixture_sample_seq = 0\n'
             'function! FrostRecordCursor(timer)\n'
+            '  let g:frost_fixture_sample_seq += 1\n'
             f'  call writefile([printf("%d:%d", line("."), col("."))], {vim_string(position)})\n'
             f'  call writefile([string(winnr("$"))], {vim_string(windows)})\n'
             f'  call writefile(map(getbufinfo({{"buflisted": 1}}), {{_, info -> info.name}}), {vim_string(buffers)})\n'
-            f'  call writefile([json_encode(getqflist({{"items": 0, "title": 0, "idx": 0}}))], {vim_string(quickfix)})\n'
+            f'  call writefile([json_encode(extend(getqflist({{"items": 0, "title": 0, "idx": 0}}), {{"sample_seq": g:frost_fixture_sample_seq}}))], {vim_string(quickfix)})\n'
             f'  call writefile([json_encode([expand("%:p"), line("."), col(".")])], {vim_string(location)})\n'
             # This independent sample distinguishes missing text input from a
             # TextChanged observation that did not fire. It changes no editor
@@ -417,12 +423,11 @@ def main() -> None:
                 xdo('click', '1')
                 wait(lambda: read(windows).strip() == '2', 'splitting through the native toolbar')
 
+                quickfix_reader = FixtureSnapshotReader(quickfix, validate_quickfix)
+
                 def qf_items(query: str, count: int):
-                    try:
-                        value = json.loads(read(quickfix))
-                    except (ValueError, OSError):
-                        return None
-                    if value.get('title') == 'Search: ' + query and len(value.get('items', [])) == count:
+                    value = quickfix_reader.poll()
+                    if value is not None and value['title'] == 'Search: ' + query and len(value['items']) == count:
                         return value['items']
                     return None
 
@@ -502,7 +507,13 @@ def main() -> None:
                     return False
 
                 wait(slow_search_stopped, 'cancelling the real search job through the native Stop search button', 5)
-                require(qf_items(expression, 4) == regex_rows, 'Cancelled search replaced the previous quickfix list')
+                # Acquire fresh, complete data, then compare once. Retrying a
+                # complete-but-different list could conceal a real regression.
+                cancelled_quickfix = quickfix_reader.fresh(
+                    process, 'sampling quickfix after the cancelled search stopped')
+                trace('cancelled_search_quickfix', snapshot=cancelled_quickfix,
+                      expected_title='Search: ' + expression, expected_items=regex_rows)
+                require_unchanged_quickfix(cancelled_quickfix, 'Search: ' + expression, regex_rows)
                 xdo('key', '--clearmodifiers', 'Escape')
 
                 # The native build form must preserve literal user review and

@@ -56,6 +56,8 @@ jobs:
         run: cargo build --bin frost --locked
       - name: Check native X11 capture pixel contracts
         run: /usr/bin/python3 scripts/test-native-x11-capture.py
+      - name: Check independent Vim fixture sampling contracts
+        run: /usr/bin/python3 scripts/test-native-vim-snapshot.py
       - name: Native XTest window acceptance
         env:
           WGPU_BACKEND: gl
