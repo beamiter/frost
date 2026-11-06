@@ -7,7 +7,8 @@ use iced::widget::{
 use iced::{Element, Length, Task};
 use jterm_core::agent_workspace::{
     ConversationId, ConversationKind, MissionWorkbench, WorkspaceMission,
-    WorkspaceMissionRepositoryReport,
+    WorkspaceMissionAttention, WorkspaceMissionReport, WorkspaceMissionRepositoryReport,
+    WorkspaceResultReport,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,6 +21,11 @@ pub(crate) struct MissionPanel {
     goal: text_editor::Content,
     checks: HashMap<String, String>,
     only_attention: bool,
+    attention: Option<WorkspaceMissionAttention>,
+    attention_changes: bool,
+    // Independent read-only selection: the general task inspector must not
+    // replace a frozen receipt with whichever task is selected elsewhere.
+    evidence: crate::workspace_review::WorkspaceReview,
     new_open: bool,
     new_title: String,
     new_goal: text_editor::Content,
@@ -36,6 +42,9 @@ impl Default for MissionPanel {
             goal: text_editor::Content::new(),
             checks: HashMap::new(),
             only_attention: false,
+            attention: None,
+            attention_changes: false,
+            evidence: Default::default(),
             new_open: false,
             new_title: "Four-terminal release".into(),
             new_goal: text_editor::Content::new(),
@@ -91,12 +100,96 @@ pub(crate) enum MissionAction {
     NeedsYou(bool),
     Link(MissionRef, ConversationId),
     OpenTask(ConversationId),
+    Attention(Box<WorkspaceMissionAttention>),
+    OpenAttention(Box<WorkspaceMissionAttention>, bool),
 }
 
 impl MissionPanel {
     pub(crate) fn poll(&mut self) {
         self.controller.poll();
         self.sync();
+        self.evidence.poll();
+    }
+
+    fn attention_items(&self) -> Vec<WorkspaceMissionAttention> {
+        if self.dirty() {
+            return Vec::new();
+        }
+        self.draft.as_ref().map_or_else(Vec::new, |mission| {
+            mission.attention_items(self.selected_report())
+        })
+    }
+
+    fn selected_report(&self) -> Option<&WorkspaceMissionReport> {
+        let mission = self.draft.as_ref()?;
+        if self.dirty() {
+            return None;
+        }
+        self.controller
+            .report
+            .as_ref()
+            .filter(|report| report.id == mission.id && report.revision == mission.revision)
+            .or_else(|| self.controller.report_for(&mission.id))
+    }
+
+    fn accepts_attention(&self, item: &WorkspaceMissionAttention) -> bool {
+        self.open && !self.controller.busy && self.attention_items().contains(item)
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.open = false;
+        self.clear_attention();
+    }
+
+    fn clear_attention(&mut self) {
+        self.attention = None;
+        self.evidence.clear_task();
+        self.evidence.notice = None;
+    }
+
+    fn reconcile_attention(&mut self) {
+        if self
+            .attention
+            .as_ref()
+            .is_some_and(|item| !self.open || !self.attention_items().contains(item))
+        {
+            self.clear_attention();
+        }
+    }
+
+    fn select_attention(&mut self, item: WorkspaceMissionAttention) {
+        if self.accepts_attention(&item) {
+            self.evidence.clear_task();
+            self.evidence.notice = None;
+            self.attention_changes = false;
+            self.attention = Some(item);
+        }
+    }
+
+    fn open_attention(&mut self, item: &WorkspaceMissionAttention, changes: bool) {
+        if !self.accepts_attention(item) || self.attention.as_ref() != Some(item) {
+            return;
+        }
+        let Some(task) = &item.task else {
+            return;
+        };
+        self.attention_changes = changes;
+        if self.evidence.selected() != Some(&task.conversation) {
+            self.evidence.select_task(task.conversation.clone());
+        } else if self.evidence.report.is_none() {
+            self.evidence.refresh_result();
+        }
+    }
+
+    fn attention_result(&self) -> Option<&WorkspaceResultReport> {
+        let item = self.attention.as_ref()?;
+        if !self.accepts_attention(item) {
+            return None;
+        }
+        self.evidence
+            .report
+            .as_ref()
+            .filter(|report| item.matches_result(report))
     }
 
     fn edited_plan(&self) -> Option<WorkspaceMission> {
@@ -135,6 +228,7 @@ impl MissionPanel {
 
     fn sync(&mut self) {
         let Some(selected) = self.controller.selected.clone() else {
+            self.clear_attention();
             return;
         };
         // Preserve unsaved edits on readback, including an uncertain-write or
@@ -155,6 +249,7 @@ impl MissionPanel {
             self.replace_draft(&selected);
         }
         self.saved = Some(selected);
+        self.reconcile_attention();
     }
 
     fn matches(&self, reference: &MissionRef) -> bool {
@@ -210,12 +305,14 @@ impl MissionPanel {
                 }
             }
         }
+        self.reconcile_attention();
     }
 }
 
 impl Frost {
     pub(crate) fn workspace_mission_action(&mut self, action: MissionAction) -> Task<Message> {
         if matches!(action, MissionAction::Open) {
+            self.agent_sessions.missions.clear_attention();
             self.agent_sessions.missions.open = true;
             self.agent_sessions.missions.only_attention = self.agent_sessions.status
                 == Some(jterm_core::agent_sessions::SessionStatus::Waiting);
@@ -229,7 +326,7 @@ impl Frost {
             self.native_enter_ownership.lock().claim_held();
             return Task::none();
         }
-        if !self.agent_sessions.missions.open {
+        if !self.agent_sessions.missions.open || !self.reference_inspector_visible() {
             return Task::none();
         }
         if let MissionAction::OpenTask(id) = &action {
@@ -238,7 +335,7 @@ impl Frost {
                 .into_iter()
                 .find(|(_, row)| row.id == *id)
             {
-                self.agent_sessions.missions.open = false;
+                self.agent_sessions.missions.close();
                 self.agent_sessions.context_input_focused = false;
                 return self.update(Message::WorkspaceTask(task));
             }
@@ -250,7 +347,7 @@ impl Frost {
         let ready = !panel.controller.busy;
         match action {
             MissionAction::Close => {
-                panel.open = false;
+                panel.close();
                 self.agent_sessions.context_input_focused = false;
             }
             MissionAction::Refresh => panel.controller.refresh(),
@@ -302,6 +399,8 @@ impl Frost {
             {
                 panel.controller.adopt_candidates();
             }
+            MissionAction::Attention(item) => panel.select_attention(*item),
+            MissionAction::OpenAttention(item, changes) => panel.open_attention(&item, changes),
             MissionAction::NeedsYou(value) => panel.only_attention = value,
             MissionAction::Link(reference, id)
                 if ready && !panel.dirty() && panel.matches(&reference) =>
@@ -310,6 +409,7 @@ impl Frost {
             }
             _ => {}
         }
+        panel.reconcile_attention();
         Task::none()
     }
 
@@ -343,22 +443,31 @@ impl Frost {
         }
         for mission in &panel.controller.missions {
             body = body.push(
-                button(text(visible(&mission.title)).size(size))
-                    .on_press_maybe(
-                        (ready && !dirty)
-                            .then(|| action(MissionAction::Select(mission.id.clone()))),
-                    )
-                    .style(
-                        if panel
-                            .draft
-                            .as_ref()
-                            .is_some_and(|draft| draft.id == mission.id)
-                        {
-                            button::primary
-                        } else {
-                            button::text
-                        },
-                    ),
+                button(
+                    text(visible(&{
+                        let reasons =
+                            mission.attention_items(panel.controller.report_for(&mission.id));
+                        reasons.first().map_or_else(
+                            || mission.title.clone(),
+                            |item| format!("{} · {}", mission.title, item.kind.label()),
+                        )
+                    }))
+                    .size(size),
+                )
+                .on_press_maybe(
+                    (ready && !dirty).then(|| action(MissionAction::Select(mission.id.clone()))),
+                )
+                .style(
+                    if panel
+                        .draft
+                        .as_ref()
+                        .is_some_and(|draft| draft.id == mission.id)
+                    {
+                        button::primary
+                    } else {
+                        button::text
+                    },
+                ),
             );
         }
         if panel.new_open {
@@ -471,10 +580,7 @@ impl Frost {
                 ),
             );
         }
-        let report = panel
-            .controller
-            .report_for(&draft.id)
-            .filter(|report| report.id == draft.id && report.revision == draft.revision && !dirty);
+        let report = panel.selected_report();
         if let Some(report) = report {
             body = body.push(text(report.state.label()).size(size + 1.0));
             for error in &report.errors {
@@ -484,6 +590,7 @@ impl Frost {
             body = body
                 .push(text("Delivery has not been inspected for this plan revision.").size(size));
         }
+        body = body.push(attention_view(panel, size));
         let task_rows = self.workspace_task_rows();
         for repository in &draft.repositories {
             let observed = report.and_then(|report| {
@@ -598,6 +705,132 @@ impl Frost {
                 .height(Length::Fill),
         )
     }
+}
+
+fn attention_view(panel: &MissionPanel, size: f32) -> Element<'static, Message> {
+    let mut body = column![text("Needs you: next actions").size(size + 1.0)].spacing(7);
+    if panel.dirty() {
+        return body
+            .push(text("Save or reload edits before reviewing evidence.").size(size))
+            .into();
+    }
+    for item in panel.attention_items() {
+        let label = format!(
+            "{}{}",
+            item.kind.label(),
+            item.repository
+                .as_ref()
+                .map_or_else(String::new, |repo| format!(" · {}", repo.full_name))
+        );
+        body = body.push(
+            button(text(visible(&label)).size(size)).on_press_maybe(
+                panel
+                    .accepts_attention(&item)
+                    .then(|| Message::WorkspaceMission(MissionAction::Attention(Box::new(item)))),
+            ),
+        );
+    }
+    let Some(item) = panel
+        .attention
+        .as_ref()
+        .filter(|item| panel.accepts_attention(item))
+    else {
+        return body.into();
+    };
+    body = body
+        .push(text(visible(&item.detail)).size(size))
+        .push(detail("Plan revision", &item.revision.to_string(), size));
+    for (label, value) in [
+        ("Candidate", item.candidate.as_deref()),
+        ("Check", item.check_name.as_deref()),
+        ("Required environment", item.environment.as_deref()),
+        ("Receipt", item.receipt_id.as_deref()),
+    ] {
+        if let Some(value) = value {
+            body = body.push(detail(label, value, size));
+        }
+    }
+    if let Some(task) = &item.task {
+        body = body.push(detail("Task run", &task.run_id, size)).push(
+            row![
+                button(text("Validation log").size(size)).on_press(Message::WorkspaceMission(
+                    MissionAction::OpenAttention(Box::new(item.clone()), false)
+                )),
+                button(text("Current changes").size(size)).on_press(Message::WorkspaceMission(
+                    MissionAction::OpenAttention(Box::new(item.clone()), true)
+                )),
+            ]
+            .spacing(6)
+            .wrap(),
+        );
+    } else {
+        body = body.push(
+            text("No uniquely linked task receipt. Inspect delivery or link its exact run.")
+                .size(size - 1.0),
+        );
+    }
+    if panel.evidence.report_loading {
+        body = body.push(text("Reading the selected receipt…").size(size));
+    }
+    if let Some(notice) = &panel.evidence.notice {
+        body = body.push(text(visible(notice)).size(size).style(text::danger));
+    }
+    if let Some(report) = panel.attention_result() {
+        body = body.push(detail("Validation status", &report.validation_status, size));
+        if !report.validation_current {
+            body = body.push(
+                text("Validation does not match the current worktree capture.")
+                    .size(size)
+                    .style(text::warning),
+            );
+        }
+        if let Some(validation) = &report.validation {
+            body = body
+                .push(detail("Validation HEAD", &validation.head, size))
+                .push(detail(
+                    "Validation fingerprint",
+                    &validation.fingerprint,
+                    size,
+                ));
+        }
+        if let Some(error) = &report.error {
+            body = body.push(text(visible(error)).size(size).style(text::danger));
+        }
+        let (output, truncated) = if panel.attention_changes {
+            body = body.push(
+                text("Current worktree capture, not necessarily the validation input").size(size),
+            );
+            if let Some(current) = &report.current {
+                body = body
+                    .push(detail("Current HEAD", &current.head, size))
+                    .push(detail("Current fingerprint", &current.fingerprint, size))
+                    .push(detail(
+                        "Captured at (Unix ms)",
+                        &current.captured_at_ms.to_string(),
+                        size,
+                    ));
+                (current.diff.as_str(), current.diff_truncated)
+            } else {
+                ("Current worktree capture is unavailable.", false)
+            }
+        } else {
+            (
+                report.validation_output.as_str(),
+                report.validation_output_truncated,
+            )
+        };
+        body = body.push(text(crate::review_text::visible_bounded(output, 65536)).size(size - 1.0));
+        if truncated || output.len() > 65536 {
+            body = body.push(
+                text("Showing a retained excerpt; omitted output is not evidence.")
+                    .size(size - 1.0),
+            );
+        }
+    } else if panel.evidence.report.is_some() {
+        body = body.push(text("The host now exposes a different run or receipt. Inspect delivery again before opening its evidence.")
+            .size(size).style(text::warning));
+    }
+    body.into()
 }
 
 fn visible(value: &str) -> String {
@@ -795,5 +1028,221 @@ mod tests {
         panel.sync();
         panel.edit(&reference, MissionEdit::Title("Wrong target".into()));
         assert_eq!(panel.draft, Some(replacement));
+    }
+    fn attention_fixture() -> (
+        MissionPanel,
+        WorkspaceMissionAttention,
+        WorkspaceResultReport,
+    ) {
+        use jterm_core::agent_workspace::*;
+        let task_id = jterm_core::agent_task::TaskId::new();
+        let task = WorkspaceMissionTaskRef {
+            conversation: ConversationId(format!(
+                "jterm:task:v1:{}",
+                serde_json::to_string(&("host", "namespace", task_id.to_string())).unwrap()
+            )),
+            task_id,
+            run_id: "run:one".into(),
+            source_sequence: 7,
+        };
+        let mut mission = plan();
+        let mut repository =
+            WorkspaceMissionRepository::new("beamiter/frost", "/fixture/frost").unwrap();
+        repository.baseline = "a".repeat(40);
+        repository.candidate = Some("b".repeat(40));
+        repository.tasks.push(task.clone());
+        let report = WorkspaceMissionReport {
+            id: mission.id.clone(),
+            revision: mission.revision,
+            state: WorkspaceMissionState::NeedsAttention,
+            repositories: vec![WorkspaceMissionRepositoryReport {
+                identity: repository.identity.clone(),
+                path: repository.path.clone(),
+                candidate: repository.candidate.clone(),
+                observed: Some(WorkspaceMissionLocalEvidence {
+                    baseline: repository.baseline.clone(),
+                    head: "b".repeat(40),
+                    fingerprint: "input".into(),
+                    modified: true,
+                    dirty: false,
+                    manifest_core_pin: None,
+                    lock_core_pin: None,
+                    observed_at_ms: 20,
+                }),
+                modified: true,
+                committed: true,
+                pushed: true,
+                integrated: true,
+                pushed_observation: None,
+                integration_observation: None,
+                validated: false,
+                pins_current: true,
+                checks: vec![WorkspaceMissionCheckReport {
+                    check_name: "validation".into(),
+                    environment: "local".into(),
+                    status: WorkspaceMissionCheckStatus::Failed,
+                    receipt_id: Some("workspace:run:one:7".into()),
+                    detail: Some("Validation failed".into()),
+                }],
+                covered_checks: vec![],
+                missing_checks: vec!["validation".into()],
+                errors: vec![],
+            }],
+            errors: vec![],
+        };
+        mission.repositories.push(repository);
+        let mut panel = MissionPanel {
+            open: true,
+            ..Default::default()
+        };
+        panel.controller.missions = vec![mission.clone()];
+        panel.controller.selected = Some(mission);
+        panel.controller.report = Some(report);
+        panel.sync();
+        let item = panel.attention_items().remove(0);
+        assert_eq!(item.task.as_ref(), Some(&task));
+        let result = WorkspaceResultReport {
+            conversation: task.conversation,
+            task_id,
+            run_id: task.run_id,
+            source_sequence: 7,
+            baseline: None,
+            current: None,
+            validation: None,
+            validation_current: false,
+            validation_status: "Failed".into(),
+            validation_output: "receipt log".into(),
+            validation_output_truncated: false,
+            error: None,
+        };
+        (panel, item, result)
+    }
+
+    #[test]
+    fn attention_callbacks_require_full_current_item_and_clean_open_plan() {
+        let (mut panel, item, _) = attention_fixture();
+        assert!(panel.accepts_attention(&item));
+        for change in 0..3 {
+            let mut stale = item.clone();
+            match change {
+                0 => stale.detail.push_str(" changed"),
+                1 => stale.receipt_id = Some("workspace:run:one:8".into()),
+                _ => stale.revision += 1,
+            }
+            assert!(!panel.accepts_attention(&stale));
+            panel.select_attention(stale);
+            assert!(panel.attention.is_none());
+        }
+        panel.controller.busy = true;
+        assert!(!panel.accepts_attention(&item));
+        panel.controller.busy = false;
+        panel.open = false;
+        assert!(!panel.accepts_attention(&item));
+        panel.open = true;
+        let reference = MissionRef::from(panel.draft.as_ref().unwrap());
+        panel.edit(&reference, MissionEdit::Title("Unsaved".into()));
+        assert!(!panel.accepts_attention(&item));
+        assert!(panel.attention_items().is_empty());
+    }
+
+    #[test]
+    fn attention_selection_survives_sync_but_not_edit_or_mission_switch() {
+        let (mut panel, item, result) = attention_fixture();
+        panel.select_attention(item.clone());
+        panel.evidence.report = Some(result.clone());
+        panel.sync();
+        assert_eq!(panel.attention.as_ref(), Some(&item));
+        assert!(panel.attention_result().is_some());
+        let reference = MissionRef::from(panel.draft.as_ref().unwrap());
+        panel.edit(&reference, MissionEdit::Title("Unsaved".into()));
+        assert!(panel.attention.is_none());
+        assert!(panel.evidence.report.is_none());
+        panel.select_attention(item.clone());
+        assert!(
+            panel.attention.is_none(),
+            "late callback cannot restore edited evidence"
+        );
+        let (mut panel, item, _) = attention_fixture();
+        panel.select_attention(item);
+        panel.controller.selected = Some(plan());
+        panel.sync();
+        assert!(panel.attention.is_none());
+        panel.evidence.report = Some(result); // Simulated late read cannot expose output.
+        assert!(panel.attention_result().is_none());
+    }
+
+    #[test]
+    fn evidence_requires_exact_receipt_sequence_run_and_conversation() {
+        let (mut panel, item, result) = attention_fixture();
+        panel.select_attention(item);
+        for change in 0..4 {
+            let mut wrong = result.clone();
+            match change {
+                0 => wrong.source_sequence += 1,
+                1 => wrong.run_id.push_str("new"),
+                2 => wrong.conversation.0.push_str("other"),
+                _ => wrong.task_id = jterm_core::agent_task::TaskId::new(),
+            }
+            panel.evidence.report = Some(wrong);
+            assert!(panel.attention_result().is_none());
+        }
+        panel.evidence.report = Some(result);
+        assert!(panel.attention_result().is_some());
+        assert!(
+            !panel.attention_result().unwrap().validation_current,
+            "receipt navigation must not promote stale evidence to current"
+        );
+        panel.controller.report.as_mut().unwrap().repositories[0].checks[0].receipt_id =
+            Some("workspace:run:one:8".into());
+        assert!(panel.attention_result().is_none());
+        panel.reconcile_attention();
+        assert!(panel.evidence.report.is_none());
+    }
+
+    #[test]
+    fn ambiguous_task_receipt_and_reopened_report_do_not_offer_old_evidence() {
+        let (mut panel, item, result) = attention_fixture();
+        panel.select_attention(item.clone());
+        panel.evidence.report = Some(result);
+        let mut mission = panel.controller.selected.clone().unwrap();
+        let mut duplicate = mission.repositories[0].tasks[0].clone();
+        duplicate.source_sequence = 6;
+        duplicate.conversation = ConversationId(format!(
+            "jterm:task:v1:{}",
+            serde_json::to_string(&("other-host", "namespace", duplicate.task_id.to_string()))
+                .unwrap()
+        ));
+        mission.repositories[0].tasks.push(duplicate);
+        panel.controller.selected = Some(mission);
+        panel.sync();
+        assert!(panel.attention_items()[0].task.is_none());
+        assert!(panel.attention.is_none());
+        assert!(panel.attention_result().is_none());
+        panel
+            .controller
+            .report
+            .as_mut()
+            .unwrap()
+            .require_reinspection();
+        assert_eq!(
+            panel.attention_items()[0].kind,
+            jterm_core::agent_workspace::WorkspaceMissionAttentionKind::Inspect
+        );
+        assert!(!panel.accepts_attention(&item));
+    }
+    #[test]
+    fn closing_retires_evidence_and_late_callbacks() {
+        let (mut panel, item, result) = attention_fixture();
+        panel.select_attention(item.clone());
+        panel.evidence.report = Some(result.clone());
+        panel.close();
+        assert!(!panel.open);
+        assert!(panel.attention.is_none());
+        assert!(panel.evidence.report.is_none());
+        panel.select_attention(item.clone());
+        panel.open_attention(&item, false);
+        assert!(panel.attention.is_none());
+        panel.evidence.report = Some(result);
+        assert!(panel.attention_result().is_none());
     }
 }

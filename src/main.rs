@@ -16825,6 +16825,9 @@ impl Frost {
                 self.sidebar_hovered = false;
                 self.invalidate_sidebar_remote_follow_intent();
                 let show = !self.reference_inspector_visible();
+                if !show {
+                    self.agent_sessions.missions.close();
+                }
                 self.reference_navigation_drawer = false;
                 self.reference_inspector_open = show;
                 self.reference_inspector_drawer =
@@ -16836,7 +16839,7 @@ impl Frost {
                 ));
             }
             Message::ReferenceInspector(tab) => {
-                self.agent_sessions.missions.open = false;
+                self.agent_sessions.missions.close();
                 self.agent_sessions.context_input_focused = false;
                 self.finish_sidebar_resize();
                 self.task_panel.retire_panel_callbacks();
@@ -18113,7 +18116,7 @@ impl Frost {
                 self.agent_sessions.context_input_focused = focused
             }
             Message::WorkspaceSearchOpen(hit) => {
-                self.agent_sessions.missions.open = false;
+                self.agent_sessions.missions.close();
                 self.agent_sessions.tools.open_hit(hit);
                 self.reference_navigation_drawer = false;
                 self.reference_inspector_tab = native_shell::InspectorTab::Context;
@@ -18150,6 +18153,7 @@ impl Frost {
                 }
             }
             Message::WorkspaceTask(id) => {
+                self.agent_sessions.missions.close();
                 self.agent_runtime.select_hosted_view(Some(id));
                 if let Some(session) = self.agent_runtime.hosted_terminal(id).cloned() {
                     self.open_hosted_native_terminal(session);
@@ -30407,6 +30411,7 @@ impl Frost {
     /// Keep Tasks dock geometry and keyboard ownership in sync for every
     /// entry point, including opening it while the ordinary sidebar is hidden.
     fn set_task_panel_open(&mut self, open: bool) {
+        self.agent_sessions.missions.close();
         if self.tasks_surface_visible() != open || self.sidebar_panel != SidebarPanel::Tasks {
             self.task_panel.retire_panel_callbacks();
             self.task_panel.input_focused = false;

@@ -88,3 +88,27 @@ python3 scripts/verify_workspace_host.py /path/to/first/frontend /path/to/second
 ```
 
 GUI validation should use isolated state/config/provider homes. Check a wide window and 390/320-pixel portrait widths, search and source switching, draft retention, workspace collapse, drawer input ownership and CLI absence of a second composer. Provider/network success, remote SSH server availability and paid-model usage are separate acceptance checks and are not implied by local fixture tests.
+
+## Mission Needs-you reasons and exact evidence
+
+The native Mission inspector renders the shared core's ordered attention items,
+including failed, blocked or stale validation, missing inspection, candidate,
+dependency-pin and publication evidence. Each entry carries its saved plan
+revision, repository, exact candidate, required check/environment and receipt
+when available. A missing prerequisite suppresses dependent instructions. The
+queue does not start a provider, run validation, push or integrate commits.
+
+Selecting an entry shows its reason. For an unambiguous linked receipt,
+**Validation log** and **Current changes** perform a read-only result inspection
+in a dedicated reader. A result is displayed only when the complete attention
+item still matches the current queue and the conversation, task, run and receipt
+sequence match exactly. Newer task output is not silently substituted. Dirty
+edits, a changed receipt, switching Missions, closing, and reopening for a new
+inspection retire the old selection and its asynchronous result.
+
+The required environment is the acceptance contract's target, not a claim about
+the environment that produced an old receipt. Current changes are a separate
+worktree capture and can differ from the validation input. Both fingerprints and
+HEADs remain distinct, and stale validation stays stale. Logs and diffs are
+bounded previews with retained-excerpt labels. These controls are not evidence
+of GUI, physical-input, remote, GPU or provider acceptance.
