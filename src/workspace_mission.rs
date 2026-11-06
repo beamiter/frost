@@ -511,6 +511,7 @@ impl Frost {
         let reference = MissionRef::from(draft);
         let edit_ref = reference.clone();
         body = body
+            .push(mission_identity(draft, size))
             .push(text(format!("Plan revision {}", draft.revision)).size(size - 1.0))
             .push(input("Title", &draft.title, size, ready, move |value| {
                 action(MissionAction::Edit(
@@ -869,6 +870,18 @@ fn detail(label: &str, value: &str, size: f32) -> Element<'static, Message> {
         .into()
 }
 
+fn mission_identity<Renderer: iced::advanced::text::Renderer>(
+    mission: &WorkspaceMission,
+    size: f32,
+) -> iced::widget::Text<'_, iced::Theme, Renderer> {
+    // Identity belongs to the displayed draft, not its editable title or a
+    // possibly newer report. Keep the complete key readable in narrow drawers.
+    text(format!("Mission ID: {}", visible(&mission.id)))
+        .size(size - 1.0)
+        .width(Length::Fill)
+        .wrapping(text::Wrapping::WordOrGlyph)
+}
+
 fn receipt_view(
     receipt: &WorkspaceMissionRepositoryReport,
     size: f32,
@@ -975,6 +988,107 @@ mod tests {
         let mut plan = WorkspaceMission::new("Release", "Validate five exact commits");
         plan.revision = 1;
         plan
+    }
+
+    fn identity_text(mission: &WorkspaceMission) -> String {
+        use iced::advanced::{layout, widget::Operation, widget::Tree, Layout};
+        use iced::{Rectangle, Size};
+
+        #[derive(Default)]
+        struct ReadText(String);
+        impl Operation for ReadText {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+
+            fn text(
+                &mut self,
+                _id: Option<&iced::advanced::widget::Id>,
+                _bounds: Rectangle,
+                text: &str,
+            ) {
+                assert!(self.0.is_empty());
+                self.0 = text.to_owned();
+            }
+        }
+
+        // Shape the actual production text with the software renderer. This
+        // checks complete glyph coverage and wrapping without a display server.
+        let renderer = iced_tiny_skia::Renderer::new(iced::Font::DEFAULT, 26.0.into());
+        let mut element: Element<'_, Message, iced::Theme, iced_tiny_skia::Renderer> =
+            mission_identity(mission, 26.0).into();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(180.0, f32::INFINITY)),
+        );
+        assert_eq!(node.size().width, 180.0);
+        let paragraph = tree
+            .state
+            .downcast_ref::<iced::widget::text::State<iced::advanced::graphics::text::Paragraph>>()
+            .raw();
+        let runs = paragraph.buffer().layout_runs().collect::<Vec<_>>();
+        assert!(
+            runs.len() > 1,
+            "the full ID must wrap at this width and size"
+        );
+        assert!(runs.iter().all(|run| run.line_w <= 180.0));
+        for offset in "Mission ID: ".len().."Mission ID: ".len() + mission.id.len() {
+            assert!(
+                runs.iter().flat_map(|run| run.glyphs).any(|glyph| {
+                    glyph.glyph_id != 0 && glyph.start <= offset && offset < glyph.end
+                }),
+                "ID byte {offset} has no laid-out glyph"
+            );
+        }
+        let mut observed = ReadText::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut observed);
+        observed.0
+    }
+
+    #[test]
+    fn mission_identity_widget_keeps_the_complete_stable_key() {
+        let mut mission = plan();
+        for id in [mission.id.clone(), format!("mission:{}", "a".repeat(120))] {
+            mission.id = id.clone();
+            assert!(mission.id.len() <= 128);
+            mission.validate().unwrap();
+            assert_eq!(identity_text(&mission), format!("Mission ID: {id}"));
+        }
+    }
+
+    #[test]
+    fn displayed_identity_tracks_the_draft_across_edits_reopen_and_selection() {
+        let mut panel = MissionPanel {
+            open: true,
+            ..Default::default()
+        };
+        let initial = plan();
+        let expected = format!("Mission ID: {}", initial.id);
+        panel.controller.selected = Some(initial.clone());
+        panel.sync();
+        let reference = MissionRef::from(&initial);
+        panel.edit(&reference, MissionEdit::Title("Unsaved title".into()));
+        let mut remote = initial;
+        remote.revision += 1;
+        panel.controller.selected = Some(remote);
+        panel.sync();
+        panel.close();
+        assert!(!panel.open);
+        panel.open = true;
+        assert_eq!(identity_text(panel.draft.as_ref().unwrap()), expected);
+        assert_eq!(panel.draft.as_ref().unwrap().title, "Unsaved title");
+
+        let replacement = plan();
+        let expected = format!("Mission ID: {}", replacement.id);
+        panel.controller.selected = Some(replacement);
+        panel.sync();
+        panel.edit(&reference, MissionEdit::Title("Late edit".into()));
+        assert_eq!(identity_text(panel.draft.as_ref().unwrap()), expected);
+        assert_eq!(panel.draft.as_ref().unwrap().title, "Release");
     }
 
     #[test]
