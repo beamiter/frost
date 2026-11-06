@@ -104,6 +104,21 @@ struct HistoryPage {
     loading: bool,
 }
 
+/// The untouched local slot, not a claim about where a restored row came from.
+pub(crate) fn is_default_chat_slot(store: &ChatStore) -> bool {
+    store.len() == 1
+        && store.active_id() == 1
+        && store.active_title() == jterm_core::ai::DEFAULT_CHAT_TITLE
+        && !store.active_archived()
+        && store.active_history().is_empty()
+        && store.active_context().is_none()
+        && store.active_draft().is_empty()
+        && !store.active_history_truncated()
+        && store.active_partial().is_empty()
+        && !store.is_active_busy()
+        && matches!(store.active_status(), jterm_core::ai::ChatStatus::Idle)
+}
+
 impl Default for WorkspaceChats {
     fn default() -> Self {
         Self {
@@ -145,11 +160,18 @@ impl WorkspaceChats {
         }
     }
 
-    pub(crate) fn start(&mut self, store: &mut ChatStore, namespace: &str, redact: bool) {
+    pub(crate) fn start(
+        &mut self,
+        store: &mut ChatStore,
+        namespace: &str,
+        redact: bool,
+        preserve_empty_chat: bool,
+    ) {
         if self.imported {
             return;
         }
         self.imported = true;
+        let skip_startup_placeholder = self.only_startup_placeholder(store, preserve_empty_chat);
         // Shared IDs occupy a disjoint numeric range and must never be imported
         // as another legacy conversation when a local safety snapshot is restored.
         if let Ok((snapshot, _)) = store.snapshot_for_persistence(redact) {
@@ -157,6 +179,7 @@ impl WorkspaceChats {
                 .chats()
                 .iter()
                 .filter(|chat| chat.id() < (1u64 << 48))
+                .filter(|chat| !skip_startup_placeholder || chat.id() != 1)
                 .cloned()
                 .collect::<Vec<_>>();
             let snapshots = legacy
@@ -182,6 +205,22 @@ impl WorkspaceChats {
             }
         }
         self.refresh();
+    }
+
+    fn only_startup_placeholder(&self, store: &ChatStore, preserve_empty_chat: bool) -> bool {
+        // Do not publish the automatic ChatStore slot merely by opening Frost.
+        // Keep the slot locally, and preserve every restored row or indication
+        // of user intent. In particular, an empty durable snapshot does not
+        // prove that a live/queued submission is empty or idle.
+        !preserve_empty_chat
+            && is_default_chat_slot(store)
+            && self.pending.is_empty()
+            && self.known.is_empty()
+            && self.awaiting_dispatch.is_empty()
+            && self.receipts.is_empty()
+            && self.read_pending.is_empty()
+            && self.history.is_empty()
+            && self.cancelled_dispatch.is_empty()
     }
 
     pub(crate) fn pin(&mut self, id: ConversationId, pinned: bool) {
@@ -1093,6 +1132,178 @@ mod tests {
     use super::*;
     use jterm_core::agent_workspace::RuntimeState;
     use jterm_core::ai::{ChatSnapshot, Role, Turn};
+
+    fn isolated_import_bridge() -> WorkspaceChats {
+        WorkspaceChats {
+            // These tests inspect queued commands; they never start a host or
+            // connect to the user's workspace/provider.
+            client: WorkspaceClient::for_state_dir(
+                std::env::temp_dir().join(format!("bridge-startup-{}", uuid::Uuid::new_v4())),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn queued_imports(bridge: &WorkspaceChats) -> Vec<u64> {
+        let mut ids = bridge
+            .pending
+            .values()
+            .filter_map(|pending| match pending {
+                Pending::Import { snapshots } => Some(snapshots.keys().copied()),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn automatic_startup_slot_stays_local_while_catalog_refresh_and_explicit_create_work() {
+        for redact in [false, true] {
+            let mut store = ChatStore::default();
+            let before = store.snapshot_for_persistence(false).unwrap().0;
+            let mut bridge = isolated_import_bridge();
+            bridge.start(&mut store, "startup-test", redact, false);
+            assert!(bridge.imported);
+            assert!(queued_imports(&bridge).is_empty());
+            assert_eq!(bridge.pending.len(), 1);
+            assert!(bridge
+                .pending
+                .values()
+                .all(|p| matches!(p, Pending::Refresh)));
+            assert_eq!(store.snapshot_for_persistence(false).unwrap().0, before);
+            assert!(!bridge.view_open);
+            bridge.start(&mut store, "startup-test", redact, false);
+            assert_eq!(bridge.pending.len(), 1, "startup remains idempotent");
+
+            bridge.create();
+            assert!(bridge
+                .pending
+                .values()
+                .any(|p| matches!(p, Pending::Open { .. })));
+            assert!(queued_imports(&bridge).is_empty());
+        }
+    }
+
+    #[test]
+    fn saved_empty_chats_and_any_legacy_user_material_still_migrate() {
+        let empty = ChatSnapshot::from_completed_history(1, "New chat", false, &[], None, "");
+        let history = [
+            Turn {
+                role: Role::User,
+                text: "Question".into(),
+            },
+            Turn {
+                role: Role::Assistant,
+                text: "Answer".into(),
+            },
+        ];
+        let cases = [
+            (empty.clone(), true),
+            (
+                ChatSnapshot::from_completed_history(1, "Named plan", false, &[], None, ""),
+                false,
+            ),
+            (
+                ChatSnapshot::from_completed_history(1, "New chat", false, &[], None, "Draft"),
+                false,
+            ),
+            (
+                ChatSnapshot::from_completed_history(1, "New chat", false, &[], None, " \n\t"),
+                false,
+            ),
+            (
+                ChatSnapshot::from_completed_history(1, "New chat", false, &history, None, ""),
+                false,
+            ),
+            (
+                ChatSnapshot::from_completed_history(1, "New chat", true, &[], None, ""),
+                false,
+            ),
+            (empty.clone().with_history_truncated(true), false),
+            (
+                ChatSnapshot::from_completed_history(2, "New chat", false, &[], None, ""),
+                false,
+            ),
+        ];
+        for (chat, restored_library) in cases {
+            let id = chat.id();
+            let mut store =
+                ChatStore::restore(ConversationSnapshot::from_chats(id, vec![chat]).unwrap());
+            let mut bridge = isolated_import_bridge();
+            bridge.start(&mut store, "material-test", false, restored_library);
+            assert!(queued_imports(&bridge).contains(&id));
+        }
+
+        // A non-pristine library is not the automatic startup slot, and shared
+        // high-bit identities retain their existing no-reimport protection.
+        let shared = ChatSnapshot::from_completed_history(1 << 48, "Shared", false, &[], None, "");
+        let second = ChatSnapshot::from_completed_history(2, "New chat", false, &[], None, "");
+        let mut store = ChatStore::restore(
+            ConversationSnapshot::from_chats(2, vec![empty, second, shared]).unwrap(),
+        );
+        let mut bridge = isolated_import_bridge();
+        bridge.start(&mut store, "mixed-test", false, false);
+        assert_eq!(queued_imports(&bridge), vec![1, 2]);
+    }
+
+    #[test]
+    fn live_or_queued_chat_work_cannot_be_mistaken_for_the_startup_slot() {
+        for state in 0..9 {
+            let mut store = ChatStore::default();
+            let mut bridge = isolated_import_bridge();
+            match state {
+                0 => {
+                    store
+                        .begin_turn("New chat".into(), None, "Thinking".into(), false)
+                        .unwrap();
+                }
+                1 => store.set_active_info("Stopped"),
+                2 => store.set_active_error("Failed"),
+                3 => {
+                    bridge.pending.insert(
+                        900,
+                        Pending::Begin {
+                            chat_id: 1,
+                            text: "Queued".into(),
+                            generation: 0,
+                        },
+                    );
+                }
+                4 => {
+                    bridge.pending.insert(
+                        900,
+                        Pending::Save {
+                            chat_id: 1,
+                            generation: 0,
+                            submit: Some("Queued".into()),
+                        },
+                    );
+                }
+                5 => {
+                    bridge.pending.insert(900, Pending::Finish { chat_id: 1 });
+                }
+                6 => bridge.authorize_fixture(1),
+                7 => {
+                    bridge.authorize_fixture(1);
+                    let receipt = bridge.awaiting_dispatch.remove(&1).unwrap();
+                    bridge.receipts.insert(
+                        RequestToken {
+                            chat_id: 1,
+                            epoch: 1,
+                        },
+                        receipt,
+                    );
+                }
+                _ => {
+                    bridge.cancelled_dispatch.insert(1);
+                }
+            }
+            bridge.start(&mut store, "work-test", false, false);
+            assert_eq!(queued_imports(&bridge), vec![1], "state {state}");
+        }
+    }
 
     fn stored(id: u64, remote: &str, draft: &str) -> StoredChat {
         let snapshot = ChatSnapshot::from_completed_history(

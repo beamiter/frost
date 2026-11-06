@@ -118,6 +118,9 @@ pub(crate) struct AiChatsUi {
     /// a panel at a fixture instead of the user's real config directory).
     path: Option<PathBuf>,
     persist_state: PersistState,
+    /// Preserve even empty rows from a decoded library; they are not this
+    /// run's automatically allocated slot. Missing/invalid files set no origin.
+    restored_library: bool,
     /// Only the instance holding frost's single-instance lock republishes the
     /// shared library. A second window still restores and uses its chats, but
     /// its writes would be a last-writer-wins overwrite of whatever the lock
@@ -164,6 +167,7 @@ impl AiChatsUi {
             restore_read: None,
             path,
             persist_state: PersistState::Unloaded,
+            restored_library: false,
             owns_persistence,
             page: ChatsPage::Chat,
             search: String::new(),
@@ -198,8 +202,12 @@ impl AiChatsUi {
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default()
         );
-        self.workspace
-            .start(&mut self.store, &namespace, self.redact_secrets);
+        self.workspace.start(
+            &mut self.store,
+            &namespace,
+            self.redact_secrets,
+            self.restored_library || self.dirty || !self.retry_payloads.is_empty(),
+        );
     }
 
     pub(crate) fn drive_workspace(&mut self, config: &Config) -> Vec<ChatRequest> {
@@ -325,6 +333,7 @@ impl AiChatsUi {
             Ok(snapshot) => {
                 self.store = ai_chat_store::restore_store(snapshot);
                 self.persist_state = PersistState::Loaded;
+                self.restored_library = true;
             }
             Err(error) => {
                 self.block_persistence(&error.to_string());
@@ -359,6 +368,16 @@ impl AiChatsUi {
         // restore failed, and a window that does not hold the instance lock
         // all have to stop here rather than publish their own view.
         if !self.can_persist() {
+            return;
+        }
+        // The normal exit flush must not turn an untouched startup slot into
+        // a "restored" chat that would be imported on the next launch. Keep
+        // existing libraries and all edits/recovery payloads on the old path.
+        if !self.restored_library
+            && !self.dirty
+            && self.retry_payloads.is_empty()
+            && crate::workspace_chat_bridge::is_default_chat_slot(&self.store)
+        {
             return;
         }
         let Some(path) = self.path.clone() else {
@@ -1070,6 +1089,61 @@ mod tests {
         store.complete_success(token, "world".into());
         store.rename_active("Renamed");
         store
+    }
+
+    #[test]
+    fn empty_library_restore_is_distinct_from_an_automatic_startup_slot() {
+        let scratch = ScratchDir::new("startup-origin");
+        let path = scratch.0.join("ai_chats.json");
+        let mut fresh = owner_panel(&path);
+        assert!(!fresh.restored_library);
+        fresh.restore_from_path(&path);
+        assert_eq!(fresh.persist_state, PersistState::Loaded);
+        assert!(
+            !fresh.restored_library,
+            "a missing file is not a saved chat"
+        );
+
+        fresh.set_draft("Deliberately edited".into());
+        fresh.set_draft(String::new());
+        fresh.persist(false);
+        let saved = std::fs::read(&path).unwrap();
+        fresh.persist(false);
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        let mut restored = owner_panel(&path);
+        restored.restore_from_path(&path);
+        assert!(restored.restored_library);
+        assert_eq!(restored.store.len(), 1);
+        assert_eq!(restored.store.active_id(), 1);
+        assert!(restored.store.active_history().is_empty());
+        assert!(restored.store.active_draft().is_empty());
+
+        std::fs::write(&path, "invalid saved library").unwrap();
+        let mut blocked = owner_panel(&path);
+        blocked.restore_from_path(&path);
+        assert_eq!(blocked.persist_state, PersistState::Blocked);
+        assert!(!blocked.restored_library);
+        blocked.persist(false);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "invalid saved library"
+        );
+    }
+
+    #[test]
+    fn untouched_startup_and_normal_exit_do_not_create_a_library_for_the_next_launch() {
+        let scratch = ScratchDir::new("startup-relaunch");
+        let path = scratch.0.join("ai_chats.json");
+        for _ in 0..2 {
+            let mut panel = owner_panel(&path);
+            panel.restore_from_path(&path);
+            panel.persist(false); // The same flush used by normal window close.
+            assert!(!path.exists());
+            assert!(!panel.restored_library);
+            assert!(crate::workspace_chat_bridge::is_default_chat_slot(
+                &panel.store
+            ));
+        }
     }
 
     #[test]
