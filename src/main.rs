@@ -27998,11 +27998,12 @@ impl Frost {
         } else {
             root
         };
-        let root: Element<'_, Message> = if let Some(menu) = self.block_menu {
-            stack![root, self.block_menu_view(menu)].into()
-        } else {
-            root
-        };
+        // Keep the workspace at the same child path while the menu opens or
+        // closes, preserving native input and navigation state.
+        let root = crate::widget_identity_scope::transient_overlay(
+            root,
+            self.block_menu.map(|menu| self.block_menu_view(menu)),
+        );
         let root: Element<'_, Message> = if let Some(state) = self.remote_picker.as_ref() {
             stack![root, self.remote_picker_view(state)].into()
         } else {

@@ -1,5 +1,5 @@
 //! Keep one navigation tree while its presentation changes between dock and drawer.
-use iced::advanced::widget::Tree;
+use iced::advanced::widget::{tree, Tree};
 use iced::advanced::{layout, mouse, overlay, renderer, Clipboard, Layout, Shell, Widget};
 use iced::{Element, Event, Length, Rectangle, Size, Vector};
 
@@ -45,7 +45,16 @@ struct Surface<'a, Message> {
     placement: Placement,
 }
 
+// The default stateless tag is shared by Stack and other unrelated widgets.
+// Overlay insertion/removal must rebuild those trees before indexing our
+// fixed native/backdrop/navigation children.
+struct SurfaceTag;
+
 impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Message> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<SurfaceTag>()
+    }
+
     fn children(&self) -> Vec<Tree> {
         vec![
             Tree::new(self.native.as_widget()),
@@ -54,9 +63,11 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         ]
     }
     fn diff(&self, tree: &mut Tree) {
-        tree.children[0].diff(self.native.as_widget());
-        tree.children[1].diff(self.backdrop.as_widget());
-        tree.children[2].diff(self.navigation.as_widget());
+        tree.diff_children(&[
+            self.native.as_widget(),
+            self.backdrop.as_widget(),
+            self.navigation.as_widget(),
+        ]);
     }
     fn size(&self) -> Size<Length> {
         Size::new(Length::Fill, Length::Fill)
@@ -370,6 +381,58 @@ mod tests {
             },
         )
     }
+    #[test]
+    fn navigation_replaces_unrelated_stateless_trees_when_overlay_layers_change() {
+        use iced::widget::{Space, Stack};
+
+        // Opening a context menu inserts a Stack above the workspace. Its
+        // stateless descendants must never be mistaken for this surface's
+        // fixed native/backdrop/navigation subtree when Iced reconciles it.
+        for count in [1, 0, 2, 3, 4] {
+            let foreign: Element<'_, ()> =
+                Stack::with_children((0..count).map(|_| Element::from(Space::new()))).into();
+            let mut tree = Tree::new(foreign.as_widget());
+            tree.diff(view(true, false).as_widget());
+            assert_eq!(tree.children.len(), 3);
+            for child in &tree.children {
+                assert_eq!(*child.state.downcast_ref::<u64>(), 0);
+            }
+            tree.diff(foreign.as_widget());
+            assert_eq!(tree.children.len(), count);
+        }
+    }
+
+    #[test]
+    fn context_menu_open_close_preserves_native_and_navigation_state() {
+        use iced::widget::Space;
+
+        let menu_view = |open: bool, visible, drawer| {
+            crate::widget_identity_scope::transient_overlay(
+                view(visible, drawer),
+                open.then(|| Element::from(Space::new())),
+            )
+        };
+        let mut tree = Tree::new(menu_view(false, true, false).as_widget());
+        for (index, child) in tree.children[0].children.iter_mut().enumerate() {
+            *child.state.downcast_mut::<u64>() = 31 + index as u64;
+        }
+        for (open, visible, drawer) in [
+            (true, true, false),
+            (false, true, false),
+            (true, false, false),
+            (false, false, false),
+            (true, true, true),
+            (false, true, true),
+        ] {
+            tree.diff(menu_view(open, visible, drawer).as_widget());
+            assert_eq!(tree.children.len(), 1 + usize::from(open));
+            assert_eq!(tree.children[0].children.len(), 3);
+            for (index, child) in tree.children[0].children.iter().enumerate() {
+                assert_eq!(*child.state.downcast_ref::<u64>(), 31 + index as u64);
+            }
+        }
+    }
+
     #[test]
     fn dock_drawer_and_hidden_transitions_preserve_the_same_native_and_navigation_state() {
         let first = view(true, false);
