@@ -1248,9 +1248,13 @@ Missing project directories or session files are reported before resume, and
 archived Codex conversations must be unarchived with Codex first. The library
 reads local history without modifying it or calling a model service.
 
-All four terminals share this session catalog through the sibling `jterm_core`
-checkout. These development manifests use `../jterm_core` so the new core API and
-native adapters build together.
+The four terminals use the shared `jterm_core` session catalog implementation.
+Frost production and development builds resolve the exact Cargo-locked Git commit
+`e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e`, not a sibling checkout. This source
+upgrade adds core security-audit coverage without changing core runtime or Cargo
+dependencies. The checked-in `packaging/jterm-core-*` archive retains its historical
+revision and is not used by this exact-Git production path. Application CI and
+cross-terminal native verification remain separate evidence.
 
 The session library ranks exact IDs and titles ahead of incidental preview matches.
 Choose **This folder** to include the captured terminal directory and its subfolders,
