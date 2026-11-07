@@ -5,6 +5,29 @@ use std::path::{Path, PathBuf};
 /// Hard cap on actionable highlights produced from one terminal row.
 const MAX_LINKS_PER_LINE: usize = 64;
 
+/// Preserve balanced URL parentheses while dropping only excess trailing closers.
+/// Count once: rescanning the whole URL after each ')' made link refresh quadratic
+/// for process-controlled output with a long run of closing parentheses.
+fn trim_unbalanced_url_parentheses(url: &str) -> &str {
+    if !url.ends_with(')') {
+        return url;
+    }
+    let (opens, closes) = url.bytes().fold((0usize, 0usize), |(opens, closes), byte| {
+        (
+            opens + usize::from(byte == b'('),
+            closes + usize::from(byte == b')'),
+        )
+    });
+    let excess = closes.saturating_sub(opens);
+    let trim = url
+        .bytes()
+        .rev()
+        .take(excess)
+        .take_while(|byte| *byte == b')')
+        .count();
+    &url[..url.len() - trim]
+}
+
 /// 链接类型
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum LinkType {
@@ -110,13 +133,7 @@ impl LinkDetector {
         // an IP/file-looking substring inside a refused scheme must never fall
         // back to a different link type.
         for mat in self.url_regex.find_iter(line) {
-            let mut url = mat.as_str();
-            // Drop trailing unbalanced `)` so a URL inside parentheses like
-            // `(https://example.com)` doesn't swallow the closing paren,
-            // while a balanced `/wiki/Foo_(bar)` is kept intact.
-            while url.ends_with(')') && url.matches(')').count() > url.matches('(').count() {
-                url = &url[..url.len() - 1];
-            }
+            let url = trim_unbalanced_url_parentheses(mat.as_str());
             let Some(col_start) = Self::byte_offset_to_char_offset(line, mat.start()) else {
                 continue;
             };
@@ -299,22 +316,25 @@ impl LinkDetector {
         let mut logical_lines: Vec<(usize, usize, String, Vec<usize>)> = Vec::new();
         let mut current_start = 0;
         let mut current_text = String::new();
+        let mut current_columns = 0;
         let mut row_char_offsets: Vec<usize> = Vec::new(); // 每个物理行在逻辑行中的起始字符偏移
 
         for (line_idx, line) in visible_cells.iter().enumerate() {
-            row_char_offsets.push(current_text.chars().count());
-            let line_str: String = line.iter().map(|cell| cell.character).collect();
-            current_text.push_str(&line_str);
+            // Each terminal cell contributes exactly one character, including
+            // wide-character continuation cells. Do not recount the entire prefix
+            // for every wrapped row or allocate an intermediate row String.
+            row_char_offsets.push(current_columns);
+            current_columns += line.len();
+            current_text.extend(line.iter().map(|cell| cell.character));
 
             if line_idx == visible_cells.len() - 1 || !row_wrapped[line_idx] {
                 logical_lines.push((
                     current_start,
                     line_idx,
-                    current_text.clone(),
-                    row_char_offsets.clone(),
+                    std::mem::take(&mut current_text),
+                    std::mem::take(&mut row_char_offsets),
                 ));
-                current_text.clear();
-                row_char_offsets.clear();
+                current_columns = 0;
                 current_start = line_idx + 1;
             }
         }
@@ -551,6 +571,104 @@ fn resolve_existing_file_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parenthesis_trimming_matches_legacy_for_all_short_inputs() {
+        fn legacy(mut url: &str) -> &str {
+            while url.ends_with(')') && url.matches(')').count() > url.matches('(').count() {
+                url = &url[..url.len() - 1];
+            }
+            url
+        }
+        // Include multi-byte text so byte trimming never splits a codepoint.
+        let alphabet = ['(', ')', '雪', 'a'];
+        for len in 0..=8 {
+            for mut encoded in 0..4usize.pow(len) {
+                let mut input = String::from("https://example.com/");
+                for _ in 0..len {
+                    input.push(alphabet[encoded % 4]);
+                    encoded /= 4;
+                }
+                assert_eq!(trim_unbalanced_url_parentheses(&input), legacy(&input));
+            }
+        }
+    }
+
+    #[test]
+    fn long_trailing_parentheses_keep_the_balanced_url_and_columns() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let target = "https://example.com/wiki/Foo_(雪)";
+        let line = format!("雪 {target}{}", ")".repeat(100_000));
+        let links = detector.detect_links_in_line(&line, 7);
+        assert_eq!(
+            links,
+            vec![Link {
+                line: 7,
+                col_start: 2,
+                col_end: 2 + target.chars().count(),
+                link_type: LinkType::Url,
+                text: target.into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn wrapped_unicode_rows_keep_exact_link_cells_and_logical_boundaries() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let rows = ["雪 https://", "example.com/", "Foo_(雪)))", "192.0.2.1"];
+        let cells: Vec<Vec<crate::terminal::TerminalCell>> = rows
+            .iter()
+            .map(|row| {
+                row.chars()
+                    .map(|character| crate::terminal::TerminalCell {
+                        character,
+                        ..Default::default()
+                    })
+                    .collect()
+            })
+            .collect();
+        let links = detector
+            .detect_links_in_visible_cells_with_wrapping(&cells, &[true, true, false, false]);
+        let target = "https://example.com/Foo_(雪)";
+        assert_eq!(
+            links,
+            vec![
+                Link {
+                    line: 0,
+                    col_start: 2,
+                    col_end: 10,
+                    link_type: LinkType::Url,
+                    text: target.into()
+                },
+                Link {
+                    line: 1,
+                    col_start: 0,
+                    col_end: 12,
+                    link_type: LinkType::Url,
+                    text: target.into()
+                },
+                Link {
+                    line: 2,
+                    col_start: 0,
+                    col_end: 7,
+                    link_type: LinkType::Url,
+                    text: target.into()
+                },
+                Link {
+                    line: 3,
+                    col_start: 0,
+                    col_end: 9,
+                    link_type: LinkType::IpAddress,
+                    text: "192.0.2.1".into()
+                },
+            ]
+        );
+        // An incomplete wrap map must retain the existing per-row fallback.
+        assert_eq!(
+            detector.detect_links_in_visible_cells_with_wrapping(&cells, &[true]),
+            detector.detect_links_in_visible_cells(&cells),
+        );
+    }
 
     #[test]
     fn file_opener_uses_an_absolute_option_safe_operand() {
