@@ -21912,6 +21912,32 @@ mod tests {
     }
 
     #[test]
+    fn background_snapshot_preserves_character_erasure_after_repainting() {
+        for (output, expected) in [
+            ("abc\r\x1b[2X", "  c"),
+            ("abc\r\x1b[2XZ", "Z c"),
+            ("界abc\r\x1b[1C\x1b[X", "  abc"),
+            ("a界bc\r\x1b[2X", "   bc"),
+        ] {
+            for split in 0..=output.len() {
+                let mut terminal = TerminalState::new(40, 8);
+                terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n");
+                terminal.process_input(&output.as_bytes()[..split]);
+                terminal.process_input(&output.as_bytes()[split..]);
+                let live: String = terminal.grid[1]
+                    .iter()
+                    .filter(|cell| !cell.flags.wide_continuation())
+                    .map(|cell| cell.character)
+                    .collect();
+                assert_eq!(live.trim_end(), expected);
+                terminal.process_input(b"\x1b]133;A\x07");
+                let zone = terminal.command_zones.back().expect("background block");
+                assert_eq!(zone.captured_output, Some((format!("\n{expected}"), false)));
+            }
+        }
+    }
+
+    #[test]
     fn background_output_survives_scrollback_trim_as_a_bounded_snapshot() {
         let mut terminal = TerminalState::new(12, 2);
         terminal.set_max_scrollback(3);

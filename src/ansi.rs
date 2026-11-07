@@ -438,6 +438,30 @@ pub(crate) fn terminal_plain_text(input: &str, max_bytes: usize) -> (String, boo
                             3 => {}
                             _ => {}
                         },
+                        b'X' => {
+                            // ECH erases cells without shifting text or moving
+                            // the cursor. The live parser retains this token in
+                            // background output, so ignoring it resurrected
+                            // erased text in the finalized block snapshot.
+                            row_extent = row_extent.max(row + 1);
+                            if let Some(cells) = grid.get_mut(&row) {
+                                let mut start = col.min(cells.len());
+                                let mut end = col
+                                    .saturating_add(parse_param(params, 0, 1))
+                                    .min(cells.len());
+                                // Match live clear_cell: erasing either half
+                                // of a wide glyph erases the complete pair.
+                                if cells.get(start) == Some(&'\0') && start > 0 {
+                                    start -= 1;
+                                }
+                                if cells.get(end) == Some(&'\0') {
+                                    end += 1;
+                                }
+                                if spend_work(&mut work_remaining, end - start, &mut truncated) {
+                                    cells[start..end].fill(' ');
+                                }
+                            }
+                        }
                         b'K' => {
                             row_extent = row_extent.max(row + 1);
                             match parse_param(params, 0, 0) {
@@ -619,6 +643,54 @@ mod tests {
             terminal_plain_text("old\nframe\x1b[Hnew\x1b[J", 1024),
             ("new".into(), false)
         );
+    }
+
+    #[test]
+    fn erase_characters_preserves_cursor_and_unaffected_suffix() {
+        for sequence in ["\x1b[X", "\x1b[0X", "\x1b[1X"] {
+            assert_eq!(
+                terminal_plain_text(&format!("abc\r{sequence}Z"), 1024),
+                ("Zbc".into(), false)
+            );
+        }
+        assert_eq!(
+            terminal_plain_text("abc\r\x1b[2X", 1024),
+            ("  c".into(), false)
+        );
+        assert_eq!(
+            terminal_plain_text("abc\r\x1b[2XZ", 1024),
+            ("Z c".into(), false)
+        );
+    }
+
+    #[test]
+    fn erase_characters_clears_wide_pairs_at_both_boundaries() {
+        assert_eq!(
+            terminal_plain_text("界abc\r\x1b[1C\x1b[X", 1024),
+            ("  abc".into(), false)
+        );
+        assert_eq!(
+            terminal_plain_text("a界bc\r\x1b[2X", 1024),
+            ("   bc".into(), false)
+        );
+    }
+
+    #[test]
+    fn erase_characters_caps_work_to_existing_cells() {
+        assert_eq!(
+            terminal_plain_text("abc\r\x1b[99999999999999999999999999999999999Xz", 1024),
+            ("z  ".into(), false)
+        );
+        assert_eq!(
+            terminal_plain_text("abc\x1b[900C\x1b[9999X", 1024),
+            ("abc".into(), false)
+        );
+        // Repeated erases spend the existing bounded reconstruction budget;
+        // they cannot cause unbounded rescanning or allocation.
+        let input = format!("abc\r{}", "\x1b[3X".repeat(100));
+        let (text, truncated) = terminal_plain_text(&input, 8);
+        assert!(text.trim().is_empty());
+        assert!(truncated);
     }
 
     #[test]
