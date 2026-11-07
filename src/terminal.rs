@@ -3288,6 +3288,8 @@ impl IdleBackgroundRawChunk {
 
 #[derive(Clone, Debug)]
 struct IdleBackgroundOutput {
+    initial_col: usize,
+    columns: usize,
     start_row: usize,
     start_row_id: Option<RawRowId>,
     start_col: usize,
@@ -3304,8 +3306,10 @@ struct IdleBackgroundOutput {
 impl IdleBackgroundOutput {
     const CHUNK_BYTES: usize = 4 * 1024;
 
-    fn new(start_row: usize, start_col: usize) -> Self {
+    fn new(start_row: usize, start_col: usize, columns: usize) -> Self {
         Self {
+            initial_col: start_col,
+            columns,
             start_row,
             start_row_id: None,
             start_col,
@@ -5330,8 +5334,11 @@ impl TerminalState {
                     let typeahead = std::mem::take(&mut self.pending_prompt_typeahead);
                     self.agent_prompt_input_tainted = typeahead;
                     self.idle_prompt_input_dirty = typeahead;
-                    self.idle_background_output =
-                        Some(IdleBackgroundOutput::new(absolute_row, self.cursor_col));
+                    self.idle_background_output = Some(IdleBackgroundOutput::new(
+                        absolute_row,
+                        self.cursor_col,
+                        self.grid.row_len(),
+                    ));
                     self.prompt_submission_pending = false;
                     self.prompt_cancel_pending = false;
                     self.agent_prompt_generation = self.agent_prompt_generation.wrapping_add(1);
@@ -5891,6 +5898,8 @@ impl TerminalState {
         }
         let raw = pending.raw_bytes();
         let IdleBackgroundOutput {
+            initial_col,
+            columns,
             start_row,
             start_row_id,
             start_col,
@@ -5904,8 +5913,12 @@ impl TerminalState {
             raw_truncated,
         } = pending;
         let (raw, invalid_utf8) = decode_utf8_without_replacement(&raw);
-        let (plain, render_truncated) =
-            crate::ansi::terminal_plain_text(&raw, Self::ZONE_OUTPUT_CAP_BYTES);
+        let (plain, render_truncated) = crate::ansi::terminal_plain_text(
+            &raw,
+            Self::ZONE_OUTPUT_CAP_BYTES,
+            columns,
+            initial_col,
+        );
         if !plain
             .chars()
             .any(|character| !character.is_whitespace() && !character.is_control())
@@ -14232,6 +14245,17 @@ impl TerminalState {
         }
 
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
+        if cols != self.grid.row_len() {
+            if let Some(pending) = self.idle_background_output.as_mut() {
+                // The retained byte stream does not encode reflow. Do not
+                // present a mixed-width reconstruction as an exact snapshot.
+                if pending.anchor_started {
+                    pending.raw_truncated = true;
+                } else {
+                    pending.columns = cols;
+                }
+            }
+        }
         let old_rows = self.grid.rows();
         let had_full_screen_region = old_rows == 0
             || (self.scroll_region_top == 0 && self.scroll_region_bottom + 1 >= old_rows);
@@ -21938,6 +21962,98 @@ mod tests {
     }
 
     #[test]
+    fn background_snapshot_preserves_row_insertions_and_deletions() {
+        for cols in [8, 12, 40] {
+            for text in [
+                "abcdefgh",
+                "界abcd",
+                "a界bcd",
+                "ab界cd",
+                "abcd界",
+                "abcdef界",
+            ] {
+                for col in 0..8 {
+                    for count in ["", "0", "1", "2", "4", "99999"] {
+                        for command in ['P', '@'] {
+                            let output = format!("{text}\r\x1b[{}G\x1b[{count}{command}Z", col + 1);
+                            for split in 0..=output.len() {
+                                let mut terminal = TerminalState::new(cols, 8);
+                                terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n");
+                                terminal.process_input(&output.as_bytes()[..split]);
+                                terminal.process_input(&output.as_bytes()[split..]);
+                                let live: String = terminal.grid[1]
+                                    .iter()
+                                    .filter(|cell| !cell.flags.wide_continuation())
+                                    .map(|cell| cell.character)
+                                    .collect();
+                                terminal.process_input(b"\x1b]133;A\x07");
+                                let zone = terminal.command_zones.back().expect("background block");
+                                let (snapshot, truncated) = zone.captured_output.as_ref().unwrap();
+                                assert_eq!(
+                                    snapshot.trim_end(),
+                                    format!("\n{}", live.trim_end()),
+                                    "cols={cols} output={output:?} split={split}"
+                                );
+                                assert!(!truncated);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn background_snapshot_keeps_unedited_logical_lines_and_pre_output_resize_exact() {
+        let mut terminal = TerminalState::new(8, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        terminal.on_resize(12, 8);
+        terminal.process_input(b"\r\nabcdefghijklmnop");
+        terminal.process_input(b"\x1b]133;A\x07");
+        let zone = terminal.command_zones.back().expect("background block");
+        assert_eq!(
+            terminal.zone_output_text_capped(zone.id),
+            Some(("\nabcdefghijklmnop".into(), false))
+        );
+    }
+
+    #[test]
+    fn background_snapshot_marks_prompt_tail_row_edits_as_inexact() {
+        for command in ['P', '@'] {
+            let mut terminal = TerminalState::new(12, 8);
+            terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07abc");
+            terminal.process_input(format!("\r\x1b[{command}Z").as_bytes());
+            terminal.process_input(b"\x1b]133;A\x07");
+            let zone = terminal.command_zones.back().expect("background block");
+            assert!(terminal.zone_output_text_capped(zone.id).unwrap().1);
+        }
+    }
+
+    #[test]
+    fn background_snapshot_marks_wrapped_row_edits_as_inexact() {
+        for command in ['P', '@'] {
+            let mut terminal = TerminalState::new(8, 8);
+            terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\nabcdefghijk");
+            terminal.process_input(format!("\r\x1b[{command}Z").as_bytes());
+            terminal.process_input(b"\x1b]133;A\x07");
+            let zone = terminal.command_zones.back().expect("background block");
+            assert!(zone.captured_output.as_ref().unwrap().1);
+            assert!(terminal.zone_output_text_capped(zone.id).unwrap().1);
+        }
+    }
+
+    #[test]
+    fn background_snapshot_marks_column_reflow_as_inexact() {
+        let mut terminal = TerminalState::new(8, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\nabcdef\r\x1b[2@");
+        terminal.on_resize(12, 8);
+        terminal.process_input(b"\x1b]133;A\x07");
+        let zone = terminal.command_zones.back().expect("background block");
+        assert!(zone.captured_output.as_ref().unwrap().1);
+        assert!(terminal.zone_output_text_capped(zone.id).unwrap().1);
+    }
+
+    #[test]
     fn background_output_survives_scrollback_trim_as_a_bounded_snapshot() {
         let mut terminal = TerminalState::new(12, 2);
         terminal.set_max_scrollback(3);
@@ -22001,7 +22117,7 @@ mod tests {
     #[test]
     fn idle_background_raw_ring_retains_only_the_newest_eight_mib() {
         let limit = TerminalState::IDLE_BACKGROUND_CAPTURE_BYTES;
-        let mut pending = IdleBackgroundOutput::new(0, 0);
+        let mut pending = IdleBackgroundOutput::new(0, 0, 80);
         pending.append(&vec![b'a'; limit], limit);
         pending.append(b"tail", limit);
 
@@ -22015,7 +22131,7 @@ mod tests {
 
     #[test]
     fn idle_background_ring_excludes_private_control_string_payloads() {
-        let mut pending = IdleBackgroundOutput::new(0, 0);
+        let mut pending = IdleBackgroundOutput::new(0, 0, 80);
         pending.append(b"visible", 32);
         pending.append(b"\x1b_Gsecret-base64\x1b\\", 32);
         pending.append(b" tail", 32);
@@ -22027,7 +22143,7 @@ mod tests {
     #[test]
     fn idle_background_ring_bounds_chunk_metadata_for_mixed_tokens() {
         let limit = 64 * 1024;
-        let mut pending = IdleBackgroundOutput::new(0, 0);
+        let mut pending = IdleBackgroundOutput::new(0, 0, 80);
         for _ in 0..limit / 2 {
             pending.append(b"a", limit);
             pending.append(b"\r", limit);

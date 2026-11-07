@@ -207,12 +207,30 @@ fn combine_with_previous(
     }
 }
 
+// Match TerminalState::blank_wide_pair_at for row insertion/deletion.
+fn blank_edit_pair(cells: &mut [char], col: usize) {
+    if cells.get(col) == Some(&'\0') && col > 0 {
+        cells[col - 1] = ' ';
+        cells[col] = ' ';
+    } else if col + 1 < cells.len() && cells[col + 1] == '\0' {
+        cells[col] = ' ';
+        cells[col + 1] = ' ';
+    }
+}
+
 /// Apply terminal cursor/erase controls and return the final plain screen.
 ///
-/// The returned flag is true when either cursor coordinates, reconstructed
-/// cells, or UTF-8 output exceeded `max_bytes`; callers propagate it as the
-/// block snapshot's truncation bit. The output itself never exceeds the cap.
-pub(crate) fn terminal_plain_text(input: &str, max_bytes: usize) -> (String, bool) {
+/// The returned flag is true when cursor coordinates, reconstructed cells,
+/// work, or UTF-8 output exceed the budget, or a row edit cannot be replayed
+/// exactly (a nonzero initial column or soft-wrapped logical line). Callers
+/// propagate it as the block snapshot's truncation/inexactness bit. The output
+/// itself never exceeds `max_bytes`; `columns` is the captured terminal width.
+pub(crate) fn terminal_plain_text(
+    input: &str,
+    max_bytes: usize,
+    columns: usize,
+    initial_col: usize,
+) -> (String, bool) {
     let bytes = input.as_bytes();
     let row_limit = MAX_GRID_ROWS.min(max_bytes.saturating_add(1).max(1));
     let col_limit = MAX_GRID_COLS.min(max_bytes.max(1));
@@ -438,6 +456,68 @@ pub(crate) fn terminal_plain_text(input: &str, max_bytes: usize) -> (String, boo
                             3 => {}
                             _ => {}
                         },
+                        b'P' | b'@' => {
+                            // This retained-output model preserves logical lines,
+                            // not soft-wrap history. Row-local editing after a
+                            // soft wrap cannot be reconstructed exactly here.
+                            if (row == 0 && initial_col > 0)
+                                || col >= columns.max(1)
+                                || grid
+                                    .get(&row)
+                                    .is_some_and(|cells| cells.len() > columns.max(1))
+                            {
+                                truncated = true;
+                                continue;
+                            }
+                            if let Some(cells) = grid.get_mut(&row) {
+                                let limit = columns.max(1);
+                                let count =
+                                    parse_param(params, 0, 1).min(limit.saturating_sub(col));
+                                if count > 0 && col < cells.len() {
+                                    let old_len = cells.len();
+                                    let new_len = if command == b'@' {
+                                        old_len.saturating_add(count).min(limit)
+                                    } else {
+                                        old_len.saturating_sub(count).max(col)
+                                    };
+                                    let needed = new_len.saturating_sub(old_len);
+                                    if new_len > col_limit
+                                        || allocated_cells.saturating_add(needed) > max_bytes
+                                    {
+                                        truncated = true;
+                                    } else if spend_work(
+                                        &mut work_remaining,
+                                        old_len - col + needed,
+                                        &mut truncated,
+                                    ) {
+                                        // Mirror the live row editor: a pair touched
+                                        // at either shift boundary cannot survive.
+                                        blank_edit_pair(cells, col);
+                                        if command == b'P' {
+                                            let end = col.saturating_add(count).min(old_len);
+                                            blank_edit_pair(cells, end);
+                                            cells.copy_within(end..old_len, col);
+                                            cells.truncate(new_len);
+                                        } else {
+                                            cells.resize(new_len, ' ');
+                                            let retained_end = old_len.min(limit - count);
+                                            if retained_end > col {
+                                                cells.copy_within(col..retained_end, col + count);
+                                            }
+                                            cells[col..(col + count).min(new_len)].fill(' ');
+                                            if new_len == limit
+                                                && cells.last().is_some_and(|ch| {
+                                                    crate::char_width::cached_char_width(*ch) == 2
+                                                })
+                                            {
+                                                cells[new_len - 1] = ' ';
+                                            }
+                                        }
+                                        allocated_cells = allocated_cells - old_len + new_len;
+                                    }
+                                }
+                            }
+                        }
                         b'X' => {
                             // ECH erases cells without shifting text or moving
                             // the cursor. The live parser retains this token in
@@ -626,7 +706,45 @@ pub(crate) fn terminal_plain_text(input: &str, max_bytes: usize) -> (String, boo
 
 #[cfg(test)]
 mod tests {
-    use super::{erase_row_prefix, release_row_suffix, terminal_plain_text};
+    use super::{erase_row_prefix, release_row_suffix};
+
+    fn terminal_plain_text(input: &str, cap: usize) -> (String, bool) {
+        super::terminal_plain_text(input, cap, super::MAX_GRID_COLS, 0)
+    }
+
+    #[test]
+    fn row_editing_obeys_columns_and_cursor_without_splitting_wide_cells() {
+        for (input, expected) in [
+            ("abcde\r\x1b[2PZ", "Zde"),
+            ("abcde\r\x1b[2@Z", "Z abc"),
+            ("a界bc\r\x1b[2G\x1b[@Z", "aZ  b"),
+            ("a界bc\r\x1b[3G\x1b[PZ", "a Zc"),
+            ("abcde\r\x1b[99999@Z", "Z    "),
+            ("abcde\r\x1b[99999PZ", "Z"),
+        ] {
+            assert_eq!(
+                super::terminal_plain_text(input, 1024, 5, 0),
+                (expected.into(), false)
+            );
+        }
+    }
+
+    #[test]
+    fn row_editing_keeps_cell_and_work_budgets() {
+        let (text, truncated) = super::terminal_plain_text("abcdef\r\x1b[2@", 6, 20, 0);
+        assert_eq!(text, "abcdef");
+        assert!(truncated);
+        for command in ['P', '@'] {
+            let input = format!("abcdef{}", format!("\r\x1b[{command}").repeat(100));
+            let (text, truncated) = super::terminal_plain_text(&input, 6, 6, 0);
+            assert!(text.len() <= 6);
+            // Repeated insertion consumes work even when the row is full;
+            // deletion becomes a cheap no-op once no retained cells remain.
+            if command == '@' {
+                assert!(truncated);
+            }
+        }
+    }
 
     #[test]
     fn reconstructs_cursor_overwrites_and_erase() {
