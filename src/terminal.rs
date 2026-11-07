@@ -319,6 +319,7 @@ impl TerminalGrid {
     }
 
     /// 在行内指定列插入一个cell，右侧cell右移，末尾cell被丢弃
+    #[cfg(test)]
     pub fn insert_cell_in_row(&mut self, row: usize, col: usize, cell: TerminalCell) {
         if row >= self.rows || col >= self.cols {
             return;
@@ -330,6 +331,7 @@ impl TerminalGrid {
     }
 
     /// 删除行内指定列的cell，右侧cell左移，末尾补blank
+    #[cfg(test)]
     pub fn remove_cell_from_row(&mut self, row: usize, col: usize) {
         if row >= self.rows || col >= self.cols {
             return;
@@ -9974,36 +9976,10 @@ impl TerminalState {
                 self.pending_wrap = false;
             }
             '@' => {
-                // ICH - Insert Character(s)
+                // ICH shares IRM's bounded bulk shift and wide-cell repair.
                 let n = params.first().copied().unwrap_or(1).max(1) as usize;
-                let cols = self.grid.row_len();
-                // Beyond the remaining columns the row is already blank; see IL.
-                let n = n.min(cols.saturating_sub(self.cursor_col));
-                let blank_cell = self.create_blank_cell();
-                if self.cursor_col < cols {
-                    // A double-width character split by the insertion point
-                    // cannot survive the shift — its halves would end up n
-                    // columns apart, leaving an orphaned glyph beside a stale
-                    // spacer and every later column on the row off by one. Take
-                    // both halves out first, as ember does.
-                    self.blank_wide_pair_at(self.cursor_row, self.cursor_col);
-                    // Insert n blank cells at cursor position, shifting content right
-                    // insert_cell_in_row shifts cells right and discards the last cell
-                    for _ in 0..n {
-                        if self.cursor_col < cols {
-                            self.grid.insert_cell_in_row(
-                                self.cursor_row,
-                                self.cursor_col,
-                                blank_cell,
-                            );
-                        }
-                    }
-                    // The shift can push a lead into the last column while its
-                    // continuation falls off the end of the row.
-                    self.blank_dangling_wide_at_row_end(self.cursor_row);
-                    // Mark row as dirty after modification
-                    self.mark_row_dirty(self.cursor_row);
-                }
+                let n = n.min(self.grid.row_len().saturating_sub(self.cursor_col));
+                self.shift_cells_right(self.cursor_row, self.cursor_col, n);
             }
             'P' => {
                 // DCH - Delete Character(s)
@@ -10017,14 +9993,11 @@ impl TerminalState {
                 // shift would drag in from the right.
                 self.blank_wide_pair_at(self.cursor_row, self.cursor_col);
                 self.blank_wide_pair_at(self.cursor_row, self.cursor_col + n);
-                for _ in 0..n {
-                    if self.cursor_col < self.grid.row_len() {
-                        self.grid
-                            .remove_cell_from_row(self.cursor_row, self.cursor_col);
-                        // Fill the last cell with proper blank (remove_cell_from_row uses default)
-                        let last_col = self.grid.row_len() - 1;
-                        *self.grid.get_mut(self.cursor_row, last_col) = blank_cell;
-                    }
+                if n > 0 {
+                    let cols = self.grid.row_len();
+                    let line = &mut self.grid[self.cursor_row];
+                    line.copy_within(self.cursor_col + n..cols, self.cursor_col);
+                    line[cols - n..].fill(blank_cell);
                 }
                 // Mark row as dirty after modification
                 self.mark_row_dirty(self.cursor_row);
@@ -21957,6 +21930,86 @@ mod tests {
                 terminal.process_input(b"\x1b]133;A\x07");
                 let zone = terminal.command_zones.back().expect("background block");
                 assert_eq!(zone.captured_output, Some((format!("\n{expected}"), false)));
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_row_edits_preserve_pending_wrap() {
+        for text in ["abcdefgh", "abcdef界"] {
+            for command in ['@', 'P'] {
+                let mut terminal = TerminalState::new(8, 8);
+                terminal.process_batch(text.as_bytes());
+                assert!(terminal.pending_wrap);
+                let cursor = terminal.get_cursor_pos();
+                terminal.process_batch(format!("\x1b[{command}").as_bytes());
+                assert!(terminal.pending_wrap);
+                assert_eq!(terminal.get_cursor_pos(), cursor);
+                terminal.process_batch(b"Z");
+                assert_eq!(terminal.get_cursor_pos(), (1, 1));
+                assert!(terminal.grid.row_wrapped[0]);
+                assert_eq!(terminal.grid.get(1, 0).character, 'Z');
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_row_edits_match_serial_cells_metadata_and_cache() {
+        for cols in [8, 12, 40] {
+            for text in ["ab界cd", "界界界界", "abcdefghijklmnop"] {
+                for column in [0, 1, 3, cols - 1] {
+                    for count in [0, 1, 2, cols / 2, cols, 65535] {
+                        for command in ['@', 'P'] {
+                            let setup = format!(
+                                "\x1b[1;3;4;38;5;121m\x1b]8;;https://example.test\x07{text}\x1b]8;;\x07\r\x1b[{}G\x1b[48;2;5;6;7m",
+                                column + 1
+                            );
+                            let sequence = format!("\x1b[{count}{command}");
+                            for split in 0..=sequence.len() {
+                                let mut actual = TerminalState::new(cols, 8);
+                                let mut expected = TerminalState::new(cols, 8);
+                                actual.process_batch(setup.as_bytes());
+                                expected.process_batch(setup.as_bytes());
+                                let row = actual.cursor_row;
+                                let row_id = actual.grid.raw_row_id(row);
+                                let wraps = actual.grid.row_wrapped.clone();
+                                let cursor = actual.get_cursor_pos();
+                                let pending_wrap = actual.pending_wrap;
+                                // Prime the visible cache before changing cells.
+                                let _ = actual.get_visible_cells();
+                                let before_version = actual.grid_version;
+                                let n = count.max(1).min(cols - column);
+                                let blank = expected.create_blank_cell();
+                                expected.blank_wide_pair_at(row, column);
+                                if command == '@' {
+                                    for _ in 0..n {
+                                        expected.grid.insert_cell_in_row(row, column, blank);
+                                    }
+                                    expected.blank_dangling_wide_at_row_end(row);
+                                } else {
+                                    expected.blank_wide_pair_at(row, column + n);
+                                    for _ in 0..n {
+                                        expected.grid.remove_cell_from_row(row, column);
+                                        *expected.grid.get_mut(row, cols - 1) = blank;
+                                    }
+                                }
+                                actual.process_batch(&sequence.as_bytes()[..split]);
+                                actual.process_batch(&sequence.as_bytes()[split..]);
+                                assert_eq!(actual.grid.to_vec(), expected.grid.to_vec(),
+                                    "cols={cols} text={text:?} col={column} count={count} command={command} split={split}");
+                                assert_eq!(
+                                    actual.get_visible_cells().as_ref(),
+                                    &expected.grid.to_vec()
+                                );
+                                assert!(actual.row_versions[row] > before_version);
+                                assert_eq!(actual.grid.raw_row_id(row), row_id);
+                                assert_eq!(actual.grid.row_wrapped, wraps);
+                                assert_eq!(actual.get_cursor_pos(), cursor);
+                                assert_eq!(actual.pending_wrap, pending_wrap);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
