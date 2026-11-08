@@ -5,6 +5,52 @@ use std::path::{Path, PathBuf};
 /// Hard cap on actionable highlights produced from one terminal row.
 const MAX_LINKS_PER_LINE: usize = 64;
 
+// Test-only accounting of the actual scan and URL-containment work. Each test
+// opts in on its own thread, so concurrent parser tests cannot affect totals.
+#[cfg(test)]
+thread_local! {
+    static LINK_WORK: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn record_link_work(bytes: usize, spans: usize) {
+    LINK_WORK.with(|work| {
+        if let Some((old_bytes, old_spans)) = work.get() {
+            work.set(Some((old_bytes + bytes, old_spans + spans)));
+        }
+    });
+}
+
+/// Each regex pass emits non-overlapping matches in byte order. Count only
+/// newly traversed UTF-8 prefixes, rather than rescanning from column zero.
+#[derive(Default)]
+struct CharOffsetCursor {
+    byte: usize,
+    column: usize,
+}
+
+impl CharOffsetCursor {
+    fn advance(&mut self, line: &str, byte: usize) -> Option<usize> {
+        let gap = line.get(self.byte..byte)?;
+        #[cfg(test)]
+        record_link_work(gap.len(), 0);
+        self.column += gap.chars().count();
+        self.byte = byte;
+        Some(self.column)
+    }
+}
+
+/// URL regex matches, including refused schemes, are ordered and disjoint.
+/// Only the last span starting before the candidate can contain it.
+fn contained_in_url(spans: &[(usize, usize)], start: usize, end: usize) -> bool {
+    let after = spans.partition_point(|&(span_start, _)| {
+        #[cfg(test)]
+        record_link_work(0, 1);
+        span_start <= start
+    });
+    after > 0 && end <= spans[after - 1].1
+}
+
 /// Preserve balanced URL parentheses while dropping only excess trailing closers.
 /// Count once: rescanning the whole URL after each ')' made link refresh quadratic
 /// for process-controlled output with a long run of closing parentheses.
@@ -114,12 +160,6 @@ impl LinkDetector {
         }
     }
 
-    /// Map a byte offset to a display column. Offsets past the line or off a
-    /// UTF-8 boundary are skipped instead of slicing-panic.
-    fn byte_offset_to_char_offset(line: &str, byte_offset: usize) -> Option<usize> {
-        Some(line.get(..byte_offset)?.chars().count())
-    }
-
     fn at_link_cap(links: &[Link]) -> bool {
         links.len() >= MAX_LINKS_PER_LINE
     }
@@ -132,13 +172,13 @@ impl LinkDetector {
         // Detect every URL-shaped span even when URL activation is disabled:
         // an IP/file-looking substring inside a refused scheme must never fall
         // back to a different link type.
+        let mut offsets = CharOffsetCursor::default();
         for mat in self.url_regex.find_iter(line) {
             let url = trim_unbalanced_url_parentheses(mat.as_str());
-            let Some(col_start) = Self::byte_offset_to_char_offset(line, mat.start()) else {
+            let Some(col_start) = offsets.advance(line, mat.start()) else {
                 continue;
             };
-            let Some(col_end) = Self::byte_offset_to_char_offset(line, mat.start() + url.len())
-            else {
+            let Some(col_end) = offsets.advance(line, mat.start() + url.len()) else {
                 continue;
             };
             if col_end < col_start {
@@ -164,6 +204,7 @@ impl LinkDetector {
         // 检测 IP 地址
         if self.config.detect_ip_addresses {
             let bytes = line.as_bytes();
+            let mut offsets = CharOffsetCursor::default();
             for mat in self.ip_regex.find_iter(line) {
                 // A four-component substring of a longer dotted sequence is
                 // not an IPv4 address (for example a five-part version).
@@ -178,19 +219,17 @@ impl LinkDetector {
                 if Self::at_link_cap(&links) {
                     break;
                 }
-                let Some(col_start) = Self::byte_offset_to_char_offset(line, mat.start()) else {
+                let Some(col_start) = offsets.advance(line, mat.start()) else {
                     continue;
                 };
-                let Some(col_end) = Self::byte_offset_to_char_offset(line, mat.end()) else {
+                let Some(col_end) = offsets.advance(line, mat.end()) else {
                     continue;
                 };
                 if col_end < col_start {
                     continue;
                 }
                 // 避免与 URL 重复
-                if !url_spans
-                    .iter()
-                    .any(|&(start, end)| start <= col_start && col_end <= end)
+                if !contained_in_url(&url_spans, col_start, col_end)
                     && !links
                         .iter()
                         .any(|l| l.col_start <= col_start && col_end <= l.col_end)
@@ -208,6 +247,7 @@ impl LinkDetector {
 
         // 检测文件路径
         if self.config.detect_file_paths {
+            let mut offsets = CharOffsetCursor::default();
             for mat in self.file_path_regex.find_iter(line) {
                 if Self::at_link_cap(&links) {
                     break;
@@ -221,12 +261,10 @@ impl LinkDetector {
                 // highlight columns cover only the path, not the preceding space.
                 let lead_ws = raw.len() - raw.trim_start().len();
                 let start_byte = mat.start() + lead_ws;
-                let Some(col_start) = Self::byte_offset_to_char_offset(line, start_byte) else {
+                let Some(col_start) = offsets.advance(line, start_byte) else {
                     continue;
                 };
-                let Some(col_end) =
-                    Self::byte_offset_to_char_offset(line, start_byte + matched_text.len())
-                else {
+                let Some(col_end) = offsets.advance(line, start_byte + matched_text.len()) else {
                     continue;
                 };
                 if col_end < col_start {
@@ -234,9 +272,7 @@ impl LinkDetector {
                 }
 
                 // 避免与 URL 重复
-                if !url_spans
-                    .iter()
-                    .any(|&(start, end)| start <= col_start && col_end <= end)
+                if !contained_in_url(&url_spans, col_start, col_end)
                     && !links
                         .iter()
                         .any(|l| l.col_start <= col_start && col_end <= l.col_end)
@@ -559,6 +595,73 @@ fn resolve_existing_file_path(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn monotonic_link_columns_and_sorted_containment_match_legacy() {
+        for text in ["", "ASCII paths", "界 e\u{301} İ ftp://192.0.2.1"] {
+            let mut offsets = CharOffsetCursor::default();
+            for byte in text
+                .char_indices()
+                .map(|(byte, _)| byte)
+                .chain([text.len()])
+            {
+                for _ in 0..2 {
+                    assert_eq!(
+                        offsets.advance(text, byte),
+                        Some(text[..byte].chars().count())
+                    );
+                }
+            }
+        }
+        for spans in [vec![], vec![(0, 2)], vec![(1, 3), (3, 5), (7, 9)]] {
+            for start in 0..12 {
+                for end in start..12 {
+                    assert_eq!(
+                        contained_in_url(&spans, start, end),
+                        spans.iter().any(|&(a, b)| a <= start && end <= b)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parsed_refused_urls_have_bounded_scan_work() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let mut measured = Vec::new();
+        for count in [512, 1024] {
+            let input = "ftp://192.0.2.1 ".repeat(count);
+            let mut terminal = crate::terminal::TerminalState::new(128, input.len() / 128 + 1);
+            terminal.process_input(input.as_bytes());
+            let viewport = terminal.get_projected_viewport(true);
+            assert!(viewport.row_wrapped()[0]);
+            LINK_WORK.with(|work| work.set(Some((0, 0))));
+            let links = detector.detect_links_in_visible_cells_with_wrapping(
+                viewport.cells(),
+                viewport.row_wrapped(),
+            );
+            let (bytes, spans) = LINK_WORK.with(|work| work.replace(None).unwrap());
+            assert!(
+                links.is_empty(),
+                "refused schemes must not expose inner IPs"
+            );
+            println!(
+                "LINK_WORK count={count} input_bytes={} prefix_bytes={bytes} span_checks={spans}",
+                input.len()
+            );
+            measured.push((count, input.len(), bytes, spans));
+        }
+        for (count, input_bytes, bytes, spans) in measured {
+            assert!(
+                bytes <= input_bytes * 4,
+                "prefix scan budget exceeded: {bytes} for {count}"
+            );
+            assert!(
+                spans <= count * 12,
+                "containment budget exceeded: {spans} for {count}"
+            );
+        }
+    }
 
     #[test]
     fn parsed_version_components_are_not_ip_links() {
@@ -1039,10 +1142,10 @@ mod tests {
 
     #[test]
     fn mid_codepoint_offsets_are_skipped_instead_of_panicking() {
-        assert_eq!(LinkDetector::byte_offset_to_char_offset("雪", 1), None);
-        assert_eq!(LinkDetector::byte_offset_to_char_offset("雪", 3), Some(1));
-        assert_eq!(LinkDetector::byte_offset_to_char_offset("雪", 99), None);
-        assert_eq!(LinkDetector::byte_offset_to_char_offset("ok", 0), Some(0));
+        assert_eq!(CharOffsetCursor::default().advance("雪", 1), None);
+        assert_eq!(CharOffsetCursor::default().advance("雪", 3), Some(1));
+        assert_eq!(CharOffsetCursor::default().advance("雪", 99), None);
+        assert_eq!(CharOffsetCursor::default().advance("ok", 0), Some(0));
     }
 
     #[test]
