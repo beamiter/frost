@@ -5,6 +5,23 @@ use std::path::{Path, PathBuf};
 /// Hard cap on actionable highlights produced from one terminal row.
 const MAX_LINKS_PER_LINE: usize = 64;
 
+
+// Test-only accounting of the actual scan and URL-containment work. Each test
+// opts in on its own thread, so concurrent parser tests cannot affect totals.
+#[cfg(test)]
+thread_local! {
+    static LINK_WORK: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn record_link_work(bytes: usize, spans: usize) {
+    LINK_WORK.with(|work| {
+        if let Some((old_bytes, old_spans)) = work.get() {
+            work.set(Some((old_bytes + bytes, old_spans + spans)));
+        }
+    });
+}
+
 /// Preserve balanced URL parentheses while dropping only excess trailing closers.
 /// Count once: rescanning the whole URL after each ')' made link refresh quadratic
 /// for process-controlled output with a long run of closing parentheses.
@@ -117,6 +134,8 @@ impl LinkDetector {
     /// Map a byte offset to a display column. Offsets past the line or off a
     /// UTF-8 boundary are skipped instead of slicing-panic.
     fn byte_offset_to_char_offset(line: &str, byte_offset: usize) -> Option<usize> {
+        #[cfg(test)]
+        record_link_work(byte_offset, 0);
         Some(line.get(..byte_offset)?.chars().count())
     }
 
@@ -190,7 +209,11 @@ impl LinkDetector {
                 // 避免与 URL 重复
                 if !url_spans
                     .iter()
-                    .any(|&(start, end)| start <= col_start && col_end <= end)
+                    .any(|&(start, end)| {
+                        #[cfg(test)]
+                        record_link_work(0, 1);
+                        start <= col_start && col_end <= end
+                    })
                     && !links
                         .iter()
                         .any(|l| l.col_start <= col_start && col_end <= l.col_end)
@@ -236,7 +259,11 @@ impl LinkDetector {
                 // 避免与 URL 重复
                 if !url_spans
                     .iter()
-                    .any(|&(start, end)| start <= col_start && col_end <= end)
+                    .any(|&(start, end)| {
+                        #[cfg(test)]
+                        record_link_work(0, 1);
+                        start <= col_start && col_end <= end
+                    })
                     && !links
                         .iter()
                         .any(|l| l.col_start <= col_start && col_end <= l.col_end)
@@ -559,6 +586,31 @@ fn resolve_existing_file_path(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn parsed_refused_urls_have_bounded_scan_work() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let mut measured = Vec::new();
+        for count in [512, 1024] {
+            let input = "ftp://192.0.2.1 ".repeat(count);
+            let mut terminal = crate::terminal::TerminalState::new(128, input.len() / 128 + 1);
+            terminal.process_input(input.as_bytes());
+            let viewport = terminal.get_projected_viewport(true);
+            assert!(viewport.row_wrapped()[0]);
+            LINK_WORK.with(|work| work.set(Some((0, 0))));
+            let links = detector.detect_links_in_visible_cells_with_wrapping(
+                viewport.cells(), viewport.row_wrapped());
+            let (bytes, spans) = LINK_WORK.with(|work| work.replace(None).unwrap());
+            assert!(links.is_empty(), "refused schemes must not expose inner IPs");
+            println!("LINK_WORK count={count} input_bytes={} prefix_bytes={bytes} span_checks={spans}", input.len());
+            measured.push((count, input.len(), bytes, spans));
+        }
+        for (count, input_bytes, bytes, spans) in measured {
+            assert!(bytes <= input_bytes * 4, "prefix scan budget exceeded: {bytes} for {count}");
+            assert!(spans <= count * 12, "containment budget exceeded: {spans} for {count}");
+        }
+    }
+
 
     #[test]
     fn parsed_version_components_are_not_ip_links() {

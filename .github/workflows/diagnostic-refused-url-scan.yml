@@ -1,0 +1,55 @@
+name: Refused URL scan validation
+on:
+  push:
+    branches: [diagnostics/refused-url-scan]
+permissions:
+  contents: read
+jobs:
+  links:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash scripts/materialize-shared-core.sh
+      - run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y pkg-config libfontconfig1-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev libxi-dev libxrandr-dev libxkbcommon-dev libegl1-mesa-dev libgl1-mesa-dev
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt,clippy
+
+      - name: Old production scan must exceed deterministic work budgets
+        run: |
+          set +e
+          CARGO_TERM_COLOR=never cargo test -p frost --all-features --locked link::tests::parsed_refused_urls_have_bounded_scan_work -- --exact --nocapture > /tmp/scan-negative.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/scan-negative.log
+          test "$status" -ne 0
+          grep -q 'parsed_refused_urls_have_bounded_scan_work ... FAILED' /tmp/scan-negative.log
+          grep -q 'prefix scan budget exceeded' /tmp/scan-negative.log
+      - name: Apply bounded scan candidate
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path('src/link.rs')
+          s = p.read_text()
+          replacements = json.loads("[[\"/// Preserve balanced URL parentheses\",\"\\n/// Each regex pass emits non-overlapping matches in byte order. Count only\\n/// newly traversed UTF-8 prefixes, rather than rescanning from column zero.\\n#[derive(Default)]\\nstruct CharOffsetCursor {\\n    byte: usize,\\n    column: usize,\\n}\\n\\nimpl CharOffsetCursor {\\n    fn advance(&mut self, line: &str, byte: usize) -> Option<usize> {\\n        let gap = line.get(self.byte..byte)?;\\n        #[cfg(test)]\\n        record_link_work(gap.len(), 0);\\n        self.column += gap.chars().count();\\n        self.byte = byte;\\n        Some(self.column)\\n    }\\n}\\n\\n/// URL regex matches, including refused schemes, are ordered and disjoint.\\n/// Only the last span starting before the candidate can contain it.\\nfn contained_in_url(spans: &[(usize, usize)], start: usize, end: usize) -> bool {\\n    let after = spans.partition_point(|&(span_start, _)| {\\n        #[cfg(test)]\\n        record_link_work(0, 1);\\n        span_start <= start\\n    });\\n    after > 0 && end <= spans[after - 1].1\\n}\\n\\n/// Preserve balanced URL parentheses\"],[\"    /// Map a byte offset to a display column. Offsets past the line or off a\\n    /// UTF-8 boundary are skipped instead of slicing-panic.\\n    fn byte_offset_to_char_offset(line: &str, byte_offset: usize) -> Option<usize> {\\n        #[cfg(test)]\\n        record_link_work(byte_offset, 0);\\n        Some(line.get(..byte_offset)?.chars().count())\\n    }\\n\\n\",\"\"],[\"        for mat in self.url_regex.find_iter(line) {\",\"        let mut offsets = CharOffsetCursor::default();\\n        for mat in self.url_regex.find_iter(line) {\"],[\"            let bytes = line.as_bytes();\",\"            let bytes = line.as_bytes();\\n            let mut offsets = CharOffsetCursor::default();\"],[\"            for mat in self.file_path_regex.find_iter(line) {\",\"            let mut offsets = CharOffsetCursor::default();\\n            for mat in self.file_path_regex.find_iter(line) {\"],[\"Self::byte_offset_to_char_offset(line, \",\"offsets.advance(line, \"],[\"url_spans\\n                    .iter()\\n                    .any(|&(start, end)| {\\n                        #[cfg(test)]\\n                        record_link_work(0, 1);\\n                        start <= col_start && col_end <= end\\n                    })\",\"contained_in_url(&url_spans, col_start, col_end)\"],[\"mod tests {\",\"mod tests {\\n\\n    #[test]\\n    fn monotonic_link_columns_and_sorted_containment_match_legacy() {\\n        for text in [\\\"\\\", \\\"ASCII paths\\\", \\\"界 e\\\\u{301} İ ftp://192.0.2.1\\\"] {\\n            let mut offsets = CharOffsetCursor::default();\\n            for byte in text.char_indices().map(|(byte, _)| byte).chain([text.len()]) {\\n                for _ in 0..2 {\\n                    assert_eq!(offsets.advance(text, byte), Some(text[..byte].chars().count()));\\n                }\\n            }\\n        }\\n        for spans in [vec![], vec![(0, 2)], vec![(1, 3), (3, 5), (7, 9)]] {\\n            for start in 0..12 {\\n                for end in start..12 {\\n                    assert_eq!(contained_in_url(&spans, start, end),\\n                        spans.iter().any(|&(a, b)| a <= start && end <= b));\\n                }\\n            }\\n        }\\n    }\\n\"]]")
+          for old, new in replacements:
+              assert old in s, old
+              s = s.replace(old, new)
+          p.write_text(s)
+          PY
+          rustfmt --edition 2021 src/link.rs
+          echo 'FORMATTED_SCAN_BEGIN'
+          base64 -w0 src/link.rs
+          printf '\nFORMATTED_SCAN_END\n'
+      - name: Full link regression and work-count suite
+        run: cargo test -p frost --all-features --locked link::tests -- --nocapture
+      - name: Clippy candidate
+        run: cargo clippy -p frost --all-targets --all-features --locked -- -D warnings
