@@ -548,6 +548,37 @@ fn resolve_existing_file_path(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn parsed_version_components_are_not_ip_links() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        for text in ["1.2.3.4.5", "x.1.2.3.4", "界 1.2.3.4.5"] {
+            for width in [80, 8] {
+                let (cells, wraps) = parsed_link_cells(text, width);
+                let links = detector.detect_links_in_visible_cells_with_wrapping(&cells, &wraps);
+                assert!(links.is_empty(), "{text:?} width={width}: {links:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn parsed_real_ip_punctuation_and_wrapped_columns_are_preserved() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let (cells, wraps) = parsed_link_cells("界 192.0.2.1.", 80);
+        let expected = vec![Link {
+            line: 0, col_start: 3, col_end: 12,
+            link_type: LinkType::IpAddress, text: "192.0.2.1".into(),
+        }];
+        for metadata in [&wraps[..], &[][..], &[true][..]] {
+            assert_eq!(detector.detect_links_in_visible_cells_with_wrapping(&cells, metadata), expected);
+        }
+        let (cells, wraps) = parsed_link_cells("界 192.0.2.1.", 8);
+        assert_eq!(detector.detect_links_in_visible_cells_with_wrapping(&cells, &wraps), vec![
+            Link { line: 0, col_start: 3, col_end: 8, link_type: LinkType::IpAddress, text: "192.0.2.1".into() },
+            Link { line: 1, col_start: 0, col_end: 4, link_type: LinkType::IpAddress, text: "192.0.2.1".into() },
+        ]);
+    }
+
     use super::*;
 
     fn parsed_link_cells(
