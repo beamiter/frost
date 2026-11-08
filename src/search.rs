@@ -560,7 +560,10 @@ impl SearchEngine {
         let search_query = if case_sensitive {
             query.to_string()
         } else {
-            query.to_lowercase()
+            // Match the per-scalar folding used by live cells and history.
+            // str::to_lowercase applies contextual final-sigma rules that
+            // char::to_lowercase does not, so even an identical query can miss.
+            query.chars().flat_map(char::to_lowercase).collect()
         };
 
         let query_chars = search_query.chars().count();
@@ -861,6 +864,93 @@ impl SearchEngine {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn parsed_sigma_queries_match_themselves_in_live_and_history_rows() {
+        for (prefix, styled) in [("", false), ("", true), ("界 ", false)] {
+            let mut terminal = crate::terminal::TerminalState::new(32, 4);
+            if styled {
+                terminal.process_input(b"\x1b[31m");
+            }
+            terminal.process_input(format!("{prefix}ΟΣ").as_bytes());
+            let start = if prefix.is_empty() { 0 } else { 3 };
+            let expected = vec![SearchMatch {
+                line: 0,
+                col_start: start,
+                col_end: start + 2,
+            }];
+            for history in [false, true] {
+                if history {
+                    terminal.process_input(b"\r\n\r\n\r\n\r\n");
+                    let first = terminal.search_lines().next().unwrap();
+                    if !styled && prefix.is_empty() {
+                        assert!(matches!(first, SearchLine::Text(_)));
+                    } else {
+                        assert!(matches!(first, SearchLine::Scrollback(_)));
+                    }
+                }
+                for case_sensitive in [true, false] {
+                    let (hits, error) = SearchEngine::search_lines(
+                        terminal.search_lines(),
+                        "ΟΣ",
+                        false,
+                        case_sensitive,
+                        &mut None,
+                    );
+                    assert!(error.is_none());
+                    assert_eq!(hits, expected, "history={history} styled={styled} prefix={prefix:?} case_sensitive={case_sensitive}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parsed_scalar_query_folding_preserves_i_expansion_and_regex_sigma() {
+        let mut terminal = crate::terminal::TerminalState::new(32, 4);
+        terminal.process_input("界 İ ΟΣ ος".as_bytes());
+        for history in [false, true] {
+            if history {
+                terminal.process_input(b"\r\n\r\n\r\n\r\n");
+            }
+            for query in ["İ", "i\u{307}"] {
+                let (hits, error) = SearchEngine::search_lines(
+                    terminal.search_lines(),
+                    query,
+                    false,
+                    false,
+                    &mut None,
+                );
+                assert!(error.is_none());
+                assert_eq!(
+                    hits,
+                    vec![SearchMatch {
+                        line: 0,
+                        col_start: 3,
+                        col_end: 4
+                    }]
+                );
+            }
+            let (hits, error) =
+                SearchEngine::search_lines(terminal.search_lines(), "ΟΣ", true, false, &mut None);
+            assert!(error.is_none());
+            assert_eq!(
+                hits,
+                vec![
+                    SearchMatch {
+                        line: 0,
+                        col_start: 5,
+                        col_end: 7
+                    },
+                    SearchMatch {
+                        line: 0,
+                        col_start: 8,
+                        col_end: 10
+                    },
+                ]
+            );
+        }
+    }
+
     #[test]
     fn live_navigation_refreshes_deleted_match_before_the_debounce_tick() {
         for previous in [false, true] {
