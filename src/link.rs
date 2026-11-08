@@ -163,7 +163,18 @@ impl LinkDetector {
 
         // 检测 IP 地址
         if self.config.detect_ip_addresses {
+            let bytes = line.as_bytes();
             for mat in self.ip_regex.find_iter(line) {
+                // A four-component substring of a longer dotted sequence is
+                // not an IPv4 address (for example a five-part version).
+                if mat.start() > 0 && bytes[mat.start() - 1] == b'.' {
+                    continue;
+                }
+                if bytes.get(mat.end()) == Some(&b'.')
+                    && bytes.get(mat.end() + 1).is_some_and(|b| b.is_ascii_digit())
+                {
+                    continue;
+                }
                 if Self::at_link_cap(&links) {
                     break;
                 }
@@ -548,6 +559,58 @@ fn resolve_existing_file_path(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn parsed_version_components_are_not_ip_links() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        for text in ["1.2.3.4.5", "x.1.2.3.4", "界 1.2.3.4.5"] {
+            for width in [80, 8] {
+                let (cells, wraps) = parsed_link_cells(text, width);
+                let links = detector.detect_links_in_visible_cells_with_wrapping(&cells, &wraps);
+                assert!(links.is_empty(), "{text:?} width={width}: {links:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn parsed_real_ip_punctuation_and_wrapped_columns_are_preserved() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let (cells, wraps) = parsed_link_cells("界 192.0.2.1.", 80);
+        let expected = vec![Link {
+            line: 0,
+            col_start: 3,
+            col_end: 12,
+            link_type: LinkType::IpAddress,
+            text: "192.0.2.1".into(),
+        }];
+        for metadata in [&wraps[..], &[][..], &[true][..]] {
+            assert_eq!(
+                detector.detect_links_in_visible_cells_with_wrapping(&cells, metadata),
+                expected
+            );
+        }
+        let (cells, wraps) = parsed_link_cells("界 192.0.2.1.", 8);
+        assert_eq!(
+            detector.detect_links_in_visible_cells_with_wrapping(&cells, &wraps),
+            vec![
+                Link {
+                    line: 0,
+                    col_start: 3,
+                    col_end: 8,
+                    link_type: LinkType::IpAddress,
+                    text: "192.0.2.1".into()
+                },
+                Link {
+                    line: 1,
+                    col_start: 0,
+                    col_end: 4,
+                    link_type: LinkType::IpAddress,
+                    text: "192.0.2.1".into()
+                },
+            ]
+        );
+    }
+
     use super::*;
 
     fn parsed_link_cells(
