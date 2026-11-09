@@ -912,7 +912,9 @@ fn projected_kitty_anchor(
 ) -> Option<terminal::ViewportCell> {
     let rows = rows.max(1);
     let cols = cols.max(1);
-    if rows > projection.cells().len() || cols > projection.cells().first().map_or(0, Vec::len) {
+    if rows > projection.row_view().len()
+        || cols > projection.row_view().first().map_or(0, <[_]>::len)
+    {
         return None;
     }
     let mut first = None;
@@ -22303,7 +22305,7 @@ impl Frost {
         let mut links = self
             .link_detector
             .detect_links_in_visible_cells_with_wrapping(
-                sess.projection.cells(),
+                sess.projection.row_view(),
                 sess.projection.row_wrapped(),
             );
         // OSC 8 is metadata rather than visible URL text. Give its exact cell
@@ -22312,7 +22314,7 @@ impl Frost {
         // here, and once more immediately before the opener is spawned.
         let osc8_links = sess
             .terminal
-            .osc8_links_in_visible_cells(sess.projection.cells());
+            .osc8_links_in_visible_cells(sess.projection.row_view());
         links.retain(|detected| {
             !osc8_links.iter().any(|explicit| {
                 detected.line == explicit.line
@@ -25763,7 +25765,7 @@ impl Frost {
         let elapsed_ms = terminal.running_duration_ms()?;
         let badge = block_mode::running_badge_text(elapsed_ms);
         let needed = badge.chars().count() + self.block_badge_inset();
-        let cells = sess.projection.cells();
+        let cells = sess.projection.row_view();
         let candidates = (0..cells.len()).filter(|&view_row| {
             sess.projection
                 .view_row_absolute(view_row)
@@ -25892,7 +25894,7 @@ impl Frost {
         if !self.config.is_block_mode() || sess.terminal.is_alt_buffer_active() {
             return Vec::new();
         }
-        let rows = sess.projection.cells().len();
+        let rows = sess.projection.row_view().len();
         if rows == 0 {
             return Vec::new();
         }
@@ -26121,7 +26123,7 @@ impl Frost {
                 block_mode::clock_at_offset(ms, offset)
             });
             let inset = self.block_badge_inset();
-            let cells = &sess.projection.cells()[top_view];
+            let cells = &sess.projection.row_view()[top_view];
             let unavailable = zone.command_truncated
                 && zone
                     .command
@@ -26455,7 +26457,7 @@ impl Frost {
         // Only walk the grid to build per-row selection spans when a selection
         // actually exists; otherwise hand the widget an empty Vec (no highlight).
         let selection: Vec<Option<(usize, usize)>> = if sess.terminal.has_text_selection() {
-            (0..sess.projection.cells().len())
+            (0..sess.projection.row_view().len())
                 .map(|r| {
                     sess.terminal
                         .row_selection_cols_in_projection(&sess.projection, r)
@@ -26531,7 +26533,7 @@ impl Frost {
             self.chat_input_ready(session_id),
         );
         let terminal = TermWidget::new(
-            sess.projection.cells(),
+            sess.projection.row_view(),
             sess.cursor,
             sess.cursor_visible,
             sess.terminal.cursor_shape,
@@ -34075,7 +34077,7 @@ impl Frost {
         let has_blink = self.layout().leaves().iter().any(|&idx| {
             self.sessions.get(idx).is_some_and(|s| {
                 s.projection
-                    .cells()
+                    .row_view()
                     .iter()
                     .flatten()
                     .any(|cell| cell.flags.blink())

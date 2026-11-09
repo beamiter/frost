@@ -22,6 +22,7 @@ def decl(marker,derive):
 code='#![allow(dead_code, clippy::iter_cloned_collect)]\nuse std::{collections::{BTreeSet,HashMap,VecDeque},sync::atomic::{AtomicU64,Ordering}};\n'
 code+='mod chat_mode { #[derive(Clone,Copy,Debug,Default,PartialEq,Eq)] pub struct ChatRow { reserved: bool } }\nmod chat_projection { #[derive(Clone,Debug,PartialEq,Eq)] pub struct ChatPlanKey; }\n'
 code+='use jterm_engine::RawRowId;\n'
+code += '#[path = ' + json.dumps(str(root / 'src/terminal/visible_rows.rs')) + '] mod visible_rows; use visible_rows::{VisibleRows, RowView};\n'
 code+=item('fn fresh_raw_row_id() -> RawRowId {')+'\n'
 for typ in ['RawCellOrigin','ViewportCell','ProjectionSourceRevision','RawCellBoundary','FinishedOutputRange','SyntheticRowKey','ChromeBoundary']:
  code+=decl('pub struct '+typ, 'Clone,Copy,Debug,PartialEq,Eq,Hash,PartialOrd,Ord' if typ=='RawRowId' else 'Clone,Copy,Debug,PartialEq,Eq,Hash')
@@ -49,10 +50,7 @@ for method in ['raw_absolute_row','raw_cell_document_row','selection_point_for_a
  if 'fn '+method+'(' in source: code+=item('fn '+method+'(')+'\n'
 code+='}\n'+item('fn copy_projected_cells(')+'\n'
 code+='''
-#[derive(Clone,Copy,Debug,Default,PartialEq,Eq)] struct StyleFlags(bool);
-impl StyleFlags { fn wide_continuation(self)->bool { self.0 } fn set_wide(&mut self,value:bool) { assert!(!value); } }
-#[derive(Clone,Copy,Debug,PartialEq,Eq)] pub struct TerminalCell { character:char, flags:StyleFlags }
-impl Default for TerminalCell { fn default()->Self { Self { character:' ',flags:StyleFlags(false) } } }
+use jterm_engine::TerminalCell;
 struct ScrollbackLine { cells:Vec<TerminalCell>, id:RawRowId }
 impl ScrollbackLine {
  fn compress(cells:&[TerminalCell],_wrapped:bool)->Self { Self { cells:cells.to_vec(),id:fresh_raw_row_id() } }

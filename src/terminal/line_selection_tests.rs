@@ -126,7 +126,7 @@ fn viewport(terminal: &TerminalState, offset: usize) -> ProjectedViewport {
     let (raw_span_index, raw_row_index) = TerminalState::projection_indexes(&m.provenance);
     ProjectedViewport {
         canvas_head: false,
-        cells: std::sync::Arc::new(m.cells),
+        cells: std::sync::Arc::new(VisibleRows::materialized(m.cells)),
         row_wrapped: std::sync::Arc::new(m.row_wrapped),
         row_kinds: std::sync::Arc::new(m.row_kinds),
         provenance: std::sync::Arc::new(m.provenance),

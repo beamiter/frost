@@ -2928,7 +2928,7 @@ mod tests {
         metrics.cell_w = 8.0;
         metrics.cell_h = 20.0;
         let input = TermWidget::new(
-            projection.cells(),
+            projection.row_view(),
             (2, 42),
             true,
             crate::terminal::CursorShape::Block,
@@ -3387,7 +3387,7 @@ mod tests {
         metrics.cell_w = 8.0;
         metrics.cell_h = 20.0;
         let input = TermWidget::new(
-            projection.cells(),
+            projection.row_view(),
             (2, 42),
             true,
             crate::terminal::CursorShape::Block,
@@ -3478,7 +3478,7 @@ mod tests {
             let projection = terminal.get_projected_viewport(false);
             let theme = crate::Theme::default();
             let input: TermWidget<'_, ()> = TermWidget::new(
-                projection.cells(),
+                projection.row_view(),
                 (2, 42),
                 true,
                 crate::terminal::CursorShape::Block,
@@ -3577,7 +3577,7 @@ mod tests {
         metrics.cell_h = 20.0;
         metrics.mono_advance_exact = false;
         let input: TermWidget<'_, ()> = TermWidget::new(
-            projection.cells(),
+            projection.row_view(),
             (2, 42),
             true,
             crate::terminal::CursorShape::Block,
@@ -3783,7 +3783,7 @@ mod tests {
         metrics.cell_w = 8.0;
         metrics.cell_h = 20.0;
         let input: TermWidget<'_, ()> = TermWidget::new(
-            projection.cells(),
+            projection.row_view(),
             (2, 42),
             true,
             crate::terminal::CursorShape::Block,
@@ -4199,7 +4199,7 @@ mod tests {
         metrics.cell_w = 8.0;
         metrics.cell_h = 20.0;
         let input: TermWidget<'_, ()> = TermWidget::new(
-            projection.cells(),
+            projection.row_view(),
             (2, 42),
             true,
             crate::terminal::CursorShape::Block,
@@ -4315,7 +4315,7 @@ mod tests {
             metrics.cell_w = cell_width;
             metrics.cell_h = line_height;
             let input: TermWidget<'_, ()> = TermWidget::new(
-                projection.cells(),
+                projection.row_view(),
                 (1, 7),
                 true,
                 crate::terminal::CursorShape::Block,
@@ -4448,7 +4448,7 @@ mod tests {
         metrics.cell_w = 8.0;
         metrics.cell_h = 20.0;
         let input: TermWidget<'_, ()> = TermWidget::new(
-            projection.cells(),
+            projection.row_view(),
             (2, 42),
             true,
             crate::terminal::CursorShape::Block,

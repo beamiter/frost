@@ -86,7 +86,7 @@ fn with_widget(test: impl FnOnce(&mut TermWidget<'_, Output>, Rectangle, &mut Or
         row.card_bottom = index == 7;
     }
     let mut widget = TermWidget::new(
-        projection.cells(),
+        projection.row_view(),
         (0, 0),
         true,
         CursorShape::Block,

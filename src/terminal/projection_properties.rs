@@ -205,7 +205,7 @@ fn viewport(
     let (spans, row_index) = TerminalState::projection_indexes(&m.provenance);
     ProjectedViewport {
         canvas_head: false,
-        cells: m.cells.into(),
+        cells: std::sync::Arc::new(VisibleRows::materialized(m.cells)),
         row_wrapped: m.row_wrapped.into(),
         row_kinds: m.row_kinds.into(),
         provenance: std::sync::Arc::new(m.provenance),

@@ -1046,7 +1046,7 @@ pub struct TermWidget<'a, Message> {
     on_canvas_pause: Option<Box<dyn Fn() -> Message + 'a>>,
     mode_epoch: u64,
     terminal_mode: crate::config::TerminalMode,
-    grid: &'a [Vec<TerminalCell>],
+    grid: crate::terminal::RowView<'a>,
     cursor: (usize, usize),
     cursor_visible: bool,
     cursor_shape: CursorShape,
@@ -1134,7 +1134,7 @@ impl<'a, Message> TermWidget<'a, Message> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        grid: &'a [Vec<TerminalCell>],
+        grid: impl Into<crate::terminal::RowView<'a>>,
         cursor: (usize, usize),
         cursor_visible: bool,
         cursor_shape: CursorShape,
@@ -1160,7 +1160,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             shared_shell: false,
             mode_epoch: 0,
             terminal_mode: crate::config::TerminalMode::Normal,
-            grid,
+            grid: grid.into(),
             cursor,
             cursor_visible,
             cursor_shape,
@@ -1449,7 +1449,7 @@ impl<'a, Message> TermWidget<'a, Message> {
         };
         let left = bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
         let top = bounds.y + self.metrics.padding;
-        let right = (left + self.grid.first().map_or(0, Vec::len) as f32 * self.metrics.cell_w)
+        let right = (left + self.grid.first().map_or(0, <[_]>::len) as f32 * self.metrics.cell_w)
             .min(
                 self.scrollbar_geometry(bounds)
                     .map_or(bounds.x + bounds.width, |(_, _, x, _, _)| x),
@@ -2609,7 +2609,7 @@ mod tests {
         for font_size in [10.0, 16.0, 32.0] {
             let metrics = Metrics::new(font_size, 1.0, 4.0, true);
             let widget = super::TermWidget::new(
-                projection.cells(),
+                projection.row_view(),
                 (0, 0),
                 true,
                 crate::terminal::CursorShape::Block,
@@ -2694,7 +2694,7 @@ mod tests {
             row.card_bottom = index == 7;
         }
         let mut widget = super::TermWidget::new(
-            projection.cells(),
+            projection.row_view(),
             (0, 0),
             true,
             crate::terminal::CursorShape::Block,
@@ -2810,7 +2810,7 @@ mod tests {
     #[test]
     fn native_body_rejects_styled_wide_link_and_nonblank_cells() {
         with_native_body(|widget, bounds| {
-            let mut cells = widget.grid.to_vec();
+            let mut cells: Vec<_> = widget.grid.iter().map(<[_]>::to_vec).collect();
             let mut cases = vec![
                 crate::terminal::TerminalCell {
                     character: 'x',
@@ -2836,7 +2836,7 @@ mod tests {
                 // The same production geometry method receives an immutable
                 // altered snapshot, with no parser or terminal I/O involved.
                 let test_widget: super::TermWidget<'_, ()> = super::TermWidget {
-                    grid: &cells,
+                    grid: (&cells).into(),
                     organism_body: widget.organism_body.as_ref().map(|b| super::OrganismBody {
                         status: String::new(),
                         explanation: String::new(),
@@ -6509,7 +6509,8 @@ mod block_spacing_render_tests {
                                     .unwrap(),
                             )
                             .unwrap();
-                        let mut blocks = vec![BlockPaintRow::default(); projection.cells().len()];
+                        let mut blocks =
+                            vec![BlockPaintRow::default(); projection.row_view().len()];
                         for (index, block) in
                             blocks.iter_mut().enumerate().take(bottom + 1).skip(top)
                         {
@@ -6520,7 +6521,7 @@ mod block_spacing_render_tests {
                             block.card_bottom = index == bottom;
                         }
                         let widget = TermWidget::<()>::new(
-                            projection.cells(),
+                            projection.row_view(),
                             (cursor.row, cursor.col),
                             true,
                             CursorShape::Block,
@@ -6960,7 +6961,7 @@ mod mode_gesture_tests {
         epoch: u64,
     ) -> TermWidget<'a, Output> {
         let mut widget = TermWidget::new(
-            projection.cells(),
+            projection.row_view(),
             (0, 0),
             true,
             CursorShape::Block,
@@ -6981,7 +6982,7 @@ mod mode_gesture_tests {
         .on_summary(projection.key(), |_| Output::Summary);
         widget.app_mouse_full_grid = mode == TerminalMode::Normal;
         if mode != TerminalMode::Normal {
-            widget.blocks = vec![BlockPaintRow::default(); projection.cells().len()];
+            widget.blocks = vec![BlockPaintRow::default(); projection.row_view().len()];
         }
         if mode == TerminalMode::Chat {
             widget.chat_projection = Some(projection);

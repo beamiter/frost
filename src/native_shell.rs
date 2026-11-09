@@ -2399,7 +2399,7 @@ impl Frost {
         let empty_history = !self.config.is_chat_mode()
             && session
                 .projection
-                .cells()
+                .row_view()
                 .iter()
                 .take(dock)
                 .all(|row| row.iter().all(|cell| cell.character.is_whitespace()));
@@ -2462,7 +2462,7 @@ impl Frost {
             return;
         }
         if let Some(session) = self.sessions.get(self.active) {
-            let anchor = (0..session.projection.cells().len()).find_map(|row| {
+            let anchor = (0..session.projection.row_view().len()).find_map(|row| {
                 session
                     .projection
                     .view_to_raw(terminal::ViewportCell { row, col: 0 })

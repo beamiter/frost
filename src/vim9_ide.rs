@@ -1160,8 +1160,8 @@ impl Ide {
                 && !session.terminal.has_text_selection()
                 && crate::vim9_buffer::usable(
                     frame,
-                    session.projection.cells().len(),
-                    session.projection.cells().first().map_or(0, Vec::len),
+                    session.projection.row_view().len(),
+                    session.projection.row_view().first().map_or(0, <[_]>::len),
                 )
         })
     }
@@ -2392,7 +2392,7 @@ impl Ide {
         };
         let native_frame = self.native_frame();
         let selection = if s.terminal.has_text_selection() {
-            (0..s.projection.cells().len())
+            (0..s.projection.row_view().len())
                 .map(|row| {
                     s.terminal
                         .row_selection_cols_in_projection(&s.projection, row)
@@ -2402,7 +2402,7 @@ impl Ide {
             Vec::new()
         };
         let terminal = TermWidget::new(
-            s.projection.cells(),
+            s.projection.row_view(),
             native_frame
                 .filter(|frame| frame.cursor.visible)
                 .map(|frame| (frame.cursor.row, frame.cursor.column))

@@ -35,6 +35,7 @@ code = '#![allow(dead_code)]\nuse smallvec::SmallVec;\n'
 shared_start = source.index('pub use jterm_engine::{')
 code += source[shared_start:source.index(';', shared_start) + 1] + '\n'
 code += 'use std::{borrow::Cow, collections::{BTreeMap, BTreeSet, HashMap, VecDeque}, sync::atomic::{AtomicU64, Ordering}};\n'
+code += '#[path = ' + json.dumps(str(ROOT / 'src/terminal/visible_rows.rs')) + '] mod visible_rows; use visible_rows::{VisibleRows, RowView};\n'
 code += item('thread_local!') + '\n'
 code += 'const MAX_TERMINAL_COLS: usize = 1024; const MAX_TERMINAL_ROWS: usize = 512;\n'
 types = between('fn fresh_raw_row_id() -> RawRowId {', '#[derive(Clone, Debug, PartialEq, Eq)]\nstruct ProjectedViewportCacheKey')

@@ -1,4 +1,9 @@
+mod visible_rows;
+pub use visible_rows::RowView;
+use visible_rows::VisibleRows;
 mod chat_projection;
+#[cfg(test)]
+mod frame_adapter_tests;
 pub(crate) use chat_projection::CHAT_MIN_INPUT_ROWS;
 #[cfg(all(test, target_os = "linux"))]
 mod chat_pty_tests;
@@ -302,6 +307,7 @@ impl TerminalGrid {
         self.storage[row][..copy_len].copy_from_slice(&cells[..copy_len]);
     }
 
+    #[cfg(test)]
     pub fn to_vec(&self) -> Vec<Vec<TerminalCell>> {
         self.storage.to_vec()
     }
@@ -922,10 +928,17 @@ impl ScrollbackLine {
 }
 
 const _: () = assert!(std::mem::size_of::<TerminalCell>() == 16);
-type VisibleCellsCache = (
+#[cfg(test)]
+type OriginalVisibleCellsCache = (
     u64,
     usize,
     std::sync::Arc<Vec<Vec<TerminalCell>>>,
+    Option<std::sync::Arc<ProjectedProvenance>>,
+);
+type VisibleCellsCache = (
+    u64,
+    usize,
+    std::sync::Arc<VisibleRows>,
     Option<std::sync::Arc<ProjectedProvenance>>,
 );
 
@@ -2185,7 +2198,7 @@ pub struct ProjectionKey {
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // Transformed fields are consumed by the P1 UI wiring slice.
 pub struct ProjectedViewport {
-    cells: std::sync::Arc<Vec<Vec<TerminalCell>>>,
+    cells: std::sync::Arc<VisibleRows>,
     row_wrapped: std::sync::Arc<Vec<bool>>,
     row_kinds: std::sync::Arc<Vec<ProjectedRowKind>>,
     provenance: std::sync::Arc<ProjectedProvenance>,
@@ -2226,6 +2239,11 @@ impl ProjectedViewport {
 
     pub fn cells(&self) -> &[Vec<TerminalCell>] {
         self.cells.as_ref()
+    }
+
+    /// Borrow immutable engine rows without the legacy nested-Vec conversion.
+    pub fn row_view(&self) -> RowView<'_> {
+        self.cells.view()
     }
 
     pub fn row_wrapped(&self) -> &[bool] {
@@ -2322,7 +2340,7 @@ impl ProjectedViewport {
             source: self.source_revision,
             scroll_offset: self.scroll_offset,
             rows: self.cells.len(),
-            cols: self.cells.first().map_or(0, Vec::len),
+            cols: self.cells.first().map_or(0, <[_]>::len),
             mode: self.mode,
             policy_revision: self.policy_revision,
             policy_ids: std::sync::Arc::clone(&self.policy_ids),
@@ -2406,6 +2424,7 @@ impl ProjectedViewport {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProjectedViewportCacheKey {
+    cursor: jterm_engine::frame::Cursor,
     grid_version: u64,
     history_revision: u64,
     row_identity_revision: u64,
@@ -3473,6 +3492,10 @@ pub struct TerminalState {
 
     // Cached visible cells to avoid per-frame cloning
     visible_cells_cache: Option<VisibleCellsCache>,
+    frame_revision: u64,
+    frame_layout: u64,
+    #[cfg(test)]
+    original_visible_cells_cache: Option<OriginalVisibleCellsCache>,
     /// Monotonic revision of retained-history membership/identity.
     history_revision: u64,
     /// Identity projection cache. Its key includes every viewport and raw-row
@@ -3819,6 +3842,10 @@ impl TerminalState {
             // This ensures dirty tracking works correctly even with scrollback
             row_versions: vec![1; rows], // Use 'rows' here since grid.rows() == rows at init
             visible_cells_cache: None,
+            frame_revision: 0,
+            frame_layout: 0,
+            #[cfg(test)]
+            original_visible_cells_cache: None,
             history_revision: 1,
             projected_viewport_cache: None,
             projection_plan_cache: None,
@@ -4106,10 +4133,11 @@ impl TerminalState {
     /// Materialize OSC 8 cell metadata into visible link spans. Every target
     /// passes the opener policy again here so stale/corrupt keys fail closed;
     /// `open_link` performs the final check at activation time as well.
-    pub fn osc8_links_in_visible_cells(
+    pub fn osc8_links_in_visible_cells<'a>(
         &self,
-        visible_cells: &[Vec<TerminalCell>],
+        visible_cells: impl Into<RowView<'a>>,
     ) -> Vec<crate::link::Link> {
+        let visible_cells = visible_cells.into();
         let mut links = Vec::new();
         for (line, cells) in visible_cells.iter().enumerate() {
             let mut col = 0;
@@ -11023,9 +11051,9 @@ impl TerminalState {
         )
     }
 
-    /// Return the P0 identity history projection. Its cells are the exact Arc
-    /// produced by the legacy visible-cell materializer; the only added data is
-    /// stable, fail-closed raw provenance and revision metadata.
+    /// Return the identity history projection over the exact cached raw frame
+    /// or materialized history rows, with stable, fail-closed raw provenance
+    /// and revision metadata.
     pub fn get_projected_viewport(
         &mut self,
         block_mode: bool,
@@ -11045,6 +11073,7 @@ impl TerminalState {
             ProjectionMode::Bypass
         };
         let key = ProjectedViewportCacheKey {
+            cursor: self.frame_cursor(),
             grid_version: self.grid_version,
             history_revision: self.history_revision,
             row_identity_revision: self.grid.identity_revision,
@@ -11390,6 +11419,7 @@ impl TerminalState {
         let rows = self.grid.rows();
         let cols = self.grid.row_len().max(1);
         let cache_key = ProjectedViewportCacheKey {
+            cursor: self.frame_cursor(),
             grid_version: self.grid_version,
             history_revision: self.history_revision,
             row_identity_revision: self.grid.identity_revision,
@@ -11433,7 +11463,7 @@ impl TerminalState {
         }
         let viewport = std::sync::Arc::new(ProjectedViewport {
             canvas_head: false,
-            cells: std::sync::Arc::new(materialized.cells),
+            cells: std::sync::Arc::new(VisibleRows::materialized(materialized.cells)),
             row_wrapped: std::sync::Arc::new(materialized.row_wrapped),
             chat_rows: std::sync::Arc::new(materialized.chat_rows),
             document_row_map: std::sync::Arc::new(materialized.document_row_map),
@@ -11498,9 +11528,9 @@ impl TerminalState {
             cells.push(
                 predecessor
                     .as_ref()
-                    .map_or_else(|| self.blank_line(cols), |p| p.cells[0].clone()),
+                    .map_or_else(|| self.blank_line(cols), |p| p.cells[0].to_vec()),
             );
-            cells.extend(viewport.cells.iter().cloned());
+            cells.extend(viewport.cells.iter().map(<[_]>::to_vec));
             let mut provenance = ProjectedProvenance {
                 origin_spans: Vec::new(),
                 row_sources: vec![predecessor
@@ -11533,7 +11563,7 @@ impl TerminalState {
                         }),
                 );
             let (spans, rows) = Self::projection_indexes(&provenance);
-            canvas.cells = std::sync::Arc::new(cells);
+            canvas.cells = std::sync::Arc::new(VisibleRows::materialized(cells));
             let mut wrapped = vec![predecessor.as_ref().is_some_and(|p| p.row_wrapped[0])];
             wrapped.extend(viewport.row_wrapped.iter().copied());
             canvas.row_wrapped = std::sync::Arc::new(wrapped);
@@ -11561,7 +11591,7 @@ impl TerminalState {
         );
         let (raw_span_index, raw_row_index) = Self::projection_indexes(&materialized.provenance);
         let mut canvas = viewport.as_ref().clone();
-        canvas.cells = std::sync::Arc::new(materialized.cells);
+        canvas.cells = std::sync::Arc::new(VisibleRows::materialized(materialized.cells));
         canvas.row_wrapped = std::sync::Arc::new(materialized.row_wrapped);
         canvas.row_kinds = std::sync::Arc::new(materialized.row_kinds);
         canvas.chat_rows = std::sync::Arc::new(materialized.chat_rows);
@@ -11928,87 +11958,115 @@ impl TerminalState {
         true
     }
 
-    pub fn get_visible_cells(&mut self) -> std::sync::Arc<Vec<Vec<TerminalCell>>> {
+    fn frame_cursor(&self) -> jterm_engine::frame::Cursor {
+        // A host can temporarily retain an out-of-grid cursor during layout
+        // changes. Frames require physical bounds: hide that paint cursor and
+        // clamp its metadata without changing the terminal's protocol state.
+        let in_bounds = self.cursor_row < self.grid.rows() && self.cursor_col < self.grid.cols();
+        jterm_engine::frame::Cursor {
+            row: self.cursor_row.min(self.grid.rows() - 1),
+            col: self.cursor_col.min(self.grid.cols() - 1),
+            pending_wrap: self.pending_wrap,
+            visible: self.cursor_enabled() && in_bounds,
+            shape: self.cursor_shape,
+        }
+    }
+
+    /// Cache immutable raw paint rows; history reflow remains host-owned.
+    /// Sharing compares cell contents rather than trusting dirty-row stamps,
+    /// so buffer replacement and cursor-only batches cannot corrupt held frames.
+    pub fn get_visible_cells(&mut self) -> std::sync::Arc<VisibleRows> {
+        use jterm_engine::frame::{Limits, Row, Screen, Stamp};
         if self.use_alt_buffer {
             self.scroll_offset = 0;
         }
-        if let Some((cached_version, cached_offset, ref cells, _)) = self.visible_cells_cache {
-            if cached_version == self.grid_version && cached_offset == self.scroll_offset {
-                return std::sync::Arc::clone(cells);
+        let cursor = self.frame_cursor();
+        if let Some((version, offset, cells, _)) = &self.visible_cells_cache {
+            let cursor_matches = cells
+                .raw_frame()
+                .is_none_or(|frame| frame.cursor() == cursor);
+            if *version == self.grid_version && *offset == self.scroll_offset && cursor_matches {
+                return cells.clone();
             }
         }
-
-        // Cache miss - rebuild
         let rows = self.grid.rows();
-        let cols = if rows > 0 { self.grid.row_len() } else { 80 };
-
-        // Try to recycle the previous allocation. The renderer drops its returned
-        // Arc each frame, so by the next miss we are usually the sole owner and can
-        // refill the existing nested Vecs in place instead of reallocating per row.
-        let prev = self.visible_cells_cache.take();
-        let prev_version = prev.as_ref().map(|(v, _, _, _)| *v);
-        let prev_offset = prev.as_ref().map(|(_, o, _, _)| *o);
-        let mut recycled = prev.map(|(_, _, a, _)| a);
-
-        if self.scroll_offset == 0 {
-            // Fast path: copy current grid, reusing inner Vec capacity when possible.
-            if let Some(buf) = recycled.as_mut().and_then(std::sync::Arc::get_mut) {
-                // Incremental path: if the recycled buffer already holds a same-sized
-                // snapshot taken at scroll_offset==0, only re-copy rows whose
-                // row_versions changed since that snapshot. Untouched rows already
-                // hold valid data, turning an O(rows*cols) copy into O(dirty cells).
-                let can_incremental = prev_offset == Some(0)
-                    && buf.len() == rows
-                    && buf.iter().all(|r| r.len() == cols);
-                if can_incremental {
-                    let base = prev_version.unwrap_or(0);
-                    for (r, (dst, chunk)) in buf.iter_mut().zip(self.grid.iter()).enumerate() {
-                        if self.row_versions[r] > base {
-                            dst.clear();
-                            dst.extend_from_slice(chunk);
-                        }
-                    }
-                } else {
-                    buf.resize_with(rows, Vec::new);
-                    for (dst, chunk) in buf.iter_mut().zip(self.grid.iter()) {
-                        dst.clear();
-                        dst.extend_from_slice(chunk);
-                    }
-                }
-                let arc = recycled.unwrap();
-                self.visible_cells_cache = Some((
-                    self.grid_version,
-                    self.scroll_offset,
-                    std::sync::Arc::clone(&arc),
-                    None,
-                ));
-                return arc;
+        let cols = self.grid.cols();
+        let (cells, provenance) = if self.scroll_offset == 0 {
+            let old = self
+                .visible_cells_cache
+                .as_ref()
+                .and_then(|(_, _, rows, _)| rows.raw_frame());
+            let screen = if self.use_alt_buffer {
+                Screen::Alternate
+            } else {
+                Screen::Primary
+            };
+            let same_layout = old.is_some_and(|f| {
+                f.cols() == cols && f.rows().len() == rows && f.stamp().screen == screen
+            });
+            self.frame_revision = self
+                .frame_revision
+                .checked_add(1)
+                .expect("frame revision exhausted");
+            if !same_layout {
+                self.frame_layout = self
+                    .frame_layout
+                    .checked_add(1)
+                    .expect("frame layout exhausted");
             }
-        }
-
-        let (cells, origin_spans) = if self.scroll_offset == 0 {
-            // Fast path (shared allocation): fresh copy of current grid.
-            (self.grid.to_vec(), None)
+            let shared_rows = self
+                .grid
+                .iter()
+                .enumerate()
+                .map(|(index, cells)| {
+                    let shared = old.filter(|f| {
+                        f.rows()
+                            .get(index)
+                            .is_some_and(|r| r.cells.as_ref() == cells)
+                    });
+                    Row {
+                        cells: shared.map_or_else(
+                            || std::sync::Arc::from(cells),
+                            |old| old.rows()[index].cells.clone(),
+                        ),
+                        wrapped: self.grid.row_wrapped()[index],
+                    }
+                })
+                .collect::<Vec<_>>();
+            let frame = jterm_engine::frame::CellFrame::new(
+                Stamp {
+                    // This is a terminal-local paint stream, not a transport epoch.
+                    epoch: 1,
+                    revision: self.frame_revision,
+                    layout: self.frame_layout,
+                    screen,
+                },
+                cols,
+                shared_rows.into(),
+                cursor,
+                Limits {
+                    max_rows: MAX_TERMINAL_ROWS,
+                    max_cols: MAX_TERMINAL_COLS,
+                    max_cells: MAX_TERMINAL_ROWS * MAX_TERMINAL_COLS,
+                },
+            )
+            .expect("terminal dimensions and cursor satisfy frame bounds");
+            (VisibleRows::raw(frame), None)
         } else {
             let (cells, spans) = self.materialize_scrolled_viewport(rows, cols);
-            (cells, Some(std::sync::Arc::new(spans)))
+            (
+                VisibleRows::materialized(cells),
+                Some(std::sync::Arc::new(spans)),
+            )
         };
-
-        // Reuse the recycled Arc's outer allocation if we still solely own it.
-        let arc = match recycled.as_mut().and_then(std::sync::Arc::get_mut) {
-            Some(buf) => {
-                *buf = cells;
-                recycled.unwrap()
-            }
-            None => std::sync::Arc::new(cells),
-        };
+        let cells = std::sync::Arc::new(cells);
         self.visible_cells_cache = Some((
             self.grid_version,
             self.scroll_offset,
-            std::sync::Arc::clone(&arc),
-            origin_spans,
+            cells.clone(),
+            provenance,
         ));
-        arc
+        cells
     }
 
     pub fn get_cursor_pos(&self) -> (usize, usize) {
@@ -12182,7 +12240,7 @@ impl TerminalState {
     ) -> ProjectedSelection {
         ProjectedSelection {
             plan_revision,
-            plan_cols: projection.cells().first().map_or(0, |row| row.len()),
+            plan_cols: projection.row_view().first().map_or(0, |row| row.len()),
             hidden: std::sync::Arc::clone(&projection.effective_collapsed),
             anchor,
             active,
@@ -12202,7 +12260,7 @@ impl TerminalState {
             col: viewport_pos.1,
         };
         if projection
-            .cells()
+            .row_view()
             .get(cell.row)?
             .get(cell.col)?
             .flags
@@ -12276,7 +12334,7 @@ impl TerminalState {
                 (
                     0,
                     projection
-                        .cells()
+                        .row_view()
                         .get(row)
                         .map_or(0, |cells| cells.len().saturating_sub(1)),
                 )
@@ -12436,7 +12494,7 @@ impl TerminalState {
         row: usize,
         col: usize,
     ) {
-        let Some(line) = projection.cells().get(row) else {
+        let Some(line) = projection.row_view().get(row) else {
             return;
         };
         let Some((left, right)) = Self::word_columns_at(line, col) else {
@@ -12570,7 +12628,7 @@ impl TerminalState {
         row: usize,
         col: usize,
     ) {
-        let Some(line) = projection.cells().get(row) else {
+        let Some(line) = projection.row_view().get(row) else {
             return;
         };
         let Some((target_left, target_right)) = Self::word_columns_at(line, col) else {
@@ -12742,7 +12800,7 @@ impl TerminalState {
         let Some(sel) = self.selection else {
             return;
         };
-        let cols = projection.cells().first().map_or(0, Vec::len);
+        let cols = projection.row_view().first().map_or(0, <[_]>::len);
         let target_row = self.projected_row_to_absolute(projection, row);
         let origin_row = sel.anchor.0;
 
@@ -12763,7 +12821,7 @@ impl TerminalState {
 
     pub fn select_line_in_projection(&mut self, projection: &ProjectedViewport, row: usize) {
         if projection.mode() != ProjectionMode::Transformed {
-            let cols = projection.cells().first().map_or(0, Vec::len);
+            let cols = projection.row_view().first().map_or(0, <[_]>::len);
             self.projected_selection = None;
             let abs_row = self.projected_row_to_absolute(projection, row);
             self.selection = Some(Selection {
@@ -13419,7 +13477,7 @@ impl TerminalState {
             left = left.max(real_left);
             right = right.min(real_right);
             if projection
-                .cells()
+                .row_view()
                 .get(viewport_row)
                 .and_then(|cells| cells.get(right))
                 .is_some_and(|cell| cell.flags.wide())

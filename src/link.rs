@@ -335,19 +335,20 @@ impl LinkDetector {
 
     /// 在当前可视内容中检测链接，处理跨行换行的URL。
     #[allow(dead_code)]
-    pub fn detect_links_in_visible_cells(
+    pub fn detect_links_in_visible_cells<'a>(
         &self,
-        visible_cells: &[Vec<crate::terminal::TerminalCell>],
+        visible_cells: impl Into<crate::terminal::RowView<'a>>,
     ) -> Vec<Link> {
         self.detect_links_in_visible_cells_with_wrapping(visible_cells, &[])
     }
 
     /// 在当前可视内容中检测链接，支持传入row_wrapped标志以正确处理跨行链接。
-    pub fn detect_links_in_visible_cells_with_wrapping(
+    pub fn detect_links_in_visible_cells_with_wrapping<'a>(
         &self,
-        visible_cells: &[Vec<crate::terminal::TerminalCell>],
+        visible_cells: impl Into<crate::terminal::RowView<'a>>,
         row_wrapped: &[bool],
     ) -> Vec<Link> {
+        let visible_cells = visible_cells.into();
         let mut all_links = Vec::new();
         let wraps_valid = row_wrapped.len() == visible_cells.len();
         let mut text = String::new();
@@ -637,7 +638,7 @@ mod tests {
             assert!(viewport.row_wrapped()[0]);
             LINK_WORK.with(|work| work.set(Some((0, 0))));
             let links = detector.detect_links_in_visible_cells_with_wrapping(
-                viewport.cells(),
+                viewport.row_view(),
                 viewport.row_wrapped(),
             );
             let (bytes, spans) = LINK_WORK.with(|work| work.replace(None).unwrap());
