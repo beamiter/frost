@@ -273,5 +273,52 @@ class SnapshotTests(unittest.TestCase):
         self.assertIsNone(namespace["geometry_observation"](lambda value: True))
 
 
+class TypingDeadlineTests(unittest.TestCase):
+    def extracted(self, name, namespace):
+        source = Path(__file__).with_name("native-vim9-buffer-smoke.py").read_text()
+        main = next(node for node in ast.parse(source).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "main")
+        function = next(node for node in main.body
+                        if isinstance(node, ast.FunctionDef) and node.name == name)
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(__file__), "exec"), namespace)
+        return namespace[name]
+
+    def test_long_command_has_typing_budget_and_is_sent_once(self):
+        xdo = Mock()
+        wait = Mock()
+        command = self.extracted("command", {"xdo": xdo, "wait_for": wait, "app": object()})
+        value = "call setqflist(" + "x" * 600 + ")"
+        command(value)
+        self.assertEqual(xdo.call_count, 3)
+        args, kwargs = xdo.call_args_list[1]
+        self.assertEqual(args, ("type", "--clearmodifiers", "--delay", "8", ":" + value))
+        self.assertGreater(kwargs["timeout"], len(":" + value) * 0.008 + 4)
+        self.assertEqual(wait.call_count, 1)
+        self.assertEqual(xdo.call_args_list[2].args, ("key", "Return"))
+
+    def test_typing_deadline_remains_bounded(self):
+        xdo = Mock()
+        command = self.extracted("command", {"xdo": xdo, "wait_for": Mock(), "app": object()})
+        command("x" * 10000)
+        self.assertEqual(xdo.call_args_list[1].kwargs["timeout"], 60)
+
+    def test_xdo_preserves_default_and_custom_deadlines(self):
+        subprocess = Mock()
+        subprocess.run.return_value.returncode = 0
+        xdo = self.extracted("xdo", {"subprocess": subprocess, "env": {}})
+        xdo("key", "Escape")
+        self.assertEqual(subprocess.run.call_args.kwargs["timeout"], 4)
+        xdo("type", "--delay", "8", "text", timeout=12)
+        self.assertEqual(subprocess.run.call_args.kwargs["timeout"], 12)
+
+    def test_xdo_does_not_retry_or_swallow_timeout(self):
+        subprocess = Mock()
+        subprocess.run.side_effect = TimeoutError("deadline")
+        xdo = self.extracted("xdo", {"subprocess": subprocess, "env": {}})
+        with self.assertRaises(TimeoutError):
+            xdo("type", "text", timeout=12)
+        self.assertEqual(subprocess.run.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

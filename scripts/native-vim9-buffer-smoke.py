@@ -113,8 +113,8 @@ def main():
     log = (out / "application.log").open("w")
     wheel_capture = None
     app = subprocess.Popen([str(args.binary.resolve()), "--ide", str(source)], env=env, stdout=log, stderr=log)
-    def xdo(*parts):
-        result = subprocess.run(["xdotool", *map(str, parts)], env=env, text=True, capture_output=True, timeout=4)
+    def xdo(*parts, timeout=4):
+        result = subprocess.run(["xdotool", *map(str, parts)], env=env, text=True, capture_output=True, timeout=timeout)
         if result.returncode and parts[0] != "search":
             raise RuntimeError("xdotool " + " ".join(map(str, parts)) + ": " + result.stderr)
         return result
@@ -172,7 +172,12 @@ def main():
                            and all(count > 30 for count in regions["panes"].values())) else None
     def command(value):
         xdo("key", "Escape")
-        xdo("type", "--clearmodifiers", "--delay", "8", ":" + value)
+        # xdotool deliberately delays each injected character. Long diagnostic
+        # commands need their typing duration in addition to process overhead;
+        # retain a finite deadline and the exact-command observation below.
+        typed = ":" + value
+        xdo("type", "--clearmodifiers", "--delay", "8", typed,
+            timeout=min(60, 4 + len(typed) * 0.016))
         # Type once and observe Vim's exact pending command before executing it.
         # A dropped character must fail here, rather than run a different Ex
         # command and later masquerade as a wheel/rendering failure.
