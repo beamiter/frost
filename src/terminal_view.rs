@@ -2828,7 +2828,7 @@ mod tests {
             wide.flags.set_wide_continuation(true);
             cases.push(wide);
             cases.push(crate::terminal::TerminalCell {
-                hyperlink: 1,
+                hyperlink_id: crate::terminal::HyperlinkId::from_raw(1),
                 ..Default::default()
             });
             for cell in cases {

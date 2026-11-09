@@ -31,10 +31,13 @@ def item(marker, text=source):
 
 
 code = '#![allow(dead_code)]\nuse smallvec::SmallVec;\n'
+# Use the same engine cell types as the live terminal, never a test-only copy.
+shared_start = source.index('pub use jterm_engine::{')
+code += source[shared_start:source.index(';', shared_start) + 1] + '\n'
 code += 'use std::{borrow::Cow, collections::{BTreeMap, BTreeSet, HashMap, VecDeque}, sync::atomic::{AtomicU64, Ordering}};\n'
 code += item('thread_local!') + '\n'
 code += 'const MAX_TERMINAL_COLS: usize = 1024; const MAX_TERMINAL_ROWS: usize = 512;\n'
-types = between('#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]\npub struct RawRowId', '#[derive(Clone, Debug, PartialEq, Eq)]\nstruct ProjectedViewportCacheKey')
+types = between('fn fresh_raw_row_id() -> RawRowId {', '#[derive(Clone, Debug, PartialEq, Eq)]\nstruct ProjectedViewportCacheKey')
 # The native canvas suite needs the full TerminalState/parser. Its registration
 # sits between production viewport items but belongs to the normal app tests.
 canvas_tests = '#[cfg(test)]\n#[path = "terminal/canvas_tests.rs"]\nmod canvas_tests;\n'
@@ -84,7 +87,7 @@ edition = "2021"
 smallvec = "=1.15.2"
 [profile.test]
 opt-level = 1
-''')
+'''.replace('[dependencies]\n', '[dependencies]\n' + next(line for line in (ROOT / 'Cargo.toml').read_text().splitlines() if line.startswith('jterm_engine = ')) + '\n'))
     command = [os.environ.get('CARGO', 'cargo'), 'test', '--manifest-path', str(path / 'Cargo.toml'), '-j', '1', '--', '--nocapture']
     subprocess.run(command, check=True)
     # The independent tagged-cell/text oracle must reject real kernel regressions,

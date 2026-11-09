@@ -5,36 +5,24 @@ mod chat_pty_tests;
 #[cfg(test)]
 mod cli_scope_tests;
 #[cfg(test)]
+mod grid_parity_tests;
+#[cfg(test)]
 mod line_selection_tests;
+#[cfg(test)]
+mod parser_oracle_tests;
 #[cfg(test)]
 mod projection_properties;
 #[cfg(test)]
 mod projection_state_properties;
 
-/// Locate cancellation before the first real string terminator. A fresh ESC
-/// abandons the string and is parsed again; CAN/SUB are consumed. The bool says
-/// that ESC was the final byte of the previous read and must be restored.
-fn control_string_abort(input: &[u8], previous_escape: bool, osc: bool) -> Option<(usize, bool)> {
-    if previous_escape {
-        match input.first().copied()? {
-            b'\\' => return None,
-            0x18 | 0x1a => return Some((1, false)),
-            _ => return Some((0, true)),
-        }
-    }
-    for (index, byte) in input.iter().copied().enumerate() {
-        match byte {
-            0x18 | 0x1a => return Some((index + 1, false)),
-            0x07 if osc => return None,
-            0x1b => match input.get(index + 1) {
-                Some(b'\\') | None => return None,
-                Some(_) => return Some((index, false)),
-            },
-            _ => {}
-        }
-    }
-    None
-}
+use jterm_engine::parser::{
+    CaptureEnd, Event as ParserEvent, Parser, ParserLimits, ParserProfile, PendingKind,
+    RejectReason, StringKind,
+};
+// Row allocation, compression and projection policies remain Frost-owned.
+pub use jterm_engine::{
+    Color, CursorShape, HyperlinkId, RawRowId, StyleFlags, TerminalCell, UnderlineStyle,
+};
 
 use crate::kitty_graphics::{KittyGraphicsState, KittyImage, KittyPlacement};
 use base64::Engine;
@@ -192,32 +180,16 @@ struct Osc8Hyperlink {
     id: Option<String>,
 }
 
-/// Stable identity of one retained physical terminal row.
-///
-/// The identity follows a row while it moves between the live grid and
-/// scrollback. Operations that physically re-materialize history (rather than
-/// merely moving a retained row) allocate new identities, so stale projected
-/// coordinates fail closed instead of being guessed onto unrelated content.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RawRowId(u64);
-
-impl RawRowId {
-    const UNTRACKED: Self = Self(0);
-
-    fn fresh() -> Self {
-        static NEXT_RAW_ROW_ID: AtomicU64 = AtomicU64::new(1);
-        NEXT_RAW_ROW_ID
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-                next.checked_add(1)
-            })
-            .map(Self)
-            .unwrap_or(Self::UNTRACKED)
-    }
-
-    #[inline]
-    fn is_tracked(self) -> bool {
-        self != Self::UNTRACKED
-    }
+/// Allocate row identity in the host, not the engine. IDs survive physical
+/// moves; zero remains fail-closed after the monotonic allocator is exhausted.
+fn fresh_raw_row_id() -> RawRowId {
+    static NEXT_RAW_ROW_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_RAW_ROW_ID
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .map(RawRowId::new)
+        .unwrap_or(RawRowId::UNTRACKED)
 }
 
 pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
@@ -227,54 +199,81 @@ pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
     )
 }
 
-/// 连续内存网格存储 - 优化内存局部性和缓存命中率
-/// 内存布局：`cells[row * cols + col]` 对应 `grid[row][col]`。
+/// Frost's host policy around the shared physical grid. Cells, row identities
+/// and wrap flags have one backing store; allocation and projection revision
+/// policy stay here until the frontends agree on their structural contract.
 #[derive(Clone)]
 pub struct TerminalGrid {
-    cells: Vec<TerminalCell>,
-    rows: usize,
-    cols: usize,
-    pub row_wrapped: Vec<bool>,
-    row_ids: Vec<RawRowId>,
+    storage: jterm_engine::TerminalGrid,
     identity_revision: u64,
 }
 
 impl TerminalGrid {
     pub fn new(rows: usize, cols: usize) -> Self {
-        TerminalGrid {
-            cells: vec![TerminalCell::default(); rows * cols],
-            rows,
-            cols,
-            row_wrapped: vec![false; rows],
-            row_ids: (0..rows).map(|_| RawRowId::fresh()).collect(),
+        let mut storage = jterm_engine::TerminalGrid::new(rows, cols);
+        for id in storage.row_ids_mut() {
+            *id = fresh_raw_row_id();
+        }
+        Self {
+            storage,
             identity_revision: 1,
         }
     }
 
     #[inline]
     pub fn get(&self, row: usize, col: usize) -> &TerminalCell {
-        &self.cells[row * self.cols + col]
+        self.storage.get(row, col)
     }
 
     #[inline]
     pub fn get_mut(&mut self, row: usize, col: usize) -> &mut TerminalCell {
-        &mut self.cells[row * self.cols + col]
+        self.storage.get_mut(row, col)
     }
 
     #[inline]
     pub fn rows(&self) -> usize {
-        self.rows
+        self.storage.rows()
     }
 
     #[inline]
     pub fn cols(&self) -> usize {
-        self.cols
+        self.storage.cols()
     }
 
-    /// Identity of a retained physical grid row.
+    /// Identity of a retained physical grid row; out-of-range stays absent.
     #[inline]
     pub fn raw_row_id(&self, row: usize) -> Option<RawRowId> {
-        self.row_ids.get(row).copied()
+        self.storage.row_ids().get(row).copied()
+    }
+
+    #[inline]
+    fn row_ids(&self) -> &[RawRowId] {
+        self.storage.row_ids()
+    }
+
+    #[inline]
+    fn row_ids_mut(&mut self) -> &mut [RawRowId] {
+        self.storage.row_ids_mut()
+    }
+
+    #[inline]
+    pub fn row_wrapped(&self) -> &[bool] {
+        &self.storage.row_wrapped
+    }
+
+    #[inline]
+    fn row_wrapped_mut(&mut self) -> &mut [bool] {
+        &mut self.storage.row_wrapped
+    }
+
+    #[inline]
+    fn cells_mut(&mut self) -> &mut [TerminalCell] {
+        self.storage.cells_mut()
+    }
+
+    #[inline]
+    fn row_slice(&self, row: usize) -> Option<&[TerminalCell]> {
+        (row < self.rows()).then(|| &self.storage[row])
     }
 
     #[inline]
@@ -282,107 +281,72 @@ impl TerminalGrid {
         self.identity_revision = self.identity_revision.wrapping_add(1).max(1);
     }
 
-    /// 获取行作Vec引用（用于兼容旧代码）
     pub fn get_row(&self, row: usize) -> Vec<TerminalCell> {
-        let start = row * self.cols;
-        let end = start + self.cols;
-        self.cells[start..end].to_vec()
+        self.storage[row].to_vec()
     }
 
-    /// 返回行数（兼容 grid.len()）
     #[inline]
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.rows
+        self.rows()
     }
 
-    /// 返回行数（兼容 `grid[i].len()`）。
     #[inline]
     pub fn row_len(&self) -> usize {
-        self.cols
+        self.storage.row_len()
     }
 
-    /// 设置整行
     #[allow(dead_code)]
     pub fn set_row(&mut self, row: usize, cells: Vec<TerminalCell>) {
-        let start = row * self.cols;
-        let copy_len = cells.len().min(self.cols);
-        self.cells[start..start + copy_len].copy_from_slice(&cells[..copy_len]);
+        let copy_len = cells.len().min(self.cols());
+        self.storage[row][..copy_len].copy_from_slice(&cells[..copy_len]);
     }
 
-    /// 获取所有行为 `Vec<Vec<_>>`（用于兼容旧代码）。
     pub fn to_vec(&self) -> Vec<Vec<TerminalCell>> {
-        self.cells
-            .chunks_exact(self.cols)
-            .map(|chunk| chunk.to_vec())
-            .collect()
+        self.storage.to_vec()
     }
 
-    /// 在行内指定列插入一个cell，右侧cell右移，末尾cell被丢弃
     #[cfg(test)]
     pub fn insert_cell_in_row(&mut self, row: usize, col: usize, cell: TerminalCell) {
-        if row >= self.rows || col >= self.cols {
-            return;
-        }
-        let start = row * self.cols;
-        self.cells
-            .copy_within(start + col..start + self.cols - 1, start + col + 1);
-        self.cells[start + col] = cell;
+        self.storage.insert_cell_in_row(row, col, cell);
     }
 
-    /// 删除行内指定列的cell，右侧cell左移，末尾补blank
     #[cfg(test)]
     pub fn remove_cell_from_row(&mut self, row: usize, col: usize) {
-        if row >= self.rows || col >= self.cols {
-            return;
-        }
-        let start = row * self.cols;
-        self.cells
-            .copy_within(start + col + 1..start + self.cols, start + col);
-        // Fill last cell with default
-        self.cells[start + self.cols - 1] = TerminalCell::default();
+        self.storage.remove_cell_from_row(row, col);
     }
 
-    /// 删除第一行，向上移动所有行，末尾补新行
     #[allow(dead_code)]
     pub fn remove_first_row(&mut self) -> (Vec<TerminalCell>, bool) {
         let removed = self.get_row(0);
-        let was_wrapped = self.row_wrapped[0];
+        let was_wrapped = self.row_wrapped()[0];
         self.shift_rows_up();
         (removed, was_wrapped)
     }
 
-    /// Shift all rows up by one (discard first row, blank last row).
-    /// Does not return the removed row - use get_row(0) before calling if needed.
+    /// Preserve Frost's single-row shift, including a fresh blank-row identity.
     #[inline]
     pub fn shift_rows_up(&mut self) {
-        self.cells.copy_within(self.cols.., 0);
-        let last_start = (self.rows - 1) * self.cols;
-        self.cells[last_start..].fill(TerminalCell::default());
-        self.row_wrapped.copy_within(1.., 0);
-        self.row_wrapped[self.rows - 1] = false;
-        self.row_ids.copy_within(1.., 0);
-        self.row_ids[self.rows - 1] = RawRowId::fresh();
+        let rows = self.rows();
+        // The original method required a nonempty grid; do not silently turn
+        // invalid calls into a revision-changing no-op during this migration.
+        assert!(rows > 0, "cannot shift an empty terminal grid");
+        self.storage.scroll_up_by(1, TerminalCell::default());
+        self.storage.row_ids_mut()[rows - 1] = fresh_raw_row_id();
         self.bump_identity_revision();
     }
 
-    /// 是否为空
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.rows == 0
+        self.storage.is_empty()
     }
 
-    /// 调整网格大小
+    /// Resize shared storage, preserving Frost's wide-pair cleanup and row IDs.
     pub fn resize(&mut self, new_rows: usize, new_cols: usize, default_cell: TerminalCell) {
-        let mut new_cells = vec![default_cell; new_rows * new_cols];
-        let copy_rows = self.rows.min(new_rows);
-        let copy_cols = self.cols.min(new_cols);
+        let copy_rows = self.rows().min(new_rows);
+        self.storage.resize(new_rows, new_cols, default_cell);
         for row in 0..copy_rows {
-            let src_start = row * self.cols;
-            let dst_start = row * new_cols;
-            new_cells[dst_start..dst_start + copy_cols]
-                .copy_from_slice(&self.cells[src_start..src_start + copy_cols]);
-            let line = &mut new_cells[dst_start..dst_start + new_cols];
+            let line = &mut self.storage[row];
             for col in 0..new_cols {
                 if line[col].flags.wide()
                     && (col + 1 >= new_cols || !line[col + 1].flags.wide_continuation())
@@ -397,251 +361,36 @@ impl TerminalGrid {
                 }
             }
         }
-        self.cells = new_cells;
-        let mut new_wrapped = vec![false; new_rows];
-        new_wrapped[..copy_rows].copy_from_slice(&self.row_wrapped[..copy_rows]);
-        self.row_wrapped = new_wrapped;
-        let mut new_row_ids: Vec<_> = (0..new_rows).map(|_| RawRowId::fresh()).collect();
-        new_row_ids[..copy_rows].copy_from_slice(&self.row_ids[..copy_rows]);
-        self.row_ids = new_row_ids;
-        self.rows = new_rows;
-        self.cols = new_cols;
+        // Frost historically allocates for every destination row, then keeps
+        // retained rows' IDs. Preserve that cadence, including discarded IDs.
+        for (row, id) in self.storage.row_ids_mut().iter_mut().enumerate() {
+            let fresh = fresh_raw_row_id();
+            if row >= copy_rows {
+                *id = fresh;
+            }
+        }
         self.bump_identity_revision();
     }
 
-    /// 获取mut访问所有行
     pub fn iter_mut(&mut self) -> std::slice::ChunksMut<'_, TerminalCell> {
-        self.cells.chunks_mut(self.cols)
+        self.storage.iter_mut()
     }
 
-    /// 获取只读访问所有行
     pub fn iter(&self) -> std::slice::Chunks<'_, TerminalCell> {
-        self.cells.chunks(self.cols)
+        self.storage.iter()
     }
 }
 
 impl std::ops::Index<usize> for TerminalGrid {
     type Output = [TerminalCell];
     fn index(&self, row: usize) -> &[TerminalCell] {
-        let start = row * self.cols;
-        &self.cells[start..start + self.cols]
+        &self.storage[row]
     }
 }
 
 impl std::ops::IndexMut<usize> for TerminalGrid {
     fn index_mut(&mut self, row: usize) -> &mut [TerminalCell] {
-        let start = row * self.cols;
-        &mut self.cells[start..start + self.cols]
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Color {
-    Black,
-    Red,
-    Green,
-    Yellow,
-    Blue,
-    Magenta,
-    Cyan,
-    White,
-    BrightBlack,
-    BrightRed,
-    BrightGreen,
-    BrightYellow,
-    BrightBlue,
-    BrightMagenta,
-    BrightCyan,
-    BrightWhite,
-    Indexed(u8),
-    Rgb(u8, u8, u8),
-    Default,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CursorShape {
-    #[default]
-    Block,
-    Underline,
-    Beam,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum UnderlineStyle {
-    #[default]
-    None,
-    Single,
-    Double,
-    #[allow(dead_code)]
-    Curly, // SGR 4:3
-    #[allow(dead_code)]
-    Dotted, // SGR 4:4
-    #[allow(dead_code)]
-    Dashed, // SGR 4:5
-}
-
-/// Packed style flags in a u16 bitfield (includes wide character bits).
-/// Layout:
-///   bit 0: bold
-///   bit 1: italic
-///   bit 2-4: underline style (3 bits, 0-5)
-///   bit 5: inverse
-///   bit 6: dim
-///   bit 7: blink
-///   bit 8: strikethrough
-///   bit 9: wide
-///   bit 10: wide_continuation
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-#[repr(transparent)]
-pub struct StyleFlags(u16);
-
-impl std::fmt::Debug for StyleFlags {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StyleFlags")
-            .field("bold", &self.bold())
-            .field("italic", &self.italic())
-            .field("underline", &self.underline())
-            .field("inverse", &self.inverse())
-            .field("dim", &self.dim())
-            .field("blink", &self.blink())
-            .field("strikethrough", &self.strikethrough())
-            .finish()
-    }
-}
-
-const BOLD_BIT: u16 = 1 << 0;
-const ITALIC_BIT: u16 = 1 << 1;
-const UNDERLINE_SHIFT: u32 = 2;
-const UNDERLINE_MASK: u16 = 0b111 << 2;
-const INVERSE_BIT: u16 = 1 << 5;
-const DIM_BIT: u16 = 1 << 6;
-const BLINK_BIT: u16 = 1 << 7;
-const STRIKETHROUGH_BIT: u16 = 1 << 8;
-const WIDE_BIT: u16 = 1 << 9;
-const WIDE_CONT_BIT: u16 = 1 << 10;
-
-impl StyleFlags {
-    #[inline(always)]
-    pub fn new() -> Self {
-        Self(0)
-    }
-
-    #[inline(always)]
-    pub fn bold(&self) -> bool {
-        self.0 & BOLD_BIT != 0
-    }
-    #[inline(always)]
-    pub fn italic(&self) -> bool {
-        self.0 & ITALIC_BIT != 0
-    }
-    #[inline(always)]
-    pub fn underline(&self) -> UnderlineStyle {
-        match (self.0 & UNDERLINE_MASK) >> UNDERLINE_SHIFT {
-            1 => UnderlineStyle::Single,
-            2 => UnderlineStyle::Double,
-            3 => UnderlineStyle::Curly,
-            4 => UnderlineStyle::Dotted,
-            5 => UnderlineStyle::Dashed,
-            _ => UnderlineStyle::None,
-        }
-    }
-    #[inline(always)]
-    pub fn inverse(&self) -> bool {
-        self.0 & INVERSE_BIT != 0
-    }
-    #[inline(always)]
-    pub fn dim(&self) -> bool {
-        self.0 & DIM_BIT != 0
-    }
-    #[inline(always)]
-    pub fn blink(&self) -> bool {
-        self.0 & BLINK_BIT != 0
-    }
-    #[inline(always)]
-    pub fn strikethrough(&self) -> bool {
-        self.0 & STRIKETHROUGH_BIT != 0
-    }
-    #[inline(always)]
-    pub fn wide(&self) -> bool {
-        self.0 & WIDE_BIT != 0
-    }
-    #[inline(always)]
-    pub fn wide_continuation(&self) -> bool {
-        self.0 & WIDE_CONT_BIT != 0
-    }
-
-    #[inline(always)]
-    pub fn set_bold(&mut self, v: bool) {
-        if v {
-            self.0 |= BOLD_BIT;
-        } else {
-            self.0 &= !BOLD_BIT;
-        }
-    }
-    #[inline(always)]
-    pub fn set_italic(&mut self, v: bool) {
-        if v {
-            self.0 |= ITALIC_BIT;
-        } else {
-            self.0 &= !ITALIC_BIT;
-        }
-    }
-    #[inline(always)]
-    pub fn set_underline(&mut self, v: UnderlineStyle) {
-        self.0 = (self.0 & !UNDERLINE_MASK) | ((v as u16) << UNDERLINE_SHIFT);
-    }
-    #[inline(always)]
-    pub fn set_inverse(&mut self, v: bool) {
-        if v {
-            self.0 |= INVERSE_BIT;
-        } else {
-            self.0 &= !INVERSE_BIT;
-        }
-    }
-    #[inline(always)]
-    pub fn set_dim(&mut self, v: bool) {
-        if v {
-            self.0 |= DIM_BIT;
-        } else {
-            self.0 &= !DIM_BIT;
-        }
-    }
-    #[inline(always)]
-    pub fn set_blink(&mut self, v: bool) {
-        if v {
-            self.0 |= BLINK_BIT;
-        } else {
-            self.0 &= !BLINK_BIT;
-        }
-    }
-    #[inline(always)]
-    pub fn set_strikethrough(&mut self, v: bool) {
-        if v {
-            self.0 |= STRIKETHROUGH_BIT;
-        } else {
-            self.0 &= !STRIKETHROUGH_BIT;
-        }
-    }
-    #[inline(always)]
-    pub fn set_wide(&mut self, v: bool) {
-        if v {
-            self.0 |= WIDE_BIT;
-        } else {
-            self.0 &= !WIDE_BIT;
-        }
-    }
-    #[inline(always)]
-    pub fn set_wide_continuation(&mut self, v: bool) {
-        if v {
-            self.0 |= WIDE_CONT_BIT;
-        } else {
-            self.0 &= !WIDE_CONT_BIT;
-        }
-    }
-
-    #[inline(always)]
-    pub fn is_default_style(&self) -> bool {
-        self.0 & 0x1FF == 0
+        &mut self.storage[row]
     }
 }
 
@@ -706,7 +455,7 @@ impl RawRowLayout {
             && cells[active_len - 1].background == Color::Default
             && !cells[active_len - 1].flags.wide()
             && !cells[active_len - 1].flags.wide_continuation()
-            && cells[active_len - 1].hyperlink == 0
+            && cells[active_len - 1].hyperlink_id.is_none()
         {
             active_len -= 1;
         }
@@ -727,7 +476,7 @@ impl RawRowLayout {
 
 impl ScrollbackLine {
     pub fn compress(cells: &[TerminalCell], is_wrapped: bool) -> Self {
-        Self::compress_with_raw_row_id(cells, is_wrapped, RawRowId::fresh())
+        Self::compress_with_raw_row_id(cells, is_wrapped, fresh_raw_row_id())
     }
 
     fn compress_with_raw_row_id(
@@ -746,7 +495,7 @@ impl ScrollbackLine {
                     || cell.background != Color::Default
                     || cell.flags.wide()
                     || cell.flags.wide_continuation()
-                    || cell.hyperlink != 0
+                    || !cell.hyperlink_id.is_none()
             })
             .map_or(0, |col| col + 1);
         let projected_wide_continuations = cells[..projected_active_len]
@@ -771,7 +520,7 @@ impl ScrollbackLine {
                     && c.flags.is_default_style()
                     && !c.flags.wide()
                     && !c.flags.wide_continuation()
-                    && c.hyperlink == 0
+                    && c.hyperlink_id.is_none()
             })
             .count();
 
@@ -782,7 +531,7 @@ impl ScrollbackLine {
                 && c.flags.is_default_style()
                 && !c.flags.wide()
                 && !c.flags.wide_continuation()
-                && c.hyperlink == 0
+                && c.hyperlink_id.is_none()
         });
 
         if all_default_attrs {
@@ -1013,7 +762,7 @@ impl ScrollbackLine {
                     && next.foreground == cell.foreground
                     && next.background == cell.background
                     && next.flags == cell.flags
-                    && next.hyperlink == cell.hyperlink
+                    && next.hyperlink_id == cell.hyperlink_id
                 {
                     run += 1;
                 } else {
@@ -1023,7 +772,7 @@ impl ScrollbackLine {
 
             // Format:
             // [char_len:1][char_bytes][fg][bg][style_flags:1][extra_flags:1]
-            // [hyperlink:2][run:1]
+            // [hyperlink_id:2][run:1]
             // style_flags uses every bit, so blink shares extra_flags with the
             // two wide-character markers.
             buf.push(ch_bytes.len() as u8);
@@ -1036,7 +785,7 @@ impl ScrollbackLine {
                 | if cell.flags.wide_continuation() { 2 } else { 0 }
                 | if cell.flags.blink() { 4 } else { 0 };
             buf.push(extra_flags);
-            buf.extend_from_slice(&cell.hyperlink.to_le_bytes());
+            buf.extend_from_slice(&cell.hyperlink_id.as_raw().to_le_bytes());
             buf.push(run);
 
             i += run as usize;
@@ -1083,7 +832,7 @@ impl ScrollbackLine {
                 foreground: fg,
                 background: bg,
                 flags,
-                hyperlink,
+                hyperlink_id: HyperlinkId::from_raw(hyperlink),
             };
             for _ in 0..run {
                 cells.push(cell);
@@ -1162,34 +911,12 @@ impl ScrollbackLine {
                 foreground: fg,
                 background: bg,
                 flags,
-                hyperlink,
+                hyperlink_id: HyperlinkId::from_raw(hyperlink),
             };
             for _ in 0..usize::from(run).min(cols - column) {
                 visit(column, cell);
                 column += 1;
             }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TerminalCell {
-    pub character: char,
-    pub foreground: Color,
-    pub background: Color,
-    pub flags: StyleFlags,
-    /// Terminal-local OSC 8 intern key; zero means no explicit hyperlink.
-    pub(crate) hyperlink: u16,
-}
-
-impl Default for TerminalCell {
-    fn default() -> Self {
-        TerminalCell {
-            character: ' ',
-            foreground: Color::Default,
-            background: Color::Default,
-            flags: StyleFlags::new(),
-            hyperlink: 0,
         }
     }
 }
@@ -3709,40 +3436,8 @@ pub struct TerminalState {
     scroll_region_top: usize,
     scroll_region_bottom: usize,
 
-    // UTF-8 decoding buffer
-    utf8_buf: [u8; 4],
-    utf8_len: u8,
-    utf8_expected: u8,
-
-    // Incomplete escape sequence buffer across PTY reads. Only short
-    // CSI/charset/lone-ESC prefixes land here; the unbounded string states
-    // (OSC/DCS/SOS/PM/APC) stream against their own buffers below.
-    pending_escape: Vec<u8>,
-
-    // Unterminated OSC (`ESC ]` … BEL/ST) and DCS/SOS/PM (`ESC P`/`ESC X`/
-    // `ESC ^` … ST) carried across PTY reads. Like the APC buffer they
-    // stream: the scan cursor marks where the terminator scan resumes, so a
-    // string split across many reads stays O(n) instead of re-scanning from
-    // byte 0 on every read. Overflow keeps the old `pending_escape`
-    // semantics exactly: a buffered prefix past the 1 MiB cap is abandoned
-    // wholesale and the next read is parsed as ordinary input.
-    pending_osc: Vec<u8>,
-    pending_osc_scan_from: usize,
-    pending_dcs: Vec<u8>,
-    pending_dcs_scan_from: usize,
-
-    // Unterminated kitty APC (`ESC _ ... ESC \`) carried across PTY reads.
-    // Unlike `pending_escape` (re-scanned from its start each read), the APC
-    // buffer streams: `pending_apc_scan_from` marks where the terminator scan
-    // resumes, so multi-read image transfers stay O(n) instead of O(n^2), and
-    // an oversized packet is rejected + discarded through its ST rather than
-    // dropped wholesale (which used to parse the base64 tail as plain input).
-    pending_apc: Vec<u8>,
-    pending_apc_scan_from: usize,
-    // An oversized APC is being discarded: consume bytes without buffering
-    // until its ST arrives, tracking a trailing ESC that may precede it.
-    discarding_oversized_apc: bool,
-    discarding_apc_prev_escape: bool,
+    // Sole live byte scanner. Host semantic/capture policy stays below.
+    parser: Parser,
 
     g0_charset: Charset,
     g1_charset: Charset,
@@ -4093,18 +3788,13 @@ impl TerminalState {
             current_working_dir: None,
             organism_idle_cwd: None,
             global_bg: Color::Default,
-            utf8_buf: [0; 4],
-            utf8_len: 0,
-            utf8_expected: 0,
-            pending_escape: Vec::new(),
-            pending_osc: Vec::new(),
-            pending_osc_scan_from: 0,
-            pending_dcs: Vec::new(),
-            pending_dcs_scan_from: 0,
-            pending_apc: Vec::new(),
-            pending_apc_scan_from: 0,
-            discarding_oversized_apc: false,
-            discarding_apc_prev_escape: false,
+            parser: Parser::with_profile(
+                ParserLimits {
+                    pending_bytes: MAX_PENDING_ESCAPE,
+                    kitty_recovery_bytes: jterm_core::kitty_graphics::MAX_CONTROL_BYTES,
+                },
+                ParserProfile::FrostLegacyV1,
+            ),
             g0_charset: Charset::Ascii,
             g1_charset: Charset::Ascii,
             active_charset: Charset::Ascii,
@@ -4424,17 +4114,17 @@ impl TerminalState {
         for (line, cells) in visible_cells.iter().enumerate() {
             let mut col = 0;
             while col < cells.len() {
-                let key = cells[col].hyperlink;
-                if key == 0 {
+                let key = cells[col].hyperlink_id;
+                if key.is_none() {
                     col += 1;
                     continue;
                 }
                 let col_start = col;
                 col += 1;
-                while col < cells.len() && cells[col].hyperlink == key {
+                while col < cells.len() && cells[col].hyperlink_id == key {
                     col += 1;
                 }
-                let Some(target) = self.osc8_hyperlinks.get(usize::from(key) - 1) else {
+                let Some(target) = self.osc8_hyperlinks.get(usize::from(key.as_raw()) - 1) else {
                     continue;
                 };
                 if !crate::link::is_openable_url(&target.uri) {
@@ -4669,7 +4359,7 @@ impl TerminalState {
                 )
             } else {
                 let grid_row = absolute_row - self.scrollback.len();
-                let wrapped = self.grid.row_wrapped[grid_row];
+                let wrapped = self.grid.row_wrapped()[grid_row];
                 (
                     append_cells(&mut capture, &self.grid[grid_row], wrapped),
                     wrapped,
@@ -6529,8 +6219,8 @@ impl TerminalState {
             .map(|row| {
                 ScrollbackLine::compress_with_raw_row_id(
                     &self.grid[row],
-                    self.grid.row_wrapped[row],
-                    self.grid.row_ids[row],
+                    self.grid.row_wrapped()[row],
+                    self.grid.row_ids()[row],
                 )
             })
             .collect();
@@ -6553,8 +6243,8 @@ impl TerminalState {
             let blank = TerminalCell::default();
             for row in 0..completed_grid_rows {
                 self.grid[row].fill(blank);
-                self.grid.row_wrapped[row] = false;
-                self.grid.row_ids[row] = RawRowId::fresh();
+                self.grid.row_wrapped_mut()[row] = false;
+                self.grid.row_ids_mut()[row] = fresh_raw_row_id();
             }
             self.mark_rows_dirty(0, completed_grid_rows - 1);
         } else {
@@ -6727,7 +6417,7 @@ impl TerminalState {
                 self.scrollback[row].is_wrapped
             } else {
                 self.grid
-                    .row_wrapped
+                    .row_wrapped()
                     .get(row - self.scrollback.len())
                     .copied()
                     .unwrap_or(false)
@@ -6815,13 +6505,8 @@ impl TerminalState {
                 )
             } else {
                 let grid_row = row - self.scrollback.len();
-                let wrapped = *self.grid.row_wrapped.get(grid_row)?;
-                let cells = self.grid.cells.get(
-                    grid_row.saturating_mul(self.grid.row_len())
-                        ..grid_row
-                            .saturating_add(1)
-                            .saturating_mul(self.grid.row_len()),
-                )?;
+                let wrapped = *self.grid.row_wrapped().get(grid_row)?;
+                let cells = self.grid.row_slice(grid_row)?;
                 (wrapped, segment_len(cells, first_col, wrapped))
             };
 
@@ -7100,7 +6785,7 @@ impl TerminalState {
                     .filter(|cell| !cell.flags.wide_continuation())
                     .map(|cell| cell.character)
                     .collect();
-                (text, self.grid.row_wrapped[grid_row])
+                (text, self.grid.row_wrapped()[grid_row])
             };
             if !wrapped {
                 // Hard line end: trailing cell padding is not real output.
@@ -7620,7 +7305,7 @@ impl TerminalState {
     /// (pushing to scrollback only for a full-screen region); otherwise it just
     /// moves down. Used by autowrap and linefeed so both stay region-aware.
     fn wrap_to_next_line(&mut self) {
-        self.grid.row_wrapped[self.cursor_row] = true;
+        self.grid.row_wrapped_mut()[self.cursor_row] = true;
         self.cursor_col = 0;
         self.index();
     }
@@ -7871,14 +7556,14 @@ impl TerminalState {
         cell.flags = self.current_flags;
         cell.flags.set_wide(width == 2);
         cell.flags.set_wide_continuation(false);
-        cell.hyperlink = self.current_hyperlink.unwrap_or(0);
+        cell.hyperlink_id = HyperlinkId::from_raw(self.current_hyperlink.unwrap_or(0));
 
         // Set up wide character continuation cell if needed
         if width == 2 && self.cursor_col + 1 < cols {
             let cont_cell = self.grid.get_mut(self.cursor_row, self.cursor_col + 1);
             *cont_cell = blank_cell;
             cont_cell.flags.set_wide_continuation(true);
-            cont_cell.hyperlink = self.current_hyperlink.unwrap_or(0);
+            cont_cell.hyperlink_id = HyperlinkId::from_raw(self.current_hyperlink.unwrap_or(0));
         }
 
         self.cursor_col += width;
@@ -7952,7 +7637,7 @@ impl TerminalState {
                 cell.foreground = fg;
                 cell.background = bg;
                 cell.flags = flags;
-                cell.hyperlink = hyperlink;
+                cell.hyperlink_id = HyperlinkId::from_raw(hyperlink);
             }
 
             self.cursor_col += chunk_len;
@@ -8039,7 +7724,7 @@ impl TerminalState {
             foreground: Color::Default,
             background: bg,
             flags: StyleFlags::default(),
-            hyperlink: 0,
+            hyperlink_id: HyperlinkId::NONE,
         }
     }
 
@@ -8068,7 +7753,7 @@ impl TerminalState {
                 && cell.foreground == blank.foreground
                 && cell.background == blank.background
                 && cell.flags == blank.flags
-                && cell.hyperlink == 0
+                && cell.hyperlink_id.is_none()
         })
     }
 
@@ -8138,7 +7823,7 @@ impl TerminalState {
         // the prefix-eviction shift used when real rows move into history.
         let selection = self.selection.take();
         for row in first..=last {
-            let line = ScrollbackLine::compress(&self.grid[row], self.grid.row_wrapped[row]);
+            let line = ScrollbackLine::compress(&self.grid[row], self.grid.row_wrapped()[row]);
             self.push_scrollback_compressed_with_options(line, allow_alt_buffer);
         }
         let appended = self.scrollback_pushes.wrapping_sub(before) as usize;
@@ -8302,13 +7987,15 @@ impl TerminalState {
         let src_end = bottom * cols;
         let dst = (top + 1) * cols;
         let blank = self.create_blank_cell();
-        self.grid.cells.copy_within(src_start..src_end, dst);
+        self.grid.cells_mut().copy_within(src_start..src_end, dst);
         // Clear top row
-        self.grid.cells[src_start..src_start + cols].fill(blank);
-        self.grid.row_wrapped.copy_within(top..bottom, top + 1);
-        self.grid.row_wrapped[top] = false;
-        self.grid.row_ids.copy_within(top..bottom, top + 1);
-        self.grid.row_ids[top] = RawRowId::fresh();
+        self.grid.cells_mut()[src_start..src_start + cols].fill(blank);
+        self.grid
+            .row_wrapped_mut()
+            .copy_within(top..bottom, top + 1);
+        self.grid.row_wrapped_mut()[top] = false;
+        self.grid.row_ids_mut().copy_within(top..bottom, top + 1);
+        self.grid.row_ids_mut()[top] = fresh_raw_row_id();
         self.grid.bump_identity_revision();
         self.mark_rows_dirty(top, bottom);
     }
@@ -8333,8 +8020,8 @@ impl TerminalState {
             if scrolls_off_screen_top && (!self.use_alt_buffer || allow_alt_scrollback) {
                 Some(ScrollbackLine::compress_with_raw_row_id(
                     &self.grid[top],
-                    self.grid.row_wrapped[top],
-                    self.grid.row_ids[top],
+                    self.grid.row_wrapped()[top],
+                    self.grid.row_ids()[top],
                 ))
             } else {
                 None
@@ -8344,13 +8031,19 @@ impl TerminalState {
         let src_end = (bottom + 1) * cols;
         let dst_start = top * cols;
         let blank = self.create_blank_cell();
-        self.grid.cells.copy_within(src_start..src_end, dst_start);
+        self.grid
+            .cells_mut()
+            .copy_within(src_start..src_end, dst_start);
         let blank_start = bottom * cols;
-        self.grid.cells[blank_start..blank_start + cols].fill(blank);
-        self.grid.row_wrapped.copy_within(top + 1..=bottom, top);
-        self.grid.row_wrapped[bottom] = false;
-        self.grid.row_ids.copy_within(top + 1..bottom + 1, top);
-        self.grid.row_ids[bottom] = RawRowId::fresh();
+        self.grid.cells_mut()[blank_start..blank_start + cols].fill(blank);
+        self.grid
+            .row_wrapped_mut()
+            .copy_within(top + 1..=bottom, top);
+        self.grid.row_wrapped_mut()[bottom] = false;
+        self.grid
+            .row_ids_mut()
+            .copy_within(top + 1..bottom + 1, top);
+        self.grid.row_ids_mut()[bottom] = fresh_raw_row_id();
         self.grid.bump_identity_revision();
 
         self.mark_rows_dirty(top, bottom);
@@ -8441,7 +8134,7 @@ impl TerminalState {
             foreground: Color::Default,
             background: bg_color,
             flags: StyleFlags::default(),
-            hyperlink: 0,
+            hyperlink_id: HyperlinkId::NONE,
         };
         // If clearing a continuation cell, also clear the wide character body
         if self.grid.get(row, col).flags.wide_continuation() && col > 0 {
@@ -8468,7 +8161,13 @@ impl TerminalState {
         self.watch_batch = WatchBatch {
             // A control prefix from an earlier read cannot certify a fresh C.
             // No extra byte storage, scanning or parser behavior is introduced.
-            fragmented: !self.pending_escape.is_empty() || !self.pending_osc.is_empty(),
+            fragmented: matches!(
+                self.parser.pending_kind(),
+                PendingKind::Escape
+                    | PendingKind::Csi
+                    | PendingKind::Charset
+                    | PendingKind::String(StringKind::Osc)
+            ),
             ..WatchBatch::default()
         };
         // Resize, an alternate-screen swap and the projection restore all park
@@ -8530,331 +8229,6 @@ impl TerminalState {
         }
     }
 
-    /// Begin buffering an unterminated APC (`ESC _` through the end of the
-    /// current read). A first fragment that already exceeds the cap is
-    /// rejected without being retained; the parser then discards through ST.
-    /// Abort a fragmented control string before its ordinary resume scanner
-    /// can consume a replacement escape or the visible text after CAN/SUB.
-    fn abort_pending_control_string(&mut self, input: &[u8]) -> bool {
-        let (previous_escape, osc) = if self.discarding_oversized_apc {
-            (self.discarding_apc_prev_escape, false)
-        } else if !self.pending_apc.is_empty() {
-            (self.pending_apc.last() == Some(&0x1b), false)
-        } else if !self.pending_osc.is_empty() {
-            (self.pending_osc.last() == Some(&0x1b), true)
-        } else if !self.pending_dcs.is_empty() {
-            (self.pending_dcs.last() == Some(&0x1b), false)
-        } else {
-            return false;
-        };
-        let Some((resume, restore_escape)) = control_string_abort(input, previous_escape, osc)
-        else {
-            return false;
-        };
-        if !self.pending_apc.is_empty() {
-            self.reject_buffered_kitty_apc_with_suffix(
-                &input[..resume],
-                "Kitty graphics APC was cancelled",
-            );
-        }
-        self.pending_apc.clear();
-        self.pending_apc_scan_from = 0;
-        self.pending_osc.clear();
-        self.pending_osc_scan_from = 0;
-        self.pending_dcs.clear();
-        self.pending_dcs_scan_from = 0;
-        self.discarding_oversized_apc = false;
-        self.discarding_apc_prev_escape = false;
-        if restore_escape {
-            self.pending_escape.push(0x1b);
-        }
-        self.process_input(&input[resume..]);
-        true
-    }
-
-    fn begin_pending_apc(&mut self, tail: &[u8]) {
-        if tail.len() > MAX_PENDING_ESCAPE {
-            if let Some(payload) = tail.strip_prefix(b"\x1b_") {
-                if jterm_core::kitty_graphics::is_graphics_payload(payload) {
-                    self.kitty_graphics.reject_graphics_payload(
-                        payload,
-                        "Kitty graphics APC exceeded the parser size limit",
-                    );
-                    let responses = self.kitty_graphics.take_responses();
-                    if !responses.is_empty() {
-                        self.output_buffer.extend_from_slice(&responses);
-                    }
-                }
-            }
-            self.pending_apc.clear();
-            self.pending_apc_scan_from = 0;
-            self.discarding_oversized_apc = true;
-            self.discarding_apc_prev_escape = tail.last() == Some(&0x1b);
-            return;
-        }
-        self.pending_apc.clear();
-        self.pending_apc.extend_from_slice(tail);
-        self.pending_apc_scan_from = self.pending_apc.len().saturating_sub(1);
-    }
-
-    /// Answer a buffered kitty APC that is being abandoned: echo a bounded
-    /// control prefix (identifier + quiet level) in the rejection so an
-    /// addressed client sees EINVAL instead of a timeout. `suffix` carries
-    /// the fragment that tripped the limit, in case fragmentation split the
-    /// control section unusually early.
-    fn reject_buffered_kitty_apc_with_suffix(&mut self, suffix: &[u8], error: &str) {
-        let Some(payload) = self.pending_apc.strip_prefix(b"\x1b_") else {
-            return;
-        };
-        if !jterm_core::kitty_graphics::is_graphics_payload(payload) {
-            return;
-        }
-
-        let limit = jterm_core::kitty_graphics::MAX_CONTROL_BYTES;
-        let mut recovery =
-            Vec::with_capacity(limit.min(payload.len().saturating_add(suffix.len())));
-        recovery.extend_from_slice(&payload[..payload.len().min(limit)]);
-        if recovery.len() < limit && !recovery.contains(&b';') {
-            recovery.extend_from_slice(&suffix[..suffix.len().min(limit - recovery.len())]);
-        }
-        self.kitty_graphics
-            .reject_graphics_payload(&recovery, error);
-        let responses = self.kitty_graphics.take_responses();
-        if !responses.is_empty() {
-            self.output_buffer.extend_from_slice(&responses);
-        }
-    }
-
-    /// Resume a fragmented kitty APC. Returns true when this function consumed
-    /// the input (including any bytes after the ST, processed recursively).
-    fn resume_pending_apc(&mut self, input: &[u8]) -> bool {
-        if self.discarding_oversized_apc {
-            let mut previous_escape = self.discarding_apc_prev_escape;
-            for (index, byte) in input.iter().copied().enumerate() {
-                if previous_escape && byte == b'\\' {
-                    self.discarding_oversized_apc = false;
-                    self.discarding_apc_prev_escape = false;
-                    if index + 1 < input.len() {
-                        self.process_input(&input[index + 1..]);
-                    }
-                    return true;
-                }
-                previous_escape = byte == 0x1b;
-            }
-            self.discarding_apc_prev_escape = previous_escape;
-            return true;
-        }
-
-        if self.pending_apc.is_empty() {
-            return false;
-        }
-
-        // Everything before pending_apc_scan_from was proved not to contain
-        // ST in the previous call. A new terminator can therefore only
-        // straddle the old/new boundary or live entirely in input. Search the
-        // new bytes once before doing the capacity check: bytes after ST are
-        // normal terminal input and must not be charged to the APC size limit.
-        let scan_from = self
-            .pending_apc_scan_from
-            .min(self.pending_apc.len().saturating_sub(1));
-        let terminator = if scan_from + 1 == self.pending_apc.len()
-            && self.pending_apc[scan_from] == 0x1b
-            && input.first() == Some(&b'\\')
-        {
-            Some((scan_from, 1))
-        } else {
-            input
-                .windows(2)
-                .position(|window| window == b"\x1b\\")
-                .map(|offset| (self.pending_apc.len() + offset, offset + 2))
-        };
-
-        if let Some((terminator, consumed)) = terminator {
-            let packet_len = self.pending_apc.len().saturating_add(consumed);
-            if packet_len > MAX_PENDING_ESCAPE {
-                self.reject_buffered_kitty_apc_with_suffix(
-                    &input[..consumed],
-                    "Kitty graphics APC exceeded the parser size limit",
-                );
-                self.pending_apc.clear();
-                self.pending_apc_scan_from = 0;
-            } else {
-                self.pending_apc.extend_from_slice(&input[..consumed]);
-                let packet = std::mem::take(&mut self.pending_apc);
-                self.pending_apc_scan_from = 0;
-                if packet.starts_with(b"\x1b_")
-                    && jterm_core::kitty_graphics::is_graphics_payload(&packet[2..terminator])
-                {
-                    self.handle_kitty_graphics_apc(&packet[2..terminator]);
-                }
-            }
-            if consumed < input.len() {
-                self.process_input(&input[consumed..]);
-            }
-            return true;
-        }
-
-        if self.pending_apc.len().saturating_add(input.len()) > MAX_PENDING_ESCAPE {
-            let previous_escape = input
-                .last()
-                .copied()
-                .or_else(|| self.pending_apc.last().copied())
-                == Some(0x1b);
-            self.reject_buffered_kitty_apc_with_suffix(
-                input,
-                "Kitty graphics APC exceeded the parser size limit",
-            );
-            self.pending_apc.clear();
-            self.pending_apc_scan_from = 0;
-            self.discarding_oversized_apc = true;
-            self.discarding_apc_prev_escape = previous_escape;
-            return true;
-        }
-
-        self.pending_apc.extend_from_slice(input);
-        self.pending_apc_scan_from = self.pending_apc.len().saturating_sub(1);
-        true
-    }
-
-    /// Begin buffering an unterminated OSC (`ESC ]` through the end of the
-    /// current read). Like the old `pending_escape` stash there is no size
-    /// check here: a prefix that grows past the cap is abandoned by the
-    /// entry check in `resume_pending_osc` on the next read.
-    fn begin_pending_osc(&mut self, tail: &[u8]) {
-        self.pending_osc.clear();
-        self.pending_osc.extend_from_slice(tail);
-        self.pending_osc_scan_from = self.pending_osc.len().saturating_sub(1);
-    }
-
-    /// Resume a fragmented OSC (`ESC ]` … BEL/ST). Returns true when this
-    /// function consumed the input (including any bytes after the
-    /// terminator, processed recursively).
-    fn resume_pending_osc(&mut self, input: &[u8]) -> bool {
-        if self.pending_osc.is_empty() {
-            return false;
-        }
-
-        // Mirror the old `pending_escape` entry check exactly: a buffered
-        // prefix past the cap is abandoned wholesale and this read is parsed
-        // as ordinary input (payload tail prints, BEL is a plain bell).
-        if self.pending_osc.len() > MAX_PENDING_ESCAPE {
-            self.pending_osc.clear();
-            self.pending_osc_scan_from = 0;
-            return false;
-        }
-
-        // Everything before pending_osc_scan_from was proved not to contain
-        // BEL or ST in the previous call. A terminator can therefore only
-        // straddle the old/new boundary (ESC at the stashed tail, `\` here)
-        // or live entirely in input. Scan the new bytes once, before any
-        // capacity concern: like the merged re-parse, a packet whose
-        // terminator shows up is dispatched regardless of its size.
-        let scan_from = self
-            .pending_osc_scan_from
-            .min(self.pending_osc.len().saturating_sub(1));
-        let straddled_st = scan_from + 1 == self.pending_osc.len()
-            && self.pending_osc[scan_from] == 0x1b
-            && input.first() == Some(&b'\\');
-        let terminator = if straddled_st {
-            Some((scan_from, 1))
-        } else {
-            let bel = input.iter().position(|&byte| byte == 0x07);
-            let st = input.windows(2).position(|window| window == b"\x1b\\");
-            match (bel, st) {
-                (Some(bel), Some(st)) if bel < st => Some((self.pending_osc.len() + bel, bel + 1)),
-                (Some(_), Some(st)) => Some((self.pending_osc.len() + st, st + 2)),
-                (Some(bel), None) => Some((self.pending_osc.len() + bel, bel + 1)),
-                (None, Some(st)) => Some((self.pending_osc.len() + st, st + 2)),
-                (None, None) => None,
-            }
-        };
-
-        if let Some((payload_end, consumed)) = terminator {
-            let capture_idle_background = self.idle_background_capture_active();
-            self.pending_osc.extend_from_slice(&input[..consumed]);
-            let packet = std::mem::take(&mut self.pending_osc);
-            self.pending_osc_scan_from = 0;
-            let terminator = if packet.last() == Some(&0x07) {
-                OSC_BEL
-            } else {
-                OSC_ST
-            };
-            self.handle_osc_payload(&packet[2..payload_end], terminator);
-            if capture_idle_background && self.idle_background_capture_active() {
-                self.append_idle_background_bytes(&packet);
-            }
-            if consumed < input.len() {
-                self.process_input(&input[consumed..]);
-            }
-            return true;
-        }
-
-        self.pending_osc.extend_from_slice(input);
-        self.pending_osc_scan_from = self.pending_osc.len().saturating_sub(1);
-        true
-    }
-
-    /// Begin buffering an unterminated DCS/SOS/PM (`ESC P`/`ESC X`/`ESC ^`
-    /// through the end of the current read). Same streaming and overflow
-    /// rules as `begin_pending_osc`.
-    fn begin_pending_dcs(&mut self, tail: &[u8]) {
-        self.pending_dcs.clear();
-        self.pending_dcs.extend_from_slice(tail);
-        self.pending_dcs_scan_from = self.pending_dcs.len().saturating_sub(1);
-    }
-
-    /// Resume a fragmented DCS/SOS/PM. Only ST terminates these strings; the
-    /// payload itself is dropped, exactly like the merged re-parse did.
-    /// Returns true when this function consumed the input.
-    fn resume_pending_dcs(&mut self, input: &[u8]) -> bool {
-        if self.pending_dcs.is_empty() {
-            return false;
-        }
-
-        // Same overflow rule as the OSC path (old `pending_escape` entry
-        // check): abandon the prefix wholesale, parse this read fresh.
-        if self.pending_dcs.len() > MAX_PENDING_ESCAPE {
-            self.pending_dcs.clear();
-            self.pending_dcs_scan_from = 0;
-            return false;
-        }
-
-        // See resume_pending_osc: only the stashed tail ESC can straddle the
-        // boundary into an ST; every earlier byte was proved clean.
-        let scan_from = self
-            .pending_dcs_scan_from
-            .min(self.pending_dcs.len().saturating_sub(1));
-        let consumed = if scan_from + 1 == self.pending_dcs.len()
-            && self.pending_dcs[scan_from] == 0x1b
-            && input.first() == Some(&b'\\')
-        {
-            Some(1)
-        } else {
-            input
-                .windows(2)
-                .position(|window| window == b"\x1b\\")
-                .map(|offset| offset + 2)
-        };
-
-        if let Some(consumed) = consumed {
-            let capture_idle_background = self.idle_background_capture_active();
-            self.pending_dcs.extend_from_slice(&input[..consumed]);
-            let packet = std::mem::take(&mut self.pending_dcs);
-            self.pending_dcs_scan_from = 0;
-            if capture_idle_background && self.idle_background_capture_active() {
-                self.append_idle_background_bytes(&packet);
-            }
-            if consumed < input.len() {
-                self.process_input(&input[consumed..]);
-            }
-            return true;
-        }
-
-        self.pending_dcs.extend_from_slice(input);
-        self.pending_dcs_scan_from = self.pending_dcs.len().saturating_sub(1);
-        true
-    }
-
     /// Check if sync output timed out (>1s) and auto-clear if so
     pub fn check_sync_output_timeout(&mut self) {
         if self.sync_output_active {
@@ -8899,45 +8273,6 @@ impl TerminalState {
         }
     }
 
-    /// Consume a UTF-8 lead byte together with its continuation bytes.
-    ///
-    /// - Not enough bytes left in this read: stash the lead byte and wait for
-    ///   the next batch.
-    /// - Continuation bytes all present: decode and print the character; if
-    ///   the sequence is well-formed in shape but invalid in content
-    ///   (overlong encoding, surrogate), print U+FFFD instead.
-    /// - A non-continuation byte inside the expected span: the sequence is
-    ///   malformed, so print U+FFFD and consume only the lead byte, leaving
-    ///   the offending byte to be processed normally.
-    fn consume_utf8_lead(&mut self, byte: u8, expected: u8, data: &[u8], i: &mut usize) {
-        let need = expected as usize;
-        if *i + need > data.len() {
-            // Incomplete: stash the lead byte and wait for the next batch.
-            self.utf8_buf[0] = byte;
-            self.utf8_len = 1;
-            self.utf8_expected = expected;
-            *i += 1;
-            return;
-        }
-
-        let all_continuation = (1..need).all(|k| (data[*i + k] & 0xC0) == 0x80);
-        if all_continuation {
-            match std::str::from_utf8(&data[*i..*i + need]) {
-                Ok(s) => {
-                    if let Some(ch) = s.chars().next() {
-                        self.put_char(ch, true);
-                    }
-                }
-                Err(_) => self.put_char('\u{FFFD}', true),
-            }
-            *i += need;
-        } else {
-            // Lead byte directly followed by a non-continuation byte.
-            self.put_char('\u{FFFD}', true);
-            *i += 1;
-        }
-    }
-
     /// Feed one PTY read batch to the parser.
     ///
     /// The wrapper exists so the deferred zone rebase settles exactly once per
@@ -8952,504 +8287,163 @@ impl TerminalState {
     }
 
     fn process_input_inner(&mut self, input: &[u8]) {
-        if self.abort_pending_control_string(input) {
-            return;
-        }
-        // A fragmented kitty APC streams against its own bounded buffer; this
-        // must run before the pending_escape merge so the APC never pays the
-        // O(n^2) re-scan and its tail is never parsed as ordinary input.
-        if self.resume_pending_apc(input) {
-            return;
-        }
-        // Fragmented OSC and DCS/SOS/PM strings stream the same way: at most
-        // one string state can be in flight, so whichever buffer is non-empty
-        // owns the input until its terminator (or the overflow abandon).
-        if self.resume_pending_osc(input) {
-            return;
-        }
-        if self.resume_pending_dcs(input) {
-            return;
-        }
-        // Guard against an unterminated escape sequence. Such a sequence
-        // is buffered into `pending_escape` and re-scanned from its start on every
-        // read, which is both O(n^2) in CPU and unbounded in memory. Once the
-        // buffered prefix exceeds this cap, abandon the partial sequence. The cap
-        // is generous enough for legitimate large payloads (e.g. OSC 52 clipboard).
-        // Only short CSI/charset prefixes still land in `pending_escape` — the
-        // unbounded OSC/DCS/SOS/PM string states stream against their own
-        // scan-cursor buffers above.
-        if self.pending_escape.len() > MAX_PENDING_ESCAPE {
-            self.pending_escape.clear();
-        }
-
-        // Fast path: if no pending escape, process input directly without allocation
-        let data;
-        let data_slice: &[u8] = if self.pending_escape.is_empty() {
-            input
-        } else {
-            // Slow path: merge pending escape with new input
-            let mut combined = std::mem::take(&mut self.pending_escape);
-            combined.extend_from_slice(input);
-            data = combined;
-            &data
-        };
-
-        let mut i = 0;
-
-        while i < data_slice.len() {
-            let token_start = i;
-            let capture_idle_background = self.idle_background_capture_active();
-            let byte = data_slice[i];
-
-            // A pending multi-byte UTF-8 sequence interrupted by a
-            // non-continuation byte is malformed: emit the U+FFFD replacement
-            // character per Unicode guidance and reset, then process the
-            // current byte normally so the partial sequence is neither
-            // silently dropped nor allowed to swallow later bytes.
-            if self.utf8_len > 0 && (byte & 0xC0) != 0x80 {
-                self.put_char('\u{FFFD}', true);
-                self.utf8_len = 0;
+        self.parser.begin_feed();
+        let mut at = 0;
+        let mut capture_active = false;
+        loop {
+            self.parser.set_ascii_batching(
+                self.active_charset == Charset::Ascii && !self.modes.contains(&4),
+            );
+            let step = self.parser.next(&input[at..]);
+            at += step.consumed;
+            if step.capture.as_ref().is_some_and(|capture| capture.started) {
+                capture_active = self.idle_background_capture_active();
             }
-
-            match byte {
-                b'\x08' => {
-                    // Backspace (0x08) - just move cursor left.
-                    // Shell handles actual deletion and sends back updated display.
-                    self.pending_wrap = false;
-                    if self.cursor_col > 0 {
-                        self.cursor_col -= 1;
+            let done = step.event.is_none();
+            if let Some(event) = step.event {
+                match event {
+                    ParserEvent::Boundary => {}
+                    ParserEvent::Print(ch) => self.put_char(ch, true),
+                    ParserEvent::Ascii(bytes) => {
+                        if self.active_charset == Charset::Ascii && !self.modes.contains(&4) {
+                            self.put_ascii_run(bytes);
+                        } else {
+                            for &byte in bytes {
+                                self.put_char(byte as char, true);
+                            }
+                        }
                     }
-                    i += 1;
-                }
-                b'\x7f' => {
-                    // DEL (0x7f) is a fill/padding character; xterm ignores it.
-                    i += 1;
-                }
-                b'\n' | b'\x0b' | b'\x0c' => {
-                    // Linefeed - move cursor down or scroll the region. VT and
-                    // FF are executed as LF, as in xterm and VTE (and as the
-                    // CSI parser below already does for them).
-                    self.pending_wrap = false;
-                    self.index();
-                    i += 1;
-                }
-                b'\r' => {
-                    self.pending_wrap = false;
-                    self.cursor_col = 0;
-                    i += 1;
-                }
-                b'\x0e' => {
-                    self.active_charset = self.g1_charset;
-                    i += 1;
-                }
-                b'\x0f' => {
-                    self.active_charset = self.g0_charset;
-                    i += 1;
-                }
-                b'\x07' => {
-                    // Bell - ignore
-                    i += 1;
-                }
-                b'\t' => {
-                    // Tab - advance to the next tab stop.
-                    self.pending_wrap = false;
-                    self.cursor_col = self.next_tab_stop(self.cursor_col);
-                    i += 1;
-                }
-                b'\x1b' => {
-                    let esc_start = i;
-
-                    if i + 1 >= data_slice.len() {
-                        self.pending_escape
-                            .extend_from_slice(&data_slice[esc_start..]);
-                        break;
-                    }
-
-                    match data_slice[i + 1] {
-                        // A repeated ESC abandons the unfinished prefix.
-                        0x1b => {
-                            i += 1;
-                        }
-                        b'7' => {
-                            // DECSC - Save cursor (position + SGR + charset + origin)
-                            self.save_cursor();
-                            i += 2;
-                        }
-                        b'8' => {
-                            // DECRC - Restore cursor
-                            self.restore_cursor();
-                            i += 2;
-                        }
-                        b'E' => {
-                            // NEL - Next Line (linefeed + carriage return)
+                    ParserEvent::Control(byte) => match byte {
+                        8 => {
                             self.pending_wrap = false;
-                            self.next_line();
-                            i += 2;
+                            self.cursor_col = self.cursor_col.saturating_sub(1);
                         }
-                        b'D' => {
-                            // IND - Index (linefeed without carriage return)
+                        9 => {
+                            self.pending_wrap = false;
+                            self.cursor_col = self.next_tab_stop(self.cursor_col);
+                        }
+                        10..=12 => {
                             self.pending_wrap = false;
                             self.index();
-                            i += 2;
                         }
-                        b'M' => {
-                            // RI - Reverse Index
+                        13 => {
                             self.pending_wrap = false;
-                            self.reverse_index();
-                            i += 2;
+                            self.cursor_col = 0;
                         }
-                        b'H' => {
-                            // HTS - set a horizontal tab stop at the current column
-                            if let Some(stop) = self.tab_stops.get_mut(self.cursor_col) {
-                                *stop = true;
-                            }
-                            i += 2;
-                        }
-                        b'c' => {
-                            // RIS - Reset to Initial State
-                            self.full_reset();
-                            i += 2;
-                        }
-                        b']' => {
-                            i += 2;
-
-                            let payload_start = i;
-                            if let Some((resume, _)) =
-                                control_string_abort(&data_slice[i..], false, true)
-                            {
-                                i += resume;
-                                continue;
-                            }
-
-                            let mut terminated = false;
-                            while i < data_slice.len() {
-                                if data_slice[i] == 0x07 {
-                                    i += 1;
-                                    terminated = true;
-                                    break;
-                                } else if i + 1 < data_slice.len()
-                                    && data_slice[i] == 0x1b
-                                    && data_slice[i + 1] == 0x5c
-                                {
-                                    i += 2;
-                                    terminated = true;
-                                    break;
-                                } else {
-                                    i += 1;
+                        14 => self.active_charset = self.g1_charset,
+                        15 => self.active_charset = self.g0_charset,
+                        _ => {} // Frost ignores BEL and other unhandled C0.
+                    },
+                    ParserEvent::Escape {
+                        intermediates,
+                        final_byte,
+                    } => {
+                        if intermediates.is_empty() {
+                            match final_byte {
+                                b'7' => self.save_cursor(),
+                                b'8' => self.restore_cursor(),
+                                b'E' => {
+                                    self.pending_wrap = false;
+                                    self.next_line();
                                 }
-                            }
-
-                            if !terminated {
-                                // Fragmented OSC: stream against its own
-                                // bounded buffer instead of re-scanning
-                                // pending_escape from byte 0 each read.
-                                self.begin_pending_osc(&data_slice[esc_start..]);
-                                break;
-                            }
-
-                            let (payload_end, terminator) = if data_slice[i - 1] == 0x07 {
-                                (i - 1, OSC_BEL)
-                            } else {
-                                (i - 2, OSC_ST)
-                            };
-                            if payload_end >= payload_start {
-                                self.handle_osc_payload(
-                                    &data_slice[payload_start..payload_end],
-                                    terminator,
-                                );
-                            }
-                        }
-                        b'P' | b'X' | b'^' | b'_' => {
-                            // DCS (ESC P), SOS (ESC X), PM (ESC ^) and APC (ESC _)
-                            // all end at ST, but only APC carries Kitty graphics.
-                            // Sniffing every string for `a=` used to hand an
-                            // unrelated DCS to the graphics state.
-                            let is_apc = data_slice[i + 1] == b'_';
-                            i += 2;
-
-                            if let Some((resume, _)) =
-                                control_string_abort(&data_slice[i..], false, false)
-                            {
-                                if is_apc {
-                                    self.kitty_graphics.reject_graphics_payload(
-                                        &data_slice[i..i + resume],
-                                        "Kitty graphics APC was cancelled",
-                                    );
-                                    let responses = self.kitty_graphics.take_responses();
-                                    self.output_buffer.extend_from_slice(&responses);
+                                b'D' => {
+                                    self.pending_wrap = false;
+                                    self.index();
                                 }
-                                i += resume;
-                                continue;
-                            }
-                            let mut terminated = false;
-                            let dcs_start = i;
-                            while i < data_slice.len() {
-                                if i + 1 < data_slice.len()
-                                    && data_slice[i] == 0x1b
-                                    && data_slice[i + 1] == 0x5c
-                                {
-                                    let payload = &data_slice[dcs_start..i];
-
-                                    if is_apc
-                                        && jterm_core::kitty_graphics::is_graphics_payload(payload)
-                                    {
-                                        self.handle_kitty_graphics_apc(payload);
-                                    }
-
-                                    i += 2;
-                                    terminated = true;
-                                    break;
+                                b'M' => {
+                                    self.pending_wrap = false;
+                                    self.reverse_index();
                                 }
-                                i += 1;
-                            }
-
-                            if !terminated {
-                                if is_apc {
-                                    // Kitty transfers stream against their
-                                    // own bounded buffer instead of the
-                                    // re-scanning pending_escape.
-                                    self.begin_pending_apc(&data_slice[esc_start..]);
-                                } else {
-                                    // DCS/SOS/PM stream the same way; their
-                                    // payload stays dropped on completion.
-                                    self.begin_pending_dcs(&data_slice[esc_start..]);
+                                b'H' => {
+                                    if let Some(stop) = self.tab_stops.get_mut(self.cursor_col) {
+                                        *stop = true;
+                                    }
                                 }
-                                break;
-                            }
-                        }
-                        b'>' => {
-                            // ESC > - DECKPNM (Keypad Numeric Mode)
-                            self.modes.remove(&66);
-                            i += 2;
-                        }
-                        b'<' => {
-                            // ESC < - DECKPM (Keypad Application Mode) or other private sequence
-                            // Just skip it
-                            i += 2;
-                        }
-                        b'=' => {
-                            // ESC = - DECKPAM (Keypad Application Mode)
-                            self.modes.insert(66);
-                            i += 2;
-                        }
-                        0x20..=0x2f => {
-                            // nF escape: ESC, one or more intermediates
-                            // (0x20..=0x2f), then one final byte. The whole
-                            // sequence is consumed even when frost does not
-                            // implement it; stopping after two bytes printed
-                            // the final as text (`ESC % G` left a "G").
-                            let mut end = i + 1;
-                            while end < data_slice.len() && (0x20..=0x2f).contains(&data_slice[end])
-                            {
-                                end += 1;
-                            }
-                            if end >= data_slice.len() {
-                                self.pending_escape
-                                    .extend_from_slice(&data_slice[esc_start..]);
-                                break;
-                            }
-                            let final_byte = data_slice[end];
-                            if (0x30..=0x7e).contains(&final_byte) {
-                                self.handle_nf_escape(&data_slice[i + 1..end], final_byte);
-                                i = end + 1;
-                            } else {
-                                // A control or 8-bit byte aborts the sequence;
-                                // leave it for the outer loop to execute.
-                                i = end;
-                            }
-                        }
-                        b'[' => {
-                            i += 2;
-
-                            // Use stack arrays for CSI params (typical CSI sequences are short)
-                            let mut param_bytes = [0u8; 128];
-                            let mut param_len = 0;
-                            let mut intermediates = [0u8; 8];
-                            let mut inter_len = 0;
-                            let mut final_byte = None;
-                            let mut cancelled = false;
-
-                            while i < data_slice.len() {
-                                match data_slice[i] {
-                                    0x30..=0x3f => {
-                                        if param_len < param_bytes.len() {
-                                            param_bytes[param_len] = data_slice[i];
-                                            param_len += 1;
-                                        }
-                                    }
-                                    0x20..=0x2f => {
-                                        if inter_len < intermediates.len() {
-                                            intermediates[inter_len] = data_slice[i];
-                                            inter_len += 1;
-                                        }
-                                    }
-                                    0x40..=0x7e => {
-                                        final_byte = Some(data_slice[i]);
-                                        break;
-                                    }
-                                    // ECMA-48 allows C0 controls inside a control
-                                    // sequence. Pagers such as util-linux `more`
-                                    // can insert CR/LF while wrapping colored text,
-                                    // even between the digits of an SGR parameter.
-                                    // Execute those controls immediately and keep
-                                    // collecting the surrounding CSI sequence.
-                                    b'\x08' => {
-                                        self.pending_wrap = false;
-                                        self.cursor_col = self.cursor_col.saturating_sub(1);
-                                    }
-                                    b'\t' => {
-                                        self.pending_wrap = false;
-                                        self.cursor_col = self.next_tab_stop(self.cursor_col);
-                                    }
-                                    b'\n' | b'\x0b' | b'\x0c' => {
-                                        self.pending_wrap = false;
-                                        self.index();
-                                    }
-                                    b'\r' => {
-                                        self.pending_wrap = false;
-                                        self.cursor_col = 0;
-                                    }
-                                    b'\x0e' => self.active_charset = self.g1_charset,
-                                    b'\x0f' => self.active_charset = self.g0_charset,
-                                    // CAN and SUB cancel the current control
-                                    // sequence. Leave a following ESC untouched so
-                                    // the outer parser can begin the replacement.
-                                    b'\x18' | b'\x1a' => {
-                                        cancelled = true;
-                                        i += 1;
-                                        break;
-                                    }
-                                    b'\x1b' => {
-                                        cancelled = true;
-                                        break;
-                                    }
-                                    // Other C0 controls are either padding or have
-                                    // no visible effect in Frost, but they do not
-                                    // make the CSI incomplete.
-                                    0x00..=0x1f => {}
-                                    _ => break,
+                                b'c' => self.full_reset(),
+                                b'>' => {
+                                    self.modes.remove(&66);
                                 }
-                                i += 1;
-                            }
-
-                            if cancelled {
-                                continue;
-                            }
-
-                            let Some(final_byte) = final_byte else {
-                                // C0 controls embedded in the partial CSI were
-                                // already executed above. Buffer only the CSI
-                                // syntax so a later PTY read does not replay a
-                                // linefeed or carriage return.
-                                self.pending_escape.extend_from_slice(b"\x1b[");
-                                self.pending_escape
-                                    .extend_from_slice(&param_bytes[..param_len]);
-                                self.pending_escape
-                                    .extend_from_slice(&intermediates[..inter_len]);
-                                break;
-                            };
-
-                            let private_prefix = match param_bytes.first().copied() {
-                                Some(prefix @ (b'<' | b'=' | b'>' | b'?')) => {
-                                    // Shift remaining params left
-                                    for j in 0..param_len - 1 {
-                                        param_bytes[j] = param_bytes[j + 1];
-                                    }
-                                    param_len -= 1;
-                                    Some(prefix)
+                                b'=' => {
+                                    self.modes.insert(66);
                                 }
-                                _ => None,
-                            };
-                            let params = Self::parse_csi_params(&param_bytes[..param_len]);
-                            let cmd = final_byte as char;
-
-                            self.handle_escape_sequence(
-                                &params,
-                                &param_bytes[..param_len],
-                                cmd,
-                                private_prefix,
-                                &intermediates[..inter_len],
-                            );
-                            i += 1;
-                        }
-                        _ => {
-                            // Unknown 2-byte escape (e.g. SS2 `ESC N`, SS3 `ESC O`).
-                            // Consume BOTH bytes so the trailing letter isn't printed
-                            // as literal text.
-                            i += 2;
+                                _ => {}
+                            }
+                        } else {
+                            self.handle_nf_escape(&intermediates, final_byte);
                         }
                     }
-                }
-                32..=126 => {
-                    // ASCII fast path: scan for run of printable ASCII and process in bulk.
-                    // Insert mode (IRM) needs per-cell shifting, so fall back to put_char.
-                    if self.utf8_len == 0
-                        && self.active_charset == Charset::Ascii
-                        && !self.modes.contains(&4)
-                    {
-                        let run_start = i;
-                        i += 1;
-                        while i < data_slice.len() {
-                            let b = data_slice[i];
-                            if !(32..=126).contains(&b) {
-                                break;
-                            }
-                            i += 1;
-                        }
-                        self.put_ascii_run(&data_slice[run_start..i]);
-                    } else {
-                        self.put_char(byte as char, true);
-                        i += 1;
+                    ParserEvent::Charset { .. } => {
+                        unreachable!("Frost uses the nF charset scanner")
                     }
-                }
-                // UTF-8 multi-byte sequences: try to consume all bytes eagerly
-                0xC2..=0xDF => {
-                    self.consume_utf8_lead(byte, 2, data_slice, &mut i);
-                }
-                0xE0..=0xEF => {
-                    self.consume_utf8_lead(byte, 3, data_slice, &mut i);
-                }
-                0xF0..=0xF4 => {
-                    self.consume_utf8_lead(byte, 4, data_slice, &mut i);
-                }
-                _ => {
-                    // Reaching here, byte is either a continuation byte (the
-                    // abandoned-sequence check above guarantees a sequence is
-                    // really pending) or an invalid UTF-8 lead byte
-                    // (0xC0/0xC1/0xF5..=0xFF), or an unhandled C0 control.
-                    if self.utf8_len > 0 && (byte & 0xC0) == 0x80 {
-                        self.utf8_buf[self.utf8_len as usize] = byte;
-                        self.utf8_len += 1;
-                        if self.utf8_len == self.utf8_expected {
-                            match std::str::from_utf8(&self.utf8_buf[..self.utf8_len as usize]) {
-                                Ok(s) => {
-                                    if let Some(ch) = s.chars().next() {
-                                        self.put_char(ch, true);
-                                    }
+                    ParserEvent::Csi {
+                        raw_params,
+                        private_prefix,
+                        intermediates,
+                        final_byte,
+                        ..
+                    } => {
+                        let params = Self::parse_csi_params(&raw_params);
+                        self.handle_escape_sequence(
+                            &params,
+                            &raw_params,
+                            final_byte as char,
+                            private_prefix,
+                            &intermediates,
+                        );
+                    }
+                    ParserEvent::String {
+                        kind,
+                        payload,
+                        bel_terminated,
+                    } => match kind {
+                        StringKind::Osc => self.handle_osc_payload(
+                            &payload,
+                            if bel_terminated { OSC_BEL } else { OSC_ST },
+                        ),
+                        StringKind::Apc
+                            if jterm_core::kitty_graphics::is_graphics_payload(&payload) =>
+                        {
+                            self.handle_kitty_graphics_apc(&payload)
+                        }
+                        _ => {} // Frost intentionally drops DCS/SOS/PM.
+                    },
+                    ParserEvent::RejectApc { recovery, reason } => {
+                        self.kitty_graphics.reject_graphics_payload(
+                            &recovery,
+                            match reason {
+                                RejectReason::Cancelled => "Kitty graphics APC was cancelled",
+                                RejectReason::TooLarge => {
+                                    "Kitty graphics APC exceeded the parser size limit"
                                 }
-                                // Full length but invalid content (overlong
-                                // encoding / surrogate): emit U+FFFD.
-                                Err(_) => self.put_char('\u{FFFD}', true),
-                            }
-                            self.utf8_len = 0;
-                        }
-                    } else {
-                        // Orphan continuation bytes and invalid lead bytes are
-                        // malformed UTF-8 and get U+FFFD; unhandled C0
-                        // controls stay ignored.
-                        if byte >= 0x80 {
-                            self.put_char('\u{FFFD}', true);
-                        }
-                        self.utf8_len = 0;
+                            },
+                        );
+                        self.output_buffer
+                            .extend_from_slice(&self.kitty_graphics.take_responses());
                     }
-                    i += 1;
                 }
             }
-            if byte == 0x1b {
-                self.note_chat_native_takeover();
+            if let Some(end) = step.capture.and_then(|capture| capture.end) {
+                if let CaptureEnd::Complete { token, escape } = end {
+                    if escape {
+                        self.note_chat_native_takeover();
+                    }
+                    if capture_active && self.idle_background_capture_active() {
+                        if let Some(token) = token {
+                            let raw = if token.prefix.is_empty() {
+                                Cow::Borrowed(&input[token.input_range])
+                            } else {
+                                let mut bytes = token.prefix;
+                                bytes.extend_from_slice(&input[token.input_range]);
+                                Cow::Owned(bytes)
+                            };
+                            self.append_idle_background_bytes(&raw);
+                        }
+                    }
+                }
+                capture_active = false;
             }
-            if capture_idle_background && self.idle_background_capture_active() && i > token_start {
-                self.append_idle_background_bytes(&data_slice[token_start..i]);
+            if done {
+                break;
             }
         }
     }
@@ -9687,13 +8681,13 @@ impl TerminalState {
                         let src_start = self.cursor_row * cols;
                         let src_end = self.scroll_region_bottom * cols;
                         let dst = (self.cursor_row + 1) * cols;
-                        self.grid.cells.copy_within(src_start..src_end, dst);
-                        self.grid.cells[src_start..src_start + cols].fill(blank);
-                        self.grid.row_ids.copy_within(
+                        self.grid.cells_mut().copy_within(src_start..src_end, dst);
+                        self.grid.cells_mut()[src_start..src_start + cols].fill(blank);
+                        self.grid.row_ids_mut().copy_within(
                             self.cursor_row..self.scroll_region_bottom,
                             self.cursor_row + 1,
                         );
-                        self.grid.row_ids[self.cursor_row] = RawRowId::fresh();
+                        self.grid.row_ids_mut()[self.cursor_row] = fresh_raw_row_id();
                         self.grid.bump_identity_revision();
                     }
                 }
@@ -9716,14 +8710,14 @@ impl TerminalState {
                         let src_start = (self.cursor_row + 1) * cols;
                         let src_end = (self.scroll_region_bottom + 1) * cols;
                         let dst = self.cursor_row * cols;
-                        self.grid.cells.copy_within(src_start..src_end, dst);
+                        self.grid.cells_mut().copy_within(src_start..src_end, dst);
                         let blank_start = self.scroll_region_bottom * cols;
-                        self.grid.cells[blank_start..blank_start + cols].fill(blank);
-                        self.grid.row_ids.copy_within(
+                        self.grid.cells_mut()[blank_start..blank_start + cols].fill(blank);
+                        self.grid.row_ids_mut().copy_within(
                             self.cursor_row + 1..self.scroll_region_bottom + 1,
                             self.cursor_row,
                         );
-                        self.grid.row_ids[self.scroll_region_bottom] = RawRowId::fresh();
+                        self.grid.row_ids_mut()[self.scroll_region_bottom] = fresh_raw_row_id();
                         self.grid.bump_identity_revision();
                     }
                 }
@@ -10225,7 +9219,7 @@ impl TerminalState {
                     foreground: Color::Default,
                     background: Color::Default,
                     flags: StyleFlags::default(),
-                    hyperlink: 0,
+                    hyperlink_id: HyperlinkId::NONE,
                 };
             }
         }
@@ -10318,15 +9312,7 @@ impl TerminalState {
         // visible placement nor a half-finished upload may survive it. The
         // parser-side state of an in-flight transfer goes with it.
         self.kitty_graphics.clear();
-        self.pending_apc.clear();
-        self.pending_apc_scan_from = 0;
-        self.discarding_oversized_apc = false;
-        self.discarding_apc_prev_escape = false;
-        // The other in-flight string states go with the reset as well.
-        self.pending_osc.clear();
-        self.pending_osc_scan_from = 0;
-        self.pending_dcs.clear();
-        self.pending_dcs_scan_from = 0;
+        self.parser.reset();
         self.clear_screen();
     }
 
@@ -10385,7 +9371,7 @@ impl TerminalState {
                     foreground: Color::Default,
                     background: bg_color,
                     flags: StyleFlags::default(),
-                    hyperlink: 0,
+                    hyperlink_id: HyperlinkId::NONE,
                 };
             }
         }
@@ -10993,11 +9979,11 @@ impl TerminalState {
 
         let cursor_row = self.cursor_row.min(rows - 1);
         let mut first = cursor_row;
-        while first > 0 && self.grid.row_wrapped[first - 1] {
+        while first > 0 && self.grid.row_wrapped()[first - 1] {
             first -= 1;
         }
         let mut last = cursor_row;
-        while last + 1 < rows && self.grid.row_wrapped[last] {
+        while last + 1 < rows && self.grid.row_wrapped()[last] {
             last += 1;
         }
 
@@ -11219,9 +10205,9 @@ impl TerminalState {
         let grid_layouts = self.grid.iter().enumerate().map(|(grid_row, cells)| {
             RawRowLayout::from_cells(
                 cells,
-                self.grid.row_wrapped[grid_row],
+                self.grid.row_wrapped()[grid_row],
                 history_len + grid_row,
-                self.grid.row_ids[grid_row],
+                self.grid.row_ids()[grid_row],
             )
         });
         ProjectionPlan::identity(history_layouts, grid_layouts, cols.max(1))
@@ -11354,7 +10340,7 @@ impl TerminalState {
                 } else {
                     *self
                         .grid
-                        .row_wrapped
+                        .row_wrapped()
                         .get(previous - self.scrollback.len())?
                 };
                 (!wrapped && (background || self.spacing_prompt_rows.contains(&row))).then_some(row)
@@ -11384,10 +10370,10 @@ impl TerminalState {
             .rev()
             .take_while(|&row| {
                 self.scrollback.len() + row >= protected
-                    && !self.grid.row_wrapped[row]
+                    && !self.grid.row_wrapped()[row]
                     && row
                         .checked_sub(1)
-                        .is_none_or(|previous| !self.grid.row_wrapped[previous])
+                        .is_none_or(|previous| !self.grid.row_wrapped()[previous])
                     && self.grid[row]
                         .iter()
                         .all(|cell| *cell == TerminalCell::default())
@@ -11406,7 +10392,7 @@ impl TerminalState {
                     self.scrollback[previous].is_wrapped
                 } else {
                     self.grid
-                        .row_wrapped
+                        .row_wrapped()
                         .get(previous - self.scrollback.len())
                         .copied()
                         .unwrap_or(true)
@@ -11669,9 +10655,9 @@ impl TerminalState {
         let grid_layouts = self.grid.iter().enumerate().map(|(index, cells)| {
             RawRowLayout::from_cells(
                 cells,
-                self.grid.row_wrapped[index],
+                self.grid.row_wrapped()[index],
                 scrolled + index,
-                self.grid.row_ids[index],
+                self.grid.row_ids()[index],
             )
         });
         let mut suffix = ProjectionPlan::identity(history_layouts, grid_layouts, key.cols)
@@ -11755,11 +10741,11 @@ impl TerminalState {
             history_len: self.scrollback.len(),
             scrollback_pushes: self.scrollback_pushes,
             full_screen_scroll_revision: self.full_screen_scroll_revision,
-            grid_row_ids: self.grid.row_ids.iter().copied().collect(),
+            grid_row_ids: self.grid.row_ids().iter().copied().collect(),
             row_identity_revision: self.grid.identity_revision,
             rows: self.grid.rows(),
             cols,
-            row_wrapped: self.grid.row_wrapped.iter().copied().collect(),
+            row_wrapped: self.grid.row_wrapped().iter().copied().collect(),
             policy_revision: policy.revision(),
             policy_ids: policy.ids(),
             block_spacing: policy.block_spacing,
@@ -11941,7 +10927,7 @@ impl TerminalState {
     fn live_view_provenance(&self, rows: usize, cols: usize) -> ProjectedProvenance {
         let mut origin_spans = Vec::with_capacity(rows);
         let mut row_sources = Vec::with_capacity(rows);
-        for (view_row, raw_row) in self.grid.row_ids.iter().copied().take(rows).enumerate() {
+        for (view_row, raw_row) in self.grid.row_ids().iter().copied().take(rows).enumerate() {
             let source = raw_row.is_tracked().then_some(RowSource {
                 raw_row,
                 raw_absolute_row: self.scrollback.len() + view_row,
@@ -12001,7 +10987,7 @@ impl TerminalState {
             }));
         }
 
-        for (grid_row, raw_row) in self.grid.row_ids.iter().copied().enumerate() {
+        for (grid_row, raw_row) in self.grid.row_ids().iter().copied().enumerate() {
             let view_row = history_rows + grid_row;
             if view_row >= rows {
                 break;
@@ -12648,7 +11634,7 @@ impl TerminalState {
             .position(|line| line.raw_row_id() == raw_row)
             .or_else(|| {
                 self.grid
-                    .row_ids
+                    .row_ids()
                     .iter()
                     .position(|row| *row == raw_row)
                     .map(|grid_row| self.scrollback.len() + grid_row)
@@ -13035,7 +12021,7 @@ impl TerminalState {
 
         if self.scroll_offset == 0 {
             // Fast path: just get current grid wrapped flags
-            self.grid.row_wrapped.clone()
+            self.grid.row_wrapped().to_vec()
         } else {
             // Slow path: need to reconstruct from scrollback
             // For simplicity, when scrolling we disable wrapped link detection
@@ -13117,7 +12103,7 @@ impl TerminalState {
             && key.row_identity_revision == self.grid.identity_revision
             && key.rows == self.grid.rows()
             && key.cols == self.grid.row_len().max(1)
-            && key.row_wrapped.as_slice() == self.grid.row_wrapped.as_slice()
+            && key.row_wrapped.as_slice() == self.grid.row_wrapped()
             && key.next_zone_id == self.next_zone_id
             && key.zone_count == self.command_zones.len()
             && key.provenance_count == self.finished_output_provenance.len()
@@ -13951,7 +12937,7 @@ impl TerminalState {
                     self.scrollback[abs_row].is_wrapped
                 } else {
                     let grid_row = abs_row - scrollback_len;
-                    grid_row < grid_rows && self.grid.row_wrapped[grid_row]
+                    grid_row < grid_rows && self.grid.row_wrapped()[grid_row]
                 };
 
                 if abs_row < scrollback_len {
@@ -14019,7 +13005,7 @@ impl TerminalState {
             && cells[end - 1].background == Color::Default
             && !cells[end - 1].flags.wide()
             && !cells[end - 1].flags.wide_continuation()
-            && cells[end - 1].hyperlink == 0
+            && cells[end - 1].hyperlink_id.is_none()
         {
             end -= 1;
         }
@@ -14267,16 +13253,18 @@ impl TerminalState {
                 for r in 0..top_remove {
                     let line = ScrollbackLine::compress_with_raw_row_id(
                         &self.grid[r],
-                        self.grid.row_wrapped[r],
-                        self.grid.row_ids[r],
+                        self.grid.row_wrapped()[r],
+                        self.grid.row_ids()[r],
                     );
                     self.push_scrollback_compressed(line);
                 }
                 let src_start = top_remove * cols_now;
                 let total = old_rows * cols_now;
-                self.grid.cells.copy_within(src_start..total, 0);
-                self.grid.row_wrapped.copy_within(top_remove..old_rows, 0);
-                self.grid.row_ids.copy_within(top_remove..old_rows, 0);
+                self.grid.cells_mut().copy_within(src_start..total, 0);
+                self.grid
+                    .row_wrapped_mut()
+                    .copy_within(top_remove..old_rows, 0);
+                self.grid.row_ids_mut().copy_within(top_remove..old_rows, 0);
                 self.grid.bump_identity_revision();
                 self.cursor_row -= top_remove;
                 self.saved_cursor_row = self.saved_cursor_row.saturating_sub(top_remove);
@@ -16144,14 +15132,67 @@ mod tests {
     }
 
     use super::{
-        AgentPromptStatus, ClipboardReadKind, Color, CursorShape, IdleBackgroundOutput,
-        ScrollbackLine, TerminalCell, TerminalState, ZoneOutputExport, MAX_COMMAND_ZONES,
-        MAX_OSC8_ID_BYTES, MAX_OSC8_URI_BYTES, MAX_PENDING_ESCAPE, MAX_TERMINAL_TITLE_CHARS,
+        AgentPromptStatus, ClipboardReadKind, Color, CursorShape, HyperlinkId,
+        IdleBackgroundOutput, ScrollbackLine, TerminalCell, TerminalState, ZoneOutputExport,
+        MAX_COMMAND_ZONES, MAX_OSC8_ID_BYTES, MAX_OSC8_URI_BYTES, MAX_PENDING_ESCAPE,
+        MAX_TERMINAL_TITLE_CHARS,
     };
 
     fn osc8_spans(terminal: &mut TerminalState) -> Vec<crate::link::Link> {
         let visible = terminal.get_visible_cells();
         terminal.osc8_links_in_visible_cells(visible.as_ref())
+    }
+
+    #[test]
+    fn shared_engine_cells_preserve_frost_compressed_bytes() {
+        let mut cell: jterm_engine::TerminalCell = TerminalCell {
+            character: 'A',
+            hyperlink_id: HyperlinkId::from_raw(0x1234),
+            ..Default::default()
+        };
+        cell.flags.set_bold(true);
+        cell.flags.set_blink(true);
+        // Frost's retained format includes blink in extra_flags, unlike the
+        // engine's current scrollback format. Only the cell types are shared.
+        let encoded = ScrollbackLine::encode_cells(&[cell]);
+        assert_eq!(encoded, [1, b'A', 0, 0, 1, 4, 0x34, 0x12, 1]);
+        assert_eq!(ScrollbackLine::decode_cells(&encoded, 1), [cell]);
+        let mut streamed = Vec::new();
+        ScrollbackLine::visit_encoded_cells(&encoded, 1, |col, decoded| {
+            streamed.push((col, decoded));
+        });
+        assert_eq!(streamed, [(0, cell)]);
+        assert_eq!(std::mem::size_of::<TerminalCell>(), 16);
+    }
+
+    #[test]
+    fn opaque_hyperlink_ids_still_require_frost_interner_and_opener() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.process_batch(b"\x1b]8;;https://example.com/x\x1b\\L");
+        let valid: jterm_engine::TerminalCell = terminal.grid[0][0];
+        assert!(!valid.hyperlink_id.is_none());
+        assert_eq!(
+            terminal.osc8_links_in_visible_cells(&[vec![valid]]).len(),
+            1
+        );
+
+        for hyperlink_id in [HyperlinkId::NONE, HyperlinkId::from_raw(u16::MAX)] {
+            let forged = TerminalCell {
+                hyperlink_id,
+                ..valid
+            };
+            assert!(terminal
+                .osc8_links_in_visible_cells(&[vec![forged]])
+                .is_empty());
+        }
+        // Even a key that exists cannot bypass the host's URL-opening policy.
+        terminal.osc8_hyperlinks[0] = std::sync::Arc::new(super::Osc8Hyperlink {
+            uri: "file:///etc/passwd".into(),
+            id: None,
+        });
+        assert!(terminal
+            .osc8_links_in_visible_cells(&[vec![valid]])
+            .is_empty());
     }
 
     #[test]
@@ -16465,7 +15506,7 @@ mod tests {
         wide[1].flags.set_wide_continuation(true);
         terminal.push_scrollback_compressed(ScrollbackLine::compress(&wide, true));
         terminal.grid.get_mut(0, 0).character = 'G';
-        terminal.grid.row_wrapped[0] = true;
+        terminal.grid.row_wrapped_mut()[0] = true;
 
         let plan = terminal.identity_projection_plan(1);
         assert_eq!(
@@ -16477,7 +15518,7 @@ mod tests {
         assert_eq!(
             plan.rows[1].row_source,
             Some(super::RowSource {
-                raw_row: terminal.grid.row_ids[0],
+                raw_row: terminal.grid.row_ids()[0],
                 raw_absolute_row: 1,
             })
         );
@@ -16493,7 +15534,7 @@ mod tests {
         let mut terminal = TerminalState::new(6, 2);
         terminal.grid.get_mut(0, 0).character = 'x';
         terminal.grid.get_mut(1, 0).character = 'g';
-        terminal.grid.row_ids[1] = super::RawRowId::UNTRACKED;
+        terminal.grid.row_ids_mut()[1] = super::RawRowId::UNTRACKED;
         let mut history_cells = vec![TerminalCell::default(); 6];
         history_cells[0].character = 'h';
         history_cells[1].foreground = Color::Red;
@@ -16514,7 +15555,7 @@ mod tests {
         assert_eq!(
             plan.rows[1].row_source,
             Some(super::RowSource {
-                raw_row: terminal.grid.row_ids[0],
+                raw_row: terminal.grid.row_ids()[0],
                 raw_absolute_row: 1,
             })
         );
@@ -16582,7 +15623,7 @@ mod tests {
         assert!(projection.is_identity());
         assert!(projection.uses_identity_fast_path());
         assert_eq!(projection.cells(), expected.as_ref());
-        assert_eq!(projection.row_wrapped(), terminal.grid.row_wrapped);
+        assert_eq!(projection.row_wrapped(), terminal.grid.row_wrapped());
         assert!(std::sync::Arc::ptr_eq(&expected, &projection.cells));
 
         for (row, row_id) in row_ids.into_iter().enumerate() {
@@ -16707,11 +15748,11 @@ mod tests {
             .expect("bound provenance");
         let row = terminal
             .grid
-            .row_ids
+            .row_ids()
             .iter()
             .position(|row| *row == range.start.row)
             .expect("range row retained");
-        terminal.grid.row_ids[row] = super::RawRowId::fresh();
+        terminal.grid.row_ids_mut()[row] = super::fresh_raw_row_id();
         assert_eq!(terminal.finished_output_range(zone_id), None);
     }
 
@@ -19587,7 +18628,7 @@ mod tests {
         // SGR parameter, producing this exact ESC [ 3 CR LF 3 m shape.
         terminal.process_input(b"A\x1b[3\r\n3mB\x1b[mC");
 
-        assert!(terminal.pending_escape.is_empty());
+        assert!(terminal.parser.snapshot().pending_escape.is_empty());
         assert_eq!(terminal.cursor_row, 1);
         assert_eq!(terminal.grid[1][0].character, 'B');
         assert_eq!(terminal.grid[1][0].foreground, Color::Yellow);
@@ -19601,11 +18642,11 @@ mod tests {
 
         terminal.process_input(b"\x1b[3\r\n");
         assert_eq!(terminal.cursor_row, 1);
-        assert_eq!(terminal.pending_escape, b"\x1b[3");
+        assert_eq!(terminal.parser.snapshot().pending_escape, b"\x1b[3");
 
         terminal.process_input(b"3mX");
 
-        assert!(terminal.pending_escape.is_empty());
+        assert!(terminal.parser.snapshot().pending_escape.is_empty());
         assert_eq!(terminal.cursor_row, 1);
         assert_eq!(terminal.grid[1][0].character, 'X');
         assert_eq!(terminal.grid[1][0].foreground, Color::Yellow);
@@ -19793,8 +18834,13 @@ mod tests {
         let mut terminal = TerminalState::new(8, 2);
         terminal.process_input(b"\x1b_Gi=52,f=32,s=1,v=1;");
         assert_eq!(
-            terminal.pending_apc_scan_from,
-            terminal.pending_apc.len().saturating_sub(1)
+            terminal.parser.snapshot().pending_apc_scan_from,
+            terminal
+                .parser
+                .snapshot()
+                .pending_apc
+                .len()
+                .saturating_sub(1)
         );
 
         for fragment in [
@@ -19803,17 +18849,25 @@ mod tests {
             b"BA".as_slice(),
             b"==".as_slice(),
         ] {
-            let old_len = terminal.pending_apc.len();
+            let old_len = terminal.parser.snapshot().pending_apc.len();
             terminal.process_input(fragment);
-            assert_eq!(terminal.pending_apc.len(), old_len + fragment.len());
             assert_eq!(
-                terminal.pending_apc_scan_from,
-                terminal.pending_apc.len().saturating_sub(1),
+                terminal.parser.snapshot().pending_apc.len(),
+                old_len + fragment.len()
+            );
+            assert_eq!(
+                terminal.parser.snapshot().pending_apc_scan_from,
+                terminal
+                    .parser
+                    .snapshot()
+                    .pending_apc
+                    .len()
+                    .saturating_sub(1),
                 "unterminated fragments must resume scanning at the previous tail"
             );
         }
         terminal.process_input(b"\x1b\\");
-        assert!(terminal.pending_apc.is_empty());
+        assert!(terminal.parser.snapshot().pending_apc.is_empty());
         assert!(terminal.kitty_graphics.get_image(52).is_some());
         let _ = terminal.get_output();
 
@@ -19823,8 +18877,8 @@ mod tests {
         let mut oversized = b"\x1b_Ga=p,i=53,q=0;".to_vec();
         oversized.resize(MAX_PENDING_ESCAPE + 1, b'A');
         terminal.process_input(&oversized);
-        assert!(terminal.pending_apc.is_empty());
-        assert!(terminal.discarding_oversized_apc);
+        assert!(terminal.parser.snapshot().pending_apc.is_empty());
+        assert!(terminal.parser.snapshot().discarding_oversized_apc);
         let response = terminal.get_output();
         assert!(
             response.starts_with(b"\x1b_Gi=53;EINVAL:"),
@@ -19836,7 +18890,7 @@ mod tests {
         // Discard through ST without allocating the oversized packet, then
         // resume ordinary terminal parsing on the same input batch.
         terminal.process_input(b"\x1b\\Z");
-        assert!(!terminal.discarding_oversized_apc);
+        assert!(!terminal.parser.snapshot().discarding_oversized_apc);
         assert_eq!(terminal.grid[0][0].character, 'Z');
 
         // The bytes after ST belong to the normal stream, not the APC. Even
@@ -19847,8 +18901,8 @@ mod tests {
         near_limit.resize(MAX_PENDING_ESCAPE - 2, b'A');
         terminal.process_input(&near_limit);
         terminal.process_input(b"\x1b\\Y");
-        assert!(!terminal.discarding_oversized_apc);
-        assert!(terminal.pending_apc.is_empty());
+        assert!(!terminal.parser.snapshot().discarding_oversized_apc);
+        assert!(terminal.parser.snapshot().pending_apc.is_empty());
         assert_eq!(terminal.grid[0][1].character, 'Y');
     }
 
@@ -19882,23 +18936,36 @@ mod tests {
         let mut terminal = TerminalState::new(16, 2);
         terminal.process_input(b"\x1b]0;ti");
         assert_eq!(
-            terminal.pending_osc_scan_from,
-            terminal.pending_osc.len().saturating_sub(1)
+            terminal.parser.snapshot().pending_osc_scan_from,
+            terminal
+                .parser
+                .snapshot()
+                .pending_osc
+                .len()
+                .saturating_sub(1)
         );
 
         for fragment in [b"tl".as_slice(), b"e-".as_slice(), b"x".as_slice()] {
-            let old_len = terminal.pending_osc.len();
+            let old_len = terminal.parser.snapshot().pending_osc.len();
             terminal.process_input(fragment);
-            assert_eq!(terminal.pending_osc.len(), old_len + fragment.len());
             assert_eq!(
-                terminal.pending_osc_scan_from,
-                terminal.pending_osc.len().saturating_sub(1),
+                terminal.parser.snapshot().pending_osc.len(),
+                old_len + fragment.len()
+            );
+            assert_eq!(
+                terminal.parser.snapshot().pending_osc_scan_from,
+                terminal
+                    .parser
+                    .snapshot()
+                    .pending_osc
+                    .len()
+                    .saturating_sub(1),
                 "unterminated fragments must resume scanning at the previous tail"
             );
         }
         assert_eq!(terminal.window_title, "");
         terminal.process_input(b"\x07Z");
-        assert!(terminal.pending_osc.is_empty());
+        assert!(terminal.parser.snapshot().pending_osc.is_empty());
         assert_eq!(terminal.window_title, "title-x");
         // Bytes after the BEL are ordinary input again.
         assert_eq!(terminal.grid[0][0].character, 'Z');
@@ -19910,11 +18977,16 @@ mod tests {
         // The ESC introducing ST ends one read; the `\` opens the next.
         terminal.process_input(b"\x1b]2;win\x1b");
         assert_eq!(
-            terminal.pending_osc_scan_from,
-            terminal.pending_osc.len().saturating_sub(1)
+            terminal.parser.snapshot().pending_osc_scan_from,
+            terminal
+                .parser
+                .snapshot()
+                .pending_osc
+                .len()
+                .saturating_sub(1)
         );
         terminal.process_input(b"\\Y");
-        assert!(terminal.pending_osc.is_empty());
+        assert!(terminal.parser.snapshot().pending_osc.is_empty());
         assert_eq!(terminal.window_title, "win");
         assert_eq!(terminal.grid[0][0].character, 'Y');
 
@@ -19923,7 +18995,7 @@ mod tests {
         terminal.process_input(b"\x1b]0;a\x1b");
         terminal.process_input(b"Xb\x07");
         assert!(terminal.window_title.is_empty());
-        assert!(!terminal.pending_dcs.is_empty());
+        assert!(!terminal.parser.snapshot().pending_string.is_empty());
         assert_eq!(terminal.grid[0][0].character, ' ');
     }
 
@@ -19966,7 +19038,7 @@ mod tests {
         crossing.resize(MAX_PENDING_ESCAPE + 8, b'A');
         crossing.extend_from_slice(b"\x07");
         terminal.process_input(&crossing);
-        assert!(terminal.pending_osc.is_empty());
+        assert!(terminal.parser.snapshot().pending_osc.is_empty());
         assert!(terminal.window_title.starts_with("huge"));
 
         // Without a terminator the prefix is retained past the cap, then
@@ -19976,9 +19048,9 @@ mod tests {
         let mut oversized = b"\x1b]0;never".to_vec();
         oversized.resize(MAX_PENDING_ESCAPE + 8, b'A');
         terminal.process_input(&oversized);
-        assert!(!terminal.pending_osc.is_empty());
+        assert!(!terminal.parser.snapshot().pending_osc.is_empty());
         terminal.process_input(b"tail\x07");
-        assert!(terminal.pending_osc.is_empty());
+        assert!(terminal.parser.snapshot().pending_osc.is_empty());
         assert_eq!(terminal.window_title, "");
         assert_eq!(terminal.grid[0][0].character, 't');
         assert_eq!(terminal.grid[0][1].character, 'a');
@@ -19991,12 +19063,17 @@ mod tests {
         let mut terminal = TerminalState::new(16, 2);
         terminal.process_input(b"\x1bP1$r");
         assert_eq!(
-            terminal.pending_dcs_scan_from,
-            terminal.pending_dcs.len().saturating_sub(1)
+            terminal.parser.snapshot().pending_string_scan_from,
+            terminal
+                .parser
+                .snapshot()
+                .pending_string
+                .len()
+                .saturating_sub(1)
         );
         terminal.process_input(b"more-payload\x1b");
         terminal.process_input(b"\\Q");
-        assert!(terminal.pending_dcs.is_empty());
+        assert!(terminal.parser.snapshot().pending_string.is_empty());
         // The DCS payload is dropped; only the byte after ST lands.
         assert_eq!(terminal.grid[0][0].character, 'Q');
 
@@ -20004,10 +19081,10 @@ mod tests {
         let mut terminal = TerminalState::new(16, 2);
         terminal.process_input(b"\x1bXsos-payload");
         terminal.process_input(b"\x1b\\");
-        assert!(terminal.pending_dcs.is_empty());
+        assert!(terminal.parser.snapshot().pending_string.is_empty());
         terminal.process_input(b"\x1b^pm-payload\x1b");
         terminal.process_input(b"\\W");
-        assert!(terminal.pending_dcs.is_empty());
+        assert!(terminal.parser.snapshot().pending_string.is_empty());
         assert_eq!(terminal.grid[0][0].character, 'W');
 
         // BEL does not terminate a DCS, and an oversized prefix is abandoned
@@ -20016,9 +19093,9 @@ mod tests {
         let mut oversized = b"\x1bPpayload-with-bel\x07".to_vec();
         oversized.resize(MAX_PENDING_ESCAPE + 8, b'A');
         terminal.process_input(&oversized);
-        assert!(!terminal.pending_dcs.is_empty());
+        assert!(!terminal.parser.snapshot().pending_string.is_empty());
         terminal.process_input(b"S");
-        assert!(terminal.pending_dcs.is_empty());
+        assert!(terminal.parser.snapshot().pending_string.is_empty());
         assert_eq!(terminal.grid[0][0].character, 'S');
     }
 
@@ -20703,7 +19780,7 @@ mod tests {
         assert_eq!(terminal.cursor_row, 1);
         assert_eq!(terminal.cursor_col, 1);
         assert_eq!(terminal.grid[1][0].character, 'X');
-        assert!(terminal.grid.row_wrapped[0]);
+        assert!(terminal.grid.row_wrapped()[0]);
     }
 
     #[test]
@@ -21497,7 +20574,7 @@ mod tests {
         assert!(if output_start < terminal.scrollback.len() {
             terminal.scrollback[output_start].is_wrapped
         } else {
-            terminal.grid.row_wrapped[output_start - terminal.scrollback.len()]
+            terminal.grid.row_wrapped()[output_start - terminal.scrollback.len()]
         });
         assert_eq!(terminal.zone_output_line_row(id, 0), None);
         assert_eq!(terminal.zone_output_line_row(id, 1), Some(output_start));
@@ -21947,7 +21024,7 @@ mod tests {
                 assert_eq!(terminal.get_cursor_pos(), cursor);
                 terminal.process_batch(b"Z");
                 assert_eq!(terminal.get_cursor_pos(), (1, 1));
-                assert!(terminal.grid.row_wrapped[0]);
+                assert!(terminal.grid.row_wrapped()[0]);
                 assert_eq!(terminal.grid.get(1, 0).character, 'Z');
             }
         }
@@ -21972,7 +21049,7 @@ mod tests {
                                 expected.process_batch(setup.as_bytes());
                                 let row = actual.cursor_row;
                                 let row_id = actual.grid.raw_row_id(row);
-                                let wraps = actual.grid.row_wrapped.clone();
+                                let wraps = actual.grid.row_wrapped().to_vec();
                                 let cursor = actual.get_cursor_pos();
                                 let pending_wrap = actual.pending_wrap;
                                 // Prime the visible cache before changing cells.
@@ -22003,7 +21080,7 @@ mod tests {
                                 );
                                 assert!(actual.row_versions[row] > before_version);
                                 assert_eq!(actual.grid.raw_row_id(row), row_id);
-                                assert_eq!(actual.grid.row_wrapped, wraps);
+                                assert_eq!(actual.grid.row_wrapped(), wraps);
                                 assert_eq!(actual.get_cursor_pos(), cursor);
                                 assert_eq!(actual.pending_wrap, pending_wrap);
                             }
@@ -22923,11 +22000,11 @@ mod tests {
             let mut oversized = b"\x1b_Gi=1;".to_vec();
             oversized.resize(MAX_PENDING_ESCAPE + 1, b'A');
             terminal.process_input(&oversized);
-            assert!(terminal.discarding_oversized_apc);
+            assert!(terminal.parser.snapshot().discarding_oversized_apc);
             for byte in suffix {
                 terminal.process_input(&[*byte]);
             }
-            assert!(!terminal.discarding_oversized_apc);
+            assert!(!terminal.parser.snapshot().discarding_oversized_apc);
             assert_eq!(terminal.grid[0][0].character, 'o');
             assert_eq!(terminal.grid[0][1].character, 'k');
         }
@@ -23509,7 +22586,7 @@ mod block_spacing_tests {
         terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b[19;1H");
         terminal.process_input(b"                         ");
         terminal.process_input(b"\x1b[1;3H");
-        assert!(terminal.grid.row_wrapped[18]);
+        assert!(terminal.grid.row_wrapped()[18]);
         assert!(terminal.grid[19]
             .iter()
             .all(|cell| *cell == TerminalCell::default()));
@@ -23719,7 +22796,7 @@ mod block_spacing_tests {
                 if let Some(raw) = view.view_to_raw(ViewportCell { row, col }) {
                     assert_eq!(view.raw_to_view(raw), Some(ViewportCell { row, col }));
                     if cell.character == 'L' {
-                        assert_ne!(cell.hyperlink, 0, "OSC 8 survives the transform");
+                        assert!(!cell.hyperlink_id.is_none(), "OSC 8 survives the transform");
                     }
                 }
             }
@@ -23831,7 +22908,7 @@ mod block_spacing_tests {
         );
         let mut wrapped = fixture(24, 8);
         let boundary = wrapped.command_zones[1].prompt_start;
-        wrapped.grid.row_wrapped[boundary - 1] = true;
+        wrapped.grid.row_wrapped_mut()[boundary - 1] = true;
         let plan = wrapped.collapsed_projection_plan(24, &normal());
         assert_eq!(
             spacer_count(&plan),
@@ -24097,7 +23174,7 @@ impl ScrollbackLine {
                 foreground: fg,
                 background: bg,
                 flags,
-                hyperlink,
+                hyperlink_id: HyperlinkId::from_raw(hyperlink),
             };
             for _ in 0..run {
                 cells.push(cell);
@@ -24117,7 +23194,7 @@ mod decoder_parity {
         let cell = TerminalCell {
             character: 'İ',
             foreground: Color::Rgb(1, 2, 3),
-            hyperlink: 65535,
+            hyperlink_id: HyperlinkId::from_raw(65535),
             ..Default::default()
         };
         for n in [0, 1, 254, 255, 256, 510, 511, 600] {

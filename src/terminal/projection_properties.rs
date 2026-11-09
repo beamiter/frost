@@ -142,7 +142,7 @@ fn eager_rows(raw: &[Raw], width: usize) -> Vec<Vec<Token>> {
                 || c.background != Color::Default
                 || c.flags.wide()
                 || c.flags.wide_continuation()
-                || c.hyperlink != 0
+                || !c.hyperlink_id.is_none()
             {
                 break;
             }
@@ -647,7 +647,7 @@ fn check_dense_collapse_case(
     let mut terminal = TerminalState::new(width, original.len());
     for (row, cells) in original.iter().enumerate() {
         terminal.grid.set_row(row, cells.clone());
-        terminal.grid.row_wrapped[row] = wrapped[row];
+        terminal.grid.row_wrapped_mut()[row] = wrapped[row];
     }
     let ids: Vec<_> = (0..original.len())
         .map(|row| terminal.grid.raw_row_id(row).unwrap())
@@ -1501,7 +1501,7 @@ fn partial_selection_fixture(case: usize) -> (TerminalState, Vec<Raw>) {
             0 | 1 => vec![TerminalCell::default(); length],
             2 => vec![
                 TerminalCell {
-                    hyperlink: 1 + rng.pick(u16::MAX as usize) as u16,
+                    hyperlink_id: HyperlinkId::from_raw(1 + rng.pick(u16::MAX as usize) as u16),
                     ..Default::default()
                 };
                 length
@@ -1520,7 +1520,8 @@ fn partial_selection_fixture(case: usize) -> (TerminalState, Vec<Raw>) {
         } else if kind >= 3 {
             for cell in &mut cells {
                 if cell.character != ' ' && rng.pick(3) == 0 {
-                    cell.hyperlink = 1 + rng.pick(u16::MAX as usize) as u16;
+                    cell.hyperlink_id =
+                        HyperlinkId::from_raw(1 + rng.pick(u16::MAX as usize) as u16);
                     cell.flags.set_blink(true);
                 }
             }
@@ -1737,14 +1738,14 @@ fn seeded_live_grid_raw_endpoint_copy_is_invariant_under_legal_chrome() {
                 } else if kind == 2 {
                     cells[col].background = Color::Indexed(17);
                     cells[col].flags.set_bold(true);
-                    cells[col].hyperlink = 1;
+                    cells[col].hyperlink_id = HyperlinkId::from_raw(1);
                 }
                 col += 1;
             }
             terminal.grid.set_row(row, cells.clone());
             original.push(cells);
             let soft = row + 1 < rows && rng.pick(2) == 0;
-            terminal.grid.row_wrapped[row] = soft;
+            terminal.grid.row_wrapped_mut()[row] = soft;
             wrapped.push(soft);
             let chrome_rows = 1 + rng.pick(3);
             boundaries.push(ChromeBoundary {

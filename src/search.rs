@@ -1698,7 +1698,11 @@ mod tests {
                     } else {
                         Color::Default
                     },
-                    hyperlink: if i % 2 == 0 { 7 } else { 0 },
+                    hyperlink_id: crate::terminal::HyperlinkId::from_raw(if i % 2 == 0 {
+                        7
+                    } else {
+                        0
+                    }),
                     ..Default::default()
                 };
                 cell.flags.set_bold(i % 2 == 0);
@@ -1715,7 +1719,7 @@ mod tests {
             // Hyperlink/style-only spaces are retained by compression but
             // trimmed by search, unlike colored spaces and continuations.
             let mut trailing = TerminalCell {
-                hyperlink: 8,
+                hyperlink_id: crate::terminal::HyperlinkId::from_raw(8),
                 ..Default::default()
             };
             trailing.flags.set_bold(true);
@@ -1874,7 +1878,7 @@ mod tests {
             let mut cell = TerminalCell::default();
             match kind {
                 0 => cell.flags.set_bold(true),
-                1 => cell.hyperlink = 7,
+                1 => cell.hyperlink_id = crate::terminal::HyperlinkId::from_raw(7),
                 2 => cell.foreground = Color::Blue,
                 3 => cell.background = Color::Blue,
                 _ => cell.flags.set_wide_continuation(true),
@@ -1904,7 +1908,7 @@ mod tests {
         let cell = TerminalCell {
             character: 'a',
             foreground: Color::Red,
-            hyperlink: 9,
+            hyperlink_id: crate::terminal::HyperlinkId::from_raw(9),
             ..Default::default()
         };
         let long = ScrollbackLine::compress(&vec![cell; 600], true);

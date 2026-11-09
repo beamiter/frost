@@ -119,7 +119,7 @@ impl TerminalState {
                 .enumerate()
                 .rev()
                 .find(|(row, cells)| {
-                    self.grid.row_wrapped[*row]
+                    self.grid.row_wrapped()[*row]
                         || cells.iter().any(|cell| *cell != TerminalCell::default())
                 })
                 .map_or(self.scrollback.len(), |(row, _)| {
@@ -170,7 +170,7 @@ impl TerminalState {
                     let absolute = self.scrollback.len() + row;
                     if running_command.is_some_and(|(start, end)| (start..end).contains(&absolute))
                     {
-                        return Some((self.grid.row_ids[row], self.row_versions[row]));
+                        return Some((self.grid.row_ids()[row], self.row_versions[row]));
                     }
                     let index = self
                         .command_zones
@@ -178,7 +178,7 @@ impl TerminalState {
                         .checked_sub(1)?;
                     let zone = &self.command_zones[index];
                     (zone.command.is_some() && zone.output_start.is_some_and(|end| absolute < end))
-                        .then_some((self.grid.row_ids[row], self.row_versions[row]))
+                        .then_some((self.grid.row_ids()[row], self.row_versions[row]))
                 })
                 .collect(),
         })
@@ -596,7 +596,7 @@ mod tests {
                         Some(ViewportCell { row, col })
                     );
                 }
-                if cell.hyperlink != 0 {
+                if !cell.hyperlink_id.is_none() {
                     assert!(view.view_to_raw(ViewportCell { row, col }).is_some());
                     assert_eq!(view.chat_rows()[row].role, ChatRole::Output);
                 }
@@ -877,7 +877,7 @@ mod tests {
         );
         prompt(&mut terminal);
         terminal.process_batch(b"/current/path");
-        let raw_wraps = terminal.grid.row_wrapped.clone();
+        let raw_wraps = terminal.grid.row_wrapped().to_vec();
         let detector = crate::link::LinkDetector::new(crate::link::LinkDetectionConfig::default());
         let mut state = ProjectionViewState::new();
         let initial = snapshot(&mut terminal, &mut state);
@@ -917,7 +917,7 @@ mod tests {
             ));
         }
         assert!(checked_seam && checked_contiguous);
-        assert_eq!(terminal.grid.row_wrapped, raw_wraps);
+        assert_eq!(terminal.grid.row_wrapped(), raw_wraps);
     }
 
     #[test]

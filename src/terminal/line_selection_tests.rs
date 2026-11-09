@@ -103,7 +103,7 @@ fn install(terminal: &mut TerminalState, plan: ProjectionPlan) {
         row_identity_revision: terminal.grid.identity_revision,
         rows: terminal.grid.rows(),
         cols: WIDTH,
-        row_wrapped: terminal.grid.row_wrapped.iter().copied().collect(),
+        row_wrapped: terminal.grid.row_wrapped().iter().copied().collect(),
         policy_revision: plan.policy_revision,
         policy_ids: Default::default(),
         block_spacing: false,
