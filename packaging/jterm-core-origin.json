@@ -1,16 +1,12 @@
 {
-  "published_core_commit": "4ffa774138ee89dc2916ce21786c45e411196ca4",
-  "published_core_tree": "708de59ad2ae3f67f6af58b23c0a4c1b61433f95",
-  "archive_sha256": "ac461b81f8002a63bde48e2c4ab57481a7c91a00f55792eccf82b959490d1be3",
-  "archive_members": 264,
-  "archive_files": 242,
-  "omitted_paths": 49,
-  "scope": "Cargo files, README.md, src/, runtime/, scripts/, tests/ and assets/ exported from the exact pinned local commit. Repository docs and CI files are excluded.",
-  "verification": "Archive bytes and executable bits exported from the exact Git commit; timestamps and owner IDs normalized.",
-  "publication_boundary": "Exact source commit verified on remote master. Application CI and desktop acceptance are tracked separately; this archive is not evidence of GUI acceptance.",
-  "source_nar_sha256": "sha256-CZinWRNrlmclrkzh9GbiKs/SEGraa5xlIL1GyIIljuk=",
-  "source_nar_verification": "Recomputed from the exact Git tree using NAR serialization on 2026-11-06, matching the published core hash. A native Nix build has not been run.",
-  "nar_baseline_commit": "f8566bb9cb6e9cca3258c8050c6dc4e9b96da8ff",
-  "nar_baseline_sha256": "sha256-zEC7/WI43Y4CiPCq+OStmEVcFzEGtnRVEMe+zOS2FYo=",
-  "nar_baseline_reproduced": true
+  "published_core_commit": "598f15808086dbea14d56fc1b86e77b6cb2e3201",
+  "published_core_tree": "895d71a78c46521bb5fb4715fc2b9603028c9ef7",
+  "archive_sha256": "ac4d3dc99c0a8ec99ca8b007e80cff66e9715f8d61921f2097f255c12c6d3eb9",
+  "archive_members": 312,
+  "archive_files": 283,
+  "omitted_paths": 54,
+  "scope": "Cargo files, README.md, src/, runtime/, scripts/, tests/, assets/ and crates/ (including the independent engine) from the exact pinned Git commit. Other repository files are excluded.",
+  "verification": "Every exported blob hash and executable bit was checked against the exact pinned Git tree. Archive timestamps and owner IDs are normalized. The generator exports Git objects, not working-tree files.",
+  "publication_boundary": "The published_core_* keys identify the Cargo-pinned release commit/tree. This local exporter does not verify remote availability or perform application builds.",
+  "source_nar_verification": "No NAR hash is asserted. This subset archive is not a complete Git export; its SHA-256 is not a recursive NAR hash."
 }

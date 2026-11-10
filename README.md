@@ -1250,12 +1250,13 @@ reads local history without modifying it or calling a model service.
 
 The four terminals use the shared `jterm_core` session catalog implementation.
 Frost production and development builds resolve the exact Cargo-locked Git commit
-`a6e47726d02bed2ca4a6ba1a682511f970853527`, not a sibling checkout. This source
+`598f15808086dbea14d56fc1b86e77b6cb2e3201`, not a sibling checkout. This source
 upgrade shares the engine parser and cell/grid primitives while retaining Frost
 projection, compression and terminal semantic policy. The engine uses the same
 Git revision as the session core. Shared runtime ownership and native visual
-acceptance are still unfinished. The checked-in `packaging/jterm-core-*` archive retains its historical
-revision and is not used by this exact-Git production path. Application CI and
+acceptance are still unfinished. The checked-in `packaging/jterm-core-*` archive exports verified immutable blobs
+from that same revision, including the independent engine. Its revision, Git tree
+and SHA-256 are recorded together; it is not used by the exact-Git production path. Application CI and
 cross-terminal native verification remain separate evidence.
 
 The session library ranks exact IDs and titles ahead of incidental preview matches.
