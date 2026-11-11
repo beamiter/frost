@@ -4222,7 +4222,7 @@ impl TerminalState {
     fn parse_color_spec(spec: &str) -> Option<(u8, u8, u8)> {
         // Parse rgb:RR/GG/BB or rgb:RRRR/GGGG/BBBB or #RRGGBB
         if let Some(hex) = spec.strip_prefix('#') {
-            if hex.len() == 6 {
+            if hex.len() == 6 && hex.is_ascii() {
                 let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
                 let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
                 let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
@@ -13530,6 +13530,85 @@ impl TerminalState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn color_spec_utf8_is_rejected_without_changing_ascii_semantics() {
+        for invalid in [
+            "#aéabc",
+            "#abcéa",
+            "#界abc",
+            "#a界ab",
+            "rgb:é/00/00",
+            "#zz0000",
+            "unknown",
+        ] {
+            assert_eq!(
+                super::TerminalState::parse_color_spec(invalid),
+                None,
+                "{invalid}"
+            );
+        }
+        for (spec, expected) in [
+            ("#a1B2c3", (161, 178, 195)),
+            ("#+1+2+3", (1, 2, 3)),
+            ("rgb:+1/ff/100", (1, 255, 0)),
+            ("rgb:ffff/8080/0000", (255, 128, 0)),
+            ("rgb:1/ff/100", (1, 255, 0)),
+            ("rgb:0100/ffff/0100", (0, 255, 0)),
+        ] {
+            assert_eq!(super::TerminalState::parse_color_spec(spec), Some(expected));
+        }
+    }
+
+    #[test]
+    fn color_spec_utf8_production_osc_preserves_state_and_emits_no_reply() {
+        for terminator in ["\x07", "\x1b\\"] {
+            for command in ["4;7", "10", "11", "12", "999"] {
+                for invalid in [
+                    "#aéabc",
+                    "#abcéa",
+                    "#界abc",
+                    "#a界ab",
+                    "rgb:é/00/00",
+                    "#zz0000",
+                    "unknown",
+                ] {
+                    let input = format!("\x1b]{command};{invalid}{terminator}");
+                    // Every byte split includes interior UTF-8 and ESC/ST boundaries.
+                    for split in 0..=input.len() {
+                        let mut terminal = super::TerminalState::new(10, 3);
+                        terminal.process_input(b"\x1b]4;7;#112233\x07\x1b]10;#445566\x07\x1b]11;#778899\x07\x1b]12;#aabbcc\x07");
+                        let before = (
+                            terminal.dynamic_palette,
+                            terminal.dynamic_fg,
+                            terminal.dynamic_bg,
+                            terminal.dynamic_cursor_color,
+                        );
+                        assert!(terminal.output_buffer.is_empty());
+                        terminal.process_input(&input.as_bytes()[..split]);
+                        terminal.process_input(&input.as_bytes()[split..]);
+                        assert_eq!(
+                            (
+                                terminal.dynamic_palette,
+                                terminal.dynamic_fg,
+                                terminal.dynamic_bg,
+                                terminal.dynamic_cursor_color
+                            ),
+                            before,
+                            "{command} {invalid} split {split}"
+                        );
+                        assert!(
+                            terminal.output_buffer.is_empty(),
+                            "invalid color emitted reply"
+                        );
+                        terminal.process_input(b"\x1b]10;#123456\x07\x1b]10;?\x1b\\");
+                        assert_eq!(terminal.dynamic_fg, Some((0x12, 0x34, 0x56)));
+                        assert_eq!(terminal.output_buffer, b"\x1b]10;rgb:1212/3434/5656\x1b\\");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn osc_133_requires_an_exact_marker_field() {
         let mut terminal = super::TerminalState::new(40, 8);
