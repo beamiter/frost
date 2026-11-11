@@ -91,11 +91,11 @@
     },
     {
       "path": "vendor/clipboard_x11/Cargo.toml",
-      "sha256": "ae33478b6d2df1e26f39c5dab682b03e6053c6a9ab804e6cbf9c975192abb48a"
+      "sha256": "25ba7e792bf623453527b507366c4310c31e82b5fc40a46179fdc2b5a480b0a4"
     },
     {
       "path": "vendor/clipboard_x11/Cargo.toml.orig",
-      "sha256": "724347d770658595226df9db78622119e3a874d6a525bee46db6f027b910e3aa"
+      "sha256": "414a05e18a733b6268f0d5c0db8bd6c4977e2a4751634426ad602786d8482b8c"
     },
     {
       "path": "vendor/clipboard_x11/LICENSE",
