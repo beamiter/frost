@@ -1,0 +1,11 @@
+--- original-production
++++ peek_not_pop
+@@ -7242,7 +7242,7 @@
+     }
+ 
+     fn restore_titles(&mut self, target: u16) {
+-        let Some((icon_title, window_title)) = self.title_stack.pop() else {
++        let Some((icon_title, window_title)) = self.title_stack.last().cloned() else {
+             return;
+         };
+         match target {

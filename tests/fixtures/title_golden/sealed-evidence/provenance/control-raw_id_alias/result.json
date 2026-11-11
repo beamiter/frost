@@ -1,0 +1,21 @@
+{
+  "caught": true,
+  "matched_records_before": 0,
+  "actual_record": "seed_0",
+  "expected_record": "seed_0",
+  "different_lanes": [
+    "grid",
+    "projected_viewport_cache",
+    "retained_view",
+    "scrollback"
+  ],
+  "actual_record_sha256": "77873072f6f7278215bcd8546ff1b7c0058d99d23b6c388d44cbe9fc4db16ca2",
+  "expected_record_sha256": "c3559000c56dde4f1d439bfefc4e72b0727e0d2d249311fd75bb752e81d3d178",
+  "name": "raw_id_alias",
+  "production_sha256": "d7b7f995347a3cb421f030d61529bf1051c64c14f8eec22165e7f92909658e63",
+  "worker_exit": -15,
+  "stream_intentionally_stopped_at_first_difference": true,
+  "partial_stream_bytes": 262144,
+  "counterexample_sha256": "e09d5670d6cadb12fbbc84729b3f82e9aa9eb03bc6f1f17079321121d67c78d2",
+  "partial_stream_retained": false
+}

@@ -5840,14 +5840,14 @@ impl Session {
             (None, Some(d)) => d,
             (None, None) => format!("Session {}", self.id + 1),
         };
-        jterm_core::title_bar::tab_label(&self.terminal.window_title, &fallback)
+        jterm_core::title_bar::tab_label(self.terminal.window_title(), &fallback)
     }
 
     /// Pane-header title. Same preference order as [`Session::label`], minus
     /// the foreground process: the header shows that in its own field, and
     /// repeating it there would crowd out the directory.
     fn pane_title(&self) -> String {
-        let title = self.terminal.window_title.trim();
+        let title = self.terminal.window_title().trim();
         let title = if !title.is_empty() {
             title.to_string()
         } else {

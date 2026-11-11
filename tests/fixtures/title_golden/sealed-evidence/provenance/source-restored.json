@@ -1,0 +1,6 @@
+{
+  "production_sources_match": true,
+  "cargo_matches": true,
+  "observer_exact_original": true,
+  "controls": 8
+}

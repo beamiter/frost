@@ -1,0 +1,44 @@
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/wgpu-hal/src/gles/egl.rs:425:40
+    |
+425 |     pub unsafe fn get_without_egl_lock(&self) -> MappedMutexGuard<glow::Context> {
+    |                                        ^^^^^     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                                        |
+    |                                        the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+425 |     pub unsafe fn get_without_egl_lock(&self) -> MappedMutexGuard<'_, glow::Context> {
+    |                                                                   +++
+
+warning: `wgpu-hal` (lib) generated 1 warning (run `cargo fix --lib -p wgpu-hal` to apply 1 suggestion)
+warning: use of deprecated constant `std::u32::MAX`: replaced by the `MAX` associated constant on this type
+   --> vendor/clipboard_x11/src/lib.rs:275:37
+    |
+275 |                         ::std::u32::MAX, // FIXME reasonable buffer size
+    |                                     ^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: `clipboard_x11` (lib) generated 1 warning
+warning: use of deprecated method `iced_debug::iced_futures::futures::futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/iced_winit/src/lib.rs:566:55
+    |
+566 |         let event = if let Ok(event) = event_receiver.try_next() {
+    |                                                       ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `iced_debug::iced_futures::futures::futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/iced_winit/src/lib.rs:286:64
+    |
+286 |                     task::Poll::Pending => match self.receiver.try_next() {
+    |                                                                ^^^^^^^^
+
+warning: `iced_winit` (lib) generated 2 warnings
+   Compiling frost v0.1.0 (/workspace/scratch/9226dcee068a/recovery/resumed-family/frost-title-capture)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.66s
+  Executable unittests src/main.rs (/workspace/scratch/9226dcee068a/recovery/frost-color-target/debug/deps/frost-9eba07696053a4d1)
+  Executable tests/font_stack.rs (/workspace/scratch/9226dcee068a/recovery/frost-color-target/debug/deps/font_stack-db07cf7e3a4f1f5f)

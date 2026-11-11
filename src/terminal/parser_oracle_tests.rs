@@ -76,10 +76,10 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
     macro_rules! fields {
         ($($field:ident),* $(,)?) => {$(out.insert(stringify!($field).into(), lane(&t.$field));)*};
     }
+    out.insert("window_title".into(), lane(&t.titles.window_title));
+    out.insert("icon_title".into(), lane(&t.titles.icon_title));
+    out.insert("title_stack".into(), lane(&t.titles.title_stack));
     fields!(
-        window_title,
-        icon_title,
-        title_stack,
         current_working_dir,
         organism_idle_cwd,
         current_fg,

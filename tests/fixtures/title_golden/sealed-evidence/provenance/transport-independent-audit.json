@@ -1,0 +1,11 @@
+{
+  "records": 53992,
+  "lanes": 133,
+  "canonical_bytes": 3775893628,
+  "max_record_bytes": 92682,
+  "canonical_sha256": "1f67b934245c3a2d305e65b9527027e6e55b79af5c6b1417ab4ebfc5f2d3af08",
+  "byte_equal_original_gzip": true,
+  "exact_ids_order": true,
+  "system_zstd_decode_memory_limit": "8MB",
+  "corpus_sha256": "479e4118f0442a38eb999bd54fcb828bfc502e79d9fb3c9a6cb38cbe4e1de3f9"
+}

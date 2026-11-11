@@ -1250,9 +1250,11 @@ reads local history without modifying it or calling a model service.
 
 The four terminals use the shared `jterm_core` session catalog implementation.
 Frost production and development builds resolve the exact Cargo-locked Git commit
-`598f15808086dbea14d56fc1b86e77b6cb2e3201`, not a sibling checkout. This source
-upgrade shares the engine parser and cell/grid primitives while retaining Frost
-projection, compression and terminal semantic policy. The engine uses the same
+`e23a2efa3a1c1faeb1867e7b94ec7ad1c8823b22`, not a sibling checkout. This source
+upgrade shares the engine parser, cell/grid primitives and the 256-scalar
+`FrostTitleState` window/icon/title-stack owner. Frost retains title admission,
+outbound sanitization and RIS title retention, as well as projection, compression
+and remaining terminal semantic policy. The engine uses the same
 Git revision as the session core. Shared runtime ownership and native visual
 acceptance are still unfinished. The checked-in `packaging/jterm-core-*` archive exports verified immutable blobs
 from that same revision, including the independent engine. Its revision, Git tree

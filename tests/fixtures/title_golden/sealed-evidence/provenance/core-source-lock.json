@@ -1,0 +1,11 @@
+{
+  "commit": "598f15808086dbea14d56fc1b86e77b6cb2e3201",
+  "tree": "895d71a78c46521bb5fb4715fc2b9603028c9ef7",
+  "status": "?? .cargo-ok\n",
+  "files": {
+    "crates/jterm_engine/src/parser.rs": "922ad14f56a7514c624cb8094664d4169c5d204131338743e0ccd66e3f4dfcee",
+    "src/kitty_graphics.rs": "41fed4610548cb58ff0ef8d81e0257ca246df2cb13b62d27928de0d432e1e02e",
+    "crates/jterm_engine/src/frame.rs": "668e1fc247358e3ddc23d6567df995277d20d96dc842b2cf1f75b34ad485f15a",
+    "crates/jterm_engine/src/grid.rs": "4c25ab3ae5450987362220ae41cd2c9bd5b30623aef80f6888717e7b82cb018b"
+  }
+}

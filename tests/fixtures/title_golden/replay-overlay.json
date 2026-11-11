@@ -1,0 +1,23 @@
+{
+  "format": "frost-title-replay-overlay-v1",
+  "original_commit": "ada5ae0cb2ff14b5b1177128aec3595c534f3a27",
+  "consumer_core_commit": "e23a2efa3a1c1faeb1867e7b94ec7ad1c8823b22",
+  "expected": "sealed-evidence/frost-title-original.jsonl.zst",
+  "expected_sha256": "8dd591c50ade8546d6d438e1c08837ceaf59c2d2e9462bd9209e75987051887b",
+  "dev_dependency_edges": {
+    "zstd": "=0.14.3",
+    "sha2": "=0.10.9"
+  },
+  "observer_changes": [
+    "remove capture-only source guard in replay",
+    "map three title fields to single titles owner preserving labels and seeds",
+    "replace only transport/orchestration with bounded fresh Rust zstd replay"
+  ],
+  "helper_change": "same cfg(test) Kitty observer relocated before tests for Clippy; exact removal restores original complete file",
+  "source_sha256": {
+    "src/terminal/title_oracles.rs": "4742df0c42bfe86709a585a0792425bfd8403525fa381fc0a11aa373803428a6",
+    "src/terminal/title_replay_transport/mod.rs": "be58e6f3f123d921c547fa59f1c9dd53d405ef0337aa1fca3ddfadac5da86585",
+    "src/terminal/title_replay_transport/worker.rs": "f19d351eca1f4790fc002edc64bcad209f7ffbe830ec7f3e60e2ff83ef004a0f",
+    "src/terminal/title_replay_transport/lanes.rs": "4987c6bb2eec3c5f7eeb67acfba08239999d957f1a463774a68d78f5b94b2568"
+  }
+}

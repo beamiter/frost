@@ -1,0 +1,10 @@
+
+running 1 test
+test terminal::title_oracles::seed_preflight ... seed 0 lanes=133 bytes=63543
+seed 1 lanes=133 bytes=63912
+seed 2 lanes=133 bytes=75910
+seed 3 lanes=133 bytes=70184
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2152 filtered out; finished in 0.07s
+

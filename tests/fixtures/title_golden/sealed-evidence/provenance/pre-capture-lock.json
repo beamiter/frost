@@ -1,0 +1,11 @@
+{
+  "status": "original-production-before-capture",
+  "files": {
+    "observer.original.rs": "e4c95a1d298ae9ebd8d2e680ac8ba1c49256cba714e6e2418e445f2a26b1a8df",
+    "kitty-helper.original.rs": "f143c65cb3b8b6c0e18f48bc3d3e6140c3f7781eb5346652eb9480e47a20b010",
+    "registration.diff": "2c8e5a6a23c13d029b0b26c9e2e25b7bf3f6437183c8d4b110778d4390df42f9",
+    "corpus.json": "479e4118f0442a38eb999bd54fcb828bfc502e79d9fb3c9a6cb38cbe4e1de3f9",
+    "source-lock.json": "53d230f7c527cabda4c2877fa7e7df16c69234002659e6b7914258587771cc5c",
+    "core-source-lock.json": "25c11390d5e5bcce277097415baeb26608bd5bd31b2085de208f1252771d7fd5"
+  }
+}

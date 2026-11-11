@@ -1,0 +1,11 @@
+--- locked-observer
++++ control-guard
+@@ -613,7 +613,7 @@
+         .unwrap();
+     assert_eq!(
+         sha(&terminal),
+-        "4c76aa0fce582d9b1398ebea0a6f7673b0da126e0188864662abba7faed6d013"
++        "91baaa0847dd7fb2ed09cda8c1e3820c867712b7c57dba382424e217b4b62a9d"
+     );
+     assert_eq!(
+         sha(kitty),

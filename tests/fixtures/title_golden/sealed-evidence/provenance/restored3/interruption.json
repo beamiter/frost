@@ -1,0 +1,8 @@
+{
+  "status": "interrupted_on_executor_key_change",
+  "bytes": 46399488,
+  "size_and_mtime_stable_over_seconds": 2,
+  "driver_has_completion": false,
+  "old_session_resume_error": "executor key changed during session recovery",
+  "new_run_directory": "restored3_retry1"
+}

@@ -1,0 +1,10 @@
+{
+  "published_sha": "ada5ae0cb2ff14b5b1177128aec3595c534f3a27",
+  "tree": "23bfa3542fde645f6135fa3db52c6af01c5a9a79",
+  "files": {
+    "src/terminal.rs": "4c76aa0fce582d9b1398ebea0a6f7673b0da126e0188864662abba7faed6d013",
+    "src/kitty_graphics.rs": "4ec3977decb3782f6ad2fb83bb8a3a7c8566b6aafce2be149c1a4f913073f363",
+    "Cargo.toml": "227f9f43dae9bf878a399849aae3363fc71159959f8a8559eeb8025aaf4b6290",
+    "Cargo.lock": "be3abc7447dd55d1cca4e1caed3a1c24a0c9e288429baf22b38c93107af3f09d"
+  }
+}

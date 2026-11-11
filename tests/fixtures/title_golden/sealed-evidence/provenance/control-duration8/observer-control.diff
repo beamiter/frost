@@ -1,0 +1,20 @@
+--- locked-observer
++++ control-guard
+@@ -309,7 +309,7 @@
+     t.output_buffer.extend_from_slice(b"reply-sentinel");
+     // Seed-only explicit renderer call; no getter occurs during observation.
+     assert!(
+-        t.command_zones.iter().any(|z| z.duration_ms == Some(7)),
++        t.command_zones.iter().any(|z| z.duration_ms == Some(8)),
+         "seed must preserve explicit shell duration"
+     );
+     let retained_rows = t.get_visible_cells();
+@@ -613,7 +613,7 @@
+         .unwrap();
+     assert_eq!(
+         sha(&terminal),
+-        "4c76aa0fce582d9b1398ebea0a6f7673b0da126e0188864662abba7faed6d013"
++        "0fbfc35b0e1b40886e3d59d11cfbef17559081de66910185f6159b22f1db257e"
+     );
+     assert_eq!(
+         sha(kitty),

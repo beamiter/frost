@@ -1,0 +1,11 @@
+--- original-production
++++ wrong_outbound
+@@ -7306,7 +7306,7 @@
+             }
+             // Report icon label / window title.
+             20 => {
+-                let response = format!("\x1b]L{}\x1b\\", Self::sanitized_title(&self.icon_title));
++                let response = format!("\x1b]L{}\x1b\\", self.icon_title.clone());
+                 self.output_buffer.extend_from_slice(response.as_bytes());
+             }
+             21 => {

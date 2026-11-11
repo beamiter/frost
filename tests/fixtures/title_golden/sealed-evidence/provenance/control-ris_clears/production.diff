@@ -1,0 +1,10 @@
+--- original-production
++++ ris_clears
+@@ -9259,6 +9259,7 @@
+ 
+     /// RIS (ESC c): reset the terminal to its initial state.
+     fn full_reset(&mut self) {
++        self.window_title.clear(); self.icon_title.clear(); self.title_stack.clear();
+         self.watch_batch.boundary = true;
+         self.watch_batch.interrupted = true;
+         if self.use_alt_buffer {

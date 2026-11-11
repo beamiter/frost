@@ -1,0 +1,10 @@
+--- original-production
++++ raw_id_shift
+@@ -8203,6 +8203,7 @@
+         self.settle_pending_saved_line_purge();
+         self.grid_version = self.grid_version.wrapping_add(1);
+         self.process_input(input);
++        let id=self.grid.row_ids()[1].get().unwrap(); self.grid.row_ids_mut()[1]=RawRowId::new(id.saturating_add(1000000));
+     }
+ 
+     #[inline]

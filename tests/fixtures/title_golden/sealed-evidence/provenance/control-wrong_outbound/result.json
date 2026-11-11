@@ -1,0 +1,18 @@
+{
+  "caught": true,
+  "matched_records_before": 736,
+  "actual_record": "osc0_bel_replacement_seed_2_schedule_0_feed_0",
+  "expected_record": "osc0_bel_replacement_seed_2_schedule_0_feed_0",
+  "different_lanes": [
+    "output_buffer"
+  ],
+  "actual_record_sha256": "b33e6c692168d51764c0fd40705987be4ff53be323114d3a3926025500a5111b",
+  "expected_record_sha256": "ce7ac89759717c9c488b2ea8328449fd47aee38fef4d5475943a4415efe24e3d",
+  "name": "wrong_outbound",
+  "production_sha256": "2b7d2e278c4a4821c6a93c74e81e944da926f702eb6ac35ced0d8e39b304ec6b",
+  "worker_exit": -15,
+  "stream_intentionally_stopped_at_first_difference": true,
+  "partial_stream_bytes": 3407872,
+  "counterexample_sha256": "34e8ab4da85ac8e5e5b9c6ad6835a6b0c5da2489a85c57c88a240f6adbdf60c1",
+  "partial_stream_retained": false
+}

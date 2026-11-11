@@ -1,0 +1,18 @@
+{
+  "caught": true,
+  "matched_records_before": 40408,
+  "actual_record": "savenone_restorenone_seed_0_schedule_0_feed_0",
+  "expected_record": "savenone_restorenone_seed_0_schedule_0_feed_0",
+  "different_lanes": [
+    "title_stack"
+  ],
+  "actual_record_sha256": "a1b81c1d285dfe027fcf70ec93131dfc36cb3a5e83bca225498f256e8b5671a5",
+  "expected_record_sha256": "0f5c67e709204e0420c9867af03c4ae9fbab09d975fb68e8079402fe64516591",
+  "name": "peek_not_pop",
+  "production_sha256": "10973107e47bb0fc1fd64b88995574d0f94fb1be840de77db40b771811d28eab",
+  "worker_exit": -15,
+  "stream_intentionally_stopped_at_first_difference": true,
+  "partial_stream_bytes": 182190080,
+  "counterexample_sha256": "5fe6753d926b646386235361e4b05fe5feb49c741269ad77da0ebb9d196e5c56",
+  "partial_stream_retained": false
+}

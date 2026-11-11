@@ -1,0 +1,31 @@
+{
+  "parameters": {
+    "level": 9,
+    "window_log": 23,
+    "threads": 0,
+    "checksum": true,
+    "content_size": 3775893628,
+    "input_chunk": 65536
+  },
+  "results": [
+    {
+      "path": "/workspace/scratch/9226dcee068a/recovery/frost-title-transport-eval/full/original1.level9.w23.run1.zst",
+      "compressed_bytes": 3501727,
+      "sha256": "8dd591c50ade8546d6d438e1c08837ceaf59c2d2e9462bd9209e75987051887b",
+      "window_size": 8388608,
+      "canonical_bytes": 3775893628,
+      "canonical_sha256": "1f67b934245c3a2d305e65b9527027e6e55b79af5c6b1417ab4ebfc5f2d3af08",
+      "seconds": 11.07793956200112
+    },
+    {
+      "path": "/workspace/scratch/9226dcee068a/recovery/frost-title-transport-eval/full/original1.level9.w23.run2.zst",
+      "compressed_bytes": 3501727,
+      "sha256": "8dd591c50ade8546d6d438e1c08837ceaf59c2d2e9462bd9209e75987051887b",
+      "window_size": 8388608,
+      "canonical_bytes": 3775893628,
+      "canonical_sha256": "1f67b934245c3a2d305e65b9527027e6e55b79af5c6b1417ab4ebfc5f2d3af08",
+      "seconds": 11.195943683000223
+    }
+  ],
+  "deterministic": true
+}

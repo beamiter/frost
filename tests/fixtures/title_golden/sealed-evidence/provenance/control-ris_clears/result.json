@@ -1,0 +1,20 @@
+{
+  "caught": true,
+  "matched_records_before": 51076,
+  "actual_record": "ris_seed_0_schedule_0_feed_0",
+  "expected_record": "ris_seed_0_schedule_0_feed_0",
+  "different_lanes": [
+    "icon_title",
+    "output_buffer",
+    "window_title"
+  ],
+  "actual_record_sha256": "70c2af25ab5f1c0f098af3b6e4e0f1c64413c419cc5e6f008d70a696dae32a16",
+  "expected_record_sha256": "6a9fe150009beb6451e3a5291e74e253163c1fc23a8dec17d2f7af61b55efe16",
+  "name": "ris_clears",
+  "production_sha256": "1755bc4e3a610949a7d8c9520bdd8365eba87ae310f231479d67746e588d07e7",
+  "worker_exit": -15,
+  "stream_intentionally_stopped_at_first_difference": true,
+  "partial_stream_bytes": 229900288,
+  "counterexample_sha256": "16c16393edabd8bb95c3d5c0a55c13084b79204022ea953ccd356352374f6333",
+  "partial_stream_retained": false
+}

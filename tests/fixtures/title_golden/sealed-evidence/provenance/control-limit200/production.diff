@@ -1,0 +1,11 @@
+--- original-production
++++ limit200
+@@ -140,7 +140,7 @@
+ const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?65;1;9c";
+ const SECONDARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[>1;7802;0c";
+ const XTERM_VERSION_RESPONSE: &[u8] = b"\x1bP>|VTE(7802)\x1b\\";
+-const MAX_TERMINAL_TITLE_CHARS: usize = 256;
++const MAX_TERMINAL_TITLE_CHARS: usize = 200;
+ /// OSC 8 fields are terminal-controlled input. Bound both fields before
+ /// allocating or interning them; the URI limit intentionally matches the
+ /// single opener policy in `link::is_openable_url`.

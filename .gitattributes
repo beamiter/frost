@@ -1,0 +1,36 @@
+
+# Exact sealed provenance artifacts retain original whitespace bytes.
+tests/fixtures/title_golden/sealed-evidence/provenance/control-accept_replacement/driver.log -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-accept_replacement/production.diff -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-accept_replacement/worker.stdout -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-duration8/driver.log -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-duration8/worker.stdout -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-limit200/driver.log -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-limit200/worker.stdout -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-peek_not_pop/driver.log -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-peek_not_pop/production.diff -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-peek_not_pop/worker.stdout -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-raw_id_alias/driver.log -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-raw_id_alias/production.diff -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-raw_id_alias/worker.stdout -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-raw_id_shift/driver.log -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-raw_id_shift/production.diff -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-raw_id_shift/worker.stdout -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-ris_clears/driver.log -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-ris_clears/production.diff -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-ris_clears/worker.stdout -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-wrong_outbound/driver.log -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/control-wrong_outbound/worker.stdout -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/original1/driver.log -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/original1/worker.stdout -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/original2/driver.log -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/original2/worker.stdout -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/restored3/driver.log -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/restored3/worker.stdout -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/restored3_retry1/driver.log -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/restored3_retry1/worker.stdout -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/seed-preflight.log -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/small1/driver.log -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/small1/worker.stdout -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/small2/driver.log -whitespace
+tests/fixtures/title_golden/sealed-evidence/provenance/small2/worker.stdout -whitespace

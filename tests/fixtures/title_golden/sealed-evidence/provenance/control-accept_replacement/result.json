@@ -1,0 +1,20 @@
+{
+  "caught": true,
+  "matched_records_before": 564,
+  "actual_record": "osc0_bel_replacement_seed_0_schedule_0_feed_0",
+  "expected_record": "osc0_bel_replacement_seed_0_schedule_0_feed_0",
+  "different_lanes": [
+    "icon_title",
+    "output_buffer",
+    "window_title"
+  ],
+  "actual_record_sha256": "3332aeb12d4b57c6a90f864dcaf12f4720717dc37aa50ec9a78e10a9d5afff18",
+  "expected_record_sha256": "e91e657ae9e628c5833db23097cae9c4a28fb6d1cc827bb737c4110b4f5b3006",
+  "name": "accept_replacement",
+  "production_sha256": "a68538385a86ff33ecab02abf2607da9b0a0cac695720a43a0123049f1841452",
+  "worker_exit": -15,
+  "stream_intentionally_stopped_at_first_difference": true,
+  "partial_stream_bytes": 2621440,
+  "counterexample_sha256": "7c8d01bc6a23ae17c5bcb9d96135b57aa34ab75f4883600bbd26edb61897ec04",
+  "partial_stream_retained": false
+}

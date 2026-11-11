@@ -1,0 +1,19 @@
+{
+  "caught": true,
+  "matched_records_before": 0,
+  "actual_record": "seed_0",
+  "expected_record": "seed_0",
+  "different_lanes": [
+    "command_zones",
+    "pending_completed_commands"
+  ],
+  "actual_record_sha256": "737d180a1b6eb10247860c3c24ae643b85ed6cef476a397079d294285fdd5d8c",
+  "expected_record_sha256": "c3559000c56dde4f1d439bfefc4e72b0727e0d2d249311fd75bb752e81d3d178",
+  "name": "duration8",
+  "production_sha256": "0fbfc35b0e1b40886e3d59d11cfbef17559081de66910185f6159b22f1db257e",
+  "worker_exit": -15,
+  "stream_intentionally_stopped_at_first_difference": true,
+  "partial_stream_bytes": 262144,
+  "counterexample_sha256": "90c012c5e9066fc93cd7c242f147473261395a44a128464bc40cd9e968e96d88",
+  "partial_stream_retained": false
+}

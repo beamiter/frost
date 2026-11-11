@@ -1,3 +1,4 @@
+use jterm_engine::titles::FrostTitleState;
 mod visible_rows;
 pub use visible_rows::RowView;
 use visible_rows::VisibleRows;
@@ -19,6 +20,8 @@ mod parser_oracle_tests;
 mod projection_properties;
 #[cfg(test)]
 mod projection_state_properties;
+#[cfg(test)]
+mod title_oracles;
 
 use jterm_engine::parser::{
     CaptureEnd, Event as ParserEvent, Parser, ParserLimits, ParserProfile, PendingKind,
@@ -3437,9 +3440,8 @@ pub struct TerminalState {
     current_fg: Color,
     current_bg: Color,
     current_flags: StyleFlags,
-    pub window_title: String,
-    icon_title: String,
-    title_stack: Vec<(Option<String>, Option<String>)>,
+    // One engine owner; Frost retains ingest/query policy and RIS retention.
+    titles: FrostTitleState,
     /// Working directory the child reported through OSC 7, if any. Without it
     /// the cwd comes only from `/proc/<pid>/cwd`, which is the *local* shell's
     /// directory and therefore always wrong once the pane is running ssh.
@@ -3805,9 +3807,7 @@ impl TerminalState {
             current_fg: Color::Default,
             current_bg: Color::Default,
             current_flags: StyleFlags::default(),
-            window_title: String::new(),
-            icon_title: String::new(),
-            title_stack: Vec::new(),
+            titles: FrostTitleState::default(),
             current_working_dir: None,
             organism_idle_cwd: None,
             global_bg: Color::Default,
@@ -4692,18 +4692,9 @@ impl TerminalState {
         if let Ok(payload) = std::str::from_utf8(payload_bytes) {
             let (command, value) = payload.split_once(';').unwrap_or((payload, ""));
             if !command.is_empty() {
-                if command == "0" {
+                if matches!(command, "0" | "1" | "2") {
                     if let Some(title) = Self::accepted_title(value) {
-                        self.icon_title.clone_from(&title);
-                        self.window_title = title;
-                    }
-                } else if command == "1" {
-                    if let Some(title) = Self::accepted_title(value) {
-                        self.icon_title = title;
-                    }
-                } else if command == "2" {
-                    if let Some(title) = Self::accepted_title(value) {
-                        self.window_title = title;
+                        self.titles.set_osc(command, &title);
                     }
                 } else if command == "7" {
                     // OSC 7 — the child reporting its cwd
@@ -7225,46 +7216,17 @@ impl TerminalState {
         }
     }
 
+    /// Borrow the accepted window title without a host mirror.
+    pub fn window_title(&self) -> &str {
+        &self.titles.window_title
+    }
+
     fn save_titles(&mut self, target: u16) {
-        if self.title_stack.len() >= 16 {
-            self.title_stack.remove(0);
-        }
-        match target {
-            1 => self.title_stack.push((Some(self.icon_title.clone()), None)),
-            2 => self
-                .title_stack
-                .push((None, Some(self.window_title.clone()))),
-            _ => self.title_stack.push((
-                Some(self.icon_title.clone()),
-                Some(self.window_title.clone()),
-            )),
-        }
+        self.titles.save(target);
     }
 
     fn restore_titles(&mut self, target: u16) {
-        let Some((icon_title, window_title)) = self.title_stack.pop() else {
-            return;
-        };
-        match target {
-            1 => {
-                if let Some(icon_title) = icon_title {
-                    self.icon_title = icon_title;
-                }
-            }
-            2 => {
-                if let Some(window_title) = window_title {
-                    self.window_title = window_title;
-                }
-            }
-            _ => {
-                if let Some(icon_title) = icon_title {
-                    self.icon_title = icon_title;
-                }
-                if let Some(window_title) = window_title {
-                    self.window_title = window_title;
-                }
-            }
-        }
+        self.titles.restore(target);
     }
 
     fn handle_window_ops(&mut self, params: &[u16]) {
@@ -7306,11 +7268,17 @@ impl TerminalState {
             }
             // Report icon label / window title.
             20 => {
-                let response = format!("\x1b]L{}\x1b\\", Self::sanitized_title(&self.icon_title));
+                let response = format!(
+                    "\x1b]L{}\x1b\\",
+                    Self::sanitized_title(&self.titles.icon_title)
+                );
                 self.output_buffer.extend_from_slice(response.as_bytes());
             }
             21 => {
-                let response = format!("\x1b]l{}\x1b\\", Self::sanitized_title(&self.window_title));
+                let response = format!(
+                    "\x1b]l{}\x1b\\",
+                    Self::sanitized_title(&self.titles.window_title)
+                );
                 self.output_buffer.extend_from_slice(response.as_bytes());
             }
             // Save/restore icon/window title. Parameter 0 means both; 1 icon;
@@ -19100,10 +19068,10 @@ mod tests {
                 "unterminated fragments must resume scanning at the previous tail"
             );
         }
-        assert_eq!(terminal.window_title, "");
+        assert_eq!(terminal.titles.window_title, "");
         terminal.process_input(b"\x07Z");
         assert!(terminal.parser.snapshot().pending_osc.is_empty());
-        assert_eq!(terminal.window_title, "title-x");
+        assert_eq!(terminal.titles.window_title, "title-x");
         // Bytes after the BEL are ordinary input again.
         assert_eq!(terminal.grid[0][0].character, 'Z');
     }
@@ -19124,14 +19092,14 @@ mod tests {
         );
         terminal.process_input(b"\\Y");
         assert!(terminal.parser.snapshot().pending_osc.is_empty());
-        assert_eq!(terminal.window_title, "win");
+        assert_eq!(terminal.titles.window_title, "win");
         assert_eq!(terminal.grid[0][0].character, 'Y');
 
         // A non-ST ESC abandons OSC and starts SOS here, even across reads.
         let mut terminal = TerminalState::new(16, 2);
         terminal.process_input(b"\x1b]0;a\x1b");
         terminal.process_input(b"Xb\x07");
-        assert!(terminal.window_title.is_empty());
+        assert!(terminal.titles.window_title.is_empty());
         assert!(!terminal.parser.snapshot().pending_string.is_empty());
         assert_eq!(terminal.grid[0][0].character, ' ');
     }
@@ -19148,12 +19116,12 @@ mod tests {
                 let mut terminal = TerminalState::new(16, 2);
                 terminal.process_input(&payload[..split_at]);
                 assert_eq!(
-                    terminal.window_title, "",
+                    terminal.titles.window_title, "",
                     "incomplete OSC was applied at split {split_at}"
                 );
                 terminal.process_input(&payload[split_at..]);
                 assert_eq!(
-                    terminal.window_title, "split-title",
+                    terminal.titles.window_title, "split-title",
                     "OSC was lost at input split {split_at}"
                 );
                 assert_eq!(
@@ -19176,7 +19144,7 @@ mod tests {
         crossing.extend_from_slice(b"\x07");
         terminal.process_input(&crossing);
         assert!(terminal.parser.snapshot().pending_osc.is_empty());
-        assert!(terminal.window_title.starts_with("huge"));
+        assert!(terminal.titles.window_title.starts_with("huge"));
 
         // Without a terminator the prefix is retained past the cap, then
         // abandoned wholesale on the next read; that read parses as ordinary
@@ -19188,7 +19156,7 @@ mod tests {
         assert!(!terminal.parser.snapshot().pending_osc.is_empty());
         terminal.process_input(b"tail\x07");
         assert!(terminal.parser.snapshot().pending_osc.is_empty());
-        assert_eq!(terminal.window_title, "");
+        assert_eq!(terminal.titles.window_title, "");
         assert_eq!(terminal.grid[0][0].character, 't');
         assert_eq!(terminal.grid[0][1].character, 'a');
         assert_eq!(terminal.grid[0][2].character, 'i');
@@ -19272,6 +19240,43 @@ mod tests {
             String::from_utf8(terminal.get_output()).unwrap(),
             "\x1b[1t\x1b[3;0;0t\x1b[4;384;640t\x1b[8;24;80t\x1b[9;24;80t\x1b]Ldemo\x1b\\\x1b]ldemo\x1b\\"
         );
+    }
+
+    #[test]
+    fn shared_title_owner_preserves_frost_limits_rejection_and_ris_retention() {
+        let mut t = TerminalState::new(6, 5);
+        t.process_batch(format!("\x1b]0;{}\x07", "界".repeat(257)).as_bytes());
+        assert_eq!(t.window_title().chars().count(), 256);
+        assert_eq!(t.titles.icon_title, t.titles.window_title);
+        t.process_batch(b"\x1b[22;0t");
+        let saved = t.titles.clone();
+        t.process_batch("\x1b]0;bad\u{fffd}\x07".as_bytes());
+        assert_eq!(t.titles, saved);
+        t.process_batch(b"\x1bc\x1b[!p");
+        assert_eq!(t.titles, saved);
+        t.process_batch(b"\x1b]0;changed\x07\x1b[23;0t");
+        assert_eq!(t.window_title().chars().count(), 256);
+        assert!(t.titles.title_stack.is_empty());
+    }
+
+    #[test]
+    fn shared_title_owner_keeps_frost_outbound_filter_and_fixed_st() {
+        let mut t = TerminalState::new(6, 5);
+        // Title replies must not reuse the most recently observed OSC framing.
+        t.process_batch(b"\x1b]0;accepted\x07");
+        assert_eq!(t.osc_reply_terminator, b"\x07");
+        assert_eq!(t.window_title(), "accepted");
+        t.titles.window_title = "x\u{200b}\u{202e}\x07y".into();
+        t.titles.icon_title = "i\u{200b}\u{202e}\x07j".into();
+        t.process_batch(b"\x1b[20t");
+        assert_eq!(t.output_buffer, "\x1b]Li\u{fffd}\u{fffd}j\x1b\\".as_bytes());
+        assert_eq!(t.osc_reply_terminator, b"\x07");
+        t.output_buffer.clear();
+        t.process_batch(b"\x1b[21t");
+        assert_eq!(t.output_buffer, "\x1b]lx\u{fffd}\u{fffd}y\x1b\\".as_bytes());
+        assert_eq!(t.osc_reply_terminator, b"\x07");
+        assert_eq!(t.titles.window_title, "x\u{200b}\u{202e}\x07y");
+        assert_eq!(t.titles.icon_title, "i\u{200b}\u{202e}\x07j");
     }
 
     #[test]
@@ -19372,7 +19377,7 @@ mod tests {
         );
 
         terminal.process_input(hostile.as_bytes());
-        assert_eq!(terminal.window_title, "kept");
+        assert_eq!(terminal.titles.window_title, "kept");
 
         let oversized = format!(
             "\x1b]2;safe{}tail\x1b\\",
@@ -19380,16 +19385,16 @@ mod tests {
         );
         terminal.process_input(oversized.as_bytes());
         assert_eq!(
-            terminal.window_title.chars().count(),
+            terminal.titles.window_title.chars().count(),
             MAX_TERMINAL_TITLE_CHARS
         );
-        assert!(terminal.window_title.starts_with("safe"));
-        assert!(!terminal.window_title.contains('\n'));
-        assert!(!terminal.window_title.ends_with("tail"));
+        assert!(terminal.titles.window_title.starts_with("safe"));
+        assert!(!terminal.titles.window_title.contains('\n'));
+        assert!(!terminal.titles.window_title.ends_with("tail"));
         terminal.process_input("\x1b]2;ok\u{200b}title\x1b\\".as_bytes());
-        assert!(!terminal.window_title.contains('\u{200b}'));
-        assert!(!terminal.window_title.contains('\u{fffd}'));
-        assert!(terminal.window_title.starts_with("safe"));
+        assert!(!terminal.titles.window_title.contains('\u{200b}'));
+        assert!(!terminal.titles.window_title.contains('\u{fffd}'));
+        assert!(terminal.titles.window_title.starts_with("safe"));
     }
 
     #[test]
@@ -22093,7 +22098,7 @@ mod tests {
                         "prefix={prefix:?}, cancel={cancel}, split={split}"
                     );
                     assert_eq!(terminal.grid[0][1].character, 'k');
-                    assert!(terminal.window_title.is_empty());
+                    assert!(terminal.titles.window_title.is_empty());
                 }
             }
         }
@@ -22125,7 +22130,7 @@ mod tests {
                     "prefix={prefix:?}, split={split}"
                 );
                 assert!(!terminal.modes.contains(&2004));
-                assert!(terminal.window_title.is_empty());
+                assert!(terminal.titles.window_title.is_empty());
             }
         }
     }

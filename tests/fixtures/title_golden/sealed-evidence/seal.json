@@ -1,0 +1,10 @@
+{
+  "status": "sealed",
+  "manifest_sha256": "6f3b99f9a73ad4c1859adf162f427a26c01172bdc145f3f01b8c3fae2e1244cf",
+  "artifact_inventory_sha256": "68f69039d0a871ef2e88613cae0605eb866378eaf868c3a997b8efc7056e795f",
+  "production_source_exact_restored": true,
+  "observer_exact_restored": true,
+  "full_original_runs": 3,
+  "production_controls_caught": 8,
+  "candidate_used": false
+}

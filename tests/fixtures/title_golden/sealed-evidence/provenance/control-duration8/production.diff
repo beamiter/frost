@@ -1,0 +1,11 @@
+--- original-production
++++ duration8
+@@ -4938,7 +4938,7 @@
+                         metadata_duration_ms = None;
+                         continue;
+                     }
+-                    metadata_duration_ms = raw.trim().parse::<u64>().ok();
++                    metadata_duration_ms = raw.trim().parse::<u64>().ok().map(|n| n + 1);
+                 }
+                 "cmd_truncated" | "command_truncated" => {
+                     if std::mem::replace(&mut seen_truncated, true) {

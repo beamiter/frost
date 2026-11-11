@@ -1355,6 +1355,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "smallvec",
  "tiny-skia",
  "tokio",
@@ -1362,6 +1363,7 @@ dependencies = [
  "unicode-normalization",
  "uuid",
  "zbus",
+ "zstd",
 ]
 
 [[package]]
@@ -2109,7 +2111,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=598f15808086dbea14d56fc1b86e77b6cb2e3201#598f15808086dbea14d56fc1b86e77b6cb2e3201"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=e23a2efa3a1c1faeb1867e7b94ec7ad1c8823b22#e23a2efa3a1c1faeb1867e7b94ec7ad1c8823b22"
 dependencies = [
  "companion-client",
  "companion-core",
@@ -2139,7 +2141,7 @@ dependencies = [
 [[package]]
 name = "jterm_engine"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=598f15808086dbea14d56fc1b86e77b6cb2e3201#598f15808086dbea14d56fc1b86e77b6cb2e3201"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=e23a2efa3a1c1faeb1867e7b94ec7ad1c8823b22#e23a2efa3a1c1faeb1867e7b94ec7ad1c8823b22"
 dependencies = [
  "smallvec",
 ]

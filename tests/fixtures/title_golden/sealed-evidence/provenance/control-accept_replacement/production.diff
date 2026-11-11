@@ -1,0 +1,11 @@
+--- original-production
++++ accept_replacement
+@@ -7218,7 +7218,7 @@
+ 
+     fn accepted_title(title: &str) -> Option<String> {
+         let title = Self::sanitized_title(title);
+-        if title.contains('\u{fffd}') {
++        if false && title.contains('\u{fffd}') {
+             None
+         } else {
+             Some(title)

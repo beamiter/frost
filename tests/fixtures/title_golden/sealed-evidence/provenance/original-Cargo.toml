@@ -1,0 +1,92 @@
+[package]
+name = "frost"
+version = "0.1.0"
+edition = "2021"
+description = "A fast, GPU-rendered Linux terminal emulator built with Rust and iced"
+repository = "https://github.com/beamiter/frost"
+homepage = "https://github.com/beamiter/frost"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+# frost ships as a Linux application with a sibling shared core checkout.
+publish = false
+keywords = ["terminal", "terminal-emulator", "iced", "gpu", "linux"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+# Shared engine and services use the same published immutable source.
+jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "598f15808086dbea14d56fc1b86e77b6cb2e3201" }
+companion-host = { version = "0.1.0", path = "vendor/companion-host" }
+iced = { version = "0.14", features = ["canvas", "tokio", "advanced", "image", "wgpu"] }
+# Direct handle on the shaper iced embeds (same locked version), used to
+# measure the primary font's real advance for the terminal grid.
+# Upgrade only together with iced_graphics, iced_tiny_skia and cryoglyph.
+cosmic-text = "=0.19.0"
+# Exact native boundary paired with the pinned local Iced shell patch.
+iced_winit = { version = "=0.14.0", default-features = false }
+libc = "0.2"
+# Shared core is acquired from the published revision, not a sibling checkout.
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "598f15808086dbea14d56fc1b86e77b6cb2e3201" }
+tokio = { version = "1", features = ["rt", "sync"] }
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
+smallvec = "1.15"
+base64 = "0.23"
+image = "0.25"
+# Already locked through Iced: rasterize the shared native vector once, without
+# adding renderer bounds to the retained terminal or its test probes.
+tiny-skia = { version = "=0.11.4", default-features = false, features = ["std", "simd"] }
+once_cell = "1.21"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["raw_value"] }
+toml = "1.1"
+dirs = "7.0"
+unicode-normalization = "0.1"
+regex = "1.13"
+fuzzy-matcher = "0.3"
+uuid = { version = "1.23", features = ["v4", "serde"] }
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+# Reuse the already locked portal transport; keep its existing async-io runtime.
+zbus = { version = "=5.19.0", default-features = false, features = ["async-io"] }
+
+[profile.dev]
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 1
+opt-level = 3
+
+# cryoglyph 0.1.0 requires the unsound lru 0.16 line. This Rust-source-identical
+# local copy changes only that dependency to the RustSec-fixed 0.18.2 release.
+[patch.crates-io]
+wgpu-hal = { path = "vendor/wgpu-hal" }
+iced_graphics = { path = "vendor/iced_graphics" }
+iced_tiny_skia = { path = "vendor/iced_tiny_skia" }
+# X11 legacy wheel release must not emit a second scroll notch.
+winit = { path = "vendor/winit" }
+cryoglyph = { path = "vendor/cryoglyph" }
+iced_winit = { path = "vendor/iced_winit" }
+# Preserve ordered native input through stalled subscription consumers.
+iced_futures = { path = "vendor/iced_futures" }
+# Replace unmaintained pin-utils with checked pin-project-lite projections.
+wasmtimer = { path = "vendor/wasmtimer" }
+window_clipboard = { path = "vendor/window_clipboard" }
+clipboard_wayland = { path = "vendor/clipboard_wayland" }
+clipboard_x11 = { path = "vendor/clipboard_x11" }
+smithay-clipboard = { path = "vendor/smithay-clipboard" }
+wayland-client = { path = "vendor/wayland-client" }
+
+
+[dev-dependencies]
+iced_tiny_skia = { version = "=0.14.1", features = ["geometry"] }
+jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "598f15808086dbea14d56fc1b86e77b6cb2e3201" }
+
+[patch."https://github.com/beamiter/jcompanion.git"]
+companion-protocol = { path = "vendor/companion-protocol" }
+companion-client = { path = "vendor/companion-client" }

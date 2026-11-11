@@ -1,0 +1,13 @@
+{
+  "records": 220,
+  "lanes": 133,
+  "canonical_bytes": 14949270,
+  "max_record_bytes": 76195,
+  "canonical_sha256": "a6cf33e515ee614b0cf6342c24622efc374020c92c7dd2c89338472b31305e61",
+  "gzip_bytes": 975314,
+  "gzip_sha256": "c39033684b3ac69dba6fd033c8bc36baaa146baefc5a911c5ba57c6e539630f6",
+  "corpus_sha256": "6be4b7bfb5e3e836f1466a05bec099a23e6d1286fd73f273c9bfa3971a44e253",
+  "exact_reference_equal": true,
+  "max_record_bound": 4194304,
+  "max_total_bound": 17179869184
+}
