@@ -25,7 +25,7 @@ use jterm_core::agent::{
 use jterm_core::ai::{AiCancellationToken, AiClient, BlockContext};
 use std::path::Path;
 
-const MAX_AGENT_MODEL_REPLY_BYTES: usize = 128 * 1024;
+use crate::agent_model_stream::MAX_AGENT_MODEL_REPLY_BYTES;
 /// Live Agent-panel composer budget: same 16 KiB envelope `submit_user`
 /// and native follow-up already refuse, so iced cannot hold more than the
 /// session will accept.

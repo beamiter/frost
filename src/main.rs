@@ -9,6 +9,7 @@ use jterm_core::pane_layout::{
 };
 use jterm_core::pty_input::{self, PasteModes, PastePolicy, UnbracketedMultiline};
 mod agent;
+mod agent_model_stream;
 mod agent_sessions;
 mod agent_task;
 mod agent_task_ui;
@@ -29729,27 +29730,30 @@ impl Frost {
             text: user,
         }];
         if self.config.ai_stream {
-            // Streaming: a dedicated worker thread runs the request and
-            // forwards each assistant fragment (and finally the complete
-            // reply) as Messages through an unbounded channel the runtime
-            // drains as a Task stream. The complete returned text is the
-            // single source of truth — `AgentUi::model_reply` records it
-            // exactly as the blocking path would; fragments only feed the
-            // live preview. The same cancellation token kills curl
-            // mid-stream when the panel closes.
-            let (tx, rx) = iced::futures::channel::mpsc::unbounded::<Message>();
+            // The blocking transport alone is backpressured. Preview bytes
+            // stay FIFO and bounded; a reserved final slot cannot be starved
+            // by a stalled preview. Closing the Task cancels the transport.
+            use iced::futures::StreamExt as _;
+            let (mut tx, rx) = agent_model_stream::channel(token.clone());
             std::thread::spawn(move || {
                 let mut on_delta = |fragment: &str| {
-                    let _ =
-                        tx.unbounded_send(Message::AgentModelDelta(identity, fragment.to_string()));
+                    let _ = tx.delta(fragment);
                 };
                 let result = client
                     .send_turns_streaming_cancellable(Some(&system), &turns, &token, &mut on_delta)
                     .map_err(|error| error.to_string());
-                let _ = tx.unbounded_send(Message::AgentModelReply(identity, result));
+                tx.finish(result);
             });
-            return Some(Task::stream(rx));
+            return Some(Task::stream(rx.map(move |event| match event {
+                agent_model_stream::Event::Delta(fragment) => {
+                    Message::AgentModelDelta(identity, fragment)
+                }
+                agent_model_stream::Event::Finished(result) => {
+                    Message::AgentModelReply(identity, result)
+                }
+            })));
         }
+
         Some(Task::perform(
             async move {
                 let result = tokio::task::spawn_blocking(move || {
