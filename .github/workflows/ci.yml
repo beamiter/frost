@@ -292,6 +292,7 @@ jobs:
       - name: Run tests
         run: |
           cargo test -p iced_futures --locked
+          cargo test -p iced_winit --lib --locked
           cargo test -p iced_tiny_skia --lib shadow_damage --locked -- --test-threads=1
           cargo test --all-targets --all-features --locked --no-fail-fast
 

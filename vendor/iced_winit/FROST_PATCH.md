@@ -32,3 +32,32 @@ Vulkan loader proxy to inject device loss into the real acquire path. It checks
 newly painted output, drag-copy and unchanged shell/PTY identities across three
 recoveries. This does not simulate the laptop's power transition or certify the
 physical lock-screen compositor. The native-feedback harness covers retry pacing.
+
+## Retained native ingress and action admission
+
+The local shell adds aggregate RAII admission across Proxy clones and holds
+credits through deferred event/message batches. Synchronous admission never
+blocks the GUI; an over-limit input/action batch permanently quarantines input
+through iced_futures' host-checked latch. Async Proxy producers backpressure with
+bounded cancellable waiter registrations. Opaque generic messages, widget
+operations and image handles are count-limited, not heap-byte measured.
+
+Runner's retained WindowEvents use 4096 slots / 8 MiB known-payload accounting.
+A fault routes pointer buttons, movement and paint feedback into separate small
+reservations so continuing keyboard traffic cannot consume the close controls.
+No guarantee is made for every click under infinite button traffic. Only
+idempotent lifecycle state coalesces. Control creation has bounded queue/title
+storage and a 32-window limit; Exit/Crash remain independently deliverable.
+
+A synchronous ready Task exceeding 256 buffered actions is explicitly rejected,
+not silently moved after later input. Widget chains are limited to 64 applied
+steps before a continuation faults. Already applied effects cannot be recalled.
+UI Vec message retention is bounded after callbacks, not allocations inside
+arbitrary trusted callback code. These are adapter-owned retention guarantees,
+not a total RSS or OS queue bound.
+
+The isolated Runner acceptance fixture stalls consumer polling while real
+compositor events pass the unchanged admission code. It is a controlled-stall
+regression, not a natural-load flood claim. Production code has no fixture file
+trigger or overload reset. See docs/NATIVE_EVENT_BUDGET_DESIGN.md for acceptance
+scope and outstanding validation.

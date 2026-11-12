@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build an isolated GUI overload-admission fixture; never rewrite production sources.
 
-The fixture drives a separate real Tracker into its production budget rejection.
-It reuses production main/view/update, but is NOT a natural winit flood test or
-an unmodified release artifact. All source changes and binary hashes are saved.
+The fixture drives either a separate real Tracker or actual Runner admission
+under a controlled consumer stall. It reuses production main/view/update but is
+NOT a natural-load flood test or an unmodified release artifact. All source changes and binary hashes are saved.
 """
 import argparse
 import difflib
@@ -79,6 +79,8 @@ def main():
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--prepare-only', action='store_true')
+    parser.add_argument('--mechanism', choices=['tracker', 'runner'], default='tracker')
+    parser.add_argument('--profile', choices=['dev', 'release'], default='release')
     args = parser.parse_args()
     root, out = args.root.resolve(strict=True), args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -92,12 +94,41 @@ def main():
     if original.count(anchor) != 1:
         raise RuntimeError('Expected one post-dispatch GUI config load; refusing ambiguous injection')
     generated = original.replace(anchor, '    native_overload_acceptance_start();\n' + anchor, 1) + HELPER
+    if args.mechanism == 'runner':
+        generated = original
     for entry in root.iterdir():
         if entry.name in {'src', 'Cargo.toml', 'Cargo.lock', '.git', 'target'}:
+            continue
+        if entry.name == 'vendor' and args.mechanism == 'runner':
             continue
         if entry == out or entry in out.parents:
             continue
         (checkout / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+    if args.mechanism == 'runner':
+        vendor = checkout / 'vendor'
+        vendor.mkdir()
+        for entry in (root / 'vendor').iterdir():
+            if entry.name == 'iced_winit':
+                shutil.copytree(entry, vendor / entry.name)
+            else:
+                (vendor / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+        lib = vendor / 'iced_winit/src/lib.rs'
+        production_lib = lib.read_text()
+        pre = '            let event = match &mut event {'
+        pause = '            // Even rejected input must poll the consumer so the fault can be shown.'
+        reject = '                        None => {\n                            subscription::Event::report_input_overload();'
+        for anchor in (pre, pause, reject):
+            if production_lib.count(anchor) != 1:
+                raise RuntimeError('Ambiguous actual Runner fixture anchor: ' + anchor)
+        derived = production_lib.replace(pre, '            let fixture_key = matches!(&event, Event::EventLoopAwakened(winit::event::Event::WindowEvent { event: winit::event::WindowEvent::KeyboardInput { .. }, .. }));\n' + pre, 1)
+        derived = derived.replace(pause, '            if frost_fixture_pause(fixture_key) { return; }\n' + pause, 1)
+        derived = derived.replace(reject, '                        None => {\n                            if !subscription::Event::input_overloaded() { FIXTURE_NATIVE_REJECTED.store(true, std::sync::atomic::Ordering::SeqCst); }\n                            subscription::Event::report_input_overload();', 1)
+        derived += (root / 'scripts/native-ingress-fixture.rs').read_text()
+        lib.write_text(derived)
+        (out / 'fixture-iced-winit.rs').write_text(derived)
+        (out / 'fixture-iced-winit.diff').write_text(''.join(difflib.unified_diff(
+            production_lib.splitlines(keepends=True), derived.splitlines(keepends=True),
+            fromfile='production/vendor/iced_winit/src/lib.rs', tofile='fixture/vendor/iced_winit/src/lib.rs')))
     (checkout / 'src').mkdir()
     for entry in (root / 'src').iterdir():
         if entry.name == 'native_overload_fixture.rs':
@@ -115,9 +146,12 @@ def main():
     paths = [root / 'Cargo.toml', root / 'Cargo.lock']
     paths += list((root / 'src').rglob('*.rs'))
     paths += list((root / 'vendor/iced_futures').rglob('*.rs'))
+    paths += list((root / 'vendor/iced_winit').rglob('*.rs'))
     source_hashes = {str(p.relative_to(root)): sha(p) for p in sorted(paths)}
     target = Path(os.environ.get('CARGO_TARGET_DIR', str(root / 'target'))).resolve()
     evidence = {
+        'mechanism': args.mechanism,
+        'profile': args.profile,
         'scope': 'real admission rejection + production GUI; not natural winit flood or unmodified release',
         'git_sha': subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip(),
         'production_sources_sha256': source_hashes,
@@ -126,6 +160,10 @@ def main():
         'fixture_manifest_sha256': sha(checkout / 'Cargo.toml'),
         'status': 'prepared',
     }
+    if args.mechanism == 'runner':
+        evidence['scope'] = 'actual Runner admission under controlled consumer stall and real compositor input; not natural flood or unmodified release'
+        evidence['runner_source_sha256'] = sha(out / 'fixture-iced-winit.rs')
+        evidence['runner_diff_sha256'] = sha(out / 'fixture-iced-winit.diff')
     evidence_path = out / 'manifest.json'
     evidence_path.write_text(json.dumps(evidence, indent=2) + '\n')
     if args.prepare_only:
@@ -133,7 +171,7 @@ def main():
         return
     env = os.environ.copy()
     env['CARGO_TARGET_DIR'] = str(target)
-    command = ['cargo', 'build', '--release', '--locked', '--manifest-path', str(checkout / 'Cargo.toml'), '--bin', 'frost-native-overload-fixture']
+    command = ['cargo', 'build'] + (['--release'] if args.profile == 'release' else []) + ['--locked', '--manifest-path', str(checkout / 'Cargo.toml'), '--bin', 'frost-native-overload-fixture']
     try:
         with (out / 'build.log').open('w') as log:
             subprocess.run(command, cwd=checkout, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
@@ -149,7 +187,7 @@ def main():
     if any(sha(root / path) != digest for path, digest in source_hashes.items()):
         raise RuntimeError('Production sources changed during fixture build; evidence invalid')
     binary = out / 'native-overload-fixture'
-    shutil.copy2(target / 'release/frost-native-overload-fixture', binary)
+    shutil.copy2(target / ('release' if args.profile == 'release' else 'debug') / 'frost-native-overload-fixture', binary)
     evidence.update(status='built', binary_sha256=sha(binary), build_command=command)
     evidence_path.write_text(json.dumps(evidence, indent=2) + '\n')
     binary.with_suffix('.source-manifest.json').write_text(json.dumps(evidence, indent=2) + '\n')

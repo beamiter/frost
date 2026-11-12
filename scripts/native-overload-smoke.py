@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Derived-fixture GUI acceptance, NOT natural winit end-to-end flood coverage.
 
-The isolated fixture exercises real Tracker admission. Production view/update,
+The isolated fixture exercises Tracker or actual stalled Runner admission. Production view/update,
 actual compositor input, screenshots, shell effects and normal exit are observed.
 No production trigger/reset API or synthetic application Message is used.
 """
@@ -86,7 +86,8 @@ def main():
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     (out / 'fixture-manifest.json').write_text(json.dumps(manifest, indent=2))
-    result = {'scope': SCOPE, 'backend': args.backend, 'binary_sha256': digest, 'status': 'fail'}
+    scope = SCOPE if manifest.get('mechanism', 'tracker') == 'tracker' else 'derived fixture: actual Runner admission under controlled consumer stall and real compositor keys; not natural flood'
+    result = {'scope': scope, 'backend': args.backend, 'binary_sha256': digest, 'status': 'fail'}
     smoke = runner.Smoke(binary, args.backend, out)
     try:
         smoke.start_desktop()
@@ -103,16 +104,40 @@ def main():
         smoke.select_terminal(require_terminal=True)
         result['baseline_pty_identity'] = smoke.command('overload-before')
         smoke.screenshot('before-overload')
-        runner.wait_for(proof.with_suffix('.armed').exists, 'fixture Tracker armed', timeout=10)
+        runner.wait_for(proof.with_suffix('.armed').exists, 'fixture admission armed', timeout=10)
         control.write_text('trigger real admission\n')
-        runner.wait_for(proof.exists, 'real admission proof', timeout=10)
+        if manifest.get('mechanism') == 'runner':
+            if args.backend == 'x11':
+                flood = smoke.spawn(['xdotool', 'key', '--clearmodifiers', '--delay', '0', '--repeat', '3000', 'F24'], 'ingress-flood')
+            else:
+                flood = smoke.spawn(['wtype', '-d', '0'] + ['-k', 'F24'] * 3000, 'ingress-flood')
+            result['real_compositor_key_pairs_requested'] = 3000
+        runner.wait_for(proof.exists, 'real admission proof', timeout=20)
         admission = json.loads(proof.read_text())
         assert admission['pid'] == app.pid, 'Proof did not originate from the visible application process'
         assert admission['input_overloaded'] is True, admission
         assert 0 < admission['events_broadcast'] <= 65536, admission
         assert admission['natural_winit_flood'] is False, admission
         assert admission['direct_latch_set_or_reset'] is False, admission
+        if manifest.get('mechanism') == 'runner':
+            assert admission['runner_admission_rejected'] is True, admission
+            assert admission['consumer_stall_ms'] < 20000, admission
+            assert 0 < admission['events_broadcast'] <= 6000, admission
+            assert flood.wait(timeout=10) == 0, 'Real compositor key flood failed'
         result['admission'] = admission
+        ongoing_flood = None
+        if manifest.get('mechanism') == 'runner':
+            if args.backend == 'x11':
+                ongoing_flood = smoke.spawn(['xdotool', 'key', '--delay', '2', '--repeat', '20000', 'F24'], 'fault-keyboard-flood')
+            else:
+                ongoing_flood = smoke.spawn(['wtype'] + ['-s', '2', '-k', 'F24'] * 20000, 'fault-keyboard-flood')
+        def fault_key_count():
+            pid, count = map(int, proof.with_suffix('.fault-keys').read_text().split())
+            assert pid == app.pid, 'Fault input observation belongs to another process'
+            return count
+        if ongoing_flood is not None:
+            runner.wait_for(lambda: proof.with_suffix('.fault-keys').exists(), 'actual postfault native keys', timeout=5)
+            flood_count_before = fault_key_count()
         observations = []
 
         def observe_fault():
@@ -133,6 +158,12 @@ def main():
         # Re-observe after native typing so stale coordinates cannot authorize a click.
         point = runner.wait_for(observe_fault, 'fault remains latched after input', timeout=10)
         result['observations'] = observations
+        if ongoing_flood is not None:
+            assert ongoing_flood.poll() is None, 'Keyboard flood ended before testing reserved close path'
+            flood_count_after = fault_key_count()
+            assert flood_count_after > flood_count_before, 'No observed native keyboard flood progress during fault UI verification'
+            result['fault_keyboard_flood_active_at_click'] = True
+            result['observed_fault_keyboard_counts'] = [flood_count_before, flood_count_after]
         result['click'] = {'text': BUTTON, 'point': point, 'method': 'native compositor pointer'}
         if args.backend == 'x11':
             smoke.run(['xdotool', 'mousemove', '--sync', *map(str, point), 'click', '1'])

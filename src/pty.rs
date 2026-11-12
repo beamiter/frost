@@ -1145,25 +1145,24 @@ mod unix_pty {
         /// Single non-blocking write. Returns bytes written, `Ok(0)` if the
         /// buffer is full (WouldBlock), or an error for a real failure.
         pub fn write(&mut self, data: &[u8]) -> Result<usize> {
-            // Final guard includes responses and any caller bypassing Session.
-            if iced::advanced::subscription::Event::input_overloaded() {
-                return Err(anyhow!("native input overloaded; restart required"));
-            }
-            // SAFETY: self.master 是有效的文件描述符，data.as_ptr() 指向有效的内存，
-            // data.len() 是正确的长度。write 系统调用不会超出缓冲区边界。
+            // One nonblocking syscall shares the fault linearization fence.
+            // EINTR retries release it, so a fault cannot starve behind retries.
             loop {
-                let n = unsafe { libc::write(self.master, data.as_ptr() as *const _, data.len()) };
-                if n < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::WouldBlock {
-                        return Ok(0);
-                    } else if err.raw_os_error() == Some(libc::EINTR) {
-                        continue;
+                let write = iced::advanced::subscription::Event::with_native_input_write(|| {
+                    // SAFETY: master is an owned descriptor and data is readable.
+                    let n = unsafe { libc::write(self.master, data.as_ptr().cast(), data.len()) };
+                    if n < 0 {
+                        Err(std::io::Error::last_os_error())
                     } else {
-                        return Err(anyhow!("Failed to write to PTY: {}", err));
+                        Ok(n as usize)
                     }
-                } else {
-                    return Ok(n as usize);
+                });
+                match write {
+                    None => return Err(anyhow!("native input overloaded; restart required")),
+                    Some(Ok(n)) => return Ok(n),
+                    Some(Err(err)) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(0),
+                    Some(Err(err)) if err.raw_os_error() == Some(libc::EINTR) => continue,
+                    Some(Err(err)) => return Err(anyhow!("Failed to write to PTY: {}", err)),
                 }
             }
         }

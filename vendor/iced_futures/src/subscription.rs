@@ -34,15 +34,69 @@ pub enum Event {
 
 // The host must consult this latch both at dispatch and at the final writer.
 // It is deliberately not reset by subscription replacement or cancellation.
-static INPUT_OVERLOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+struct InputGate {
+    requested: std::sync::atomic::AtomicBool,
+    faulted: std::sync::atomic::AtomicBool,
+    writer: std::sync::Mutex<()>,
+}
+impl InputGate {
+    const fn new() -> Self {
+        Self {
+            requested: std::sync::atomic::AtomicBool::new(false),
+            faulted: std::sync::atomic::AtomicBool::new(false),
+            writer: std::sync::Mutex::new(()),
+        }
+    }
+    fn latch(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        // Refuse new writers while the already-admitted nonblocking syscall
+        // completes. The visible fault linearizes only after that writer exits.
+        self.requested.store(true, SeqCst);
+        let _writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.faulted.store(true, SeqCst);
+    }
+    fn write<R>(&self, write: impl FnOnce() -> R) -> Option<R> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.requested.load(SeqCst) {
+            return None;
+        }
+        let Ok(_writer) = self.writer.lock() else {
+            self.requested.store(true, SeqCst);
+            self.faulted.store(true, SeqCst);
+            return None;
+        };
+        if self.requested.load(SeqCst) {
+            return None;
+        }
+        Some(write())
+    }
+}
+static INPUT_GATE: InputGate = InputGate::new();
 fn latch_input_overload() {
-    INPUT_OVERLOADED.store(true, std::sync::atomic::Ordering::SeqCst);
+    INPUT_GATE.latch();
 }
 impl Event {
+    /// Permanently quarantine native input after an upstream adapter rejects it.
+    /// This has no reset path; hosts must enforce it at dispatch and final write.
+    pub fn report_input_overload() {
+        latch_input_overload();
+    }
+
+    /// Serializes one final nonblocking write with permanent fault latching.
+    /// The closure MUST NOT block, re-enter this gate, or latch input itself.
+    /// Retry interrupted syscalls outside this function, never inside the closure.
+    /// Returns `None` when faulting has started; it never replays rejected writes.
+    pub fn with_native_input_write<R>(write: impl FnOnce() -> R) -> Option<R> {
+        INPUT_GATE.write(write)
+    }
+
     /// Whether native subscription input was quarantined for this process.
     /// The application must reject pending input and require a process restart.
     pub fn input_overloaded() -> bool {
-        INPUT_OVERLOADED.load(std::sync::atomic::Ordering::SeqCst)
+        INPUT_GATE.faulted.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -223,9 +277,7 @@ impl<T> Subscription<T> {
 
     /// Batches all the provided subscriptions and returns the resulting
     /// [`Subscription`].
-    pub fn batch(
-        subscriptions: impl IntoIterator<Item = Subscription<T>>,
-    ) -> Self {
+    pub fn batch(subscriptions: impl IntoIterator<Item = Subscription<T>>) -> Self {
         Self {
             recipes: subscriptions
                 .into_iter()
@@ -260,10 +312,7 @@ impl<T> Subscription<T> {
                 self.recipe.hash(state);
             }
 
-            fn stream(
-                self: Box<Self>,
-                input: EventStream,
-            ) -> BoxStream<Self::Output> {
+            fn stream(self: Box<Self>, input: EventStream) -> BoxStream<Self::Output> {
                 use futures::StreamExt;
 
                 let value = self.value;
@@ -324,10 +373,7 @@ impl<T> Subscription<T> {
                 self.recipe.hash(state);
             }
 
-            fn stream(
-                self: Box<Self>,
-                input: EventStream,
-            ) -> BoxStream<Self::Output> {
+            fn stream(self: Box<Self>, input: EventStream) -> BoxStream<Self::Output> {
                 use futures::StreamExt;
 
                 Box::pin(self.recipe.stream(input).map(self.mapper))
@@ -383,10 +429,7 @@ impl<T> Subscription<T> {
                 self.recipe.hash(state);
             }
 
-            fn stream(
-                self: Box<Self>,
-                input: EventStream,
-            ) -> BoxStream<Self::Output> {
+            fn stream(self: Box<Self>, input: EventStream) -> BoxStream<Self::Output> {
                 use futures::StreamExt;
                 use futures::future;
 
@@ -421,18 +464,14 @@ impl<T> Subscription<T> {
 }
 
 /// Creates a [`Subscription`] from a [`Recipe`] describing it.
-pub fn from_recipe<T>(
-    recipe: impl Recipe<Output = T> + 'static,
-) -> Subscription<T> {
+pub fn from_recipe<T>(recipe: impl Recipe<Output = T> + 'static) -> Subscription<T> {
     Subscription {
         recipes: vec![Box::new(recipe)],
     }
 }
 
 /// Returns the different recipes of the [`Subscription`].
-pub fn into_recipes<T>(
-    subscription: Subscription<T>,
-) -> Vec<Box<dyn Recipe<Output = T>>> {
+pub fn into_recipes<T>(subscription: Subscription<T>) -> Vec<Box<dyn Recipe<Output = T>>> {
     subscription.recipes
 }
 
@@ -514,6 +553,57 @@ const fn check_zero_sized<T>() {
             Closures given to Subscription::map or filter_map cannot \
             capture external variables. If you need to capture state, \
             consider using Subscription::with."
+        );
+    }
+}
+
+#[cfg(test)]
+mod input_gate_tests {
+    use super::InputGate;
+    use std::sync::{Arc, atomic::Ordering, mpsc};
+    use std::time::Duration;
+    #[test]
+    fn fault_linearizes_after_inflight_write_and_rejects_later_writes() {
+        let gate = Arc::new(InputGate::new());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writing = gate.clone();
+        let writer = std::thread::spawn(move || {
+            writing.write(|| {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                7
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let faulting = gate.clone();
+        let fault = std::thread::spawn(move || {
+            faulting.latch();
+            done_tx.send(()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !gate.requested.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fault thread did not request admission stop"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            gate.write(|| panic!("write entered while fault is pending")),
+            None::<()>
+        );
+        assert!(done_rx.recv_timeout(Duration::from_millis(30)).is_err());
+        assert!(!gate.faulted.load(Ordering::SeqCst));
+        release_tx.send(()).unwrap();
+        assert_eq!(writer.join().unwrap(), Some(7));
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        fault.join().unwrap();
+        assert!(gate.faulted.load(Ordering::SeqCst));
+        assert_eq!(
+            gate.write(|| panic!("postfault write executed")),
+            None::<()>
         );
     }
 }

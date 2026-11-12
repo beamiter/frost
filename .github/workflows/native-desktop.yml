@@ -176,12 +176,12 @@ jobs:
         run: |
           python3 scripts/native-overload-smoke.py --self-test
           python3 scripts/native-overload-smoke.py --regression-test native-smoke-artifacts/overload-observer-regression
-          python3 scripts/build-native-overload-fixture.py --output native-smoke-artifacts/overload-fixture
-      - name: Observe X11 overload fault UI and explicit close
+          python3 scripts/build-native-overload-fixture.py --mechanism runner --output native-smoke-artifacts/overload-fixture
+      - name: Observe X11 Runner ingress overload, fault UI and explicit close
         timeout-minutes: 3
         if: ${{ !cancelled() && steps.overload_fixture.outcome == 'success' }}
         run: python3 scripts/native-overload-smoke.py --binary native-smoke-artifacts/overload-fixture/native-overload-fixture --manifest native-smoke-artifacts/overload-fixture/manifest.json --backend x11 --output native-smoke-artifacts/x11-overload
-      - name: Observe Wayland overload fault UI and explicit close
+      - name: Observe Wayland Runner ingress overload, fault UI and explicit close
         timeout-minutes: 3
         if: ${{ !cancelled() && steps.overload_fixture.outcome == 'success' && steps.clipboard_owner.outcome == 'success' }}
         env:
