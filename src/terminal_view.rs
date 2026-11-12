@@ -1072,6 +1072,7 @@ pub struct TermWidget<'a, Message> {
     blocks: Vec<BlockPaintRow>,
     chat_rows: &'a [crate::chat_mode::ChatRow],
     chat_projection: Option<&'a crate::terminal::ProjectedViewport>,
+    projection_available: bool,
     on_chat_submit: Option<Box<dyn Fn() -> Message + 'a>>,
     organism_body: Option<OrganismBody>,
     organism_status: Option<crate::organism::LivePresentation>,
@@ -1132,6 +1133,12 @@ impl<'a, Message> TermWidget<'a, Message> {
         self
     }
 
+    /// A rejected projection must not expose old geometry or emit coordinate input.
+    pub fn projection_available(mut self, available: bool) -> Self {
+        self.projection_available = available;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         grid: impl Into<crate::terminal::RowView<'a>>,
@@ -1182,6 +1189,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             blocks: Vec::new(),
             chat_rows: &[],
             chat_projection: None,
+            projection_available: true,
             on_chat_submit: None,
             organism_body: None,
             organism_status: None,
@@ -1304,6 +1312,9 @@ impl<'a, Message> TermWidget<'a, Message> {
     /// rules used by press handling, so the hand cursor/highlight never
     /// promises an activation the application will refuse.
     fn link_at_position(&self, position: Point, bounds: Rectangle) -> Option<&crate::link::Link> {
+        if !self.projection_available {
+            return None;
+        }
         let (col, row) = self.cell_at(position, bounds);
         let before_scrollbar = self
             .scrollbar_geometry(bounds)
@@ -5605,6 +5616,37 @@ where
         if tree.state.downcast_mut::<State>().reset_on_unfocused(event) {
             return;
         }
+        if !self.projection_available {
+            // Keep IME input usable without positioning it at a guessed terminal
+            // cell. This is a fixed host surface, not content-derived geometry.
+            if self.focused
+                && matches!(
+                    event,
+                    Event::Window(iced::window::Event::RedrawRequested(_))
+                )
+            {
+                let bounds = layout.bounds();
+                let preedit =
+                    self.preedit
+                        .as_ref()
+                        .map(|(content, selection)| input_method::Preedit {
+                            content: content.as_str(),
+                            selection: selection.clone(),
+                            text_size: Some(Pixels(self.metrics.font_size)),
+                        });
+                shell.request_input_method(&InputMethod::Enabled {
+                    cursor: Rectangle::new(bounds.position(), Size::new(1.0, self.metrics.cell_h)),
+                    purpose: input_method::Purpose::Terminal,
+                    preedit,
+                });
+            }
+            // Retire the entire gesture without replaying its eventual release.
+            *tree.state.downcast_mut::<State>() = State::default();
+            if matches!(event, Event::Mouse(_) | Event::Touch(_)) {
+                shell.capture_event();
+            }
+            return;
+        }
         let bounds = self.prompt_presentation_bounds(layout.bounds(), viewport);
         // A native speech close is chrome, not a terminal reading gesture.
         // Consume it before canvas pause and before any PTY mouse bookkeeping.
@@ -6235,6 +6277,9 @@ where
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
+        if !self.projection_available {
+            return;
+        }
         let bounds = self.prompt_presentation_bounds(layout.bounds(), viewport);
         let Some(surface_clip) = bounds.intersection(viewport) else {
             return;
@@ -6319,6 +6364,9 @@ where
         viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
+        if !self.projection_available {
+            return mouse::Interaction::default();
+        }
         if let Some(p) = cursor.position_over(self.canvas_content_bounds(layout.bounds())) {
             if self.on_chat_submit.is_some()
                 && self
@@ -7036,6 +7084,37 @@ mod mode_gesture_tests {
     fn moved(point: Point) -> Event {
         Event::Mouse(mouse::Event::CursorMoved { position: point })
     }
+    #[test]
+    fn projection_unavailable_blocks_pointer_events_and_clears_retained_gestures() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = Theme::default();
+        let point = Point::new(30.0, 20.0);
+        for mode in MODES {
+            let mut widget = fixture(&projection, &theme, mode, 0);
+            let mut retained = tree(&widget);
+            let _ = send(&mut widget, &mut retained, press(), point);
+            widget.projection_available = false;
+            for event in [
+                release(),
+                press(),
+                moved(point),
+                Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Lines { x: 0.0, y: 3.0 },
+                }),
+            ] {
+                assert!(send(&mut widget, &mut retained, event, point).is_empty());
+            }
+            assert!(widget
+                .link_at_position(point, Rectangle::with_size(Size::new(600.0, 150.0)))
+                .is_none());
+            widget.projection_available = true;
+            // Recovery must not publish the release from a press accepted before failure.
+            assert!(send(&mut widget, &mut retained, release(), point).is_empty());
+            assert!(!send(&mut widget, &mut retained, press(), point).is_empty());
+        }
+    }
+
     fn owner(button: MouseButton, app: bool) -> crate::TerminalMouseGesture {
         crate::TerminalMouseGesture {
             session_id: 17,

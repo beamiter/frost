@@ -94,7 +94,8 @@ pub fn terminal_press_allowed(
     row: usize,
     col: usize,
 ) -> bool {
-    projection.view_revision() == revision
+    projection.unavailable().is_none()
+        && projection.view_revision() == revision
         && projection
             .view_to_raw(crate::terminal::ViewportCell { row, col })
             .is_some()

@@ -204,6 +204,7 @@ fn viewport(
     let m = terminal.materialize_projection_plan(plan, offset, rows, plan.cols);
     let (spans, row_index) = TerminalState::projection_indexes(&m.provenance);
     ProjectedViewport {
+        unavailable: None,
         canvas_head: false,
         cells: std::sync::Arc::new(VisibleRows::materialized(m.cells)),
         row_wrapped: m.row_wrapped.into(),

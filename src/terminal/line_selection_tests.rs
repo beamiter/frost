@@ -120,11 +120,12 @@ fn install(terminal: &mut TerminalState, plan: ProjectionPlan) {
     terminal.projection_plan_cache = Some((key, std::sync::Arc::new(plan)));
 }
 
-fn viewport(terminal: &TerminalState, offset: usize) -> ProjectedViewport {
+fn viewport(terminal: &mut TerminalState, offset: usize) -> ProjectedViewport {
     let plan = &terminal.projection_plan_cache.as_ref().unwrap().1;
     let m = terminal.materialize_projection_plan(plan, offset, terminal.grid.rows(), WIDTH);
     let (raw_span_index, raw_row_index) = TerminalState::projection_indexes(&m.provenance);
-    ProjectedViewport {
+    let mut view = ProjectedViewport {
+        unavailable: None,
         canvas_head: false,
         cells: std::sync::Arc::new(VisibleRows::materialized(m.cells)),
         row_wrapped: std::sync::Arc::new(m.row_wrapped),
@@ -152,7 +153,25 @@ fn viewport(terminal: &TerminalState, offset: usize) -> ProjectedViewport {
         plan_revision: plan.plan_revision,
         chat_rows: std::sync::Arc::new(m.chat_rows),
         document_row_map: std::sync::Arc::new(m.document_row_map),
+    };
+    // Explicitly publish this independently constructed ledger as the active
+    // test snapshot. Do not change its rows, slices, or expected copy oracle.
+    if terminal.projected_viewport_cache.is_none() {
+        // Seed only the cache-key container before the first fixture frame.
+        // Publishing a later test frame is not a real switch to raw mode:
+        // calling the raw getter here would erase an ongoing projected drag.
+        terminal.get_projected_viewport(false);
     }
+    view.source_revision = ProjectionSourceRevision {
+        grid: terminal.grid_version,
+        history: terminal.history_revision,
+        row_identity: terminal.grid.identity_revision,
+        alternate_screen: terminal.use_alt_buffer,
+    };
+    view.view_revision = terminal.next_projected_view_revision;
+    terminal.next_projected_view_revision += 1;
+    terminal.projected_viewport_cache.as_mut().unwrap().1 = std::sync::Arc::new(view.clone());
+    view
 }
 
 fn row_of(terminal: &TerminalState, view: &ProjectedViewport, raw: usize) -> usize {
@@ -194,7 +213,7 @@ fn projected_line_drag_long_short_reverse_keeps_original_line() {
     let mut terminal = fixture(&text);
     let p = plan(&terminal, &text, &[None, Some(0), Some(1), Some(2)], 1);
     install(&mut terminal, p);
-    let view = viewport(&terminal, 0);
+    let view = viewport(&mut terminal, 0);
     terminal.select_line_in_projection(&view, row_of(&terminal, &view, 1));
     for target in [2, 0] {
         terminal.extend_line_selection_in_projection(&view, row_of(&terminal, &view, target));
@@ -208,7 +227,7 @@ fn projected_line_drag_repeated_reversals_and_same_row_keep_raw_anchor() {
     let mut terminal = fixture(&text);
     let p = plan(&terminal, &text, &[None, Some(0), Some(1), Some(2)], 1);
     install(&mut terminal, p);
-    let view = viewport(&terminal, 0);
+    let view = viewport(&mut terminal, 0);
     terminal.select_line_in_projection(&view, row_of(&terminal, &view, 1));
     for target in [2, 0, 2, 1, 0, 1, 2, 0] {
         terminal.extend_line_selection_in_projection(&view, row_of(&terminal, &view, target));
@@ -222,7 +241,7 @@ fn projected_line_drag_plan_chrome_reorder_preserves_original_raw_anchor() {
     let mut terminal = fixture(&text);
     let p = plan(&terminal, &text, &[None, Some(0), Some(1), Some(2)], 1);
     install(&mut terminal, p);
-    let view = viewport(&terminal, 0);
+    let view = viewport(&mut terminal, 0);
     terminal.select_line_in_projection(&view, row_of(&terminal, &view, 1));
     terminal.extend_line_selection_in_projection(&view, row_of(&terminal, &view, 2));
     for (revision, layout, target) in [
@@ -232,7 +251,7 @@ fn projected_line_drag_plan_chrome_reorder_preserves_original_raw_anchor() {
     ] {
         let p = plan(&terminal, &text, &layout, revision);
         install(&mut terminal, p);
-        let view = viewport(&terminal, 0);
+        let view = viewport(&mut terminal, 0);
         terminal.extend_line_selection_in_projection(&view, row_of(&terminal, &view, target));
         assert_drag(&terminal, &text, 1, target);
     }
@@ -247,9 +266,9 @@ fn projected_line_drag_origin_outside_viewport_still_uses_full_raw_line() {
         .collect();
     let p = plan(&terminal, &text, &layout, 1);
     install(&mut terminal, p);
-    let top = viewport(&terminal, 3);
+    let top = viewport(&mut terminal, 3);
     terminal.select_line_in_projection(&top, row_of(&terminal, &top, 1));
-    let bottom = viewport(&terminal, 0);
+    let bottom = viewport(&mut terminal, 0);
     assert!(bottom
         .raw_to_view(RawCellOrigin {
             row: terminal.scrollback[1].raw_row_id(),
@@ -258,6 +277,7 @@ fn projected_line_drag_origin_outside_viewport_still_uses_full_raw_line() {
         .is_none());
     terminal.extend_line_selection_in_projection(&bottom, row_of(&terminal, &bottom, 5));
     assert_drag(&terminal, &text, 1, 5);
+    let top = viewport(&mut terminal, 3);
     terminal.extend_line_selection_in_projection(&top, row_of(&terminal, &top, 0));
     assert_drag(&terminal, &text, 1, 0);
 }
@@ -268,7 +288,7 @@ fn projected_line_drag_stale_revision_still_fails_closed() {
     let mut terminal = fixture(&text);
     let p = plan(&terminal, &text, &[None, Some(0), Some(1), Some(2)], 1);
     install(&mut terminal, p);
-    let stale = viewport(&terminal, 0);
+    let stale = viewport(&mut terminal, 0);
     terminal.select_line_in_projection(&stale, row_of(&terminal, &stale, 1));
     let mut p = plan(&terminal, &text, &[Some(0), None, Some(1), Some(2)], 2);
     // A source-driven rebuild may keep the policy revision unchanged. This
@@ -311,7 +331,7 @@ fn projected_line_drag_joined_source_rows_reanchors_each_real_boundary() {
         raw.last_view_row = Some(row);
     }
     install(&mut terminal, p);
-    let view = viewport(&terminal, 0);
+    let view = viewport(&mut terminal, 0);
     terminal.select_line_in_projection(&view, row_of(&terminal, &view, 1));
     assert_eq!(
         terminal.copy_projected_selection().as_deref(),
@@ -355,7 +375,7 @@ fn projected_line_drag_joined_source_rows_reanchors_each_real_boundary() {
         p.plan_revision = revision;
         p.policy_revision = revision;
         install(&mut terminal, p);
-        let view = viewport(&terminal, 0);
+        let view = viewport(&mut terminal, 0);
         terminal.extend_line_selection_in_projection(&view, row_of(&terminal, &view, target));
         let (expected_text, expected_raw, expected_col) = if target == 0 {
             ("UP\nABCDEFGH", 2, 3)
@@ -382,7 +402,7 @@ fn projected_line_drag_source_revision_change_still_fails_closed() {
     let mut terminal = fixture(&text);
     let p = plan(&terminal, &text, &[None, Some(0), Some(1), Some(2)], 1);
     install(&mut terminal, p);
-    let stale = viewport(&terminal, 0);
+    let stale = viewport(&mut terminal, 0);
     terminal.select_line_in_projection(&stale, row_of(&terminal, &stale, 1));
     terminal.history_revision += 1;
     terminal.extend_line_selection_in_projection(&stale, 0);

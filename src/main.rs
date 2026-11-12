@@ -789,6 +789,9 @@ fn finalized_block_at_viewport_row(
     projection: &ProjectedViewport,
     row: usize,
 ) -> Option<u64> {
+    if !terminal.projection_interaction_allowed(projection) {
+        return None;
+    }
     if !block_mode_enabled || terminal.is_alt_buffer_active() {
         return None;
     }
@@ -845,6 +848,9 @@ fn chat_completed_zone_at_row(
     projection: &ProjectedViewport,
     row: usize,
 ) -> Option<u64> {
+    if !terminal.projection_interaction_allowed(projection) {
+        return None;
+    }
     let chat = projection.chat_rows().get(row)?;
     if !matches!(
         chat.role,
@@ -884,6 +890,9 @@ fn project_search_match(
     projection: &ProjectedViewport,
     matched: &search::SearchMatch,
 ) -> Option<search::SearchMatch> {
+    if !terminal.projection_interaction_allowed(projection) {
+        return None;
+    }
     let end_col = matched.col_end.checked_sub(1)?;
     let start_origin = terminal.raw_cell_origin_at_absolute(matched.line, matched.col_start)?;
     let end_origin = terminal.raw_cell_origin_at_absolute(matched.line, end_col)?;
@@ -913,6 +922,9 @@ fn projected_kitty_anchor(
     cols: usize,
     rows: usize,
 ) -> Option<terminal::ViewportCell> {
+    if !terminal.projection_interaction_allowed(projection) {
+        return None;
+    }
     let rows = rows.max(1);
     let cols = cols.max(1);
     if rows > projection.row_view().len()
@@ -945,6 +957,9 @@ fn projected_live_grid_cell(
     row: usize,
     col: usize,
 ) -> Option<(usize, usize)> {
+    if !terminal.projection_interaction_allowed(projection) {
+        return None;
+    }
     let origin = projection.view_to_raw(terminal::ViewportCell { row, col })?;
     let absolute = projection.view_row_absolute(row)?;
     let history = terminal.scrollback_len();
@@ -1233,7 +1248,7 @@ fn search_reveal_target(
     projection: &terminal::ProjectedViewport,
     policy: &terminal::ProjectionPolicy,
 ) -> Option<SearchRevealTarget> {
-    if !search.is_open || dirty {
+    if !terminal.projection_interaction_allowed(projection) || !search.is_open || dirty {
         return None;
     }
     let found = search.current_match()?;
@@ -1297,6 +1312,48 @@ fn clear_stale_hidden_match_diagnostic(error: &mut Option<String>) {
 /// Bindings that write to the active terminal or act on its selection or
 /// block selection. While a Tasks-dock field owns typing, keys it did not
 /// consume never trigger these; every other binding is an app command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectionCallbackIdentity {
+    key: terminal::ProjectionKey,
+    view_revision: u64,
+}
+impl ProjectionCallbackIdentity {
+    fn capture(view: &ProjectedViewport) -> Self {
+        Self {
+            key: view.key(),
+            view_revision: view.view_revision(),
+        }
+    }
+}
+
+fn projection_callback_targets_active(owner: usize, active_owner: Option<usize>) -> bool {
+    active_owner == Some(owner)
+}
+
+fn projection_callback_is_current(
+    terminal: &TerminalState,
+    current: &ProjectedViewport,
+    captured: &ProjectionCallbackIdentity,
+) -> bool {
+    captured.view_revision == current.view_revision()
+        && current.key() == captured.key
+        && terminal.projection_interaction_allowed(current)
+}
+
+fn projection_command_requires_mapping(command: &keybindings::Command) -> bool {
+    use keybindings::Command as C;
+    command_requires_block_context(command)
+        || matches!(
+            command,
+            C::EditCopy
+                | C::EditCopyBlockOutput
+                | C::TerminalScrollUp
+                | C::TerminalScrollDown
+                | C::SearchNext
+                | C::SearchPrev
+        )
+}
+
 fn command_targets_terminal(command: &keybindings::Command) -> bool {
     use keybindings::Command as C;
     command_requires_block_context(command)
@@ -4877,6 +4934,9 @@ enum Message {
     ModifiersChanged(keyboard::Modifiers),
     /// A mouse interaction within the pane showing the stable session id.
     MousePane(usize, MouseInput),
+    ProjectedMousePane(usize, ProjectionCallbackIdentity, MouseInput),
+    ProjectedAction(usize, ProjectionCallbackIdentity, Box<Message>),
+    ProjectedTranscriptScroll(usize, ProjectionCallbackIdentity, u64, f64, bool),
     /// Stable release of a host-owned collapsed-output summary row.
     SummaryActivate(usize, SummaryActivation),
     /// Clipboard result scoped to the stable session that requested the paste.
@@ -5159,6 +5219,7 @@ enum Message {
     BlockReadingNavigate(bool),
     BlockGoLive,
     BlockReadingMenuOpened(usize),
+    ProjectedReadingMenu(usize, ProjectionCallbackIdentity, Option<&'static str>),
     BlockReadingMenuClosed,
     BlockReadingMenuAction(usize, &'static str),
     /// Presentation-only bulk folding, bound to the pane that drew the control.
@@ -5197,7 +5258,7 @@ enum Message {
     OverlayEscape(keyboard::Event),
     /// Dismiss or execute the completed-card action menu.
     BlockMenuClose,
-    BlockMenuAction(BlockMenuAction),
+    ProjectedBlockMenuAction(usize, ProjectionCallbackIdentity, BlockMenuAction),
     /// Confirm or cancel permanently clearing the active pane's completed
     /// block records. Every entry point opens this same counted modal.
     BlockClearConfirmYes,
@@ -5994,6 +6055,15 @@ impl Session {
             &self.projection_policy,
             &mut self.projection_view_state,
         );
+        if self.projection.unavailable().is_some() {
+            self.block_selection.clear();
+            self.terminal.clear_text_selection();
+            self.transcript_canvas.park();
+            self.projection_view_state.invalidate_unavailable();
+            self.cursor = (0, 0);
+            self.cursor_visible = false;
+            return;
+        }
         if self.projection.is_identity() {
             debug_assert_eq!(
                 self.projection.uses_identity_fast_path(),
@@ -6052,6 +6122,15 @@ impl Session {
         } else {
             self.transcript_canvas.disable();
         }
+        if self.projection.unavailable().is_some() {
+            self.block_selection.clear();
+            self.terminal.clear_text_selection();
+            self.transcript_canvas.park();
+            self.projection_view_state.invalidate_unavailable();
+            self.cursor = (0, 0);
+            self.cursor_visible = false;
+            return;
+        }
         let raw_cursor = self.terminal.get_cursor_pos();
         if self.projection.mode() == terminal::ProjectionMode::Transformed
             || self.projection.has_canvas_head()
@@ -6074,6 +6153,12 @@ impl Session {
     }
 
     fn scroll(&mut self, lines: isize) {
+        if !self
+            .terminal
+            .projection_interaction_allowed(&self.projection)
+        {
+            return;
+        }
         self.projection_view_state.release_reading_position();
         if self.projection.mode() == terminal::ProjectionMode::Transformed {
             self.projection_view_state.scroll(lines, &self.projection);
@@ -6090,6 +6175,12 @@ impl Session {
     }
 
     fn set_scroll_offset(&mut self, offset: usize) {
+        if !self
+            .terminal
+            .projection_interaction_allowed(&self.projection)
+        {
+            return;
+        }
         self.projection_view_state.release_reading_position();
         if self.projection.mode() == terminal::ProjectionMode::Transformed {
             self.projection_view_state
@@ -6114,6 +6205,12 @@ impl Session {
     /// jumps reveal stable raw headers instead of mutating the dormant legacy
     /// scroll offset.
     fn jump_prompt(&mut self, older: bool) -> bool {
+        if !self
+            .terminal
+            .projection_interaction_allowed(&self.projection)
+        {
+            return false;
+        }
         if self.projection.mode() != terminal::ProjectionMode::Transformed {
             let moved = if older {
                 self.terminal.jump_to_prev_prompt()
@@ -6189,6 +6286,12 @@ impl Session {
     }
 
     fn reveal_absolute_cell(&mut self, absolute_row: usize, col: usize) -> bool {
+        if !self
+            .terminal
+            .projection_interaction_allowed(&self.projection)
+        {
+            return false;
+        }
         self.projection_view_state.release_reading_position();
         let Some(origin) = self.terminal.raw_cell_origin_at_absolute(absolute_row, col) else {
             return false;
@@ -6398,6 +6501,12 @@ impl Session {
     }
 
     fn chat_control_token(&self, kind: chat_mode::ControlKind) -> Option<chat_mode::ControlToken> {
+        if !self
+            .terminal
+            .projection_interaction_allowed(&self.projection)
+        {
+            return None;
+        }
         use chat_mode::{ChatSurface, ControlAction, ControlKind, ControlToken};
         let action = match (kind, self.terminal.chat_surface()) {
             (ControlKind::Submit, ChatSurface::Prompt) => {
@@ -7285,6 +7394,7 @@ struct Frost {
     block_search_job: Option<BlockSearchJob>,
     /// Context actions for the finalized block right-clicked anywhere in its card.
     block_menu: Option<BlockMenuState>,
+    block_menu_projection: Option<ProjectionCallbackIdentity>,
     block_review: Option<BlockReview>,
     /// Counted destructive confirmation for clearing one stable pane's block
     /// history. Revalidated before deletion in case PTY output changed it.
@@ -7544,6 +7654,7 @@ impl Frost {
             next_block_search_epoch: 0,
             block_search_job: None,
             block_menu: None,
+            block_menu_projection: None,
             block_review: None,
             block_clear_confirm: None,
             tab_close_confirm: None,
@@ -8244,6 +8355,25 @@ impl Frost {
 
     /// Search is intentionally non-modal for scrolling/selection. The remaining
     /// overlays block pointer actions from reaching panes underneath them.
+    fn projection_interaction_allowed_for(&self, session_id: usize) -> bool {
+        self.sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .is_some_and(|session| {
+                session
+                    .terminal
+                    .projection_interaction_allowed(&session.projection)
+            })
+    }
+
+    fn active_projection_interaction_allowed(&self) -> bool {
+        self.sessions.get(self.active).is_some_and(|session| {
+            session
+                .terminal
+                .projection_interaction_allowed(&session.projection)
+        })
+    }
+
     fn terminal_mouse_active(&self) -> bool {
         !self.reference_navigation_drawer_visible()
             && self.sidebar_resize.is_none()
@@ -11460,6 +11590,11 @@ impl Frost {
     /// the search bar is closed) so the key can fall through.
     fn dispatch_command(&mut self, cmd: keybindings::Command) -> Option<Task<Message>> {
         use keybindings::Command as C;
+        if projection_command_requires_mapping(&cmd)
+            && !self.active_projection_interaction_allowed()
+        {
+            return Some(Task::none());
+        }
         if command_requires_block_context(&cmd) && !self.block_binding_available() {
             return None;
         }
@@ -12215,7 +12350,8 @@ impl Frost {
     /// in the alternate screen, so neither keybindings nor palette actions may
     /// mutate or read an invisible selection there.
     fn block_action_available(&self) -> bool {
-        self.config.is_block_mode()
+        self.active_projection_interaction_allowed()
+            && self.config.is_block_mode()
             && self
                 .sessions
                 .get(self.active)
@@ -12482,6 +12618,22 @@ impl Frost {
             return Task::none();
         };
         if action == BlockMenuAction::Close {
+            return Task::none();
+        }
+        if !projection_callback_targets_active(
+            menu.session_id,
+            self.sessions.get(self.active).map(|session| session.id),
+        ) {
+            return Task::none();
+        }
+        if !self.sessions.iter().any(|session| {
+            session.id == menu.session_id
+                && self.block_menu_projection.as_ref()
+                    == Some(&ProjectionCallbackIdentity::capture(&session.projection))
+                && session
+                    .terminal
+                    .projection_interaction_allowed(&session.projection)
+        }) {
             return Task::none();
         }
         if menu.chat_read_only {
@@ -14121,6 +14273,9 @@ impl Frost {
     /// identified by `session_id`. Running/live-prompt rows deliberately have
     /// no target. Mouse events retain this stable identity across focus moves.
     fn block_at_viewport_row(&self, session_id: usize, row: usize) -> Option<u64> {
+        if !self.projection_interaction_allowed_for(session_id) {
+            return None;
+        }
         let sess = self.sessions.iter().find(|sess| sess.id == session_id)?;
         if self.config.is_chat_mode() {
             return chat_completed_zone_at_row(&sess.terminal, &sess.projection, row);
@@ -14138,6 +14293,9 @@ impl Frost {
         source_session_id: usize,
         activation: SummaryActivation,
     ) -> Task<Message> {
+        if !self.projection_interaction_allowed_for(source_session_id) {
+            return Task::none();
+        }
         let Some(source) = self.session_index_by_id(source_session_id) else {
             return Task::none();
         };
@@ -14178,6 +14336,11 @@ impl Frost {
     }
 
     fn handle_mouse(&mut self, source_session_id: usize, input: MouseInput) -> Task<Message> {
+        if !self.projection_interaction_allowed_for(source_session_id) {
+            self.terminal_mouse_gestures = [None; 3];
+            self.click_tracker.cancel();
+            return Task::none();
+        }
         self.sync_terminal_pane_owners();
         let speed = self.config.scroll_speed.max(1) as isize;
         // Validate the exact current cell before *any* terminal action,
@@ -14263,6 +14426,8 @@ impl Frost {
                 }
                 BlockMouseAction::Menu => {
                     sess.block_selection.activate(&ids, id);
+                    self.block_menu_projection =
+                        Some(ProjectionCallbackIdentity::capture(&sess.projection));
                     self.block_menu = Some(BlockMenuState {
                         session_id: sess.id,
                         zone_id: id,
@@ -14732,6 +14897,14 @@ impl Frost {
     /// `SearchRefreshTick` debounce plus the zero-copy `search_lines` text
     /// keep the full refresh cheap enough.
     fn recompute_search(&mut self) {
+        if !self.active_projection_interaction_allowed() {
+            self.search.matches.clear();
+            // A PTY batch may invalidate the source before Session::refresh
+            // rebuilds its scoped projection. Keep the deferred refresh alive;
+            // an unavailable projection also retries cheaply until recovery.
+            self.search_dirty = self.search.is_open && self.sessions.get(self.active).is_some();
+            return;
+        }
         self.search_dirty = false;
         if !self.search.is_open {
             return;
@@ -14745,6 +14918,9 @@ impl Frost {
     }
 
     fn navigate_search(&mut self, previous: bool) {
+        if !self.active_projection_interaction_allowed() {
+            return;
+        }
         if let Some(session) = self.sessions.get(self.active) {
             self.search.navigate(
                 session.terminal.search_lines(),
@@ -14763,6 +14939,9 @@ impl Frost {
     /// visible snapshot. Kept separate from recomputation so streaming PTY
     /// output never steals the user's manually chosen scroll position.
     fn reveal_current_search_match(&mut self) {
+        if !self.active_projection_interaction_allowed() {
+            return;
+        }
         // This is a location diagnostic for the previously active match, not
         // a search-engine error. Recompute it for the new target.
         clear_stale_hidden_match_diagnostic(&mut self.search.error_message);
@@ -15113,6 +15292,9 @@ impl Frost {
     /// palette: a visible terminal text selection wins, otherwise a whole-block
     /// selection is copied in terminal order (`output_only` is Alt+Copy).
     fn edit_copy_task(&mut self, output_only: bool) -> Task<Message> {
+        if !self.active_projection_interaction_allowed() {
+            return Task::none();
+        }
         let text = self
             .sessions
             .get(self.active)
@@ -15404,6 +15586,9 @@ impl Frost {
     /// Copy the previous command's output (OSC 133 zones) to the clipboard,
     /// shared by the Ctrl+Shift+G binding and the command palette.
     fn copy_last_output_task(&mut self) -> Task<Message> {
+        if !self.active_projection_interaction_allowed() {
+            return Task::none();
+        }
         if !self.ensure_block_action_available("Last block output copy") {
             return Task::none();
         }
@@ -15448,6 +15633,9 @@ impl Frost {
     /// other block actions use for a gone zone, instead of silently doing
     /// nothing.
     fn select_and_reveal_block(&mut self, id: u64) {
+        if !self.active_projection_interaction_allowed() {
+            return;
+        }
         let Some(sess) = self.sessions.get(self.active) else {
             return;
         };
@@ -15482,6 +15670,9 @@ impl Frost {
     /// falls back first to the logical line and then to the ordinary block
     /// header reveal performed by `select_and_reveal_block`.
     fn reveal_block_search_hit(&mut self, hit: &block_mode::BlockSearchHit) {
+        if !self.active_projection_interaction_allowed() {
+            return;
+        }
         self.select_and_reveal_block(hit.zone_id);
         if !hit.is_output_line || hit.line_no == 0 {
             return;
@@ -15587,6 +15778,9 @@ impl Frost {
         &mut self,
         mode: block_mode::SelectedClipboardMode,
     ) -> Option<Task<Message>> {
+        if !self.active_projection_interaction_allowed() {
+            return Some(Task::none());
+        }
         let result = {
             let sess = self.sessions.get_mut(self.active)?;
             if !self.config.is_block_mode() || sess.terminal.is_alt_buffer_active() {
@@ -16704,6 +16898,39 @@ impl Frost {
     }
 
     fn update_message(&mut self, message: Message) -> Task<Message> {
+        let mapped_owner = match &message {
+            Message::MousePane(id, ..)
+            | Message::ProjectedMousePane(id, ..)
+            | Message::ProjectedTranscriptScroll(id, ..)
+            | Message::SummaryActivate(id, ..)
+            | Message::TranscriptScroll(id, ..)
+            | Message::TranscriptFrame(id, ..)
+            | Message::BlockSetAllCollapsed(id, ..)
+            | Message::BlockReadingMenuOpened(id)
+            | Message::BlockReadingMenuAction(id, ..) => Some(*id),
+            Message::ImageDropped(..)
+            | Message::SearchRevealMatch(..)
+            | Message::SearchRevealKey(..)
+            | Message::SearchReplaceApply(..)
+            | Message::BlockSearchAccept(..)
+            | Message::BlockReviewSelected
+            | Message::BlockBrowse
+            | Message::BlockReviewOpen
+            | Message::BlockReviewInsert
+            | Message::BlockReviewCopy
+            | Message::BlockReviewCompare
+            | Message::BlockReviewExport(..)
+            | Message::BlockComparisonCopy
+            | Message::BlockReadingNavigate(..)
+            | Message::BlockGoLive => self.sessions.get(self.active).map(|s| s.id),
+            _ => None,
+        };
+        if mapped_owner.is_some_and(|id| !self.projection_interaction_allowed_for(id)) {
+            self.terminal_mouse_gestures = [None; 3];
+            self.click_tracker.cancel();
+            return Task::none();
+        }
+
         let editor_active = self
             .sessions
             .get(self.active)
@@ -19985,6 +20212,54 @@ impl Frost {
                     session.refresh();
                 }
             }
+            Message::ProjectedAction(owner, identity, action) => {
+                if !projection_callback_targets_active(
+                    owner,
+                    self.sessions.get(self.active).map(|session| session.id),
+                ) {
+                    return Task::none();
+                }
+                if !self.sessions.iter().any(|session| {
+                    session.id == owner
+                        && projection_callback_is_current(
+                            &session.terminal,
+                            &session.projection,
+                            &identity,
+                        )
+                }) {
+                    return Task::none();
+                }
+                return self.update_message(*action);
+            }
+            Message::ProjectedMousePane(session_id, key, input) => {
+                if !self.sessions.iter().any(|session| {
+                    session.id == session_id
+                        && projection_callback_is_current(
+                            &session.terminal,
+                            &session.projection,
+                            &key,
+                        )
+                }) {
+                    self.terminal_mouse_gestures = [None; 3];
+                    self.click_tracker.cancel();
+                    return Task::none();
+                }
+                return self.update_message(Message::MousePane(session_id, input));
+            }
+            Message::ProjectedTranscriptScroll(session_id, key, epoch, rows, precise) => {
+                if !self.sessions.iter().any(|session| {
+                    session.id == session_id
+                        && projection_callback_is_current(
+                            &session.terminal,
+                            &session.projection,
+                            &key,
+                        )
+                }) {
+                    return Task::none();
+                }
+                return self
+                    .update_message(Message::TranscriptScroll(session_id, epoch, rows, precise));
+            }
             Message::MousePane(session_id, input) => {
                 if matches!(
                     input,
@@ -22060,6 +22335,29 @@ impl Frost {
                     }
                 }
             }
+            Message::ProjectedReadingMenu(owner, identity, action) => {
+                if !projection_callback_targets_active(
+                    owner,
+                    self.sessions.get(self.active).map(|session| session.id),
+                ) {
+                    return Task::none();
+                }
+                if !self.sessions.iter().any(|session| {
+                    session.id == owner
+                        && projection_callback_is_current(
+                            &session.terminal,
+                            &session.projection,
+                            &identity,
+                        )
+                }) {
+                    self.close_block_reading_menu();
+                    return Task::none();
+                }
+                return self.update_message(match action {
+                    Some(action) => Message::BlockReadingMenuAction(owner, action),
+                    None => Message::BlockReadingMenuOpened(owner),
+                });
+            }
             Message::BlockReadingMenuOpened(owner) => {
                 if self.block_reading_menu_available(owner) {
                     self.block_reading_menu = Some(owner);
@@ -22107,7 +22405,12 @@ impl Frost {
                 }
             }
             Message::BlockMenuClose => self.block_menu = None,
-            Message::BlockMenuAction(action) => {
+            Message::ProjectedBlockMenuAction(owner, key, action) => {
+                if self.block_menu.is_none_or(|menu| menu.session_id != owner)
+                    || self.block_menu_projection.as_ref() != Some(&key)
+                {
+                    return Task::none();
+                }
                 return self.execute_block_menu_action(action);
             }
             Message::BlockClearConfirmNo => self.block_clear_confirm = None,
@@ -22324,6 +22627,11 @@ impl Frost {
     /// Re-detect links in the active session's visible grid. Version-gated so it
     /// is a no-op when neither the grid, the scroll position, nor the tab changed.
     fn recompute_links(&mut self) {
+        if !self.active_projection_interaction_allowed() {
+            self.links.clear();
+            self.links_cache_key = None;
+            return;
+        }
         let Some(sess) = self.sessions.get(self.active) else {
             self.links.clear();
             return;
@@ -24510,10 +24818,18 @@ impl Frost {
                 controls = controls.push(widget_identity_scope::scope(
                     self.block_reading_menu_epoch.clone(),
                     pick_list(actions, None::<&str>, move |action| {
-                        Message::BlockReadingMenuAction(session_id, action)
+                        Message::ProjectedReadingMenu(
+                            session_id,
+                            ProjectionCallbackIdentity::capture(&sess.projection),
+                            Some(action),
+                        )
                     })
                     .menu_style(self.popup_menu_style())
-                    .on_open(Message::BlockReadingMenuOpened(session_id))
+                    .on_open(Message::ProjectedReadingMenu(
+                        session_id,
+                        ProjectionCallbackIdentity::capture(&sess.projection),
+                        None,
+                    ))
                     .on_close(Message::BlockReadingMenuClosed)
                     .placeholder("Actions")
                     .text_size(font_size)
@@ -24561,7 +24877,11 @@ impl Frost {
                 ));
             }
         }
-        Some(controls.into())
+        let controls: Element<'_, Message> = controls.into();
+        let identity = ProjectionCallbackIdentity::capture(&sess.projection);
+        Some(controls.map(move |message| {
+            Message::ProjectedAction(session_id, identity.clone(), Box::new(message))
+        }))
     }
 
     fn block_details_snapshot(
@@ -25047,11 +25367,13 @@ impl Frost {
             selected.is_some_and(|id| sess.terminal.zone_by_id(id).is_some()),
         )?;
         let session_id = sess.id;
+        let projection_key = ProjectionCallbackIdentity::capture(&sess.projection);
         let rect = self
             .pane_rects()
             .into_iter()
             .find(|pane| pane.session == self.active)?
             .rect;
+        self.block_menu_projection = Some(projection_key);
         self.block_menu = Some(BlockMenuState {
             session_id,
             zone_id,
@@ -25191,7 +25513,12 @@ impl Frost {
                 .on_press_maybe(
                     actions
                         .contains(&action)
-                        .then_some(Message::BlockMenuAction(action)),
+                        .then(|| {
+                            self.block_menu_projection.clone().map(|key| {
+                                Message::ProjectedBlockMenuAction(state.session_id, key, action)
+                            })
+                        })
+                        .flatten(),
                 )
                 .padding([5, 9])
                 .width(Length::Fill)
@@ -26481,6 +26808,42 @@ impl Frost {
                 .embedded_view(self.modifiers)
                 .map(move |message| Message::EmbeddedVim(id, Box::new(message)));
         }
+        if !sess
+            .terminal
+            .projection_interaction_allowed(&sess.projection)
+        {
+            let input_surface: Element<'_, Message> = TermWidget::new(
+                sess.projection.row_view(),
+                (0, 0),
+                false,
+                sess.terminal.cursor_shape,
+                self.focused && sess_idx == self.active && self.terminal_input_active(),
+                &self.theme,
+                self.metrics,
+                self.mono,
+                self.cjk_mono,
+                self.symbol_mono,
+                self.math_symbol,
+                self.nerd_symbol,
+                Vec::new(),
+                0,
+                0,
+            )
+            .projection_available(false)
+            .preedit((!sess.terminal.preedit_text.is_empty()).then(|| {
+                (
+                    sess.terminal.preedit_text.clone(),
+                    sess.terminal.preedit_selection.clone(),
+                )
+            }))
+            .into();
+            let notice = container(column![
+                text("Terminal output temporarily unavailable").size(18),
+                text("The display resource budget was exceeded. The process is still running."),
+                text("Widen the pane or reduce retained history to retry. Keyboard input, resize and close remain available."),
+            ].spacing(12)).padding(24).width(Length::Fill).height(Length::Fill);
+            return stack![input_surface, notice].into();
+        }
         let session_id = sess.id;
         let is_active = sess_idx == self.active;
         // An open overlay input owns the keyboard and IME, so the terminal pane
@@ -26564,6 +26927,9 @@ impl Frost {
             chat_mode::ControlKind::Submit,
             self.chat_input_ready(session_id),
         );
+        let mouse_projection_key = ProjectionCallbackIdentity::capture(&sess.projection);
+        let scroll_projection_key = ProjectionCallbackIdentity::capture(&sess.projection);
+        let summary_projection_key = ProjectionCallbackIdentity::capture(&sess.projection);
         let terminal = TermWidget::new(
             sess.projection.row_view(),
             sess.cursor,
@@ -26580,6 +26946,10 @@ impl Frost {
             selection,
             sess.projection.scroll_offset(),
             sess.projection.max_scroll_offset(),
+        )
+        .projection_available(
+            sess.terminal
+                .projection_interaction_allowed(&sess.projection),
         )
         .interaction_mode(
             self.config.effective_terminal_mode(),
@@ -26606,7 +26976,13 @@ impl Frost {
             sess.projection.has_canvas_head(),
             sess.terminal.is_mouse_enabled() && !sess.reading_agent(),
             move |rows, precise| {
-                Message::TranscriptScroll(session_id, transcript_epoch, rows, precise)
+                Message::ProjectedTranscriptScroll(
+                    session_id,
+                    scroll_projection_key.clone(),
+                    transcript_epoch,
+                    rows,
+                    precise,
+                )
             },
             move || Message::TranscriptPause(session_id, transcript_epoch),
         )
@@ -26652,9 +27028,15 @@ impl Frost {
         .shared_shell()
         .blink_on(self.blink_on)
         .opacity(self.config.opacity * glass_shell_tokens::TERMINAL[3] as f32 / 255.0)
-        .on_mouse(move |inp| Message::MousePane(session_id, inp))
+        .on_mouse(move |inp| {
+            Message::ProjectedMousePane(session_id, mouse_projection_key.clone(), inp)
+        })
         .on_summary(sess.projection.key(), move |activation| {
-            Message::SummaryActivate(session_id, activation)
+            Message::ProjectedAction(
+                session_id,
+                summary_projection_key.clone(),
+                Box::new(Message::SummaryActivate(session_id, activation)),
+            )
         });
         self.font_zoom_region(font_zoom::Group::Content, terminal)
     }
@@ -35901,6 +36283,105 @@ mod block_browser_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queued_active_action_cannot_retarget_after_tab_switch() {
+        let mut terminal = super::TerminalState::new(8, 2);
+        let view = terminal.get_projected_viewport(false);
+        let queued = super::ProjectionCallbackIdentity::capture(&view);
+        let owner = 17;
+        // The original pane remains live and its frame remains current.
+        assert!(super::projection_callback_is_current(
+            &terminal, &view, &queued
+        ));
+        assert!(super::projection_callback_targets_active(owner, Some(17)));
+        assert!(!super::projection_callback_targets_active(owner, Some(18)));
+        assert!(!super::projection_callback_targets_active(owner, None));
+    }
+
+    #[test]
+    fn queued_callback_rejects_same_source_policy_aba() {
+        super::TerminalState::with_projection_row_budget(1, || {
+            let mut terminal = super::TerminalState::new(8, 2);
+            let mut policy = super::ProjectionPolicy::new();
+            policy.set_block_spacing(true);
+            let mut state = super::ProjectionViewState::default();
+            let old = terminal.get_projected_viewport_with_state(false, &policy, &mut state);
+            let captured = super::ProjectionCallbackIdentity::capture(&old);
+            assert!(old.unavailable().is_none());
+            let failed = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+            assert!(failed.unavailable().is_some());
+            let restored = terminal.get_projected_viewport_with_state(false, &policy, &mut state);
+            assert!(restored.unavailable().is_none());
+            assert_eq!(old.key(), restored.key(), "same source and original policy");
+            assert_ne!(old.view_revision(), restored.view_revision());
+            assert!(!super::projection_callback_is_current(
+                &terminal, &restored, &captured
+            ));
+        });
+    }
+
+    #[test]
+    fn queued_projection_callback_cannot_revive_after_budget_failure_and_recovery() {
+        super::TerminalState::with_projection_row_budget(12, || {
+            let mut terminal = super::TerminalState::new(8, 2);
+            terminal.process_input(b"abcdefgh\r\nijklmnop\r\nqrstuvwx\r\n");
+            let mut policy = super::ProjectionPolicy::new();
+            policy.set_block_spacing(true);
+            let mut state = super::ProjectionViewState::default();
+            let old = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+            let queued = super::ProjectionCallbackIdentity::capture(&old);
+            assert!(super::projection_callback_is_current(
+                &terminal, &old, &queued
+            ));
+            terminal.on_resize(1, 2);
+            let failed = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+            assert!(failed.unavailable().is_some());
+            assert!(!super::projection_callback_is_current(
+                &terminal, &failed, &queued
+            ));
+            terminal.on_resize(8, 2);
+            let restored = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+            assert!(restored.unavailable().is_none());
+            assert!(!super::projection_callback_is_current(
+                &terminal, &restored, &queued
+            ));
+            assert!(super::projection_callback_is_current(
+                &terminal,
+                &restored,
+                &super::ProjectionCallbackIdentity::capture(&restored)
+            ));
+        });
+    }
+
+    #[test]
+    fn projection_budget_refuses_mapping_commands_not_process_controls() {
+        use crate::keybindings::Command as C;
+        for command in [
+            C::EditCopy,
+            C::SearchNext,
+            C::TerminalScrollUp,
+            C::TerminalPromptNext,
+            C::BlockCopyOutput,
+        ] {
+            assert!(super::projection_command_requires_mapping(&command));
+        }
+        for command in [
+            C::EditPaste,
+            C::TerminalSendSigint,
+            C::TerminalSendEof,
+            C::SessionClose,
+            C::TerminalClosePane,
+            C::WindowClose,
+            C::SearchClose,
+            C::SearchOpen,
+            C::SearchHistoryPrev,
+            C::SearchHistoryNext,
+            C::SearchReplaceToggle,
+        ] {
+            assert!(!super::projection_command_requires_mapping(&command));
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn close_role_tracks_real_command_owned_pty_until_child_exit() {

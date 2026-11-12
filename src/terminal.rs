@@ -3,6 +3,8 @@ mod visible_rows;
 pub use visible_rows::RowView;
 use visible_rows::VisibleRows;
 mod chat_projection;
+mod projection_budget;
+pub use projection_budget::ProjectionUnavailable;
 #[cfg(test)]
 mod frame_adapter_tests;
 pub(crate) use chat_projection::CHAT_MIN_INPUT_ROWS;
@@ -2207,9 +2209,10 @@ pub struct ProjectionKey {
 /// Immutable view of the existing terminal materialization plus stable raw
 /// provenance. P0 is deliberately identity-only: it cannot collapse, filter,
 /// delete, or otherwise change visible cells.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 #[allow(dead_code)] // Transformed fields are consumed by the P1 UI wiring slice.
 pub struct ProjectedViewport {
+    unavailable: Option<ProjectionUnavailable>,
     cells: std::sync::Arc<VisibleRows>,
     row_wrapped: std::sync::Arc<Vec<bool>>,
     row_kinds: std::sync::Arc<Vec<ProjectedRowKind>>,
@@ -2239,12 +2242,50 @@ pub struct ProjectedViewport {
     canvas_head: bool,
 }
 
+// Preserve the established diagnostic representation for valid snapshots.
+// The new failure state is additive and must remain visible when present;
+// no existing field or immutable replay evidence is normalized away.
+impl std::fmt::Debug for ProjectedViewport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("ProjectedViewport");
+        if self.unavailable.is_some() {
+            debug.field("unavailable", &self.unavailable);
+        }
+        debug.field("cells", &self.cells);
+        debug.field("row_wrapped", &self.row_wrapped);
+        debug.field("row_kinds", &self.row_kinds);
+        debug.field("provenance", &self.provenance);
+        debug.field("raw_span_index", &self.raw_span_index);
+        debug.field("raw_row_index", &self.raw_row_index);
+        debug.field("source_revision", &self.source_revision);
+        debug.field("view_revision", &self.view_revision);
+        debug.field("identity_fast_path", &self.identity_fast_path);
+        debug.field("mode", &self.mode);
+        debug.field("scroll_offset", &self.scroll_offset);
+        debug.field("policy_revision", &self.policy_revision);
+        debug.field("policy_ids", &self.policy_ids);
+        debug.field("block_spacing", &self.block_spacing);
+        debug.field("document_rows", &self.document_rows);
+        debug.field("document_start", &self.document_start);
+        debug.field("top_padding", &self.top_padding);
+        debug.field("effective_collapsed", &self.effective_collapsed);
+        debug.field("plan_revision", &self.plan_revision);
+        debug.field("chat_rows", &self.chat_rows);
+        debug.field("document_row_map", &self.document_row_map);
+        debug.field("canvas_head", &self.canvas_head);
+        debug.finish()
+    }
+}
+
 #[cfg(test)]
 #[path = "terminal/canvas_tests.rs"]
 mod canvas_tests;
 
 #[allow(dead_code)] // Transformed accessors are consumed by the P1 UI wiring slice.
 impl ProjectedViewport {
+    pub fn unavailable(&self) -> Option<ProjectionUnavailable> {
+        self.unavailable
+    }
     pub fn chat_rows(&self) -> &[crate::chat_mode::ChatRow] {
         &self.chat_rows
     }
@@ -2529,6 +2570,15 @@ impl Default for ProjectionViewState {
 
 #[allow(dead_code)] // Session wiring lands in the next slice.
 impl ProjectionViewState {
+    pub fn invalidate_unavailable(&mut self) {
+        self.last_plan_key = None;
+        self.top_anchor = None;
+        // Retain only the numeric request, never its former raw-row anchor.
+        // Otherwise an idle redraw could silently retry at the cheap bottom.
+        self.reading_hold = false;
+        self.follow_bottom = self.offset_from_bottom == 0;
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -3510,6 +3560,11 @@ pub struct TerminalState {
     /// structural input; cell contents continue to use `grid_version`.
     projected_viewport_cache: Option<ProjectedViewportCache>,
     projection_plan_cache: Option<ProjectionPlanCache>,
+    projection_failure: Option<ProjectionUnavailable>,
+    raw_projection_budget_cache: Option<projection_budget::RawAdmissionCache>,
+    projection_material_failure: Option<(ProjectedViewportCacheKey, ProjectionUnavailable)>,
+    projection_budget_cache: Option<projection_budget::AdmissionCache>,
+    projection_failure_cache: Option<(ProjectionPlanCacheKey, u64, usize, ProjectionUnavailable)>,
     next_projected_view_revision: u64,
     next_projection_plan_revision: u64,
 
@@ -3850,6 +3905,11 @@ impl TerminalState {
             history_revision: 1,
             projected_viewport_cache: None,
             projection_plan_cache: None,
+            projection_failure: None,
+            raw_projection_budget_cache: None,
+            projection_material_failure: None,
+            projection_budget_cache: None,
+            projection_failure_cache: None,
             next_projected_view_revision: 1,
             next_projection_plan_revision: 1,
             current_hyperlink: None,
@@ -9838,6 +9898,10 @@ impl TerminalState {
 
     /// Visibility for a raw cursor already resolved into a projected viewport.
     pub fn is_mapped_cursor_visible(&self, projection: &ProjectedViewport, mapped: bool) -> bool {
+        if !self.projection_interaction_allowed(projection) {
+            return false;
+        }
+
         let visible = if projection.mode() == ProjectionMode::Transformed
             && !projection.chat_rows().is_empty()
         {
@@ -10471,6 +10535,7 @@ impl TerminalState {
     }
 
     #[allow(dead_code)] // P1 plan core; consumer wiring lands in the next slice.
+    #[cfg(test)]
     fn collapsed_projection_plan(&self, cols: usize, policy: &ProjectionPolicy) -> ProjectionPlan {
         let mut identity = self.identity_projection_plan(cols);
         if let Some(key) = self.chat_plan_key(policy) {
@@ -10491,7 +10556,45 @@ impl TerminalState {
             )
     }
 
+    fn checked_collapsed_projection_plan(
+        &mut self,
+        cols: usize,
+        policy: &ProjectionPolicy,
+    ) -> Result<Option<std::sync::Arc<ProjectionPlan>>, ProjectionUnavailable> {
+        let key = self.projection_plan_cache_key(cols, policy);
+        let cached_failure =
+            self.projection_failure_cache
+                .as_ref()
+                .and_then(|(old, grid, offset, reason)| {
+                    (*old == key && *grid == self.grid_version && *offset == self.scroll_offset)
+                        .then_some(*reason)
+                });
+        let result =
+            cached_failure.map_or_else(|| self.cached_projection_preflight(true, policy), Err);
+        if let Err(reason) = result {
+            self.projection_failure_cache =
+                Some((key, self.grid_version, self.scroll_offset, reason));
+            self.projection_failure = Some(reason);
+            self.projection_plan_cache = None;
+            self.projected_viewport_cache = None;
+            self.clear_text_selection();
+            return Err(reason);
+        }
+        self.projection_failure_cache = None;
+        Ok(self.unchecked_collapsed_projection_plan(cols, policy))
+    }
+
+    #[cfg(test)]
     fn cached_collapsed_projection_plan(
+        &mut self,
+        cols: usize,
+        policy: &ProjectionPolicy,
+    ) -> Option<std::sync::Arc<ProjectionPlan>> {
+        self.checked_collapsed_projection_plan(cols, policy)
+            .expect("test projection within budget")
+    }
+
+    fn unchecked_collapsed_projection_plan(
         &mut self,
         cols: usize,
         policy: &ProjectionPolicy,
@@ -11043,6 +11146,13 @@ impl TerminalState {
         &mut self,
         block_mode: bool,
     ) -> std::sync::Arc<ProjectedViewport> {
+        if let Some(reason) = self.projection_failure {
+            return self.unavailable_viewport(reason);
+        }
+        if let Err(reason) = self.cached_raw_preflight(self.grid.rows(), self.grid.cols().max(1)) {
+            return self.unavailable_viewport(reason);
+        }
+
         // Identity and bypass coordinates are raw-buffer coordinates. A
         // projected selection can never cross this boundary, while an
         // existing raw selection remains valid and must be preserved.
@@ -11134,6 +11244,7 @@ impl TerminalState {
             self.next_projected_view_revision = view_revision.checked_add(1).unwrap_or(0);
         }
         let viewport = std::sync::Arc::new(ProjectedViewport {
+            unavailable: None,
             canvas_head: false,
             chat_rows: std::sync::Arc::new(Vec::new()),
             document_row_map: std::sync::Arc::new(Vec::new()),
@@ -11172,6 +11283,7 @@ impl TerminalState {
         viewport
     }
 
+    #[cfg(test)]
     fn materialize_projection_plan(
         &self,
         plan: &ProjectionPlan,
@@ -11383,27 +11495,14 @@ impl TerminalState {
     /// P0 cell Arc; active collapses decode only raw rows referenced by the
     /// requested projected viewport slice.
     #[allow(dead_code)] // Session/UI wiring lands in the next slice.
-    pub fn get_projected_viewport_with_policy(
-        &mut self,
-        block_mode: bool,
+    fn projection_viewport_key(
+        &self,
         policy: &ProjectionPolicy,
         view_scroll_offset: usize,
-    ) -> std::sync::Arc<ProjectedViewport> {
-        let scoped_policy = self.inline_cli_projection_policy();
-        let policy = scoped_policy.as_ref().unwrap_or(policy);
-        let block_mode = block_mode || scoped_policy.is_some();
-
-        if !block_mode
-            || self.use_alt_buffer
-            || policy.is_identity()
-            || (policy.chat && self.chat_plan_key(policy).is_none())
-        {
-            return self.get_projected_viewport(block_mode);
-        }
-
+    ) -> ProjectedViewportCacheKey {
         let rows = self.grid.rows();
-        let cols = self.grid.row_len().max(1);
-        let cache_key = ProjectedViewportCacheKey {
+        let cols = self.grid.cols().max(1);
+        ProjectedViewportCacheKey {
             cursor: self.frame_cursor(),
             grid_version: self.grid_version,
             history_revision: self.history_revision,
@@ -11423,7 +11522,42 @@ impl TerminalState {
             chrome_tail_rows: self.native_chrome_tail_rows(policy),
             view_scroll_offset,
             chat: self.chat_plan_key(policy),
-        };
+        }
+    }
+
+    pub fn get_projected_viewport_with_policy(
+        &mut self,
+        block_mode: bool,
+        policy: &ProjectionPolicy,
+        view_scroll_offset: usize,
+    ) -> std::sync::Arc<ProjectedViewport> {
+        let scoped_policy = self.inline_cli_projection_policy();
+        let policy = scoped_policy.as_ref().unwrap_or(policy);
+        let block_mode = block_mode || scoped_policy.is_some();
+        let eligibility = self.cached_projection_preflight(block_mode, policy);
+        if let Err(reason) = eligibility {
+            return self.unavailable_viewport(reason);
+        }
+        // Only an explicitly requested policy frame may recover active state;
+        // auxiliary raw getters cannot undo a failed scoped/chat projection.
+        self.projection_failure = None;
+
+        if !block_mode
+            || self.use_alt_buffer
+            || policy.is_identity()
+            || (policy.chat && self.chat_plan_key(policy).is_none())
+        {
+            return self.get_projected_viewport(block_mode);
+        }
+
+        let rows = self.grid.rows();
+        let cols = self.grid.row_len().max(1);
+        let cache_key = self.projection_viewport_key(policy, view_scroll_offset);
+        if let Some((failed_key, reason)) = &self.projection_material_failure {
+            if failed_key == &cache_key {
+                return self.unavailable_viewport(*reason);
+            }
+        }
         if let Some((cached_key, viewport)) = &self.projected_viewport_cache {
             if *cached_key == cache_key {
                 let viewport = std::sync::Arc::clone(viewport);
@@ -11432,21 +11566,39 @@ impl TerminalState {
             }
         }
 
-        let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
+        let checked = match self.checked_collapsed_projection_plan(cols, policy) {
+            Ok(plan) => plan,
+            Err(reason) => {
+                return self.unavailable_viewport(reason);
+            }
+        };
+        let Some(plan) = checked else {
             return self.get_projected_viewport(true);
         };
         self.enter_transformed_selection_space(plan.plan_revision);
 
         let document_rows = plan.rows.len();
         let effective_collapsed = std::sync::Arc::new(plan.effective_collapsed.clone());
-        let materialized =
-            self.materialize_projection_plan(plan.as_ref(), view_scroll_offset, rows, cols);
+        let materialized = match self.checked_materialize_projection(
+            plan.as_ref(),
+            view_scroll_offset,
+            rows,
+            cols,
+            false,
+        ) {
+            Ok(materialized) => materialized,
+            Err(reason) => {
+                self.projection_material_failure = Some((cache_key, reason));
+                return self.unavailable_viewport(reason);
+            }
+        };
         let (raw_span_index, raw_row_index) = Self::projection_indexes(&materialized.provenance);
         let view_revision = self.next_projected_view_revision;
         if view_revision != 0 {
             self.next_projected_view_revision = view_revision.checked_add(1).unwrap_or(0);
         }
         let viewport = std::sync::Arc::new(ProjectedViewport {
+            unavailable: None,
             canvas_head: false,
             cells: std::sync::Arc::new(VisibleRows::materialized(materialized.cells)),
             row_wrapped: std::sync::Arc::new(materialized.row_wrapped),
@@ -11490,6 +11642,10 @@ impl TerminalState {
         viewport: &std::sync::Arc<ProjectedViewport>,
         policy: &ProjectionPolicy,
     ) -> std::sync::Arc<ProjectedViewport> {
+        if let Some(reason) = viewport.unavailable() {
+            return self.unavailable_viewport(reason);
+        }
+
         let scoped_policy = self.inline_cli_projection_policy();
         let policy = scoped_policy.as_ref().unwrap_or(policy);
 
@@ -11501,6 +11657,7 @@ impl TerminalState {
             // Keep one genuine predecessor row for fractional native scrolling.
             // The child PTY retains its exact grid dimensions and cursor space.
             let offset = self.scroll_offset;
+            let active_cache = self.projected_viewport_cache.clone();
             let predecessor = (offset < viewport.max_scroll_offset()).then(|| {
                 self.scroll_offset = offset + 1;
                 let previous =
@@ -11508,6 +11665,11 @@ impl TerminalState {
                 self.scroll_offset = offset;
                 previous
             });
+            if let Some(reason) = predecessor.as_ref().and_then(|p| p.unavailable()) {
+                return self.unavailable_viewport(reason);
+            }
+            // The temporary predecessor is not the current interaction frame.
+            self.projected_viewport_cache = active_cache;
             let mut canvas = viewport.as_ref().clone();
             let mut cells = Vec::with_capacity(viewport.cells.len() + 1);
             cells.push(
@@ -11564,16 +11726,31 @@ impl TerminalState {
             canvas.identity_fast_path = false;
             return std::sync::Arc::new(canvas);
         }
-        let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
+        let checked = match self.checked_collapsed_projection_plan(cols, policy) {
+            Ok(plan) => plan,
+            Err(reason) => {
+                return self.unavailable_viewport(reason);
+            }
+        };
+        let Some(plan) = checked else {
             return std::sync::Arc::clone(viewport);
         };
-        let materialized = self.materialize_projection_plan_with_margin(
+        let materialized = match self.checked_materialize_projection(
             &plan,
             viewport.scroll_offset,
             self.grid.rows(),
             cols,
             true,
-        );
+        ) {
+            Ok(materialized) => materialized,
+            Err(reason) => {
+                self.projection_material_failure = Some((
+                    self.projection_viewport_key(policy, viewport.scroll_offset),
+                    reason,
+                ));
+                return self.unavailable_viewport(reason);
+            }
+        };
         let (raw_span_index, raw_row_index) = Self::projection_indexes(&materialized.provenance);
         let mut canvas = viewport.as_ref().clone();
         canvas.cells = std::sync::Arc::new(VisibleRows::materialized(materialized.cells));
@@ -11687,9 +11864,32 @@ impl TerminalState {
         policy: &ProjectionPolicy,
         state: &mut ProjectionViewState,
     ) -> std::sync::Arc<ProjectedViewport> {
+        let requested_offset = state.offset_from_bottom;
         let scoped_policy = self.inline_cli_projection_policy();
         let policy = scoped_policy.as_ref().unwrap_or(policy);
         let block_mode = block_mode || scoped_policy.is_some();
+        let transformed = block_mode
+            && !self.use_alt_buffer
+            && !policy.is_identity()
+            && !(policy.chat && self.chat_plan_key(policy).is_none());
+        if transformed {
+            let request_key = self.projection_viewport_key(policy, state.offset_from_bottom);
+            if let Some((failed, reason)) = &self.projection_material_failure {
+                if failed == &request_key {
+                    let reason = *reason;
+                    state.invalidate_unavailable();
+                    return self.unavailable_viewport(reason);
+                }
+            }
+        }
+        let eligibility = self.cached_projection_preflight(block_mode, policy);
+        if let Err(reason) = eligibility {
+            state.invalidate_unavailable();
+            return self.unavailable_viewport(reason);
+        }
+        // Only an explicitly requested policy frame may recover active state;
+        // auxiliary raw getters cannot undo a failed scoped/chat projection.
+        self.projection_failure = None;
 
         if !block_mode
             || self.use_alt_buffer
@@ -11753,7 +11953,14 @@ impl TerminalState {
             state.follow_bottom = false;
         }
         let plan_key = self.projection_plan_cache_key(cols, policy);
-        let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
+        let checked = match self.checked_collapsed_projection_plan(cols, policy) {
+            Ok(plan) => plan,
+            Err(reason) => {
+                state.invalidate_unavailable();
+                return self.unavailable_viewport(reason);
+            }
+        };
+        let Some(plan) = checked else {
             if state.last_plan_key.is_some() {
                 self.restore_identity_scroll_from_projection(state);
                 state.last_plan_key = None;
@@ -11778,6 +11985,16 @@ impl TerminalState {
 
         let viewport =
             self.get_projected_viewport_with_policy(true, policy, state.offset_from_bottom);
+        if viewport.unavailable().is_some() {
+            // Admission may have clamped a candidate offset. A failed frame
+            // must not commit that navigation change or retry at the bottom.
+            state.offset_from_bottom = requested_offset;
+            state.invalidate_unavailable();
+            if let Some((key, _)) = &mut self.projection_material_failure {
+                key.view_scroll_offset = requested_offset;
+            }
+            return viewport;
+        }
         state.offset_from_bottom = viewport.scroll_offset();
         state.follow_bottom = state.offset_from_bottom == 0 && !state.reading_hold;
         state.top_anchor = (!state.follow_bottom)
@@ -11792,6 +12009,10 @@ impl TerminalState {
         projection: &ProjectedViewport,
         origin: RawCellOrigin,
     ) -> ProjectedRawCellLocation {
+        if !self.projection_interaction_allowed(projection) {
+            return ProjectedRawCellLocation::Unmapped;
+        }
+
         if let Some(cell) = projection.raw_to_view(origin) {
             return ProjectedRawCellLocation::Visible(cell);
         }
@@ -11832,6 +12053,10 @@ impl TerminalState {
         projection: &ProjectedViewport,
         absolute_rows: &[usize],
     ) -> Vec<f32> {
+        if !self.projection_interaction_allowed(projection) {
+            return Vec::new();
+        }
+
         if projection.mode() != ProjectionMode::Transformed {
             return crate::block_mode::marker_fractions(absolute_rows, projection.document_rows());
         }
@@ -11873,7 +12098,13 @@ impl TerminalState {
         }
         let cols = self.grid.row_len().max(1);
         let plan_key = self.projection_plan_cache_key(cols, policy);
-        let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
+        let checked = match self.checked_collapsed_projection_plan(cols, policy) {
+            Ok(plan) => plan,
+            Err(_reason) => {
+                return false;
+            }
+        };
+        let Some(plan) = checked else {
             // A requested transform can be ineffective (no OSC partitions,
             // one prompt, or every boundary ambiguous). Search/navigation
             // must still reveal raw history through the identity projection.
@@ -11916,7 +12147,13 @@ impl TerminalState {
         }
         let cols = self.grid.row_len().max(1);
         let plan_key = self.projection_plan_cache_key(cols, policy);
-        let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
+        let checked = match self.checked_collapsed_projection_plan(cols, policy) {
+            Ok(plan) => plan,
+            Err(_reason) => {
+                return false;
+            }
+        };
+        let Some(plan) = checked else {
             return false;
         };
         let Some(summary_row) = plan.summary_row(zone_id) else {
@@ -11961,6 +12198,13 @@ impl TerminalState {
     /// Sharing compares cell contents rather than trusting dirty-row stamps,
     /// so buffer replacement and cursor-only batches cannot corrupt held frames.
     pub fn get_visible_cells(&mut self) -> std::sync::Arc<VisibleRows> {
+        if let Some(reason) = self.projection_failure {
+            return self.unavailable_viewport(reason).cells.clone();
+        }
+        if let Err(reason) = self.cached_raw_preflight(self.grid.rows(), self.grid.cols().max(1)) {
+            return self.unavailable_viewport(reason).cells.clone();
+        }
+
         use jterm_engine::frame::{Limits, Row, Screen, Stamp};
         if self.use_alt_buffer {
             self.scroll_offset = 0;
@@ -12349,6 +12593,11 @@ impl TerminalState {
         viewport_pos: (usize, usize),
         mode: SelectionMode,
     ) {
+        if !self.projection_interaction_allowed(projection) {
+            self.clear_text_selection();
+            return;
+        }
+
         if projection.mode() == ProjectionMode::Transformed {
             let Some(plan_revision) = self.projection_selection_revision(projection) else {
                 self.clear_text_selection();
@@ -12407,6 +12656,11 @@ impl TerminalState {
         projection: &ProjectedViewport,
         viewport_pos: (usize, usize),
     ) {
+        if !self.projection_interaction_allowed(projection) {
+            self.clear_text_selection();
+            return;
+        }
+
         if projection.mode() == ProjectionMode::Transformed {
             let Some(plan_revision) = self.projection_selection_revision(projection) else {
                 self.clear_text_selection();
@@ -12479,6 +12733,11 @@ impl TerminalState {
         row: usize,
         col: usize,
     ) {
+        if !self.projection_interaction_allowed(projection) {
+            self.clear_text_selection();
+            return;
+        }
+
         let Some(line) = projection.row_view().get(row) else {
             return;
         };
@@ -12613,6 +12872,11 @@ impl TerminalState {
         row: usize,
         col: usize,
     ) {
+        if !self.projection_interaction_allowed(projection) {
+            self.clear_text_selection();
+            return;
+        }
+
         let Some(line) = projection.row_view().get(row) else {
             return;
         };
@@ -12737,6 +13001,11 @@ impl TerminalState {
         projection: &ProjectedViewport,
         row: usize,
     ) {
+        if !self.projection_interaction_allowed(projection) {
+            self.clear_text_selection();
+            return;
+        }
+
         if projection.mode() == ProjectionMode::Transformed {
             let Some(plan_revision) = self.projection_selection_revision(projection) else {
                 self.clear_text_selection();
@@ -12805,6 +13074,11 @@ impl TerminalState {
     }
 
     pub fn select_line_in_projection(&mut self, projection: &ProjectedViewport, row: usize) {
+        if !self.projection_interaction_allowed(projection) {
+            self.clear_text_selection();
+            return;
+        }
+
         if projection.mode() != ProjectionMode::Transformed {
             let cols = projection.row_view().first().map_or(0, <[_]>::len);
             self.projected_selection = None;
@@ -12943,6 +13217,9 @@ impl TerminalState {
     }
 
     pub fn copy_selection(&self) -> Option<String> {
+        if self.projection_failure.is_some() {
+            return None;
+        }
         if self.projected_selection.is_some() {
             return self.copy_projected_selection();
         }
@@ -13505,6 +13782,10 @@ impl TerminalState {
         projection: &ProjectedViewport,
         viewport_row: usize,
     ) -> Option<(usize, usize)> {
+        if !self.projection_interaction_allowed(projection) {
+            return None;
+        }
+
         if projection.mode() == ProjectionMode::Transformed {
             let selection = self.projected_selection.as_ref()?;
             let (plan_key, plan) = self.projection_plan_cache.as_ref()?;

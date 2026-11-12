@@ -12,7 +12,7 @@ pub(super) struct ChatPlanKey {
     command_bubbles: bool,
     prompt: Option<usize>,
     keep_end: usize,
-    companion_rows: usize,
+    pub(super) companion_rows: usize,
     running_command: Option<(usize, usize)>,
     // Capsule width depends on command cell widths. A primary-screen app
     // can CUP into an earlier command and return within one parser batch, so
@@ -1091,8 +1091,13 @@ mod tests {
         assert!(!terminal.is_mapped_cursor_visible(&alt, false));
         terminal.process_batch(b"\x1b[?25l");
         assert!(!terminal.is_mapped_cursor_visible(&alt, true));
+        let hidden = snapshot(&mut terminal, &mut ProjectionViewState::new());
+        assert!(!terminal.is_mapped_cursor_visible(&hidden, true));
         terminal.process_batch(b"\x1b[?25h");
-        assert!(terminal.is_mapped_cursor_visible(&alt, true));
+        // The original frame remains stale even when cursor visibility returns.
+        assert!(!terminal.is_mapped_cursor_visible(&alt, true));
+        let shown = snapshot(&mut terminal, &mut ProjectionViewState::new());
+        assert!(terminal.is_mapped_cursor_visible(&shown, true));
     }
 
     #[test]
