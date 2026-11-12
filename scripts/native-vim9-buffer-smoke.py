@@ -163,6 +163,11 @@ def main():
             key = f"{xi},{yi}"
             panes[key] = panes.get(key, 0) + 1
         return {"pixels": len(spots), "x_regions": xs, "y_regions": ys, "panes": panes}
+    def presented_color_regions(name):
+        # Vim's fixture acknowledgement can precede native presentation. Wait
+        # only for actual RGB pixels, not until incorrect geometry looks right.
+        regions = color_regions(name)
+        return regions if regions["pixels"] > 30 and regions["x_regions"] and regions["y_regions"] else None
     def native_splits(name, horizontal_regions, vertical_regions):
         regions = color_regions(name)
         expected_panes = horizontal_regions + vertical_regions - 1
@@ -513,7 +518,8 @@ def main():
         if args.app == "frost":
             # A missing [vim9] section must leave the GUI buffer enabled while
             # giving it the area formerly occupied by persistent IDE controls.
-            regions = color_regions("buffer-first")
+            regions = wait_for(lambda: presented_color_regions("buffer-first"),
+                               "restored buffer RGB presentation", app)
             assert regions["x_regions"][0][0] < 80, "Project panel reserved default space"
             assert regions["y_regions"][0][0] < 80, "Toolbar/tabs reserved default space"
             original_state = fresh_state("complete buffer-first geometry")

@@ -191,3 +191,18 @@ The standalone projection property harness also imports the production failure
 metadata enums introduced by projection admission. It does not stub those types
 or remove the property/mutation gates. Its 14 tests (including 10,000 generated
 sequences) and both unchanged negative-control mutants pass locally.
+
+At 78870d3, CI, Provider and Layout passed. Wayland again completed the real
+controlled-stall fault/input-block/close scenario. X11 still timed out at close,
+so the local-update change alone is not a verified resolution. The isolated
+fixture adds bounded real-pointer delivery/UI-status/exit-action diagnostics to
+locate the remaining stage, without manufacturing input or changing production
+behavior or acceptance conditions.
+
+The independent Vim GUI run also exposed a presentation race: the fixture had
+acknowledged restoration while the screenshot still showed the prior compatibility
+frame. Buffer-first geometry now waits within the existing bounded deadline for
+actual GUI RGB pixels, then applies the unchanged strict position assertions.
+Visible incorrect geometry is not retried until it passes. Both observer negative
+controls and the full 28 snapshot/typing tests pass locally; GUI acceptance still
+requires the new exact-commit run.

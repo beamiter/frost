@@ -134,6 +134,20 @@ def main():
             if derived.count(anchor) != 1:
                 raise RuntimeError('Ambiguous fixture milestone anchor: ' + label)
             derived = derived.replace(anchor, f'        frost_fixture_milestone("{label}", {bit});\n' + anchor, 1)
+        # Bounded derived-only diagnostics distinguish real pointer delivery,
+        # UI interaction, and exit action. They never generate input/messages.
+        traces = [
+            (pre, '            if let Event::EventLoopAwakened(winit::event::Event::WindowEvent { event, .. }) = &event { frost_fixture_pointer("runner", event); }\n'),
+            ('                        if native_events::observe(id, &window_event) {', '                        frost_fixture_pointer("consumer", &window_event);\n'),
+            ('                            let (ui_state, statuses) = user_interfaces', '                            if window_events.iter().any(|event| matches!(event, core::Event::Mouse(_))) { frost_fixture_trace("ui-before", &format!("cursor={:?} mouse_events={}", window.state.cursor(), window_events.iter().filter(|event| matches!(event, core::Event::Mouse(_))).count())); }\n'),
+            ('                            match ui_state {', '                            if window_events.iter().any(|event| matches!(event, core::Event::Mouse(_))) { frost_fixture_trace("ui-after", &format!("statuses={:?} status_count={} messages={}", statuses.iter().take(8).collect::<Vec<_>>(), statuses.len(), messages.len())); }\n'),
+            ('        Action::Exit => {', '        // Trace the real action, never manufacture an exit.\n'),
+        ]
+        for anchor, trace in traces:
+            if derived.count(anchor) != 1:
+                raise RuntimeError('Ambiguous fixture pointer trace anchor: ' + anchor)
+            derived = derived.replace(anchor, trace + anchor, 1)
+        derived = derived.replace('        Action::Exit => {', '        Action::Exit => {\n            frost_fixture_trace("exit-action", "observed");', 1)
         derived += (root / 'scripts/native-ingress-fixture.rs').read_text()
         lib.write_text(derived)
         (out / 'fixture-iced-winit.rs').write_text(derived)

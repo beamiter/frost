@@ -51,3 +51,20 @@ fn frost_fixture_milestone(label: &str, bit: u32) {
     std::fs::write(&tmp, std::process::id().to_string()).unwrap();
     std::fs::rename(tmp, path).unwrap();
 }
+
+// At most 64 small synthetic-fixture observations; no keyboard text is logged.
+fn frost_fixture_trace(stage: &str, detail: &str) {
+    if !subscription::Event::input_overloaded() { return; }
+    static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let index = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if index < 64 {
+        eprintln!("FROST_FAULT_POINTER pid={} stage={} {}", std::process::id(), stage, detail);
+    }
+}
+fn frost_fixture_pointer(stage: &str, event: &winit::event::WindowEvent) {
+    use winit::event::WindowEvent;
+    if matches!(event, WindowEvent::CursorMoved { .. } | WindowEvent::CursorEntered { .. }
+        | WindowEvent::CursorLeft { .. } | WindowEvent::MouseInput { .. }) {
+        frost_fixture_trace(stage, &format!("{:?}", event));
+    }
+}

@@ -283,6 +283,23 @@ class TypingDeadlineTests(unittest.TestCase):
         exec(compile(ast.Module(body=[function], type_ignores=[]), str(__file__), "exec"), namespace)
         return namespace[name]
 
+    def test_buffer_pixel_probe_waits_for_presentation_not_fixture_ack(self):
+        empty = {"pixels": 0, "x_regions": [], "y_regions": []}
+        visible = {"pixels": 31, "x_regions": [[1, 200]], "y_regions": [[2, 20]]}
+        capture = Mock(side_effect=[empty, visible])
+        probe = self.extracted("presented_color_regions", {"color_regions": capture})
+        self.assertIsNone(probe("buffer-first"))
+        self.assertIs(probe("buffer-first"), visible)
+        self.assertEqual(capture.call_count, 2)
+
+    def test_visible_wrong_geometry_is_returned_for_strict_assertion(self):
+        wrong = {"pixels": 31, "x_regions": [[200, 400]], "y_regions": [[100, 120]]}
+        capture = Mock(return_value=wrong)
+        probe = self.extracted("presented_color_regions", {"color_regions": capture})
+        self.assertIs(probe("buffer-first"), wrong)
+        with self.assertRaises(AssertionError):
+            assert probe("buffer-first")["x_regions"][0][0] < 80
+
     def test_long_command_has_typing_budget_and_is_sent_once(self):
         xdo = Mock()
         wait = Mock()
