@@ -456,6 +456,16 @@ fn record(
     state_ids: &mut BTreeMap<String, usize>,
 ) -> Value {
     let mut terminal = TerminalState::new(24, 6);
+    // This frozen pre-extraction oracle includes old unsafe overflow/reply
+    // semantics. Keep its scope explicitly historical; production bounded
+    // behavior is covered separately and must not rewrite these fixtures.
+    terminal.parser = jterm_engine::parser::Parser::with_profile(
+        jterm_engine::parser::ParserLimits {
+            pending_bytes: MAX_PENDING_ESCAPE,
+            kitty_recovery_bytes: jterm_core::kitty_graphics::MAX_CONTROL_BYTES,
+        },
+        jterm_engine::parser::ParserProfile::FrostLegacyV1,
+    );
     terminal.max_scrollback = 32;
     let mut start = 0;
     let mut snapshots = Vec::new();
@@ -581,7 +591,7 @@ fn verify_original_source_before_capture() {
 }
 
 #[test]
-fn parser_oracle_original_scanner() {
+fn historical_legacy_parser_oracle_original_scanner() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/parser/frost-original-scanner-oracle.json");
     let capture = std::env::var_os("FROST_CAPTURE_PARSER_ORACLE").is_some();

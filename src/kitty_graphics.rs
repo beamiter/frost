@@ -733,14 +733,20 @@ impl KittyGraphicsState {
         }
     }
 
+    /// Abort pending transfer state without reflecting untrusted parser input.
+    /// Completed images remain available; only the in-flight assembly is lost.
+    pub(crate) fn abort_pending_transfer(&mut self) {
+        self.assembler.reset();
+        self.pending_placements.clear();
+        self.chunked_target = None;
+    }
+
     /// 拒绝一个到不了控制解析器的 APC-G（例如超出解析器上限的包），同时仍按
     /// 可恢复的身份与安静级别应答：`i=` 寻址的客户端看到 EINVAL 而不是干等
     /// 超时。在途分块随之作废——被拒绝的传输不允许之后再拼出一张图。
     pub(crate) fn reject_graphics_payload(&mut self, payload: &[u8], error: &str) {
         let target = self.recover_target(payload);
-        self.assembler.reset();
-        self.pending_placements.clear();
-        self.chunked_target = None;
+        self.abort_pending_transfer();
         self.answer(target, Some(&Failure::invalid(error)));
     }
 

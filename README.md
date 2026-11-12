@@ -949,6 +949,8 @@ frost 优先使用配套 shell [`jsh`](https://github.com/beamiter/jsh)，找不
 
 ## 安全说明
 
+控制字符串现采用[有界解析策略](docs/BOUNDED_PARSER.md)：完整和跨批次输入统一限制为 1 MiB payload，超限后保持不透明丢弃；超限或取消的 Kitty APC 不再返回旧的 payload 派生错误回复。
+
 终端控制序列来自本地或远程程序，不能天然视为可信输入。frost 默认拒绝 OSC 52/5522 读取宿主剪贴板；如果显式开启 `allow_clipboard_read`，通过 SSH 运行的程序也可能获得剪贴板内容。OSC 52 写入同样默认拒绝：改写剪贴板与读取跨越同一条信任边界，只是方向相反——决定用户下一次粘贴出什么内容的，会变成终端里跑的程序；需要时用 `allow_remote_clipboard_write` 显式打开。Kitty 图像、OSC 8 链接和通知均有资源、协议或频率限制。
 
 失败命令的纠正卡片是唯一会“因为命令失败而自动拉起子进程”的界面，因此它的探测只从固定绝对候选

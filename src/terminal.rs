@@ -6,6 +6,8 @@ mod chat_projection;
 #[cfg(test)]
 mod frame_adapter_tests;
 pub(crate) use chat_projection::CHAT_MIN_INPUT_ROWS;
+#[cfg(test)]
+mod bounded_parser_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod chat_pty_tests;
 #[cfg(test)]
@@ -154,11 +156,12 @@ const MAX_OSC8_ID_BYTES: usize = 256;
 /// Cell keys are `u16`, but a much smaller terminal-local cap bounds retained
 /// URI/id memory even when a child emits a fresh id for every character.
 const MAX_OSC8_HYPERLINKS: usize = 4 * 1024;
-/// Cap on one buffered unfinished escape/string sequence carried across PTY
-/// reads. Generous enough for legitimate large payloads (e.g. OSC 52
-/// clipboard); kitty graphics APCs stream against the same cap via
-/// `pending_apc` instead of being dropped wholesale.
-const MAX_PENDING_ESCAPE: usize = 1 << 20; // 1 MiB
+/// Strict per-string payload cap, for complete and fragmented reads alike.
+/// A possible trailing ST prefix adds one retained byte; diagnostic snapshots
+/// also include the two-byte introducer. Oversize strings discard until ST,
+/// OSC BEL or CAN/SUB; embedded escapes cannot execute during discard.
+/// CSI has its own fixed bound; ESC intermediates are limited to eight bytes.
+const MAX_PENDING_ESCAPE: usize = 1 << 20; // 1 MiB, unchanged from legacy.
 pub const MAX_TERMINAL_COLS: usize = 1024;
 pub const MAX_TERMINAL_ROWS: usize = 512;
 pub use jterm_engine::colors::DynamicColorPalette;
@@ -3805,13 +3808,14 @@ impl TerminalState {
             current_working_dir: None,
             organism_idle_cwd: None,
             global_bg: Color::Default,
-            parser: Parser::with_profile(
+            parser: Parser::with_bounded_profile(
                 ParserLimits {
                     pending_bytes: MAX_PENDING_ESCAPE,
                     kitty_recovery_bytes: jterm_core::kitty_graphics::MAX_CONTROL_BYTES,
                 },
                 ParserProfile::FrostLegacyV1,
-            ),
+            )
+            .expect("fixed Frost parser limits are valid"),
             g0_charset: Charset::Ascii,
             g1_charset: Charset::Ascii,
             active_charset: Charset::Ascii,
@@ -8303,7 +8307,16 @@ impl TerminalState {
             self.parser.set_ascii_batching(
                 self.active_charset == Charset::Ascii && !self.modes.contains(&4),
             );
+            let rejected_before = self.parser.rejected_count();
             let step = self.parser.next(&input[at..]);
+            if step.abandoned_apc {
+                self.kitty_graphics.abort_pending_transfer();
+            }
+            if self.parser.rejected_count() != rejected_before {
+                // Rejected opaque input may be an OSC 8 close/open. Clear
+                // active linkage without inspecting or reflecting payload.
+                self.current_hyperlink = None;
+            }
             at += step.consumed;
             if step.capture.as_ref().is_some_and(|capture| capture.started) {
                 capture_active = self.idle_background_capture_active();
@@ -18977,26 +18990,24 @@ mod tests {
         assert!(terminal.kitty_graphics.get_image(52).is_some());
         let _ = terminal.get_output();
 
-        // An oversized packet is rejected with a bounded response and then
+        // An oversized packet is rejected without reflecting a response and then
         // discarded through its ST — never buffered wholesale and never
         // parsed as ordinary input afterwards.
         let mut oversized = b"\x1b_Ga=p,i=53,q=0;".to_vec();
-        oversized.resize(MAX_PENDING_ESCAPE + 1, b'A');
+        oversized.resize(MAX_PENDING_ESCAPE + 3, b'A');
         terminal.process_input(&oversized);
         assert!(terminal.parser.snapshot().pending_apc.is_empty());
-        assert!(terminal.parser.snapshot().discarding_oversized_apc);
-        let response = terminal.get_output();
-        assert!(
-            response.starts_with(b"\x1b_Gi=53;EINVAL:"),
-            "{}",
-            String::from_utf8_lossy(&response)
+        assert_eq!(
+            terminal.parser.pending_kind(),
+            super::PendingKind::String(super::StringKind::Apc)
         );
-        assert!(response.len() < 256);
+        assert_eq!(terminal.parser.rejected_count(), 1);
+        assert!(terminal.get_output().is_empty());
 
         // Discard through ST without allocating the oversized packet, then
         // resume ordinary terminal parsing on the same input batch.
         terminal.process_input(b"\x1b\\Z");
-        assert!(!terminal.parser.snapshot().discarding_oversized_apc);
+        assert_eq!(terminal.parser.pending_kind(), super::PendingKind::None);
         assert_eq!(terminal.grid[0][0].character, 'Z');
 
         // The bytes after ST belong to the normal stream, not the APC. Even
@@ -19007,7 +19018,7 @@ mod tests {
         near_limit.resize(MAX_PENDING_ESCAPE - 2, b'A');
         terminal.process_input(&near_limit);
         terminal.process_input(b"\x1b\\Y");
-        assert!(!terminal.parser.snapshot().discarding_oversized_apc);
+        assert_eq!(terminal.parser.pending_kind(), super::PendingKind::None);
         assert!(terminal.parser.snapshot().pending_apc.is_empty());
         assert_eq!(terminal.grid[0][1].character, 'Y');
     }
@@ -19134,34 +19145,20 @@ mod tests {
     }
 
     #[test]
-    fn oversized_osc_keeps_the_old_pending_escape_overflow_semantics() {
-        let mut terminal = TerminalState::new(64, 2);
-
-        // A terminator inside the read that crosses the cap still completes
-        // the packet, exactly like the old merged re-parse did.
-        terminal.process_input(b"\x1b]0;huge");
-        let mut crossing = Vec::new();
-        crossing.resize(MAX_PENDING_ESCAPE + 8, b'A');
-        crossing.extend_from_slice(b"\x07");
-        terminal.process_input(&crossing);
-        assert!(terminal.parser.snapshot().pending_osc.is_empty());
-        assert!(terminal.titles.window_title.starts_with("huge"));
-
-        // Without a terminator the prefix is retained past the cap, then
-        // abandoned wholesale on the next read; that read parses as ordinary
-        // input (the old pending_escape clear behavior).
-        let mut terminal = TerminalState::new(64, 2);
-        let mut oversized = b"\x1b]0;never".to_vec();
-        oversized.resize(MAX_PENDING_ESCAPE + 8, b'A');
-        terminal.process_input(&oversized);
-        assert!(!terminal.parser.snapshot().pending_osc.is_empty());
-        terminal.process_input(b"tail\x07");
-        assert!(terminal.parser.snapshot().pending_osc.is_empty());
-        assert_eq!(terminal.titles.window_title, "");
-        assert_eq!(terminal.grid[0][0].character, 't');
-        assert_eq!(terminal.grid[0][1].character, 'a');
-        assert_eq!(terminal.grid[0][2].character, 'i');
-        assert_eq!(terminal.grid[0][3].character, 'l');
+    fn oversized_osc_discards_through_terminator_without_title_or_grid_effects() {
+        for split in [2, MAX_PENDING_ESCAPE, MAX_PENDING_ESCAPE + 8] {
+            let mut terminal = TerminalState::new(64, 2);
+            let mut packet = b"\x1b]0;never".to_vec();
+            packet.resize(MAX_PENDING_ESCAPE + 8, b'A');
+            packet.extend_from_slice(b"\x1b[2JSECRET\x07Z");
+            terminal.process_input(&packet[..split]);
+            terminal.process_input(&packet[split..]);
+            assert_eq!(terminal.parser.rejected_count(), 1);
+            assert_eq!(terminal.parser.retained_bytes(), 0);
+            assert!(terminal.titles.window_title.is_empty());
+            assert_eq!(terminal.grid[0][0].character, 'Z');
+            assert!(terminal.get_output().is_empty());
+        }
     }
 
     #[test]
@@ -19193,15 +19190,16 @@ mod tests {
         assert!(terminal.parser.snapshot().pending_string.is_empty());
         assert_eq!(terminal.grid[0][0].character, 'W');
 
-        // BEL does not terminate a DCS, and an oversized prefix is abandoned
-        // on the next read just like the OSC path.
+        // BEL does not terminate a DCS. Overflow stays opaque until ST.
         let mut terminal = TerminalState::new(64, 2);
         let mut oversized = b"\x1bPpayload-with-bel\x07".to_vec();
         oversized.resize(MAX_PENDING_ESCAPE + 8, b'A');
         terminal.process_input(&oversized);
-        assert!(!terminal.parser.snapshot().pending_string.is_empty());
-        terminal.process_input(b"S");
-        assert!(terminal.parser.snapshot().pending_string.is_empty());
+        assert_eq!(terminal.parser.rejected_count(), 1);
+        terminal.process_input(b"SECRET\x07");
+        assert_eq!(terminal.grid[0][0].character, ' ');
+        terminal.process_input(b"\x1b\\S");
+        assert_eq!(terminal.parser.retained_bytes(), 0);
         assert_eq!(terminal.grid[0][0].character, 'S');
     }
 
@@ -22143,17 +22141,20 @@ mod tests {
     }
 
     #[test]
-    fn discarded_oversized_apc_still_obeys_cancellation_and_reset() {
-        for suffix in [b"\x18ok".as_slice(), b"\x1aok", b"\x1bcok"] {
+    fn discarded_oversized_apc_cancels_but_does_not_execute_embedded_reset() {
+        for suffix in [b"\x18ok".as_slice(), b"\x1aok", b"\x1bcSECRET\x1b\\ok"] {
             let mut terminal = TerminalState::new(16, 2);
             let mut oversized = b"\x1b_Gi=1;".to_vec();
-            oversized.resize(MAX_PENDING_ESCAPE + 1, b'A');
+            oversized.resize(MAX_PENDING_ESCAPE + 3, b'A');
             terminal.process_input(&oversized);
-            assert!(terminal.parser.snapshot().discarding_oversized_apc);
+            assert_eq!(
+                terminal.parser.pending_kind(),
+                super::PendingKind::String(super::StringKind::Apc)
+            );
             for byte in suffix {
                 terminal.process_input(&[*byte]);
             }
-            assert!(!terminal.parser.snapshot().discarding_oversized_apc);
+            assert_eq!(terminal.parser.pending_kind(), super::PendingKind::None);
             assert_eq!(terminal.grid[0][0].character, 'o');
             assert_eq!(terminal.grid[0][1].character, 'k');
         }
