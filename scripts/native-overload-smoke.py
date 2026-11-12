@@ -81,6 +81,24 @@ def ingress_flood_command(backend, pairs=3000):
     return ['wtype'] + ['-k', 'F24'] * pairs
 
 
+def observed_x11_press(log, pid):
+    # The fixture records actual Runner callbacks, not the injector's success.
+    prefix = f'FROST_FAULT_POINTER pid={pid} stage=runner MouseInput '
+    return any(line.startswith(prefix) and 'state: Pressed, button: Left' in line
+               for line in log.splitlines())
+
+
+def x11_observed_click(smoke, point, pid, wait_for):
+    smoke.run(['xdotool', 'mousemove', '--sync', *map(str, point)])
+    smoke.run(['xdotool', 'mousedown', '1'])
+    try:
+        wait_for(lambda: observed_x11_press((smoke.out / 'fixture.log').read_text(), pid),
+                 'same-process real X11 button press', timeout=5)
+    finally:
+        # Release even when observation fails; never leave the compositor held.
+        smoke.run(['xdotool', 'mouseup', '1'])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
@@ -180,7 +198,11 @@ def main():
             result['observed_fault_keyboard_counts'] = [flood_count_before, flood_count_after]
         result['click'] = {'text': BUTTON, 'point': point, 'method': 'native compositor pointer'}
         if args.backend == 'x11':
-            smoke.run(['xdotool', 'mousemove', '--sync', *map(str, point), 'click', '1'])
+            if manifest.get('mechanism') == 'runner':
+                x11_observed_click(smoke, point, app.pid, runner.wait_for)
+                result['x11_same_pid_press_observed_before_release'] = True
+            else:
+                smoke.run(['xdotool', 'mousemove', '--sync', *map(str, point), 'click', '1'])
         else:
             pointer = smoke.env.get('FROST_SMOKE_POINTER')
             assert pointer, 'Missing genuine Wayland pointer helper'
@@ -234,6 +256,39 @@ def regression_test(output):
 
 
 class ObservationTests(unittest.TestCase):
+    def test_press_proof_requires_matching_pid_stage_and_button(self):
+        good = 'FROST_FAULT_POINTER pid=42 stage=runner MouseInput { state: Pressed, button: Left }'
+        self.assertTrue(observed_x11_press(good, 42))
+        for wrong in [good.replace('pid=42', 'pid=43'), good.replace('runner', 'consumer'),
+                      good.replace('Pressed', 'Released'), good.replace('Left', 'Right')]:
+            self.assertFalse(observed_x11_press(wrong, 42))
+
+    def test_x11_release_follows_observed_press_without_retry(self):
+        from unittest.mock import Mock
+        smoke = Mock()
+        smoke.out = Mock()
+        smoke.out.__truediv__ = Mock(return_value=Mock())
+        order = []
+        smoke.run.side_effect = lambda command: order.append(command[1])
+        def seen(probe, description, timeout):
+            order.append('observed-press')
+            self.assertEqual(timeout, 5)
+            return True
+        x11_observed_click(smoke, (413, 531), 42, seen)
+        self.assertEqual(order, ['mousemove', 'mousedown', 'observed-press', 'mouseup'])
+
+    def test_x11_release_is_guaranteed_when_press_not_delivered(self):
+        from unittest.mock import Mock
+        smoke = Mock()
+        def fail(*args, **kwargs):
+            raise TimeoutError('no observed native press')
+        with self.assertRaises(TimeoutError):
+            x11_observed_click(smoke, (413, 531), 42, fail)
+        self.assertEqual([call.args[0] for call in smoke.run.call_args_list], [
+            ['xdotool', 'mousemove', '--sync', '413', '531'],
+            ['xdotool', 'mousedown', '1'], ['xdotool', 'mouseup', '1']])
+
+
     def test_wayland_flood_uses_valid_default_zero_delay(self):
         self.assertEqual(ingress_flood_command('wayland', 2), ['wtype', '-k', 'F24', '-k', 'F24'])
         self.assertNotIn('-d', ingress_flood_command('wayland'))

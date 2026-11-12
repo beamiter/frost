@@ -108,7 +108,7 @@ def main():
         vendor = checkout / 'vendor'
         vendor.mkdir()
         for entry in (root / 'vendor').iterdir():
-            if entry.name == 'iced_winit':
+            if entry.name in {'iced_winit', 'winit'}:
                 shutil.copytree(entry, vendor / entry.name)
             else:
                 (vendor / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
@@ -154,6 +154,30 @@ def main():
         (out / 'fixture-iced-winit.diff').write_text(''.join(difflib.unified_diff(
             production_lib.splitlines(keepends=True), derived.splitlines(keepends=True),
             fromfile='production/vendor/iced_winit/src/lib.rs', tofile='fixture/vendor/iced_winit/src/lib.rs')))
+        x11 = vendor / 'winit/src/platform_impl/linux/x11/event_processor.rs'
+        production_x11 = x11.read_text()
+        filter_anchor = '        // Don\'t process event if it was filtered.'
+        button_anchor = '        // Deliver multi-touch events instead of emulated mouse events.'
+        for anchor in (filter_anchor, button_anchor):
+            if production_x11.count(anchor) != 1:
+                raise RuntimeError('Ambiguous fixture X11 pointer anchor: ' + anchor)
+        derived_x11 = production_x11.replace(filter_anchor, '''        if event_type == xlib::GenericEvent {
+            let cookie = unsafe { xev.generic_event_cookie };
+            if matches!(cookie.evtype, xinput2::XI_ButtonPress | xinput2::XI_ButtonRelease
+                | xinput2::XI_RawButtonPress | xinput2::XI_RawButtonRelease) {
+                frost_fixture_x11_pointer("filter", &format!("evtype={} filtered={} extension={}", cookie.evtype, filtered, cookie.extension));
+            }
+        }
+''' + filter_anchor, 1)
+        derived_x11 = derived_x11.replace(button_anchor,
+            '        frost_fixture_x11_pointer("button", &format!("state={:?} detail={} flags={} window={} x={} y={} mods={}", state, event.detail, event.flags, event.event, event.event_x, event.event_y, event.mods.effective));\n' + button_anchor, 1)
+        derived_x11 += (root / 'scripts/native-x11-pointer-fixture.rs').read_text()
+        x11.write_text(derived_x11)
+        (out / 'fixture-x11-pointer.rs').write_text(derived_x11)
+        (out / 'fixture-x11-pointer.diff').write_text(''.join(difflib.unified_diff(
+            production_x11.splitlines(keepends=True), derived_x11.splitlines(keepends=True),
+            fromfile='production/vendor/winit/src/platform_impl/linux/x11/event_processor.rs',
+            tofile='fixture/vendor/winit/src/platform_impl/linux/x11/event_processor.rs')))
     (checkout / 'src').mkdir()
     for entry in (root / 'src').iterdir():
         if entry.name == 'native_overload_fixture.rs':
@@ -172,6 +196,7 @@ def main():
     paths += list((root / 'src').rglob('*.rs'))
     paths += list((root / 'vendor/iced_futures').rglob('*.rs'))
     paths += list((root / 'vendor/iced_winit').rglob('*.rs'))
+    paths += list((root / 'vendor/winit').rglob('*.rs'))
     source_hashes = {str(p.relative_to(root)): sha(p) for p in sorted(paths)}
     target = Path(os.environ.get('CARGO_TARGET_DIR', str(root / 'target'))).resolve()
     evidence = {
@@ -189,6 +214,8 @@ def main():
         evidence['scope'] = 'actual Runner admission under controlled consumer stall and real compositor input; not natural flood or unmodified release'
         evidence['runner_source_sha256'] = sha(out / 'fixture-iced-winit.rs')
         evidence['runner_diff_sha256'] = sha(out / 'fixture-iced-winit.diff')
+        evidence['x11_pointer_source_sha256'] = sha(out / 'fixture-x11-pointer.rs')
+        evidence['x11_pointer_diff_sha256'] = sha(out / 'fixture-x11-pointer.diff')
     evidence_path = out / 'manifest.json'
     evidence_path.write_text(json.dumps(evidence, indent=2) + '\n')
     if args.prepare_only:

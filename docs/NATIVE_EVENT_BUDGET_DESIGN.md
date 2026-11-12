@@ -206,3 +206,17 @@ actual GUI RGB pixels, then applies the unchanged strict position assertions.
 Visible incorrect geometry is not retried until it passes. Both observer negative
 controls and the full 28 snapshot/typing tests pass locally; GUI acceptance still
 requires the new exact-commit run.
+
+At ae44934, Vim GUI, CI, Provider and Layout passed. Native Desktop again passed
+ordinary scenarios and Wayland controlled-stall acceptance. X11 still failed:
+PID 21826 recorded cursor motion through Runner, consumer and UI, but no native
+MouseInput press/release callbacks. Wayland PID 21997 recorded both buttons,
+Captured UI status, one message and the real exit action. Thus the evidence does
+not attribute the remaining X11 failure to application close handling.
+
+The next isolated fixture traces raw X11 button/filter stages and emulation
+flags (bounded, no keyboard text). X11 injection now issues one genuine press,
+requires its same-PID Runner observation, then releases (also on timeout). It
+never retries a click, sets focus, manufactures an application event, or accepts
+cleanup as exit. This distinguishes delivery/filtering failure from a short
+press/release observation race; actual new CI evidence remains required.
