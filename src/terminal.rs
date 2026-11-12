@@ -8,6 +8,8 @@ mod frame_adapter_tests;
 pub(crate) use chat_projection::CHAT_MIN_INPUT_ROWS;
 #[cfg(test)]
 mod bounded_parser_tests;
+#[cfg(test)]
+mod bounded_reflow_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod chat_pty_tests;
 #[cfg(test)]
@@ -48,6 +50,7 @@ use unicode_normalization::UnicodeNormalization;
 
 #[cfg(test)]
 thread_local! {
+    static BOUNDED_REFLOW_PEAK: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
     static PROJECTED_HISTORY_DECOMPRESS_COUNT: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
@@ -13052,6 +13055,7 @@ impl TerminalState {
         &cells[..end]
     }
 
+    #[cfg(test)]
     fn reflow_lines(
         lines: &[ScrollbackLine],
         new_cols: usize,
@@ -13122,6 +13126,93 @@ impl TerminalState {
         result
     }
 
+    /// Reflow into a bounded newest-row tail. Input rows are consumed instead
+    /// of accumulating a decompressed logical line or all expanded output.
+    /// Compress even rows subsequently evicted, preserving fresh row-ID cadence.
+    fn reflow_lines_bounded(
+        lines: impl IntoIterator<Item = ScrollbackLine>,
+        new_cols: usize,
+        blank_cell: &TerminalCell,
+        retain_rows: usize,
+    ) -> VecDeque<ScrollbackLine> {
+        assert!(new_cols > 0);
+        let mut result = VecDeque::new();
+        let mut emit = |cells: &[TerminalCell], wrapped: bool| {
+            let line = ScrollbackLine::compress(cells, wrapped);
+            if retain_rows != 0 {
+                if result.len() == retain_rows {
+                    result.pop_front();
+                }
+                result.push_back(line);
+                #[cfg(test)]
+                BOUNDED_REFLOW_PEAK.with(|peak| {
+                    let (a, b, c) = peak.get();
+                    peak.set((a, b, c.max(result.len())));
+                });
+            }
+        };
+        let mut row = Vec::with_capacity(new_cols);
+        let mut group_open = false;
+        let mut group_has_cells = false;
+        // A final sentinel ends a wrapped group whose continuation was evicted
+        // or absent. It must not add an extra empty line after a hard newline.
+        for line in lines.into_iter().map(Some).chain(std::iter::once(None)) {
+            let mut wrapped = false;
+            if let Some(line) = line {
+                group_open = true;
+                wrapped = line.is_wrapped;
+                let decompressed = line.decompress();
+                #[cfg(test)]
+                BOUNDED_REFLOW_PEAK.with(|peak| {
+                    let (a, b, c) = peak.get();
+                    peak.set((a.max(decompressed.len()), b, c));
+                });
+                let cells = Self::strip_trailing_blanks(&decompressed);
+                group_has_cells |= !cells.is_empty();
+                for &cell in cells {
+                    if new_cols == 1 && cell.flags.wide_continuation() {
+                        continue;
+                    }
+                    if row.len() == new_cols {
+                        if new_cols > 1 && cell.flags.wide_continuation() {
+                            // Match legacy: keep body and continuation together
+                            // rather than splitting at a new physical row edge.
+                            let body = row.pop().expect("full row");
+                            row.resize(new_cols, *blank_cell);
+                            emit(&row, true);
+                            row.clear();
+                            row.push(body);
+                        } else {
+                            emit(&row, true);
+                            row.clear();
+                        }
+                    }
+                    let mut cell = cell;
+                    if new_cols == 1 {
+                        cell.flags.set_wide(false);
+                    }
+                    row.push(cell);
+                    debug_assert!(row.len() <= new_cols);
+                    #[cfg(test)]
+                    BOUNDED_REFLOW_PEAK.with(|peak| {
+                        let (a, b, c) = peak.get();
+                        peak.set((a, b.max(row.len()), c));
+                    });
+                }
+            }
+            if group_open && !wrapped {
+                if !row.is_empty() || !group_has_cells {
+                    row.resize(new_cols, *blank_cell);
+                    emit(&row, false);
+                    row.clear();
+                }
+                group_open = false;
+                group_has_cells = false;
+            }
+        }
+        result
+    }
+
     /// Normalize retained history after a burst of width changes. This is kept
     /// separate from `on_resize` so window/divider drags can debounce the O(n)
     /// decompress/reflow/recompress pass instead of freezing every pointer step.
@@ -13160,11 +13251,9 @@ impl TerminalState {
         // Historical padding must stay neutral even when a live application has
         // a non-default background active at the instant the resize settles.
         let blank_cell = TerminalCell::default();
-        let source: Vec<_> = self.scrollback.drain(..).collect();
-        self.scrollback = Self::reflow_lines(&source, cols, &blank_cell).into();
-        while self.scrollback.len() > self.max_scrollback {
-            self.scrollback.pop_front();
-        }
+        let source = std::mem::take(&mut self.scrollback);
+        self.scrollback =
+            Self::reflow_lines_bounded(source, cols, &blank_cell, self.max_scrollback);
         self.bump_history_revision();
         let new_scrollback_len = self.scrollback.len();
         self.kitty_graphics
