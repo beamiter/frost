@@ -100,3 +100,26 @@ for contract in ('y:layout.rail.y+recovery_height',
                  'height:(layout.rail.height-recovery_height).max(0.0)',
                  'top:layout.center.y+recovery_height'):
     assert contract in workspace, contract
+
+# Readiness may retry observation, never paste. Wrong bytes or owner death
+# cannot count as ready, even when the clipboard tool exits successfully.
+with tempfile.TemporaryDirectory() as directory:
+    smoke = module.Smoke(Path('/not-executed'), 'wayland', Path(directory))
+    owner = SimpleNamespace(poll=lambda: None)
+    observations = [SimpleNamespace(returncode=1, stdout=b''),
+                    SimpleNamespace(returncode=0, stdout=b'old'),
+                    SimpleNamespace(returncode=0, stdout=b'expected')]
+    with patch.object(module.subprocess, 'run', side_effect=observations) as probe, \
+            patch.object(module.time, 'sleep'):
+        smoke.wait_clipboard_owner(owner, b'expected', 'test')
+        assert probe.call_count == 3
+        assert all(call.args[0] == ['wl-paste', '--no-newline'] for call in probe.call_args_list)
+    with patch.object(module.subprocess, 'run') as probe:
+        try:
+            smoke.wait_clipboard_owner(SimpleNamespace(poll=lambda: 1), b'x', 'dead')
+        except AssertionError as error:
+            assert 'owner exited' in str(error)
+        else:
+            raise AssertionError('dead owner accepted')
+        probe.assert_not_called()
+    smoke.close()

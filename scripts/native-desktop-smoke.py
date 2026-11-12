@@ -355,6 +355,19 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
         assert re.fullmatch(r'/dev/pts/[0-9]+', tty), tty
         return {'pid': int(pid), 'tty': tty, 'rows': int(rows), 'cols': int(cols)}
 
+    def wait_clipboard_owner(self, owner, expected, label):
+        # Probe only this isolated synthetic selection, never retry paste/Return.
+        # A sleep is not proof that wl-copy owns the selection yet.
+        def ready():
+            assert owner.poll() is None, 'Clipboard owner exited before readiness'
+            try:
+                probe = subprocess.run(['wl-paste', '--no-newline'], env=self.env,
+                                       capture_output=True, timeout=1)
+            except subprocess.TimeoutExpired:
+                return False
+            return probe.returncode == 0 and probe.stdout == expected
+        wait_for(ready, 'exact clipboard owner ' + label, timeout=5)
+
     def command(self, sentinel, paste=False):
         command = "printf '%s:%s:%s\\n' " + shlex.quote(sentinel) + ' "$$" "$(tty)" >> ' + shlex.quote(str(self.transcript))
         if paste:
@@ -372,7 +385,10 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
             self.processes.append(owner)
             owner.stdin.write(command.encode())
             owner.stdin.close()
-            time.sleep(0.5)
+            if self.backend == 'wayland':
+                self.wait_clipboard_owner(owner, command.encode(), sentinel)
+            else:
+                time.sleep(0.5)
             self.key('v', ('ctrl', 'shift'))
         else:
             self.text(command)
@@ -472,6 +488,11 @@ def main():
     smoke = Smoke(args.binary, args.backend, args.output)
     try:
         smoke.start_desktop()
+        if args.backend == 'wayland':
+            # Match the genuine clipboard/IME fixtures: keep a keyboard on the
+            # headless seat while one-shot wtype devices come and go. Otherwise
+            # selection can remain nil until the next input device is created.
+            smoke.spawn(['wtype', '-s', '600000', '-k', 'F24'], 'smoke-seat-keyboard')
         for mode in ('normal', 'block', 'chat'):
             smoke.exercise(mode)
             result['passed_modes'].append(mode)
