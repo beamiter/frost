@@ -123,6 +123,17 @@ def main():
         derived = production_lib.replace(pre, '            let fixture_key = matches!(&event, Event::EventLoopAwakened(winit::event::Event::WindowEvent { event: winit::event::WindowEvent::KeyboardInput { .. }, .. }));\n' + pre, 1)
         derived = derived.replace(pause, '            if frost_fixture_pause(fixture_key) { return; }\n' + pause, 1)
         derived = derived.replace(reject, '                        None => {\n                            if !subscription::Event::input_overloaded() { FIXTURE_NATIVE_REJECTED.store(true, std::sync::atomic::Ordering::SeqCst); }\n                            subscription::Event::report_input_overload();', 1)
+        # Record real consumer milestones without setting or resetting the latch.
+        milestones = [
+            ('        let event = match event {', 'consumer', 0),
+            ('            fault_displayed = true;', 'view-rebuilt', 1),
+            ('                        draw_span.finish();', 'drawn', 2),
+            ('                                window.surface_recovery.recovered();', 'presented', 3),
+        ]
+        for anchor, label, bit in milestones:
+            if derived.count(anchor) != 1:
+                raise RuntimeError('Ambiguous fixture milestone anchor: ' + label)
+            derived = derived.replace(anchor, f'        frost_fixture_milestone("{label}", {bit});\n' + anchor, 1)
         derived += (root / 'scripts/native-ingress-fixture.rs').read_text()
         lib.write_text(derived)
         (out / 'fixture-iced-winit.rs').write_text(derived)

@@ -154,6 +154,7 @@ where
         id: Option<String>,
         sender: mpsc::UnboundedSender<Event<proxy::Event<Message>>>,
         native_budget: event_budget::Budget,
+        fault_notified: bool,
         fault_buttons: event_budget::Budget,
         fault_pointer: event_budget::Budget,
         fault_paint: event_budget::Budget,
@@ -173,6 +174,7 @@ where
         id: settings.id,
         sender: event_sender,
         native_budget: event_budget::Budget::default(),
+        fault_notified: false,
         fault_buttons: event_budget::Budget::with_limits(32, 64 * 1024),
         fault_pointer: event_budget::Budget::with_limits(128, 128 * 1024),
         fault_paint: event_budget::Budget::with_limits(64, 128 * 1024),
@@ -337,6 +339,10 @@ where
             };
             if let Some(event) = event {
                 self.sender.start_send(event).expect("Send event");
+            }
+            if subscription::Event::input_overloaded() && !self.fault_notified {
+                self.fault_notified = true;
+                self.sender.start_send(Event::InputFault).expect("Send fault control");
             }
             // Even rejected input must poll the consumer so the fault can be shown.
 
@@ -524,6 +530,8 @@ where
 
 #[derive(Debug)]
 enum Event<Message: 'static> {
+    // A dedicated once-only notification, independent of data/idle capacity.
+    InputFault,
     Coalesced {
         event: Box<Event<Message>>,
         lease: event_budget::WakeLease,
@@ -652,7 +660,10 @@ async fn run_instance<P>(
     let mut native_leases = Vec::new();
 
     let mut ui_caches = FxHashMap::default();
-    let mut user_interfaces = ManuallyDrop::new(FxHashMap::default());
+    let mut user_interfaces: ManuallyDrop<FxHashMap<
+        window::Id,
+        UserInterface<'_, P::Message, P::Theme, P::Renderer>,
+    >> = ManuallyDrop::new(FxHashMap::default());
     let mut clipboard = Clipboard::unconnected();
 
     #[cfg(all(feature = "linux-theme-detection", target_os = "linux"))]
@@ -713,7 +724,27 @@ async fn run_instance<P>(
             }
             event => event,
         };
+        // Fault rendering must not depend on AboutToWait: a continuously busy
+        // native source can delay idle callbacks. Rebuild before processing the
+        // next admitted event, including a queued redraw or pointer event.
+        if subscription::Event::input_overloaded() && !fault_displayed {
+            let cached_interfaces: FxHashMap<_, _> =
+                ManuallyDrop::into_inner(user_interfaces)
+                    .into_iter()
+                    .map(|(id, ui)| (id, ui.into_cache()))
+                    .collect();
+            user_interfaces = ManuallyDrop::new(build_user_interfaces(
+                &program,
+                &mut window_manager,
+                cached_interfaces,
+            ));
+            fault_displayed = true;
+            for (_, window) in window_manager.iter_mut() {
+                window.raw.request_redraw();
+            }
+        }
         match event {
+            Event::InputFault => {},
             Event::Coalesced { .. } => unreachable!("lifecycle envelope nested"),
             Event::Admitted { .. } => unreachable!("native envelope nested"),
             Event::WindowCreated {

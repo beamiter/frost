@@ -40,3 +40,14 @@ fn frost_fixture_pause(is_keyboard: bool) -> bool {
     assert!(start.elapsed() < std::time::Duration::from_secs(20), "actual ingress did not overload during bounded consumer stall");
     true
 }
+
+// Diagnostic proof of actual consumer progress, never an overload trigger.
+fn frost_fixture_milestone(label: &str, bit: u32) {
+    if !subscription::Event::input_overloaded() { return; }
+    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SEEN.fetch_or(1 << bit, std::sync::atomic::Ordering::SeqCst) & (1 << bit) != 0 { return; }
+    let path = std::path::PathBuf::from(std::env::var_os("FROST_OVERLOAD_FIXTURE_PROOF").unwrap()).with_extension(label);
+    let tmp = path.with_extension(format!("{label}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, std::process::id().to_string()).unwrap();
+    std::fs::rename(tmp, path).unwrap();
+}

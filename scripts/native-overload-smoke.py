@@ -72,6 +72,15 @@ def capture_fault_ocr(png, run):
                    'preprocessing': command, 'scale': 3, 'offset': [0, 0], 'page_segmentation': 3}
 
 
+def ingress_flood_command(backend, pairs=3000):
+    assert 0 < pairs <= 3000
+    if backend == 'x11':
+        return ['xdotool', 'key', '--clearmodifiers', '--delay', '0', '--repeat', str(pairs), 'F24']
+    assert backend == 'wayland'
+    # wtype rejects an explicit zero delay; its default already has no sleep.
+    return ['wtype'] + ['-k', 'F24'] * pairs
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
@@ -107,10 +116,7 @@ def main():
         runner.wait_for(proof.with_suffix('.armed').exists, 'fixture admission armed', timeout=10)
         control.write_text('trigger real admission\n')
         if manifest.get('mechanism') == 'runner':
-            if args.backend == 'x11':
-                flood = smoke.spawn(['xdotool', 'key', '--clearmodifiers', '--delay', '0', '--repeat', '3000', 'F24'], 'ingress-flood')
-            else:
-                flood = smoke.spawn(['wtype', '-d', '0'] + ['-k', 'F24'] * 3000, 'ingress-flood')
+            flood = smoke.spawn(ingress_flood_command(args.backend), 'ingress-flood')
             result['real_compositor_key_pairs_requested'] = 3000
         runner.wait_for(proof.exists, 'real admission proof', timeout=20)
         admission = json.loads(proof.read_text())
@@ -125,6 +131,14 @@ def main():
             assert 0 < admission['events_broadcast'] <= 6000, admission
             assert flood.wait(timeout=10) == 0, 'Real compositor key flood failed'
         result['admission'] = admission
+        if manifest.get('mechanism') == 'runner':
+            result['consumer_milestones'] = {}
+            for label in ['consumer', 'view-rebuilt', 'drawn', 'presented']:
+                path = proof.with_suffix('.' + label)
+                runner.wait_for(path.exists, 'postfault ' + label, timeout=10)
+                pid = int(path.read_text())
+                assert pid == app.pid, 'Consumer milestone belongs to another process'
+                result['consumer_milestones'][label] = pid
         ongoing_flood = None
         if manifest.get('mechanism') == 'runner':
             if args.backend == 'x11':
@@ -220,6 +234,11 @@ def regression_test(output):
 
 
 class ObservationTests(unittest.TestCase):
+    def test_wayland_flood_uses_valid_default_zero_delay(self):
+        self.assertEqual(ingress_flood_command('wayland', 2), ['wtype', '-k', 'F24', '-k', 'F24'])
+        self.assertNotIn('-d', ingress_flood_command('wayland'))
+        self.assertEqual(ingress_flood_command('x11', 2)[-3:], ['--repeat', '2', 'F24'])
+
     def words(self, button=BUTTON):
         lines = ['Input stopped:', 'Pending input was rejected and will not be replayed.',
                  'may terminate running terminal jobs', 'lose unsaved editor changes.', button]

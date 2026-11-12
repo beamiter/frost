@@ -152,3 +152,20 @@ Final local strict Clippy passed. The isolated Runner fixture compiled in dev
 profile (followed only by PTY import-order formatting). This compile does not
 exercise a compositor. CI builds the release fixture and must provide the actual
 X11/Wayland evidence for the published source.
+
+## First Runner desktop result and follow-up
+
+At c26ec06, CI, Provider, Vim and conversation layout passed. Native Desktop
+passed all ordinary production scenarios, but the new isolated Runner cases
+failed: X11 proved real admission rejection after 585 keyboard callbacks and
+992 ms, yet the screenshot remained on the old terminal UI; Wayland's key tool
+rejected an explicit `-d 0` before admission. No postfault close/input-isolation
+success is claimed for that commit.
+
+The follow-up removes the invalid tool argument and makes first-fault view
+rebuilding independent of `AboutToWait`, with a single reserved fault control
+even when the rejected input itself cannot be queued. The isolated fixture now
+records actual consumer, rebuilt-view, draw and successful-present milestones
+bound to the visible process PID. This diagnoses the actual rendering stage
+instead of accepting a timeout increase or weaker OCR. Exact new desktop CI is
+still required to establish that this resolves the observed X11 symptom.
