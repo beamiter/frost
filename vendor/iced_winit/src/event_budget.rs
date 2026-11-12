@@ -220,3 +220,54 @@ mod ready_tests {
         assert!(actions.is_empty());
     }
 }
+
+/// Only already-admitted fault-page interactions request a local update turn.
+/// Keyboard/data floods cannot create these turns or bypass ingress budgets.
+pub(crate) fn fault_interaction_needs_flush(
+    faulted: bool,
+    event: &winit::event::WindowEvent,
+) -> bool {
+    use winit::event::WindowEvent;
+    faulted
+        && matches!(
+            event,
+            WindowEvent::MouseInput { .. }
+                | WindowEvent::CursorMoved { .. }
+                | WindowEvent::CursorEntered { .. }
+                | WindowEvent::CursorLeft { .. }
+                | WindowEvent::Touch(_)
+        )
+}
+
+#[cfg(test)]
+mod fault_interaction_tests {
+    use super::*;
+    #[test]
+    fn fault_pointer_dispatch_does_not_wait_for_native_idle() {
+        use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
+        let device_id = DeviceId::dummy();
+        for state in [ElementState::Pressed, ElementState::Released] {
+            let event = WindowEvent::MouseInput {
+                device_id,
+                state,
+                button: MouseButton::Left,
+            };
+            assert!(fault_interaction_needs_flush(true, &event));
+            assert!(!fault_interaction_needs_flush(false, &event));
+        }
+        let moved = WindowEvent::CursorMoved {
+            device_id,
+            position: winit::dpi::PhysicalPosition::new(413.0, 531.0),
+        };
+        assert!(fault_interaction_needs_flush(true, &moved));
+        // Drawing the page must not create a self-sustaining update/redraw loop.
+        assert!(!fault_interaction_needs_flush(
+            true,
+            &WindowEvent::RedrawRequested
+        ));
+        assert!(!fault_interaction_needs_flush(
+            true,
+            &WindowEvent::Ime(winit::event::Ime::Commit("blocked".into()))
+        ));
+    }
+}

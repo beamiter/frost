@@ -169,3 +169,25 @@ records actual consumer, rebuilt-view, draw and successful-present milestones
 bound to the visible process PID. This diagnoses the actual rendering stage
 instead of accepting a timeout increase or weaker OCR. Exact new desktop CI is
 still required to establish that this resolves the observed X11 symptom.
+
+## Sustained X11 fault interaction follow-up
+
+At 923c0b6, the native run 43160728015 passed the complete Wayland Runner
+controlled-stall scenario, including real pointer close. X11 now displayed the
+fault page and passed same-PID consumer/rebuild/draw/present milestones plus
+blocked-shell-input observation, but timed out waiting for exit after the real
+button click while native input remained busy. These are controlled consumer
+stalls with real native ingress, not proof of natural-flood exhaustion.
+
+The follow-up gives already-admitted fault-page pointer events one bounded local
+update turn before receiving more native events. It reuses the normal UI update
+path, without synthesizing a click, relying on OS idle, or allowing rejected
+keyboard data to schedule turns. The normal native admission reservations and
+permanent fail-closed input latch remain unchanged. Fresh native CI is required
+to verify X11 close for this exact implementation; local tests are not desktop
+acceptance.
+
+The standalone projection property harness also imports the production failure
+metadata enums introduced by projection admission. It does not stub those types
+or remove the property/mutation gates. Its 14 tests (including 10,000 generated
+sequences) and both unchanged negative-control mutants pass locally.

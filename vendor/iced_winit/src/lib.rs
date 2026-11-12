@@ -701,12 +701,20 @@ async fn run_instance<P>(
 
     log::info!("System theme: {system_theme:?}");
 
+    // One local turn, not an ingress queue: fault-page pointer interactions
+    // must reach UserInterface::update even when X11 never becomes idle.
+    let mut fault_interaction_pending = false;
     'next_event: loop {
-        // Empty the queue if possible
-        let event = match event_receiver.try_recv() {
-            Ok(event) => Some(event),
-            Err(mpsc::TryRecvError::Empty) => event_receiver.next().await,
-            Err(mpsc::TryRecvError::Closed) => None,
+        // Service the preceding admitted fault pointer before receiving more
+        // native traffic. Reuse the normal update path, not a synthetic click.
+        let event = if std::mem::take(&mut fault_interaction_pending) {
+            Some(Event::EventLoopAwakened(winit::event::Event::AboutToWait))
+        } else {
+            match event_receiver.try_recv() {
+                Ok(event) => Some(event),
+                Err(mpsc::TryRecvError::Empty) => event_receiver.next().await,
+                Err(mpsc::TryRecvError::Closed) => None,
+            }
         };
 
         let Some(event) = event else {
@@ -724,6 +732,15 @@ async fn run_instance<P>(
             }
             event => event,
         };
+        if let Event::EventLoopAwakened(winit::event::Event::WindowEvent {
+            event, ..
+        }) = &event
+        {
+            fault_interaction_pending = event_budget::fault_interaction_needs_flush(
+                subscription::Event::input_overloaded(),
+                event,
+            );
+        }
         // Fault rendering must not depend on AboutToWait: a continuously busy
         // native source can delay idle callbacks. Rebuild before processing the
         // next admitted event, including a queued redraw or pointer event.

@@ -44,6 +44,14 @@ types = between('fn fresh_raw_row_id() -> RawRowId {', '#[derive(Clone, Debug, P
 canvas_tests = '#[cfg(test)]\n#[path = "terminal/canvas_tests.rs"]\nmod canvas_tests;\n'
 assert types.count(canvas_tests) == 1
 code += types.replace(canvas_tests, '')
+# Viewport failure metadata now lives in the admission module. Keep its real
+# declarations, without importing the full admission/cache implementation into
+# this pure-kernel harness or substituting a test-only error type.
+budget = (ROOT / 'src/terminal/projection_budget.rs').read_text()
+for marker in ['pub enum ProjectionResource {', 'pub enum ProjectionUnavailable {']:
+    start = budget.rfind('#[derive', 0, budget.index(marker))
+    assert start >= 0, marker
+    code += budget[start:budget.index(marker)] + item(marker, budget) + '\n'
 code += '#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n' + item('enum ProjectedTopAnchor')
 # These contiguous types include the pure copy helper and selection anchors.
 start = source.index('#[derive(Debug)]\nstruct ProjectedLine')
