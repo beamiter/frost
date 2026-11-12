@@ -237,3 +237,29 @@ Replaying the actual failed frame locally took 0.953–1.057 seconds with defaul
 workers and 0.770–0.772 seconds with one worker, with identical 2,923-byte TSV.
 This bounds OCR resource use; it does not establish the CI timeout's CPU cause
 or claim the pending X11 click acceptance is fixed.
+
+### 749fc68 X11 injector/WM interaction isolated
+
+Native run `43183980975` passed all ordinary desktop checks and Wayland overload
+close (exit 0, forbidden shell marker absent). CI, Vim, Provider and Layout also
+passed. X11 PID `21254` passed admission and all four presentation milestones;
+two fault frames identified the same button at root `(413, 531)`. The continuing
+native keyboard count increased from 5,376 to 8,832. The real button press reached
+XI raw input (`evtype=15`, `filtered=false`) but no window-directed XI button or
+Runner mouse press appeared. The strict press observation correctly failed.
+
+A separate Xvfb + default Openbox + xdotool + xev reproduction, with no Frost
+process, isolated the injector: F24 is absent from the default Xvfb keymap.
+Repeated xdotool F24 generates dynamic keymap changes and MappingNotify traffic.
+The F24 trial observed 1,030 key presses and 16,472 MappingNotify events, but only
+the initial pointer pair; the pointer pair during the flood never reached xev.
+An independently started F12 trial observed 1,174 key presses, no MappingNotify,
+and both initial and during-flood pointer pairs. Without Openbox, F24 pointer
+pairs also arrived. These are bounded local observations, not a claim about all
+X11 window managers or natural production floods.
+
+The X11 acceptance injector therefore uses the already mapped F12 key instead
+of F24. Admission event count, injection rate, sustained postfault flood, same-PID
+press, shell-input blocking, and real close/exit gates remain unchanged. Wayland
+continues to use F24. Production code and event budgets are not changed; full
+Frost native acceptance still must pass on the published commit.

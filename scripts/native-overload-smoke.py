@@ -78,10 +78,19 @@ def capture_fault_ocr(png, run):
 def ingress_flood_command(backend, pairs=3000):
     assert 0 < pairs <= 3000
     if backend == 'x11':
-        return ['xdotool', 'key', '--clearmodifiers', '--delay', '0', '--repeat', str(pairs), 'F24']
+        # F12 is mapped by the standard Xvfb keyboard. F24 is not: xdotool
+        # repeatedly changes the keymap, making Openbox swallow pointer clicks.
+        return ['xdotool', 'key', '--clearmodifiers', '--delay', '0', '--repeat', str(pairs), 'F12']
     assert backend == 'wayland'
     # wtype rejects an explicit zero delay; its default already has no sleep.
     return ['wtype'] + ['-k', 'F24'] * pairs
+
+
+def ongoing_flood_command(backend):
+    if backend == 'x11':
+        return ['xdotool', 'key', '--delay', '2', '--repeat', '20000', 'F12']
+    assert backend == 'wayland'
+    return ['wtype'] + ['-s', '2', '-k', 'F24'] * 20000
 
 
 def observed_x11_press(log, pid):
@@ -162,10 +171,7 @@ def main():
                 result['consumer_milestones'][label] = pid
         ongoing_flood = None
         if manifest.get('mechanism') == 'runner':
-            if args.backend == 'x11':
-                ongoing_flood = smoke.spawn(['xdotool', 'key', '--delay', '2', '--repeat', '20000', 'F24'], 'fault-keyboard-flood')
-            else:
-                ongoing_flood = smoke.spawn(['wtype'] + ['-s', '2', '-k', 'F24'] * 20000, 'fault-keyboard-flood')
+            ongoing_flood = smoke.spawn(ongoing_flood_command(args.backend), 'fault-keyboard-flood')
         def fault_key_count():
             pid, count = map(int, proof.with_suffix('.fault-keys').read_text().split())
             assert pid == app.pid, 'Fault input observation belongs to another process'
@@ -310,7 +316,15 @@ class ObservationTests(unittest.TestCase):
     def test_wayland_flood_uses_valid_default_zero_delay(self):
         self.assertEqual(ingress_flood_command('wayland', 2), ['wtype', '-k', 'F24', '-k', 'F24'])
         self.assertNotIn('-d', ingress_flood_command('wayland'))
-        self.assertEqual(ingress_flood_command('x11', 2)[-3:], ['--repeat', '2', 'F24'])
+        self.assertEqual(ingress_flood_command('x11', 2)[-3:], ['--repeat', '2', 'F12'])
+
+    def test_x11_flood_avoids_unmapped_key_without_weakening_load(self):
+        self.assertEqual(ingress_flood_command('x11'),
+                         ['xdotool', 'key', '--clearmodifiers', '--delay', '0', '--repeat', '3000', 'F12'])
+        self.assertEqual(ongoing_flood_command('x11'),
+                         ['xdotool', 'key', '--delay', '2', '--repeat', '20000', 'F12'])
+        self.assertEqual(ongoing_flood_command('wayland'),
+                         ['wtype'] + ['-s', '2', '-k', 'F24'] * 20000)
 
     def words(self, button=BUTTON):
         lines = ['Input stopped:', 'Pending input was rejected and will not be replayed.',
