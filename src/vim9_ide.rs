@@ -2425,11 +2425,11 @@ impl Ide {
         .modifiers(modifiers.shift(), modifiers.alt(), modifiers.control())
         .scrollbar_always(true)
         .app_mouse_full_grid(true)
-        .dynamic_palette(&s.terminal.dynamic_palette)
+        .dynamic_palette(s.terminal.palette_overrides())
         .dynamic_defaults(
-            s.terminal.dynamic_fg,
-            s.terminal.dynamic_bg,
-            s.terminal.dynamic_cursor_color,
+            s.terminal.foreground_override(),
+            s.terminal.background_override(),
+            s.terminal.cursor_override(),
         )
         .preedit(
             (self.input_active() && !s.terminal.preedit_text.is_empty()).then(|| {

@@ -24,6 +24,29 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
     out.insert("window_title".into(), lane(&t.titles.window_title));
     out.insert("icon_title".into(), lane(&t.titles.icon_title));
     out.insert("title_stack".into(), lane(&t.titles.title_stack));
+    out.insert(
+        "saved_primary_dynamic_fg".into(),
+        lane(t.saved_primary_colors.dynamic_fg),
+    );
+    out.insert(
+        "saved_primary_dynamic_bg".into(),
+        lane(t.saved_primary_colors.dynamic_bg),
+    );
+    out.insert(
+        "saved_primary_dynamic_cursor_color".into(),
+        lane(t.saved_primary_colors.dynamic_cursor_color),
+    );
+    out.insert(
+        "saved_primary_dynamic_palette".into(),
+        lane(t.saved_primary_colors.dynamic_palette),
+    );
+    out.insert("dynamic_fg".into(), lane(t.colors.dynamic_fg));
+    out.insert("dynamic_bg".into(), lane(t.colors.dynamic_bg));
+    out.insert(
+        "dynamic_cursor_color".into(),
+        lane(t.colors.dynamic_cursor_color),
+    );
+    out.insert("dynamic_palette".into(), lane(t.colors.dynamic_palette));
     fields!(
         scrollback,
         selection,
@@ -46,10 +69,6 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         saved_cursor_col,
         saved_primary_global_bg,
         saved_primary_cursor_shape,
-        saved_primary_dynamic_fg,
-        saved_primary_dynamic_bg,
-        saved_primary_dynamic_cursor_color,
-        saved_primary_dynamic_palette,
         tab_stops,
         last_printed_char,
         pending_wrap,
@@ -122,10 +141,6 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         active_agent_execution,
         current_command_text,
         current_command_exact,
-        dynamic_fg,
-        dynamic_bg,
-        dynamic_cursor_color,
-        dynamic_palette,
         theme_default_colors,
         theme_ansi_colors,
         osc_reply_terminator,

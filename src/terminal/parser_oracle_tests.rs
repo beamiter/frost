@@ -79,6 +79,13 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
     out.insert("window_title".into(), lane(&t.titles.window_title));
     out.insert("icon_title".into(), lane(&t.titles.icon_title));
     out.insert("title_stack".into(), lane(&t.titles.title_stack));
+    out.insert("dynamic_fg".into(), lane(t.colors.dynamic_fg));
+    out.insert("dynamic_bg".into(), lane(t.colors.dynamic_bg));
+    out.insert(
+        "dynamic_cursor_color".into(),
+        lane(t.colors.dynamic_cursor_color),
+    );
+    out.insert("dynamic_palette".into(), lane(t.colors.dynamic_palette));
     fields!(
         current_working_dir,
         organism_idle_cwd,
@@ -90,10 +97,6 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
         osc8_hyperlinks,
         output_buffer,
         modes,
-        dynamic_fg,
-        dynamic_bg,
-        dynamic_cursor_color,
-        dynamic_palette,
         keyboard_enhancement_flags,
         keyboard_enhancement_stack,
         alt_keyboard_enhancement_flags,
@@ -179,10 +182,10 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
         lane((
             t.saved_primary_global_bg,
             t.saved_primary_cursor_shape,
-            t.saved_primary_dynamic_fg,
-            t.saved_primary_dynamic_bg,
-            t.saved_primary_dynamic_cursor_color,
-            t.saved_primary_dynamic_palette,
+            t.saved_primary_colors.dynamic_fg,
+            t.saved_primary_colors.dynamic_bg,
+            t.saved_primary_colors.dynamic_cursor_color,
+            t.saved_primary_colors.dynamic_palette,
         )),
     );
     out.insert("grid_cells".into(), lane(t.grid.to_vec()));

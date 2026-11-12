@@ -1250,7 +1250,7 @@ reads local history without modifying it or calling a model service.
 
 The four terminals use the shared `jterm_core` session catalog implementation.
 Frost production and development builds resolve the exact Cargo-locked Git commit
-`e23a2efa3a1c1faeb1867e7b94ec7ad1c8823b22`, not a sibling checkout. This source
+`57ed89a62fdd61db060a3c976ab9e8cdac9ae823`, not a sibling checkout. This source
 upgrade shares the engine parser, cell/grid primitives and the 256-scalar
 `FrostTitleState` window/icon/title-stack owner. Frost retains title admission,
 outbound sanitization and RIS title retention, as well as projection, compression

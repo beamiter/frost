@@ -1,0 +1,20 @@
+{
+  "original_sealed_files": 213,
+  "original_fixture_unchanged": true,
+  "original_production_base": "3ff47cbea7992108aa271fd0553ff088270cb617",
+  "consumer_core": "57ed89a62fdd61db060a3c976ab9e8cdac9ae823",
+  "replay_changes": [
+    "Original source guard replaced by fixed bounded corpus verification; original guard preserved separately.",
+    "Fresh subprocess worker plus bounded streaming zstd full record comparison against unchanged original expected.",
+    "Eight original dynamic lanes read active colors / saved_primary_colors fields; names and full values unchanged.",
+    "Explicit Copy-value Debug calls remove needless borrowing; expected remains immutable."
+  ],
+  "files": {
+    "src/terminal/color_oracles.rs": "66fbe6b3a237ab7c342adafb6eaa55d50dc2e4326680d10326f9f5243649bcfd",
+    "src/terminal/color_replay_transport/lanes.rs": "4987c6bb2eec3c5f7eeb67acfba08239999d957f1a463774a68d78f5b94b2568",
+    "src/terminal/color_replay_transport/mod.rs": "6adf49d60768f7d45db2bd835be800b61f73babfc6a75bed9c11f627b27e191e",
+    "src/terminal/color_replay_transport/worker.rs": "bd6d68b0ff3011a550824f348d874eeeb0810b9b11a9c49023c7ed4bb395fbe4"
+  },
+  "repository_fixture_files": 2,
+  "private_provenance_files": 211
+}

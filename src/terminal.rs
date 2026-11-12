@@ -11,6 +11,8 @@ mod chat_pty_tests;
 #[cfg(test)]
 mod cli_scope_tests;
 #[cfg(test)]
+mod color_oracles;
+#[cfg(test)]
 mod grid_parity_tests;
 #[cfg(test)]
 mod line_selection_tests;
@@ -159,7 +161,8 @@ const MAX_OSC8_HYPERLINKS: usize = 4 * 1024;
 const MAX_PENDING_ESCAPE: usize = 1 << 20; // 1 MiB
 pub const MAX_TERMINAL_COLS: usize = 1024;
 pub const MAX_TERMINAL_ROWS: usize = 512;
-pub type DynamicColorPalette = [Option<(u8, u8, u8)>; 256];
+pub use jterm_engine::colors::DynamicColorPalette;
+use jterm_engine::colors::DynamicColorState;
 
 /// String Terminator (`ESC \`) and BEL: the two ways an OSC packet ends.
 const OSC_ST: &[u8] = b"\x1b\\";
@@ -3422,10 +3425,7 @@ pub struct TerminalState {
     saved_primary_screen_state: Option<SavedCursor>,
     saved_primary_global_bg: Color,
     saved_primary_cursor_shape: CursorShape,
-    saved_primary_dynamic_fg: Option<(u8, u8, u8)>,
-    saved_primary_dynamic_bg: Option<(u8, u8, u8)>,
-    saved_primary_dynamic_cursor_color: Option<(u8, u8, u8)>,
-    saved_primary_dynamic_palette: DynamicColorPalette,
+    saved_primary_colors: DynamicColorState,
     // Per-column horizontal tab stops (HTS/TBC); index = column.
     tab_stops: Vec<bool>,
     // Last printed character, for REP (CSI b).
@@ -3591,10 +3591,7 @@ pub struct TerminalState {
     current_command_exact: bool,
 
     // OSC 10/11/12 dynamic colors
-    pub dynamic_fg: Option<(u8, u8, u8)>,
-    pub dynamic_bg: Option<(u8, u8, u8)>,
-    pub dynamic_cursor_color: Option<(u8, u8, u8)>,
-    pub dynamic_palette: DynamicColorPalette,
+    colors: DynamicColorState,
     /// The host theme's default foreground, background and cursor colours,
     /// pushed in by [`Self::set_default_colors`]. Colour queries report these
     /// until an explicit OSC 10/11/12 set overrides them; a reply of fixed
@@ -3794,10 +3791,7 @@ impl TerminalState {
             saved_primary_screen_state: None,
             saved_primary_global_bg: Color::Default,
             saved_primary_cursor_shape: CursorShape::default(),
-            saved_primary_dynamic_fg: None,
-            saved_primary_dynamic_bg: None,
-            saved_primary_dynamic_cursor_color: None,
-            saved_primary_dynamic_palette: [None; 256],
+            saved_primary_colors: DynamicColorState::default(),
             tab_stops: Self::default_tab_stops(cols),
             last_printed_char: None,
             pending_wrap: false,
@@ -3886,10 +3880,7 @@ impl TerminalState {
             active_agent_execution: None,
             current_command_text: None,
             current_command_exact: false,
-            dynamic_fg: None,
-            dynamic_bg: None,
-            dynamic_cursor_color: None,
-            dynamic_palette: [None; 256],
+            colors: DynamicColorState::default(),
             theme_default_colors: DefaultColors::FALLBACK,
             theme_ansi_colors: None,
             osc_reply_terminator: OSC_ST,
@@ -3932,6 +3923,22 @@ impl TerminalState {
         OSC_ST
     }
 
+    pub fn foreground_override(&self) -> Option<(u8, u8, u8)> {
+        self.colors.foreground_override()
+    }
+
+    pub fn background_override(&self) -> Option<(u8, u8, u8)> {
+        self.colors.background_override()
+    }
+
+    pub fn cursor_override(&self) -> Option<(u8, u8, u8)> {
+        self.colors.cursor_override()
+    }
+
+    pub fn palette_overrides(&self) -> &DynamicColorPalette {
+        self.colors.palette_overrides()
+    }
+
     /// Adopt the host theme's default colours. Called when a session is
     /// created and whenever the theme changes, so OSC 10/11/12 queries and the
     /// `CSI ? 996 n` colour-scheme report describe what is actually on screen.
@@ -3960,7 +3967,9 @@ impl TerminalState {
 
     /// Effective default background: an OSC 11 set, else the theme's.
     fn effective_default_bg(&self) -> (u8, u8, u8) {
-        self.dynamic_bg.unwrap_or(self.theme_default_colors.bg)
+        self.colors
+            .dynamic_bg
+            .unwrap_or(self.theme_default_colors.bg)
     }
 
     /// Whether the effective default background reads as dark, judged by its
@@ -4048,9 +4057,13 @@ impl TerminalState {
         if value == "?" {
             // Query: respond with current color
             let color = match command {
-                "10" => self.dynamic_fg.unwrap_or(self.theme_default_colors.fg),
+                "10" => self
+                    .colors
+                    .dynamic_fg
+                    .unwrap_or(self.theme_default_colors.fg),
                 "11" => self.effective_default_bg(),
                 "12" => self
+                    .colors
                     .dynamic_cursor_color
                     .unwrap_or(self.theme_default_colors.cursor),
                 _ => return,
@@ -4058,9 +4071,9 @@ impl TerminalState {
             self.append_osc_color_response(command, color);
         } else if let Some(rgb) = Self::parse_color_spec(value) {
             match command {
-                "10" => self.dynamic_fg = Some(rgb),
-                "11" => self.dynamic_bg = Some(rgb),
-                "12" => self.dynamic_cursor_color = Some(rgb),
+                "10" => self.colors.dynamic_fg = Some(rgb),
+                "11" => self.colors.dynamic_bg = Some(rgb),
+                "12" => self.colors.dynamic_cursor_color = Some(rgb),
                 _ => {}
             }
         }
@@ -4177,9 +4190,9 @@ impl TerminalState {
 
     fn reset_osc_color(&mut self, command: &str) {
         match command {
-            "110" => self.dynamic_fg = None,
-            "111" => self.dynamic_bg = None,
-            "112" => self.dynamic_cursor_color = None,
+            "110" => self.colors.dynamic_fg = None,
+            "111" => self.colors.dynamic_bg = None,
+            "112" => self.colors.dynamic_cursor_color = None,
             _ => {}
         }
     }
@@ -4197,24 +4210,24 @@ impl TerminalState {
                 let theme = self
                     .theme_ansi_colors
                     .and_then(|ansi| ansi.get(idx as usize).copied());
-                let color = self.dynamic_palette[idx as usize]
+                let color = self.colors.dynamic_palette[idx as usize]
                     .or(theme)
                     .unwrap_or_else(|| Self::default_256_color(idx));
                 self.append_osc_palette_response(idx, color);
             } else if let Some(rgb) = Self::parse_color_spec(color_s) {
-                self.dynamic_palette[idx as usize] = Some(rgb);
+                self.colors.dynamic_palette[idx as usize] = Some(rgb);
             }
         }
     }
 
     fn reset_osc_palette(&mut self, value: &str) {
         if value.is_empty() {
-            self.dynamic_palette = [None; 256];
+            self.colors.dynamic_palette = [None; 256];
             return;
         }
         for idx_s in value.split(';').filter(|s| !s.is_empty()) {
             if let Ok(idx) = idx_s.parse::<u8>() {
-                self.dynamic_palette[idx as usize] = None;
+                self.colors.dynamic_palette[idx as usize] = None;
             }
         }
     }
@@ -9292,10 +9305,7 @@ impl TerminalState {
         self.last_archived_screen_snapshot.clear();
         self.last_synced_primary_screen_snapshot.clear();
         self.cursor_shape = CursorShape::default();
-        self.dynamic_fg = None;
-        self.dynamic_bg = None;
-        self.dynamic_cursor_color = None;
-        self.dynamic_palette = [None; 256];
+        self.colors.reset_dynamic();
         self.keyboard_enhancement_flags = 0;
         self.keyboard_enhancement_stack.clear();
         self.alt_keyboard_enhancement_flags = 0;
@@ -9427,10 +9437,7 @@ impl TerminalState {
                     self.saved_primary_screen_state = Some(self.snapshot_cursor_state());
                     self.saved_primary_global_bg = self.global_bg;
                     self.saved_primary_cursor_shape = self.cursor_shape;
-                    self.saved_primary_dynamic_fg = self.dynamic_fg;
-                    self.saved_primary_dynamic_bg = self.dynamic_bg;
-                    self.saved_primary_dynamic_cursor_color = self.dynamic_cursor_color;
-                    self.saved_primary_dynamic_palette = self.dynamic_palette;
+                    self.saved_primary_colors = self.colors.clone();
 
                     // Reset scroll offset so we don't show scrollback in alt buffer
                     self.scroll_offset = 0;
@@ -9599,14 +9606,8 @@ impl TerminalState {
                     self.global_bg = self.saved_primary_global_bg;
                     self.saved_primary_global_bg = Color::Default;
                     self.cursor_shape = self.saved_primary_cursor_shape;
-                    self.dynamic_fg = self.saved_primary_dynamic_fg;
-                    self.dynamic_bg = self.saved_primary_dynamic_bg;
-                    self.dynamic_cursor_color = self.saved_primary_dynamic_cursor_color;
-                    self.dynamic_palette = self.saved_primary_dynamic_palette;
-                    self.saved_primary_dynamic_fg = None;
-                    self.saved_primary_dynamic_bg = None;
-                    self.saved_primary_dynamic_cursor_color = None;
-                    self.saved_primary_dynamic_palette = [None; 256];
+                    self.colors = self.saved_primary_colors.clone();
+                    self.saved_primary_colors.reset_dynamic();
 
                     // Mark all rows dirty after grid swap to force full re-render
                     // Increment by rows+1 to trigger grid_version_jumped in ui.rs
@@ -13546,20 +13547,20 @@ mod tests {
                         let mut terminal = super::TerminalState::new(10, 3);
                         terminal.process_input(b"\x1b]4;7;#112233\x07\x1b]10;#445566\x07\x1b]11;#778899\x07\x1b]12;#aabbcc\x07");
                         let before = (
-                            terminal.dynamic_palette,
-                            terminal.dynamic_fg,
-                            terminal.dynamic_bg,
-                            terminal.dynamic_cursor_color,
+                            terminal.colors.dynamic_palette,
+                            terminal.colors.dynamic_fg,
+                            terminal.colors.dynamic_bg,
+                            terminal.colors.dynamic_cursor_color,
                         );
                         assert!(terminal.output_buffer.is_empty());
                         terminal.process_input(&input.as_bytes()[..split]);
                         terminal.process_input(&input.as_bytes()[split..]);
                         assert_eq!(
                             (
-                                terminal.dynamic_palette,
-                                terminal.dynamic_fg,
-                                terminal.dynamic_bg,
-                                terminal.dynamic_cursor_color
+                                terminal.colors.dynamic_palette,
+                                terminal.colors.dynamic_fg,
+                                terminal.colors.dynamic_bg,
+                                terminal.colors.dynamic_cursor_color
                             ),
                             before,
                             "{command} {invalid} split {split}"
@@ -13569,7 +13570,7 @@ mod tests {
                             "invalid color emitted reply"
                         );
                         terminal.process_input(b"\x1b]10;#123456\x07\x1b]10;?\x1b\\");
-                        assert_eq!(terminal.dynamic_fg, Some((0x12, 0x34, 0x56)));
+                        assert_eq!(terminal.colors.dynamic_fg, Some((0x12, 0x34, 0x56)));
                         assert_eq!(terminal.output_buffer, b"\x1b]10;rgb:1212/3434/5656\x1b\\");
                     }
                 }
@@ -19600,8 +19601,8 @@ mod tests {
         let mut terminal = TerminalState::new(8, 2);
 
         terminal.process_input(b"\x1b]4;1;#112233;2;rgb:4455/6677/8899\x1b\\");
-        assert_eq!(terminal.dynamic_palette[1], Some((0x11, 0x22, 0x33)));
-        assert_eq!(terminal.dynamic_palette[2], Some((0x44, 0x66, 0x88)));
+        assert_eq!(terminal.colors.dynamic_palette[1], Some((0x11, 0x22, 0x33)));
+        assert_eq!(terminal.colors.dynamic_palette[2], Some((0x44, 0x66, 0x88)));
 
         terminal.process_input(b"\x1b]4;1;?;2;?\x1b\\");
         assert_eq!(
@@ -19610,11 +19611,11 @@ mod tests {
         );
 
         terminal.process_input(b"\x1b]104;1\x1b\\");
-        assert_eq!(terminal.dynamic_palette[1], None);
-        assert_eq!(terminal.dynamic_palette[2], Some((0x44, 0x66, 0x88)));
+        assert_eq!(terminal.colors.dynamic_palette[1], None);
+        assert_eq!(terminal.colors.dynamic_palette[2], Some((0x44, 0x66, 0x88)));
 
         terminal.process_input(b"\x1b]104\x1b\\");
-        assert_eq!(terminal.dynamic_palette[2], None);
+        assert_eq!(terminal.colors.dynamic_palette[2], None);
     }
 
     #[test]
@@ -19622,14 +19623,17 @@ mod tests {
         let mut terminal = TerminalState::new(8, 2);
 
         terminal.process_input(b"\x1b]10;#112233\x1b\\\x1b]11;#445566\x1b\\\x1b]12;#778899\x1b\\");
-        assert_eq!(terminal.dynamic_fg, Some((0x11, 0x22, 0x33)));
-        assert_eq!(terminal.dynamic_bg, Some((0x44, 0x55, 0x66)));
-        assert_eq!(terminal.dynamic_cursor_color, Some((0x77, 0x88, 0x99)));
+        assert_eq!(terminal.colors.dynamic_fg, Some((0x11, 0x22, 0x33)));
+        assert_eq!(terminal.colors.dynamic_bg, Some((0x44, 0x55, 0x66)));
+        assert_eq!(
+            terminal.colors.dynamic_cursor_color,
+            Some((0x77, 0x88, 0x99))
+        );
 
         terminal.process_input(b"\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\");
-        assert_eq!(terminal.dynamic_fg, None);
-        assert_eq!(terminal.dynamic_bg, None);
-        assert_eq!(terminal.dynamic_cursor_color, None);
+        assert_eq!(terminal.colors.dynamic_fg, None);
+        assert_eq!(terminal.colors.dynamic_bg, None);
+        assert_eq!(terminal.colors.dynamic_cursor_color, None);
     }
 
     #[test]
@@ -19838,10 +19842,13 @@ mod tests {
         terminal.process_input(b"\x1b[?1049l");
 
         assert_eq!(terminal.cursor_shape, CursorShape::Underline);
-        assert_eq!(terminal.dynamic_fg, Some((0x11, 0x22, 0x33)));
-        assert_eq!(terminal.dynamic_bg, Some((0x44, 0x55, 0x66)));
-        assert_eq!(terminal.dynamic_cursor_color, Some((0x77, 0x88, 0x99)));
-        assert_eq!(terminal.dynamic_palette[1], Some((0xab, 0xcd, 0xef)));
+        assert_eq!(terminal.colors.dynamic_fg, Some((0x11, 0x22, 0x33)));
+        assert_eq!(terminal.colors.dynamic_bg, Some((0x44, 0x55, 0x66)));
+        assert_eq!(
+            terminal.colors.dynamic_cursor_color,
+            Some((0x77, 0x88, 0x99))
+        );
+        assert_eq!(terminal.colors.dynamic_palette[1], Some((0xab, 0xcd, 0xef)));
     }
 
     #[test]

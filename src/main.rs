@@ -26602,11 +26602,11 @@ impl Frost {
         .block_markers(block_markers)
         .block_bookmark_markers(block_bookmark_markers)
         .links(links, sess.projection.view_revision())
-        .dynamic_palette(&sess.terminal.dynamic_palette)
+        .dynamic_palette(sess.terminal.palette_overrides())
         .dynamic_defaults(
-            sess.terminal.dynamic_fg,
-            sess.terminal.dynamic_bg,
-            sess.terminal.dynamic_cursor_color,
+            sess.terminal.foreground_override(),
+            sess.terminal.background_override(),
+            sess.terminal.cursor_override(),
         )
         .images(images)
         .preedit(if focused && !sess.terminal.preedit_text.is_empty() {
