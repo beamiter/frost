@@ -220,3 +220,20 @@ requires its same-PID Runner observation, then releases (also on timeout). It
 never retries a click, sets focus, manufactures an application event, or accepts
 cleanup as exit. This distinguishes delivery/filtering failure from a short
 press/release observation race; actual new CI evidence remains required.
+
+### a8c9ca33 observer resource bound
+
+Native run `43180105495` passed the ordinary desktop checks and Wayland
+controlled-stall overload acceptance. X11 PID `23289` reached admission rejection
+and all four consumer/view/draw/present milestones, but the very first full-frame
+Tesseract invocation exceeded its existing 30-second timeout. No click was yet
+injected, so the absence of raw XI/pointer traces in this run says nothing about
+the earlier missing button delivery. CI, Vim, Provider and Layout passed.
+
+The observer now bounds only the Tesseract child to `OMP_THREAD_LIMIT=1`.
+It retains the exact screenshot transform, PSM 3, confidence requirements,
+30-second subprocess deadline, live input flood and real press/close gates.
+Replaying the actual failed frame locally took 0.953–1.057 seconds with default
+workers and 0.770–0.772 seconds with one worker, with identical 2,923-byte TSV.
+This bounds OCR resource use; it does not establish the CI timeout's CPU cause
+or claim the pending X11 click acceptance is fixed.

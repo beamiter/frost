@@ -63,13 +63,16 @@ def capture_fault_ocr(png, run):
     command = ['convert', str(png), '-filter', 'Lanczos', '-resize', '300%', str(processed)]
     run(command, capture_output=True)
     assert ocr.png_extent(processed) == (3840, 2700), 'Unexpected OCR transform'
-    tsv = run(['tesseract', str(processed), 'stdout', '--psm', '3', 'tsv'],
+    # Bound only OCR's OpenMP workers while the real compositor/input flood
+    # continues. Keep the same pixels, recognition mode and 30-second deadline.
+    tsv = run(['env', 'OMP_THREAD_LIMIT=1', 'tesseract', str(processed), 'stdout', '--psm', '3', 'tsv'],
               text=True, capture_output=True).stdout
     tsv_path = png.with_suffix('.fault-ocr.tsv')
     tsv_path.write_text(tsv)
     words = ocr.original_coordinates(ocr.parse_ocr(tsv))
     return words, {'original': png.name, 'processed': processed.name, 'tsv': tsv_path.name,
-                   'preprocessing': command, 'scale': 3, 'offset': [0, 0], 'page_segmentation': 3}
+                   'preprocessing': command, 'scale': 3, 'offset': [0, 0], 'page_segmentation': 3,
+                   'ocr_environment': {'OMP_THREAD_LIMIT': '1'}}
 
 
 def ingress_flood_command(backend, pairs=3000):
@@ -256,6 +259,21 @@ def regression_test(output):
 
 
 class ObservationTests(unittest.TestCase):
+    def test_only_ocr_child_has_bounded_openmp_workers(self):
+        from unittest.mock import Mock, patch
+        from tempfile import TemporaryDirectory
+        run = Mock(return_value=Mock(stdout=''))
+        with TemporaryDirectory() as temp, patch.object(ocr, 'png_extent', side_effect=[ocr.SCREEN, (3840, 2700)]):
+            png = Path(temp) / 'frame.png'
+            _, transform = capture_fault_ocr(png, run)
+        calls = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(calls[0][0], 'convert')
+        self.assertEqual(calls[1][:3], ['env', 'OMP_THREAD_LIMIT=1', 'tesseract'])
+        self.assertEqual(calls[1][-4:], ['stdout', '--psm', '3', 'tsv'])
+        self.assertEqual(transform['ocr_environment'], {'OMP_THREAD_LIMIT': '1'})
+        self.assertTrue(all('timeout' not in call.kwargs for call in run.call_args_list))
+
+
     def test_press_proof_requires_matching_pid_stage_and_button(self):
         good = 'FROST_FAULT_POINTER pid=42 stage=runner MouseInput { state: Pressed, button: Left }'
         self.assertTrue(observed_x11_press(good, 42))
