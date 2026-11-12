@@ -1,0 +1,10 @@
+{
+  "origin_commit": "faf8bc280eefcf93f6a35a4e8b90eb0192586c54",
+  "workflow_run": 43137510254,
+  "artifact_id": 13909492100,
+  "description": "Unmodified synthetic native overload GUI screenshots; regression for mixed-polarity OCR only, not evidence that native click/exit passed.",
+  "frames": {
+    "x11.png": "57c0c7c4602d9ce44523177884b9fbaebf606ac5686af72beb9949a12bbc7623",
+    "wayland.png": "69c22d2b16904aef6ccf7f39d693061bdf11be5af50eba1b8ac745878b4bc614"
+  }
+}

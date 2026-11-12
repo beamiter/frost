@@ -50,6 +50,28 @@ def fault_button(words):
     return [(left + right) // 2, (top + bottom) // 2]
 
 
+def capture_fault_ocr(png, run):
+    """Fixed color-preserving pipeline for mixed-polarity fault UI.
+
+    White paragraphs on a dark surface and dark text on the blue action button
+    must both survive. Global grayscale inversion and sparse PSM 11 can omit
+    the button. Keep the entire raw color frame and use automatic page layout;
+    never guess/crop a button rectangle or adapt pixels to the expected text.
+    """
+    assert ocr.png_extent(png) == ocr.SCREEN, 'Unexpected capture extent'
+    processed = png.with_suffix('.fault-ocr.png')
+    command = ['convert', str(png), '-filter', 'Lanczos', '-resize', '300%', str(processed)]
+    run(command, capture_output=True)
+    assert ocr.png_extent(processed) == (3840, 2700), 'Unexpected OCR transform'
+    tsv = run(['tesseract', str(processed), 'stdout', '--psm', '3', 'tsv'],
+              text=True, capture_output=True).stdout
+    tsv_path = png.with_suffix('.fault-ocr.tsv')
+    tsv_path.write_text(tsv)
+    words = ocr.original_coordinates(ocr.parse_ocr(tsv))
+    return words, {'original': png.name, 'processed': processed.name, 'tsv': tsv_path.name,
+                   'preprocessing': command, 'scale': 3, 'offset': [0, 0], 'page_segmentation': 3}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
@@ -85,6 +107,7 @@ def main():
         control.write_text('trigger real admission\n')
         runner.wait_for(proof.exists, 'real admission proof', timeout=10)
         admission = json.loads(proof.read_text())
+        assert admission['pid'] == app.pid, 'Proof did not originate from the visible application process'
         assert admission['input_overloaded'] is True, admission
         assert 0 < admission['events_broadcast'] <= 65536, admission
         assert admission['natural_winit_flood'] is False, admission
@@ -96,7 +119,7 @@ def main():
             assert app.poll() is None, 'Application exited before fault UI observation'
             name = 'fault-' + str(len(observations))
             smoke.screenshot(name)
-            words, transform = ocr.capture_ocr(out / (name + '.png'), smoke.run)
+            words, transform = capture_fault_ocr(out / (name + '.png'), smoke.run)
             point = fault_button(words)
             observations.append({'frame': name, 'transform': transform, 'button': point})
             return point
@@ -142,6 +165,29 @@ def main():
         smoke.close()
 
 
+def regression_test(output):
+    """Replay frozen genuine CI frames through the exact production observer."""
+    import shutil
+    fixtures = HERE.parent / 'tests/fixtures/native_overload_observation'
+    manifest = json.loads((fixtures / 'manifest.json').read_text())
+    output = Path(output).resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    results = []
+    for name, digest in manifest['frames'].items():
+        source = fixtures / name
+        assert hashlib.sha256(source.read_bytes()).hexdigest() == digest, name
+        target = output / name
+        shutil.copy2(source, target)
+        def run(command, **kwargs):
+            return subprocess.run(command, check=True, timeout=30, **kwargs)
+        words, transform = capture_fault_ocr(target, run)
+        point = fault_button(words)
+        assert point is not None, f'Exact fault warning/button not observed in {name}'
+        results.append({'frame': name, 'sha256': digest, 'button_from_ocr': point, 'transform': transform})
+    (output / 'result.json').write_text(json.dumps({'status': 'pass', 'scope': 'frozen screenshot observer regression only', 'frames': results}, indent=2))
+    print(json.dumps({'status': 'pass', 'frames': len(results), 'scope': 'observer regression only'}))
+
+
 class ObservationTests(unittest.TestCase):
     def words(self, button=BUTTON):
         lines = ['Input stopped:', 'Pending input was rejected and will not be replayed.',
@@ -168,5 +214,7 @@ if __name__ == '__main__':
     import sys
     if sys.argv[1:] == ['--self-test']:
         unittest.main(argv=[sys.argv[0]])
+    elif len(sys.argv) == 3 and sys.argv[1] == '--regression-test':
+        regression_test(sys.argv[2])
     else:
         main()

@@ -56,12 +56,14 @@ fn native_overload_acceptance_start() {
         let proof = serde_json::json!({
             "mechanism": "separate real Tracker with unpolled recipe; production admission rejection",
             "events_broadcast": count,
+            "pid": std::process::id(),
             "input_overloaded": Event::input_overloaded(),
             "natural_winit_flood": false,
             "direct_latch_set_or_reset": false,
         });
-        std::fs::write(proof_path.with_extension("tmp"), serde_json::to_vec_pretty(&proof).unwrap()).unwrap();
-        std::fs::rename(proof_path.with_extension("tmp"), &proof_path).unwrap();
+        let temporary = proof_path.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&temporary, serde_json::to_vec_pretty(&proof).unwrap()).unwrap();
+        std::fs::rename(&temporary, &proof_path).unwrap();
         assert!(Event::input_overloaded(), "production budget did not reject bounded fixture flood");
     });
 }
@@ -84,10 +86,12 @@ def main():
     checkout.mkdir()
     source = root / 'src/main.rs'
     original = source.read_text()
-    anchor = 'fn main() -> iced::Result {'
+    # Embedded workspace/Vim helper invocations must never start the GUI
+    # fixture worker or race the parent process's proof publication.
+    anchor = '    let config::ConfigLoad {'
     if original.count(anchor) != 1:
-        raise RuntimeError('Expected exactly one production main; refusing ambiguous injection')
-    generated = original.replace(anchor, anchor + '\n    native_overload_acceptance_start();', 1) + HELPER
+        raise RuntimeError('Expected one post-dispatch GUI config load; refusing ambiguous injection')
+    generated = original.replace(anchor, '    native_overload_acceptance_start();\n' + anchor, 1) + HELPER
     for entry in root.iterdir():
         if entry.name in {'src', 'Cargo.toml', 'Cargo.lock', '.git', 'target'}:
             continue

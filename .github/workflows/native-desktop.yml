@@ -175,6 +175,7 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: |
           python3 scripts/native-overload-smoke.py --self-test
+          python3 scripts/native-overload-smoke.py --regression-test native-smoke-artifacts/overload-observer-regression
           python3 scripts/build-native-overload-fixture.py --output native-smoke-artifacts/overload-fixture
       - name: Observe X11 overload fault UI and explicit close
         timeout-minutes: 3
