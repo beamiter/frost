@@ -6,6 +6,80 @@ use futures::sink::{Sink, SinkExt};
 use rustc_hash::FxHashMap;
 
 use std::hash::Hasher as _;
+use std::sync::{Arc, Mutex};
+
+// This bounds retained subscription inbox copies, not the upstream window or
+// proxy channels. No keyboard/IME/focus event is coalesced or silently skipped:
+// exceeding either budget permanently quarantines input in the host.
+const MAX_INBOX_EVENTS: usize = 8192;
+const MAX_INBOX_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct Budget {
+    events: usize,
+    bytes: usize,
+    faulted: bool,
+}
+
+#[derive(Debug)]
+struct AdmittedEvent {
+    event: Option<Event>,
+    bytes: usize,
+    budget: Arc<Mutex<Budget>>,
+}
+
+impl Drop for AdmittedEvent {
+    fn drop(&mut self) {
+        let mut budget = self.budget.lock().expect("event budget poisoned");
+        budget.events -= 1;
+        budget.bytes -= self.bytes;
+    }
+}
+
+fn event_bytes(event: &Event) -> usize {
+    use crate::core::{Event as UiEvent, input_method, keyboard, window};
+    fn key_bytes(key: &keyboard::Key) -> usize {
+        match key {
+            keyboard::Key::Character(s) => s.len(),
+            _ => 0,
+        }
+    }
+    let extra = match event {
+        Event::Interaction {
+            event:
+                UiEvent::Keyboard(keyboard::Event::KeyPressed {
+                    key,
+                    modified_key,
+                    text,
+                    ..
+                }),
+            ..
+        } => key_bytes(key)
+            .saturating_add(key_bytes(modified_key))
+            .saturating_add(text.as_ref().map_or(0, |t| t.len())),
+        Event::Interaction {
+            event:
+                UiEvent::Keyboard(keyboard::Event::KeyReleased {
+                    key, modified_key, ..
+                }),
+            ..
+        } => key_bytes(key).saturating_add(key_bytes(modified_key)),
+        Event::Interaction {
+            event:
+                UiEvent::InputMethod(
+                    input_method::Event::Commit(text) | input_method::Event::Preedit(text, _),
+                ),
+            ..
+        } => text.len(),
+        Event::Interaction {
+            event:
+                UiEvent::Window(window::Event::FileHovered(path) | window::Event::FileDropped(path)),
+            ..
+        } => path.as_os_str().len(),
+        _ => 0,
+    };
+    std::mem::size_of::<AdmittedEvent>().saturating_add(extra)
+}
 
 /// A registry of subscription streams.
 ///
@@ -17,12 +91,13 @@ use std::hash::Hasher as _;
 #[derive(Debug, Default)]
 pub struct Tracker {
     subscriptions: FxHashMap<u64, Execution>,
+    budget: Arc<Mutex<Budget>>,
 }
 
 #[derive(Debug)]
 pub struct Execution {
     _cancel: futures::channel::oneshot::Sender<()>,
-    listener: Option<futures::channel::mpsc::UnboundedSender<Event>>,
+    listener: Option<futures::channel::mpsc::UnboundedSender<AdmittedEvent>>,
 }
 
 impl Tracker {
@@ -30,6 +105,7 @@ impl Tracker {
     pub fn new() -> Self {
         Self {
             subscriptions: FxHashMap::default(),
+            budget: Arc::default(),
         }
     }
 
@@ -66,6 +142,13 @@ impl Tracker {
         let mut futures: Vec<BoxFuture<()>> = Vec::new();
         let mut alive = std::collections::HashSet::new();
 
+        if self.budget.lock().expect("event budget poisoned").faulted {
+            // Preserve timer/task recipes that discarded the native inbox.
+            // Their existing wake path makes the host fault view observable.
+            self.subscriptions
+                .retain(|_, execution| execution.listener.is_none());
+            return futures;
+        }
         for recipe in recipes {
             let id = {
                 let mut hasher = Hasher::default();
@@ -82,12 +165,12 @@ impl Tracker {
 
             let (cancel, mut canceled) = futures::channel::oneshot::channel();
 
-            // These events include keyboard bytes, modifier transitions, IME
-            // commits and focus. A full bounded inbox must not silently turn
-            // a received command into a different command. Keep the one FIFO
-            // without blocking the UI thread; the consumer still applies its
-            // original downstream backpressure. Cancellation drops the inbox.
-            let (event_sender, event_receiver) = futures::channel::mpsc::unbounded();
+            // Admission is budgeted before cloning; the permit is released on
+            // dequeue or cancellation. The underlying queue cannot exceed it.
+            let (event_sender, event_receiver) =
+                futures::channel::mpsc::unbounded::<AdmittedEvent>();
+            let event_receiver =
+                event_receiver.map(|mut admitted| admitted.event.take().expect("admitted event"));
 
             let mut receiver = receiver.clone();
             let mut stream = recipe.stream(event_receiver.boxed());
@@ -149,12 +232,49 @@ impl Tracker {
     ///
     /// [`Recipe::stream`]: crate::subscription::Recipe::stream
     pub fn broadcast(&mut self, event: Event) {
-        for connection in self.subscriptions.values_mut() {
+        let bytes = event_bytes(&event);
+        let live: Vec<_> = self
+            .subscriptions
+            .iter()
+            .filter(|(_, e)| e.listener.as_ref().is_some_and(|s| !s.is_closed()))
+            .map(|(id, _)| *id)
+            .collect();
+        let listeners = live.len();
+        let total = bytes.checked_mul(listeners);
+        let mut budget = self.budget.lock().expect("event budget poisoned");
+        if budget.faulted {
+            return;
+        }
+        if listeners > MAX_INBOX_EVENTS.saturating_sub(budget.events)
+            || total.is_none_or(|n| n > MAX_INBOX_BYTES.saturating_sub(budget.bytes))
+        {
+            budget.faulted = true;
+            // Must happen synchronously, before any already-admitted Return
+            // can reach the application's update or final PTY write boundary.
+            super::latch_input_overload();
+            drop(budget);
+            // Preserve timer/task recipes that discarded the native inbox.
+            // Their existing wake path makes the host fault view observable.
+            self.subscriptions
+                .retain(|_, execution| execution.listener.is_none());
+            log::error!(
+                "Native subscription input overloaded; input quarantined until process restart"
+            );
+            return;
+        }
+        // Reserve the whole broadcast atomically, not a partial set of listeners.
+        budget.events += listeners;
+        budget.bytes += total.expect("checked event budget");
+        drop(budget);
+        for id in live {
+            let connection = self.subscriptions.get_mut(&id).expect("live subscription");
             if let Some(listener) = connection.listener.as_mut() {
-                if let Err(error) = listener.unbounded_send(event.clone()) {
-                    log::warn!("Error sending event to subscription: {error:?}");
-                    // Only disconnection can fail an unbounded send. Release
-                    // the closed sender and avoid retaining a dead listener.
+                let admitted = AdmittedEvent {
+                    event: Some(event.clone()),
+                    bytes,
+                    budget: self.budget.clone(),
+                };
+                if listener.unbounded_send(admitted).is_err() {
                     connection.listener = None;
                 }
             }

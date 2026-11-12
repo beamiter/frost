@@ -1145,6 +1145,10 @@ mod unix_pty {
         /// Single non-blocking write. Returns bytes written, `Ok(0)` if the
         /// buffer is full (WouldBlock), or an error for a real failure.
         pub fn write(&mut self, data: &[u8]) -> Result<usize> {
+            // Final guard includes responses and any caller bypassing Session.
+            if iced::advanced::subscription::Event::input_overloaded() {
+                return Err(anyhow!("native input overloaded; restart required"));
+            }
             // SAFETY: self.master 是有效的文件描述符，data.as_ptr() 指向有效的内存，
             // data.len() 是正确的长度。write 系统调用不会超出缓冲区边界。
             loop {

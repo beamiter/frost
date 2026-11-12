@@ -32,6 +32,20 @@ pub enum Event {
     SystemThemeChanged(theme::Mode),
 }
 
+// The host must consult this latch both at dispatch and at the final writer.
+// It is deliberately not reset by subscription replacement or cancellation.
+static INPUT_OVERLOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn latch_input_overload() {
+    INPUT_OVERLOADED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+impl Event {
+    /// Whether native subscription input was quarantined for this process.
+    /// The application must reject pending input and require a process restart.
+    pub fn input_overloaded() -> bool {
+        INPUT_OVERLOADED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// A stream of runtime events.
 ///
 /// It is the input of a [`Subscription`].

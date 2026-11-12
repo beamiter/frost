@@ -151,7 +151,7 @@ fn cancellation_releases_stalled_non_input_backlog_before_next_generation() {
             .to_owned()
     };
     let before = rss();
-    for _ in 0..65_536 {
+    for _ in 0..MAX_INBOX_EVENTS {
         tracker.broadcast(Event::SystemThemeChanged(theme::Mode::Light));
     }
     let queued = rss();
@@ -170,7 +170,7 @@ fn cancellation_releases_stalled_non_input_backlog_before_next_generation() {
         "cancelled backlog reached next opening"
     );
     eprintln!(
-        "non-input backlog65536 EventSize{} before[{before}] queued[{queued}] after[{}]; no hard memory cap is claimed",
+        "bounded non-input backlog8192 EventSize{} before[{before}] queued[{queued}] after[{}]; subscription inbox budget only",
         std::mem::size_of::<Event>(),
         rss()
     );
@@ -243,5 +243,114 @@ fn cancellation_interrupts_a_send_blocked_by_a_live_full_output_sink() {
     assert!(
         drain(&mut pool, &mut received) == vec![expected],
         "cancelled internal backlog entered the next generation"
+    );
+}
+
+#[test]
+fn overflow_is_permanent_and_releases_all_inbox_reservations() {
+    let mut tracker = Tracker::new();
+    let mut pool = LocalPool::new();
+    let (output, mut received) = mpsc::channel(1);
+    let lifetime = subscribe(&mut tracker, &mut pool, output.clone(), 80);
+    for _ in 0..MAX_INBOX_EVENTS {
+        tracker.broadcast(key_press("a"));
+    }
+    assert_eq!(tracker.budget.lock().unwrap().events, MAX_INBOX_EVENTS);
+    tracker.broadcast(key_press("\r"));
+    assert!(tracker.budget.lock().unwrap().faulted);
+    pool.run_until_stalled();
+    assert!(lifetime.upgrade().is_none());
+    assert_eq!(tracker.budget.lock().unwrap().events, 0);
+    assert_eq!(tracker.budget.lock().unwrap().bytes, 0);
+    assert!(received.try_recv().is_err());
+    let _ = subscribe(&mut tracker, &mut pool, output, 81);
+    tracker.broadcast(key_press("new"));
+    assert!(drain(&mut pool, &mut received).is_empty());
+}
+
+#[test]
+fn oversized_ime_latches_before_clone_or_partial_broadcast() {
+    let mut tracker = Tracker::new();
+    let mut pool = LocalPool::new();
+    let (output, mut received) = mpsc::channel(1);
+    let _ = subscribe(&mut tracker, &mut pool, output, 82);
+    tracker.broadcast(interaction(UiEvent::InputMethod(
+        input_method::Event::Commit("x".repeat(MAX_INBOX_BYTES)),
+    )));
+    assert!(tracker.budget.lock().unwrap().faulted);
+    pool.run_until_stalled();
+    assert_eq!(tracker.budget.lock().unwrap().bytes, 0);
+    assert!(received.try_recv().is_err());
+}
+
+#[test]
+fn budget_is_shared_across_listeners_and_broadcast_admission_is_atomic() {
+    let mut tracker = Tracker::new();
+    let mut pool = LocalPool::new();
+    let (output, mut received) = mpsc::channel(1);
+    let recipes: Vec<Box<dyn Recipe<Output = Event>>> = (100..103)
+        .map(|generation| {
+            Box::new(Passthrough {
+                generation,
+                lifetime: Arc::new(()),
+            }) as Box<dyn Recipe<Output = Event>>
+        })
+        .collect();
+    for future in tracker.update(recipes.into_iter(), output) {
+        pool.spawner().spawn_local(future).unwrap();
+    }
+    for _ in 0..MAX_INBOX_EVENTS / 3 {
+        tracker.broadcast(key_press("a"));
+    }
+    assert_eq!(
+        tracker.budget.lock().unwrap().events,
+        MAX_INBOX_EVENTS / 3 * 3
+    );
+    tracker.broadcast(key_press("\r"));
+    assert!(tracker.budget.lock().unwrap().faulted);
+    pool.run_until_stalled();
+    assert_eq!(tracker.budget.lock().unwrap().events, 0);
+    assert!(received.try_recv().is_err());
+}
+
+#[test]
+fn independent_wake_recipe_survives_input_quarantine() {
+    struct IndependentWake;
+    impl Recipe for IndependentWake {
+        type Output = Event;
+        fn hash(&self, state: &mut Hasher) {
+            state.write_u64(301);
+        }
+        fn stream(
+            self: Box<Self>,
+            input: crate::subscription::EventStream,
+        ) -> crate::BoxStream<Event> {
+            drop(input);
+            futures::stream::once(async { Event::SystemThemeChanged(theme::Mode::Dark) }).boxed()
+        }
+    }
+    let mut tracker = Tracker::new();
+    let mut pool = LocalPool::new();
+    let (output, mut received) = mpsc::channel(4);
+    let recipes: Vec<Box<dyn Recipe<Output = Event>>> = vec![
+        Box::new(IndependentWake),
+        Box::new(Passthrough {
+            generation: 302,
+            lifetime: Arc::new(()),
+        }),
+    ];
+    for future in tracker.update(recipes.into_iter(), output.clone()) {
+        pool.spawner().spawn_local(future).unwrap();
+    }
+    tracker.broadcast(interaction(UiEvent::InputMethod(
+        input_method::Event::Commit("x".repeat(MAX_INBOX_BYTES)),
+    )));
+    assert!(tracker.budget.lock().unwrap().faulted);
+    // Even a subsequent subscription update must not cancel the independent
+    // wake that lets the host mount its persistent failure screen.
+    assert!(tracker.update(std::iter::empty(), output).is_empty());
+    assert_eq!(
+        drain(&mut pool, &mut received),
+        vec![Event::SystemThemeChanged(theme::Mode::Dark)]
     );
 }

@@ -20,10 +20,34 @@ Cancellation is polled while a downstream send is backpressured as well as
 while waiting for the next input event. Messages already accepted by the
 downstream sink are distinct from the subscription's cancelled internal inbox.
 
-This is an unbounded inbox, so backlog memory can grow while an active consumer
-stalls. It has no hard memory cap. This preserves input identity instead of
-silently discarding bytes or blocking the GUI. Native input, modifiers, focus,
-IME and non-input events share the same order; no keyboard bypass is added.
-The transport tests deliberately leave the consumer unpolled, exceed the old
-limit, exercise mixed events and cancellation, and measure a 65,536-event
-non-input backlog. Tests are run explicitly by Frost's test CI job.
+Native input, modifiers, focus, IME and non-input events share the same order;
+no keyboard bypass is added. The transport tests deliberately leave consumers
+unpolled, exceed the old 100-event limit, exercise mixed events, cancellation,
+aggregate budget saturation, and an oversized IME payload. Tests are run
+explicitly by Frost's test CI job.
+
+## Subscription admission budget (Frost host integration required)
+
+The native subscription inbox now admits at most 8,192 event copies and 16 MiB
+of accounted event storage across all listeners of a tracker. Keyboard, modifier,
+IME, focus and mouse events remain FIFO; none are coalesced. A whole broadcast is
+reserved before cloning. Payload accounting includes text and file paths.
+Cancellation and dequeue release reservations. These are payload budgets, not
+allocator/RSS limits, and do not bound the upstream winit or action proxy queues.
+
+Exceeding either budget synchronously latches `Event::input_overloaded()` for the
+process before cancelling native listeners. Timer recipes that discard their
+native inbox remain active. Frost's always-active `PollShellVim` timer supplies an
+independent wake for the persistent fault view; the fault is not a queued toast.
+Subscription replacement cannot clear the latch. Frost rejects all application
+messages except its explicit fault-exit control, and guards both Session queue
+admission/draining and the final PTY write entry point. This includes a Return
+already sitting in a downstream application message or a blocked PTY queue.
+Unsent bytes are never replayed. Bytes already accepted by the kernel before the
+fault cannot be recalled; commands already running may continue until exit.
+
+Recovery is deliberately process restart, not an unlock button. The fault view
+warns that its dedicated close control may terminate jobs and lose unsaved editor
+changes. Ordinary window-close input does not bypass that warning. Upstream
+window/proxy resource limits remain separate work; this patch must not be
+represented as a whole-process memory guarantee.

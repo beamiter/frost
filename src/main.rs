@@ -54,6 +54,8 @@ mod native_companion;
 mod native_enter;
 mod native_font_probe;
 mod native_input_surface;
+#[cfg(all(test, unix))]
+mod native_overload_tests;
 mod native_popup_surface;
 mod native_shell;
 #[path = "glass_native_viewport.rs"]
@@ -4587,6 +4589,8 @@ fn main() -> iced::Result {
 
 #[derive(Debug, Clone)]
 enum Message {
+    /// Explicit confirmation to exit a quarantined process, including live jobs.
+    ExitAfterInputOverload,
     Eva(eva_companion::Event),
     InputDockHoldExpired(u64),
     ReferenceInspector(native_shell::InspectorTab),
@@ -6495,6 +6499,9 @@ impl Session {
     }
 
     fn write_pty_with_origin(&mut self, data: &[u8], taint_prompt: bool) -> bool {
+        if iced::advanced::subscription::Event::input_overloaded() {
+            return false;
+        }
         if data.is_empty() {
             return true;
         }
@@ -6528,6 +6535,9 @@ impl Session {
     }
 
     fn flush_write_queue(&mut self) -> bool {
+        if iced::advanced::subscription::Event::input_overloaded() {
+            return false;
+        }
         let mut budget = PTY_WRITE_DRAIN_BUDGET;
         while let Some(front) = self.write_queue.front() {
             if budget == 0 {
@@ -16579,6 +16589,26 @@ impl Frost {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if iced::advanced::subscription::Event::input_overloaded() {
+            // The latch was set synchronously by admission. Reject even a
+            // Return, widget submit, or paste already in the downstream sink.
+            // Never resume an old shell containing a partially received command.
+            for session in &mut self.sessions {
+                session.write_queue.clear();
+                session.write_queue_offset = 0;
+                session.queued_write_bytes = 0;
+                session.queued_response_bytes = 0;
+            }
+            return match message {
+                Message::ExitAfterInputOverload => {
+                    // This dedicated control explicitly warns about live jobs.
+                    self.eva = None;
+                    self.exit_flushing_durable_state()
+                }
+                _ => Task::none(),
+            };
+        }
+
         if let Message::WindowKey(id, _) | Message::CapturedEnterPress(id, _) = &message {
             if let Some(eva) = self.eva.as_mut() {
                 eva.bind(*id);
@@ -20195,6 +20225,7 @@ impl Frost {
                 }
             }
             Message::NewSession => self.new_session(),
+            Message::ExitAfterInputOverload => {}
             Message::WindowClose => return self.request_window_close(),
             // Window moves and resizes are compositor operations: we only get
             // to ask, and only while the button that started them is held.
@@ -27786,6 +27817,15 @@ impl Frost {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        if iced::advanced::subscription::Event::input_overloaded() {
+            return container(column![
+                text("Input stopped: native event queue overloaded").size(24),
+                text("Pending input was rejected and will not be replayed. Commands already sent may still be running. Close and restart Frost before typing again."),
+                text("Closing stops this process and may terminate running terminal jobs or lose unsaved editor changes."),
+                button("Close Frost and stop jobs").on_press(Message::ExitAfterInputOverload),
+            ].spacing(16).max_width(680)).padding(32).center(Length::Fill).into();
+        }
+
         if self.sessions.is_empty() {
             let message = self
                 .session_diagnostic
