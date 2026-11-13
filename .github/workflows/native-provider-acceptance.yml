@@ -38,6 +38,7 @@ jobs:
           set -euo pipefail
           mkdir -p native-provider-artifacts
           git rev-parse HEAD > native-provider-artifacts/commit.txt
+          python3 scripts/test-cargo-test-artifact.py
           python3 scripts/verify-provider-sources.py 2>&1 | tee native-provider-artifacts/source-verification.log
       - name: Build real host and native test executables
         run: |
@@ -50,14 +51,14 @@ jobs:
           cp scripts/provider-acceptance/smithay-tests.lock native-provider-artifacts/smithay-tests.lock
           python3 scripts/isolated_cargo.py --manifest-path scripts/provider-acceptance/Cargo.toml build --locked
           python3 scripts/isolated_cargo.py --manifest-path scripts/provider-acceptance/Cargo.toml test --locked -p clipboard_x11 --lib --no-run
-          python3 scripts/isolated_cargo.py --manifest-path "$RUNNER_TEMP/frost-smithay-tests/Cargo.toml" test --locked -p smithay-clipboard --lib --no-run
+          python3 scripts/isolated_cargo.py --manifest-path "$RUNNER_TEMP/frost-smithay-tests/Cargo.toml" test --locked -p smithay-clipboard --lib --no-run --message-format=json > native-provider-artifacts/smithay-build.jsonl
           wayland-scanner client-header scripts/protocols/wlr-data-control-unstable-v1.xml "$RUNNER_TEMP/provider-owner/wlr-data-control-unstable-v1-client-protocol.h"
           wayland-scanner private-code scripts/protocols/wlr-data-control-unstable-v1.xml "$RUNNER_TEMP/provider-owner/wlr-data-control-unstable-v1-protocol.c"
           cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/provider-owner" scripts/native-clipboard-owner.c "$RUNNER_TEMP/provider-owner/wlr-data-control-unstable-v1-protocol.c" $(pkg-config --libs wayland-client) -o "$RUNNER_TEMP/provider-owner/owner"
           sha256sum scripts/provider-acceptance/target/debug/frost-provider-acceptance "$RUNNER_TEMP/provider-owner/owner" > native-provider-artifacts/binaries.sha256
           python3 scripts/isolated_cargo.py --manifest-path scripts/provider-acceptance/Cargo.toml tree --locked > native-provider-artifacts/cargo-tree.txt
           python3 scripts/isolated_cargo.py --manifest-path "$RUNNER_TEMP/frost-smithay-tests/Cargo.toml" tree --locked -e features > native-provider-artifacts/smithay-test-features.txt
-          find "$RUNNER_TEMP/frost-smithay-tests/target/debug/deps" -maxdepth 1 -type f -name 'smithay_clipboard-*' -executable -exec sha256sum {} + > native-provider-artifacts/smithay-test-binaries.sha256
+          python3 scripts/record-cargo-test-artifact.py --messages native-provider-artifacts/smithay-build.jsonl --manifest "$RUNNER_TEMP/frost-smithay-tests/smithay-clipboard/Cargo.toml" --target smithay_clipboard > native-provider-artifacts/smithay-test-binaries.sha256
       - name: Run all six ignored native provider tests
         run: |
           set -euo pipefail
