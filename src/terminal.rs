@@ -23,6 +23,8 @@ mod grid_parity_tests;
 #[cfg(test)]
 mod line_selection_tests;
 #[cfg(test)]
+mod mouse_reporting_tests;
+#[cfg(test)]
 mod parser_oracle_tests;
 #[cfg(test)]
 mod projection_properties;
@@ -9920,89 +9922,25 @@ impl TerminalState {
         self.settle_pending_saved_line_purge();
     }
 
-    fn push_utf8_mouse_coord(output: &mut Vec<u8>, value: usize) {
-        let codepoint = 32 + value.saturating_add(1).min(2015) as u32;
-        if let Some(ch) = char::from_u32(codepoint) {
-            let mut buf = [0u8; 4];
-            output.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+    /// Project only mouse wire modes; Frost keeps its distinct mode storage,
+    /// lifecycle and input routing. Never reinterpret the host bit layout.
+    fn mouse_wire_modes(&self) -> jterm_engine::protocol_state::TerminalModes {
+        let mut modes = jterm_engine::protocol_state::TerminalModes::default();
+        for mode in [1000, 1002, 1003, 1005, 1006, 1015] {
+            if self.modes.contains(&mode) {
+                modes.insert(mode);
+            }
         }
-    }
-
-    fn x10_mouse_report(button: u8, col: usize, row: usize) -> Vec<u8> {
-        let mut output = Vec::with_capacity(6);
-        output.extend_from_slice(b"\x1b[M");
-        output.push(32 + button);
-        output.push(32 + (col.saturating_add(1).min(223) as u8));
-        output.push(32 + (row.saturating_add(1).min(223) as u8));
-        output
-    }
-
-    fn utf8_mouse_report(button: u8, col: usize, row: usize) -> Vec<u8> {
-        let mut output = Vec::with_capacity(12);
-        output.extend_from_slice(b"\x1b[M");
-        output.push(32 + button);
-        Self::push_utf8_mouse_coord(&mut output, col);
-        Self::push_utf8_mouse_coord(&mut output, row);
-        output
-    }
-
-    fn urxvt_mouse_report(button: u8, col: usize, row: usize) -> Vec<u8> {
-        format!(
-            "\x1b[{};{};{}M",
-            32 + button,
-            col.saturating_add(1),
-            row.saturating_add(1)
-        )
-        .into_bytes()
+        modes
     }
 
     pub fn get_mouse_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
-        // Check if any mouse reporting mode is enabled
-        if !self.modes.contains(&1000) && !self.modes.contains(&1002) && !self.modes.contains(&1003)
-        {
-            return None;
-        }
-
-        // SGR format (mode 1006) is preferred: CSI < button ; col ; row M/m
-        // urxvt format (mode 1015): CSI button ; col ; row M
-        // UTF-8 format (mode 1005): CSI M button col row, with UTF-8 coords
-        // Standard format (mode 1000/1002): CSI M button col row (raw bytes)
-
-        if self.modes.contains(&1006) {
-            // SGR format: CSI < button ; x ; y M (button press) or m (button release)
-            // For now, we'll generate press events (M) - release tracking would need more state
-            // SGR encodes coordinates as decimal integers, so the 223/255 cap that
-            // applies to the legacy X10 byte form is not needed here.
-            let x = col as u32 + 1;
-            let y = row as u32 + 1;
-            Some(format!("\x1b[<{};{};{}M", button, x, y).into_bytes())
-        } else if self.modes.contains(&1015) {
-            Some(Self::urxvt_mouse_report(button, col, row))
-        } else if self.modes.contains(&1005) {
-            Some(Self::utf8_mouse_report(button, col, row))
-        } else {
-            Some(Self::x10_mouse_report(button, col, row))
-        }
+        self.mouse_wire_modes().get_mouse_report(button, col, row)
     }
 
     pub fn get_mouse_release_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
-        if !self.modes.contains(&1000) && !self.modes.contains(&1002) && !self.modes.contains(&1003)
-        {
-            return None;
-        }
-
-        if self.modes.contains(&1006) {
-            // SGR format: lowercase 'm' for release
-            let x = col as u32 + 1;
-            let y = row as u32 + 1;
-            Some(format!("\x1b[<{};{};{}m", button, x, y).into_bytes())
-        } else if self.modes.contains(&1015) {
-            Some(Self::urxvt_mouse_report(3, col, row))
-        } else if self.modes.contains(&1005) {
-            Some(Self::utf8_mouse_report(3, col, row))
-        } else {
-            Some(Self::x10_mouse_report(3, col, row))
-        }
+        self.mouse_wire_modes()
+            .get_mouse_release_report(button, col, row)
     }
 
     pub fn is_mouse_enabled(&self) -> bool {
@@ -20367,6 +20305,34 @@ mod tests {
         assert_eq!(terminal.grid[0][0].character, 'm');
         terminal.process_input(b"\x1b[?1049h");
         assert!(!terminal.is_alt_buffer_active());
+    }
+
+    #[test]
+    fn shared_mouse_encoding_follows_fragmented_host_mode_changes() {
+        let stream = b"\x1b[?1002h\x1b[?1005h\x1b[?1015h\x1b[?1006h";
+        for split in 0..=stream.len() {
+            let mut terminal = TerminalState::new(20, 5);
+            terminal.process_input(&stream[..split]);
+            terminal.process_input(&stream[split..]);
+            assert_eq!(
+                terminal.get_mouse_report(0, 299, 10).unwrap(),
+                b"\x1b[<0;300;11M"
+            );
+            terminal.process_input(b"\x1b[?1006l");
+            assert_eq!(
+                terminal.get_mouse_release_report(2, 299, 10).unwrap(),
+                b"\x1b[35;300;11M"
+            );
+            terminal.process_input(b"\x1b[?1015l");
+            assert_eq!(
+                terminal.get_mouse_report(0, 299, 10).unwrap(),
+                b"\x1b[M \xc5\x8c+"
+            );
+            terminal.process_input(b"\x1b[?1002l");
+            assert!(terminal.get_mouse_report(0, 0, 0).is_none());
+            terminal.process_input(b"\x1bc");
+            assert!(terminal.get_mouse_release_report(0, 0, 0).is_none());
+        }
     }
 
     #[test]

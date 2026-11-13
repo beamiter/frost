@@ -93,6 +93,9 @@ jobs:
       - name: Check Files follow callback races
         run: python3 scripts/test-files-follow.py
 
+      - name: Check shared mouse wire adapter
+        run: python3 scripts/test-mouse-reporting.py
+
       - name: Check measurement and rendering font stack
         run: python3 scripts/check-font-stack.py
 
