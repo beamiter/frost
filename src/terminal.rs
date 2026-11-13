@@ -13706,8 +13706,8 @@ impl TerminalState {
         if cols != self.tab_stops.len() {
             let old_len = self.tab_stops.len();
             self.tab_stops.resize(cols, false);
-            for c in old_len..cols {
-                self.tab_stops[c] = c % 8 == 0 && c != 0;
+            for (c, stop) in self.tab_stops.iter_mut().enumerate().skip(old_len) {
+                *stop = c % 8 == 0 && c != 0;
             }
         }
 
@@ -15234,8 +15234,8 @@ mod tests {
                 cell.character = '\u{1f600}';
             }
         }
-        for col in 0..1008 {
-            exact.grid[63][col].character = '\u{1f600}';
+        for cell in exact.grid[63].iter_mut().take(1008) {
+            cell.character = '\u{1f600}';
         }
         exact.grid[63][1008].character = 'x';
         let (text, capped) = exact.rows_text(0, 64, CAP);

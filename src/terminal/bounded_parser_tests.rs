@@ -250,3 +250,79 @@ fn bounded_non_apc_boundary_preserves_transfer_and_abort_preserves_completed_ima
     terminal.process_input(b"\x1b_Gm=0;BA==\x1b\\");
     assert!(terminal.kitty_graphics.get_image(35).is_none());
 }
+
+// These assertions run through the real host dispatch and screen, not just
+// parser tokens. In FrostLegacyV1 the private prefix consumes one of the 128
+// retained parameter bytes; excess parameter bytes are consumed, not executed.
+#[test]
+fn bounded_csi_capacity_reaches_host_without_suffix_execution() {
+    for zeros in [127, 128, 129] {
+        let mut bytes = b"\x1b[".to_vec();
+        bytes.extend(std::iter::repeat_n(b'0', zeros));
+        bytes.extend_from_slice(b"1mZ\x1b[0m\x1b[6n");
+        for cut in 0..=bytes.len() {
+            let mut terminal = TerminalState::new(40, 8);
+            terminal.process_input(&bytes[..cut]);
+            terminal.process_input(&bytes[cut..]);
+            assert_eq!(
+                terminal.grid[0][0].character, 'Z',
+                "zeros={zeros} cut={cut}"
+            );
+            assert_eq!(
+                terminal.grid[0][0].flags.bold(),
+                zeros == 127,
+                "zeros={zeros} cut={cut}"
+            );
+            assert_eq!(
+                terminal.get_output(),
+                b"\x1b[1;2R",
+                "zeros={zeros} cut={cut}"
+            );
+            assert_eq!(terminal.parser.retained_bytes(), 0);
+        }
+    }
+    for zeros in [126, 127, 128] {
+        let mut bytes = b"\x1b[?".to_vec();
+        bytes.extend(std::iter::repeat_n(b'0', zeros));
+        bytes.extend_from_slice(b"1hZ\x1b[6n");
+        for cut in 0..=bytes.len() {
+            let mut terminal = TerminalState::new(40, 8);
+            terminal.process_input(&bytes[..cut]);
+            terminal.process_input(&bytes[cut..]);
+            assert_eq!(
+                terminal.is_application_cursor_keys(),
+                zeros == 126,
+                "zeros={zeros} cut={cut}"
+            );
+            assert_eq!(terminal.grid[0][0].character, 'Z');
+            assert_eq!(terminal.get_output(), b"\x1b[1;2R");
+            assert_eq!(terminal.parser.retained_bytes(), 0);
+        }
+    }
+}
+
+#[test]
+fn bounded_cancelled_csi_cannot_change_host_color_or_cursor_mode() {
+    for cancel in [0x18, 0x1a] {
+        let mut bytes = b"\x1b[31".to_vec();
+        bytes.push(cancel);
+        bytes.extend_from_slice(b"m\x1b[?1");
+        bytes.push(cancel);
+        bytes.extend_from_slice(b"hZ\x1b[6n");
+        for cut in 0..=bytes.len() {
+            let mut terminal = TerminalState::new(40, 8);
+            terminal.process_input(&bytes[..cut]);
+            terminal.process_input(&bytes[cut..]);
+            assert!(!terminal.is_application_cursor_keys());
+            for (col, character) in ['m', 'h', 'Z'].into_iter().enumerate() {
+                assert_eq!(
+                    terminal.grid[0][col].character, character,
+                    "cancel={cancel} cut={cut}"
+                );
+                assert_eq!(terminal.grid[0][col].foreground, Color::Default);
+            }
+            assert_eq!(terminal.get_output(), b"\x1b[1;4R");
+            assert_eq!(terminal.parser.retained_bytes(), 0);
+        }
+    }
+}
