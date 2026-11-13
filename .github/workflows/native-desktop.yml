@@ -84,10 +84,12 @@ jobs:
       - name: Check production-derived native geometry oracle
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: |
-          export FROST_SCALE_PROBE="$(PYTHONPATH=scripts python3 -c 'import native_scale_geometry as g; print(g.build_probe("native-smoke-artifacts/geometry-contract"))')"
+          python3 scripts/test-geometry-artifacts.py
+          FROST_SCALE_PROBE="$(PYTHONPATH=scripts python3 -c 'import native_scale_geometry as g; print(g.build_probe("native-smoke-artifacts/geometry-contract"))')"
+          export FROST_SCALE_PROBE
           python3 scripts/test-native-scale-geometry.py
       - name: Build public Wayland pointer for observed close dialogs
-        if: steps.install.outcome == 'success'
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: |
           mkdir -p "$RUNNER_TEMP/frost-pointer"
           wayland-scanner client-header scripts/protocols/wlr-virtual-pointer-unstable-v1.xml "$RUNNER_TEMP/frost-pointer/wlr-virtual-pointer-unstable-v1-client-protocol.h"

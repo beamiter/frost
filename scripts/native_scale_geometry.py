@@ -42,6 +42,46 @@ def constant(source, name):
     return matches[0]
 
 
+def locked_probe_dependencies(deps):
+    """Resolve the release's exact dependencies in both Cargo artifact layouts."""
+    deps = Path(deps).resolve()
+    profile = deps.parent
+    fingerprints = sorted(
+        [*(profile / '.fingerprint').glob('frost-*/bin-frost.json'),
+         *(profile / 'build/frost').glob('*/fingerprint/bin-frost.json')],
+        key=lambda path: path.stat().st_mtime, reverse=True)
+    require(fingerprints, 'Build Frost release with its locked compiler before the geometry probe')
+    app = json.loads(fingerprints[0].read_text())
+    libraries = {}
+    for name in ('iced', 'cosmic_text'):
+        package = name.replace('_', '-')
+        identities = [entry[3] for entry in app['deps'] if entry[1] == name]
+        require(len(identities) == 1, 'Missing production dependency identity: ' + name)
+        pairs = []
+        for library in deps.glob('lib' + name + '-*.rlib'):
+            suffix = library.stem.split('-')[-1]
+            pairs.append((library, profile / '.fingerprint' / (package + '-' + suffix) / ('lib-' + name + '.json')))
+        for library in (profile / 'build' / package).glob('*/out/lib' + name + '-*.rlib'):
+            pairs.append((library, library.parent.parent / 'fingerprint' / ('lib-' + name + '.json')))
+        candidates = []
+        for library, fingerprint in pairs:
+            checksum = fingerprint.with_suffix('')
+            if (fingerprint.exists() and checksum.exists()
+                    and json.loads(fingerprint.read_text()).get('rustc') == app['rustc']
+                    and int.from_bytes(bytes.fromhex(checksum.read_text()), 'little') == identities[0]):
+                candidates.append(library)
+        require(len(candidates) == 1, 'Expected one same-compiler locked ' + name + ' rlib; use a clean release dependency directory')
+        libraries[name] = candidates[0]
+    # Rustc also needs transitive crates, including proc-macro shared libraries.
+    # This is the new-layout equivalent of
+    # the legacy deps directory; direct externs above remain fingerprint-bound.
+    search = sorted(p for p in (profile / 'build').glob('*/*/out') if p.is_dir())
+    if deps.is_dir():
+        search.append(deps)
+    require(search, 'Missing Cargo dependency search directories')
+    return fingerprints[0], libraries, search
+
+
 def build_probe(output, deps=None, rustc=None):
     """Compile only a small observer against existing release dependencies."""
     output = Path(output).resolve()
@@ -98,28 +138,11 @@ def build_probe(output, deps=None, rustc=None):
         body = body.replace(token, value)
     generated = output / 'production_probe.rs'
     generated.write_text(body)
-    fingerprints = sorted((deps.parent / '.fingerprint').glob('frost-*/bin-frost.json'),
-                          key=lambda path: path.stat().st_mtime, reverse=True)
-    require(fingerprints, 'Build Frost release with its locked compiler before the geometry probe')
-    app_fingerprint = json.loads(fingerprints[0].read_text())
-    compiler_id = app_fingerprint['rustc']
-    libraries = {}
-    for name in ('iced', 'cosmic_text'):
-        candidates = []
-        dependency_ids = [entry[3] for entry in app_fingerprint['deps'] if entry[1] == name]
-        require(len(dependency_ids) == 1, 'Missing production dependency identity: ' + name)
-        for library in deps.glob('lib' + name + '-*.rlib'):
-            folder = name.replace('_', '-') + '-' + library.stem.split('-')[-1]
-            fingerprint = deps.parent / '.fingerprint' / folder / ('lib-' + name + '.json')
-            checksum = fingerprint.with_suffix('')
-            if (fingerprint.exists() and checksum.exists() and
-                    json.loads(fingerprint.read_text()).get('rustc') == compiler_id and
-                    int.from_bytes(bytes.fromhex(checksum.read_text()), 'little') == dependency_ids[0]):
-                candidates.append(library)
-        require(len(candidates) == 1, 'Expected one same-compiler locked ' + name + ' rlib; use a clean release dependency directory')
-        libraries[name] = candidates[0]
+    fingerprint, libraries, search = locked_probe_dependencies(deps)
     command = ([os.environ['RUSTC_WRAPPER']] if os.environ.get('RUSTC_WRAPPER') else [])
-    command += [rustc, '--edition=2021', '-C', 'opt-level=1', '-L', 'dependency=' + str(deps)]
+    command += [rustc, '--edition=2021', '-C', 'opt-level=1']
+    for directory in search:
+        command += ['-L', 'dependency=' + str(directory)]
     if os.environ.get('CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER'):
         command += ['-C', 'linker=' + os.environ['CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER']]
     for name, library in libraries.items():
@@ -137,7 +160,7 @@ def build_probe(output, deps=None, rustc=None):
     for path in sorted((ROOT / 'src').rglob('*.rs')):
         after_digest.update(str(path.relative_to(ROOT)).encode() + b'\0' + path.read_bytes())
     require(after_digest.hexdigest() == source_digest.hexdigest(), 'Rust source set changed while building probe')
-    manifest = {'production_sources_sha256': hashes, 'production_fingerprint': str(fingerprints[0]),
+    manifest = {'production_sources_sha256': hashes, 'production_fingerprint': str(fingerprint),
                 'rust_sources_sha256': source_digest.hexdigest(),
                 'cargo_toml_sha256': hashlib.sha256((ROOT / 'Cargo.toml').read_bytes()).hexdigest(),
                 'cargo_lock_sha256': hashlib.sha256((ROOT / 'Cargo.lock').read_bytes()).hexdigest(),
