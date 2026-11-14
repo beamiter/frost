@@ -7351,7 +7351,11 @@ mod mode_gesture_tests {
                     gesture.session_id, 17,
                     "changing active pane cannot retarget retirement"
                 );
-                let report = crate::cancelled_terminal_mouse_report(gesture, &terminal);
+                let report = crate::cancelled_terminal_mouse_report(
+                    gesture,
+                    &terminal,
+                    keyboard::Modifiers::default(),
+                );
                 if app {
                     assert_eq!(report, Some(format!("\x1b[<{code};8;3m").into_bytes()));
                 } else {
@@ -7362,7 +7366,8 @@ mod mode_gesture_tests {
                         last_app_cell: None,
                         ..gesture
                     },
-                    &terminal
+                    &terminal,
+                    keyboard::Modifiers::default(),
                 )
                 .is_none());
                 assert!(crate::cancelled_terminal_mouse_report(
@@ -7370,7 +7375,8 @@ mod mode_gesture_tests {
                         consumed: true,
                         ..gesture
                     },
-                    &terminal
+                    &terminal,
+                    keyboard::Modifiers::default(),
                 )
                 .is_none());
                 assert!(
@@ -7434,7 +7440,13 @@ mod mode_gesture_tests {
             }
             let reports: Vec<_> = retired
                 .into_iter()
-                .filter_map(|gesture| crate::cancelled_terminal_mouse_report(gesture, &terminal))
+                .filter_map(|gesture| {
+                    crate::cancelled_terminal_mouse_report(
+                        gesture,
+                        &terminal,
+                        keyboard::Modifiers::default(),
+                    )
+                })
                 .collect();
             assert_eq!(reports, [b"\x1b[<0;8;3m".to_vec()]);
             let mut next = fixture(&projection, &theme, mode, epoch);
@@ -7513,7 +7525,11 @@ mod mode_gesture_tests {
                 );
                 assert_eq!(retired.len(), 1);
                 assert_eq!(
-                    crate::cancelled_terminal_mouse_report(retired[0], &terminal),
+                    crate::cancelled_terminal_mouse_report(
+                        retired[0],
+                        &terminal,
+                        keyboard::Modifiers::default()
+                    ),
                     Some(b"\x1b[<0;8;3m".to_vec())
                 );
                 assert!(gestures.iter().all(Option::is_none));
@@ -7677,7 +7693,12 @@ mod mode_gesture_tests {
                 .map(|gesture| {
                     (
                         gesture.session_id,
-                        crate::cancelled_terminal_mouse_report(gesture, &terminal).unwrap(),
+                        crate::cancelled_terminal_mouse_report(
+                            gesture,
+                            &terminal,
+                            keyboard::Modifiers::default(),
+                        )
+                        .unwrap(),
                     )
                 })
                 .collect();
@@ -7737,7 +7758,12 @@ mod mode_gesture_tests {
             &mut clicks,
         );
         assert_eq!(retired.len(), 1);
-        assert!(crate::cancelled_terminal_mouse_report(retired[0], &terminal).is_none());
+        assert!(crate::cancelled_terminal_mouse_report(
+            retired[0],
+            &terminal,
+            keyboard::Modifiers::default()
+        )
+        .is_none());
         assert!(
             crate::take_terminal_mouse_gesture(&mut slots, 17, MouseButton::Left).is_none(),
             "retired local release must not reach selection copy"
@@ -7761,7 +7787,12 @@ mod mode_gesture_tests {
             .map(|&gesture| {
                 (
                     gesture.session_id,
-                    crate::cancelled_terminal_mouse_report(gesture, &terminal).unwrap(),
+                    crate::cancelled_terminal_mouse_report(
+                        gesture,
+                        &terminal,
+                        keyboard::Modifiers::default(),
+                    )
+                    .unwrap(),
                 )
             })
             .collect();
