@@ -7354,7 +7354,7 @@ mod mode_gesture_tests {
                 let report = crate::cancelled_terminal_mouse_report(
                     gesture,
                     &terminal,
-                    keyboard::Modifiers::default(),
+                    iced::keyboard::Modifiers::default(),
                 );
                 if app {
                     assert_eq!(report, Some(format!("\x1b[<{code};8;3m").into_bytes()));
@@ -7367,7 +7367,7 @@ mod mode_gesture_tests {
                         ..gesture
                     },
                     &terminal,
-                    keyboard::Modifiers::default(),
+                    iced::keyboard::Modifiers::default(),
                 )
                 .is_none());
                 assert!(crate::cancelled_terminal_mouse_report(
@@ -7376,7 +7376,7 @@ mod mode_gesture_tests {
                         ..gesture
                     },
                     &terminal,
-                    keyboard::Modifiers::default(),
+                    iced::keyboard::Modifiers::default(),
                 )
                 .is_none());
                 assert!(
@@ -7444,7 +7444,7 @@ mod mode_gesture_tests {
                     crate::cancelled_terminal_mouse_report(
                         gesture,
                         &terminal,
-                        keyboard::Modifiers::default(),
+                        iced::keyboard::Modifiers::default(),
                     )
                 })
                 .collect();
@@ -7528,7 +7528,7 @@ mod mode_gesture_tests {
                     crate::cancelled_terminal_mouse_report(
                         retired[0],
                         &terminal,
-                        keyboard::Modifiers::default()
+                        iced::keyboard::Modifiers::default()
                     ),
                     Some(b"\x1b[<0;8;3m".to_vec())
                 );
@@ -7696,7 +7696,7 @@ mod mode_gesture_tests {
                         crate::cancelled_terminal_mouse_report(
                             gesture,
                             &terminal,
-                            keyboard::Modifiers::default(),
+                            iced::keyboard::Modifiers::default(),
                         )
                         .unwrap(),
                     )
@@ -7761,7 +7761,7 @@ mod mode_gesture_tests {
         assert!(crate::cancelled_terminal_mouse_report(
             retired[0],
             &terminal,
-            keyboard::Modifiers::default()
+            iced::keyboard::Modifiers::default()
         )
         .is_none());
         assert!(
@@ -7790,7 +7790,7 @@ mod mode_gesture_tests {
                     crate::cancelled_terminal_mouse_report(
                         gesture,
                         &terminal,
-                        keyboard::Modifiers::default(),
+                        iced::keyboard::Modifiers::default(),
                     )
                     .unwrap(),
                 )
