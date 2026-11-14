@@ -10619,6 +10619,11 @@ impl Frost {
     /// because a stalled state filesystem must not turn quitting into a hang;
     /// a missed deadline is logged and the exit continues.
     fn exit_flushing_durable_state(&mut self) -> Task<Message> {
+        eprintln!(
+            "[close-diag {:?}] exit entry ready={}",
+            std::time::Instant::now(),
+            self.eva.as_ref().is_none_or(|eva| eva.ready_to_close())
+        );
         if let Some(eva) = self.eva.as_mut() {
             eva.request_close();
             if !eva.ready_to_close() {
@@ -10632,8 +10637,20 @@ impl Frost {
         self.organism.set_enabled(false);
         self.organism.close_preview();
         const EXIT_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+        eprintln!(
+            "[close-diag {:?}] before self.agent.persist();",
+            std::time::Instant::now()
+        );
         self.agent.persist();
+        eprintln!(
+            "[close-diag {:?}] before self.ai_chats.persist(self.config.ai_redact_secrets);",
+            std::time::Instant::now()
+        );
         self.ai_chats.persist(self.config.ai_redact_secrets);
+        eprintln!(
+            "[close-diag {:?}] before self.save_session_snapshot();",
+            std::time::Instant::now()
+        );
         self.save_session_snapshot();
         if !jterm_core::execution_journal::flush(EXIT_FLUSH_TIMEOUT) {
             log::warn!("jsh execution journal did not flush before exit");
@@ -10641,7 +10658,15 @@ impl Frost {
         if let Err(error) = jterm_core::command_history::flush_pending(EXIT_FLUSH_TIMEOUT) {
             log::warn!("command history did not flush before exit: {error}");
         }
+        eprintln!(
+            "[close-diag {:?}] before self.flush_config_on_exit();",
+            std::time::Instant::now()
+        );
         self.flush_config_on_exit();
+        eprintln!(
+            "[close-diag {:?}] before iced::exit()",
+            std::time::Instant::now()
+        );
         iced::exit()
     }
 

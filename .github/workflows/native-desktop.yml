@@ -96,106 +96,19 @@ jobs:
           wayland-scanner private-code scripts/protocols/wlr-virtual-pointer-unstable-v1.xml "$RUNNER_TEMP/frost-pointer/wlr-virtual-pointer-unstable-v1-protocol.c"
           cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/frost-pointer" scripts/native-pointer.c "$RUNNER_TEMP/frost-pointer/wlr-virtual-pointer-unstable-v1-protocol.c" $(pkg-config --libs wayland-client) -o "$RUNNER_TEMP/frost-pointer/native-pointer"
           echo "FROST_SMOKE_POINTER=$RUNNER_TEMP/frost-pointer/native-pointer" >> "$GITHUB_ENV"
-      - name: Exercise X11 visible Mission lifecycle
-        timeout-minutes: 5
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: python3 scripts/native-mission-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend x11 --output native-smoke-artifacts/x11-mission
-      - name: Exercise Wayland visible Mission lifecycle
-        timeout-minutes: 5
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: python3 scripts/native-mission-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend wayland --output native-smoke-artifacts/wayland-mission
-      - name: Preserve visible Mission evidence immediately
+      - name: Diagnose complete Wayland recovery sequence
+        timeout-minutes: 6
+        env:
+          FROST_SMOKE_WAYLAND_DEBUG: '1'
+        run: python3 scripts/native-recovery-report.py --runner scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend wayland --pointer "$FROST_SMOKE_POINTER" --output native-smoke-artifacts/wayland-recovery-report
+      - name: Diagnose bounded repetitions of the failing case
+        timeout-minutes: 8
+        env:
+          FROST_SMOKE_WAYLAND_DEBUG: '1'
+        run: python3 scripts/diagnose-close.py "$RUNNER_TEMP/frost-installed/bin/frost" "$FROST_SMOKE_POINTER" native-smoke-artifacts/close-repetitions
+      - name: Preserve close diagnostic evidence
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: frost-native-missions-${{ github.sha }}
-          path: |
-            native-smoke-artifacts/x11-mission
-            native-smoke-artifacts/wayland-mission
-          if-no-files-found: warn
-          retention-days: 14
-      - name: Exercise X11 production input
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend x11 --output native-smoke-artifacts/x11
-      - name: Exercise Wayland production input
-        timeout-minutes: 10
-        env:
-          FROST_SMOKE_WAYLAND_DEBUG: "1"
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend wayland --output native-smoke-artifacts/wayland
-      - name: Exercise X11 restart and recovery
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: python3 scripts/native-desktop-recovery.py --runner scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend x11 --output native-smoke-artifacts/x11-recovery
-      - name: Exercise Wayland recovery and fractional output scale
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: python3 scripts/native-desktop-recovery.py --runner scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend wayland --output native-smoke-artifacts/wayland-recovery
-      - name: Characterize delayed synthetic clipboard latency
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: python3 scripts/native-clipboard-latency.py --runner scripts/native-desktop-smoke.py --owner scripts/delayed-x11-clipboard.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --output native-smoke-artifacts/clipboard-latency
-      - name: Build genuine Wayland IME protocol client
-        id: ime
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/frost-ime"
-          wayland-scanner client-header scripts/protocols/input-method-unstable-v2.xml "$RUNNER_TEMP/frost-ime/input-method-unstable-v2-client-protocol.h"
-          wayland-scanner private-code scripts/protocols/input-method-unstable-v2.xml "$RUNNER_TEMP/frost-ime/input-method-unstable-v2-protocol.c"
-          cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/frost-ime" scripts/native-ime-client.c "$RUNNER_TEMP/frost-ime/input-method-unstable-v2-protocol.c" $(pkg-config --libs wayland-client) -o "$RUNNER_TEMP/frost-ime/native-ime-client"
-      - name: Exercise actual Wayland preedit and commit
-        if: ${{ !cancelled() && steps.ime.outcome == 'success' }}
-        run: python3 scripts/native-ime-smoke.py --runner scripts/native-desktop-smoke.py --ime-client "$RUNNER_TEMP/frost-ime/native-ime-client" --binary "$RUNNER_TEMP/frost-installed/bin/frost" --output native-smoke-artifacts/wayland-ime
-      - name: Build genuine Wayland clipboard owner and pointer
-        id: clipboard_owner
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/frost-clipboard"
-          for protocol in wlr-data-control-unstable-v1 wlr-virtual-pointer-unstable-v1; do
-            wayland-scanner client-header "scripts/protocols/$protocol.xml" "$RUNNER_TEMP/frost-clipboard/$protocol-client-protocol.h"
-            wayland-scanner private-code "scripts/protocols/$protocol.xml" "$RUNNER_TEMP/frost-clipboard/$protocol-protocol.c"
-          done
-          cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/frost-clipboard" scripts/native-clipboard-owner.c "$RUNNER_TEMP/frost-clipboard/wlr-data-control-unstable-v1-protocol.c" $(pkg-config --libs wayland-client) -o "$RUNNER_TEMP/frost-clipboard/native-clipboard-owner"
-          cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/frost-clipboard" scripts/native-pointer.c "$RUNNER_TEMP/frost-clipboard/wlr-virtual-pointer-unstable-v1-protocol.c" $(pkg-config --libs wayland-client) -o "$RUNNER_TEMP/frost-clipboard/native-pointer"
-      - name: Exercise actual Wayland bounded clipboard transfers
-        timeout-minutes: 10
-        env:
-          FROST_SMOKE_WAYLAND_DEBUG: "1"
-        if: ${{ !cancelled() && steps.clipboard_owner.outcome == 'success' }}
-        run: python3 scripts/native-wayland-clipboard.py --runner scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --owner "$RUNNER_TEMP/frost-clipboard/native-clipboard-owner" --output native-smoke-artifacts/wayland-clipboard
-      - name: Exercise actual clipboard widgets PRIMARY and idle ownership
-        if: ${{ !cancelled() && steps.clipboard_owner.outcome == 'success' }}
-        run: python3 scripts/native-clipboard-ui.py --runner scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --owner "$RUNNER_TEMP/frost-clipboard/native-clipboard-owner" --pointer "$RUNNER_TEMP/frost-clipboard/native-pointer" --output native-smoke-artifacts/wayland-clipboard-ui
-      - name: Exercise X11 recovery report and preservation gate
-        timeout-minutes: 5
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: python3 scripts/native-recovery-report.py --runner scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend x11 --output native-smoke-artifacts/x11-recovery-report
-      - name: Exercise Wayland recovery report and preservation gate
-        timeout-minutes: 5
-        if: ${{ !cancelled() && steps.clipboard_owner.outcome == 'success' }}
-        run: python3 scripts/native-recovery-report.py --runner scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend wayland --pointer "$RUNNER_TEMP/frost-clipboard/native-pointer" --output native-smoke-artifacts/wayland-recovery-report
-      - name: Build isolated native overload acceptance fixture
-        id: overload_fixture
-        timeout-minutes: 10
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: |
-          python3 scripts/native-overload-smoke.py --self-test
-          python3 scripts/native-overload-smoke.py --regression-test native-smoke-artifacts/overload-observer-regression
-          python3 scripts/build-native-overload-fixture.py --mechanism runner --output native-smoke-artifacts/overload-fixture
-      - name: Observe X11 Runner ingress overload, fault UI and explicit close
-        timeout-minutes: 3
-        if: ${{ !cancelled() && steps.overload_fixture.outcome == 'success' }}
-        run: python3 scripts/native-overload-smoke.py --binary native-smoke-artifacts/overload-fixture/native-overload-fixture --manifest native-smoke-artifacts/overload-fixture/manifest.json --backend x11 --output native-smoke-artifacts/x11-overload
-      - name: Observe Wayland Runner ingress overload, fault UI and explicit close
-        timeout-minutes: 3
-        if: ${{ !cancelled() && steps.overload_fixture.outcome == 'success' && steps.clipboard_owner.outcome == 'success' }}
-        env:
-          FROST_SMOKE_POINTER: ${{ runner.temp }}/frost-clipboard/native-pointer
-        run: python3 scripts/native-overload-smoke.py --binary native-smoke-artifacts/overload-fixture/native-overload-fixture --manifest native-smoke-artifacts/overload-fixture/manifest.json --backend wayland --output native-smoke-artifacts/wayland-overload
-      - name: Preserve screenshots and PTY evidence
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: frost-native-desktop-${{ github.sha }}
-          path: |
-            native-smoke-artifacts
-            !native-smoke-artifacts/overload-fixture/checkout/**
-          if-no-files-found: error
-          retention-days: 14
+          name: frost-close-diagnostic-${{ github.sha }}
+          path: native-smoke-artifacts

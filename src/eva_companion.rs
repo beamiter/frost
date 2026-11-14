@@ -737,6 +737,7 @@ impl Eva {
                 }
             }
             Event::ForceClose(revision) => {
+                eprintln!("[close-diag {:?}] ForceClose revision={revision} current={} closing={} paused={}", Instant::now(), self.close_ui_revision, self.closing, self.close_paused_for_work);
                 if self.closing && !self.close_paused_for_work && revision == self.close_ui_revision
                 {
                     self.force_close = true;

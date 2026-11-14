@@ -16,7 +16,20 @@ pub(crate) fn install() -> SharedOwnership {
     let state = Arc::new(parking_lot::Mutex::new(NativeEnterOwnership::default()));
     let observer = Arc::clone(&state);
     assert!(
-        iced_winit::native_events::install(move |id, event| { observer.lock().observe(id, event) }),
+        iced_winit::native_events::install(move |id, event| {
+            if matches!(
+                event,
+                WindowEvent::MouseInput { .. }
+                    | WindowEvent::CloseRequested
+                    | WindowEvent::Focused(_)
+            ) {
+                eprintln!(
+                    "[close-diag {:?}] native {event:?}",
+                    std::time::Instant::now()
+                );
+            }
+            observer.lock().observe(id, event)
+        }),
         "native keyboard observer already installed"
     );
     state
