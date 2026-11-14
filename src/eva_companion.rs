@@ -741,9 +741,15 @@ impl Eva {
                 if self.closing && !self.close_paused_for_work && revision == self.close_ui_revision
                 {
                     self.force_close = true;
+                    eprintln!("[close-diag {:?}] ForceClose accepted", Instant::now());
                 }
             }
             Event::KeepOpen(revision) => {
+                eprintln!(
+                    "[close-diag {:?}] KeepOpen revision={revision} current={}",
+                    Instant::now(),
+                    self.close_ui_revision
+                );
                 if self.closing && self.close_guarded && revision == self.close_ui_revision {
                     self.keep_window_open();
                 }
@@ -982,6 +988,12 @@ impl Eva {
         }
     }
     pub fn request_guarded_close(&mut self) {
+        eprintln!(
+            "[close-diag {:?}] request_guarded_close current={} paused={}",
+            Instant::now(),
+            self.close_ui_revision,
+            self.close_paused_for_work
+        );
         if self.close_paused_for_work {
             self.close_ui_revision = self.close_ui_revision.saturating_add(1);
         }
@@ -993,6 +1005,11 @@ impl Eva {
         self.closing && self.close_guarded && !self.close_paused_for_work
     }
     pub fn pause_close_for_work(&mut self) {
+        eprintln!(
+            "[close-diag {:?}] pause_close_for_work current={}",
+            Instant::now(),
+            self.close_ui_revision
+        );
         if self.closing && self.close_guarded && !self.close_paused_for_work {
             // Keep the exact in-flight withdrawal/proof. Ending the new work
             // must not itself authorize a GUI exit.
@@ -1007,6 +1024,11 @@ impl Eva {
         self.close_paused_for_work = false;
     }
     pub fn keep_window_open(&mut self) {
+        eprintln!(
+            "[close-diag {:?}] keep_window_open current={}",
+            Instant::now(),
+            self.close_ui_revision
+        );
         self.close_ui_revision = self.close_ui_revision.saturating_add(1);
         self.closing = false;
         self.close_guarded = false;
