@@ -1214,6 +1214,7 @@ impl Frost {
         let destinations = column![self.chrome_section("SPACES"), spaces].spacing(3);
         container(column![
             scrollable(navigation).height(Length::Fill),
+            self.eva_navigation_avatar(),
             destinations,
             footer,
         ])

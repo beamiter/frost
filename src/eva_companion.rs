@@ -14,6 +14,21 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+fn navigation_slot(width: f32, height: f32) -> Option<(f32, f32)> {
+    if !width.is_finite() || !height.is_finite() {
+        return None;
+    }
+    // Leave navigation controls and its scrolling list their own space.
+    let available = (width - 24., height - 260.);
+    if available.0 >= 240. && available.1 >= 242. {
+        Some((240., 242.))
+    } else if available.0 >= 120. && available.1 >= 121. {
+        Some((120., 121.))
+    } else {
+        None
+    }
+}
+
 fn companion_button<'a>(label: iced::widget::Text<'a>) -> iced::widget::Button<'a, Message> {
     button(label.size(11))
         .padding([5, 8])
@@ -1360,7 +1375,7 @@ impl Frost {
             return;
         }
         self.sync_eva_handoffs();
-        let inspector = self.reference_layout().inspector;
+        let navigation = self.reference_layout().navigation;
         let session = self.sessions.get(self.active);
         let selecting = session.is_some_and(|s| s.terminal.has_text_selection());
         let unsafe_input = session.is_none_or(|s| {
@@ -1383,32 +1398,18 @@ impl Frost {
             && !self.agent.is_open
             && !self.ai_chats.is_open
             && self.agent.session.is_none()
-            && self.reference_inspector_tab == crate::native_shell::InspectorTab::Agent
-            && !self.config.experimental_task_sidebar
             && !jterm_core::reference_conversation::fixture_enabled();
 
         let reduced = self.organism_motion_control.system_reduced();
-        let header = 72.0_f32.min(self.reference_layout().header.height);
         let viewport = Rect {
             x: 0.,
             y: 0.,
             width: self.win_size.width.max(1.) as f64,
             height: self.win_size.height.max(1.) as f64,
         };
-        // Dedicated inspector slot: measure its actual native Canvas bounds below.
-        // Reserve no terminal/document rows. Tiny/narrow inspectors have no slot.
-        let details_open = self.eva.as_ref().is_some_and(|eva| eva.details_open);
-        let slot_size = inspector.and_then(|r| {
-            let height = r.height - header - if details_open { 400. } else { 96. };
-            let width = r.width - 24.;
-            if width >= 240. && height >= 242. {
-                Some((240., 242.))
-            } else if width >= 120. && height >= 121. {
-                Some((120., 121.))
-            } else {
-                None
-            }
-        });
+        // The default-closed inspector cannot be the only home for a default-on
+        // companion. Its one measured canvas lives below the navigation list.
+        let slot_size = navigation.and_then(|r| navigation_slot(r.width, r.height));
         let running = session
             .filter(|s| {
                 !s.managed_remote
@@ -1474,6 +1475,14 @@ impl Frost {
         let slot = eva.geometry.filter(|r| {
             slot_size.is_some_and(|(w, h)| {
                 (r.width - w as f64).abs() < 1. && (r.height - h as f64).abs() < 1.
+            }) && navigation.is_some_and(|n| {
+                Rect {
+                    x: n.x as f64,
+                    y: n.y as f64,
+                    width: n.width as f64,
+                    height: n.height as f64,
+                }
+                .contains(*r)
             })
         });
         let candidates = if safe {
@@ -1540,29 +1549,10 @@ impl Frost {
         }
         eva.cached = frame;
     }
-    pub(crate) fn eva_card(&self) -> Element<'_, Message> {
+    pub(crate) fn eva_navigation_avatar(&self) -> Element<'_, Message> {
         let Some(eva) = self.eva.as_ref() else {
             return iced::widget::Space::new().height(0).into();
         };
-        let context_revision = eva.context.as_ref().map_or(0, |c| c.revision);
-        let turn = eva
-            .dialogue
-            .as_ref()
-            .map_or(String::new(), |(id, _)| id.clone());
-        let notice = eva.host.notices.latest();
-        let mut card = column![row![
-            text(if notice.is_some() { "Eva •" } else { "Eva" })
-                .size(12)
-                .width(Length::Fill),
-            companion_button(text(if eva.details_open {
-                "Close"
-            } else {
-                "Talk / settings"
-            }))
-            .on_press(Message::Eva(Event::ToggleDetails))
-        ]
-        .align_y(iced::Alignment::Center),]
-        .spacing(6);
         let mut avatar = column![].spacing(6);
         if let Some((width, height)) = eva.slot_size {
             // The unpainted slot can establish geometry before residence is granted.
@@ -1592,7 +1582,31 @@ impl Frost {
         }
         // Transient glyph/error children stay inside fixed parent positions;
         // neither an admission change nor a hidden body may reset Ask Eva.
-        card = card.push(avatar);
+        container(avatar).padding([8, 0]).width(Length::Fill).into()
+    }
+    pub(crate) fn eva_card(&self) -> Element<'_, Message> {
+        let Some(eva) = self.eva.as_ref() else {
+            return iced::widget::Space::new().height(0).into();
+        };
+        let context_revision = eva.context.as_ref().map_or(0, |c| c.revision);
+        let turn = eva
+            .dialogue
+            .as_ref()
+            .map_or(String::new(), |(id, _)| id.clone());
+        let notice = eva.host.notices.latest();
+        let mut card = column![row![
+            text(if notice.is_some() { "Eva •" } else { "Eva" })
+                .size(12)
+                .width(Length::Fill),
+            companion_button(text(if eva.details_open {
+                "Close"
+            } else {
+                "Talk / settings"
+            }))
+            .on_press(Message::Eva(Event::ToggleDetails))
+        ]
+        .align_y(iced::Alignment::Center),]
+        .spacing(6);
         if !eva.details_open {
             return container(card).padding(12).width(Length::Fill).into();
         }
@@ -2312,6 +2326,13 @@ impl canvas::Program<Message> for Glyphs<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_navigation_hosts_body_without_opening_inspector() {
+        assert_eq!(navigation_slot(280., 700.), Some((240., 242.)));
+        assert_eq!(navigation_slot(240., 500.), Some((120., 121.)));
+        assert_eq!(navigation_slot(280., 300.), None);
+        assert_eq!(navigation_slot(f32::NAN, 700.), None);
+    }
     #[test]
     fn selection_consent_binds_snapshot_source_and_context() {
         let c = shared::ContextRef {

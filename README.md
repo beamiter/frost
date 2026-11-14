@@ -41,9 +41,9 @@ Chat 仍只有一个真实 PTY：补全、多行、粘贴、IME 与键盘输入�
 ## Shared Eva（默认启用）
 
 设置中的 **Shared Eva (next window launch)** 保存并重启窗口后，Frost 接入本地
-`jcompaniond`，在原有 Agent Inspector 中呈现一个共享身体。八种皮肤沿用共享字符图集，
+`jcompaniond`，在左侧导航列表下方呈现唯一的共享身体，无需先打开右侧检查器。八种皮肤沿用共享字符图集，
 设置预览保持静态；Follow / Stay / Hide / Recall 操作不写入终端。共享模式失联时隐藏，
-不会恢复成本地宠物。默认关闭。原生提交回执不是 GPU 完成或屏幕像素证明；严格物理模式
+不会恢复成本地宠物。原生提交回执不是 GPU 完成或屏幕像素证明；严格物理模式
 需 compositor/JWM 支持。配置、边界及验证状态见 [Shared Eva](docs/eva-companion.md)。
 
 ## ASCII 数字伙伴（传统本地模式）

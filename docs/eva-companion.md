@@ -64,15 +64,16 @@ acceptance remain unfinished.
 
 ## Drawing and safety
 
-The existing Agent inspector contains the single Eva dock/card; its original tabs
-and assistant controls remain. The dedicated canvas reports its actual logical
-bounds and renders a cached 40×22 colored ASCII atlas. It never occupies terminal
-rows, alters `CanvasMotion`, PTY dimensions, document height, scroll anchors, or
+The single Eva body lives below the left navigation list, so the default-closed
+Agent inspector does not hide a default-enabled companion. The inspector retains
+its text dialogue/settings card without a second body. The dedicated navigation
+canvas reports its actual logical bounds and renders a cached 40×22 colored
+ASCII atlas. It never occupies terminal rows, alters `CanvasMotion`, PTY dimensions, document height, scroll anchors, or
 input focus. Eight distinct source sketches are preserved as **static** settings
 previews, alongside static selectors for all 13 poses and 9 optional artistic
 moods. The rich atlas is explicitly implementation-derived from figures 4/5. No emoji/recolored generic face substitutes for that atlas.
 
-Body → Compact → Hidden is determined by the safe inspector slot. Input, IME
+Body → Compact → Hidden is determined by the safe navigation slot. Input, IME
 preedit, selection, mouse-reporting/dragging, alternate screens, remote/read-only
 sessions, approval/modal/agent UI, and insufficient geometry suppress painting.
 Changing tabs/panes does not create a host. Follow, Stay, Hide, Recall are labeled

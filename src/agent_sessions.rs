@@ -1893,14 +1893,15 @@ impl super::Frost {
                     }),
             );
         }
-        container(
+        container(column![
             scrollable(list)
                 .id(iced::widget::Id::new("workspace-session-navigation"))
                 .on_scroll(move |viewport| {
                     M::AgentWorkspaceScrolled(visible, viewport.absolute_offset().y)
                 })
                 .height(Length::Fill),
-        )
+            self.eva_navigation_avatar(),
+        ])
         .padding(12)
         .width(Length::Fill)
         .height(Length::Fill)
