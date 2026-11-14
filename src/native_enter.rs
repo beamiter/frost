@@ -16,7 +16,24 @@ pub(crate) fn install() -> SharedOwnership {
     let state = Arc::new(parking_lot::Mutex::new(NativeEnterOwnership::default()));
     let observer = Arc::clone(&state);
     assert!(
-        iced_winit::native_events::install(move |id, event| { observer.lock().observe(id, event) }),
+        iced_winit::native_events::install(move |id, event| {
+            match event {
+                WindowEvent::CloseRequested => {
+                    crate::close_diagnostics::record(true, || "native_close_requested".into())
+                }
+                WindowEvent::MouseInput {
+                    state,
+                    button: iced_winit::winit::event::MouseButton::Left,
+                    ..
+                } => {
+                    crate::close_diagnostics::record(false, || {
+                        format!("native_left_button state={state:?}")
+                    });
+                }
+                _ => {}
+            }
+            observer.lock().observe(id, event)
+        }),
         "native keyboard observer already installed"
     );
     state

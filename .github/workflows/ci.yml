@@ -95,6 +95,8 @@ jobs:
 
       - name: Check shared mouse wire adapter
         run: python3 scripts/test-mouse-reporting.py
+      - name: Check bounded close evidence
+        run: python3 scripts/test-close-diagnostics.py
 
       - name: Check measurement and rendering font stack
         run: python3 scripts/check-font-stack.py

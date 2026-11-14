@@ -17,6 +17,8 @@ import struct
 from pathlib import Path
 import shlex
 import subprocess
+import sys
+import itertools
 import time
 import tempfile
 
@@ -37,6 +39,7 @@ class Smoke:
         self.processes = []
         self.logs = []
         self.env = os.environ.copy()
+        self.env['FROST_CLOSE_DIAGNOSTICS'] = '1'
         for name in ('DISPLAY', 'WAYLAND_DISPLAY', 'SWAYSOCK'):
             self.env.pop(name, None)
         home = out / 'home'
@@ -273,6 +276,46 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
         return matches[0] if len(matches) == 1 else None
 
     def close_app(self, app):
+        # Evidence is written once, after the unchanged single-click/20s path.
+        events = []
+        def trace(stage, **fields):
+            if len(events) < 32:
+                events.append(dict(stage=stage, monotonic_ns=time.monotonic_ns(), **fields))
+        trace('attempt_started')
+        failure = None
+        try:
+            return self._close_app(app, trace)
+        except BaseException as error:
+            failure = type(error).__name__
+            trace('failed', exception=failure)
+            raise
+        finally:
+            attempt = getattr(self, '_close_attempts', 0) + 1
+            self._close_attempts = attempt
+            if attempt <= 16:
+                evidence = dict(events=events, failure=failure,
+                                application_events='See [frost-close] in the application log')
+                if failure and app.poll() is None:
+                    # Owned, unreaped child only; no terminal text, stacks or argv.
+                    try:
+                        tasks = list(itertools.islice(Path(f'/proc/{app.pid}/task').iterdir(), 65))
+                        evidence['thread_waits_truncated'] = len(tasks) > 64
+                        waits = []
+                        for task in tasks[:64]:
+                            try:
+                                waits.append(dict(tid=int(task.name), wchan=(task / 'wchan').read_text()[:128]))
+                            except OSError:
+                                pass
+                        evidence['thread_waits'] = waits
+                    except OSError as error:
+                        evidence['thread_waits_error'] = type(error).__name__
+                try:
+                    (self.out / f'close-attempt-{attempt}.json').write_text(json.dumps(evidence, indent=2))
+                except OSError as error:
+                    # Preserve the original close failure, including TimeoutExpired.
+                    print(f'close evidence write failed: {type(error).__name__}', file=sys.stderr)
+
+    def _close_app(self, app, trace):
         requested = time.monotonic()
         approved = requested
         # Previous cases may leave the cursor over this same dialog button.
@@ -286,10 +329,12 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
                 proc.stdin.write(b'move 1279 450 1280 900\n')
                 proc.stdin.flush()
                 self.pointer_reply(proc, 'done')
+                trace('compositor_ack', application_delivery_proven=False)
         if self.backend == 'x11':
             self.key('F4', ('alt',))
         else:
             self.run(['swaymsg', '[app_id="io.github.beamiter.frost"]', 'kill'])
+        trace('close_requested')
         def closed_or_dialog():
             if app.poll() is not None:
                 return 'closed'
@@ -299,8 +344,10 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
         result = wait_for(closed_or_dialog, 'application exit or disconnected Eva close dialog')
         if result != 'closed':
             name, (x, y) = result
+            trace('dialog_observed', button_center=[x, y])
             approved = time.monotonic()
             if self.backend == 'x11':
+                trace('click_sent')
                 self.run(['xdotool', 'mousemove', '--sync', str(x), str(y), 'click', '1'])
             else:
                 pointer = self.env.get('FROST_SMOKE_POINTER')
@@ -310,21 +357,28 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
                 # protocol device alive until the whole fixture is cleaned up.
                 proc = getattr(self, '_close_pointer', None)
                 if proc is None:
+                    trace('pointer_creation_started')
                     log = open(self.out / 'close-pointer.log', 'w')
                     self.logs.append(log)
                     proc = subprocess.Popen([pointer], env=self.env, stdin=subprocess.PIPE,
                                             stdout=subprocess.PIPE, stderr=log, bufsize=0)
                     self.processes.append(proc)
                     self._close_pointer = proc
+                    trace('pointer_created', pid=proc.pid)
                     self.pointer_reply(proc, 'ready')
+                    trace('pointer_ready')
                 assert proc.poll() is None, 'Close pointer disappeared'
+                trace('click_sent')
                 proc.stdin.write(f'click {x} {y} 1280 900\n'.encode())
                 proc.stdin.flush()
                 self.pointer_reply(proc, 'done')
+                trace('compositor_ack', application_delivery_proven=False)
             (self.out / (name + '.json')).write_text(json.dumps({
                 'visible_warning': 'Eva disconnected', 'action': 'Close anyway',
                 'button_center': [x, y]}, indent=2))
+        trace('exit_wait', timeout_seconds=20)
         app.wait(timeout=20)
+        trace('process_exited', returncode=app.returncode)
         assert app.returncode == 0, app.returncode
         return {'requested': requested, 'approved': approved, 'exited': time.monotonic()}
 

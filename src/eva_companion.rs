@@ -737,6 +737,12 @@ impl Eva {
                 }
             }
             Event::ForceClose(revision) => {
+                crate::close_diagnostics::record(false, || {
+                    format!(
+                    "force_close callback_revision={} current_revision={} closing={} paused={} accepted={}",
+                    revision, self.close_ui_revision, self.closing, self.close_paused_for_work,
+                    self.closing && !self.close_paused_for_work && revision == self.close_ui_revision)
+                });
                 if self.closing && !self.close_paused_for_work && revision == self.close_ui_revision
                 {
                     self.force_close = true;
@@ -981,6 +987,12 @@ impl Eva {
         }
     }
     pub fn request_guarded_close(&mut self) {
+        crate::close_diagnostics::record(false, || {
+            format!(
+                "request_guarded_close current_revision={} closing={} paused={}",
+                self.close_ui_revision, self.closing, self.close_paused_for_work
+            )
+        });
         if self.close_paused_for_work {
             self.close_ui_revision = self.close_ui_revision.saturating_add(1);
         }
@@ -992,6 +1004,12 @@ impl Eva {
         self.closing && self.close_guarded && !self.close_paused_for_work
     }
     pub fn pause_close_for_work(&mut self) {
+        crate::close_diagnostics::record(false, || {
+            format!(
+                "pause_close_for_work current_revision={} closing={} paused={}",
+                self.close_ui_revision, self.closing, self.close_paused_for_work
+            )
+        });
         if self.closing && self.close_guarded && !self.close_paused_for_work {
             // Keep the exact in-flight withdrawal/proof. Ending the new work
             // must not itself authorize a GUI exit.
@@ -1006,6 +1024,12 @@ impl Eva {
         self.close_paused_for_work = false;
     }
     pub fn keep_window_open(&mut self) {
+        crate::close_diagnostics::record(false, || {
+            format!(
+                "keep_window_open current_revision={} closing={} paused={}",
+                self.close_ui_revision, self.closing, self.close_paused_for_work
+            )
+        });
         self.close_ui_revision = self.close_ui_revision.saturating_add(1);
         self.closing = false;
         self.close_guarded = false;

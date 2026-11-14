@@ -36,3 +36,31 @@ The actual installed Frost application is exercised with small, delayed, stalled
 A second UI fixture pastes into the actual Find text input, which delegates to iced TextInput's synchronous core clipboard API. It checks visible text and copies the selection for an independent external read after an idle interval. It also selects a real terminal word, checks PRIMARY and CLIPBOARD through independent clients, middle-pastes a synthetic PRIMARY command, and closes after a bounded stalled legacy read. This synchronous compatibility path is not claimed nonblocking. Idle-service acceptance uses the 250 ms worker interval plus an explicit 500 ms hosted scheduling allowance (750 ms total); actual measured times are recorded. Idle-service latency includes scheduling tolerance and does not establish zero wakeups or an idle CPU budget.
 
 These fixtures do not establish eight simultaneous provider admissions, allocator bounds, every exact-cap/invalid-UTF8 variant, or all OSC permission/session-generation transitions. Those remain explicit provider/application acceptance cases. All native claims require hosted results; syntax checks alone are not acceptance.
+
+## Bounded close failure evidence
+
+Native fixtures enable `FROST_CLOSE_DIAGNOSTICS=1` for their isolated application.
+Normal launches leave tracing off. After the first close request, application
+stderr contains at most 128 `[frost-close]` records per process (the final slot
+reports budget exhaustion). Records contain fixed stage names, monotonic time,
+native left-button state, close callback/current revisions and gate flags, and
+flush/exit progress. They contain no terminal text or keyboard contents.
+
+The fixture writes `close-attempt-N.json` after each close attempt, capped at
+16 files and 32 timeline entries per attempt. Failure evidence includes up to
+64 Linux thread wait channels from the still-owned child. Evidence collection
+is best effort and never replaces the original failure. Pointer creation, OCR,
+compositor acknowledgement and process exit are separate stages. A pointer
+`done` acknowledgement is **not** evidence that the application received either
+button event; correlate it with the application's native-button records.
+Linux `monotonic_ns` values share a clock across these processes. A failed clock
+read is explicitly marked; sequence numbers identify record order, although
+concurrent writers can reach stderr out of order.
+
+The click count and `app.wait(timeout=20)` remain unchanged. These diagnostics
+improve the next failure's evidence; they do not resolve the unlocated Wayland
+32-session close timeout at `f49f6cd186ea2fac6ec30754fe44d3075335acd2`
+([original Native Desktop run](https://github.com/beamiter/frost/actions/runs/43566866000)).
+Headless compositor tests exercise software-generated native events, not a
+physical mouse or hardware GPU. `scripts/test-close-diagnostics.py` uses fake
+processes only to check evidence and timeout propagation.
