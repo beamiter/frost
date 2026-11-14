@@ -271,7 +271,7 @@
     },
     {
       "path": "scripts/native-desktop-smoke.py",
-      "sha256": "62afb1390a9db137d609d546c99ab50f62a597947985829dc56c925a31daf7e4"
+      "sha256": "d7749235e2287a59e78ab596c11c2b38b60c9db2c2f9a229f0c884887725ea3a"
     },
     {
       "path": "scripts/native-clipboard-owner.c",
