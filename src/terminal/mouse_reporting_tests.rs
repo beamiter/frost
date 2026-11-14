@@ -50,7 +50,7 @@ fn shared_mouse_extreme_coordinates_and_buttons_never_wrap() {
         terminal
             .get_mouse_report(255, usize::MAX, usize::MAX)
             .unwrap(),
-        b"\x1b[M\xff\xdf\xbf\xdf\xbf"
+        b"\x1b[M\xc4\x9f\xdf\xbf\xdf\xbf"
     );
     terminal.modes.insert(1015);
     assert_eq!(
@@ -86,4 +86,28 @@ fn unrelated_host_modes_cannot_enable_mouse_reports() {
     assert!(terminal.get_mouse_release_report(0, 0, 0).is_none());
     assert!(terminal.modes.contains(&4));
     assert!(terminal.modes.contains(&6));
+}
+
+#[test]
+fn shared_mouse_utf8_button_boundaries_are_valid_through_host_adapter() {
+    let mut terminal = TerminalState::new(20, 5);
+    terminal.modes.insert(1000);
+    terminal.modes.insert(1005);
+    for (button, wire) in [
+        (95, &b"\x1b[M\x7f!!"[..]),
+        (96, &b"\x1b[M\xc2\x80!!"[..]),
+        (127, &b"\x1b[M\xc2\x9f!!"[..]),
+        (128, &b"\x1b[M\xc2\xa0!!"[..]),
+        (223, &b"\x1b[M\xc3\xbf!!"[..]),
+        (224, &b"\x1b[M\xc4\x80!!"[..]),
+        (255, &b"\x1b[M\xc4\x9f!!"[..]),
+    ] {
+        let report = terminal.get_mouse_report(button, 0, 0).unwrap();
+        assert_eq!(report, wire, "button={button}");
+        assert!(std::str::from_utf8(&report).is_ok());
+        assert_eq!(
+            terminal.get_mouse_release_report(button, 0, 0).unwrap(),
+            b"\x1b[M#!!"
+        );
+    }
 }

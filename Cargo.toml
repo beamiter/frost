@@ -14,7 +14,7 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 # Shared engine and services use the same published immutable source.
-jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "1ebfe4573d43c1b6de0332476cfea75f42899a96" }
+jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "af1625b4272a226783f513da3f6a0a8e41a66bd4" }
 companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 iced = { version = "0.14", features = ["canvas", "tokio", "advanced", "image", "wgpu"] }
 # Direct handle on the shaper iced embeds (same locked version), used to
@@ -25,7 +25,7 @@ cosmic-text = "=0.19.0"
 iced_winit = { version = "=0.14.0", default-features = false }
 libc = "0.2"
 # Shared core is acquired from the published revision, not a sibling checkout.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "1ebfe4573d43c1b6de0332476cfea75f42899a96" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "af1625b4272a226783f513da3f6a0a8e41a66bd4" }
 tokio = { version = "1", features = ["rt", "sync"] }
 anyhow = "1.0"
 log = "0.4"
@@ -88,7 +88,7 @@ wayland-client = { path = "vendor/wayland-client" }
 zstd = "=0.14.3"
 sha2 = "=0.10.9"
 iced_tiny_skia = { version = "=0.14.1", features = ["geometry"] }
-jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "1ebfe4573d43c1b6de0332476cfea75f42899a96" }
+jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "af1625b4272a226783f513da3f6a0a8e41a66bd4" }
 
 [patch."https://github.com/beamiter/jcompanion.git"]
 companion-protocol = { path = "vendor/companion-protocol" }

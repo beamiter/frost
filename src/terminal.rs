@@ -20328,6 +20328,14 @@ mod tests {
                 terminal.get_mouse_report(0, 299, 10).unwrap(),
                 b"\x1b[M \xc5\x8c+"
             );
+            assert_eq!(
+                terminal.get_mouse_report(96, 0, 0).unwrap(),
+                b"\x1b[M\xc2\x80!!"
+            );
+            assert_eq!(
+                terminal.get_mouse_report(255, 0, 0).unwrap(),
+                b"\x1b[M\xc4\x9f!!"
+            );
             terminal.process_input(b"\x1b[?1002l");
             assert!(terminal.get_mouse_report(0, 0, 0).is_none());
             terminal.process_input(b"\x1bc");
