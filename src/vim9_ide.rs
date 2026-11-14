@@ -4,6 +4,7 @@
 //! shell tabs, or persists editor argv. Managed shell entry embeds the same
 //! editor in its source pane. Bridge disconnection is not a child exit.
 
+use super::mouse_report_code;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -805,10 +806,6 @@ fn native_shortcut(
         },
         _ => None,
     }
-}
-
-fn mouse_report_code(base: u8, shift: bool, alt: bool, ctrl: bool) -> u8 {
-    base | if shift { 4 } else { 0 } | if alt { 8 } else { 0 } | if ctrl { 16 } else { 0 }
 }
 
 fn moved_selection(current: usize, delta: isize, count: usize) -> usize {

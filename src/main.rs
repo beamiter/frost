@@ -6830,6 +6830,7 @@ impl TerminalMouseGesture {
 fn cancelled_terminal_mouse_report(
     gesture: TerminalMouseGesture,
     terminal: &terminal::TerminalState,
+    modifiers: keyboard::Modifiers,
 ) -> Option<Vec<u8>> {
     let (col, row) =
         gesture.app_release_cell(None, terminal.grid.row_len(), terminal.grid.rows())?;
@@ -6838,7 +6839,16 @@ fn cancelled_terminal_mouse_report(
         MouseButton::Middle => 1,
         MouseButton::Right => 2,
     };
-    terminal.get_mouse_release_report(code, col, row)
+    terminal.get_mouse_release_report(
+        mouse_report_code(
+            code,
+            modifiers.shift(),
+            modifiers.alt(),
+            modifiers.control(),
+        ),
+        col,
+        row,
+    )
 }
 
 /// App ownership must retire before a mode change can replace the widget tree.
@@ -14329,7 +14339,9 @@ impl Frost {
     fn finish_cancelled_terminal_mouse_gesture(&mut self, gesture: TerminalMouseGesture) {
         if let Some(index) = self.session_index_by_id(gesture.session_id) {
             let session = &mut self.sessions[index];
-            if let Some(report) = cancelled_terminal_mouse_report(gesture, &session.terminal) {
+            if let Some(report) =
+                cancelled_terminal_mouse_report(gesture, &session.terminal, self.modifiers)
+            {
                 session.write_pty(&report);
             }
         }
@@ -14637,6 +14649,8 @@ impl Frost {
                 row,
                 button,
                 alt,
+                shift,
+                ctrl,
                 count,
                 ..
             } => {
@@ -14644,10 +14658,11 @@ impl Frost {
                     if let Some((grid_col, grid_row)) =
                         projected_live_grid_cell(&sess.terminal, &sess.projection, row, col)
                     {
-                        if let Some(report) =
-                            sess.terminal
-                                .get_mouse_report(btn_code(button), grid_col, grid_row)
-                        {
+                        if let Some(report) = sess.terminal.get_mouse_report(
+                            mouse_report_code(btn_code(button), shift, alt, ctrl),
+                            grid_col,
+                            grid_row,
+                        ) {
                             if sess.write_pty(&report) {
                                 record_terminal_app_mouse_cell(
                                     &mut self.terminal_mouse_gestures,
@@ -14695,9 +14710,16 @@ impl Frost {
                         if let Some((grid_col, grid_row)) =
                             gesture.and_then(|gesture| gesture.app_drag_cell(current))
                         {
-                            if let Some(report) =
-                                sess.terminal.get_mouse_report(32, grid_col, grid_row)
-                            {
+                            if let Some(report) = sess.terminal.get_mouse_report(
+                                mouse_report_code(
+                                    32,
+                                    self.modifiers.shift(),
+                                    self.modifiers.alt(),
+                                    self.modifiers.control(),
+                                ),
+                                grid_col,
+                                grid_row,
+                            ) {
                                 if sess.write_pty(&report) {
                                     record_terminal_app_mouse_cell(
                                         &mut self.terminal_mouse_gestures,
@@ -14737,7 +14759,12 @@ impl Frost {
                         )
                     }) {
                         if let Some(report) = sess.terminal.get_mouse_release_report(
-                            btn_code(button),
+                            mouse_report_code(
+                                btn_code(button),
+                                self.modifiers.shift(),
+                                self.modifiers.alt(),
+                                self.modifiers.control(),
+                            ),
                             grid_col,
                             grid_row,
                         ) {
@@ -35309,6 +35336,10 @@ fn read_rss_mb() -> Option<f64> {
     None
 }
 
+fn mouse_report_code(base: u8, shift: bool, alt: bool, ctrl: bool) -> u8 {
+    base | if shift { 4 } else { 0 } | if alt { 8 } else { 0 } | if ctrl { 16 } else { 0 }
+}
+
 /// xterm button code for press/motion reports.
 fn btn_code(button: MouseButton) -> u8 {
     match button {
@@ -40823,6 +40854,55 @@ mod tests {
             assert_eq!(gesture.button, button);
         }
         assert!(gestures.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn terminal_app_mouse_modifiers_preserve_shift_selection_ownership() {
+        let mut terminal = terminal::TerminalState::new(20, 5);
+        terminal.process_input(b"\x1b[?1002h");
+        for (modifiers, code, wire) in [
+            (keyboard::Modifiers::ALT, 10, &b"\x1b[M+!!"[..]),
+            (keyboard::Modifiers::CTRL, 18, &b"\x1b[M3!!"[..]),
+            (
+                keyboard::Modifiers::SHIFT | keyboard::Modifiers::ALT | keyboard::Modifiers::CTRL,
+                30,
+                &b"\x1b[M?!!"[..],
+            ),
+        ] {
+            assert_eq!(
+                mouse_report_code(2, modifiers.shift(), modifiers.alt(), modifiers.control()),
+                code
+            );
+            let gesture = TerminalMouseGesture {
+                session_id: 1,
+                button: MouseButton::Right,
+                report_to_app: true,
+                last_app_cell: Some((0, 0)),
+                consumed: false,
+            };
+            assert_eq!(
+                cancelled_terminal_mouse_report(gesture, &terminal, modifiers).as_deref(),
+                Some(wire)
+            );
+            let local = TerminalMouseGesture {
+                report_to_app: app_owns_terminal_mouse(true, true, true, false),
+                ..gesture
+            };
+            assert!(
+                !local.report_to_app,
+                "Shift at press keeps local selection ownership"
+            );
+            assert!(cancelled_terminal_mouse_report(local, &terminal, modifiers).is_none());
+            assert!(cancelled_terminal_mouse_report(
+                TerminalMouseGesture {
+                    consumed: true,
+                    ..gesture
+                },
+                &terminal,
+                modifiers
+            )
+            .is_none());
+        }
     }
 
     #[test]

@@ -20344,6 +20344,37 @@ mod tests {
     }
 
     #[test]
+    fn shared_mouse_release_modifiers_follow_fragmented_host_modes() {
+        let sequences: &[(&[u8], &[u8])] = &[
+            (b"\x1b[?1002h", b"\x1b[M?!!"),
+            (b"\x1b[?1005h", b"\x1b[M?!!"),
+            (b"\x1b[?1015h", b"\x1b[63;1;1M"),
+            (b"\x1b[?1006h", b"\x1b[<30;1;1m"),
+            (b"\x1b[?1006l", b"\x1b[63;1;1M"),
+            (b"\x1b[?1015l", b"\x1b[M?!!"),
+            (b"\x1b[?1005l", b"\x1b[M?!!"),
+        ];
+        for split in 0..=8 {
+            let mut terminal = TerminalState::new(20, 5);
+            for &(sequence, expected) in sequences {
+                let split = split.min(sequence.len());
+                terminal.process_input(&sequence[..split]);
+                terminal.process_input(&sequence[split..]);
+                assert_eq!(
+                    terminal.get_mouse_release_report(30, 0, 0).unwrap(),
+                    expected
+                );
+            }
+            for byte in b"\x1b[?1002l" {
+                terminal.process_input(&[*byte]);
+            }
+            assert!(terminal.get_mouse_release_report(30, 0, 0).is_none());
+            terminal.process_input(b"\x1bc");
+            assert!(terminal.get_mouse_release_report(30, 0, 0).is_none());
+        }
+    }
+
+    #[test]
     fn sgr_mouse_report_is_not_capped_at_255() {
         let mut terminal = TerminalState::new(400, 50);
         // Enable mouse tracking + SGR encoding.

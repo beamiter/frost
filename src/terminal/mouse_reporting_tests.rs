@@ -93,21 +93,58 @@ fn shared_mouse_utf8_button_boundaries_are_valid_through_host_adapter() {
     let mut terminal = TerminalState::new(20, 5);
     terminal.modes.insert(1000);
     terminal.modes.insert(1005);
-    for (button, wire) in [
-        (95, &b"\x1b[M\x7f!!"[..]),
-        (96, &b"\x1b[M\xc2\x80!!"[..]),
-        (127, &b"\x1b[M\xc2\x9f!!"[..]),
-        (128, &b"\x1b[M\xc2\xa0!!"[..]),
-        (223, &b"\x1b[M\xc3\xbf!!"[..]),
-        (224, &b"\x1b[M\xc4\x80!!"[..]),
-        (255, &b"\x1b[M\xc4\x9f!!"[..]),
+    for (button, wire, release) in [
+        (95, &b"\x1b[M\x7f!!"[..], &b"\x1b[M?!!"[..]),
+        (96, &b"\x1b[M\xc2\x80!!"[..], &b"\x1b[M#!!"[..]),
+        (127, &b"\x1b[M\xc2\x9f!!"[..], &b"\x1b[M?!!"[..]),
+        (128, &b"\x1b[M\xc2\xa0!!"[..], &b"\x1b[M#!!"[..]),
+        (223, &b"\x1b[M\xc3\xbf!!"[..], &b"\x1b[M?!!"[..]),
+        (224, &b"\x1b[M\xc4\x80!!"[..], &b"\x1b[M#!!"[..]),
+        (255, &b"\x1b[M\xc4\x9f!!"[..], &b"\x1b[M?!!"[..]),
     ] {
         let report = terminal.get_mouse_report(button, 0, 0).unwrap();
         assert_eq!(report, wire, "button={button}");
         assert!(std::str::from_utf8(&report).is_ok());
         assert_eq!(
             terminal.get_mouse_release_report(button, 0, 0).unwrap(),
-            b"\x1b[M#!!"
+            release
         );
+    }
+}
+
+#[test]
+fn shared_mouse_release_preserves_each_modifier_and_discards_legacy_button_bits() {
+    // Independent expected Cb bytes: no production encoder computes these values.
+    for (mods, legacy, decimal) in [
+        (0, b'#', 35),
+        (4, b'\'', 39),
+        (8, b'+', 43),
+        (12, b'/', 47),
+        (16, b'3', 51),
+        (20, b'7', 55),
+        (24, b';', 59),
+        (28, b'?', 63),
+    ] {
+        for base in [0, 1, 2, 32, 64, 128, 192] {
+            let mut terminal = TerminalState::new(20, 5);
+            terminal.modes.insert(1002);
+            for mode in [0, 1005, 1015, 1006] {
+                if mode != 0 {
+                    terminal.modes.insert(mode);
+                }
+                let expected = match mode {
+                    1006 => format!("\x1b[<{};1;1m", base | mods).into_bytes(),
+                    1015 => format!("\x1b[{decimal};1;1M").into_bytes(),
+                    _ => vec![27, b'[', b'M', legacy, b'!', b'!'],
+                };
+                assert_eq!(
+                    terminal
+                        .get_mouse_release_report(base | mods, 0, 0)
+                        .unwrap(),
+                    expected,
+                    "mode={mode}, base={base}, mods={mods}"
+                );
+            }
+        }
     }
 }
