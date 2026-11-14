@@ -47,8 +47,11 @@ native left-button state, close callback/current revisions and gate flags, and
 flush/exit progress. They contain no terminal text or keyboard contents.
 
 The fixture writes `close-attempt-N.json` after each close attempt, capped at
-16 files and 32 timeline entries per attempt. Failure evidence includes up to
-64 Linux thread wait channels from the still-owned child. Evidence collection
+16 files and 32 timeline entries per attempt. Each file identifies its application
+PID, backend and attempt number so evidence from successive application launches
+cannot be confused when collected together. The PID is a correlation label, not
+proof of process identity across PID reuse or separate runners. Failure evidence
+includes up to 64 Linux thread wait channels from the still-owned child. Evidence collection
 is best effort and never replaces the original failure. Pointer creation, OCR,
 compositor acknowledgement and process exit are separate stages. A pointer
 `done` acknowledgement is **not** evidence that the application received either

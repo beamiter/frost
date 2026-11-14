@@ -63,6 +63,9 @@ class CloseEvidenceTests(unittest.TestCase):
             evidence = json.loads((fixture.out / 'close-attempt-1.json').read_text())
             stages = [event['stage'] for event in evidence['events']]
             self.assertLessEqual(len(stages), 32)
+            self.assertEqual(evidence['application_pid'], app.pid)
+            self.assertEqual(evidence['backend'], 'wayland')
+            self.assertEqual(evidence['attempt'], 1)
             self.assertEqual(stages[-1], 'failed' if timeout else 'process_exited')
             ack = next(e for e in evidence['events'] if e['stage'] == 'compositor_ack')
             self.assertFalse(ack['application_delivery_proven'])
@@ -76,12 +79,28 @@ class CloseEvidenceTests(unittest.TestCase):
     def test_failed_evidence_write_preserves_original_timeout(self):
         fixture = object.__new__(smoke.Smoke)
         fixture.out = Path('/unused-test-directory')
+        fixture.backend = 'wayland'
         def fail(app, trace):
             raise subprocess.TimeoutExpired('frost', 20)
         fixture._close_app = fail
         with patch.object(Path, 'write_text', side_effect=OSError), patch.object(smoke.sys, 'stderr', io.StringIO()):
             with self.assertRaises(subprocess.TimeoutExpired):
                 fixture.close_app(App(True))
+
+    def test_attempts_keep_their_own_application_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = object.__new__(smoke.Smoke)
+            fixture.out = Path(directory)
+            fixture.backend = 'x11'
+            fixture._close_app = lambda app, trace: trace('process_exited', returncode=0)
+            for attempt, pid in enumerate((12345, 12346), start=1):
+                app = App(False)
+                app.pid = pid
+                fixture.close_app(app)
+                evidence = json.loads((fixture.out / f'close-attempt-{attempt}.json').read_text())
+                self.assertEqual(evidence['application_pid'], pid)
+                self.assertEqual(evidence['backend'], 'x11')
+                self.assertEqual(evidence['attempt'], attempt)
 
     def test_evidence_attempt_limit(self):
         with tempfile.TemporaryDirectory() as directory:

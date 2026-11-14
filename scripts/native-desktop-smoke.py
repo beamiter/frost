@@ -293,7 +293,8 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
             attempt = getattr(self, '_close_attempts', 0) + 1
             self._close_attempts = attempt
             if attempt <= 16:
-                evidence = dict(events=events, failure=failure,
+                evidence = dict(application_pid=app.pid, backend=self.backend,
+                                attempt=attempt, events=events, failure=failure,
                                 application_events='See [frost-close] in the application log')
                 if failure and app.poll() is None:
                     # Owned, unreaped child only; no terminal text, stacks or argv.
