@@ -96,11 +96,6 @@ jobs:
           wayland-scanner private-code scripts/protocols/wlr-virtual-pointer-unstable-v1.xml "$RUNNER_TEMP/frost-pointer/wlr-virtual-pointer-unstable-v1-protocol.c"
           cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/frost-pointer" scripts/native-pointer.c "$RUNNER_TEMP/frost-pointer/wlr-virtual-pointer-unstable-v1-protocol.c" $(pkg-config --libs wayland-client) -o "$RUNNER_TEMP/frost-pointer/native-pointer"
           echo "FROST_SMOKE_POINTER=$RUNNER_TEMP/frost-pointer/native-pointer" >> "$GITHUB_ENV"
-      - name: Diagnose complete Wayland recovery sequence
-        timeout-minutes: 6
-        env:
-          FROST_SMOKE_WAYLAND_DEBUG: '1'
-        run: python3 scripts/native-recovery-report.py --runner scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend wayland --pointer "$FROST_SMOKE_POINTER" --output native-smoke-artifacts/wayland-recovery-report
       - name: Diagnose bounded repetitions of the failing case
         timeout-minutes: 8
         env:

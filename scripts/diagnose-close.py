@@ -7,7 +7,7 @@ r=importlib.util.module_from_spec(spec);spec.loader.exec_module(r)
 spec=importlib.util.spec_from_file_location('smoke',Path(__file__).with_name('native-desktop-smoke.py'))
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 for n in range(8):
-    output=Path(sys.argv[3])/str(n);output.mkdir(parents=True)
+    output=Path(sys.argv[3]).resolve()/str(n);output.mkdir(parents=True)
     args=SimpleNamespace(binary=Path(sys.argv[1]).resolve(),pointer=Path(sys.argv[2]).resolve(),backend='wayland',output=output)
     result={};case=r.Case(m,args,'excess_sessions',result,time.monotonic()+240)
     try:
