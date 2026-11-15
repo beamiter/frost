@@ -515,17 +515,40 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
                     app.wait()
 
     def close(self):
+        # Cleanup must not mask acceptance failures or strand later resources.
+        # SIGKILL can remain pending for a task in uninterruptible kernel sleep;
+        # even the post-kill reap therefore has a finite deadline.
+        acceptance_failed = sys.exc_info()[0] is not None
+        failures = []
+        def record(resource, error):
+            if len(failures) < 16:
+                failures.append(f'{resource}: {type(error).__name__}')
         for proc in reversed(self.processes):
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
+            except Exception as error:
+                record('process', error)
         for log in self.logs:
-            log.close()
-        self._runtime.cleanup()
+            try:
+                log.close()
+            except Exception as error:
+                record('log', error)
+        try:
+            self._runtime.cleanup()
+        except Exception as error:
+            record('runtime', error)
+        if failures:
+            message = 'Native cleanup failed: ' + '; '.join(failures)
+            if acceptance_failed:
+                print(message, file=sys.stderr)
+            else:
+                raise RuntimeError(message)
 
 
 def main():
