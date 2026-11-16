@@ -3563,6 +3563,8 @@ pub struct TerminalState {
     projected_viewport_cache: Option<ProjectedViewportCache>,
     projection_plan_cache: Option<ProjectionPlanCache>,
     projection_failure: Option<ProjectionUnavailable>,
+    history_projection_budget_cache:
+        std::cell::RefCell<Option<projection_budget::HistoryAdmissionCache>>,
     raw_projection_budget_cache: Option<projection_budget::RawAdmissionCache>,
     projection_material_failure: Option<(ProjectedViewportCacheKey, ProjectionUnavailable)>,
     projection_budget_cache: Option<projection_budget::AdmissionCache>,
@@ -3908,6 +3910,7 @@ impl TerminalState {
             projected_viewport_cache: None,
             projection_plan_cache: None,
             projection_failure: None,
+            history_projection_budget_cache: std::cell::RefCell::new(None),
             raw_projection_budget_cache: None,
             projection_material_failure: None,
             projection_budget_cache: None,

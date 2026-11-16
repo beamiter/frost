@@ -20,12 +20,20 @@ pub enum ProjectionUnavailable {
     ArithmeticOverflow,
 }
 
-pub(super) type RawAdmissionCache = ((u64, u64, u64, usize, usize, usize), Result<()>);
-pub(super) type AdmissionCache = (super::ProjectionPlanCacheKey, u64, usize, bool, Result<()>);
+pub(super) type HistoryAdmissionCache = ((u64, usize, usize, Limits), Result<Estimate>);
+pub(super) type RawAdmissionCache = ((u64, u64, u64, usize, usize, usize, Limits), Result<()>);
+pub(super) type AdmissionCache = (
+    super::ProjectionPlanCacheKey,
+    u64,
+    usize,
+    bool,
+    Limits,
+    Result<()>,
+);
 
 type Result<T> = std::result::Result<T, ProjectionUnavailable>;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Limits {
     pub source_rows: usize,
     pub wide: usize,
@@ -63,7 +71,7 @@ pub(super) fn check(value: usize, limit: usize, resource: ProjectionResource) ->
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(super) struct Estimate {
     pub source_rows: usize,
     pub wide: usize,
@@ -321,13 +329,32 @@ impl super::TerminalState {
 }
 
 impl super::TerminalState {
+    /// Repainting the live grid does not change retained-history geometry.
+    /// Cache only that immutable subtotal; live cells and policy additions
+    /// still pass the complete admission checks on every source revision.
+    /// Every retained-history mutation must advance history_revision; length
+    /// alone cannot identify same-sized replacements or prefix eviction.
+    fn cached_history_estimate(&self, cols: usize, limits: Limits) -> Result<Estimate> {
+        let key = (self.history_revision, self.scrollback.len(), cols, limits);
+        if let Some((old, estimate)) = *self.history_projection_budget_cache.borrow() {
+            if old == key {
+                return estimate;
+            }
+        }
+        #[cfg(test)]
+        HISTORY_PREFLIGHT_SCANS.with(|count| count.set(count.get() + 1));
+        let result = history(self.scrollback.iter(), cols, limits, false);
+        *self.history_projection_budget_cache.borrow_mut() = Some((key, result));
+        result
+    }
+
     pub(super) fn plan_preflight(
         &self,
         cols: usize,
         policy: &super::ProjectionPolicy,
     ) -> Result<()> {
         let limits = Limits::current();
-        let estimate = history(self.scrollback.iter(), cols, limits, false)?;
+        let estimate = self.cached_history_estimate(cols, limits)?;
         check(
             add(estimate.source_rows, self.grid.rows())?,
             limits.source_rows,
@@ -428,11 +455,12 @@ impl super::TerminalState {
         policy: &super::ProjectionPolicy,
     ) -> Result<()> {
         let key = self.projection_plan_cache_key(self.grid.cols().max(1), policy);
-        if let Some((old, grid, offset, mode, result)) = &self.projection_budget_cache {
+        if let Some((old, grid, offset, mode, limits, result)) = &self.projection_budget_cache {
             if old == &key
                 && *grid == self.grid_version
                 && *offset == self.scroll_offset
                 && *mode == block_mode
+                && *limits == Limits::current()
             {
                 return *result;
             }
@@ -453,6 +481,7 @@ impl super::TerminalState {
             self.grid_version,
             self.scroll_offset,
             block_mode,
+            Limits::current(),
             result,
         ));
         result
@@ -606,12 +635,134 @@ impl super::TerminalState {
 }
 
 #[cfg(test)]
+thread_local! { static HISTORY_PREFLIGHT_SCANS: std::cell::Cell<usize> = const {std::cell::Cell::new(0)}; }
+#[cfg(test)]
 thread_local! { static PREFLIGHT_SCANS: std::cell::Cell<usize> = const {std::cell::Cell::new(0)}; }
 
 #[cfg(test)]
 mod cache_tests {
     use super::*;
     use crate::terminal::{ProjectionPolicy, TerminalState};
+    #[test]
+    fn history_subtotal_is_reused_but_live_grid_and_limits_are_rechecked() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.process_input(b"abcdefgh\r\nijklmnop\r\nqrstuvwx\r\n");
+        let policy = ProjectionPolicy {
+            retain_identity_canvas: true,
+            ..ProjectionPolicy::new()
+        };
+        let start = HISTORY_PREFLIGHT_SCANS.with(std::cell::Cell::get);
+        assert!(terminal.cached_projection_preflight(true, &policy).is_ok());
+        for _ in 0..16 {
+            terminal.process_batch(b"\x1b[?2026h\x1b[Hx\x1b[?2026l");
+            assert!(terminal.cached_projection_preflight(true, &policy).is_ok());
+        }
+        assert_eq!(
+            HISTORY_PREFLIGHT_SCANS.with(std::cell::Cell::get),
+            start + 1
+        );
+        // The same source cannot reuse an admission after budgets tighten.
+        TerminalState::with_projection_row_budget(1, || {
+            assert!(terminal.cached_projection_preflight(true, &policy).is_err());
+        });
+        assert!(terminal.cached_projection_preflight(true, &policy).is_ok());
+        assert_eq!(
+            HISTORY_PREFLIGHT_SCANS.with(std::cell::Cell::get),
+            start + 3
+        );
+
+        struct Restore(Limits);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_LIMITS.with(|slot| slot.set(self.0));
+            }
+        }
+        let _restore = Restore(TEST_LIMITS.with(|slot| {
+            let old = slot.get();
+            slot.set(Limits { wide: 0, ..old });
+            old
+        }));
+        assert!(terminal.cached_projection_preflight(true, &policy).is_ok());
+        let scans = HISTORY_PREFLIGHT_SCANS.with(std::cell::Cell::get);
+        terminal.process_batch("\x1b[H界".as_bytes());
+        assert!(matches!(
+            terminal.cached_projection_preflight(true, &policy),
+            Err(ProjectionUnavailable::BudgetExceeded {
+                resource: ProjectionResource::WideContinuations,
+                ..
+            })
+        ));
+        assert_eq!(HISTORY_PREFLIGHT_SCANS.with(std::cell::Cell::get), scans);
+    }
+
+    #[test]
+    fn cached_history_never_authorizes_raw_decode_or_zero_width() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.process_input(b"abcdefgh\r\nijklmnop\r\nqrstuvwx\r\n");
+        terminal.set_scroll_offset(1);
+        let old = TEST_LIMITS.with(std::cell::Cell::get);
+        struct Restore(Limits);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_LIMITS.with(|slot| slot.set(self.0));
+            }
+        }
+        let _restore = Restore(old);
+        assert!(terminal.cached_history_estimate(8, old).is_ok());
+        assert!(terminal.cached_raw_preflight(2, 8).is_ok());
+        let strict = Limits {
+            decoded_cells: 0,
+            ..old
+        };
+        TEST_LIMITS.with(|slot| slot.set(strict));
+        // Plan metadata admission does not decode raw source cells. A warm
+        // subtotal must never grant raw materialization's separate budget.
+        assert!(terminal.cached_history_estimate(8, strict).is_ok());
+        assert!(matches!(
+            terminal.cached_raw_preflight(2, 8),
+            Err(ProjectionUnavailable::BudgetExceeded {
+                resource: ProjectionResource::DecodedCells,
+                ..
+            })
+        ));
+        assert_eq!(
+            terminal.cached_history_estimate(0, strict),
+            Err(ProjectionUnavailable::ArithmeticOverflow)
+        );
+        assert!(terminal.cached_history_estimate(8, strict).is_ok());
+    }
+
+    #[test]
+    fn history_subtotal_tracks_append_trim_width_and_same_length_replacement() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.process_input(b"abcdefgh\r\nijklmnop\r\nqrstuvwx\r\n");
+        let limits = Limits::default();
+        let first = terminal.cached_history_estimate(8, limits).unwrap();
+        assert!(first.source_rows > 0);
+        terminal.process_batch(b"\x1b[2;1Hnext\r\n");
+        let appended = terminal.cached_history_estimate(8, limits).unwrap();
+        assert!(appended.source_rows > first.source_rows);
+        let narrower = terminal.cached_history_estimate(1, limits).unwrap();
+        assert!(narrower.rows > appended.rows);
+        terminal.set_max_scrollback(1);
+        let trimmed = terminal.cached_history_estimate(8, limits).unwrap();
+        assert_eq!(trimmed.source_rows, 1);
+        // Same-length history changes are revision-owned, not length-owned.
+        terminal.scrollback[0] = ScrollbackLine::compress(&[], false);
+        terminal.bump_history_revision();
+        let replaced = terminal.cached_history_estimate(8, limits).unwrap();
+        assert_ne!(replaced, trimmed);
+        let strict = Limits {
+            source_rows: 0,
+            ..limits
+        };
+        assert!(terminal.cached_history_estimate(8, strict).is_err());
+        assert_eq!(
+            terminal.cached_history_estimate(8, limits).unwrap(),
+            replaced
+        );
+    }
+
     #[test]
     fn unchanged_success_and_failure_are_cached_and_source_changes_recheck() {
         TerminalState::with_projection_row_budget(12, || {
@@ -952,6 +1103,7 @@ impl super::TerminalState {
             rows,
             cols,
             self.scroll_offset,
+            Limits::current(),
         );
         if let Some((old, result)) = &self.raw_projection_budget_cache {
             if *old == key {
