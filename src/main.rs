@@ -6021,7 +6021,9 @@ impl Session {
     }
 
     fn refresh(&mut self) {
-        if !self.block_selection.is_empty() || self.terminal.has_text_selection() {
+        self.transcript_canvas
+            .set_text_selection_active(self.terminal.has_text_selection());
+        if !self.block_selection.is_empty() {
             self.transcript_canvas.cancel();
         }
         if self.transcript_canvas.following() && self.block_selection.is_empty() {
@@ -6151,6 +6153,15 @@ impl Session {
             self.cursor = raw_cursor;
             self.cursor_visible = self.terminal.is_cursor_visible();
         }
+    }
+
+    fn scroll_transcript(&mut self, rows: f64, precise: bool, now: std::time::Instant) -> bool {
+        // Mouse selection mutates the terminal without requiring a projection
+        // refresh. Observe its edge before scheduling a new user destination,
+        // not on the first animation frame after that destination was set.
+        self.transcript_canvas
+            .set_text_selection_active(self.terminal.has_text_selection());
+        self.transcript_canvas.scroll(rows, precise, now)
     }
 
     fn scroll(&mut self, lines: isize) {
@@ -14903,10 +14914,7 @@ impl Frost {
             } else {
                 -page
             };
-            if sess
-                .transcript_canvas
-                .scroll(delta as f64, false, std::time::Instant::now())
-            {
+            if sess.scroll_transcript(delta as f64, false, std::time::Instant::now()) {
                 sess.refresh();
             }
             return true;
@@ -20213,11 +20221,8 @@ impl Frost {
                 let reduced = self.organism_motion_control.system_reduced();
                 let session = &mut self.sessions[index];
                 let snapped = session.transcript_canvas.set_reduced_motion(reduced);
-                let moved_row = session.transcript_canvas.scroll(
-                    rows * speed,
-                    precise,
-                    std::time::Instant::now(),
-                );
+                let moved_row =
+                    session.scroll_transcript(rows * speed, precise, std::time::Instant::now());
                 if moved_row || snapped {
                     session.refresh();
                 } else if !session.transcript_canvas.following() {
@@ -36597,6 +36602,102 @@ mod tests {
             drop(session);
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inline_agent_selected_history_keeps_page_navigation_through_refresh() {
+        let mut config = super::Config {
+            shell: Some("/bin/sh".into()),
+            ..Default::default()
+        };
+        config.vim9.auto_gui = false;
+        let mut session = super::Session::spawn(&config, 0, 40, 10, Some("/tmp")).unwrap();
+        session.projection_block_mode = false;
+        // Controlled protocol input; no Codex process or user session is read.
+        session.terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07codex\r\n\x1b]133;C;cmdline_url=codex\x07",
+        );
+        for row in 0..100 {
+            session
+                .terminal
+                .process_input(format!("CLI{row:04}\r\n").as_bytes());
+        }
+        session.refresh();
+        session.set_scroll_offset(20);
+        session.terminal.start_selection_in_projection(
+            &session.projection,
+            (1, 0),
+            super::terminal::SelectionMode::Normal,
+        );
+        session
+            .terminal
+            .update_selection_in_projection(&session.projection, (1, 6));
+        // No refresh between selection and navigation: this is the mouse
+        // reducer's real ordering, not a pre-observed selection edge.
+        let selected = session.terminal.copy_selection();
+        assert!(selected.is_some());
+        let before = session.transcript_canvas.position_rows();
+        let page = session.terminal.grid.rows().saturating_sub(2).max(1) as f64;
+        let start = std::time::Instant::now();
+        session.scroll_transcript(page, false, start);
+        for frame in 1..=120 {
+            session
+                .transcript_canvas
+                .advance(start + std::time::Duration::from_millis(frame * 16));
+            session.refresh();
+        }
+        assert!((session.transcript_canvas.position_rows() - before - page).abs() < 0.001);
+        assert_eq!(session.terminal.copy_selection(), selected);
+        assert!(!session.transcript_canvas.following());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inline_agent_history_drag_survives_synchronized_live_repaints() {
+        let mut config = super::Config {
+            shell: Some("/bin/sh".into()),
+            ..Default::default()
+        };
+        config.vim9.auto_gui = false;
+        let mut session = super::Session::spawn(&config, 0, 40, 10, Some("/tmp")).unwrap();
+        session.projection_block_mode = false;
+        session.terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07codex\r\n\x1b]133;C;cmdline_url=codex\x07",
+        );
+        for row in 0..100 {
+            session
+                .terminal
+                .process_input(format!("CLI{row:04}\r\n").as_bytes());
+        }
+        session.refresh();
+        session.set_scroll_offset(40);
+        session.terminal.start_selection_in_projection(
+            &session.projection,
+            (4, 0),
+            super::terminal::SelectionMode::Normal,
+        );
+        session.refresh();
+        let mut max_update = std::time::Duration::ZERO;
+        for frame in 0..64 {
+            // Repaint the live frame while a reader drags retained history.
+            session.terminal.process_batch(
+                format!("\x1b[?2026h\x1b[Hlive frame {frame:04}\x1b[?2026l").as_bytes(),
+            );
+            session.refresh();
+            let row = if frame % 2 == 0 { 2 } else { 6 };
+            let start = std::time::Instant::now();
+            session
+                .terminal
+                .update_selection_in_projection(&session.projection, (row, 6));
+            assert!(session
+                .terminal
+                .row_selection_cols_in_projection(&session.projection, row)
+                .is_some());
+            assert!(session.terminal.copy_selection().is_some());
+            max_update = max_update.max(start.elapsed());
+        }
+        eprintln!("controlled history drag: 64 synchronized repaints; max selection update {max_update:?}");
     }
 
     #[cfg(target_os = "linux")]

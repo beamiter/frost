@@ -19,6 +19,7 @@ pub struct TranscriptCanvas {
     extent: usize,
     viewport_rows: usize,
     columns: usize,
+    text_selection_active: bool,
     frame: Option<Instant>,
 }
 
@@ -173,6 +174,20 @@ impl TranscriptCanvas {
         before != self.row()
     }
 
+    /// A new selection pauses motion once. Keeping selected text must not
+    /// cancel later wheel/page navigation on every output or animation frame.
+    pub fn set_text_selection_active(&mut self, active: bool) {
+        if active && !self.text_selection_active {
+            self.cancel();
+        }
+        if active {
+            // Reaching the live edge with selected text is still a reading
+            // operation, not permission for later output to move the view.
+            self.following = false;
+        }
+        self.text_selection_active = active;
+    }
+
     pub fn cancel(&mut self) {
         self.motion.cancel();
         self.following = false;
@@ -254,6 +269,64 @@ impl CanvasGeometry {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn selected_text_does_not_truncate_page_or_wheel_navigation() {
+        for delta in [23.0, 3.0, -23.0, -3.0, -40.0] {
+            let mut canvas = TranscriptCanvas::default();
+            canvas.reconcile(40, 100, 25, 80);
+            canvas.applied(40);
+            canvas.set_text_selection_active(true);
+            let start = Instant::now();
+            canvas.scroll(delta, false, start);
+            for frame in 1..=120 {
+                canvas.advance(start + Duration::from_millis(frame * 16));
+                // Session refresh repeats this on output and every whole-row
+                // animation update, while the same selection remains present.
+                canvas.set_text_selection_active(true);
+                canvas.reconcile(canvas.applied_row, 100, 25, 80);
+                canvas.applied(canvas.row());
+            }
+            assert!(!canvas.animating());
+            assert!((canvas.position_rows() - (40.0 + delta)).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn selected_navigation_survives_continuous_output_rebases() {
+        let mut canvas = TranscriptCanvas::default();
+        canvas.reconcile(40, 100, 25, 80);
+        canvas.applied(40);
+        canvas.set_text_selection_active(true);
+        let start = Instant::now();
+        canvas.scroll(23.0, false, start);
+        for frame in 1..=120 {
+            canvas.advance(start + Duration::from_millis(frame * 16));
+            canvas.set_text_selection_active(true);
+            // Output appends above the last materialized reading anchor.
+            canvas.reconcile(canvas.applied_row + 1, 100 + frame as usize, 25, 80);
+            canvas.applied(canvas.row());
+        }
+        assert!(!canvas.animating());
+        assert!((canvas.position_rows() - 183.0).abs() < 0.001);
+        assert!(!canvas.following());
+    }
+
+    #[test]
+    fn new_selection_still_pauses_pending_motion() {
+        let mut canvas = TranscriptCanvas::default();
+        canvas.reconcile(0, 100, 25, 80);
+        canvas.reconcile(0, 105, 25, 80);
+        assert!(canvas.animating());
+        canvas.set_text_selection_active(true);
+        assert!(!canvas.animating());
+        assert!(!canvas.following());
+        canvas.set_text_selection_active(false);
+        canvas.scroll(20.0, false, Instant::now());
+        assert!(canvas.animating());
+        canvas.set_text_selection_active(true);
+        assert!(!canvas.animating());
+    }
 
     #[test]
     fn touchpad_retains_every_fraction_without_a_timer() {
