@@ -313,7 +313,10 @@ fn cli_projected_reader_and_copy_survive_ed3_until_explicit_live_navigation() {
         state.set_offset(live.max_scroll_offset(), &live);
         let reading = terminal.get_projected_viewport_with_state(chat, &policy, &mut state);
         assert!(reading.scroll_offset() > 0);
-        assert_eq!(terminal.scroll_offset, 0, "projected reading owns its offset");
+        assert_eq!(
+            terminal.scroll_offset, 0,
+            "projected reading owns its offset"
+        );
         terminal.start_selection_in_projection(&reading, (0, 0), SelectionMode::Normal);
         terminal.update_selection_in_projection(&reading, (0, 6));
         assert_eq!(terminal.copy_selection().as_deref(), Some("CLI0000"));
@@ -322,8 +325,7 @@ fn cli_projected_reader_and_copy_survive_ed3_until_explicit_live_navigation() {
         assert_eq!(terminal.scrollback.len(), retained);
         assert_eq!(terminal.pending_saved_line_purge, retained);
         terminal.process_batch(b"\x1b[?2026h\x1b[?2026l");
-        let reading_again =
-            terminal.get_projected_viewport_with_state(chat, &policy, &mut state);
+        let reading_again = terminal.get_projected_viewport_with_state(chat, &policy, &mut state);
         assert_eq!(reading_again.scroll_offset(), reading.scroll_offset());
         assert_eq!(terminal.copy_selection().as_deref(), Some("CLI0000"));
         assert_eq!(terminal.scrollback.len(), retained);
