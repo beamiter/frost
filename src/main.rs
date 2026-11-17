@@ -6989,6 +6989,13 @@ enum TerminalPaneOwner {
 }
 
 impl TerminalPaneOwner {
+    fn contains_id(&self, id: usize) -> bool {
+        match self {
+            Self::Leaf(owner) => *owner == Some(id),
+            Self::Split(_, children) => children.iter().any(|child| child.contains_id(id)),
+        }
+    }
+
     fn matches(&self, tree: &PaneTree, session_id: &impl Fn(usize) -> Option<usize>) -> bool {
         match (self, tree) {
             (Self::Leaf(saved), PaneTree::Leaf(index)) => *saved == session_id(*index),
@@ -7025,6 +7032,10 @@ struct TerminalPaneOwners {
 }
 
 impl TerminalPaneOwners {
+    fn newly_reveals(&self, previous: Option<&Self>, id: usize) -> bool {
+        self.tree.contains_id(id) && previous.is_some_and(|previous| !previous.tree.contains_id(id))
+    }
+
     fn matches(
         &self,
         tab: Option<&Tab>,
@@ -10008,6 +10019,15 @@ impl Frost {
             return;
         }
         let next = TerminalPaneOwners::capture(tab, self.pane_zoomed, self.active, &session_id);
+        // Only newly revealed panes resume. Reordering or focusing an already
+        // visible split must not interrupt its scrolling or reading position.
+        for session in &mut self.sessions {
+            if next.newly_reveals(self.terminal_pane_owners.as_ref(), session.id) {
+                session.transcript_canvas.resume_visible();
+                session.refresh();
+            }
+        }
+
         for gesture in change_terminal_pane_owners(
             &mut self.terminal_pane_owners,
             next,
@@ -36431,6 +36451,85 @@ mod block_browser_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remapped_live_projection_matches_canvas_before_first_frame() {
+        let mut terminal = TerminalState::new(40, 10);
+        let policy = terminal::ProjectionPolicy::new();
+        let mut state = terminal::ProjectionViewState::new();
+        let mut canvas = transcript_canvas::TranscriptCanvas::default();
+        canvas.reconcile(0, 0, 10, 40);
+        for _ in 0..100 {
+            terminal.process_input(b"hidden output\r\n");
+            let projection = terminal.get_projected_viewport_with_state(false, &policy, &mut state);
+            canvas.reconcile(0, projection.max_scroll_offset(), 10, 40);
+            terminal.set_scroll_offset(canvas.row());
+            canvas.applied(canvas.row());
+        }
+        assert!(canvas.row() > 0);
+        canvas.resume_visible();
+        // These are the production Session::refresh identity-projection steps:
+        // reconcile, apply canvas row to terminal, rematerialize, then publish.
+        state.scroll_to_bottom();
+        let projection = terminal.get_projected_viewport_with_state(false, &policy, &mut state);
+        canvas.reconcile(
+            projection.scroll_offset(),
+            projection.max_scroll_offset(),
+            10,
+            40,
+        );
+        terminal.set_scroll_offset(canvas.row());
+        let projection = terminal.get_projected_viewport_with_state(false, &policy, &mut state);
+        canvas.applied(projection.scroll_offset());
+        assert_eq!(projection.scroll_offset(), 0);
+        assert_eq!(terminal.scroll_offset, 0);
+        assert_eq!(canvas.position_rows(), 0.0);
+        assert!(!canvas.animating());
+    }
+
+    #[test]
+    fn remapped_panes_are_only_newly_visible_stable_owners() {
+        let split = TerminalPaneOwners {
+            tab_id: Some(1),
+            tree: TerminalPaneOwner::Split(
+                true,
+                vec![
+                    TerminalPaneOwner::Leaf(Some(7)),
+                    TerminalPaneOwner::Leaf(Some(9)),
+                ],
+            ),
+        };
+        let zoomed = TerminalPaneOwners {
+            tab_id: Some(1),
+            tree: TerminalPaneOwner::Leaf(Some(7)),
+        };
+        let other_tab = TerminalPaneOwners {
+            tab_id: Some(2),
+            tree: TerminalPaneOwner::Leaf(Some(11)),
+        };
+        assert!(!split.newly_reveals(None, 7));
+        assert!(!split.newly_reveals(Some(&split), 7));
+        assert!(!zoomed.newly_reveals(Some(&split), 7));
+        assert!(!split.newly_reveals(Some(&zoomed), 7));
+        assert!(split.newly_reveals(Some(&zoomed), 9));
+        assert!(split.newly_reveals(Some(&other_tab), 7));
+        assert!(split.newly_reveals(Some(&other_tab), 9));
+        assert!(!split.newly_reveals(Some(&other_tab), 11));
+        let reordered = TerminalPaneOwners {
+            tab_id: Some(1),
+            tree: TerminalPaneOwner::Split(
+                false,
+                vec![
+                    TerminalPaneOwner::Leaf(Some(9)),
+                    TerminalPaneOwner::Leaf(Some(7)),
+                    TerminalPaneOwner::Leaf(Some(13)),
+                ],
+            ),
+        };
+        assert!(!reordered.newly_reveals(Some(&split), 7));
+        assert!(!reordered.newly_reveals(Some(&split), 9));
+        assert!(reordered.newly_reveals(Some(&split), 13));
+    }
+
     #[test]
     fn queued_active_action_cannot_retarget_after_tab_switch() {
         let mut terminal = super::TerminalState::new(8, 2);

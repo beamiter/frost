@@ -43,6 +43,18 @@ impl TranscriptCanvas {
         self.motion.position() / ROW
     }
 
+    /// Restore a newly visible pane before its first paint. Hidden output is
+    /// already in the document; it must not be replayed as a scroll animation.
+    /// A reader keeps the exact fractional position rather than being sent live.
+    pub fn resume_visible(&mut self) {
+        if self.enabled && self.following {
+            self.motion.jump_to(0.0);
+        } else {
+            self.motion.cancel();
+        }
+        self.frame = None;
+    }
+
     pub fn disable(&mut self) {
         self.motion.cancel();
         self.enabled = false;
@@ -269,6 +281,43 @@ impl CanvasGeometry {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn remapped_live_canvas_does_not_replay_hidden_output() {
+        let mut canvas = TranscriptCanvas::default();
+        canvas.reconcile(0, 100, 25, 80);
+        canvas.applied(0);
+        // Hidden panes still refresh on each PTY batch but receive no frames.
+        for extent in 101..=10_000 {
+            canvas.reconcile(0, extent, 25, 80);
+            canvas.applied(canvas.row());
+        }
+        assert!(canvas.animating());
+        canvas.resume_visible();
+        assert_eq!(canvas.position_rows(), 0.0);
+        assert!(canvas.following());
+        assert!(!canvas.animating());
+        canvas.reconcile(0, 10_000, 25, 80);
+        assert_eq!(canvas.position_rows(), 0.0);
+        assert!(!canvas.animating());
+        // Subsequent visible output retains normal smooth live-follow.
+        canvas.reconcile(0, 10_001, 25, 80);
+        assert!(canvas.animating());
+    }
+
+    #[test]
+    fn remapped_reader_keeps_fraction_and_does_not_resume_old_wheel() {
+        let mut canvas = TranscriptCanvas::default();
+        canvas.reconcile(40, 100, 25, 80);
+        canvas.applied(40);
+        canvas.scroll(0.25, true, Instant::now());
+        canvas.scroll(23.0, false, Instant::now());
+        let position = canvas.position_rows();
+        canvas.resume_visible();
+        assert_eq!(canvas.position_rows(), position);
+        assert!(!canvas.following());
+        assert!(!canvas.animating());
+    }
 
     #[test]
     fn selected_text_does_not_truncate_page_or_wheel_navigation() {
