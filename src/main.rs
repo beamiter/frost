@@ -11453,32 +11453,34 @@ impl Frost {
         None
     }
 
-    /// Resize every session once for the current layout. Background tabs use the
-    /// full terminal area; sessions displayed in a split use their pane size.
-    /// While a pane is zoomed every session gets the full area, so the zoomed
-    /// pane renders full-size and unzooming is a plain relayout.
+    /// Resize only visible panes for the current layout. Hidden PTYs retain
+    /// their own dimensions until revealed: another tab's docked prompt must
+    /// not resize a background Codex and make it redraw its entire transcript.
+    /// Activation and unzooming relayout newly visible panes before painting.
     fn relayout(&mut self) {
         // Legal owner activation/split already requested a relayout. Refresh
-        // its own dimensions before the existing single per-session pass;
+        // its own dimensions before the single visible-pane pass;
         // never add another pass or write through a retired owner callback.
         self.refresh_glass_grid_dimensions();
         // Retire old raw coordinates before resizing or replacing projections.
         self.sync_terminal_pane_owners();
-        let mut targets = vec![(self.cols, self.rows); self.sessions.len()];
+        let mut targets = Vec::new();
         if self.is_split() && !self.pane_zoomed {
             for pane in self.pane_rects() {
-                if pane.session < targets.len() {
+                if pane.session < self.sessions.len() {
                     let w = (pane.rect.width - terminal_view::SCROLLBAR_WIDTH).max(0.0);
                     // The header strip sits inside the pane rect, above the
                     // grid. Charging the PTY for those pixels would make the
                     // shell believe it has one row more than it can show.
                     let h = (pane.rect.height - self.pane_header_height()).max(0.0);
-                    targets[pane.session] = self.metrics.grid_size(w, h);
+                    targets.push((pane.session, self.metrics.grid_size(w, h)));
                 }
             }
+        } else {
+            targets.push((self.active, (self.cols, self.rows)));
         }
         let mut width_changed = false;
-        for (index, (cols, rows)) in targets.into_iter().enumerate() {
+        for (index, (cols, rows)) in targets {
             if let Some(id) = self.resize_session(index, cols, rows) {
                 self.history_reflow_sessions.insert(id);
                 width_changed = true;
