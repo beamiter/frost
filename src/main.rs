@@ -6941,6 +6941,30 @@ fn retire_terminal_mouse_gestures(
     std::mem::take(gestures).into_iter().flatten().collect()
 }
 
+/// A rejected callback belongs to one pane, not to every gesture in the window.
+/// Keep sibling-pane button ownership intact while still failing the stale pane closed.
+fn cancel_terminal_mouse_gestures_for_pane(
+    gestures: &mut [Option<TerminalMouseGesture>; 3],
+    clicks: &mut TerminalClickTracker,
+    session_id: usize,
+) {
+    let owns_left =
+        gestures[MouseButton::Left.slot()].is_some_and(|gesture| gesture.session_id == session_id);
+    if owns_left
+        || clicks
+            .pending
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == session_id)
+    {
+        clicks.cancel();
+    }
+    for slot in gestures {
+        if slot.is_some_and(|gesture| gesture.session_id == session_id) {
+            *slot = None;
+        }
+    }
+}
+
 fn change_terminal_interaction_mode(
     previous: &mut config::TerminalMode,
     next: config::TerminalMode,
@@ -14440,8 +14464,11 @@ impl Frost {
 
     fn handle_mouse(&mut self, source_session_id: usize, input: MouseInput) -> Task<Message> {
         if !self.projection_interaction_allowed_for(source_session_id) {
-            self.terminal_mouse_gestures = [None; 3];
-            self.click_tracker.cancel();
+            cancel_terminal_mouse_gestures_for_pane(
+                &mut self.terminal_mouse_gestures,
+                &mut self.click_tracker,
+                source_session_id,
+            );
             return Task::none();
         }
         self.sync_terminal_pane_owners();
@@ -17040,9 +17067,13 @@ impl Frost {
             | Message::BlockGoLive => self.sessions.get(self.active).map(|s| s.id),
             _ => None,
         };
-        if mapped_owner.is_some_and(|id| !self.projection_interaction_allowed_for(id)) {
-            self.terminal_mouse_gestures = [None; 3];
-            self.click_tracker.cancel();
+        if let Some(owner) = mapped_owner.filter(|id| !self.projection_interaction_allowed_for(*id))
+        {
+            cancel_terminal_mouse_gestures_for_pane(
+                &mut self.terminal_mouse_gestures,
+                &mut self.click_tracker,
+                owner,
+            );
             return Task::none();
         }
 
@@ -20352,8 +20383,11 @@ impl Frost {
                             &key,
                         )
                 }) {
-                    self.terminal_mouse_gestures = [None; 3];
-                    self.click_tracker.cancel();
+                    cancel_terminal_mouse_gestures_for_pane(
+                        &mut self.terminal_mouse_gestures,
+                        &mut self.click_tracker,
+                        session_id,
+                    );
                     return Task::none();
                 }
                 return self.update_message(Message::MousePane(session_id, input));
@@ -41207,6 +41241,83 @@ mod tests {
         assert!(!link_projection_matches(41, 42));
         assert!(!link_projection_matches(0, 0));
         assert!(!link_projection_matches(0, 41));
+    }
+
+    #[test]
+    fn stale_pane_callback_preserves_sibling_mouse_gestures() {
+        let gesture = |session_id, button| {
+            Some(TerminalMouseGesture {
+                session_id,
+                button,
+                report_to_app: true,
+                last_app_cell: Some((2, 3)),
+                consumed: false,
+            })
+        };
+        let mut gestures = [None; 3];
+        gestures[MouseButton::Left.slot()] = gesture(7, MouseButton::Left);
+        gestures[MouseButton::Right.slot()] = gesture(9, MouseButton::Right);
+        let mut clicks = TerminalClickTracker::default();
+        cancel_terminal_mouse_gestures_for_pane(&mut gestures, &mut clicks, 9);
+        assert!(gestures[MouseButton::Right.slot()].is_none());
+        assert!(
+            !clicks.cancelled,
+            "a sibling rejection must not cancel local selection"
+        );
+        let left = take_terminal_mouse_gesture(&mut gestures, 7, MouseButton::Left)
+            .expect("the original pane must still receive its button release");
+        assert_eq!(left.last_app_cell, Some((2, 3)));
+    }
+
+    #[test]
+    fn stale_pane_callback_cancels_owned_pending_caret_without_button_slot() {
+        let mut terminal = TerminalState::new(20, 5);
+        let key = terminal.get_projected_viewport(true).key();
+        let mut clicks = TerminalClickTracker::default();
+        clicks.update(caret_test_press(0, 1), 7, key, false);
+        let mut gestures = [None; 3];
+        cancel_terminal_mouse_gestures_for_pane(&mut gestures, &mut clicks, 7);
+        assert!(clicks.pending.is_none());
+        assert!(clicks.cancelled);
+    }
+
+    #[test]
+    fn stale_pane_callback_preserves_sibling_pending_caret_and_left_slot() {
+        let mut terminal = TerminalState::new(20, 5);
+        let key = terminal.get_projected_viewport(true).key();
+        let mut clicks = TerminalClickTracker::default();
+        clicks.update(caret_test_press(0, 1), 7, key, false);
+        let mut gestures = [None; 3];
+        gestures[MouseButton::Left.slot()] = Some(TerminalMouseGesture {
+            session_id: 7,
+            button: MouseButton::Left,
+            report_to_app: false,
+            last_app_cell: None,
+            consumed: false,
+        });
+        cancel_terminal_mouse_gestures_for_pane(&mut gestures, &mut clicks, 9);
+        assert!(clicks
+            .pending
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == 7));
+        assert!(!clicks.cancelled);
+        assert!(take_terminal_mouse_gesture(&mut gestures, 7, MouseButton::Left).is_some());
+    }
+
+    #[test]
+    fn stale_pane_callback_still_cancels_its_own_selection() {
+        let mut gestures = [None; 3];
+        gestures[MouseButton::Left.slot()] = Some(TerminalMouseGesture {
+            session_id: 7,
+            button: MouseButton::Left,
+            report_to_app: false,
+            last_app_cell: None,
+            consumed: false,
+        });
+        let mut clicks = TerminalClickTracker::default();
+        cancel_terminal_mouse_gestures_for_pane(&mut gestures, &mut clicks, 7);
+        assert!(gestures.iter().all(Option::is_none));
+        assert!(clicks.cancelled);
     }
 
     #[test]
