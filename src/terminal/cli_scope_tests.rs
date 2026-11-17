@@ -300,3 +300,81 @@ fn cli_alt_erase_saved_lines_preserves_a_deferred_primary_purge() {
     assert_eq!(terminal.pending_saved_line_purge, 0);
     assert_eq!(terminal.scrollback.len(), 0);
 }
+
+#[test]
+fn cli_projected_reader_and_copy_survive_ed3_until_explicit_live_navigation() {
+    for chat in [false, true] {
+        let mut terminal = fixture("codex");
+        let mut policy = ProjectionPolicy::new();
+        policy.set_chat(chat);
+        policy.set_native_chrome(true, 0);
+        let mut state = ProjectionViewState::new();
+        let live = terminal.get_projected_viewport_with_state(chat, &policy, &mut state);
+        state.set_offset(live.max_scroll_offset(), &live);
+        let reading = terminal.get_projected_viewport_with_state(chat, &policy, &mut state);
+        assert!(reading.scroll_offset() > 0);
+        assert_eq!(terminal.scroll_offset, 0, "projected reading owns its offset");
+        terminal.start_selection_in_projection(&reading, (0, 0), SelectionMode::Normal);
+        terminal.update_selection_in_projection(&reading, (0, 6));
+        assert_eq!(terminal.copy_selection().as_deref(), Some("CLI0000"));
+        let retained = terminal.scrollback.len();
+        terminal.process_batch(b"\x1b[3J");
+        assert_eq!(terminal.scrollback.len(), retained);
+        assert_eq!(terminal.pending_saved_line_purge, retained);
+        terminal.process_batch(b"\x1b[?2026h\x1b[?2026l");
+        let reading_again =
+            terminal.get_projected_viewport_with_state(chat, &policy, &mut state);
+        assert_eq!(reading_again.scroll_offset(), reading.scroll_offset());
+        assert_eq!(terminal.copy_selection().as_deref(), Some("CLI0000"));
+        assert_eq!(terminal.scrollback.len(), retained);
+        // Navigating via the projection (not the dormant raw offset) releases
+        // exactly the prefix requested by ED 3 and invalidates its selection.
+        state.scroll_to_bottom();
+        let bottom = terminal.get_projected_viewport_with_state(chat, &policy, &mut state);
+        assert_eq!(bottom.scroll_offset(), 0);
+        assert!(terminal.scrollback.is_empty());
+        assert_eq!(terminal.pending_saved_line_purge, 0);
+        assert!(terminal.copy_selection().is_none());
+    }
+}
+
+#[test]
+fn cli_fractional_reading_hold_defers_ed3_even_at_zero_whole_rows() {
+    let mut terminal = fixture("codex");
+    let policy = ProjectionPolicy::new();
+    let mut state = ProjectionViewState::new();
+    let live = terminal.get_projected_viewport_with_state(false, &policy, &mut state);
+    state.hold_reading_position(&live);
+    let held = terminal.get_projected_viewport_with_state(false, &policy, &mut state);
+    assert_eq!(held.scroll_offset(), 0);
+    let retained = terminal.scrollback.len();
+    terminal.process_batch(b"\x1b[3J");
+    terminal.process_batch(b"");
+    assert_eq!(terminal.scrollback.len(), retained);
+    state.scroll_to_bottom();
+    terminal.get_projected_viewport_with_state(false, &policy, &mut state);
+    assert!(terminal.scrollback.is_empty());
+    assert_eq!(terminal.pending_saved_line_purge, 0);
+}
+
+#[test]
+fn cli_projected_ed3_hold_survives_temporary_alt_and_explicit_bottom_releases_it() {
+    let mut terminal = fixture("codex");
+    let policy = ProjectionPolicy::new();
+    let mut state = ProjectionViewState::new();
+    let live = terminal.get_projected_viewport_with_state(false, &policy, &mut state);
+    state.set_offset(live.max_scroll_offset(), &live);
+    terminal.get_projected_viewport_with_state(false, &policy, &mut state);
+    let retained = terminal.scrollback.len();
+    terminal.process_batch(b"\x1b[3J\x1b[?1049h");
+    terminal.get_projected_viewport_with_state(false, &policy, &mut state);
+    terminal.scroll_to_bottom();
+    terminal.process_batch(b"\x1b[3J\x1b[?1049l");
+    terminal.process_batch(b"");
+    assert_eq!(terminal.scrollback.len(), retained);
+    assert_eq!(terminal.pending_saved_line_purge, retained);
+    // The explicit input path can release the hold before another paint.
+    terminal.scroll_to_bottom();
+    assert!(terminal.scrollback.is_empty());
+    assert_eq!(terminal.pending_saved_line_purge, 0);
+}

@@ -6102,8 +6102,7 @@ impl Session {
         {
             self.projection_view_state.release_reading_position();
         } else if self.transcript_canvas.enabled() && !self.transcript_canvas.following() {
-            self.projection_view_state
-                .hold_reading_position(&self.projection);
+            self.hold_transcript_reading_position();
         }
         // The identity/P0 hot path must not allocate or scan every retained
         // zone on each PTY batch. Reconcile only after a transform exists.
@@ -6144,8 +6143,7 @@ impl Session {
         }
         if let Some(id) = self.block_selection.active() {
             if self.projection_block_mode && !self.terminal.is_alt_buffer_active() {
-                self.projection_view_state
-                    .hold_reading_position(&self.projection);
+                self.hold_transcript_reading_position();
             }
             self.block_reading.visit(id);
         }
@@ -6226,13 +6224,26 @@ impl Session {
         }
     }
 
+    fn hold_transcript_reading_position(&mut self) {
+        self.projection_view_state
+            .hold_reading_position(&self.projection);
+        self.terminal.hold_saved_lines_for_reading();
+    }
+
     fn scroll_transcript(&mut self, rows: f64, precise: bool, now: std::time::Instant) -> bool {
         // Mouse selection mutates the terminal without requiring a projection
         // refresh. Observe its edge before scheduling a new user destination,
         // not on the first animation frame after that destination was set.
         self.transcript_canvas
             .set_text_selection_active(self.terminal.has_text_selection());
-        self.transcript_canvas.scroll(rows, precise, now)
+        let moved = self.transcript_canvas.scroll(rows, precise, now);
+        if self.transcript_canvas.enabled() && !self.transcript_canvas.following() {
+            // Fractional input can leave the whole row unchanged, so the
+            // caller need not refresh. Protect the reading prefix before the
+            // next PTY batch rather than waiting for a projection rebuild.
+            self.hold_transcript_reading_position();
+        }
+        moved
     }
 
     fn scroll(&mut self, lines: isize) {
@@ -20388,9 +20399,7 @@ impl Frost {
                 if moved_row || snapped {
                     session.refresh();
                 } else if !session.transcript_canvas.following() {
-                    session
-                        .projection_view_state
-                        .hold_reading_position(&session.projection);
+                    session.hold_transcript_reading_position();
                 }
                 self.click_tracker.cancel();
                 self.organism.retreat();
@@ -25222,8 +25231,7 @@ impl Frost {
         let id = zone.id;
         let review = Self::block_details_snapshot(&sess.terminal, sess.id, id);
         sess.block_selection.replace(Some(id));
-        sess.projection_view_state
-            .hold_reading_position(&sess.projection);
+        sess.hold_transcript_reading_position();
         sess.block_reading.visit(id);
         self.block_review = review;
         Task::none()
@@ -36883,6 +36891,33 @@ mod tests {
         session.set_scroll_offset(20);
         assert!(session.transcript_scroll_domain().is_some());
         session
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inline_cli_subrow_and_review_holds_protect_ed3_before_another_refresh() {
+        for fractional in [false, true] {
+            let mut session = relative_scroll_fixture();
+            session.scroll_to_bottom();
+            let retained = session.terminal.scrollback_len();
+            assert!(retained > 0);
+            assert_eq!(session.terminal.scroll_offset, 0);
+            if fractional {
+                assert!(!session.scroll_transcript(0.125, true, std::time::Instant::now()));
+                assert_eq!(session.transcript_canvas.row(), 0);
+                assert!(!session.transcript_canvas.following());
+            } else {
+                // Review can hold the current projection without repainting.
+                session.hold_transcript_reading_position();
+            }
+            // Match the reducer's no-whole-row-change path: a PTY batch can
+            // arrive before a new projection is requested or rendered.
+            session.terminal.process_batch(b"\x1b[3J");
+            session.terminal.process_batch(b"");
+            assert_eq!(session.terminal.scrollback_len(), retained);
+            session.scroll_to_bottom();
+            assert_eq!(session.terminal.scrollback_len(), 0);
+        }
     }
 
     #[cfg(target_os = "linux")]

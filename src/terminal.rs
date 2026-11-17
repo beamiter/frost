@@ -3452,6 +3452,9 @@ pub struct TerminalState {
     /// Rows an app asked to erase with ED 3 while the viewport was scrolled
     /// back, held until the viewport returns to the live bottom.
     pending_saved_line_purge: usize,
+    /// The active projected reader owns a separate offset (including sub-row
+    /// holds); the legacy raw offset cannot decide whether ED 3 may erase it.
+    projected_saved_lines_held: bool,
     /// Monotonic count of rows appended to scrollback, used to tell whether the
     /// provisional alternate-screen snapshot is still the tail.
     scrollback_pushes: u64,
@@ -3839,6 +3842,7 @@ impl TerminalState {
             projected_selection: None,
             scroll_offset: 0,
             pending_saved_line_purge: 0,
+            projected_saved_lines_held: false,
             scrollback_pushes: 0,
             full_screen_scroll_revision: 0,
             provisional_alt_snapshot: None,
@@ -5919,7 +5923,7 @@ impl TerminalState {
         if self.use_alt_buffer && self.inline_cli_owner_active() {
             return;
         }
-        if self.scroll_offset > 0 {
+        if self.scroll_offset > 0 || self.projected_saved_lines_held {
             self.pending_saved_line_purge = self.scrollback.len();
             return;
         }
@@ -5949,7 +5953,10 @@ impl TerminalState {
         if self.use_alt_buffer && self.inline_cli_owner_active() {
             return;
         }
-        if self.pending_saved_line_purge > 0 && self.scroll_offset == 0 {
+        if self.pending_saved_line_purge > 0
+            && self.scroll_offset == 0
+            && !self.projected_saved_lines_held
+        {
             self.purge_saved_lines(self.pending_saved_line_purge);
         }
     }
@@ -9354,6 +9361,7 @@ impl TerminalState {
         }
         self.scrollback.clear();
         self.pending_saved_line_purge = 0;
+        self.projected_saved_lines_held = false;
         self.provisional_alt_snapshot = None;
         self.command_zones.clear();
         self.pending_zone_row_trim = 0;
@@ -9937,7 +9945,18 @@ impl TerminalState {
         visible && mapped
     }
 
+    /// Publish a sub-row reader immediately, before another PTY batch can
+    /// arrive. Such movement need not rebuild or repaint a whole-row viewport.
+    pub fn hold_saved_lines_for_reading(&mut self) {
+        if !self.use_alt_buffer {
+            self.projected_saved_lines_held = true;
+        }
+    }
+
     pub fn scroll_to_bottom(&mut self) {
+        if !self.use_alt_buffer {
+            self.projected_saved_lines_held = false;
+        }
         self.scroll_offset = 0;
         self.settle_pending_saved_line_purge();
     }
@@ -11831,6 +11850,18 @@ impl TerminalState {
             && !self.use_alt_buffer
             && !policy.is_identity()
             && !(policy.chat && self.chat_plan_key(policy).is_none());
+        // Publish the active reader before the next PTY batch. In particular,
+        // a scoped CLI transcript leaves the legacy scroll_offset at zero.
+        // Preserve primary ownership while an alternate screen is displayed.
+        if !self.use_alt_buffer {
+            self.projected_saved_lines_held =
+                (transformed && state.offset_from_bottom > 0) || state.reading_hold;
+            if transformed {
+                // Apply a deferred request only when the projected reader
+                // explicitly returns live, before building its new plan.
+                self.settle_pending_saved_line_purge();
+            }
+        }
         if transformed {
             let request_key = self.projection_viewport_key(policy, state.offset_from_bottom);
             if let Some((failed, reason)) = &self.projection_material_failure {
