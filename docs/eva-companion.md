@@ -44,10 +44,14 @@ start time. The original foreground PID/PGID/SID alone cannot identify idle:
 `exec` preserves them, and a running builtin may retain the executable too.
 The root must match the pinned program and the terminal must observe a fresh
 empty semantic prompt, with no submitted input, typeahead or active execution.
-Whole-window close otherwise preserves the sessions. Shells without command
-boundaries, including plain `sh`, require an explicit shell exit or the existing
-tab-close confirmation; Escape cancels that confirmation. These observations
-are not authenticated shell attestation.
+When any pane has work or cannot prove idle, whole-window close offers **Cancel**
+and **Close window**. Confirmation explicitly permits terminating work in every
+tab and pane, including hidden tabs, and continues through normal Eva withdrawal.
+This also provides a close path for shells without command boundaries, including
+plain `sh`. Cancelling either confirmation or withdrawal revokes that intent;
+ending a job alone does not close the window. Explicit **Close anyway** is not
+blocked again by the terminal work check. Unsaved Vim protection still runs first.
+These observations are not authenticated shell attestation.
 
 Right-side prompt decorations such as jsh's elapsed duration do not block a
 healthy close after work ends. Closing uses the clean semantic prompt and
@@ -268,3 +272,15 @@ normal WM_DELETE_WINDOW close and fail-closed owner SIGKILL. Crash blocking is n
 automatic recovery: trusted surface-destruction certification remains missing.
 These are scoped native acceptance cases, not physical scanout, IME or performance
 measurements; machine reports preserve individual outcomes and binary hashes.
+
+
+## Native window-close regression
+
+Run `python3 scripts/native-window-close.py --binary target/release/frost
+--output /tmp/frost-close-check --eva on` (and again with a fresh output directory
+and `--eva off`). The fixture owns its Xvfb display and private home/configuration.
+It runs a real foreground `sleep` in a hidden tab, checks Cancel/Escape and modal
+input ownership, then verifies confirmed GUI exit and termination of that job.
+With Eva enabled, it also cancels withdrawal and verifies that the next close
+requires fresh terminal-work approval before using **Close anyway** against an
+unavailable private coordinator. This does not certify compositor retirement.

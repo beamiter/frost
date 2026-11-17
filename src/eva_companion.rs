@@ -231,6 +231,7 @@ pub(crate) struct Eva {
     close_ui_revision: u64,
     cancel_key: shared::CancelKeyLease,
     force_close: bool,
+    terminal_work_confirmed: bool,
     task_revision: u64,
     running_task: Option<(usize, bool)>,
     task_ids: std::collections::BTreeMap<usize, u64>,
@@ -322,6 +323,7 @@ impl Eva {
             close_ui_revision: 0,
             cancel_key: Default::default(),
             force_close: false,
+            terminal_work_confirmed: false,
             task_revision: 0,
             running_task: None,
             task_ids: Default::default(),
@@ -1001,7 +1003,7 @@ impl Eva {
             self.send(Request::Withdraw);
         }
     }
-    pub fn request_guarded_close(&mut self) {
+    pub fn request_guarded_close(&mut self, terminal_work_confirmed: bool) {
         crate::close_diagnostics::record(false, || {
             format!(
                 "request_guarded_close current_revision={} closing={} paused={}",
@@ -1014,9 +1016,16 @@ impl Eva {
         self.close_guarded = true;
         self.close_paused_for_work = false;
         self.request_close();
+        self.terminal_work_confirmed |= terminal_work_confirmed;
     }
     pub fn guarded_close_waiting(&self) -> bool {
         self.closing && self.close_guarded && !self.close_paused_for_work
+    }
+    pub fn terminal_close_check_required(&self) -> bool {
+        self.guarded_close_waiting() && !self.terminal_close_confirmed()
+    }
+    pub fn terminal_close_confirmed(&self) -> bool {
+        self.terminal_work_confirmed || self.force_close
     }
     pub fn pause_close_for_work(&mut self) {
         crate::close_diagnostics::record(false, || {
@@ -1050,6 +1059,7 @@ impl Eva {
         self.close_guarded = false;
         self.close_paused_for_work = false;
         self.force_close = false;
+        self.terminal_work_confirmed = false;
         self.cached = None;
         self.deadline = None;
         // Preserve the actual in-flight Submission and retirement token.

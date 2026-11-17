@@ -1782,6 +1782,8 @@ enum PendingClose {
     Session { activate_after: Option<usize> },
     /// Close the whole tab that owns the named session.
     Tab,
+    /// Close every tab and pane in this window after explicit confirmation.
+    Window,
 }
 
 /// Startup-only repair facts survive fallback, successful terminal actions and
@@ -6502,9 +6504,7 @@ impl Session {
         let foreground = jterm_core::process::tty_foreground_pgid(self.master_fd);
         match foreground {
             Some(group) if group != child => {
-                return Some(
-                    "A foreground process is still running. Stop it or close its tab before closing this window.",
-                );
+                return Some("A foreground process is still running.");
             }
             _ => {}
         }
@@ -6516,15 +6516,15 @@ impl Session {
         }
         if foreground == Some(child) && !self.command_owned {
             if !self.shell_identity.matches_current_program() {
-                return Some("The shell was replaced by a command. Stop it or close its tab before closing this window.");
+                return Some("The shell was replaced by a command.");
             }
             match self.pty.session_activity() {
-                companion_host::pty_session::Activity::Busy => return Some(
-                    "A background process is still attached. Stop it or close its tab before closing this window.",
-                ),
-                companion_host::pty_session::Activity::Unknown => return Some(
-                    "Cannot verify attached terminal work. Check the session or close its tab explicitly.",
-                ),
+                companion_host::pty_session::Activity::Busy => {
+                    return Some("A background process is still attached.")
+                }
+                companion_host::pty_session::Activity::Unknown => {
+                    return Some("Cannot verify attached terminal work.")
+                }
                 companion_host::pty_session::Activity::Idle => {}
             }
             if self.terminal.window_close_prompt_ready() {
@@ -6533,13 +6533,13 @@ impl Session {
             log::debug!(target: "terminal_close", "close held: root={child} prompt={:?} activity={:?}",
                 self.terminal.agent_prompt_status(), self.terminal.live_activity_facts());
             return Some(if self.terminal.has_prompt_marks() {
-                "Terminal work or unfinished input is still present. Return to an empty prompt or close its tab explicitly."
+                "Terminal work or unfinished input is still present."
             } else {
-                "Shell activity is unavailable. Exit this shell or close its tab explicitly before closing this window."
+                "Shell activity is unavailable."
             });
         }
         Some(if self.command_owned {
-            "A terminal command is still running. Stop it or close its tab before closing this window."
+            "A terminal command is still running."
         } else {
             "Cannot verify that a terminal is idle. Check its work before closing this window."
         })
@@ -7525,8 +7525,8 @@ struct Frost {
     /// Counted destructive confirmation for clearing one stable pane's block
     /// history. Revalidated before deletion in case PTY output changed it.
     block_clear_confirm: Option<BlockClearConfirmation>,
-    /// Close-confirmation overlay for a pane or tab with a running foreground
-    /// process. Holds `(target_id, process_name, what_to_close)`.
+    /// Close-confirmation overlay for a pane, tab, or window with terminal work.
+    /// Holds `(target_id, process_name_or_reason, what_to_close)`.
     tab_close_confirm: Option<(usize, String, PendingClose)>,
     /// Last desktop notification launch. OSC 9/777 originates inside the PTY
     /// (and may be remote over SSH), so process spawning is globally rate-limited.
@@ -10476,6 +10476,33 @@ impl Frost {
                 Some(tab) => self.close_tab(tab),
                 None => self.close_session(index),
             },
+            PendingClose::Window => self.request_window_close_with_confirmation(true),
+        }
+    }
+
+    fn confirm_pending_close(&mut self) -> Task<Message> {
+        let Some((id, _, pending)) = self.tab_close_confirm.take() else {
+            return Task::none();
+        };
+        // A window confirmation outlives the particular job that triggered it.
+        if matches!(pending, PendingClose::Window) {
+            return self.request_window_close_with_confirmation(true);
+        }
+        match self.session_index_by_id(id) {
+            Some(index) => self.execute_pending_close(index, pending),
+            None => Task::none(),
+        }
+    }
+
+    fn cancel_pending_close(&mut self) {
+        if self
+            .tab_close_confirm
+            .take()
+            .is_some_and(|(_, _, pending)| matches!(pending, PendingClose::Window))
+        {
+            if let Some(eva) = self.eva.as_mut() {
+                eva.keep_window_open();
+            }
         }
     }
 
@@ -10700,10 +10727,25 @@ impl Frost {
         task
     }
 
-    /// Refuse a whole-window exit while a foreground job is still attached.
-    /// The user can inspect and close that tab explicitly, which uses the normal
-    /// per-process confirmation flow instead of silently terminating work.
+    /// Confirm a whole-window exit when any pane still has terminal work.
     fn request_window_close(&mut self) -> Task<Message> {
+        self.request_window_close_with_confirmation(false)
+    }
+
+    fn show_window_close_confirmation(&mut self, index: usize, reason: &'static str) {
+        if let Some(eva) = self.eva.as_mut() {
+            eva.pause_close_for_work();
+        }
+        self.focus_session(index);
+        self.relayout();
+        self.refresh_active_context();
+        self.tab_close_confirm = self
+            .sessions
+            .get(index)
+            .map(|session| (session.id, reason.to_owned(), PendingClose::Window));
+    }
+
+    fn request_window_close_with_confirmation(&mut self, confirmed: bool) -> Task<Message> {
         close_diagnostics::record(true, || "window_close_requested".into());
         if !self.vim9_tabs.is_empty() {
             return Task::batch(self.vim9_tabs.iter_mut().map(|(id, editor)| {
@@ -10713,18 +10755,19 @@ impl Frost {
                     .map(move |message| Message::EmbeddedVim(id, Box::new(message)))
             }));
         }
-        if let Some((index, reason)) = self.window_close_blocker() {
-            if let Some(eva) = self.eva.as_mut() {
-                eva.pause_close_for_work();
+        let confirmed = confirmed
+            || self
+                .eva
+                .as_ref()
+                .is_some_and(|eva| eva.terminal_close_confirmed());
+        if !confirmed {
+            if let Some((index, reason)) = self.window_close_blocker() {
+                self.show_window_close_confirmation(index, reason);
+                return Task::none();
             }
-            self.focus_session(index);
-            self.relayout();
-            self.refresh_active_context();
-            self.push_toast(reason.to_owned(), ToastKind::Warning);
-            return Task::none();
         }
         if let Some(eva) = self.eva.as_mut() {
-            eva.request_guarded_close();
+            eva.request_guarded_close(confirmed);
         }
         self.exit_flushing_durable_state()
     }
@@ -17048,11 +17091,10 @@ impl Frost {
         if self
             .eva
             .as_ref()
-            .is_some_and(|eva| eva.guarded_close_waiting())
+            .is_some_and(|eva| eva.terminal_close_check_required())
         {
-            if let Some((_, reason)) = self.window_close_blocker() {
-                self.eva.as_mut().unwrap().pause_close_for_work();
-                self.push_toast(reason.to_owned(), ToastKind::Warning);
+            if let Some((index, reason)) = self.window_close_blocker() {
+                self.show_window_close_confirmation(index, reason);
             }
         }
         if self.eva.as_ref().is_some_and(|eva| eva.ready_to_close()) {
@@ -19750,15 +19792,13 @@ impl Frost {
                         return Task::none();
                     }
                     if self.tab_close_confirm.is_some() {
-                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter)) {
-                            if let Some((id, _, pending)) = self.tab_close_confirm.take() {
-                                if let Some(index) = self.session_index_by_id(id) {
-                                    return self.execute_pending_close(index, pending);
-                                }
-                            }
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter))
+                            && !repeat
+                        {
+                            return self.confirm_pending_close();
                         } else if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
                         {
-                            self.tab_close_confirm = None;
+                            self.cancel_pending_close();
                         }
                         return Task::none();
                     }
@@ -22697,14 +22737,10 @@ impl Frost {
                 return self.deliver_workflow_args(attempt, id, command);
             }
             Message::TabCloseConfirmNo => {
-                self.tab_close_confirm = None;
+                self.cancel_pending_close();
             }
             Message::TabCloseConfirmYes => {
-                if let Some((id, _, pending)) = self.tab_close_confirm.take() {
-                    if let Some(index) = self.session_index_by_id(id) {
-                        return self.execute_pending_close(index, pending);
-                    }
-                }
+                return self.confirm_pending_close();
             }
         }
         self.recompute_links();
@@ -23464,7 +23500,12 @@ impl Frost {
 
     /// Centered modal: "Tab is running `<proc>`. Close anyway?". Esc / outside
     /// click cancel; only TabCloseConfirmYes proceeds with the close.
-    fn tab_close_confirm_view(&self, id: usize, proc_name: &str) -> Element<'_, Message> {
+    fn tab_close_confirm_view(
+        &self,
+        id: usize,
+        proc_name: &str,
+        pending: PendingClose,
+    ) -> Element<'_, Message> {
         let label = session_persistence::bound_tab_title_draft(
             self.sessions
                 .iter()
@@ -23473,10 +23514,20 @@ impl Frost {
                 .unwrap_or_else(|| format!("Session {}", id + 1)),
         );
         let proc_name = session_persistence::bound_tab_title_draft(proc_name);
+        let whole_window = matches!(pending, PendingClose::Window);
+        let title = if whole_window {
+            "Close Frost window?".to_owned()
+        } else {
+            format!("Close \"{}\"?", label)
+        };
+        let detail = if whole_window {
+            format!("{proc_name}\nClosing this window will terminate work in all tabs and panes.")
+        } else {
+            format!("Foreground process: {proc_name}")
+        };
         let body = column![
-            self.popup_text(format!("Close \"{}\"?", label))
-                .size(self.effective_font_size()),
-            self.popup_text(format!("Foreground process: {}", proc_name))
+            self.popup_text(title).size(self.effective_font_size()),
+            self.popup_text(detail)
                 .size(self.effective_font_size())
                 .color(self.c_text_dim()),
             row![
@@ -23486,8 +23537,12 @@ impl Frost {
                     .style(self.ghost_btn_style()),
                 Space::new().width(Length::Fill),
                 button(
-                    self.popup_text("Close anyway")
-                        .size(self.effective_font_size())
+                    self.popup_text(if whole_window {
+                        "Close window"
+                    } else {
+                        "Close anyway"
+                    })
+                    .size(self.effective_font_size())
                 )
                 .on_press(Message::TabCloseConfirmYes)
                 .padding([4, 12])
@@ -28605,11 +28660,12 @@ impl Frost {
         } else {
             root
         };
-        let root: Element<'_, Message> = if let Some((id, process, _)) = &self.tab_close_confirm {
-            stack![root, self.tab_close_confirm_view(*id, process)].into()
-        } else {
-            root
-        };
+        let root: Element<'_, Message> =
+            if let Some((id, process, pending)) = &self.tab_close_confirm {
+                stack![root, self.tab_close_confirm_view(*id, process, *pending)].into()
+            } else {
+                root
+            };
         // The file tree's own overlays: menu below the modals, deletion last
         // (top-most) since it is the destructive one.
         let root: Element<'_, Message> = if let Some(menu) = &self.sidebar_menu {
