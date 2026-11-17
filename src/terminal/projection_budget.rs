@@ -205,6 +205,28 @@ fn finish_group(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relative_scroll_guard_revokes_on_checked_plan_failure_before_view_recovery() {
+        let mut terminal = super::super::TerminalState::new(8, 2);
+        let mut policy = super::super::ProjectionPolicy::new();
+        policy.set_block_spacing(true);
+        let before = terminal.projection_scroll_identity();
+        super::super::TerminalState::with_projection_row_budget(1, || {
+            assert!(terminal
+                .checked_collapsed_projection_plan(8, &policy)
+                .is_err());
+        });
+        assert_ne!(before, terminal.projection_scroll_identity());
+        // A later live repaint invalidates the cached failed plan and allows
+        // recovery at the normal budget, without reviving the old lease.
+        let failure = terminal.projection_scroll_identity();
+        terminal.process_batch(b"x");
+        let restored = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+        assert!(restored.unavailable().is_none());
+        assert_eq!(failure, terminal.projection_scroll_identity());
+        assert_ne!(before, terminal.projection_scroll_identity());
+    }
+
     use super::*;
     use crate::terminal::TerminalCell;
     #[test]
@@ -261,6 +283,10 @@ mod tests {
 }
 
 impl super::TerminalState {
+    pub(crate) fn projection_scroll_identity(&self) -> crate::relative_scroll_admission::Identity {
+        self.projection_scroll_guard.snapshot()
+    }
+
     pub fn projection_unavailable(&self) -> Option<ProjectionUnavailable> {
         self.projection_failure
     }
@@ -287,6 +313,7 @@ impl super::TerminalState {
         &mut self,
         reason: ProjectionUnavailable,
     ) -> std::sync::Arc<super::ProjectedViewport> {
+        self.projection_scroll_guard.revoke();
         self.projection_failure = Some(reason);
         self.projection_plan_cache = None;
         self.projected_viewport_cache = None;

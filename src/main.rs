@@ -80,6 +80,7 @@ mod recovery_report;
 mod reference_conversation;
 mod reference_icon;
 mod reference_organism;
+mod relative_scroll_admission;
 mod remote_fs;
 mod remote_host_editor;
 mod review_text;
@@ -4937,7 +4938,13 @@ enum Message {
     MousePane(usize, MouseInput),
     ProjectedMousePane(usize, ProjectionCallbackIdentity, MouseInput),
     ProjectedAction(usize, ProjectionCallbackIdentity, Box<Message>),
-    ProjectedTranscriptScroll(usize, ProjectionCallbackIdentity, u64, f64, bool),
+    ProjectedTranscriptScroll(
+        usize,
+        Option<relative_scroll_admission::Token>,
+        u64,
+        f64,
+        bool,
+    ),
     /// Stable release of a host-owned collapsed-output summary row.
     SummaryActivate(usize, SummaryActivation),
     /// Clipboard result scoped to the stable session that requested the paste.
@@ -5363,6 +5370,8 @@ struct Session {
     projection_policy: ProjectionPolicy,
     projection_view_state: ProjectionViewState,
     transcript_canvas: transcript_canvas::TranscriptCanvas,
+    scroll_identity: relative_scroll_admission::Identity,
+    scroll_admission: relative_scroll_admission::Admission,
     cursor: (usize, usize),
     cursor_visible: bool,
     /// Cached working directory, refreshed periodically so the status bar can
@@ -5868,6 +5877,8 @@ impl Session {
             projection_policy,
             projection_view_state,
             transcript_canvas: transcript_canvas::TranscriptCanvas::default(),
+            scroll_identity: relative_scroll_admission::Identity::default(),
+            scroll_admission: relative_scroll_admission::Admission::default(),
             cursor,
             cursor_visible,
             cwd_cache: None,
@@ -6020,6 +6031,61 @@ impl Session {
         self.terminal.inline_cli_scope_floor().is_some()
     }
 
+    /// Relative local motion may survive content repaints, but never a changed
+    /// semantic surface or a budget failure. Coordinate-targeted actions keep
+    /// their exact ProjectionCallbackIdentity checks.
+    fn transcript_scroll_domain(&self) -> Option<relative_scroll_admission::Domain> {
+        if !self.transcript_canvas.enabled()
+            || !self.projection.has_canvas_head()
+            || !self
+                .terminal
+                .projection_interaction_allowed(&self.projection)
+        {
+            return None;
+        }
+        let key = self.projection.key();
+        Some(relative_scroll_admission::Domain {
+            rows: key.rows,
+            cols: key.cols,
+            projection_mode: match key.mode {
+                terminal::ProjectionMode::Identity => 0,
+                terminal::ProjectionMode::Transformed => 1,
+                terminal::ProjectionMode::Bypass => 2,
+            },
+            alternate_screen: key.source.alternate_screen,
+            row_identity: key.source.row_identity,
+            policy_revision: key.policy_revision,
+            host_policy_revision: self.projection_policy.revision(),
+            block_spacing: key.block_spacing,
+            inline_scope_floor: self.terminal.inline_cli_scope_floor(),
+            command_generation: self.terminal.watch_generation(),
+            app_mouse_enabled: self.terminal.is_mouse_enabled(),
+        })
+    }
+
+    fn observe_transcript_scroll_domain(&mut self) {
+        self.scroll_admission.observe(
+            self.transcript_scroll_domain(),
+            self.terminal.projection_scroll_identity(),
+        );
+    }
+
+    fn permits_transcript_scroll(
+        &self,
+        token: Option<&relative_scroll_admission::Token>,
+        pane_epoch: u64,
+    ) -> bool {
+        token.is_some_and(|token| {
+            self.scroll_admission.permits(
+                token,
+                &self.scroll_identity,
+                pane_epoch,
+                self.transcript_scroll_domain().as_ref(),
+                &self.terminal.projection_scroll_identity(),
+            )
+        })
+    }
+
     fn refresh(&mut self) {
         self.transcript_canvas
             .set_text_selection_active(self.terminal.has_text_selection());
@@ -6063,6 +6129,7 @@ impl Session {
             self.terminal.clear_text_selection();
             self.transcript_canvas.park();
             self.projection_view_state.invalidate_unavailable();
+            self.observe_transcript_scroll_domain();
             self.cursor = (0, 0);
             self.cursor_visible = false;
             return;
@@ -6130,10 +6197,12 @@ impl Session {
             self.terminal.clear_text_selection();
             self.transcript_canvas.park();
             self.projection_view_state.invalidate_unavailable();
+            self.observe_transcript_scroll_domain();
             self.cursor = (0, 0);
             self.cursor_visible = false;
             return;
         }
+        self.observe_transcript_scroll_domain();
         let raw_cursor = self.terminal.get_cursor_pos();
         if self.projection.mode() == terminal::ProjectionMode::Transformed
             || self.projection.has_canvas_head()
@@ -20292,11 +20361,7 @@ impl Frost {
             Message::ProjectedTranscriptScroll(session_id, key, epoch, rows, precise) => {
                 if !self.sessions.iter().any(|session| {
                     session.id == session_id
-                        && projection_callback_is_current(
-                            &session.terminal,
-                            &session.projection,
-                            &key,
-                        )
+                        && session.permits_transcript_scroll(key.as_ref(), epoch)
                 }) {
                     return Task::none();
                 }
@@ -26971,7 +27036,9 @@ impl Frost {
             self.chat_input_ready(session_id),
         );
         let mouse_projection_key = ProjectionCallbackIdentity::capture(&sess.projection);
-        let scroll_projection_key = ProjectionCallbackIdentity::capture(&sess.projection);
+        let scroll_admission = sess
+            .scroll_admission
+            .capture(&sess.scroll_identity, transcript_epoch);
         let summary_projection_key = ProjectionCallbackIdentity::capture(&sess.projection);
         let terminal = TermWidget::new(
             sess.projection.row_view(),
@@ -27021,7 +27088,7 @@ impl Frost {
             move |rows, precise| {
                 Message::ProjectedTranscriptScroll(
                     session_id,
-                    scroll_projection_key.clone(),
+                    scroll_admission.clone(),
                     transcript_epoch,
                     rows,
                     precise,
@@ -36602,6 +36669,199 @@ mod tests {
             drop(session);
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn relative_scroll_fixture() -> super::Session {
+        let mut config = super::Config {
+            shell: Some("/bin/sh".into()),
+            ..Default::default()
+        };
+        config.vim9.auto_gui = false;
+        let mut session = super::Session::spawn(&config, 0, 40, 10, Some("/tmp")).unwrap();
+        session.projection_block_mode = false;
+        session.terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07codex\r\n\x1b]133;C;cmdline_url=codex\x07",
+        );
+        for row in 0..100 {
+            session
+                .terminal
+                .process_input(format!("CLI{row:04}\r\n").as_bytes());
+        }
+        session.refresh();
+        session.set_scroll_offset(20);
+        assert!(session.transcript_scroll_domain().is_some());
+        session
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relative_scroll_survives_repaint_but_coordinate_callback_does_not() {
+        let mut session = relative_scroll_fixture();
+        let exact = super::ProjectionCallbackIdentity::capture(&session.projection);
+        let token = session
+            .scroll_admission
+            .capture(&session.scroll_identity, 4);
+        assert!(session.permits_transcript_scroll(token.as_ref(), 4));
+        session
+            .terminal
+            .process_batch(b"\x1b[?2026h\x1b[Hupdated live frame\x1b[?2026l");
+        session.refresh();
+        assert!(!super::projection_callback_is_current(
+            &session.terminal,
+            &session.projection,
+            &exact
+        ));
+        assert!(session.permits_transcript_scroll(token.as_ref(), 4));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relative_scroll_same_widget_batch_keeps_every_precise_delta() {
+        let mut session = relative_scroll_fixture();
+        let token = session
+            .scroll_admission
+            .capture(&session.scroll_identity, 4);
+        let before = session.transcript_canvas.position_rows();
+        let now = std::time::Instant::now();
+        for _ in 0..20 {
+            assert!(session.permits_transcript_scroll(token.as_ref(), 4));
+            assert!(session.scroll_transcript(1.0, true, now));
+            session.refresh();
+        }
+        assert!((session.transcript_canvas.position_rows() - before - 20.0).abs() < 0.001);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relative_scroll_budget_failure_and_recovery_cannot_revive_queued_token() {
+        let mut session = relative_scroll_fixture();
+        let token = session
+            .scroll_admission
+            .capture(&session.scroll_identity, 4);
+        // A failing auxiliary materialization can be recovered before Session
+        // observes it. The terminal's central failure identity must still revoke.
+        super::TerminalState::with_projection_row_budget(1, || {
+            let failed = session.terminal.get_projected_viewport_with_state(
+                session.projection_block_mode,
+                &session.projection_policy,
+                &mut session.projection_view_state,
+            );
+            assert!(failed.unavailable().is_some());
+            assert!(!session.permits_transcript_scroll(token.as_ref(), 4));
+        });
+        session.refresh();
+        assert!(session.transcript_scroll_domain().is_some());
+        assert!(!session.permits_transcript_scroll(token.as_ref(), 4));
+        let fresh = session
+            .scroll_admission
+            .capture(&session.scroll_identity, 4);
+        assert!(session.permits_transcript_scroll(fresh.as_ref(), 4));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relative_scroll_session_pane_and_resize_aba_keep_ownership() {
+        let mut session = relative_scroll_fixture();
+        let token = session
+            .scroll_admission
+            .capture(&session.scroll_identity, 4);
+        assert!(!session.permits_transcript_scroll(token.as_ref(), 5));
+        let replacement = relative_scroll_fixture();
+        assert_eq!(session.id, replacement.id);
+        assert!(!replacement.permits_transcript_scroll(token.as_ref(), 4));
+        session.terminal.on_resize(39, 10);
+        session.refresh();
+        session.terminal.on_resize(40, 10);
+        session.refresh();
+        assert!(!session.permits_transcript_scroll(token.as_ref(), 4));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relative_scroll_redundant_mouse_mode_and_synchronized_erase_keep_lease() {
+        let mut session = relative_scroll_fixture();
+        session.terminal.process_batch(b"\x1b[?1000h");
+        session.refresh();
+        let token = session
+            .scroll_admission
+            .capture(&session.scroll_identity, 4);
+        assert!(token.is_some());
+        for batch in [
+            b"\x1b[?1000h".as_slice(),
+            b"\x1b[?2026h\x1b[2J\x1b[Hnew frame\x1b[?2026l".as_slice(),
+        ] {
+            session.terminal.process_batch(batch);
+            session.refresh();
+            assert!(session.permits_transcript_scroll(token.as_ref(), 4));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relative_scroll_single_batch_screen_and_mouse_aba_revoke() {
+        for batch in [
+            b"\x1b[?1049h\x1b[?1049l".as_slice(),
+            b"\x1b[?1000h\x1b[?1000l".as_slice(),
+            b"\x1b[?1006h\x1b[?1006l".as_slice(),
+        ] {
+            let mut session = relative_scroll_fixture();
+            let token = session
+                .scroll_admission
+                .capture(&session.scroll_identity, 4);
+            session.terminal.process_batch(batch);
+            session.refresh();
+            assert!(!session.permits_transcript_scroll(token.as_ref(), 4));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relative_scroll_command_generation_and_reset_revoke_without_intermediate_refresh() {
+        let mut session = relative_scroll_fixture();
+        let token = session
+            .scroll_admission
+            .capture(&session.scroll_identity, 4);
+        let generation = session.terminal.watch_generation();
+        session.terminal.process_batch(
+            b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07codex\x1b]133;C;cmdline_url=codex\x07",
+        );
+        session.refresh();
+        assert_ne!(generation, session.terminal.watch_generation());
+        assert!(!session.permits_transcript_scroll(token.as_ref(), 4));
+        // Direct launch keeps its scope through RIS, but not old input leases.
+        session.terminal.set_inline_cli_launch(true);
+        session.refresh();
+        let token = session
+            .scroll_admission
+            .capture(&session.scroll_identity, 4);
+        assert!(token.is_some());
+        session.terminal.process_batch(b"\x1bc");
+        session.refresh();
+        assert!(!session.permits_transcript_scroll(token.as_ref(), 4));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relative_scroll_mode_and_policy_aba_cannot_revive_queued_token() {
+        let mut session = relative_scroll_fixture();
+        let token = session
+            .scroll_admission
+            .capture(&session.scroll_identity, 4);
+        session.terminal.process_input(b"\x1b[?1049h");
+        session.refresh();
+        assert!(!session.permits_transcript_scroll(token.as_ref(), 4));
+        session.terminal.process_input(b"\x1b[?1049l");
+        session.refresh();
+        assert!(!session.permits_transcript_scroll(token.as_ref(), 4));
+        let token = session
+            .scroll_admission
+            .capture(&session.scroll_identity, 4);
+        session.projection_policy.set_block_spacing(true);
+        session.refresh();
+        session.projection_policy.set_block_spacing(false);
+        session.refresh();
+        assert!(!session.permits_transcript_scroll(token.as_ref(), 4));
     }
 
     #[cfg(target_os = "linux")]

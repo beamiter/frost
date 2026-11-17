@@ -3563,6 +3563,7 @@ pub struct TerminalState {
     projected_viewport_cache: Option<ProjectedViewportCache>,
     projection_plan_cache: Option<ProjectionPlanCache>,
     projection_failure: Option<ProjectionUnavailable>,
+    projection_scroll_guard: crate::relative_scroll_admission::ScrollGuard,
     history_projection_budget_cache:
         std::cell::RefCell<Option<projection_budget::HistoryAdmissionCache>>,
     raw_projection_budget_cache: Option<projection_budget::RawAdmissionCache>,
@@ -3910,6 +3911,7 @@ impl TerminalState {
             projected_viewport_cache: None,
             projection_plan_cache: None,
             projection_failure: None,
+            projection_scroll_guard: crate::relative_scroll_admission::ScrollGuard::default(),
             history_projection_budget_cache: std::cell::RefCell::new(None),
             raw_projection_budget_cache: None,
             projection_material_failure: None,
@@ -5219,6 +5221,7 @@ impl TerminalState {
                             execution_id: mark_id.clone(),
                         });
                     }
+                    self.projection_scroll_guard.revoke();
                     self.watch_generation = self.watch_generation.and_then(|n| n.checked_add(1));
                     self.inline_cli_command_scope = self
                         .current_command_text
@@ -9321,6 +9324,7 @@ impl TerminalState {
 
     /// RIS (ESC c): reset the terminal to its initial state.
     fn full_reset(&mut self) {
+        self.projection_scroll_guard.revoke();
         self.watch_batch.boundary = true;
         self.watch_batch.interrupted = true;
         if self.use_alt_buffer {
@@ -9475,6 +9479,11 @@ impl TerminalState {
             }
             return;
         }
+        // Revoke even a mode round-trip hidden inside one PTY batch. A fresh
+        // view must not reinterpret an already queued local scroll as app input.
+        if matches!(mode, 1000..=1003 | 1005 | 1006 | 1015) && !self.modes.contains(&mode) {
+            self.projection_scroll_guard.revoke();
+        }
         match mode {
             4 => {
                 // DECSCLM (smooth scroll) — accepted and ignored. Must NOT fall
@@ -9538,6 +9547,7 @@ impl TerminalState {
                     );
                     self.watch_batch.interrupted = true;
                     self.watch_batch.boundary = true;
+                    self.projection_scroll_guard.revoke();
                     self.use_alt_buffer = true;
                     self.organism_idle_cwd = None;
                     // Retained cells keep their keys, but an unterminated
@@ -9595,6 +9605,11 @@ impl TerminalState {
             }
             return;
         }
+        // Revoke even a mode round-trip hidden inside one PTY batch. A fresh
+        // view must not reinterpret an already queued local scroll as app input.
+        if matches!(mode, 1000..=1003 | 1005 | 1006 | 1015) && self.modes.contains(&mode) {
+            self.projection_scroll_guard.revoke();
+        }
         match mode {
             4 => {
                 // DECSCLM reset — ignored (see set_mode).
@@ -9645,6 +9660,7 @@ impl TerminalState {
                     );
                     self.watch_batch.interrupted = true;
                     self.watch_batch.boundary = true;
+                    self.projection_scroll_guard.revoke();
                     self.use_alt_buffer = false;
                     // Whatever the alternate screen last left in scrollback is
                     // all that remains of it, so it stops being provisional.
@@ -9818,6 +9834,7 @@ impl TerminalState {
 
     /// Known direct/configured/managed CLI launches are armed before ingest.
     pub fn set_inline_cli_launch(&mut self, enabled: bool) {
+        self.projection_scroll_guard.revoke();
         self.inline_cli_launch_floor = (enabled
             && std::env::var_os("JTERM_AGENT_SCROLLBACK").as_deref()
                 != Some(std::ffi::OsStr::new("0")))
@@ -10515,6 +10532,7 @@ impl TerminalState {
         if let Err(reason) = result {
             self.projection_failure_cache =
                 Some((key, self.grid_version, self.scroll_offset, reason));
+            self.projection_scroll_guard.revoke();
             self.projection_failure = Some(reason);
             self.projection_plan_cache = None;
             self.projected_viewport_cache = None;
