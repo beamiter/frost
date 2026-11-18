@@ -389,7 +389,7 @@ mod tests {
         std::fs::remove_dir(&exact).unwrap();
         std::fs::write(&exact, "exact").unwrap();
         assert!(load("app.tsx:2", &f.0).unwrap().location.is_none());
-        std::fs::set_permissions(&exact, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&exact, std::fs::Permissions::from_mode(0o0)).unwrap();
         if unsafe { libc::geteuid() } != 0 {
             assert!(
                 load("app.tsx:2", &f.0).is_err(),
