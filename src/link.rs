@@ -149,7 +149,7 @@ impl LinkDetector {
         // excluded from the first relative component so URL schemes are not
         // reclassified as file paths.
         let file_path_regex = Regex::new(
-            r"(?:^|\s)(?:(?:/|\./|\.\./|~/)[^\s<>\[\]{}|\\^`()]*|[^/:\s<>\[\]{}|\\^`()]+(?:/[^/\s<>\[\]{}|\\^`()]+)+)"
+            r"(?:^|\s)(?:(?:/|\./|\.\./|~/)[^\s<>\[\]{}|\\^`()]*|[^/:\s<>\[\]{}|\\^`()]+(?:/[^/\s<>\[\]{}|\\^`()]+)+|[\w.-]+\.[\w.:-]+)"
         ).unwrap();
 
         Self {
@@ -311,12 +311,18 @@ impl LinkDetector {
             return false;
         }
 
-        // Must be rooted explicitly or contain at least one relative separator.
+        // Existing rooted/relative paths, plus a narrow bare-name preview set.
         trimmed.starts_with('/')
             || trimmed.starts_with("./")
             || trimmed.starts_with("../")
             || trimmed.starts_with("~/")
             || trimmed.contains('/')
+            || strip_source_location(trimmed)
+                .unwrap_or(trimmed)
+                .rsplit_once('.')
+                .is_some_and(|(stem, extension)| {
+                    !stem.is_empty() && matches!(extension, "tsx" | "md" | "png" | "jpg" | "jpeg")
+                })
     }
 
     /// 在整个网格中检测链接（带缓存）
@@ -1159,5 +1165,22 @@ mod tests {
         let links = detector.detect_links_in_line(&line, 0);
         assert_eq!(links.len(), MAX_LINKS_PER_LINE);
         assert!(links.iter().all(|link| link.link_type == LinkType::Url));
+    }
+}
+
+#[cfg(test)]
+mod local_preview_links {
+    use super::*;
+    #[test]
+    fn bare_preview_names_and_source_locations_preserve_unicode_columns() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let links = detector.detect_links_in_line("中 app.tsx:4:2 note.md image.png", 0);
+        assert_eq!(links.len(), 3);
+        assert_eq!(links[0].text, "app.tsx:4:2");
+        assert_eq!(links[0].col_start, 2);
+        assert!(links.iter().all(|l| l.link_type == LinkType::FilePath));
+        assert!(detector
+            .detect_links_in_line("app.tsx.exe app.tsx:bad", 0)
+            .is_empty());
     }
 }

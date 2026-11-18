@@ -2106,7 +2106,7 @@ impl Frost {
         let body: Element<'_, Message> = match selected_tab {
             InspectorTab::Changes | InspectorTab::Run => self.workspace_inspector(selected_tab),
             InspectorTab::Files => mouse_area(
-                self.font_zoom_region(font_zoom::Group::Chrome, self.sidebar_files_view()),
+                self.font_zoom_region(font_zoom::Group::Chrome, self.file_preview_view()),
             )
             .on_enter(Message::SidebarHover(true))
             .on_exit(Message::SidebarHover(false))

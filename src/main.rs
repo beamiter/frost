@@ -34,6 +34,7 @@ mod debug;
 mod eva_companion;
 #[cfg(all(test, unix))]
 mod eva_handoff_tests;
+mod file_preview;
 mod find_focus;
 mod fold_preview;
 mod font_zoom;
@@ -4656,6 +4657,9 @@ enum Message {
     InputDockHoldExpired(u64),
     ReferenceInspector(native_shell::InspectorTab),
     ReferenceInspectorToggle,
+    FilePreviewLoaded(usize, u64, Result<file_preview::Preview, String>),
+    FilePreviewClose(u64),
+    FilePreviewConfirm(u64),
     ReferenceNavigationToggle,
     ReferenceNavigationClose,
     SidebarResize(sidebar_resize::Side, sidebar_resize::Action),
@@ -7327,6 +7331,11 @@ struct Frost {
     ai_key_draft: String,
     config_dirty: bool,
     config_save_retry: config_retry::ConfigSaveRetry,
+    file_preview: Option<(usize, u64, Result<file_preview::Preview, String>)>,
+    file_preview_pending: Option<(usize, u64)>,
+    file_preview_busy: bool,
+    file_preview_next_token: u64,
+    file_preview_confirmation: Option<(usize, u64, String, String)>,
     link_detector: link::LinkDetector,
     links: Vec<link::Link>,
     /// Stable session plus the complete immutable projection identity used by
@@ -7705,6 +7714,11 @@ impl Frost {
             ai_key_draft: String::new(),
             config_dirty: false,
             config_save_retry: config_retry::ConfigSaveRetry::default(),
+            file_preview: None,
+            file_preview_pending: None,
+            file_preview_busy: false,
+            file_preview_next_token: 0,
+            file_preview_confirmation: None,
             link_detector: link::LinkDetector::new(link::LinkDetectionConfig::default()),
             links: Vec::new(),
             links_cache_key: None,
@@ -8503,6 +8517,150 @@ impl Frost {
             })
     }
 
+    fn begin_file_preview(
+        &mut self,
+        session_id: usize,
+        request_token: u64,
+        path: String,
+        confirmed: bool,
+    ) -> Task<Message> {
+        if self.file_preview_busy {
+            self.push_toast("A file preview is still loading", ToastKind::Warning);
+            return Task::none();
+        }
+        let Some(session) = self
+            .sessions
+            .get(self.active)
+            .filter(|s| s.id == session_id)
+        else {
+            return Task::none();
+        };
+        if session.managed_remote
+            || session.observed_ssh_command().is_some()
+            || session.transcript_read_only()
+        {
+            self.push_toast(
+                "Local preview is unavailable for remote or restored output",
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        let Some(cwd) = session.cwd_cache.clone().or_else(|| session.cwd()) else {
+            self.push_toast(
+                "Terminal working directory is required for local preview",
+                ToastKind::Warning,
+            );
+            return Task::none();
+        };
+        if path.len() > 4096
+            || cwd.len() > 4096
+            || path.chars().chain(cwd.chars()).any(|c| {
+                c.is_control() || jterm_core::review_input::is_visual_spoofing_character(c)
+            })
+        {
+            self.push_toast(
+                "File preview path contains unsafe formatting",
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        if !confirmed {
+            let Some(token) = self.file_preview_next_token.checked_add(1) else {
+                return Task::none();
+            };
+            self.file_preview_next_token = token;
+            self.file_preview = None;
+            // The click was checked against its rendered frame before entry.
+            // Freeze that candidate: opening the inspector itself changes layout.
+            self.file_preview_confirmation = Some((session_id, token, path, cwd));
+            self.reference_inspector_tab = native_shell::InspectorTab::Files;
+            self.reference_navigation_drawer = false;
+            self.reference_inspector_open = true;
+            self.reference_inspector_drawer = self.reference_layout().inspector.is_none();
+            self.sync_reference_inspector_geometry();
+            return Task::none();
+        }
+        self.file_preview = None;
+        self.file_preview_pending = Some((session_id, request_token));
+        self.file_preview_busy = true;
+        self.reference_inspector_tab = native_shell::InspectorTab::Files;
+        self.reference_navigation_drawer = false;
+        self.reference_inspector_open = true;
+        self.reference_inspector_drawer = self.reference_layout().inspector.is_none();
+        self.sync_reference_inspector_geometry();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    file_preview::load(&path, std::path::Path::new(&cwd))
+                })
+                .await
+                .unwrap_or_else(|_| Err("File preview worker failed".into()))
+            },
+            move |result| Message::FilePreviewLoaded(session_id, request_token, result),
+        )
+    }
+
+    pub(crate) fn file_preview_view(&self) -> Element<'_, Message> {
+        let active_id = self.sessions.get(self.active).map(|session| session.id);
+        if let Some((id, token, path, cwd)) = &self.file_preview_confirmation {
+            if Some(*id) == active_id {
+                return column![
+                    text("Confirm local file preview"),
+                    text("Terminal output cannot prove a path is local. This will read a file from this computer, not a remote host. Nothing will be executed."),
+                    text(format!("Working directory: {cwd}\nFile: {path}")),
+                    button("Read local file").on_press(Message::FilePreviewConfirm(*token)),
+                    button("Cancel").on_press(Message::FilePreviewClose(*token)),
+                ].spacing(10).padding(10).into();
+            }
+        }
+        let preview = self
+            .file_preview
+            .as_ref()
+            .filter(|(id, _, _)| Some(*id) == active_id);
+        let pending = self
+            .file_preview_pending
+            .is_some_and(|(id, _)| Some(id) == active_id);
+        if preview.is_none() && !pending {
+            return self.sidebar_files_view();
+        }
+        let body: Element<'_, Message> = match preview.map(|(_, _, result)| result) {
+            None => text("Loading local preview…").into(),
+            Some(Err(error)) => text(format!("Preview unavailable: {error}")).into(),
+            Some(Ok(preview)) => {
+                let content: Element<'_, Message> = match &preview.content {
+                    file_preview::Content::Text(value) => {
+                        scrollable(text(value).font(iced::Font::MONOSPACE)).into()
+                    }
+                    file_preview::Content::Image(handle) => iced::widget::image(handle.clone())
+                        .width(Length::Fill)
+                        .into(),
+                };
+                column![
+                    text(preview.path.to_string_lossy().into_owned()).size(12),
+                    content
+                ]
+                .spacing(8)
+                .into()
+            }
+        };
+        column![
+            row![
+                text("Local preview · read only"),
+                button("Close").on_press(Message::FilePreviewClose(
+                    preview
+                        .map(|(_, token, _)| *token)
+                        .or_else(|| self.file_preview_pending.map(|(_, token)| token))
+                        .unwrap_or(0)
+                ))
+            ]
+            .spacing(8),
+            body,
+        ]
+        .spacing(10)
+        .padding(10)
+        .into()
+    }
+
     fn active_projection_interaction_allowed(&self) -> bool {
         self.sessions.get(self.active).is_some_and(|session| {
             session
@@ -8626,6 +8784,9 @@ impl Frost {
     }
 
     fn active_session_changed_for_remote_follow(&mut self) {
+        self.file_preview_confirmation = None;
+        self.file_preview_pending = None;
+        self.file_preview = None;
         self.sidebar_drop_intents.clear();
         self.sidebar_drop_burst.clear();
         self.sidebar_drop_debounce_generation = None;
@@ -14723,6 +14884,14 @@ impl Frost {
                         consumed: true,
                     });
                 if let Some(link) = current_link {
+                    if link.link_type == link::LinkType::FilePath {
+                        return self.begin_file_preview(
+                            source_session_id,
+                            link_revision,
+                            link.text,
+                            false,
+                        );
+                    }
                     let cwd = self
                         .session_index_by_id(source_session_id)
                         .and_then(|source| self.sessions.get(source))
@@ -17297,7 +17466,67 @@ impl Frost {
                 self.native_enter_ownership.lock().claim_held();
                 self.reference_navigation_drawer = false;
             }
+            Message::FilePreviewConfirm(token) => {
+                if self
+                    .file_preview_confirmation
+                    .as_ref()
+                    .is_some_and(|(_, candidate, _, _)| *candidate == token)
+                {
+                    if let Some((id, token, path, cwd)) = self.file_preview_confirmation.take() {
+                        if self.sessions.get(self.active).is_some_and(|session| {
+                            session.id == id
+                                && session
+                                    .cwd_cache
+                                    .clone()
+                                    .or_else(|| session.cwd())
+                                    .as_deref()
+                                    == Some(cwd.as_str())
+                        }) {
+                            return self.begin_file_preview(id, token, path, true);
+                        }
+                        self.push_toast(
+                            "Terminal context changed. Ctrl-click the file again.",
+                            ToastKind::Warning,
+                        );
+                    }
+                }
+            }
+            Message::FilePreviewClose(token) => {
+                if self
+                    .file_preview_confirmation
+                    .as_ref()
+                    .is_some_and(|(_, candidate, _, _)| *candidate == token)
+                {
+                    self.file_preview_confirmation = None;
+                }
+                if self
+                    .file_preview
+                    .as_ref()
+                    .is_some_and(|(_, candidate, _)| *candidate == token)
+                {
+                    self.file_preview = None;
+                }
+                if self
+                    .file_preview_pending
+                    .is_some_and(|(_, candidate)| candidate == token)
+                {
+                    self.file_preview_pending = None;
+                }
+            }
+            Message::FilePreviewLoaded(session_id, token, result) => {
+                self.file_preview_busy = false;
+                if file_preview::accepts_request(
+                    self.file_preview_pending,
+                    (session_id, token),
+                    self.sessions.get(self.active).map(|session| session.id),
+                ) {
+                    self.file_preview_pending = None;
+                    self.file_preview = Some((session_id, token, result));
+                }
+            }
             Message::ReferenceInspectorToggle => {
+                self.file_preview_confirmation = None;
+                self.file_preview_pending = None;
                 self.finish_sidebar_resize();
                 self.trace_reference_inspector("toggle-before");
                 self.task_panel.retire_panel_callbacks();
