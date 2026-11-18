@@ -45,7 +45,8 @@ impl Recorder {
 }
 
 /// Closure formatting is skipped entirely when disabled or the budget is spent.
-/// Callers supply only fixed labels, revisions, and booleans; never user content.
+/// Callers supply only fixed event labels, revisions, booleans and widget/pointer
+/// geometry; never terminal text, file paths or other user content.
 pub(crate) fn record(begin: bool, detail: impl FnOnce() -> String) {
     static RECORDER: OnceLock<Recorder> = OnceLock::new();
     let recorder = RECORDER.get_or_init(|| {

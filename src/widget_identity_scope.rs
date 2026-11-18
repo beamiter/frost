@@ -19,6 +19,7 @@ pub(crate) fn transient_overlay<'a, Message: 'a, Theme: 'a, Renderer: renderer::
 
 struct Scope<'a, Message, Theme, Renderer, Key> {
     identity: Key,
+    close_trace: bool,
     content: Element<'a, Message, Theme, Renderer>,
 }
 
@@ -56,6 +57,19 @@ pub(crate) fn scope_key<
 ) -> Element<'a, Message, Theme, Renderer> {
     Element::new(Scope {
         identity,
+        close_trace: false,
+        content: content.into(),
+    })
+}
+
+/// Observe the real close button without changing input ownership or callbacks.
+pub(crate) fn close_button<'a, Message: 'a, Theme: 'a, Renderer: renderer::Renderer + 'a>(
+    revision: u64,
+    content: impl Into<Element<'a, Message, Theme, Renderer>>,
+) -> Element<'a, Message, Theme, Renderer> {
+    Element::new(Scope {
+        identity: revision,
+        close_trace: true,
         content: content.into(),
     })
 }
@@ -150,6 +164,23 @@ impl<Message, Theme, Renderer: renderer::Renderer, Key: Clone + PartialEq + 'sta
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        let trace = self.close_trace
+            && matches!(
+                event,
+                Event::Mouse(
+                    mouse::Event::ButtonPressed(mouse::Button::Left)
+                        | mouse::Event::ButtonReleased(mouse::Button::Left)
+                )
+            );
+        if trace {
+            crate::close_diagnostics::record(false, || {
+                format!(
+                "close_button_before event={event:?} cursor={:?} bounds={:?} over={} captured={} has_messages={}",
+                cursor.position(), layout.bounds(), cursor.is_over(layout.bounds()),
+                shell.is_event_captured(), !shell.is_empty()
+            )
+            });
+        }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -160,6 +191,15 @@ impl<Message, Theme, Renderer: renderer::Renderer, Key: Clone + PartialEq + 'sta
             shell,
             viewport,
         );
+        if trace {
+            crate::close_diagnostics::record(false, || {
+                format!(
+                    "close_button_after captured={} has_messages={}",
+                    shell.is_event_captured(),
+                    !shell.is_empty()
+                )
+            });
+        }
     }
 
     fn mouse_interaction(
@@ -716,6 +756,34 @@ mod tests {
             &Rectangle::with_size(Size::new(100.0, 100.0)),
         );
         messages
+    }
+
+    #[test]
+    fn close_diagnostic_scope_preserves_click_and_revision_boundaries() {
+        for changed in [false, true] {
+            let view = |revision, message| {
+                close_button(
+                    revision,
+                    button(Space::new().width(40).height(30)).on_press(message),
+                )
+            };
+            let mut old: Element<'_, u8, iced::Theme, TestRenderer> = view(1, 1);
+            let mut tree = Tree::new(old.as_widget());
+            assert!(send(
+                &mut old,
+                &mut tree,
+                mouse::Event::ButtonPressed(mouse::Button::Left)
+            )
+            .is_empty());
+            let mut next = view(if changed { 2 } else { 1 }, 2);
+            tree.diff(next.as_widget());
+            let messages = send(
+                &mut next,
+                &mut tree,
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            );
+            assert_eq!(messages, if changed { vec![] } else { vec![2] });
+        }
     }
 
     #[test]

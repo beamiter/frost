@@ -21,6 +21,17 @@ pub(crate) fn install() -> SharedOwnership {
                 WindowEvent::CloseRequested => {
                     crate::close_diagnostics::record(true, || "native_close_requested".into())
                 }
+                WindowEvent::CursorMoved { position, .. } => {
+                    crate::close_diagnostics::record(false, || {
+                        format!("native_cursor_moved x={} y={}", position.x, position.y)
+                    });
+                }
+                WindowEvent::CursorLeft { .. } => {
+                    crate::close_diagnostics::record(false, || "native_cursor_left".into());
+                }
+                WindowEvent::Focused(focused) => {
+                    crate::close_diagnostics::record(false, || format!("native_focused={focused}"));
+                }
                 WindowEvent::MouseInput {
                     state,
                     button: iced_winit::winit::event::MouseButton::Left,

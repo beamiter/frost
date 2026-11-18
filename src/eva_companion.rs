@@ -2164,10 +2164,11 @@ impl Frost {
                 }
                 let panel = container(
                     content
-                        .push(
+                        .push(crate::widget_identity_scope::close_button(
+                            eva.close_ui_revision,
                             companion_button(text("Close anyway"))
                                 .on_press(Message::Eva(Event::ForceClose(eva.close_ui_revision))),
-                        )
+                        ))
                         .spacing(12),
                 )
                 .padding(24)
