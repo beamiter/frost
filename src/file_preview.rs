@@ -258,13 +258,16 @@ pub(crate) fn load(path: &str, cwd: &Path) -> Result<Preview, String> {
         }
         let text =
             String::from_utf8(bytes).map_err(|_| "File is not UTF-8 text or a supported image")?;
+        // A single initial UTF-8 signature identifies the text encoding, not
+        // visible content. Do not strip embedded/repeated BOMs or normalize paths.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
         if text.chars().any(|c| {
             !matches!(c, '\n' | '\r' | '\t')
                 && (c.is_control() || jterm_core::review_input::is_visual_spoofing_character(c))
         }) {
             return Err("Text contains unsafe control or formatting characters".into());
         }
-        Content::Text(text)
+        Content::Text(text.to_owned())
     };
     Ok(Preview {
         path: cwd.join(relative),
@@ -304,6 +307,37 @@ mod tests {
         assert!(!accepts_request(Some((1, 2)), (1, 2), Some(2)));
         assert!(!accepts_request(Some((1, 2)), (2, 2), Some(2)));
     }
+    #[test]
+    fn utf8_signature_is_only_allowed_once_at_start_of_text_content() {
+        let f = Fixture::new();
+        for name in ["note.md", "app.tsx"] {
+            std::fs::write(f.0.join(name), "\u{feff}first\r\nsecond\n").unwrap();
+            let preview = load(&format!("{name}:2"), &f.0).unwrap();
+            assert!(matches!(&preview.content, Content::Text(text) if text == "first\r\nsecond\n"));
+            assert!(preview.source_context().unwrap().contains("> 2 | second"));
+        }
+        for body in ["\u{feff}", "plain text"] {
+            std::fs::write(f.0.join("note.md"), body).unwrap();
+            assert!(matches!(load("note.md", &f.0).unwrap().content,
+                Content::Text(text) if text == body.strip_prefix('\u{feff}').unwrap_or(body)));
+        }
+        for body in [
+            "\u{feff}\u{feff}text",
+            "a\u{feff}b",
+            "\u{feff}a\u{202e}b",
+            "\u{feff}a\0b",
+        ] {
+            std::fs::write(f.0.join("note.md"), body).unwrap();
+            assert!(load("note.md", &f.0).is_err());
+        }
+        std::fs::write(f.0.join("\u{feff}note.md"), "text").unwrap();
+        assert!(load("\u{feff}note.md", &f.0).is_err());
+        let mut oversized = vec![b'a'; 64 * 1024];
+        oversized.splice(..0, [0xef, 0xbb, 0xbf]);
+        std::fs::write(f.0.join("note.md"), oversized).unwrap();
+        assert!(load("note.md", &f.0).unwrap_err().contains("64 KiB"));
+    }
+
     #[test]
     fn source_text_is_static_and_source_locations_are_supported() {
         let f = Fixture::new();
