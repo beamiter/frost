@@ -257,9 +257,7 @@ pub enum MouseInput {
         /// classify `block`. The app must never re-target a later neighbour
         /// merely because the viewport moved before update handled the press.
         block_zone_id: Option<u64>,
-        /// A Ctrl+single-left link activation claimed for its entire gesture.
-        /// No Drag/Release is emitted, so it can never mutate text selection or
-        /// leak half a mouse-reporting sequence after opening the link.
+        /// A Ctrl+single-left link activation confirmed on release.
         link: bool,
         /// Immutable terminal projection revision used to classify `link`.
         /// The application revalidates it before opening so resize, scrolling,
@@ -877,6 +875,7 @@ struct State {
     scroll_accum: f32,
     summary_press: Option<SummaryPress>,
     header_drag_press: Option<(MouseInput, ProjectionKey)>,
+    link_press: Option<(MouseInput, Option<crate::link::Link>)>,
     organism_pointer: organism_block::Pointer<OrganismBodyGeometry>,
     body_geometry: Option<OrganismBodyGeometry>,
     body_frame: u64,
@@ -889,6 +888,13 @@ struct SummaryPress {
     projection_key: ProjectionKey,
     point: Point,
     dragged: bool,
+}
+
+fn link_dragged(press: MouseInput, current: Point) -> bool {
+    let MouseInput::Press { x, y, .. } = press else {
+        return true;
+    };
+    (current.x - x).hypot(current.y - y) > 4.0
 }
 
 fn stable_summary_activation(
@@ -920,6 +926,7 @@ impl Default for State {
             scroll_accum: 0.0,
             summary_press: None,
             header_drag_press: None,
+            link_press: None,
             organism_pointer: organism_block::Pointer::default(),
             body_geometry: None,
             body_frame: 0,
@@ -4434,13 +4441,12 @@ impl<Message> TermWidget<'_, Message> {
                 // Clickable links keep their terminal color unless hovered.
                 let row_links: &[&crate::link::Link] =
                     links_by_row.get(row_idx).map(Vec::as_slice).unwrap_or(&[]);
-                let is_link = row_links
+                let link = row_links
                     .iter()
-                    .any(|l| col_idx >= l.col_start && col_idx < l.col_end);
-                if is_link {
-                    let is_hovered = hovered.is_some_and(|h| {
-                        h.line == row_idx && col_idx >= h.col_start && col_idx < h.col_end
-                    });
+                    .find(|link| (link.col_start..link.col_end).contains(&col_idx));
+                let is_link = link.is_some();
+                if let Some(link) = link {
+                    let is_hovered = hovered.is_some_and(|hover| hover.same_reference(link));
                     if is_hovered {
                         fg = hovered_link_color();
                     }
@@ -5809,6 +5815,7 @@ where
                 };
                 if button == MouseButton::Left {
                     state.header_drag_press = None;
+                    state.link_press = None;
                 }
                 if button == MouseButton::Left {
                     // A second press always supersedes an unfinished summary
@@ -6007,9 +6014,10 @@ where
                     block_mouse_action(button, finalized, row_is_header, shift, ctrl, count)
                 };
                 let block_zone_id = block.and_then(|_| block_row.and_then(|row| row.zone_id));
-                let link = block.is_none()
-                    && ctrl_link_eligible(button, count, ctrl, shift, link_eligible)
-                    && self.link_at(col, row).is_some();
+                let link_candidate = block.is_none()
+                    && !alt
+                    && ctrl_link_eligible(button, count, ctrl, shift, link_eligible);
+                let link = link_candidate && self.link_at(col, row).is_some();
                 let consumed = block.is_some() || link;
                 if consumed {
                     state.consumed_presses[button.slot()] = true;
@@ -6063,11 +6071,23 @@ where
                         state.header_drag_press = Some((text_press, key));
                     }
                 }
-                shell.publish(on_mouse(press));
+                if link || (link_candidate && !app_eligible) {
+                    state.link_press = Some((press, self.link_at(col, row).cloned()));
+                }
+                if !link {
+                    shell.publish(on_mouse(press));
+                }
                 shell.capture_event();
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 let pos = cursor.position().unwrap_or(Point::new(bounds.x, bounds.y));
+                if state
+                    .link_press
+                    .as_ref()
+                    .is_some_and(|(press, _)| link_dragged(*press, pos))
+                {
+                    state.link_press = None;
+                }
                 if let Some((press, key)) = state.header_drag_press.as_ref() {
                     if self.projection_key.as_ref() != Some(key) {
                         state.header_drag_press = None;
@@ -6156,6 +6176,48 @@ where
                         }
                         shell.capture_event();
                         return;
+                    }
+                }
+                if button == MouseButton::Left {
+                    if let Some((mut press, target)) = state.link_press.take() {
+                        let activated = cursor
+                            .position_over(bounds)
+                            .filter(|&pos| !link_dragged(press, pos))
+                            .and_then(|pos| {
+                                self.link_at_position(pos, bounds).map(|link| (pos, link))
+                            })
+                            .is_some_and(|(pos, current)| {
+                                let (col, row) = self.cell_at(pos, bounds);
+                                let MouseInput::Press {
+                                    col: pressed_col,
+                                    row: pressed_row,
+                                    link,
+                                    link_revision,
+                                    ..
+                                } = &mut press
+                                else {
+                                    return false;
+                                };
+                                if target.as_ref().map_or(
+                                    *link_revision == self.link_revision
+                                        && (*pressed_col, *pressed_row) == (col, row),
+                                    |target| current.same_reference(target),
+                                ) {
+                                    *pressed_col = col;
+                                    *pressed_row = row;
+                                    *link_revision = self.link_revision;
+                                    *link = true;
+                                    shell.publish(on_mouse(press));
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                        if activated {
+                            state.published_presses[button.slot()] = false;
+                            state.consumed_presses[button.slot()] = true;
+                            state.dragging = false;
+                        }
                     }
                 }
                 if state.consumed_presses[button.slot()] {
@@ -6428,6 +6490,7 @@ mod focus_state_tests {
             scroll_accum: 0.75,
             summary_press: None,
             header_drag_press: None,
+            link_press: None,
             organism_pointer: organism_block::Pointer::default(),
             body_geometry: None,
             body_frame: 0,
@@ -7084,6 +7147,45 @@ mod mode_gesture_tests {
     fn moved(point: Point) -> Event {
         Event::Mouse(mouse::Event::CursorMoved { position: point })
     }
+    #[test]
+    fn wrapped_link_click_waits_for_release_and_cancels_after_dragging() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = Theme::default();
+        let point = Point::new(50.0, 25.0);
+        let bounds = Rectangle::with_size(Size::new(600.0, 150.0));
+        for drag in [false, true] {
+            let (col, row) =
+                fixture(&projection, &theme, TerminalMode::Normal, 0).cell_at(point, bounds);
+            let links = [crate::link::Link {
+                group: Some((row.saturating_sub(1), 20)),
+                line: row,
+                col_start: 0,
+                col_end: col + 1,
+                link_type: crate::link::LinkType::Url,
+                text: "https://example.org/wrapped".into(),
+            }];
+            let mut widget = fixture(&projection, &theme, TerminalMode::Normal, 0)
+                .links(&links, projection.view_revision());
+            widget.ctrl = true;
+            let mut retained = tree(&widget);
+            assert!(send(&mut widget, &mut retained, press(), point).is_empty());
+            if drag {
+                let farther = Point::new(point.x + 35.0, point.y);
+                assert!(send(&mut widget, &mut retained, moved(farther), farther).is_empty());
+            }
+            let release = send(&mut widget, &mut retained, release(), point);
+            if drag {
+                assert!(release.is_empty());
+            } else {
+                assert!(matches!(
+                    release.as_slice(),
+                    [Output::Mouse(MouseInput::Press { link: true, .. })]
+                ));
+            }
+        }
+    }
+
     #[test]
     fn projection_unavailable_blocks_pointer_events_and_clears_retained_gestures() {
         let mut terminal = crate::terminal::TerminalState::new(80, 8);

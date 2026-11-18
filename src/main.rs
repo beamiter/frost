@@ -31,6 +31,7 @@ mod command_palette;
 mod config;
 mod config_retry;
 mod debug;
+mod delimited_reference;
 mod eva_companion;
 #[cfg(all(test, unix))]
 mod eva_handoff_tests;
@@ -14833,18 +14834,17 @@ impl Frost {
             if button != MouseButton::Right {
                 if let Some(source) = self.session_index_by_id(source_session_id) {
                     let sess = &mut self.sessions[source];
-                    sess.block_selection.clear();
-                    sess.refresh();
+                    if !sess.block_selection.is_empty() {
+                        sess.block_selection.clear();
+                        sess.refresh();
+                    }
                 }
             }
             self.block_menu = None;
         }
 
-        // Link metadata is active-pane scoped. An inactive pane therefore
-        // cannot classify the link inside its widget; focusing it refreshes
-        // `self.links` before this handler runs. If that second, authoritative
-        // lookup claims the press, retain a consumed app-layer slot so the
-        // widget's already-armed Drag/Release sequence is swallowed whole.
+        // The widget has resolved this Ctrl-click at release. Check the
+        // current pane and its exact link revision before opening the target.
         if let MouseInput::Press {
             col,
             row,
@@ -14853,7 +14853,7 @@ impl Frost {
             shift,
             count,
             link_eligible,
-            link: widget_claimed_link,
+            link: true,
             link_revision,
             ..
         } = input
@@ -14878,40 +14878,27 @@ impl Frost {
                         .flatten()
                 })
                 .flatten();
-            if widget_claimed_link || current_link.is_some() {
-                self.click_tracker.cancel();
-                self.terminal_mouse_gestures[button.slot()] =
-                    (!widget_claimed_link).then_some(TerminalMouseGesture {
-                        session_id: source_session_id,
-                        button,
-                        report_to_app: false,
-                        last_app_cell: None,
-                        consumed: true,
-                    });
-                if let Some(link) = current_link {
-                    if link.link_type == link::LinkType::FilePath {
-                        return self.begin_file_preview(
-                            source_session_id,
-                            link_revision,
-                            link.text,
-                            false,
-                        );
-                    }
-                    let cwd = self
-                        .session_index_by_id(source_session_id)
-                        .and_then(|source| self.sessions.get(source))
-                        .and_then(|session| session.cwd_cache.clone().or_else(|| session.cwd()));
-                    if let Err(error) =
-                        link::open_link(&link, cwd.as_deref().map(std::path::Path::new))
-                    {
-                        self.push_toast(
-                            format!("Could not open link: {error}"),
-                            ToastKind::Warning,
-                        );
-                    }
+            self.click_tracker.cancel();
+            self.terminal_mouse_gestures[button.slot()] = None;
+            if let Some(link) = current_link {
+                if link.link_type == link::LinkType::FilePath {
+                    return self.begin_file_preview(
+                        source_session_id,
+                        link_revision,
+                        link.text,
+                        false,
+                    );
                 }
-                return Task::none();
+                let cwd = self
+                    .session_index_by_id(source_session_id)
+                    .and_then(|source| self.sessions.get(source))
+                    .and_then(|session| session.cwd_cache.clone().or_else(|| session.cwd()));
+                if let Err(error) = link::open_link(&link, cwd.as_deref().map(std::path::Path::new))
+                {
+                    self.push_toast(format!("Could not open link: {error}"), ToastKind::Warning);
+                }
             }
+            return Task::none();
         }
 
         // Resolve each event to the stable pane chosen at press time. Focus may
@@ -14928,7 +14915,7 @@ impl Frost {
                     return Task::none();
                 };
                 let report_to_app = app_owns_terminal_mouse(
-                    self.sessions[source].terminal.is_mouse_enabled(),
+                    self.sessions[source].terminal.application_owns_pointer(),
                     shift,
                     app_eligible,
                     false,
@@ -14978,7 +14965,7 @@ impl Frost {
                 };
                 (
                     app_owns_terminal_wheel(
-                        self.sessions[source].terminal.is_mouse_enabled(),
+                        self.sessions[source].terminal.application_owns_pointer(),
                         shift,
                         app_eligible,
                     ),
@@ -15043,11 +15030,28 @@ impl Frost {
                     }
                     return Task::none();
                 }
+                if button == MouseButton::Left && sess.transcript_canvas.enabled() {
+                    sess.transcript_canvas.cancel();
+                    sess.hold_transcript_reading_position();
+                }
                 match button {
                     MouseButton::Left => match count {
-                        2 => sess
-                            .terminal
-                            .select_word_in_projection(&sess.projection, row, col),
+                        2 => {
+                            if let Some(link) = self.links.iter().find(|link| {
+                                self.links_cache_key == Some((sess.id, sess.projection.key()))
+                                    && link.line == row
+                                    && (link.col_start..link.col_end).contains(&col)
+                            }) {
+                                sess.terminal.select_link_in_projection(
+                                    &sess.projection,
+                                    link,
+                                    &self.links,
+                                );
+                            } else {
+                                sess.terminal
+                                    .select_word_in_projection(&sess.projection, row, col);
+                            }
+                        }
                         n if n >= 3 => sess
                             .terminal
                             .select_line_in_projection(&sess.projection, row),
@@ -15142,6 +15146,11 @@ impl Frost {
                     return Task::none();
                 }
                 if button == MouseButton::Left {
+                    if clicked_cell.is_none()
+                        && self.links_cache_key == Some((sess.id, sess.projection.key()))
+                    {
+                        sess.terminal.normalize_link_selection(&sess.projection, &self.links);
+                    }
                     // A plain click must be handled before the selection copy:
                     // the press already anchored a one-cell selection, so
                     // `copy_selection` would return that cell's character and
@@ -23098,13 +23107,7 @@ impl Frost {
         let osc8_links = sess
             .terminal
             .osc8_links_in_visible_cells(sess.projection.row_view());
-        links.retain(|detected| {
-            !osc8_links.iter().any(|explicit| {
-                detected.line == explicit.line
-                    && detected.col_start < explicit.col_end
-                    && explicit.col_start < detected.col_end
-            })
-        });
+        link::keep_uncovered(&mut links, &osc8_links);
         links.extend(
             osc8_links
                 .into_iter()
@@ -27437,7 +27440,7 @@ impl Frost {
         .transcript_canvas(
             &sess.transcript_canvas,
             sess.projection.has_canvas_head(),
-            sess.terminal.is_mouse_enabled() && !sess.reading_agent(),
+            sess.terminal.application_owns_pointer(),
             move |rows, precise| {
                 Message::ProjectedTranscriptScroll(
                     session_id,
@@ -37125,6 +37128,51 @@ mod tests {
         session.set_scroll_offset(20);
         assert!(session.transcript_scroll_domain().is_some());
         session
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inline_cli_drag_keeps_its_native_anchor_while_output_scrolls() {
+        let mut session = relative_scroll_fixture();
+        session.terminal.process_input(b"\x1b[?1002h");
+        assert!(session.terminal.is_mouse_enabled());
+        assert!(!super::app_owns_terminal_mouse(
+            session.terminal.application_owns_pointer(),
+            false,
+            true,
+            false,
+        ));
+        session.refresh();
+
+        let row = (0..session.projection.row_view().len())
+            .find(|&row| {
+                session
+                    .projection
+                    .row_view()
+                    .get(row)
+                    .is_some_and(|cells| cells[0].character == 'C')
+            })
+            .unwrap();
+        let cell = terminal::ViewportCell { row, col: 0 };
+        let anchor = session.projection.view_to_raw(cell).unwrap();
+        session.transcript_canvas.cancel();
+        session.hold_transcript_reading_position();
+        session.terminal.start_selection_in_projection(
+            &session.projection,
+            (row, 0),
+            terminal::SelectionMode::Normal,
+        );
+        session
+            .terminal
+            .process_input(b"\x1b[?2026hworking...\r\nnew output\r\n\x1b[?2026l");
+        session.refresh();
+        assert_eq!(session.projection.view_to_raw(cell), Some(anchor));
+        session
+            .terminal
+            .update_selection_in_projection(&session.projection, (row, 6));
+        let copied = session.terminal.copy_selection().unwrap();
+        assert!(copied.starts_with("CLI"));
+        assert_eq!(copied.len(), 7);
     }
 
     #[cfg(target_os = "linux")]
