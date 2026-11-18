@@ -321,7 +321,10 @@ impl LinkDetector {
                 .unwrap_or(trimmed)
                 .rsplit_once('.')
                 .is_some_and(|(stem, extension)| {
-                    !stem.is_empty() && matches!(extension, "tsx" | "md" | "png" | "jpg" | "jpeg")
+                    !stem.is_empty()
+                        && ["tsx", "md", "png", "jpg", "jpeg"]
+                            .iter()
+                            .any(|allowed| extension.eq_ignore_ascii_case(allowed))
                 })
     }
 
@@ -1171,6 +1174,28 @@ mod tests {
 #[cfg(test)]
 mod local_preview_links {
     use super::*;
+    #[test]
+    fn bare_preview_extensions_match_loader_case_policy() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let links =
+            detector.detect_links_in_line("图 PHOTO.PNG IMG_001.JpEg 文档.MD 界面.TSX:4:2", 0);
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| link.text.as_str())
+                .collect::<Vec<_>>(),
+            ["PHOTO.PNG", "IMG_001.JpEg", "文档.MD", "界面.TSX:4:2"]
+        );
+        assert_eq!(links[0].col_start, 2);
+        assert!(links
+            .iter()
+            .all(|link| link.link_type == LinkType::FilePath));
+        assert!(detector
+            .detect_links_in_line("PHOTO.PNG.exe app.TSX:bad http://example.org/PHOTO.PNG", 0)
+            .iter()
+            .all(|link| link.link_type != LinkType::FilePath));
+    }
+
     #[test]
     fn bare_preview_names_and_source_locations_preserve_unicode_columns() {
         let detector = LinkDetector::new(LinkDetectionConfig::default());
