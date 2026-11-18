@@ -8629,7 +8629,12 @@ impl Frost {
             Some(Ok(preview)) => {
                 let content: Element<'_, Message> = match &preview.content {
                     file_preview::Content::Text(value) => {
-                        scrollable(text(value).font(iced::Font::MONOSPACE)).into()
+                        let mut body = column![];
+                        if let Some(context) = preview.source_context() {
+                            body = body.push(text(context).font(iced::Font::MONOSPACE));
+                        }
+                        body = body.push(text(value).font(iced::Font::MONOSPACE));
+                        scrollable(body.spacing(12)).into()
                     }
                     file_preview::Content::Image(handle) => iced::widget::image(handle.clone())
                         .width(Length::Fill)

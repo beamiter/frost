@@ -14,6 +14,62 @@ pub(crate) enum Content {
 pub(crate) struct Preview {
     pub path: PathBuf,
     pub content: Content,
+    pub location: Option<(usize, Option<usize>)>,
+}
+
+/// Source coordinates are one-based. Invalid/overflowing coordinates never
+/// influence path resolution or allocate a padding buffer.
+fn source_location(path: &str) -> Option<(&str, usize, Option<usize>)> {
+    let (prefix, last) = path.rsplit_once(':')?;
+    let positive = |value: &str| {
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        value.parse::<usize>().ok().filter(|value| *value > 0)
+    };
+    let last = positive(last)?;
+    match prefix.rsplit_once(':') {
+        Some((path, line)) if line.bytes().all(|b| b.is_ascii_digit()) => {
+            Some((path, positive(line)?, Some(last)))
+        }
+        _ => Some((prefix, last, None)),
+    }
+}
+
+impl Preview {
+    /// A small, numbered context above the complete static text. Columns are
+    /// reported verbatim, not converted to byte offsets (compiler units vary).
+    pub fn source_context(&self) -> Option<String> {
+        let (line, column) = self.location?;
+        let Content::Text(value) = &self.content else {
+            return None;
+        };
+        let total = value.split('\n').count();
+        let heading = match column {
+            Some(column) => format!("Requested line {line}, column {column}"),
+            None => format!("Requested line {line}"),
+        };
+        if line > total {
+            return Some(format!("{heading} · outside this file ({total} lines)"));
+        }
+        let start = line.saturating_sub(3);
+        let context = value
+            .split('\n')
+            .enumerate()
+            .skip(start)
+            .take(5)
+            .map(|(index, value)| {
+                format!(
+                    "{} {} | {}",
+                    if index + 1 == line { ">" } else { " " },
+                    index + 1,
+                    value.strip_suffix('\r').unwrap_or(value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(format!("{heading}\n{context}\n\nComplete file below:"))
+    }
 }
 
 /// Match only the frozen, still-live request, never just the current filename.
@@ -112,25 +168,16 @@ fn open_regular(_: &Path, _: &Path) -> Result<std::fs::File, String> {
 
 pub(crate) fn load(path: &str, cwd: &Path) -> Result<Preview, String> {
     let mut relative = relative_path(path, cwd)?;
+    let mut location = None;
     let mut file = match open_regular(cwd, &relative) {
         Ok(file) => file,
         Err(original) => {
             // Compiler source locations are interpreted only after the exact
             // displayed filename fails. Never silently strip arbitrary colons.
-            let Some((prefix, number)) = path.rsplit_once(':') else {
+            let Some((prefix, line, column)) = source_location(path) else {
                 return Err(original);
             };
-            if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(original);
-            }
-            let prefix = match prefix.rsplit_once(':') {
-                Some((prefix, line))
-                    if !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit()) =>
-                {
-                    prefix
-                }
-                _ => prefix,
-            };
+            location = Some((line, column));
             relative = relative_path(prefix, cwd)?;
             open_regular(cwd, &relative)?
         }
@@ -186,8 +233,8 @@ pub(crate) fn load(path: &str, cwd: &Path) -> Result<Preview, String> {
         let text =
             String::from_utf8(bytes).map_err(|_| "File is not UTF-8 text or a supported image")?;
         if text.chars().any(|c| {
-            (c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
-                || jterm_core::review_input::is_visual_spoofing_character(c)
+            !matches!(c, '\n' | '\r' | '\t')
+                && (c.is_control() || jterm_core::review_input::is_visual_spoofing_character(c))
         }) {
             return Err("Text contains unsafe control or formatting characters".into());
         }
@@ -196,6 +243,7 @@ pub(crate) fn load(path: &str, cwd: &Path) -> Result<Preview, String> {
     Ok(Preview {
         path: cwd.join(relative),
         content,
+        location,
     })
 }
 
@@ -245,6 +293,53 @@ mod tests {
         ));
     }
     #[test]
+    fn source_context_is_numbered_bounded_and_preserves_exact_colon_names() {
+        let f = Fixture::new();
+        std::fs::write(
+            f.0.join("app.tsx"),
+            "first\n界é\nthird\nfourth\nfifth\nsixth",
+        )
+        .unwrap();
+        let p = load("app.tsx:2:99", &f.0).unwrap();
+        let context = p.source_context().unwrap();
+        assert!(context.contains("Requested line 2, column 99"));
+        assert!(context.contains("> 2 | 界é"));
+        assert!(!context.contains("sixth"));
+        assert!(matches!(p.content, Content::Text(ref text) if text.ends_with("sixth")));
+        assert!(load("app.tsx:999", &f.0)
+            .unwrap()
+            .source_context()
+            .unwrap()
+            .contains("outside this file"));
+        for suffix in ["0", "2:0", "184467440737095516160", "2:bad"] {
+            assert!(load(&format!("app.tsx:{suffix}"), &f.0).is_err());
+        }
+        std::fs::write(f.0.join("app.tsx:2:99"), "literal filename").unwrap();
+        let exact = load("app.tsx:2:99", &f.0).unwrap();
+        assert!(exact.location.is_none());
+        assert!(exact.source_context().is_none());
+    }
+
+    #[test]
+    fn source_context_preserves_empty_eof_lines_and_crlf() {
+        let f = Fixture::new();
+        for (body, line, expected) in [
+            ("", 1, "> 1 | "),
+            ("first\n", 2, "> 2 | "),
+            ("first\r\nsecond\r\n", 2, "> 2 | second"),
+        ] {
+            std::fs::write(f.0.join("note.md"), body).unwrap();
+            let context = load(&format!("note.md:{line}"), &f.0)
+                .unwrap()
+                .source_context()
+                .unwrap();
+            assert!(context.contains(expected), "{context}");
+            assert!(!context.contains("outside"));
+            assert!(!context.contains('\r'));
+        }
+    }
+
+    #[test]
     fn rejects_escape_symlink_directory_and_fifo_without_reading() {
         let f = Fixture::new();
         std::fs::write(f.0.join("safe"), "ok").unwrap();
@@ -272,6 +367,7 @@ mod tests {
             ("big.txt", vec![b'a'; 65537]),
             ("bad.txt", vec![0xff]),
             ("escape.txt", b"\x1b[31m".to_vec()),
+            ("bidi.txt", "\u{202e}spoof".as_bytes().to_vec()),
         ] {
             std::fs::write(f.0.join(name), bytes).unwrap();
             assert!(load(name, &f.0).is_err());
