@@ -166,6 +166,9 @@ def main():
          "        self.files_surface_visible(),\n",
          "        self.sidebar_open,\n"),
     ]
+    for field in ("file_preview_confirmation", "file_preview_pending", "file_preview"):
+        mutants.append(("retain-stale-" + field,
+                        f"    self.{field} = None;\n", ""))
     for name, original in drawer_decisions((ROOT / "src/main.rs").read_text()).items():
         mutants.append(("legacy-drawer-decision-" + name, original,
                         original.replace("self.reference_layout().inspector.is_none()",

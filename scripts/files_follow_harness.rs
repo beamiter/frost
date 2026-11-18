@@ -330,6 +330,11 @@ impl DropIntentInvalidation {
 }
 
 struct TerminalApp {
+    // Preview payload is opaque here: this harness exercises the production
+    // focus-change invalidation, not image decoding or preview rendering.
+    file_preview_confirmation: Option<(usize, u64, String, String)>,
+    file_preview_pending: Option<(usize, u64)>,
+    file_preview: Option<(usize, u64, Result<(), String>)>,
     config: config::Config,
     win_size: Size,
     reference_inspector_open: bool,
@@ -430,6 +435,9 @@ fn setup() -> Rc<RefCell<TerminalApp>> {
         sidebar_panel: SidebarPanel::Tabs,
     };
     Rc::new(RefCell::new(TerminalApp {
+        file_preview_confirmation: None,
+        file_preview_pending: None,
+        file_preview: None,
         config: config::Config::default(),
         win_size: Size { width: 1356.0, height: 704.0 },
         reference_inspector_open: true,
@@ -1003,3 +1011,19 @@ fn long_labels_and_tree_roots_keep_narrow_drawer_follow_intent_and_loaded_rows()
     }
 }
 // @files-follow:native-tests
+
+#[test]
+fn source_focus_change_retires_preview_confirmation_worker_and_content() {
+    let app = setup();
+    {
+        let mut app = app.borrow_mut();
+        app.file_preview_confirmation = Some((3, 9, "note.md".into(), "/tmp".into()));
+        app.file_preview_pending = Some((3, 10));
+        app.file_preview = Some((3, 8, Ok(())));
+        app.active_session_changed_for_remote_follow();
+    }
+    let app = app.borrow();
+    assert!(app.file_preview_confirmation.is_none());
+    assert!(app.file_preview_pending.is_none());
+    assert!(app.file_preview.is_none());
+}
