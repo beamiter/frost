@@ -246,6 +246,11 @@ esac
             }
         }
         fn run(&self) -> io::Result<PathBuf> {
+            // Success checks verify transport semantics, not scheduler latency.
+            // Keep the short deadline only in the deliberate failure fixtures.
+            self.run_with_deadline(default_spec().listing_deadline)
+        }
+        fn run_with_deadline(&self, deadline: Duration) -> io::Result<PathBuf> {
             run_spec(
                 &self.bin,
                 &self.corpus,
@@ -254,8 +259,8 @@ esac
                     name: WORKER,
                     marker: &self.marker,
                     hash: &self.hash,
-                    listing_deadline: Duration::from_millis(150),
-                    worker_deadline: Duration::from_millis(150),
+                    listing_deadline: deadline,
+                    worker_deadline: deadline,
                     diagnostic_limit: 1024,
                     actual_limit: 1024,
                 },
@@ -296,7 +301,10 @@ esac
             "mismatch",
         ] {
             let f = Fixture::new(mode);
-            assert!(f.run().is_err(), "{mode}");
+            assert!(
+                f.run_with_deadline(Duration::from_millis(150)).is_err(),
+                "{mode}"
+            );
             f.reaped();
         }
     }
