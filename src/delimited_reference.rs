@@ -8,10 +8,11 @@ const MAX_BYTES: usize = 4096;
 pub(crate) struct Reference {
     pub target: String,
     pub web: bool,
+    pub ambiguous: bool,
     pub spans: Vec<(usize, Range<usize>)>,
 }
 
-pub(crate) fn detect(rows: &[(&str, bool)]) -> Vec<Reference> {
+pub(crate) fn detect(rows: &[(&str, bool)], soft_wraps: &[bool]) -> Vec<Reference> {
     static DESTINATION: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(
             r"\(((?:(?i:https?)://|(?:\.{0,2}|~)/|[\p{L}\p{N}_][\p{L}\p{N}\p{M}_.-]*/)[^()\r\n]*(?:\n[^()\r\n]+){0,7})\)",
@@ -43,48 +44,64 @@ pub(crate) fn detect(rows: &[(&str, bool)]) -> Vec<Reference> {
             continue;
         }
         let first_row = row_starts.partition_point(|&start| start <= raw.start()) - 1;
-        let mut spans = Vec::new();
+        let raw_web = raw.as_str().split_once("://").is_some_and(|(scheme, _)| {
+            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+        });
         let mut target = String::new();
+        let mut spans = Vec::new();
+        let mut ambiguous = false;
         for (index, fragment) in raw.as_str().split('\n').enumerate() {
             let row = first_row + index;
-            let fragment_offset = if index == 0 {
+            let start = if index == 0 {
                 raw.start() - row_starts[row]
             } else {
                 0
             };
-            let trimmed = fragment.trim();
-            if trimmed.is_empty() || index >= MAX_ROWS {
+            if fragment.is_empty() || index >= MAX_ROWS {
                 break;
             }
-            // A full row or an explicit token break is evidence of wrapping.
-            // A short row ending in prose must not capture the next line.
-            if index != 0 && !rows[row - 1].1 && !target.ends_with(['-', '/', '_', '.']) {
-                break;
+            // No trim: spaces are filename data, and whitespace in a URL is
+            // ambiguity, not permission to choose a different destination.
+            spans.push((row, start..start + fragment.len()));
+            target.push_str(fragment);
+            if index > 0 && (soft_wraps.len() != rows.len() || !soft_wraps[row - 1]) {
+                ambiguous = true;
             }
-            let start = fragment_offset + fragment.len() - fragment.trim_start().len();
-            spans.push((row, start..start + trimmed.len()));
-            target.push_str(trimmed);
         }
-        if spans.len() != raw.as_str().bytes().filter(|&b| b == b'\n').count() + 1
-            || target.chars().any(char::is_control)
-        {
+        if spans.len() != raw.as_str().split('\n').count() {
             continue;
         }
-        let web = target.split_once("://").is_some_and(|(scheme, _)| {
-            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+        let multiline = spans.len() > 1;
+        let valid_target = if raw_web {
+            !target.contains(char::is_whitespace) && jterm_core::link::is_openable_url(&target)
+        } else {
+            !target.contains("://")
+                && !target.contains(['\\', '<', '>', '|'])
+                && !target.chars().any(char::is_control)
+                && !jterm_core::review_input::contains_visual_spoofing(&target)
+                && FILE_END.is_match(&target)
+        };
+        ambiguous |= !valid_target;
+        // Retain the entire blocked group before validating its target so
+        // ordinary per-line detection cannot expose a different fragment.
+        if ambiguous {
+            references.push(Reference {
+                target,
+                web: raw_web,
+                ambiguous,
+                spans,
+            });
+            continue;
+        }
+        if !multiline && (raw_web || !target.contains(char::is_whitespace)) {
+            continue;
+        }
+        references.push(Reference {
+            target,
+            web: raw_web,
+            ambiguous: false,
+            spans,
         });
-        if web {
-            if spans.len() == 1 {
-                continue;
-            }
-        } else if target.contains("://")
-            || target.contains(['\\', '<', '>', '|'])
-            || !FILE_END.is_match(&target)
-            || (spans.len() == 1 && !target.contains(char::is_whitespace))
-        {
-            continue;
-        }
-        references.push(Reference { target, web, spans });
     }
     references
 }
@@ -102,24 +119,29 @@ mod tests {
                 false,
             ),
         ];
-        let references = detect(&rows);
+        let references = detect(&rows, &[]);
         assert_eq!(references.len(), 2);
         assert_eq!(
             references[0].target,
-            "/tmp/中 文/PMG-SOTA-roadmap.canvas.tsx"
+            "/tmp/中 文/PMG-SOTA-    roadmap.canvas.tsx"
         );
-        assert_eq!(references[0].spans[1], (1, 4..22));
+        assert!(references[0].ambiguous);
+        assert_eq!(references[0].spans[1], (1, 0..22));
         assert_eq!(references[1].target, "reports/接触 优化.md");
     }
 
     #[test]
     fn joins_only_with_a_supported_boundary_and_delimiter() {
-        assert!(detect(&[("(/tmp/first", false), ("second.md)", false)]).is_empty());
-        assert!(detect(&[("(/tmp/first-", false), ("second.md", false)]).is_empty());
-        let rejected = detect(&[("(https://user@host/a-", false), ("b)", false)]);
+        assert!(detect(&[("(/tmp/first", false), ("second.md)", false)], &[])[0].ambiguous);
+        assert!(detect(&[("(/tmp/first-", false), ("second.md", false)], &[]).is_empty());
+        let rejected = detect(&[("(https://user@host/a-", false), ("b)", false)], &[]);
         assert!(!jterm_core::link::is_openable_url(&rejected[0].target));
-        let links = detect(&[("(https://example.org/one-", false), ("two)", false)]);
+        let links = detect(
+            &[("(https://example.org/one-", false), ("two)", false)],
+            &[],
+        );
         assert!(links[0].web);
+        assert!(links[0].ambiguous);
         assert_eq!(links[0].target, "https://example.org/one-two");
     }
 }

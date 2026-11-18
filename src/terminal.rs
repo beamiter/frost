@@ -13244,7 +13244,10 @@ impl TerminalState {
         viewport: &ProjectedViewport,
         links: &[crate::link::Link],
     ) {
-        for link in links.iter().filter(|link| link.group == Some((link.line, link.col_start))) {
+        for link in links
+            .iter()
+            .filter(|link| link.group == Some((link.line, link.col_start)))
+        {
             let (start, end) = link.selection_bounds(links);
             if self.selection_matches_link(viewport, start, end) {
                 self.remember_link_selection(link);
@@ -13266,9 +13269,16 @@ impl TerminalState {
             let (Some(start), Some(end)) = (
                 Self::projected_selection_point(viewport, start),
                 Self::projected_selection_point(viewport, end),
-            ) else { return false };
+            ) else {
+                return false;
+            };
             return selection.mode == SelectionMode::Normal
-                && matches(selection.anchor.point, selection.active.point, start.point, end.point);
+                && matches(
+                    selection.anchor.point,
+                    selection.active.point,
+                    start.point,
+                    end.point,
+                );
         }
         self.selection.is_some_and(|selection| {
             selection.mode == SelectionMode::Normal

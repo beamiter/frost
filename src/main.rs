@@ -15149,7 +15149,8 @@ impl Frost {
                     if clicked_cell.is_none()
                         && self.links_cache_key == Some((sess.id, sess.projection.key()))
                     {
-                        sess.terminal.normalize_link_selection(&sess.projection, &self.links);
+                        sess.terminal
+                            .normalize_link_selection(&sess.projection, &self.links);
                     }
                     // A plain click must be handled before the selection copy:
                     // the press already anchored a one-cell selection, so
