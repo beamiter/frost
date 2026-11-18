@@ -119,10 +119,31 @@ fn relative_path(path: &str, cwd: &Path) -> Result<PathBuf, String> {
     Ok(result)
 }
 
+#[derive(Debug)]
+struct OpenError {
+    message: String,
+    missing_final_component: bool,
+}
+impl OpenError {
+    fn rejected(error: impl std::fmt::Display) -> Self {
+        Self {
+            message: error.to_string(),
+            missing_final_component: false,
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn component(error: std::io::Error, last: bool) -> Self {
+        Self {
+            missing_final_component: last && error.kind() == std::io::ErrorKind::NotFound,
+            message: error.to_string(),
+        }
+    }
+}
+
 // Walk from a pinned directory descriptor. Refuse symlinks at every component,
 // including races after validation; O_NONBLOCK prevents FIFO/device open hangs.
 #[cfg(target_os = "linux")]
-fn open_regular(cwd: &Path, relative: &Path) -> Result<std::fs::File, String> {
+fn open_regular(cwd: &Path, relative: &Path) -> Result<std::fs::File, OpenError> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -131,10 +152,10 @@ fn open_regular(cwd: &Path, relative: &Path) -> Result<std::fs::File, String> {
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
         .open(cwd)
-        .map_err(|e| e.to_string())?;
+        .map_err(OpenError::rejected)?;
     let components: Vec<_> = relative.components().collect();
     for (index, component) in components.iter().enumerate() {
-        let name = CString::new(component.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        let name = CString::new(component.as_os_str().as_bytes()).map_err(OpenError::rejected)?;
         let last = index + 1 == components.len();
         let flags = (if last { libc::O_PATH } else { libc::O_RDONLY })
             | libc::O_CLOEXEC
@@ -145,25 +166,27 @@ fn open_regular(cwd: &Path, relative: &Path) -> Result<std::fs::File, String> {
         // openat returns a new descriptor whose sole owner is the File below.
         let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error().to_string());
+            return Err(OpenError::component(std::io::Error::last_os_error(), last));
         }
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
         if last {
-            if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-                return Err("Only regular files can be previewed".into());
+            if !file.metadata().map_err(OpenError::rejected)?.is_file() {
+                return Err(OpenError::rejected("Only regular files can be previewed"));
             }
             // Reopen the checked, pinned inode, not the attacker-controlled path.
             // O_PATH above never opens a device/FIFO for I/O.
             return std::fs::File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))
-                .map_err(|e| e.to_string());
+                .map_err(OpenError::rejected);
         }
         dir = file;
     }
-    Err("Choose a regular file".into())
+    Err(OpenError::rejected("Choose a regular file"))
 }
 #[cfg(not(target_os = "linux"))]
-fn open_regular(_: &Path, _: &Path) -> Result<std::fs::File, String> {
-    Err("Safe local preview is not supported on this platform".into())
+fn open_regular(_: &Path, _: &Path) -> Result<std::fs::File, OpenError> {
+    Err(OpenError::rejected(
+        "Safe local preview is not supported on this platform",
+    ))
 }
 
 pub(crate) fn load(path: &str, cwd: &Path) -> Result<Preview, String> {
@@ -172,14 +195,17 @@ pub(crate) fn load(path: &str, cwd: &Path) -> Result<Preview, String> {
     let mut file = match open_regular(cwd, &relative) {
         Ok(file) => file,
         Err(original) => {
-            // Compiler source locations are interpreted only after the exact
-            // displayed filename fails. Never silently strip arbitrary colons.
+            // Only an absent final name may be a compiler source location.
+            // Never turn a denied/unsafe exact candidate into a different file.
+            if !original.missing_final_component {
+                return Err(original.message);
+            }
             let Some((prefix, line, column)) = source_location(path) else {
-                return Err(original);
+                return Err(original.message);
             };
             location = Some((line, column));
             relative = relative_path(prefix, cwd)?;
-            open_regular(cwd, &relative)?
+            open_regular(cwd, &relative).map_err(|error| error.message)?
         }
     };
     if file.metadata().map_err(|e| e.to_string())?.len() > BYTE_LIMIT {
@@ -337,6 +363,50 @@ mod tests {
             assert!(!context.contains("outside"));
             assert!(!context.contains('\r'));
         }
+    }
+
+    #[test]
+    fn source_location_fallback_requires_missing_final_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        std::fs::write(f.0.join("app.tsx"), "source").unwrap();
+        assert_eq!(
+            load("app.tsx:2:3", &f.0).unwrap().location,
+            Some((2, Some(3)))
+        );
+        let exact = f.0.join("app.tsx:2");
+        symlink("app.tsx", &exact).unwrap();
+        assert!(
+            load("app.tsx:2", &f.0).is_err(),
+            "a refused symlink must not select another file"
+        );
+        std::fs::remove_file(&exact).unwrap();
+        std::fs::create_dir(&exact).unwrap();
+        assert!(
+            load("app.tsx:2", &f.0).is_err(),
+            "a directory must not select another file"
+        );
+        std::fs::remove_dir(&exact).unwrap();
+        std::fs::write(&exact, "exact").unwrap();
+        assert!(load("app.tsx:2", &f.0).unwrap().location.is_none());
+        std::fs::set_permissions(&exact, std::fs::Permissions::from_mode(0)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(
+                load("app.tsx:2", &f.0).is_err(),
+                "permission denial must not select another file"
+            );
+        }
+        assert!(
+            !OpenError::component(std::io::Error::from_raw_os_error(libc::EACCES), true)
+                .missing_final_component
+        );
+        assert!(
+            !open_regular(&f.0, Path::new("missing/app.tsx:2"))
+                .unwrap_err()
+                .missing_final_component
+        );
+        std::fs::set_permissions(&exact, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load("missing/app.tsx:2", &f.0).is_err());
     }
 
     #[test]
