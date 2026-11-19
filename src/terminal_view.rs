@@ -1080,6 +1080,7 @@ pub struct TermWidget<'a, Message> {
     chat_rows: &'a [crate::chat_mode::ChatRow],
     chat_projection: Option<&'a crate::terminal::ProjectedViewport>,
     projection_available: bool,
+    paint_retained_projection: bool,
     on_chat_submit: Option<Box<dyn Fn() -> Message + 'a>>,
     organism_body: Option<OrganismBody>,
     organism_status: Option<crate::organism::LivePresentation>,
@@ -1146,6 +1147,12 @@ impl<'a, Message> TermWidget<'a, Message> {
         self
     }
 
+    /// Reuse the published cells while live coordinates are temporarily stale.
+    pub fn paint_retained_projection(mut self, retained: bool) -> Self {
+        self.paint_retained_projection = retained;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         grid: impl Into<crate::terminal::RowView<'a>>,
@@ -1197,6 +1204,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             chat_rows: &[],
             chat_projection: None,
             projection_available: true,
+            paint_retained_projection: false,
             on_chat_submit: None,
             organism_body: None,
             organism_status: None,
@@ -6339,7 +6347,7 @@ where
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        if !self.projection_available {
+        if !self.projection_available && !self.paint_retained_projection {
             return;
         }
         let bounds = self.prompt_presentation_bounds(layout.bounds(), viewport);

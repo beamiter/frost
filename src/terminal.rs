@@ -8323,24 +8323,26 @@ impl TerminalState {
         }
     }
 
-    /// Check if sync output timed out (>1s) and auto-clear if so
-    pub fn check_sync_output_timeout(&mut self) {
-        if self.sync_output_active {
-            if let Some(start) = self.sync_output_start {
-                if start.elapsed() > std::time::Duration::from_secs(1) {
-                    if self.use_alt_buffer {
-                        self.archive_alt_screen_frame();
-                    } else {
-                        self.last_synced_primary_screen_snapshot =
-                            self.visible_screen_snapshot().unwrap_or_default();
-                    }
-                    self.sync_output_active = false;
-                    self.sync_output_start = None;
-                    self.modes.remove(&2026);
-                    self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
-                }
-            }
+    /// Publish even if a program never sends the end of its update.
+    pub fn check_sync_output_timeout(&mut self, now: std::time::Instant) {
+        if self.sync_output_start.is_some_and(|start| {
+            now.saturating_duration_since(start) >= std::time::Duration::from_secs(1)
+        }) {
+            self.finish_synchronized_output();
         }
+    }
+
+    pub(crate) fn finish_synchronized_output(&mut self) {
+        if self.use_alt_buffer {
+            self.archive_alt_screen_frame();
+        } else {
+            self.last_synced_primary_screen_snapshot =
+                self.visible_screen_snapshot().unwrap_or_default();
+        }
+        self.modes.remove(&2026);
+        self.sync_output_active = false;
+        self.sync_output_start = None;
+        self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
     }
 
     #[allow(dead_code)]
@@ -9583,7 +9585,8 @@ impl TerminalState {
                 // Synchronized output: suppress rendering until cleared
                 self.modes.insert(2026);
                 self.sync_output_active = true;
-                self.sync_output_start = Some(std::time::Instant::now());
+                self.sync_output_start
+                    .get_or_insert_with(std::time::Instant::now);
             }
             6 => {
                 // DECOM origin mode. `place_cursor` and `set_cursor_row_abs`
@@ -9724,17 +9727,7 @@ impl TerminalState {
                 }
             }
             2026 => {
-                // End synchronized output: force full render
-                if self.use_alt_buffer {
-                    self.archive_alt_screen_frame();
-                } else {
-                    self.last_synced_primary_screen_snapshot =
-                        self.visible_screen_snapshot().unwrap_or_default();
-                }
-                self.modes.remove(&2026);
-                self.sync_output_active = false;
-                self.sync_output_start = None;
-                self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+                self.finish_synchronized_output();
             }
             6 => {
                 // Resetting DECOM homes to the absolute top-left, not to the

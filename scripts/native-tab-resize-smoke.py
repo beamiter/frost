@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Check real tab-switch/resize input against a private X11 Frost and PTY.
 
-The inline CLI is a deterministic fixture, not a live Codex/API session. Its
-SIGWINCH log detects redraw triggers without depending on animation timing/OCR.
-Requires Xvfb, Openbox, xdotool and bash; never uses the person's display.
+The inline CLI fixture records SIGWINCH and paints distinguishable colors for
+intermediate and complete redraws. Requires Xvfb, Openbox, xdotool, bash and
+Pillow. All input and screen capture run on a private X11 display.
 """
 import argparse
 import hashlib
@@ -16,6 +16,15 @@ import signal
 import subprocess
 import sys
 import time
+
+from native_x11_capture import X11StripCapture
+
+
+REPLAY_COLOR = (249, 18, 81)
+
+
+def ready_color(columns):
+    return (24 + columns % 180, 239, 97)
 
 
 def main():
@@ -34,15 +43,28 @@ def main():
         (root / name).mkdir(mode=0o700, parents=True)
     log_path = root / 'resize.jsonl'
     fixture = root / 'codex'
-    fixture.write_text('''import json, os, signal, time
+    fixture.write_text(f'''import json, os, signal, time
 from pathlib import Path
 log = Path(os.environ['FROST_TAB_RESIZE_ROOT']) / 'resize.jsonl'
+resize_requested = False
+
 def record(event):
     size = os.get_terminal_size()
     with log.open('a') as stream:
-        stream.write(json.dumps({'event': event, 'cols': size.columns,
-                                 'rows': size.lines}) + '\\n')
-signal.signal(signal.SIGWINCH, lambda *_: record('SIGWINCH'))
+        stream.write(json.dumps({{'event': event, 'cols': size.columns,
+                                 'rows': size.lines}}) + '\\n')
+
+def resized(*_):
+    global resize_requested
+    record('SIGWINCH')
+    resize_requested = True
+
+def stripe(color):
+    rgb = ';'.join(map(str, color))
+    print(f'\\x1b[7;5H\\x1b[48;2;{{rgb}}m' + ' ' * 40 +
+          '\\x1b[0m\\x1b[11;1H', end='', flush=True)
+
+signal.signal(signal.SIGWINCH, resized)
 print('\\x1b]0;CLI_RESIZE_FIXTURE\\x07'
       '\\x1b]133;A\\x07$ \\x1b]133;B\\x07codex\\r\\n'
       '\\x1b]133;C;cmdline_url=codex\\x07', end='', flush=True)
@@ -51,7 +73,20 @@ for row in range(300):
 print('CLI_READY', flush=True)
 record('start')
 while True:
-    time.sleep(.1)
+    time.sleep(.01)
+    if not resize_requested:
+        continue
+    resize_requested = False
+    cols = os.get_terminal_size().columns
+    print('\\x1b[H\\x1b[2J\\x1b[3J', end='', flush=True)
+    for _ in range(10):
+        print('\\x1b[?2026h', end='')
+        stripe({REPLAY_COLOR!r})
+        print('\\x1b[?2026l', end='', flush=True)
+        time.sleep(.025)
+    print('\\x1b[?2026h\\x1b[H\\x1b[2J', end='')
+    stripe((24 + cols % 180, 239, 97))
+    print('\\x1b[?2026l', end='', flush=True)
 ''')
     bashrc = root / 'bashrc'
     bashrc.write_text("PS1='\\[\\e]133;A\\a\\]$ \\[\\e]133;B\\a\\]'\n"
@@ -79,7 +114,7 @@ while True:
                ICED_BACKEND='tiny-skia', RUST_LOG='error')
     processes, streams = [], []
     result = {'binary': str(binary), 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
-              'scope': 'native X11 keys and real PTY SIGWINCH; deterministic inline CLI fixture',
+              'scope': 'native X11 input and frames with real PTY SIGWINCH',
               'status': 'running'}
 
     def spawn(command, name, **kwargs):
@@ -151,10 +186,62 @@ while True:
         assert records() == resized, 'Switching after a real resize retriggered SIGWINCH'
         result['resize_on_reveal'] = resized[-1]
 
+        # A single resize can still replay earlier rows in several PTY writes.
+        # Sample the actual screen until the new frame shows up.
+        capture = X11StripCapture(env['DISPLAY'], (0, 0, 1500, 900))
+        try:
+            def colors():
+                return {color for count, color in capture.capture().getcolors(65536)
+                        if count >= 80}
+
+            old_color = ready_color(resized[-1]['cols'])
+            def old_frame():
+                painted = colors()
+                return old_color in painted and REPLAY_COLOR not in painted
+
+            wait(old_frame, 'original frame')
+            run('xdotool', 'windowsize', '--sync', window, '1296', '800')
+            began = time.monotonic()
+            retained_frame_seen = False
+
+            def new_frame():
+                nonlocal retained_frame_seen
+                painted = colors()
+                assert REPLAY_COLOR not in painted, 'An intermediate CLI replay reached the screen'
+                latest = records()[-1]
+                if latest['cols'] == resized[-1]['cols']:
+                    return False
+                retained_frame_seen |= old_color in painted
+                return ready_color(latest['cols']) in painted
+
+            wait(new_frame, 'complete resize repaint')
+            assert retained_frame_seen, 'The previous frame disappeared during the CLI replay'
+            result['retained_previous_frame'] = retained_frame_seen
+            result['settled_frame_ms'] = round((time.monotonic() - began) * 1000)
+        finally:
+            capture.close()
+        single = records()
+        assert len(single) == len(resized) + 1, 'A single resize sent multiple PTY resizes'
+
+        # Cross multiple grid boundaries while the inline CLI is visible.
+        # One xdotool process issues the same rapid configure burst as a drag.
+        burst = []
+        for step in range(1, 9):
+            burst.extend(['windowsize', window, str(1296 + 18 * step),
+                          str(800 - 22 * step), 'sleep', '.018'])
+        run('xdotool', *burst)
+        wait(lambda: len(records()) > len(single), 'settled resize after a visible drag')
+        time.sleep(.4)
+        dragged = records()
+        result['visible_drag_sigwinches'] = len(dragged) - len(single)
+        assert result['visible_drag_sigwinches'] == 1, 'Drag sent multiple PTY resizes'
+        assert dragged[-1]['cols'] > single[-1]['cols'], 'Final drag width was lost'
+        assert dragged[-1]['rows'] < single[-1]['rows'], 'Final drag height was lost'
+
         # Splitting legitimately changes the CLI's pane, but hiding that split
         # behind a normal shell tab must keep the same dimensions on return.
         key('ctrl+shift+e', 'SHELL_RESIZE_FIXTURE')
-        wait(lambda: len(records()) > len(resized), 'CLI split-pane resize')
+        wait(lambda: len(records()) > len(dragged), 'CLI split-pane resize')
         split = records()
         key('ctrl+Next', 'SHELL_RESIZE_FIXTURE')
         key('ctrl+Prior', 'SHELL_RESIZE_FIXTURE')

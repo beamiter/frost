@@ -219,6 +219,9 @@ const DIVIDER: f32 = 6.0;
 const RESIZE_EDGE: f32 = 5.0;
 /// Hit size of the diagonal resize grips in the window corners.
 const RESIZE_CORNER: f32 = 12.0;
+const WINDOW_RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+const RESIZE_REPAINT_QUIET: std::time::Duration = std::time::Duration::from_millis(120);
+const RESIZE_REPAINT_LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 const COMPANION_BODY_WIDTH: f32 = 200.0;
 const COMPANION_HORIZONTAL_PADDING: f32 = 10.0;
@@ -5168,6 +5171,7 @@ enum Message {
     PtyWriteTick,
     SearchRefreshTick,
     HistoryReflowTick,
+    TerminalPresentationTick,
     /// Right-click on a tab opened its context menu (close/duplicate/etc).
     TabMenuOpen(usize),
     /// Dismiss the tab context menu without an action.
@@ -5352,6 +5356,24 @@ struct ThemeEditState {
     error: Option<String>,
 }
 
+struct ResizeRepaint {
+    publish_at: std::time::Instant,
+    limit: std::time::Instant,
+}
+
+impl ResizeRepaint {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            publish_at: now + RESIZE_REPAINT_QUIET,
+            limit: now + RESIZE_REPAINT_LIMIT,
+        }
+    }
+
+    fn note_output(&mut self, now: std::time::Instant) {
+        self.publish_at = (now + RESIZE_REPAINT_QUIET).min(self.limit);
+    }
+}
+
 /// A single terminal session: its own PTY child and terminal state.
 struct Session {
     id: usize,
@@ -5371,6 +5393,7 @@ struct Session {
     /// One immutable materialization shared by rendering, links, and stable
     /// coordinate consumers for this refresh.
     projection: Arc<ProjectedViewport>,
+    resize_repaint: Option<ResizeRepaint>,
     projection_block_mode: bool,
     /// User-owned transforms survive Block Mode/alternate-screen bypass. The
     /// companion view state owns scrolling only while a transform is active.
@@ -5880,6 +5903,7 @@ impl Session {
             watch_source: organism_watch::SourceAuthority::default(),
             watch_receiver: organism_watch::SourceReceiver::default(),
             projection,
+            resize_repaint: None,
             projection_block_mode: config.is_card_mode(),
             projection_policy,
             projection_view_state,
@@ -6038,6 +6062,15 @@ impl Session {
         self.terminal.inline_cli_scope_floor().is_some()
     }
 
+    fn resize_sensitive_agent(&self) -> bool {
+        !self.terminal.is_alt_buffer_active()
+            && (self.reading_agent()
+                || self
+                    .fg_proc()
+                    .as_deref()
+                    .is_some_and(immersive_command::reading_agent_command))
+    }
+
     /// Relative local motion may survive content repaints, but never a changed
     /// semantic surface or a budget failure. Coordinate-targeted actions keep
     /// their exact ProjectionCallbackIdentity checks.
@@ -6093,7 +6126,35 @@ impl Session {
         })
     }
 
+    fn presentation_held(&self) -> bool {
+        self.resize_repaint.is_some() || self.terminal.sync_output_active
+    }
+
+    fn note_pty_output(&mut self, now: std::time::Instant) {
+        if let Some(repaint) = &mut self.resize_repaint {
+            repaint.note_output(now);
+        }
+    }
+
+    fn settle_presentation(&mut self, now: std::time::Instant) {
+        if !self.presentation_held() {
+            return;
+        }
+        self.terminal.check_sync_output_timeout(now);
+        if self.resize_repaint.as_ref().is_some_and(|repaint| {
+            now >= repaint.limit || (!self.terminal.sync_output_active && now >= repaint.publish_at)
+        }) {
+            self.resize_repaint = None;
+        }
+        self.refresh();
+    }
+
     fn refresh(&mut self) {
+        // Keep the last published rows while a synchronized update is open.
+        // Inline CLI resize replays can also clear outside that update.
+        if self.presentation_held() {
+            return;
+        }
         self.transcript_canvas
             .set_text_selection_active(self.terminal.has_text_selection());
         if !self.block_selection.is_empty() {
@@ -7559,6 +7620,7 @@ struct Frost {
     /// activity settles, keyed by stable session id.
     history_reflow_sessions: std::collections::HashSet<usize>,
     history_reflow_due: Option<std::time::Instant>,
+    window_resize_due: Option<std::time::Instant>,
     /// Held for the process lifetime to enforce single-instance behavior. When
     /// `None`, another instance already holds the lock and this one runs fresh
     /// (no session restore, no snapshot writes) to avoid clobbering its history.
@@ -7814,6 +7876,7 @@ impl Frost {
             read_only_hint_at: None,
             history_reflow_sessions: std::collections::HashSet::new(),
             history_reflow_due: None,
+            window_resize_due: None,
             _instance_lock: instance_lock,
             is_first_instance,
         };
@@ -11666,7 +11729,9 @@ impl Frost {
             let old_dimensions = sess.terminal.get_dimensions();
             if old_dimensions != (cols, rows) {
                 sess.terminal.on_resize(cols, rows);
-                let _ = sess.pty.resize(cols, rows);
+                if sess.pty.resize(cols, rows).is_ok() && sess.resize_sensitive_agent() {
+                    sess.resize_repaint = Some(ResizeRepaint::new(std::time::Instant::now()));
+                }
             }
             sess.refresh();
             return (old_dimensions.0 != cols).then_some(sess.id);
@@ -11679,6 +11744,10 @@ impl Frost {
     /// not resize a background Codex and make it redraw its entire transcript.
     /// Activation and unzooming relayout newly visible panes before painting.
     fn relayout(&mut self) {
+        self.relayout_terminals(false);
+    }
+
+    fn relayout_terminals(&mut self, window_resized: bool) {
         // Legal owner activation/split already requested a relayout. Refresh
         // its own dimensions before the single visible-pane pass;
         // never add another pass or write through a retired owner callback.
@@ -11701,11 +11770,30 @@ impl Frost {
             targets.push((self.active, (self.cols, self.rows)));
         }
         let mut width_changed = false;
+        let mut deferred = false;
         for (index, (cols, rows)) in targets {
+            if window_resized {
+                let Some(session) = self.sessions.get(index) else {
+                    continue;
+                };
+                if session.terminal.get_dimensions() == (cols, rows) {
+                    continue;
+                }
+                if session.resize_sensitive_agent() {
+                    deferred = true;
+                    continue;
+                }
+            }
             if let Some(id) = self.resize_session(index, cols, rows) {
                 self.history_reflow_sessions.insert(id);
                 width_changed = true;
             }
+        }
+        if window_resized {
+            // A drag can cross many cell boundaries. Resize the agent once
+            // the native window stops changing, using the latest pane layout.
+            self.window_resize_due =
+                deferred.then(|| std::time::Instant::now() + WINDOW_RESIZE_SETTLE);
         }
         if width_changed {
             self.history_reflow_due =
@@ -17749,6 +17837,9 @@ impl Frost {
                 let watch_batch_admitted = self.organism.watch_batch_admitted(id);
                 if let Some(sess) = self.session_by_identity(id, fd) {
                     sess.terminal.process_batch(&data);
+                    if !data.is_empty() {
+                        sess.note_pty_output(std::time::Instant::now());
+                    }
                     let retained_block_ids: Vec<u64> = sess
                         .terminal
                         .command_zones
@@ -19721,7 +19812,13 @@ impl Frost {
                     );
                     if task_bound {
                         self.organism.forget_session(id);
-                        self.sessions[index].hold_after_exit = true;
+                        let session = &mut self.sessions[index];
+                        session.hold_after_exit = true;
+                        session.resize_repaint = None;
+                        if session.terminal.sync_output_active {
+                            session.terminal.finish_synchronized_output();
+                        }
+                        session.refresh();
                         if let Some(message) = feedback {
                             self.push_toast(message, ToastKind::Info);
                         }
@@ -20876,6 +20973,7 @@ impl Frost {
             }
             Message::Resized(size) => {
                 self.finish_sidebar_resize();
+                let window_resized = self.glass_geometry_ready;
                 self.glass_geometry_ready = true;
                 let search_was_compact = block_search_layout::compact(
                     block_search_layout::panel_size(self.win_size),
@@ -20888,11 +20986,15 @@ impl Frost {
                 let term_h = self.term_height();
                 let term_w = (self.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
                 let (cols, rows) = self.metrics.grid_size(term_w, term_h);
-                if cols != self.cols || rows != self.rows {
-                    self.cols = cols;
-                    self.rows = rows;
-                    // Apply either full-tab or pane dimensions exactly once.
-                    self.relayout();
+                let grid_changed = (cols, rows) != (self.cols, self.rows);
+                (self.cols, self.rows) = (cols, rows);
+                if grid_changed
+                    || (self.is_split() && !self.pane_zoomed)
+                    || self.window_resize_due.is_some()
+                {
+                    self.relayout_terminals(window_resized);
+                }
+                if grid_changed {
                     self.refresh_active_context();
                 }
                 if self.block_search.is_some()
@@ -21868,6 +21970,16 @@ impl Frost {
                     self.recompute_search();
                 }
             }
+            Message::TerminalPresentationTick => {
+                let now = std::time::Instant::now();
+                if self.window_resize_due.is_some_and(|due| now >= due) {
+                    self.window_resize_due = None;
+                    self.relayout();
+                }
+                for session in &mut self.sessions {
+                    session.settle_presentation(now);
+                }
+            }
             Message::HistoryReflowTick => {
                 if self
                     .history_reflow_due
@@ -22446,7 +22558,6 @@ impl Frost {
                 // while either consumer (pane header, bottom bar) is on.
                 let want_git = self.config.show_repo_strip || self.config.bottom_bar;
                 for sess in self.sessions.iter_mut() {
-                    sess.terminal.check_sync_output_timeout();
                     sess.refresh();
                     sess.cwd_cache = sess.cwd();
                     sess.fg_proc_cache = sess.fg_proc();
@@ -27273,10 +27384,12 @@ impl Frost {
                 .embedded_view(self.modifiers)
                 .map(move |message| Message::EmbeddedVim(id, Box::new(message)));
         }
-        if !sess
+        let projection_available = sess
             .terminal
-            .projection_interaction_allowed(&sess.projection)
-        {
+            .projection_interaction_allowed(&sess.projection);
+        let paint_retained_projection =
+            sess.presentation_held() && sess.projection.unavailable().is_none();
+        if !projection_available && !paint_retained_projection {
             let input_surface: Element<'_, Message> = TermWidget::new(
                 sess.projection.row_view(),
                 (0, 0),
@@ -27316,19 +27429,21 @@ impl Frost {
         let focused = self.focused && is_active && self.terminal_input_active();
         // Only walk the grid to build per-row selection spans when a selection
         // actually exists; otherwise hand the widget an empty Vec (no highlight).
-        let selection: Vec<Option<(usize, usize)>> = if sess.terminal.has_text_selection() {
-            (0..sess.projection.row_view().len())
-                .map(|r| {
-                    sess.terminal
-                        .row_selection_cols_in_projection(&sess.projection, r)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let selection: Vec<Option<(usize, usize)>> =
+            if projection_available && sess.terminal.has_text_selection() {
+                (0..sess.projection.row_view().len())
+                    .map(|r| {
+                        sess.terminal
+                            .row_selection_cols_in_projection(&sess.projection, r)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         // Only paint match highlights while the search bar is open; otherwise
         // stale matches (whose line indices drift as the grid scrolls) linger.
-        let (search_matches, current) = if is_active && self.search.is_open {
+        let (search_matches, current) = if projection_available && is_active && self.search.is_open
+        {
             let visible = self
                 .search
                 .matches
@@ -27349,12 +27464,14 @@ impl Frost {
             (Vec::new(), None)
         };
         let links: &[link::Link] = if is_active { &self.links } else { &[] };
-        let images = if is_active {
+        let images = if projection_available && is_active {
             self.kitty_images(sess)
         } else {
             Vec::new()
         };
-        let (blocks, block_markers, block_bookmark_markers) = if self.config.is_chat_mode() {
+        let (blocks, block_markers, block_bookmark_markers) = if !projection_available {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else if self.config.is_chat_mode() {
             (self.chat_paint_rows(sess), Vec::new(), Vec::new())
         } else {
             self.block_chrome(sess)
@@ -27414,10 +27531,8 @@ impl Frost {
             sess.projection.scroll_offset(),
             sess.projection.max_scroll_offset(),
         )
-        .projection_available(
-            sess.terminal
-                .projection_interaction_allowed(&sess.projection),
-        )
+        .projection_available(projection_available)
+        .paint_retained_projection(paint_retained_projection)
         .interaction_mode(
             self.config.effective_terminal_mode(),
             self.terminal_interaction_epoch,
@@ -35042,6 +35157,13 @@ impl Frost {
                     .map(|_| Message::HistoryReflowTick),
             );
         }
+        if self.window_resize_due.is_some() || self.sessions.iter().any(Session::presentation_held)
+        {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(25))
+                    .map(|_| Message::TerminalPresentationTick),
+            );
+        }
         if !self.toasts.is_empty() {
             subs.push(
                 iced::time::every(std::time::Duration::from_millis(250))
@@ -37129,6 +37251,75 @@ mod tests {
         session.set_scroll_offset(20);
         assert!(session.transcript_scroll_domain().is_some());
         session
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inline_cli_resize_publishes_only_the_settled_replay() {
+        let mut session = relative_scroll_fixture();
+        session.scroll_to_bottom();
+        let before = super::Arc::clone(&session.projection);
+        let now = std::time::Instant::now();
+        let ms = |value| std::time::Duration::from_millis(value);
+
+        session.terminal.on_resize(38, 9);
+        session.resize_repaint = Some(super::ResizeRepaint::new(now));
+        session.note_pty_output(now + ms(5));
+        session.settle_presentation(now + ms(90));
+        assert!(super::Arc::ptr_eq(&before, &session.projection));
+
+        for (at, chunk) in [
+            (100, b"\x1b[H\x1b[2J\x1b[3J".as_slice()),
+            (120, b"\x1b[?2026hREPLAY_BEGIN\r\n"),
+            (280, b"REPLAY_CONTINUES\x1b[?2026l"),
+            (320, b"\r\n\x1b[?2026hREPLAY_FINAL\x1b[?2026l"),
+        ] {
+            session.settle_presentation(now + ms(at));
+            session.terminal.process_batch(chunk);
+            session.note_pty_output(now + ms(at));
+            session.refresh();
+            session.settle_presentation(now + ms(at));
+            assert!(super::Arc::ptr_eq(&before, &session.projection));
+        }
+        assert!(!session.terminal.projection_interaction_allowed(&before));
+        session.settle_presentation(now + ms(439));
+        assert!(super::Arc::ptr_eq(&before, &session.projection));
+        session.settle_presentation(now + ms(440));
+        let text = session
+            .projection
+            .cells()
+            .iter()
+            .flatten()
+            .map(|cell| cell.character)
+            .collect::<String>();
+        assert!(text.contains("REPLAY_FINAL"));
+        assert!(session
+            .terminal
+            .projection_interaction_allowed(&session.projection));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn synchronized_pty_chunks_preserve_the_frame_until_end_or_timeout() {
+        let mut session = relative_scroll_fixture();
+        session.scroll_to_bottom();
+        let before = super::Arc::clone(&session.projection);
+        session
+            .terminal
+            .process_batch(b"\x1b[?2026h\x1b[H\x1b[2JSTAGED");
+        session.refresh();
+        assert!(super::Arc::ptr_eq(&before, &session.projection));
+        session.terminal.process_batch(b"\x1b[?2026l");
+        session.refresh();
+        assert!(!super::Arc::ptr_eq(&before, &session.projection));
+
+        let before = super::Arc::clone(&session.projection);
+        session.terminal.process_batch(b"\x1b[?2026hSTILL_STAGED");
+        session.refresh();
+        assert!(super::Arc::ptr_eq(&before, &session.projection));
+        session.settle_presentation(std::time::Instant::now() + super::RESIZE_REPAINT_LIMIT);
+        assert!(!session.presentation_held());
+        assert!(!super::Arc::ptr_eq(&before, &session.projection));
     }
 
     #[cfg(target_os = "linux")]
