@@ -39,7 +39,14 @@ for name, source in [('spawn_argv_env', function(main, 'spawn_argv_env')), ('app
     calls = re.findall(r'\.set_native_chrome\(([^)]*)\)', source)
     assert [re.sub(r'\s+', '', args) for args in calls] == ['true,0'], name
 assert re.search(r'\.organism_status\(\s*None,', function(main, 'pane_view'))
-assert 'self.pane_header_height()' in function(main, 'relayout')
+# Non-window callers must immediately delegate; only native window resize may defer.
+relayout_wrapper = function(main, 'relayout')
+assert re.fullmatch(
+    r'fn relayout\(&mut self\)\s*\{\s*self\.relayout_terminals\(false\);\s*\}',
+    relayout_wrapper,
+)
+relayout = function(main, 'relayout_terminals')
+assert 'self.pane_header_height()' in relayout
 for name in ['pane_header', 'config_panel', 'agent_panel']:
     assert 'self.effective_font_size()' in function(main, name), name
 for name in ['sidebar_files_view', 'sidebar_render_item', 'sidebar_tasks_view', 'task_card', 'sidebar_row_height']:
@@ -62,9 +69,12 @@ for route in ['native_viewport::raw_rect(', 'self.reference_layout()',
 # viewport fixture while production consumes the glass joint budget.
 assert re.search(r'#\[path = "glass_native_viewport.rs"\]\s*mod native_viewport;', main)
 assert re.search(r'#\[cfg\(test\)\]\s*#\[path = "native_viewport.rs"\]\s*mod legacy_native_viewport;', main)
-relayout = function(main, 'relayout')
 assert relayout.count('self.refresh_glass_grid_dimensions()') == 1
-assert relayout.index('self.refresh_glass_grid_dimensions()') < relayout.index('let mut targets')
+assert relayout.count('self.sync_terminal_pane_owners()') == 1
+assert (relayout.index('self.refresh_glass_grid_dimensions()')
+        < relayout.index('self.sync_terminal_pane_owners()')
+        < relayout.index('let mut targets')
+        < relayout.index('self.resize_session('))
 assert 'self.relayout()' in function(main, 'activate_tab')
 assert 'self.relayout()' in function(main, 'split')
 settings = function(main, 'config_panel')
