@@ -988,7 +988,7 @@ impl Frost {
                         .text_size(self.chrome_font_size());
                         let image = iced::widget::image(handle.clone());
                         let image: Element<'_, Message> = if let Some(scale) = page.zoom.scale() {
-                            let scale = scale / self.scale_factor() as f32;
+                            let scale = scale / self.scale_factor();
                             scrollable(
                                 image
                                     .width(*width as f32 * scale)

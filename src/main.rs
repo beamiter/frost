@@ -36,7 +36,6 @@ mod eva_companion;
 #[cfg(all(test, unix))]
 mod eva_handoff_tests;
 mod file_preview;
-mod preview_navigation;
 mod find_focus;
 mod fold_preview;
 mod font_zoom;
@@ -76,6 +75,7 @@ mod organism_wake_plan;
 mod organism_watch;
 mod paste_feedback;
 mod persistence;
+mod preview_navigation;
 mod pty;
 #[cfg(all(test, unix))]
 mod readline_preservation_tests;
@@ -114,10 +114,10 @@ mod workspace_navigation_surface;
 mod workspace_remote;
 mod workspace_remote_ui;
 mod workspace_review;
+mod workspace_scope;
 mod workspace_sessions_bridge;
 mod workspace_tools;
 mod workspace_visibility;
-mod workspace_scope;
 
 use std::hash::Hash;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -17455,9 +17455,11 @@ impl Frost {
         };
         if let Some(owner) = mapped_owner.filter(|id| !self.projection_interaction_allowed_for(*id))
         {
-            if !self.sessions.iter().any(|session| {
-                session.id == owner && session.terminal.inline_text_dragging()
-            }) {
+            if !self
+                .sessions
+                .iter()
+                .any(|session| session.id == owner && session.terminal.inline_text_dragging())
+            {
                 cancel_terminal_mouse_gestures_for_pane(
                     &mut self.terminal_mouse_gestures,
                     &mut self.click_tracker,
@@ -19031,7 +19033,9 @@ impl Frost {
                 self.agent_sessions.scope = scope;
                 self.agent_sessions.apply_filters();
             }
-            Message::WorkspaceActivity(activity) => self.agent_sessions.set_workspace_activity(activity),
+            Message::WorkspaceActivity(activity) => {
+                self.agent_sessions.set_workspace_activity(activity)
+            }
             Message::WorkspaceClearFilters => {
                 self.agent_sessions.clear_filters();
                 return iced::widget::operation::focus(WORKSPACE_SEARCH_INPUT_ID.clone());

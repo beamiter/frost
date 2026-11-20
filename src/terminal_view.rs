@@ -5745,7 +5745,9 @@ where
             state.published_presses[left] = dragging;
             if let Some(on_mouse) = self.on_mouse.as_ref().filter(|_| self.retained_inline_text) {
                 let bounds = self.prompt_presentation_bounds(layout.bounds(), viewport);
-                if let Some(input) = self.retained_text_input(state, event, cursor, bounds, viewport) {
+                if let Some(input) =
+                    self.retained_text_input(state, event, cursor, bounds, viewport)
+                {
                     shell.publish(on_mouse(input));
                 }
             }
