@@ -75,6 +75,7 @@ def build_harness():
     source = (ROOT / "src/main.rs").read_text(encoding="utf-8")
     shell = (ROOT / "src/native_shell.rs").read_text(encoding="utf-8")
     sidebar = (ROOT / "src/sidebar.rs").read_text(encoding="utf-8")
+    preview = (ROOT / "src/file_preview.rs").read_text(encoding="utf-8")
     remote = (ROOT / "src/remote_fs.rs").read_text(encoding="utf-8")
     template = (ROOT / "scripts/files_follow_harness.rs").read_text(encoding="utf-8")
     assert 'use crate::glass_profile::{self as shell, color};' in shell
@@ -114,6 +115,10 @@ def build_harness():
         "helpers": "\n\n".join(item(source, name) for name in helpers),
         "methods": item(shell, "pub(crate) fn reference_layout(") + "\n\n"
         + "\n\n".join(item(source, name) for name in methods),
+        "preview-boundary": "\n\n".join(item(preview, name) for name in (
+            "pub(crate) fn is_visible_for(",
+            "pub(crate) fn close(",
+        )),
         "drawer-decisions": "\n\n".join(
             "fn fixture_drawer_" + name + "(&mut self" +
             (", tab: native_shell::InspectorTab" if name == "tab" else
@@ -166,9 +171,7 @@ def main():
          "        self.files_surface_visible(),\n",
          "        self.sidebar_open,\n"),
     ]
-    for field in ("file_preview_confirmation", "file_preview_pending", "file_preview"):
-        mutants.append(("retain-stale-" + field,
-                        f"    self.{field} = None;\n", ""))
+    mutants.append(("retain-retired-preview", "    self.file_preview.close();\n", ""))
     for name, original in drawer_decisions((ROOT / "src/main.rs").read_text()).items():
         mutants.append(("legacy-drawer-decision-" + name, original,
                         original.replace("self.reference_layout().inspector.is_none()",

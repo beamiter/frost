@@ -1143,6 +1143,20 @@ after any root/location change. If the initial remote-home probe fails, the
 panel returns to a usable Local tree, shows the bounded error inline, and lets
 the profile be selected again for a retry.
 
+### Local file preview
+
+In **Files**, right-click a single local file and choose **Preview file**.
+Ctrl-click a supported path in terminal output to review the exact local path
+and any source-location fallback before choosing **Read local file**. Terminal
+references stay within the originating local terminal's working directory.
+
+**Go to line** reveals and highlights a one-based source line. Use **Copy
+text**, **Copy path**, or **Reload** from the toolbar. Reload reads the file
+named in the result. PNG and JPEG previews show pixel dimensions and fit the
+inspector by default. **Actual size** allows scrolling through the full-size
+image. Reads are limited to 64 KiB for UTF-8 text and 2 MiB for PNG/JPEG
+images, with a 4096-pixel edge and 4-megapixel image limit.
+
 ### Block reading workspace
 
 Block Mode shows its reading state in the workspace header instead of a separate
