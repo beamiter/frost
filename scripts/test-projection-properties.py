@@ -74,7 +74,7 @@ impl TerminalState {
         Self { scrollback: VecDeque::new(), grid: TerminalGrid::new(rows, cols) }
     }
 '''
-for method in ['identity_projection_plan', 'materialize_projection_plan', 'materialize_projection_plan_with_margin', 'projection_indexes']:
+for method in ['identity_projection_plan', 'projected_row_real_column_bounds', 'materialize_projection_plan', 'materialize_projection_plan_with_margin', 'projection_indexes']:
     code += item('fn ' + method + '(') + '\n'
 code += '}\n'
 code += '#[path = ' + json.dumps(str(ROOT / 'src/terminal/projection_properties.rs')) + '] mod projection_properties;\n'
