@@ -1,4 +1,5 @@
 //! Native session-library state. Discovery and resume validation live in core.
+use crate::workspace_scope::{conversation_summary, project_choices, ConversationScope};
 use jterm_core::agent_sessions::{
     validate_session_batch_tag, validate_session_details, AgentSession, SessionArchiveFilter,
     SessionBatchAction, SessionCatalog, SessionLaunch, SessionLibraryFilter,
@@ -137,6 +138,13 @@ impl OrganizationEditor {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WorkspaceActivity {
+    All,
+    Running,
+    Attention,
+}
+
 pub(crate) struct SessionLibrary {
     pub(crate) context: crate::workspace_context::ContextEditor,
     pub(crate) review: crate::workspace_review::WorkspaceReview,
@@ -160,6 +168,7 @@ pub(crate) struct SessionLibrary {
     pub catalog: SessionCatalog,
     pub scanner: SessionScanner,
     pub query: String,
+    pub(crate) scope: ConversationScope,
     pub provider: Option<SessionProvider>,
     pub status: Option<SessionStatus>,
     pub live_only: bool,
@@ -296,6 +305,7 @@ impl SessionLibrary {
     }
     fn workspace_filter(&self) -> jterm_core::agent_workspace::WorkspaceFilter {
         let mut query = self.query.clone();
+        self.scope.qualify(&mut query);
         if let Some(provider) = self.provider {
             query.push_str(&format!(
                 " provider:{}",
@@ -311,11 +321,7 @@ impl SessionLibrary {
         if self.archive == SessionArchiveFilter::Archived {
             query.push_str(" is:archived");
         }
-        if let Some(project) = self.project_selection.as_deref().or_else(|| {
-            self.project_only
-                .then_some(self.project.as_deref())
-                .flatten()
-        }) {
+        if let Some(project) = self.filter_project() {
             let quoted = serde_json::to_string(&project.to_string_lossy()).unwrap_or_default();
             query.push_str(&format!(" project:{quoted}"));
         }
@@ -338,7 +344,58 @@ impl SessionLibrary {
         query
     }
 
+    fn update_workspace_search(&mut self) {
+        let query = self.workspace_search_query();
+        self.tools
+            .set_search(&query, None, self.archive != SessionArchiveFilter::Active);
+    }
+
+    fn has_workspace_filters(&self) -> bool {
+        self.scope != ConversationScope::All
+            || !self.query.trim().is_empty()
+            || self.provider.is_some()
+            || self.status.is_some()
+            || self.live_only
+            || self.pinned_only
+            || self.archive != SessionArchiveFilter::Active
+            || self.filter_project().is_some()
+    }
+
+    fn filter_project(&self) -> Option<&std::path::Path> {
+        self.project_selection.as_deref().or_else(|| {
+            self.project_only
+                .then_some(self.project.as_deref())
+                .flatten()
+        })
+    }
+
+    fn project_workspace_rows(
+        &self,
+        filter: &jterm_core::agent_workspace::WorkspaceFilter,
+        rows: &[jterm_core::agent_workspace::WorkspaceRow],
+    ) -> Vec<jterm_core::agent_workspace::WorkspaceRow> {
+        let mut result = filter.project(rows);
+        if let Some(project) = self.filter_project() {
+            result.retain(|row| std::path::Path::new(&row.cwd).starts_with(project));
+        }
+        result
+    }
+
+    pub(crate) fn set_workspace_activity(&mut self, activity: WorkspaceActivity) {
+        self.live_only = matches!(activity, WorkspaceActivity::Running);
+        self.status =
+            matches!(activity, WorkspaceActivity::Attention).then_some(SessionStatus::Waiting);
+        if self.status.is_some() {
+            self.missions.controller.refresh();
+        }
+        self.apply_filters();
+    }
+
     fn workspace_visible(&self) -> Vec<usize> {
+        use jterm_core::agent_workspace::ConversationKind;
+        if !self.scope.includes(ConversationKind::Cli) {
+            return Vec::new();
+        }
         let filter = self.workspace_filter();
         if filter.query_error().is_some() {
             return Vec::new();
@@ -386,15 +443,7 @@ impl SessionLibrary {
                             .any(|p| p.provider == session.provider && p.id == session.id))
                     && (!self.pinned_only || self.workspace.pinned(session))
                     && self
-                        .project_selection
-                        .as_deref()
-                        .or({
-                            if self.project_only {
-                                self.project.as_deref()
-                            } else {
-                                None
-                            }
-                        })
+                        .filter_project()
                         .is_none_or(|project| session.cwd.starts_with(project))
                     && row.map_or_else(
                         || session.matches_query(&self.query),
@@ -456,6 +505,7 @@ impl SessionLibrary {
             catalog: SessionCatalog::default(),
             scanner: SessionScanner::new(),
             query: String::new(),
+            scope: ConversationScope::All,
             provider: None,
             status: None,
             live_only: false,
@@ -551,12 +601,6 @@ impl SessionLibrary {
             return false;
         }
         self.query = query;
-        let search_query = self.workspace_search_query();
-        self.tools.set_search(
-            &search_query,
-            None,
-            self.archive != SessionArchiveFilter::Active,
-        );
         self.apply_filters();
         true
     }
@@ -576,12 +620,7 @@ impl SessionLibrary {
         if let Some(draft) = self.context.draft() {
             self.context_inputs.sync(draft);
         }
-        let search_query = self.workspace_search_query();
-        self.tools.set_search(
-            &search_query,
-            None,
-            self.archive != SessionArchiveFilter::Active,
-        );
+        self.update_workspace_search();
         self.tools.poll();
         let old_page = self.page;
         if let Some(catalog) = self.scanner.poll() {
@@ -736,6 +775,7 @@ impl SessionLibrary {
     /// different list, so type-then-Enter resumes its top hit. Only a
     /// background refresh keeps a selection (see `reconcile`).
     pub(crate) fn apply_filters(&mut self) {
+        self.update_workspace_search();
         self.cancel_confirmation();
         self.project_query();
         self.selected = self.first_visible_key();
@@ -1203,6 +1243,7 @@ impl SessionLibrary {
     pub fn clear_filters(&mut self) {
         self.cancel_confirmation();
         self.query.clear();
+        self.scope = ConversationScope::All;
         self.provider = None;
         self.status = None;
         self.live_only = false;
@@ -1453,30 +1494,13 @@ impl super::Frost {
     pub(crate) fn workspace_navigation(&self) -> iced::Element<'_, super::Message> {
         use super::Message as M;
         use iced::widget::{
-            button, column, container, pick_list, row, scrollable, text, text_input,
+            button, checkbox, column, container, pick_list, row, scrollable, text, text_input,
         };
         use iced::Length;
-        use jterm_core::agent_workspace::WorkspaceAction as Action;
+        use jterm_core::agent_workspace::{ConversationKind, WorkspaceAction as Action};
         let state = &self.agent_sessions;
         let filter = state.workspace_filter();
         let workspace_error = filter.query_error();
-        let task_rows = self.workspace_task_rows();
-        let needs_count = state
-            .workspace
-            .rows
-            .values()
-            .chain(self.ai_chats.workspace.rows.iter())
-            .filter(|row| row.attention().is_some())
-            .count()
-            + if self.config.experimental_task_sidebar {
-                task_rows
-                    .iter()
-                    .filter(|(_, row)| row.attention().is_some())
-                    .count()
-            } else {
-                0
-            }
-            + state.missions.controller.needs_attention();
         let size = self.chrome_font_size();
         let visible = self.config.agent_workspace_enabled;
         let mut list = column![button(
@@ -1492,6 +1516,14 @@ impl super::Frost {
         .style(button::text)]
         .spacing(8);
         if visible {
+            let task_rows = if self.config.experimental_task_sidebar {
+                self.workspace_task_rows()
+                    .into_iter()
+                    .map(|(_, row)| row)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             list = list
                 .push(crate::widget_identity_scope::scope_key(
                     ("workspace-menus", state.menu_epoch),
@@ -1542,13 +1574,13 @@ impl super::Frost {
                     .wrap(),
                 ))
                 .push(
-                    text_input("Search · provider:codex status:review", &state.query)
+                    text_input("Search workspace", &state.query)
+                        .id(super::WORKSPACE_SEARCH_INPUT_ID.clone())
                         .on_input(M::AgentSessionsQuery)
                         .size(size),
                 );
             let project = state
-                .project_selection
-                .as_ref()
+                .filter_project()
                 .and_then(|path| path.file_name())
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "All projects".into());
@@ -1563,42 +1595,94 @@ impl super::Frost {
                         .on_press(M::WorkspaceProject(None))
                         .style(button::text),
                 );
-                for project in &state.projects {
+                let projects = project_choices(
+                    state
+                        .projects
+                        .iter()
+                        .map(|project| project.root.clone())
+                        .chain(
+                            self.ai_chats
+                                .workspace
+                                .rows
+                                .iter()
+                                .chain(task_rows.iter())
+                                .map(|row| PathBuf::from(&row.cwd)),
+                        ),
+                );
+                for project in projects {
                     list = list.push(
-                        button(text(project.root.to_string_lossy().into_owned()).size(size - 1.0))
-                            .on_press(M::WorkspaceProject(Some(project.root.clone())))
-                            .style(button::text),
+                        button(
+                            text(crate::review_text::visible_bounded(
+                                &project.to_string_lossy(),
+                                160,
+                            ))
+                            .size(size - 1.0),
+                        )
+                        .on_press(M::WorkspaceProject(Some(project)))
+                        .style(button::text),
                     );
                 }
             }
+            let scope = pick_list(ConversationScope::ALL, Some(state.scope), |scope| {
+                M::WorkspaceMenuChoice(Box::new(M::WorkspaceConversationScope(scope)))
+            })
+            .text_size(size - 1.0)
+            .padding([4, 5])
+            .on_open(M::WorkspaceMenu(true))
+            .on_close(M::WorkspaceMenu(false));
+            let archive = pick_list(SessionArchiveFilter::ALL, Some(state.archive), |archive| {
+                M::WorkspaceMenuChoice(Box::new(M::AgentSessionsArchiveFilter(archive)))
+            })
+            .text_size(size - 1.0)
+            .padding([4, 5])
+            .on_open(M::WorkspaceMenu(true))
+            .on_close(M::WorkspaceMenu(false));
+            list = list.push(crate::widget_identity_scope::scope_key(
+                ("workspace-filters", state.menu_epoch),
+                row![
+                    scope,
+                    archive,
+                    checkbox(state.pinned_only)
+                        .label("Pinned only")
+                        .on_toggle(M::AgentSessionsPinned)
+                        .size(size),
+                ]
+                .spacing(5)
+                .wrap(),
+            ));
+            let activity_button = |label, activity, active| {
+                button(text(label).size(size - 1.0))
+                    .on_press(M::WorkspaceActivity(activity))
+                    .style(if active {
+                        button::primary
+                    } else {
+                        button::text
+                    })
+            };
             list = list.push(
                 row![
-                    button(text("All").size(size - 1.0))
-                        .on_press(M::AgentSessionsClear)
-                        .style(button::text),
-                    button(text("Running").size(size - 1.0))
-                        .on_press(M::AgentSessionsLive(!state.live_only))
-                        .style(if state.live_only {
-                            button::primary
-                        } else {
-                            button::text
-                        }),
-                    button(text(format!("Needs you · {needs_count}")).size(size - 1.0))
-                        .on_press(M::AgentSessionsStatus(
-                            if state.status == Some(SessionStatus::Waiting) {
-                                None
-                            } else {
-                                Some(SessionStatus::Waiting)
-                            }
-                        ))
-                        .style(if state.status == Some(SessionStatus::Waiting) {
-                            button::primary
-                        } else {
-                            button::text
-                        }),
+                    activity_button(
+                        "All activity",
+                        WorkspaceActivity::All,
+                        !state.live_only && state.status.is_none()
+                    ),
+                    activity_button("Running", WorkspaceActivity::Running, state.live_only),
+                    activity_button(
+                        "Needs you",
+                        WorkspaceActivity::Attention,
+                        state.status == Some(SessionStatus::Waiting)
+                    ),
                 ]
-                .spacing(2),
+                .spacing(2)
+                .wrap(),
             );
+            if state.has_workspace_filters() {
+                list = list.push(
+                    button(text("Clear filters").size(size - 1.0))
+                        .on_press(M::WorkspaceClearFilters)
+                        .style(button::text),
+                );
+            }
             list = list.push(
                 button(
                     text(format!(
@@ -1622,6 +1706,24 @@ impl super::Frost {
             }
             if state.pending_confirm.is_some() {
                 list = list.push(text("Checking conversation…").size(size - 1.0));
+            }
+            let cli_rows = state.workspace_visible();
+            let api_rows = state.project_workspace_rows(&filter, &self.ai_chats.workspace.rows);
+            let projected_tasks = state.project_workspace_rows(&filter, &task_rows);
+            if workspace_error.is_none() {
+                let task_count = projected_tasks
+                    .iter()
+                    .filter(|task| task.facts.task_id.is_some())
+                    .count();
+                list = list.push(
+                    text(conversation_summary(
+                        cli_rows.len() + api_rows.len() + task_count,
+                        state.has_workspace_filters(),
+                        state.scope.includes(ConversationKind::Cli) && state.scanner.is_scanning(),
+                    ))
+                    .size(size - 1.0)
+                    .style(text::secondary),
+                );
             }
             if !state.tools.query().is_empty() {
                 list = list.push(
@@ -1676,8 +1778,7 @@ impl super::Frost {
             }
             let mut conversations = iced::widget::keyed::Column::new().spacing(8);
             let mut group = None;
-            let visible = state.workspace_visible();
-            for &index in &visible {
+            for &index in &cli_rows {
                 let session = &state.catalog.sessions[index];
                 let pinned = state.workspace.pinned(session);
                 if group != Some(pinned) {
@@ -1686,9 +1787,9 @@ impl super::Frost {
                         workspace_navigation_key(("group", pinned)),
                         workspace_navigation_child(
                             text(if pinned {
-                                "PINNED"
+                                "PINNED CLI SESSIONS"
                             } else {
-                                "RECENT CONVERSATIONS"
+                                "CLI SESSIONS"
                             })
                             .size(size - 2.0)
                             .style(text::secondary),
@@ -1743,37 +1844,15 @@ impl super::Frost {
                     )),
                 );
             }
-            if visible.is_empty() {
+            if !api_rows.is_empty() {
                 conversations = conversations.push(
-                    workspace_navigation_key("empty-cli"),
+                    workspace_navigation_key("api-header"),
                     workspace_navigation_child(
-                        text(if state.scanner.is_scanning() {
-                            "Discovering local sessions…"
-                        } else {
-                            "No CLI conversations match"
-                        })
-                        .size(size - 1.0)
-                        .style(text::secondary),
+                        text("API CHATS").size(size - 2.0).style(text::secondary),
                     ),
                 );
             }
-            conversations = conversations.push(
-                workspace_navigation_key("api-header"),
-                workspace_navigation_child(
-                    text("API CONVERSATIONS")
-                        .size(size - 2.0)
-                        .style(text::secondary),
-                ),
-            );
-            let api_rows = filter.project(&self.ai_chats.workspace.rows);
-            for chat in api_rows.iter().filter(|chat| {
-                true && (!state.live_only || chat.runtime.is_live())
-                    && (state.status != Some(SessionStatus::Waiting) || chat.attention().is_some())
-                    && state
-                        .project_selection
-                        .as_ref()
-                        .is_none_or(|project| std::path::Path::new(&chat.cwd).starts_with(project))
-            }) {
+            for chat in &api_rows {
                 let selected = self.ai_chats.is_open
                     && self
                         .ai_chats
@@ -1791,7 +1870,8 @@ impl super::Frost {
                                 .style(button::text),
                             button(
                                 column![
-                                    text(chat.title.clone()).size(size),
+                                    text(crate::review_text::visible_bounded(&chat.title, 90))
+                                        .size(size),
                                     text(presentation.status_label)
                                         .size(size - 2.0)
                                         .style(text::secondary)
@@ -1810,7 +1890,10 @@ impl super::Frost {
                     )),
                 );
             }
-            if self.config.experimental_task_sidebar {
+            if projected_tasks
+                .iter()
+                .any(|task| task.facts.task_id.is_some())
+            {
                 conversations = conversations.push(
                     workspace_navigation_key("task-header"),
                     workspace_navigation_child(
@@ -1819,20 +1902,7 @@ impl super::Frost {
                             .style(text::secondary),
                     ),
                 );
-                let projected_tasks = filter.project(
-                    &task_rows
-                        .iter()
-                        .map(|(_, row)| row.clone())
-                        .collect::<Vec<_>>(),
-                );
-                for task in projected_tasks.iter().filter(|task| {
-                    true && (!state.live_only || task.runtime.is_live())
-                        && (state.status != Some(SessionStatus::Waiting)
-                            || task.attention().is_some())
-                        && state.project_selection.as_ref().is_none_or(|project| {
-                            std::path::Path::new(&task.cwd).starts_with(project)
-                        })
-                }) {
+                for task in &projected_tasks {
                     let Some(task_id) = task.facts.task_id else {
                         continue;
                     };
@@ -3114,6 +3184,29 @@ mod tests {
         replacement.source = PathBuf::from("/another/profile/session.jsonl");
         state.replace_catalog(catalog(vec![replacement]));
         assert!(!state.workspace_reference_current(&reference));
+    }
+
+    #[test]
+    fn workspace_scope_applies_to_history_and_withdraws_hidden_cli_actions() {
+        let first = session(SessionProvider::Codex, "exact-id", "Renderer");
+        let mut state = library();
+        state.replace_catalog(catalog(vec![first.clone()]));
+        let reference = WorkspaceSessionRef {
+            epoch: state.catalog_epoch,
+            session: first,
+        };
+        assert!(state.workspace_reference_current(&reference));
+        state.scope = ConversationScope::Api;
+        state.query = "Renderer".into();
+        assert!(!state.workspace_reference_current(&reference));
+        assert!(state.workspace_search_query().contains(" kind:api"));
+        state.archive = SessionArchiveFilter::Archived;
+        state.pinned_only = true;
+        let search = state.workspace_search_query();
+        assert!(search.contains(" is:archived") && search.contains(" is:pinned"));
+        state.clear_filters();
+        assert!(state.workspace_search_query().is_empty());
+        assert_eq!(state.scope, ConversationScope::All);
     }
 
     #[test]

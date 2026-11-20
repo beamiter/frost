@@ -117,6 +117,7 @@ mod workspace_review;
 mod workspace_sessions_bridge;
 mod workspace_tools;
 mod workspace_visibility;
+mod workspace_scope;
 
 use std::hash::Hash;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -1513,6 +1514,8 @@ static AGENT_SESSIONS_LIST_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-agent-sessions-list"));
 static AGENT_SESSIONS_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-agent-sessions-input"));
+static WORKSPACE_SEARCH_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-workspace-search-input"));
 static AGENT_SESSIONS_ALIAS_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-agent-session-name"));
 static AGENT_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
@@ -4842,6 +4845,9 @@ enum Message {
     AgentWorkspaceToggle,
     AgentWorkspaceScrolled(bool, f32),
     WorkspaceProject(Option<std::path::PathBuf>),
+    WorkspaceConversationScope(workspace_scope::ConversationScope),
+    WorkspaceActivity(agent_sessions::WorkspaceActivity),
+    WorkspaceClearFilters,
     AiChatsComposerAction(
         workspace_chat_bridge::ChatRef,
         iced::widget::text_editor::Action,
@@ -18997,6 +19003,15 @@ impl Frost {
                         iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
                     );
                 }
+            }
+            Message::WorkspaceConversationScope(scope) => {
+                self.agent_sessions.scope = scope;
+                self.agent_sessions.apply_filters();
+            }
+            Message::WorkspaceActivity(activity) => self.agent_sessions.set_workspace_activity(activity),
+            Message::WorkspaceClearFilters => {
+                self.agent_sessions.clear_filters();
+                return iced::widget::operation::focus(WORKSPACE_SEARCH_INPUT_ID.clone());
             }
             Message::WorkspaceProject(project) => {
                 self.agent_sessions.project_only = false;
