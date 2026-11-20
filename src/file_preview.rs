@@ -331,6 +331,47 @@ fn read_preview(
     })
 }
 
+#[derive(Default)]
+struct SourceMatches(Vec<usize>);
+
+impl SourceMatches {
+    fn update(&mut self, source: &str, query: &str) {
+        self.0.clear();
+        if !query.is_empty() {
+            self.0.extend(
+                source
+                    .split('\n')
+                    .enumerate()
+                    .filter_map(|(index, line)| line.contains(query).then_some(index + 1)),
+            );
+        }
+    }
+
+    fn step(&self, line: Option<usize>, previous: bool) -> Option<usize> {
+        let index = if previous {
+            line.map_or(self.0.len(), |line| {
+                self.0.partition_point(|hit| *hit < line)
+            })
+            .checked_sub(1)
+            .or_else(|| self.0.len().checked_sub(1))?
+        } else {
+            line.map_or(0, |line| self.0.partition_point(|hit| *hit <= line))
+        };
+        self.0.get(index).or_else(|| self.0.first()).copied()
+    }
+
+    fn status(&self, line: Option<usize>) -> String {
+        if self.0.is_empty() {
+            return "No matching lines".into();
+        }
+        match line.and_then(|line| self.0.binary_search(&line).ok()) {
+            Some(index) => format!("Match {} of {}", index + 1, self.0.len()),
+            None if self.0.len() == 1 => "1 matching line".into(),
+            None => format!("{} matching lines", self.0.len()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum Action {
     Confirm,
@@ -340,6 +381,11 @@ pub(crate) enum Action {
     CopyText,
     EditLine(String),
     Jump,
+    ToggleFind,
+    EditFind(String),
+    FindStep {
+        previous: bool,
+    },
     Scrolled {
         x: f32,
         y: f32,
@@ -358,16 +404,61 @@ enum Phase {
 struct Page {
     session: usize,
     token: u64,
+    view_token: u64,
     target: ReadTarget,
     phase: Phase,
     notice: Option<String>,
     line_input: String,
     selected_line: Option<usize>,
     reported_column: Option<usize>,
+    find_open: bool,
+    find_query: String,
+    matches: SourceMatches,
     scroll_x: f32,
     scroll_y: f32,
     viewport_height: f32,
     actual_size: bool,
+}
+
+impl Page {
+    fn select_line(&mut self, line: usize) {
+        self.selected_line = Some(line);
+        self.reported_column = None;
+        self.line_input = line.to_string();
+        self.notice = None;
+    }
+
+    /// Publish a new snapshot after the worker finishes. A failed reload leaves
+    /// the existing content, scroll position and search results usable.
+    fn finish_read(&mut self, result: Result<Preview, String>) -> bool {
+        let preview = match result {
+            Ok(preview) => preview,
+            Err(error) => {
+                if matches!(self.phase, Phase::Ready(_)) {
+                    self.notice =
+                        Some(format!("Reload failed. Showing the last preview.\n{error}"));
+                } else {
+                    self.phase = Phase::Failed(Some(error));
+                }
+                return false;
+            }
+        };
+        if let Ok(relative) = preview.path.strip_prefix(&self.target.base) {
+            self.target.relative = relative.to_path_buf();
+            self.target.fallback = None;
+        }
+        if let Some((line, column)) = preview.location {
+            self.select_line(line);
+            self.reported_column = column;
+        }
+        match &preview.content {
+            Content::Text(text) => self.matches.update(text, &self.find_query),
+            Content::Image { .. } => self.matches.update("", ""),
+        }
+        let reveal = preview.location.is_some();
+        self.phase = Phase::Ready(preview);
+        reveal
+    }
 }
 
 #[derive(Default)]
@@ -422,6 +513,10 @@ fn location_label(line: usize, column: Option<usize>) -> String {
 
 fn scroll_id(token: u64, actual_size: bool) -> iced::widget::Id {
     iced::widget::Id::from(format!("local-file-preview-{token}-{actual_size}"))
+}
+
+fn find_input_id(token: u64) -> iced::widget::Id {
+    iced::widget::Id::from(format!("local-file-preview-find-{token}"))
 }
 
 fn both_axes() -> scrollable::Direction {
@@ -491,6 +586,7 @@ impl Frost {
         self.file_preview.page = Some(Page {
             session: session_id,
             token,
+            view_token: token,
             target,
             phase: if confirm {
                 Phase::Confirm
@@ -501,6 +597,9 @@ impl Frost {
             line_input: String::new(),
             selected_line: None,
             reported_column: None,
+            find_open: false,
+            find_query: String::new(),
+            matches: SourceMatches::default(),
             scroll_x: 0.0,
             scroll_y: 0.0,
             viewport_height: (self.win_size.height - 240.0).max(80.0),
@@ -534,10 +633,10 @@ impl Frost {
         let session = page.session;
         let target = page.target.clone();
         page.token = token;
-        page.phase = Phase::Reading;
+        if !matches!(page.phase, Phase::Ready(_)) {
+            page.phase = Phase::Reading;
+        }
         page.notice = None;
-        page.scroll_x = 0.0;
-        page.scroll_y = 0.0;
         self.file_preview.reader = Some((session, token));
         Task::perform(
             async move {
@@ -559,22 +658,11 @@ impl Frost {
         let Some(page) = self.file_preview.accept_completion(session, token, active) else {
             return Task::none();
         };
-        page.phase = match result {
-            Ok(preview) => {
-                if let Ok(relative) = preview.path.strip_prefix(&page.target.base) {
-                    page.target.relative = relative.to_path_buf();
-                    page.target.fallback = None;
-                }
-                if let Some((line, column)) = preview.location {
-                    page.selected_line = Some(line);
-                    page.reported_column = column;
-                    page.line_input = line.to_string();
-                }
-                Phase::Ready(preview)
-            }
-            Err(error) => Phase::Failed(Some(error)),
-        };
-        self.reveal_file_preview_line()
+        if page.finish_read(result) {
+            self.reveal_file_preview_line()
+        } else {
+            Task::none()
+        }
     }
 
     pub(crate) fn update_file_preview(&mut self, token: u64, action: Action) -> Task<Message> {
@@ -630,13 +718,33 @@ impl Frost {
                     let count = preview.lines.len();
                     if let Ok(line) = page.line_input.trim().parse::<usize>() {
                         if (1..=count).contains(&line) {
-                            page.selected_line = Some(line);
-                            page.reported_column = None;
-                            page.notice = None;
+                            page.select_line(line);
                             return self.reveal_file_preview_line();
                         }
                     }
                     page.notice = Some(format!("Choose a line from 1 to {count}."));
+                }
+            }
+            Action::ToggleFind => {
+                page.find_open = !page.find_open;
+                if page.find_open {
+                    return iced::widget::operation::focus(find_input_id(page.view_token));
+                }
+            }
+            Action::EditFind(query) => {
+                if let Phase::Ready(Preview {
+                    content: Content::Text(text),
+                    ..
+                }) = &page.phase
+                {
+                    page.find_query = query.chars().take(256).collect();
+                    page.matches.update(text, &page.find_query);
+                }
+            }
+            Action::FindStep { previous } if page.find_open => {
+                if let Some(line) = page.matches.step(page.selected_line, previous) {
+                    page.select_line(line);
+                    return self.reveal_file_preview_line();
                 }
             }
             Action::Scrolled {
@@ -694,7 +802,7 @@ impl Frost {
             return Task::none();
         };
         iced::widget::operation::scroll_to(
-            scroll_id(page.token, false),
+            scroll_id(page.view_token, false),
             scrollable::AbsoluteOffset {
                 x: page.scroll_x,
                 y: page.scroll_y,
@@ -753,14 +861,24 @@ impl Frost {
             _ => page.target.base.join(&page.target.relative),
         };
         let path_hint = text(sidebar::bound_sidebar_path_label(&path)).size(12);
-        body = body.push(iced::widget::tooltip(
+        let reading = self.file_preview.reader == Some((page.session, page.token));
+        let mut details = column![iced::widget::tooltip(
             path_hint,
             text(display_path(&path)).size(12),
             iced::widget::tooltip::Position::Bottom,
-        ));
-        if let Some(notice) = &page.notice {
-            body = body.push(text(notice).style(text::warning));
+        )]
+        .spacing(4);
+        if reading && matches!(page.phase, Phase::Ready(_)) {
+            details = details.push(
+                text("Reloading local file…")
+                    .size(12)
+                    .style(text::secondary),
+            );
         }
+        if let Some(notice) = &page.notice {
+            details = details.push(text(notice).size(12).style(text::warning));
+        }
+        body = body.push(details);
         match &page.phase {
             Phase::Reading => body.push(text("Reading local file…")).into(),
             Phase::Failed(error) => {
@@ -773,7 +891,7 @@ impl Frost {
             }
             Phase::Ready(preview) => {
                 let tools = row![
-                    control("Reload").on_press(event(Action::Reload)),
+                    control("Reload").on_press_maybe((!reading).then(|| event(Action::Reload))),
                     control("Copy path").on_press(event(Action::CopyPath)),
                 ]
                 .spacing(4);
@@ -790,18 +908,48 @@ impl Frost {
                             .width(Length::Fixed(78.0))
                             .on_input(move |value| event(Action::EditLine(value)))
                             .on_submit(event(Action::Jump));
-                        body.push(
-                            row![
-                                line_input,
-                                control("Go to line").on_press(event(Action::Jump))
-                            ]
-                            .spacing(4)
-                            .wrap(),
-                        )
-                        .push(text(source_status(page, preview.lines.len())).size(12))
-                        .push(self.file_preview_source(page, preview, value))
-                        .height(Length::Fill)
-                        .into()
+                        let navigation = row![
+                            line_input,
+                            control("Go to line").on_press(event(Action::Jump)),
+                            control(if page.find_open { "Hide find" } else { "Find" })
+                                .on_press(event(Action::ToggleFind)),
+                        ]
+                        .spacing(4)
+                        .wrap();
+                        let mut search = column![navigation].spacing(4);
+                        if page.find_open {
+                            let available = !page.matches.0.is_empty();
+                            let query = text_input("Find text", &page.find_query)
+                                .id(find_input_id(page.view_token))
+                                .size(self.chrome_font_size())
+                                .width(Length::Fixed(99.0))
+                                .on_input(move |value| event(Action::EditFind(value)))
+                                .on_submit(event(Action::FindStep { previous: false }));
+                            search = search.push(
+                                row![
+                                    query,
+                                    control("Prev").on_press_maybe(
+                                        available
+                                            .then(|| event(Action::FindStep { previous: true }))
+                                    ),
+                                    control("Next").on_press_maybe(
+                                        available
+                                            .then(|| event(Action::FindStep { previous: false }))
+                                    ),
+                                ]
+                                .spacing(4)
+                                .wrap(),
+                            );
+                            if !page.find_query.is_empty() {
+                                search = search
+                                    .push(text(page.matches.status(page.selected_line)).size(12));
+                            }
+                        }
+                        body.push(search)
+                            .push(text(source_status(page, preview.lines.len())).size(12))
+                            .push(self.file_preview_source(page, preview, value))
+                            .height(Length::Fill)
+                            .into()
                     }
                     Content::Image {
                         handle,
@@ -821,7 +969,7 @@ impl Frost {
                                     .width(*width as f32 / scale)
                                     .height(*height as f32 / scale),
                             )
-                            .id(scroll_id(page.token, true))
+                            .id(scroll_id(page.view_token, true))
                             .direction(both_axes())
                             .height(Length::Fill)
                             .into()
@@ -885,7 +1033,7 @@ impl Frost {
         }
         let token = page.token;
         scrollable(lines.push(Space::new().height(pad_bottom)))
-            .id(scroll_id(token, false))
+            .id(scroll_id(page.view_token, false))
             .direction(both_axes())
             .height(Length::Fill)
             .on_scroll(move |viewport| {
@@ -919,6 +1067,21 @@ fn source_status(page: &Page, count: usize) -> String {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_find_uses_literal_matching_lines_and_wraps() {
+        let mut matches = SourceMatches::default();
+        matches.update("first\n界界\nempty\n界", "界");
+        assert_eq!(matches.status(None), "2 matching lines");
+        assert_eq!(matches.step(None, false), Some(2));
+        assert_eq!(matches.step(Some(2), false), Some(4));
+        assert_eq!(matches.step(Some(4), false), Some(2));
+        assert_eq!(matches.step(Some(2), true), Some(4));
+        assert_eq!(matches.status(Some(4)), "Match 2 of 2");
+        matches.update("larger", "Large");
+        assert_eq!(matches.status(None), "No matching lines");
+        assert_eq!(matches.step(None, true), None);
+    }
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
