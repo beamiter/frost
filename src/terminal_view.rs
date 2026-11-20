@@ -1081,6 +1081,7 @@ pub struct TermWidget<'a, Message> {
     chat_projection: Option<&'a crate::terminal::ProjectedViewport>,
     projection_available: bool,
     paint_retained_projection: bool,
+    retained_inline_text: bool,
     on_chat_submit: Option<Box<dyn Fn() -> Message + 'a>>,
     organism_body: Option<OrganismBody>,
     organism_status: Option<crate::organism::LivePresentation>,
@@ -1153,6 +1154,11 @@ impl<'a, Message> TermWidget<'a, Message> {
         self
     }
 
+    pub fn retained_inline_text(mut self, enabled: bool) -> Self {
+        self.retained_inline_text = enabled;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         grid: impl Into<crate::terminal::RowView<'a>>,
@@ -1205,6 +1211,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             chat_projection: None,
             projection_available: true,
             paint_retained_projection: false,
+            retained_inline_text: false,
             on_chat_submit: None,
             organism_body: None,
             organism_status: None,
@@ -1889,6 +1896,77 @@ impl<'a, Message> TermWidget<'a, Message> {
         let col = ((rel_x / cw) as usize).min(max_col);
         let row = self.canvas.row(rel_y, ch, max_row + 1);
         (col, row)
+    }
+
+    fn retained_text_input(
+        &self,
+        state: &mut State,
+        event: &Event,
+        cursor: mouse::Cursor,
+        bounds: Rectangle,
+        viewport: &Rectangle,
+    ) -> Option<MouseInput> {
+        let left = MouseButton::Left.slot();
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if !self.ctrl => {
+                let pos = cursor.position_over(bounds.intersection(viewport)?)?;
+                let grid_left = bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
+                let grid_top = bounds.y + self.metrics.padding;
+                let grid_bottom = grid_top
+                    + self
+                        .grid
+                        .len()
+                        .saturating_sub(usize::from(self.canvas.head)) as f32
+                        * self.metrics.cell_h;
+                let grid_right = grid_left + self.grid.first()?.len() as f32 * self.metrics.cell_w;
+                let edge = self
+                    .scrollbar_geometry(bounds)
+                    .map_or(grid_right, |(_, _, x, _, _)| x);
+                if !(grid_left..grid_right.min(edge)).contains(&pos.x)
+                    || !(grid_top..grid_bottom).contains(&pos.y)
+                {
+                    return None;
+                }
+                let (col, row) = self.cell_at(pos, bounds);
+                state.dragging = true;
+                state.published_presses[left] = true;
+                Some(MouseInput::Press {
+                    col,
+                    row,
+                    button: MouseButton::Left,
+                    shift: self.shift,
+                    alt: self.alt,
+                    ctrl: false,
+                    count: 1,
+                    finalized: false,
+                    link_eligible: false,
+                    app_eligible: false,
+                    block: None,
+                    block_zone_id: None,
+                    link: false,
+                    link_revision: 0,
+                    x: pos.x,
+                    y: pos.y,
+                })
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) if state.dragging => {
+                let (col, row) = self.cell_at(cursor.position()?, bounds);
+                Some(MouseInput::Drag { col, row, count: 1 })
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.dragging => {
+                state.dragging = false;
+                state.published_presses[left] = false;
+                let (col, row) = cursor
+                    .position()
+                    .map_or((0, usize::MAX), |pos| self.cell_at(pos, bounds));
+                Some(MouseInput::Release {
+                    col,
+                    row,
+                    button: MouseButton::Left,
+                })
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn transcript_canvas(
@@ -5654,8 +5732,23 @@ where
                     preedit,
                 });
             }
-            // Retire the entire gesture without replaying its eventual release.
-            *tree.state.downcast_mut::<State>() = State::default();
+            let state = tree.state.downcast_mut::<State>();
+            let left = MouseButton::Left.slot();
+            let dragging =
+                self.retained_inline_text && state.dragging && state.published_presses[left];
+            *state = State {
+                terminal_mode: state.terminal_mode,
+                mode_epoch: state.mode_epoch,
+                dragging,
+                ..State::default()
+            };
+            state.published_presses[left] = dragging;
+            if let Some(on_mouse) = self.on_mouse.as_ref().filter(|_| self.retained_inline_text) {
+                let bounds = self.prompt_presentation_bounds(layout.bounds(), viewport);
+                if let Some(input) = self.retained_text_input(state, event, cursor, bounds, viewport) {
+                    shell.publish(on_mouse(input));
+                }
+            }
             if matches!(event, Event::Mouse(_) | Event::Touch(_)) {
                 shell.capture_event();
             }

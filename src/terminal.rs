@@ -2823,6 +2823,98 @@ pub struct Selection {
     pub mode: SelectionMode,
 }
 
+struct InlineTextSelection {
+    viewport: ProjectedViewport,
+    range: Selection,
+    dragging: bool,
+}
+
+impl InlineTextSelection {
+    fn point(viewport: &ProjectedViewport, (row, col): (usize, usize)) -> Option<(usize, usize)> {
+        let (left, right) = Self::row_bounds(viewport, row)?;
+        let col = col.clamp(left, right);
+        let cell = viewport.row_view().get(row)?.get(col)?;
+        Some((
+            row,
+            col - usize::from(col > left && cell.flags.wide_continuation()),
+        ))
+    }
+
+    fn row_bounds(viewport: &ProjectedViewport, row: usize) -> Option<(usize, usize)> {
+        if !matches!(viewport.row_kinds().get(row), Some(ProjectedRowKind::Raw)) {
+            return None;
+        }
+        TerminalState::projected_row_real_column_bounds(viewport, row)
+    }
+
+    fn columns(&self, row: usize) -> Option<(usize, usize)> {
+        let Selection {
+            anchor,
+            active,
+            mode,
+        } = self.range;
+        let (start, end) = (anchor.min(active), anchor.max(active));
+        if !(start.0..=end.0).contains(&row) {
+            return None;
+        }
+        let (left, right) = Self::row_bounds(&self.viewport, row)?;
+        let (start_col, end_col) = match mode {
+            SelectionMode::Block => (anchor.1.min(active.1), anchor.1.max(active.1)),
+            SelectionMode::Normal => (
+                if row == start.0 { start.1 } else { left },
+                if row == end.0 { end.1 } else { right },
+            ),
+        };
+        let cells = self.viewport.row_view().get(row)?;
+        let (mut start_col, mut end_col) = (left.max(start_col), right.min(end_col));
+        if start_col > end_col {
+            return None;
+        }
+        if start_col > left && cells.get(start_col)?.flags.wide_continuation() {
+            start_col -= 1;
+        }
+        if end_col < right && cells.get(end_col)?.flags.wide() {
+            end_col += 1;
+        }
+        Some((start_col, end_col))
+    }
+
+    fn copy(&self) -> Option<String> {
+        if self.range.anchor == self.range.active {
+            return None;
+        }
+        let (start, end) = (
+            self.range.anchor.min(self.range.active),
+            self.range.anchor.max(self.range.active),
+        );
+        let mut text = String::new();
+        let mut previous_row = None;
+        for row in start.0..=end.0 {
+            let Some((left, right)) = self.columns(row) else {
+                continue;
+            };
+            if let Some(previous) = previous_row {
+                let soft_wrap = row == previous + 1
+                    && self.range.mode == SelectionMode::Normal
+                    && self.viewport.row_wrapped().get(previous) == Some(&true);
+                if !soft_wrap {
+                    text.push('\n');
+                }
+            }
+            let cells = self.viewport.row_view().get(row)?;
+            text.extend(
+                cells
+                    .get(left..=right)?
+                    .iter()
+                    .filter(|cell| !cell.flags.wide_continuation())
+                    .map(|cell| cell.character),
+            );
+            previous_row = Some(row);
+        }
+        Some(text)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProjectedSelection {
     plan_revision: u64,
@@ -3448,6 +3540,7 @@ pub struct TerminalState {
     pub scrollback: VecDeque<ScrollbackLine>,
     pub selection: Option<Selection>,
     projected_selection: Option<ProjectedSelection>,
+    inline_text_selection: Option<InlineTextSelection>,
     selection_link_text: Option<(String, String)>,
     pub scroll_offset: usize,
     /// Rows an app asked to erase with ED 3 while the viewport was scrolled
@@ -3841,6 +3934,7 @@ impl TerminalState {
             scrollback: VecDeque::new(),
             selection: None,
             projected_selection: None,
+            inline_text_selection: None,
             selection_link_text: None,
             scroll_offset: 0,
             pending_saved_line_purge: 0,
@@ -9865,6 +9959,15 @@ impl TerminalState {
             .flatten()
     }
 
+    pub(crate) fn inline_text_scope(&self) -> Option<(usize, Option<u64>)> {
+        self.inline_cli_scope_floor().map(|floor| {
+            (
+                floor,
+                self.inline_cli_command_scope.map(|(sequence, _)| sequence),
+            )
+        })
+    }
+
     fn inline_cli_screen_erased(&mut self) {
         if self.inline_cli_scope_floor().is_none() {
             return;
@@ -12340,6 +12443,7 @@ impl TerminalState {
     #[allow(dead_code)]
     pub fn select_text(&mut self, anchor: (usize, usize), active: (usize, usize)) {
         self.selection_link_text = None;
+        self.inline_text_selection = None;
         self.projected_selection = None;
         self.selection = Some(Selection {
             anchor,
@@ -12352,10 +12456,86 @@ impl TerminalState {
         self.selection_link_text = None;
         self.selection = None;
         self.projected_selection = None;
+        self.inline_text_selection = None;
     }
 
     pub fn has_text_selection(&self) -> bool {
-        self.selection.is_some() || self.projected_selection.is_some()
+        self.selection.is_some()
+            || self.projected_selection.is_some()
+            || self.inline_text_selection.is_some()
+    }
+
+    pub(crate) fn inline_text_dragging(&self) -> bool {
+        self.inline_text_selection
+            .as_ref()
+            .is_some_and(|selection| selection.dragging)
+    }
+
+    pub(crate) fn has_inline_text_selection(&self) -> bool {
+        !self.is_alt_buffer_active()
+            && self.projection_unavailable().is_none()
+            && self
+                .inline_text_selection
+                .as_ref()
+                .is_some_and(|selection| selection.range.anchor != selection.range.active)
+    }
+
+    pub(crate) fn start_inline_text_selection(
+        &mut self,
+        viewport: &ProjectedViewport,
+        point: (usize, usize),
+        mode: SelectionMode,
+    ) -> bool {
+        if self.inline_text_scope().is_none()
+            || self.projection_unavailable().is_some()
+            || viewport.unavailable().is_some()
+            || viewport.key().source.alternate_screen
+            || !viewport.chat_rows().is_empty()
+        {
+            return false;
+        }
+        let Some(anchor) = InlineTextSelection::point(viewport, point) else {
+            return false;
+        };
+        self.clear_text_selection();
+        self.inline_text_selection = Some(InlineTextSelection {
+            viewport: viewport.clone(),
+            range: Selection {
+                anchor,
+                active: anchor,
+                mode,
+            },
+            dragging: true,
+        });
+        true
+    }
+
+    pub(crate) fn update_inline_text_selection(&mut self, point: (usize, usize)) {
+        let Some(selection) = self
+            .inline_text_selection
+            .as_mut()
+            .filter(|selection| selection.dragging)
+        else {
+            return;
+        };
+        if let Some(point) = InlineTextSelection::point(&selection.viewport, point) {
+            selection.range.active = point;
+        }
+    }
+
+    pub(crate) fn finish_inline_text_selection(&mut self, keep: bool) {
+        let Some(selection) = self
+            .inline_text_selection
+            .as_mut()
+            .filter(|selection| selection.dragging)
+        else {
+            return;
+        };
+        if keep && selection.range.anchor != selection.range.active {
+            selection.dragging = false;
+        } else {
+            self.clear_text_selection();
+        }
     }
 
     fn projection_selection_revision(&self, projection: &ProjectedViewport) -> Option<u64> {
@@ -12588,6 +12768,7 @@ impl TerminalState {
         mode: SelectionMode,
     ) {
         self.selection_link_text = None;
+        self.inline_text_selection = None;
         if !self.projection_interaction_allowed(projection) {
             self.clear_text_selection();
             return;
@@ -12730,6 +12911,7 @@ impl TerminalState {
         col: usize,
     ) {
         self.selection_link_text = None;
+        self.inline_text_selection = None;
         if !self.projection_interaction_allowed(projection) {
             self.clear_text_selection();
             return;
@@ -13074,6 +13256,7 @@ impl TerminalState {
 
     pub fn select_line_in_projection(&mut self, projection: &ProjectedViewport, row: usize) {
         self.selection_link_text = None;
+        self.inline_text_selection = None;
         if !self.projection_interaction_allowed(projection) {
             self.clear_text_selection();
             return;
@@ -13307,6 +13490,11 @@ impl TerminalState {
     fn copy_displayed_selection(&self) -> Option<String> {
         if self.projection_failure.is_some() {
             return None;
+        }
+        if let Some(selection) = &self.inline_text_selection {
+            return (!self.is_alt_buffer_active())
+                .then(|| selection.copy())
+                .flatten();
         }
         if self.projected_selection.is_some() {
             return self.copy_projected_selection();
@@ -13870,6 +14058,13 @@ impl TerminalState {
         projection: &ProjectedViewport,
         viewport_row: usize,
     ) -> Option<(usize, usize)> {
+        if let Some(selection) = &self.inline_text_selection {
+            return (projection.unavailable().is_none()
+                && projection.view_revision() == selection.viewport.view_revision()
+                && projection.has_canvas_head() == selection.viewport.has_canvas_head())
+            .then(|| selection.columns(viewport_row))
+            .flatten();
+        }
         if !self.projection_interaction_allowed(projection) {
             return None;
         }

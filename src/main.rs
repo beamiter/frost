@@ -5394,6 +5394,7 @@ struct Session {
     /// One immutable materialization shared by rendering, links, and stable
     /// coordinate consumers for this refresh.
     projection: Arc<ProjectedViewport>,
+    inline_text_frame: Option<InlineTextFrame>,
     resize_repaint: Option<ResizeRepaint>,
     projection_block_mode: bool,
     /// User-owned transforms survive Block Mode/alternate-screen bypass. The
@@ -5904,6 +5905,7 @@ impl Session {
             watch_source: organism_watch::SourceAuthority::default(),
             watch_receiver: organism_watch::SourceReceiver::default(),
             projection,
+            inline_text_frame: None,
             resize_repaint: None,
             projection_block_mode: config.is_card_mode(),
             projection_policy,
@@ -6131,6 +6133,21 @@ impl Session {
         self.resize_repaint.is_some() || self.terminal.sync_output_active
     }
 
+    fn inline_text_frame(&self) -> Option<InlineTextFrame> {
+        Some(InlineTextFrame {
+            scope: self.terminal.inline_text_scope()?,
+            size: self.terminal.get_dimensions(),
+        })
+    }
+
+    fn inline_text_surface(&self) -> bool {
+        self.inline_text_frame.is_some()
+            && self.inline_text_frame == self.inline_text_frame()
+            && self.projection.unavailable().is_none()
+            && self.terminal.projection_unavailable().is_none()
+            && self.projection.chat_rows().is_empty()
+    }
+
     fn note_pty_output(&mut self, now: std::time::Instant) {
         if let Some(repaint) = &mut self.resize_repaint {
             repaint.note_output(now);
@@ -6151,6 +6168,12 @@ impl Session {
     }
 
     fn refresh(&mut self) {
+        if self.terminal.inline_text_dragging() {
+            if self.inline_text_surface() {
+                return;
+            }
+            self.terminal.finish_inline_text_selection(false);
+        }
         // Keep the last published rows while a synchronized update is open.
         // Inline CLI resize replays can also clear outside that update.
         if self.presentation_held() {
@@ -6193,6 +6216,7 @@ impl Session {
             &mut self.projection_view_state,
         );
         if self.projection.unavailable().is_some() {
+            self.inline_text_frame = None;
             self.block_selection.clear();
             self.terminal.clear_text_selection();
             self.transcript_canvas.park();
@@ -6260,6 +6284,7 @@ impl Session {
             self.transcript_canvas.disable();
         }
         if self.projection.unavailable().is_some() {
+            self.inline_text_frame = None;
             self.block_selection.clear();
             self.terminal.clear_text_selection();
             self.transcript_canvas.park();
@@ -6269,6 +6294,7 @@ impl Session {
             self.cursor_visible = false;
             return;
         }
+        self.inline_text_frame = self.inline_text_frame();
         self.observe_transcript_scroll_domain();
         let raw_cursor = self.terminal.get_cursor_pos();
         if self.projection.mode() == terminal::ProjectionMode::Transformed
@@ -6882,6 +6908,12 @@ struct TerminalMouseGesture {
     /// cache was refreshed only after focus moved). Subsequent drag/release
     /// messages close the slot without touching selection or the PTY.
     consumed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct InlineTextFrame {
+    scope: (usize, Option<u64>),
+    size: (usize, usize),
 }
 
 fn sync_embedded_body_modifiers(input: &mut MouseInput, modifiers: keyboard::Modifiers) {
@@ -8583,6 +8615,12 @@ impl Frost {
                 .terminal
                 .projection_interaction_allowed(&session.projection)
         })
+    }
+
+    fn active_inline_text_selection(&self) -> bool {
+        self.sessions
+            .get(self.active)
+            .is_some_and(|session| session.terminal.has_inline_text_selection())
     }
 
     fn terminal_mouse_active(&self) -> bool {
@@ -11919,6 +11957,8 @@ impl Frost {
         use keybindings::Command as C;
         if projection_command_requires_mapping(&cmd)
             && !self.active_projection_interaction_allowed()
+            && !(matches!(cmd, C::EditCopy | C::EditCopyBlockOutput)
+                && self.active_inline_text_selection())
         {
             return Some(Task::none());
         }
@@ -14656,12 +14696,123 @@ impl Frost {
     fn finish_cancelled_terminal_mouse_gesture(&mut self, gesture: TerminalMouseGesture) {
         if let Some(index) = self.session_index_by_id(gesture.session_id) {
             let session = &mut self.sessions[index];
+            if gesture.button == MouseButton::Left && session.terminal.inline_text_dragging() {
+                session.terminal.finish_inline_text_selection(false);
+                session.refresh();
+            }
             if let Some(report) =
                 cancelled_terminal_mouse_report(gesture, &session.terminal, self.modifiers)
             {
                 session.write_pty(&report);
             }
         }
+    }
+
+    fn handle_retained_inline_mouse(&mut self, index: usize, input: MouseInput) -> Task<Message> {
+        let id = self.sessions[index].id;
+        let slot = MouseButton::Left.slot();
+        let owns_drag = self.terminal_mouse_gestures[slot]
+            .is_some_and(|gesture| gesture.session_id == id && !gesture.report_to_app)
+            && self.sessions[index].terminal.inline_text_dragging();
+        if !self.focused || !self.terminal_mouse_active() || !self.layout().contains_session(index)
+        {
+            if owns_drag
+                && matches!(
+                    input,
+                    MouseInput::Release {
+                        button: MouseButton::Left,
+                        ..
+                    }
+                )
+            {
+                self.sessions[index]
+                    .terminal
+                    .finish_inline_text_selection(false);
+                self.sessions[index].refresh();
+                self.terminal_mouse_gestures[slot] = None;
+            }
+            return Task::none();
+        }
+        match input {
+            MouseInput::Press {
+                row,
+                col,
+                alt,
+                button: MouseButton::Left,
+                ctrl: false,
+                count: 1,
+                block: None,
+                link: false,
+                ..
+            } => {
+                self.sidebar_files_focused = false;
+                self.task_panel.input_focused = false;
+                self.set_focus(index);
+                self.session_dirty = true;
+                self.refresh_active_context();
+                let session = &mut self.sessions[index];
+                let mode = if alt {
+                    terminal::SelectionMode::Block
+                } else {
+                    terminal::SelectionMode::Normal
+                };
+                if session.inline_text_surface()
+                    && session.terminal.start_inline_text_selection(
+                        &session.projection,
+                        (row, col),
+                        mode,
+                    )
+                {
+                    session.block_selection.clear();
+                    session.transcript_canvas.cancel();
+                    session.hold_transcript_reading_position();
+                    self.click_tracker.cancel();
+                    self.terminal_mouse_gestures[slot] = Some(TerminalMouseGesture {
+                        session_id: id,
+                        button: MouseButton::Left,
+                        report_to_app: false,
+                        last_app_cell: None,
+                        consumed: false,
+                    });
+                }
+            }
+            MouseInput::Drag { row, col, .. } if owns_drag => {
+                self.sessions[index]
+                    .terminal
+                    .update_inline_text_selection((row, col));
+            }
+            MouseInput::Release {
+                row,
+                col,
+                button: MouseButton::Left,
+            } if owns_drag => {
+                self.terminal_mouse_gestures[slot] = None;
+                self.click_tracker.cancel();
+                let session = &mut self.sessions[index];
+                session.terminal.update_inline_text_selection((row, col));
+                session.terminal.finish_inline_text_selection(true);
+                let text = session.terminal.copy_selection();
+                session.refresh();
+                return self.copy_terminal_selection_to_primary(text);
+            }
+            _ => {}
+        }
+        Task::none()
+    }
+
+    fn copy_terminal_selection_to_primary(&mut self, text: Option<String>) -> Task<Message> {
+        let Some(text) = text.filter(|text| !text.is_empty()) else {
+            return Task::none();
+        };
+        if crate::block_mode::clipboard_multiline_is_unsafe(&text) {
+            self.push_toast(
+                "Selection not copied: it contains control or visual-spoofing characters"
+                    .to_string(),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        iced::clipboard::write_primary(text)
     }
 
     fn handle_mouse(&mut self, source_session_id: usize, input: MouseInput) -> Task<Message> {
@@ -15009,16 +15160,27 @@ impl Frost {
                         n if n >= 3 => sess
                             .terminal
                             .select_line_in_projection(&sess.projection, row),
-                        _ if alt => sess.terminal.start_selection_in_projection(
-                            &sess.projection,
-                            (row, col),
-                            terminal::SelectionMode::Block,
-                        ),
-                        _ => sess.terminal.start_selection_in_projection(
-                            &sess.projection,
-                            (row, col),
-                            terminal::SelectionMode::Normal,
-                        ),
+                        _ => {
+                            let mode = if alt {
+                                terminal::SelectionMode::Block
+                            } else {
+                                terminal::SelectionMode::Normal
+                            };
+                            if ctrl
+                                || !sess.inline_text_surface()
+                                || !sess.terminal.start_inline_text_selection(
+                                    &sess.projection,
+                                    (row, col),
+                                    mode,
+                                )
+                            {
+                                sess.terminal.start_selection_in_projection(
+                                    &sess.projection,
+                                    (row, col),
+                                    mode,
+                                );
+                            }
+                        }
                     },
                     MouseButton::Middle => {
                         let id = sess.id;
@@ -15057,6 +15219,10 @@ impl Frost {
                             }
                         }
                     }
+                    return Task::none();
+                }
+                if sess.terminal.inline_text_dragging() {
+                    sess.terminal.update_inline_text_selection((row, col));
                     return Task::none();
                 }
                 match count {
@@ -15100,6 +15266,12 @@ impl Frost {
                     return Task::none();
                 }
                 if button == MouseButton::Left {
+                    if sess.terminal.inline_text_dragging() {
+                        sess.terminal.update_inline_text_selection((row, col));
+                        sess.terminal
+                            .finish_inline_text_selection(clicked_cell.is_none());
+                        sess.refresh();
+                    }
                     if clicked_cell.is_none()
                         && self.links_cache_key == Some((sess.id, sess.projection.key()))
                     {
@@ -15127,20 +15299,9 @@ impl Frost {
                             sess.write_pty(&bytes);
                         }
                         sess.refresh();
-                    } else if let Some(text) = sess
-                        .terminal
-                        .copy_selection()
-                        .filter(|t| !cancelled_click && !t.is_empty())
-                    {
-                        if crate::block_mode::clipboard_multiline_is_unsafe(&text) {
-                            self.push_toast(
-                                "Selection not copied: it contains control or visual-spoofing characters"
-                                    .to_string(),
-                                ToastKind::Warning,
-                            );
-                            return Task::none();
-                        }
-                        return iced::clipboard::write_primary(text);
+                    } else if !cancelled_click {
+                        let text = sess.terminal.copy_selection();
+                        return self.copy_terminal_selection_to_primary(text);
                     }
                 }
             }
@@ -15648,7 +15809,7 @@ impl Frost {
     /// palette: a visible terminal text selection wins, otherwise a whole-block
     /// selection is copied in terminal order (`output_only` is Alt+Copy).
     fn edit_copy_task(&mut self, output_only: bool) -> Task<Message> {
-        if !self.active_projection_interaction_allowed() {
+        if !self.active_projection_interaction_allowed() && !self.active_inline_text_selection() {
             return Task::none();
         }
         let text = self
@@ -17255,7 +17416,6 @@ impl Frost {
     fn update_message(&mut self, message: Message) -> Task<Message> {
         let mapped_owner = match &message {
             Message::MousePane(id, ..)
-            | Message::ProjectedMousePane(id, ..)
             | Message::ProjectedTranscriptScroll(id, ..)
             | Message::SummaryActivate(id, ..)
             | Message::TranscriptScroll(id, ..)
@@ -17282,11 +17442,15 @@ impl Frost {
         };
         if let Some(owner) = mapped_owner.filter(|id| !self.projection_interaction_allowed_for(*id))
         {
-            cancel_terminal_mouse_gestures_for_pane(
-                &mut self.terminal_mouse_gestures,
-                &mut self.click_tracker,
-                owner,
-            );
+            if !self.sessions.iter().any(|session| {
+                session.id == owner && session.terminal.inline_text_dragging()
+            }) {
+                cancel_terminal_mouse_gestures_for_pane(
+                    &mut self.terminal_mouse_gestures,
+                    &mut self.click_tracker,
+                    owner,
+                );
+            }
             return Task::none();
         }
 
@@ -20603,14 +20767,20 @@ impl Frost {
                 return self.update_message(*action);
             }
             Message::ProjectedMousePane(session_id, key, input) => {
-                if !self.sessions.iter().any(|session| {
-                    session.id == session_id
-                        && projection_callback_is_current(
-                            &session.terminal,
-                            &session.projection,
-                            &key,
-                        )
-                }) {
+                let Some(index) = self.session_index_by_id(session_id) else {
+                    return Task::none();
+                };
+                let session = &self.sessions[index];
+                if projection_callback_is_current(&session.terminal, &session.projection, &key) {
+                    return self.update_message(Message::MousePane(session_id, input));
+                }
+                if (session.presentation_held() || session.terminal.inline_text_dragging())
+                    && session.inline_text_surface()
+                    && key == ProjectionCallbackIdentity::capture(&session.projection)
+                {
+                    return self.handle_retained_inline_mouse(index, input);
+                }
+                if !session.terminal.inline_text_dragging() {
                     cancel_terminal_mouse_gestures_for_pane(
                         &mut self.terminal_mouse_gestures,
                         &mut self.click_tracker,
@@ -20662,7 +20832,9 @@ impl Frost {
                     ) {
                         OverlayReleaseDisposition::Reject => return Task::none(),
                         OverlayReleaseDisposition::ClearOnly => {
-                            self.terminal_mouse_gestures[slot] = None;
+                            if let Some(gesture) = self.terminal_mouse_gestures[slot].take() {
+                                self.finish_cancelled_terminal_mouse_gesture(gesture);
+                            }
                             if button == MouseButton::Left {
                                 self.click_tracker.cancel();
                             }
@@ -27211,8 +27383,11 @@ impl Frost {
         let projection_available = sess
             .terminal
             .projection_interaction_allowed(&sess.projection);
-        let paint_retained_projection =
-            sess.presentation_held() && sess.projection.unavailable().is_none();
+        let paint_retained_projection = (sess.presentation_held()
+            || sess.terminal.inline_text_dragging())
+            && sess.projection.unavailable().is_none();
+        let retained_inline_text =
+            !projection_available && paint_retained_projection && sess.inline_text_surface();
         if !projection_available && !paint_retained_projection {
             let input_surface: Element<'_, Message> = TermWidget::new(
                 sess.projection.row_view(),
@@ -27254,7 +27429,8 @@ impl Frost {
         // Only walk the grid to build per-row selection spans when a selection
         // actually exists; otherwise hand the widget an empty Vec (no highlight).
         let selection: Vec<Option<(usize, usize)>> =
-            if projection_available && sess.terminal.has_text_selection() {
+            if (projection_available || retained_inline_text) && sess.terminal.has_text_selection()
+            {
                 (0..sess.projection.row_view().len())
                     .map(|r| {
                         sess.terminal
@@ -27357,6 +27533,7 @@ impl Frost {
         )
         .projection_available(projection_available)
         .paint_retained_projection(paint_retained_projection)
+        .retained_inline_text(retained_inline_text)
         .interaction_mode(
             self.config.effective_terminal_mode(),
             self.terminal_interaction_epoch,
@@ -37482,6 +37659,76 @@ mod tests {
             max_update = max_update.max(start.elapsed());
         }
         eprintln!("controlled history drag: 64 synchronized repaints; max selection update {max_update:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inline_agent_drag_copies_the_visible_cells_during_a_partial_frame() {
+        for press_in_sync in [false, true] {
+            let mut session = relative_scroll_fixture();
+            session.scroll_to_bottom();
+            session
+                .terminal
+                .process_batch(b"\x1b[2J\x1b[Hwide \xe7\x95\x8cA\r\nwide \xe7\x95\x8cB");
+            session.refresh();
+            let published = super::Arc::clone(&session.projection);
+            let row = published
+                .row_view()
+                .iter()
+                .position(|cells| {
+                    cells
+                        .iter()
+                        .take(8)
+                        .filter(|cell| !cell.flags.wide_continuation())
+                        .map(|cell| cell.character)
+                        .collect::<String>()
+                        == "wide 界A"
+                })
+                .unwrap();
+            let partial_update = b"\x1b[?2026h\x1b[2J\x1b[HWorking in a replacement frame";
+            if press_in_sync {
+                session.terminal.process_batch(partial_update);
+                session.refresh();
+            }
+            assert!(session.inline_text_surface());
+            assert!(session.terminal.start_inline_text_selection(
+                &session.projection,
+                (row, 6),
+                super::terminal::SelectionMode::Block,
+            ));
+            if !press_in_sync {
+                session.terminal.process_batch(partial_update);
+                session.refresh();
+            }
+            assert!(session.terminal.sync_output_active);
+            assert!(!session.terminal.projection_interaction_allowed(&published));
+            session.terminal.update_inline_text_selection((row + 1, 7));
+            assert_eq!(
+                session
+                    .terminal
+                    .row_selection_cols_in_projection(&published, row),
+                Some((5, 7))
+            );
+            assert_eq!(
+                session.terminal.copy_selection().as_deref(),
+                Some("界A\n界B")
+            );
+            session.terminal.finish_inline_text_selection(true);
+            assert!(session.terminal.has_inline_text_selection());
+            session.terminal.process_batch(b"\x1b[?2026l");
+            session.refresh();
+            assert!(!super::Arc::ptr_eq(&published, &session.projection));
+            assert_eq!(
+                session.terminal.copy_selection().as_deref(),
+                Some("界A\n界B")
+            );
+            assert_eq!(
+                session
+                    .terminal
+                    .row_selection_cols_in_projection(&session.projection, row),
+                None
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
