@@ -36,6 +36,7 @@ mod eva_companion;
 #[cfg(all(test, unix))]
 mod eva_handoff_tests;
 mod file_preview;
+mod preview_navigation;
 mod find_focus;
 mod fold_preview;
 mod font_zoom;

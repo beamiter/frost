@@ -1,6 +1,10 @@
 //! Read-only, bounded local previews. Never invoke an opener, shell or web renderer.
+use crate::preview_navigation::{match_background, ImageZoom, SourceMatches};
 use crate::{native_shell::InspectorTab, sidebar, Frost, Message, ToastKind};
-use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
+use iced::widget::{
+    button, checkbox, column, container, pick_list, rich_text, row, scrollable, span, text,
+    text_input, Space,
+};
 use iced::{Element, Length, Task};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -331,47 +335,6 @@ fn read_preview(
     })
 }
 
-#[derive(Default)]
-struct SourceMatches(Vec<usize>);
-
-impl SourceMatches {
-    fn update(&mut self, source: &str, query: &str) {
-        self.0.clear();
-        if !query.is_empty() {
-            self.0.extend(
-                source
-                    .split('\n')
-                    .enumerate()
-                    .filter_map(|(index, line)| line.contains(query).then_some(index + 1)),
-            );
-        }
-    }
-
-    fn step(&self, line: Option<usize>, previous: bool) -> Option<usize> {
-        let index = if previous {
-            line.map_or(self.0.len(), |line| {
-                self.0.partition_point(|hit| *hit < line)
-            })
-            .checked_sub(1)
-            .or_else(|| self.0.len().checked_sub(1))?
-        } else {
-            line.map_or(0, |line| self.0.partition_point(|hit| *hit <= line))
-        };
-        self.0.get(index).or_else(|| self.0.first()).copied()
-    }
-
-    fn status(&self, line: Option<usize>) -> String {
-        if self.0.is_empty() {
-            return "No matching lines".into();
-        }
-        match line.and_then(|line| self.0.binary_search(&line).ok()) {
-            Some(index) => format!("Match {} of {}", index + 1, self.0.len()),
-            None if self.0.len() == 1 => "1 matching line".into(),
-            None => format!("{} matching lines", self.0.len()),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) enum Action {
     Confirm,
@@ -379,10 +342,12 @@ pub(crate) enum Action {
     Reload,
     CopyPath,
     CopyText,
+    CopyLine,
     EditLine(String),
     Jump,
     ToggleFind,
     EditFind(String),
+    SetMatchCase(bool),
     FindStep {
         previous: bool,
     },
@@ -391,7 +356,7 @@ pub(crate) enum Action {
         y: f32,
         viewport_height: f32,
     },
-    SetActualSize(bool),
+    SetZoom(ImageZoom),
 }
 
 enum Phase {
@@ -413,14 +378,56 @@ struct Page {
     reported_column: Option<usize>,
     find_open: bool,
     find_query: String,
+    match_case: bool,
     matches: SourceMatches,
     scroll_x: f32,
     scroll_y: f32,
     viewport_height: f32,
-    actual_size: bool,
+    zoom: ImageZoom,
 }
 
 impl Page {
+    fn selected_line_text(&self) -> Option<&str> {
+        let Phase::Ready(Preview {
+            content: Content::Text(text),
+            lines,
+            ..
+        }) = &self.phase
+        else {
+            return None;
+        };
+        if text.is_empty() {
+            return None;
+        }
+        let index = self.selected_line?.checked_sub(1)?;
+        lines.get(index)?;
+        Some(source_line(text, lines, index))
+    }
+
+    fn update_matches(&mut self) {
+        self.matches.clear_active();
+        if let Phase::Ready(Preview {
+            content: Content::Text(text),
+            ..
+        }) = &self.phase
+        {
+            self.matches.update(text, &self.find_query, self.match_case);
+        }
+    }
+
+    fn match_prefix(&self) -> Option<String> {
+        let hit = self.find_open.then(|| self.matches.active()).flatten()?;
+        if self.selected_line != Some(hit.line) {
+            return None;
+        }
+        let Phase::Ready(preview) = &self.phase else {
+            return None;
+        };
+        let digits = preview.lines.len().to_string().len();
+        let prefix = self.selected_line_text()?.get(..hit.start)?;
+        Some(format!("{:>digits$}  {prefix}", hit.line))
+    }
+
     fn select_line(&mut self, line: usize) {
         self.selected_line = Some(line);
         self.reported_column = None;
@@ -452,8 +459,8 @@ impl Page {
             self.reported_column = column;
         }
         match &preview.content {
-            Content::Text(text) => self.matches.update(text, &self.find_query),
-            Content::Image { .. } => self.matches.update("", ""),
+            Content::Text(text) => self.matches.update(text, &self.find_query, self.match_case),
+            Content::Image { .. } => self.matches = SourceMatches::default(),
         }
         let reveal = preview.location.is_some();
         self.phase = Phase::Ready(preview);
@@ -511,8 +518,12 @@ fn location_label(line: usize, column: Option<usize>) -> String {
     }
 }
 
-fn scroll_id(token: u64, actual_size: bool) -> iced::widget::Id {
-    iced::widget::Id::from(format!("local-file-preview-{token}-{actual_size}"))
+fn source_scroll_id(token: u64) -> iced::widget::Id {
+    iced::widget::Id::from(format!("local-file-preview-source-{token}"))
+}
+
+fn image_scroll_id(token: u64, zoom: ImageZoom) -> iced::widget::Id {
+    iced::widget::Id::from(format!("local-file-preview-image-{token}-{zoom}"))
 }
 
 fn find_input_id(token: u64) -> iced::widget::Id {
@@ -599,11 +610,12 @@ impl Frost {
             reported_column: None,
             find_open: false,
             find_query: String::new(),
+            match_case: true,
             matches: SourceMatches::default(),
             scroll_x: 0.0,
             scroll_y: 0.0,
             viewport_height: (self.win_size.height - 240.0).max(80.0),
-            actual_size: false,
+            zoom: ImageZoom::Fit,
         });
         self.reference_inspector_tab = InspectorTab::Files;
         self.reference_navigation_drawer = false;
@@ -710,6 +722,11 @@ impl Frost {
                     return iced::clipboard::write(value.clone());
                 }
             }
+            Action::CopyLine => {
+                if let Some(line) = page.selected_line_text() {
+                    return iced::clipboard::write(line.to_owned());
+                }
+            }
             Action::EditLine(value) => {
                 page.line_input = value.chars().take(20).collect();
             }
@@ -719,6 +736,7 @@ impl Frost {
                     if let Ok(line) = page.line_input.trim().parse::<usize>() {
                         if (1..=count).contains(&line) {
                             page.select_line(line);
+                            page.matches.clear_active();
                             return self.reveal_file_preview_line();
                         }
                     }
@@ -732,18 +750,16 @@ impl Frost {
                 }
             }
             Action::EditFind(query) => {
-                if let Phase::Ready(Preview {
-                    content: Content::Text(text),
-                    ..
-                }) = &page.phase
-                {
-                    page.find_query = query.chars().take(256).collect();
-                    page.matches.update(text, &page.find_query);
-                }
+                page.find_query = query.chars().take(256).collect();
+                page.update_matches();
+            }
+            Action::SetMatchCase(case) => {
+                page.match_case = case;
+                page.update_matches();
             }
             Action::FindStep { previous } if page.find_open => {
-                if let Some(line) = page.matches.step(page.selected_line, previous) {
-                    page.select_line(line);
+                if let Some(hit) = page.matches.step(page.selected_line, previous) {
+                    page.select_line(hit.line);
                     return self.reveal_file_preview_line();
                 }
             }
@@ -758,7 +774,7 @@ impl Frost {
                     page.viewport_height = viewport_height;
                 }
             }
-            Action::SetActualSize(value) => page.actual_size = value,
+            Action::SetZoom(zoom) => page.zoom = zoom,
             _ => {}
         }
         Task::none()
@@ -770,6 +786,7 @@ impl Frost {
 
     fn reveal_file_preview_line(&mut self) -> Task<Message> {
         let row_height = self.preview_line_height();
+        let font_size = self.chrome_font_size().max(12.0);
         let Some(page) = &mut self.file_preview.page else {
             return Task::none();
         };
@@ -784,7 +801,9 @@ impl Frost {
         let viewport = page.viewport_height.max(stride);
         let max_offset = (count as f32 * stride - viewport).max(0.0);
         let centered = (line - 1) as f32 * stride - (viewport - stride) / 2.0;
-        page.scroll_x = 0.0;
+        page.scroll_x = page.match_prefix().map_or(0.0, |prefix| {
+            (source_text_width(&prefix, font_size) - 28.0).max(0.0)
+        });
         page.scroll_y = centered.clamp(0.0, max_offset);
         self.restore_file_preview_scroll()
     }
@@ -802,7 +821,7 @@ impl Frost {
             return Task::none();
         };
         iced::widget::operation::scroll_to(
-            scroll_id(page.view_token, false),
+            source_scroll_id(page.view_token),
             scrollable::AbsoluteOffset {
                 x: page.scroll_x,
                 y: page.scroll_y,
@@ -897,8 +916,11 @@ impl Frost {
                 .spacing(4);
                 match &preview.content {
                     Content::Text(value) => {
-                        let tools =
-                            tools.push(control("Copy text").on_press(event(Action::CopyText)));
+                        let tools = tools
+                            .push(control("Copy text").on_press(event(Action::CopyText)))
+                            .push(control("Copy line").on_press_maybe(
+                                page.selected_line_text().map(|_| event(Action::CopyLine)),
+                            ));
                         body = body.push(tools.wrap());
                         if value.is_empty() {
                             return body.push(text("Empty file")).into();
@@ -918,7 +940,7 @@ impl Frost {
                         .wrap();
                         let mut search = column![navigation].spacing(4);
                         if page.find_open {
-                            let available = !page.matches.0.is_empty();
+                            let available = !page.matches.is_empty();
                             let query = text_input("Find text", &page.find_query)
                                 .id(find_input_id(page.view_token))
                                 .size(self.chrome_font_size())
@@ -936,13 +958,15 @@ impl Frost {
                                         available
                                             .then(|| event(Action::FindStep { previous: false }))
                                     ),
+                                    checkbox(page.match_case)
+                                        .label("Match case")
+                                        .on_toggle(move |value| event(Action::SetMatchCase(value))),
                                 ]
                                 .spacing(4)
                                 .wrap(),
                             );
                             if !page.find_query.is_empty() {
-                                search = search
-                                    .push(text(page.matches.status(page.selected_line)).size(12));
+                                search = search.push(text(page.matches.status()).size(12));
                             }
                         }
                         body.push(search)
@@ -956,20 +980,21 @@ impl Frost {
                         width,
                         height,
                     } => {
-                        let sizing = if page.actual_size {
-                            "Fit image"
-                        } else {
-                            "Actual size"
-                        };
+                        let zoom = pick_list(
+                            ImageZoom::OPTIONS.as_slice(),
+                            Some(page.zoom),
+                            move |zoom| event(Action::SetZoom(zoom)),
+                        )
+                        .text_size(self.chrome_font_size());
                         let image = iced::widget::image(handle.clone());
-                        let image: Element<'_, Message> = if page.actual_size {
-                            let scale = self.scale_factor() as f32;
+                        let image: Element<'_, Message> = if let Some(scale) = page.zoom.scale() {
+                            let scale = scale / self.scale_factor() as f32;
                             scrollable(
                                 image
-                                    .width(*width as f32 / scale)
-                                    .height(*height as f32 / scale),
+                                    .width(*width as f32 * scale)
+                                    .height(*height as f32 * scale),
                             )
-                            .id(scroll_id(page.view_token, true))
+                            .id(image_scroll_id(page.view_token, page.zoom))
                             .direction(both_axes())
                             .height(Length::Fill)
                             .into()
@@ -982,13 +1007,9 @@ impl Frost {
                         };
                         body.push(tools.wrap())
                             .push(
-                                row![
-                                    text(format!("{width} × {height} pixels")).size(12),
-                                    control(sizing)
-                                        .on_press(event(Action::SetActualSize(!page.actual_size))),
-                                ]
-                                .spacing(8)
-                                .wrap(),
+                                row![text(format!("{width} × {height} pixels")).size(12), zoom,]
+                                    .spacing(8)
+                                    .wrap(),
                             )
                             .push(image)
                             .height(Length::Fill)
@@ -1015,14 +1036,37 @@ impl Frost {
         );
         let font_size = self.chrome_font_size().max(12.0);
         let digits = preview.lines.len().to_string().len();
+        let active = page.matches.active();
         let mut lines = column![Space::new().height(pad_top)];
         for index in start..start + count {
             let line = source_line(value, &preview.lines, index);
-            let label = text(format!("{:>digits$}  {line}", index + 1))
+            let row = index + 1;
+            let hits = if page.find_open {
+                page.matches.hits(Some(row))
+            } else {
+                &[]
+            };
+            let mut spans = vec![span(format!("{row:>digits$}  "))];
+            let mut start = 0;
+            for hit in hits {
+                if start < hit.start {
+                    spans.push(span(&line[start..hit.start]));
+                }
+                let [red, green, blue] = match_background(active == Some(*hit));
+                spans.push(
+                    span(&line[hit.start..hit.end])
+                        .background(iced::Color::from_rgb8(red, green, blue))
+                        .color(iced::Color::from_rgb8(35, 23, 8)),
+                );
+                start = hit.end;
+            }
+            spans.push(span(&line[start..]));
+            let label = rich_text::<(), Message, _, _>(spans)
                 .size(font_size)
                 .font(iced::Font::MONOSPACE)
                 .wrapping(text::Wrapping::None);
             let line = container(label)
+                .padding(iced::Padding::new(0.0).right(18.0))
                 .height(row_height + sidebar::SIDEBAR_TREE_ROW_GAP)
                 .align_y(iced::alignment::Vertical::Center);
             lines = lines.push(if page.selected_line == Some(index + 1) {
@@ -1033,7 +1077,7 @@ impl Frost {
         }
         let token = page.token;
         scrollable(lines.push(Space::new().height(pad_bottom)))
-            .id(scroll_id(page.view_token, false))
+            .id(source_scroll_id(page.view_token))
             .direction(both_axes())
             .height(Length::Fill)
             .on_scroll(move |viewport| {
@@ -1048,6 +1092,22 @@ impl Frost {
             })
             .into()
     }
+}
+
+fn source_text_width(value: &str, font_size: f32) -> f32 {
+    use iced::advanced::text::{Paragraph, Renderer, Shaping, Text, Wrapping};
+    <iced::Renderer as Renderer>::Paragraph::with_text(Text {
+        content: value,
+        bounds: iced::Size::INFINITE,
+        size: iced::Pixels(font_size),
+        line_height: Default::default(),
+        font: iced::Font::MONOSPACE,
+        align_x: Default::default(),
+        align_y: iced::alignment::Vertical::Top,
+        shaping: Shaping::Advanced,
+        wrapping: Wrapping::None,
+    })
+    .min_width()
 }
 
 fn source_status(page: &Page, count: usize) -> String {
@@ -1068,20 +1128,6 @@ fn source_status(page: &Page, count: usize) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn source_find_uses_literal_matching_lines_and_wraps() {
-        let mut matches = SourceMatches::default();
-        matches.update("first\n界界\nempty\n界", "界");
-        assert_eq!(matches.status(None), "2 matching lines");
-        assert_eq!(matches.step(None, false), Some(2));
-        assert_eq!(matches.step(Some(2), false), Some(4));
-        assert_eq!(matches.step(Some(4), false), Some(2));
-        assert_eq!(matches.step(Some(2), true), Some(4));
-        assert_eq!(matches.status(Some(4)), "Match 2 of 2");
-        matches.update("larger", "Large");
-        assert_eq!(matches.status(None), "No matching lines");
-        assert_eq!(matches.step(None, true), None);
-    }
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);

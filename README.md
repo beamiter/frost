@@ -1150,14 +1150,17 @@ Ctrl-click a supported path in terminal output to review the exact local path
 and any source-location fallback before choosing **Read local file**. Terminal
 references stay within the originating local terminal's working directory.
 
-**Go to line** reveals and highlights a one-based source line. Use **Copy
-text**, **Copy path**, or **Reload** from the toolbar. **Find** searches the
-source with case-sensitive text matching. **Prev** and **Next** move between
-matching lines and wrap around. Reload reads the file named in the result.
-The last preview stays available during the read and if it fails. PNG and JPEG previews show pixel dimensions and fit the
-inspector by default. **Actual size** allows scrolling through the full-size
-image. Reads are limited to 64 KiB for UTF-8 text and 2 MiB for PNG/JPEG
-images, with a 4096-pixel edge and 4-megapixel image limit.
+**Go to line** reveals and highlights a one-based source line. The toolbar
+offers **Copy text**, **Copy line**, **Copy path**, and **Reload**. **Find**
+marks literal occurrences, including multiple matches on one line. **Prev**
+and **Next** wrap through matches and reveal the active occurrence
+horizontally. **Match case** is on by default. The preview indexes the first
+4,096 matches and adds a plus sign to the count when more exist. Reload reads
+the resolved filename and keeps the last preview available during a read or
+after an error. PNG and JPEG previews show pixel dimensions and offer **Fit
+image** and preset zoom levels from 25% to 400%. At 100%, a source pixel maps
+to a display pixel. Reads are limited to 64 KiB for UTF-8 text and 2 MiB for
+PNG/JPEG images, with a 4096-pixel edge and 4-megapixel image limit.
 
 ### Block reading workspace
 
