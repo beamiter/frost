@@ -4808,6 +4808,9 @@ enum Message {
     AgentLaunch(agent_task::AgentProvider),
     WorkspaceOpenSession(agent_sessions::WorkspaceSessionRef),
     WorkspacePin(agent_sessions::WorkspaceSessionRef),
+    WorkspaceRequestDeleteCli(agent_sessions::WorkspaceCliDeletion),
+    WorkspaceCancelDeleteCli,
+    WorkspaceConfirmDeleteCli,
     WorkspaceApi(jterm_core::agent_workspace::ConversationId),
     WorkspaceApiReload(jterm_core::agent_workspace::ConversationId),
     WorkspaceApiUseShared(jterm_core::agent_workspace::ConversationId),
@@ -8559,6 +8562,7 @@ impl Frost {
             && !self.agent_sessions.open
             && !self.agent_sessions.remote.open
             && !self.agent_sessions.menu_open
+            && self.agent_sessions.delete_confirmation.is_none()
             && !self.palette.is_open
             && self.reference_tools_selection.is_none()
             && !native_input_surface::ai_surface_active(
@@ -8637,6 +8641,7 @@ impl Frost {
             && !self.agent_sessions.open
             && !self.agent_sessions.remote.open
             && !self.agent_sessions.menu_open
+            && self.agent_sessions.delete_confirmation.is_none()
             && !self.palette.is_open
             && self.reference_tools_selection.is_none()
             && !native_input_surface::ai_surface_active(
@@ -12660,6 +12665,7 @@ impl Frost {
             || self.agent_sessions.open
             || self.agent_sessions.remote.open
             || self.agent_sessions.menu_open
+            || self.agent_sessions.delete_confirmation.is_some()
             || self.history_picker.is_some()
             || self.workflow_overlay.is_some()
             || self.block_search.is_some()
@@ -18858,6 +18864,23 @@ impl Frost {
             Message::WorkspacePin(reference) => {
                 self.agent_sessions.pin_workspace_session(&reference)
             }
+            Message::WorkspaceRequestDeleteCli(target) => {
+                self.native_enter_ownership.lock().claim_held();
+                self.agent_sessions.delete_confirmation = Some(target);
+            }
+            Message::WorkspaceCancelDeleteCli => {
+                self.native_enter_ownership.lock().claim_held();
+                self.agent_sessions.delete_confirmation = None;
+            }
+            Message::WorkspaceConfirmDeleteCli => {
+                self.native_enter_ownership.lock().claim_held();
+                if let Some(target) = self.agent_sessions.delete_confirmation.take() {
+                    match self.agent_sessions.delete_cli_session(&target) {
+                        Ok(()) => self.push_toast("Deleting session…", ToastKind::Info),
+                        Err(error) => self.push_toast(error, ToastKind::Warning),
+                    }
+                }
+            }
             Message::WorkspaceOpenSession(reference) => {
                 self.activate_workspace_session(reference);
             }
@@ -19266,6 +19289,15 @@ impl Frost {
                         && state.workspace.sync(&state.catalog, state.store.snapshot())
                     {
                         state.refresh_workspace_metadata();
+                    }
+                }
+                for result in self.agent_sessions.settle_cli_deletions() {
+                    match result {
+                        Ok(_) => self.push_toast(
+                            "Session deleted from Agent Workspace.",
+                            ToastKind::Success,
+                        ),
+                        Err(error) => self.push_toast(error, ToastKind::Warning),
                     }
                 }
                 self.finish_pending_agent_resume();
@@ -19872,6 +19904,19 @@ impl Frost {
                 return self.update(Message::Key(event));
             }
             Message::Key(event) => {
+                if self.agent_sessions.delete_confirmation.is_some() {
+                    self.native_enter_ownership.lock().claim_held();
+                    if matches!(
+                        &event,
+                        keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                            ..
+                        }
+                    ) {
+                        self.agent_sessions.delete_confirmation = None;
+                    }
+                    return Task::none();
+                }
                 if self.agent_sessions.menu_open {
                     self.native_enter_ownership.lock().claim_held();
                     if matches!(
@@ -29058,6 +29103,11 @@ impl Frost {
         };
         let root: Element<'_, Message> = if let Some(confirmation) = &self.sidebar_delete_confirm {
             stack![root, self.sidebar_delete_confirm_view(&confirmation.paths)].into()
+        } else {
+            root
+        };
+        let root = if let Some(confirmation) = &self.agent_sessions.delete_confirmation {
+            stack![root, self.workspace_cli_delete_confirmation(confirmation)].into()
         } else {
             root
         };

@@ -63,6 +63,12 @@ fn same_launch_target(left: &AgentSession, right: &AgentSession) -> bool {
         && left.archived == right.archived
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceCliDeletion {
+    id: jterm_core::agent_workspace::ConversationId,
+    session: AgentSession,
+}
+
 pub(crate) fn session_key(session: &AgentSession) -> SessionKey {
     (session.provider, session.id.clone())
 }
@@ -155,6 +161,7 @@ pub(crate) struct SessionLibrary {
     pub(crate) menu_open: bool,
     pub(crate) menu_epoch: u64,
     pub(crate) tools: crate::workspace_tools::WorkspaceTools,
+    pub(crate) delete_confirmation: Option<WorkspaceCliDeletion>,
     pub open: bool,
     pub(crate) workspace_pending: bool,
     pub(crate) workspace_task: Option<jterm_core::agent_task::TaskId>,
@@ -227,6 +234,41 @@ impl Default for SessionLibrary {
 impl SessionLibrary {
     pub(crate) fn owns_terminal(&self, terminal_id: usize) -> bool {
         self.bindings.values().any(|id| *id == terminal_id)
+    }
+
+    pub(crate) fn delete_cli_session(
+        &mut self,
+        target: &WorkspaceCliDeletion,
+    ) -> Result<(), String> {
+        let session = self
+            .catalog
+            .sessions
+            .iter()
+            .find(|session| same_launch_target(session, &target.session))
+            .ok_or("This session source changed. Refresh before deleting it.")?;
+        if self
+            .workspace
+            .row(session)
+            .is_some_and(|row| row.runtime.is_live())
+            || !self.catalog.live_pids(session).is_empty()
+        {
+            return Err("Stop the running CLI session before deleting it.".into());
+        }
+        self.workspace.delete(target.id.clone(), session.clone())
+    }
+
+    pub(crate) fn settle_cli_deletions(
+        &mut self,
+    ) -> Vec<Result<jterm_core::agent_workspace::ConversationId, String>> {
+        let updates = self.workspace.take_deletion_updates();
+        if updates.iter().any(Result::is_ok) {
+            for id in updates.iter().filter_map(|result| result.as_ref().ok()) {
+                self.tools.retire_conversation(id);
+            }
+            self.replace_catalog(self.catalog.clone());
+            self.scanner.refresh();
+        }
+        updates
     }
 
     pub(crate) fn metadata(&self) -> &SessionLibrarySnapshot {
@@ -484,6 +526,7 @@ impl SessionLibrary {
     fn with_store(store: SessionLibraryStore) -> Self {
         Self {
             tools: Default::default(),
+            delete_confirmation: None,
             context: Default::default(),
             review: Default::default(),
             remote: Default::default(),
@@ -670,7 +713,10 @@ impl SessionLibrary {
         old_page != self.page
     }
 
-    pub fn replace_catalog(&mut self, catalog: SessionCatalog) -> bool {
+    pub fn replace_catalog(&mut self, mut catalog: SessionCatalog) -> bool {
+        catalog
+            .sessions
+            .retain(|session| !self.workspace.is_deleted(session));
         if self.catalog == catalog {
             return false;
         }
@@ -1806,6 +1852,18 @@ impl super::Frost {
                     });
                 let title = state.workspace.title(session);
                 let presentation = state.workspace.row(session).map(|row| row.presentation());
+                let deletion = state
+                    .workspace
+                    .row(session)
+                    .filter(|row| {
+                        !row.runtime.is_live() && state.catalog.live_pids(session).is_empty()
+                    })
+                    .map(|row| {
+                        M::WorkspaceRequestDeleteCli(WorkspaceCliDeletion {
+                            id: row.id.clone(),
+                            session: session.clone(),
+                        })
+                    });
                 let status_label = presentation
                     .as_ref()
                     .map(|p| p.status_label.as_str())
@@ -1834,6 +1892,9 @@ impl super::Frost {
                     } else {
                         button::text
                     }),
+                    button(text("Delete…").size(size - 2.0))
+                        .on_press_maybe(deletion)
+                        .style(button::text),
                 ]
                 .spacing(2);
                 conversations = conversations.push(
@@ -1976,6 +2037,52 @@ impl super::Frost {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+    }
+
+    pub(crate) fn workspace_cli_delete_confirmation(
+        &self,
+        target: &WorkspaceCliDeletion,
+    ) -> iced::Element<'_, super::Message> {
+        use super::Message as M;
+        use iced::widget::{
+            button, column, container, mouse_area, row, scrollable, stack, text, Space,
+        };
+        use iced::Length;
+        let title = crate::review_text::visible_bounded(
+            self.agent_sessions.workspace.title(&target.session),
+            180,
+        );
+        let provider = target.session.provider.label();
+        let size = self.chrome_font_size();
+        let body = column![
+            self.popup_text("Delete CLI session?").size(size + 2.0),
+            self.popup_text(format!("Delete “{title}” from Agent Workspace and its history search? The original {provider} history is kept."))
+                .size(size).wrapping(text::Wrapping::Word),
+            row![
+                button(self.popup_text("Cancel").size(size))
+                    .on_press(M::WorkspaceCancelDeleteCli)
+                    .style(self.ghost_btn_style()),
+                Space::new().width(Length::Fill),
+                button(self.popup_text("Delete session").size(size))
+                    .on_press(M::WorkspaceConfirmDeleteCli)
+                    .style(button::danger),
+            ].spacing(8),
+        ].spacing(12);
+        let panel = container(scrollable(body).height(Length::Shrink))
+            .width((self.win_size.width - 16.0).clamp(1.0, 410.0))
+            .max_height((self.win_size.height - 16.0).max(1.0))
+            .padding(14)
+            .style(self.popup_style());
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(M::WorkspaceCancelDeleteCli);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![iced::Element::from(dismiss), iced::Element::from(centered)].into()
     }
 
     /// The live tab this window already resumed for one conversation.
