@@ -32,6 +32,42 @@ def image_with_markers(ids, x, y, cell_width, cell_height):
 
 
 class PageCalibrationTest(unittest.TestCase):
+    def test_accepts_one_blended_seam_but_rejects_ambiguous_edges(self):
+        # Native X11 raster alternates 7–8 solid pixels and one mixed
+        # boundary pixel. The five RGB interiors must remain exact.
+        rows = tuple(range(269, 277))
+        seams = ((85, 29, 158), (35, 53, 179), (153, 132, 179), (61, 165, 126))
+        for width, fill, accepted in (
+            (1, seams[0], True),
+            (2, seams[0], False),
+            (1, marker_colors(269)[-1], False),
+        ):
+            with self.subTest(seam_width=width, seam_color=fill):
+                image = Image.new('RGB', (400, 200), (0, 0, 0))
+                draw = ImageDraw.Draw(image)
+                for i, row in enumerate(rows):
+                    left, top = 30, 20 + i * 16
+                    for j, color in enumerate(marker_colors(row)):
+                        length = 8 - j % 2
+                        draw.rectangle((left, top, left + length - 1, top + 15), fill=color)
+                        left += length
+                        if j < 4:
+                            seam = seams[j] if accepted else fill
+                            draw.rectangle((left, top, left + width - 1, top + 15), fill=seam)
+                            left += width
+                if not accepted:
+                    with self.assertRaises(InvalidWitness):
+                        calibrate_grid(image, ('same-window',), rows)
+                    continue
+                grid = calibrate_grid(image, ('same-window',), rows)
+                self.assertEqual(row_ids(Frame(grid, image, 100, 101)), rows)
+                with self.assertRaises(InvalidWitness):
+                    calibrate_grid(image, ('same-window',), rows[:-1])
+                # Changed grid/marker centers on one row cannot pass.
+                image.paste(image.crop((29, 36, 90, 52)), (28, 36))
+                with self.assertRaises(InvalidWitness):
+                    calibrate_grid(image, ('same-window',), rows)
+
     def test_calibrates_two_geometries_with_repeated_hex_digits(self):
         for box in ((13, 26, 6, 8), (31, 49, 9, 13)):
             img, expected = image_with_markers(range(252, 260), *box)

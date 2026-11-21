@@ -26,6 +26,7 @@ def calibrate_grid(image, target, expected):
     start = bytes(MARKER_START)
     digits = tuple(tuple(bytes(color) for color in bank) for bank in NIBBLE_COLORS)
     end = bytes(MARKER_END)
+    palette = {start, end, *(color for bank in digits for color in bank)}
     bands = []
     for y in range(image.height):
         line = raw[y * width:(y + 1) * width]
@@ -36,6 +37,11 @@ def calibrate_grid(image, target, expected):
         samples, encoded = [], []
         for desired in ((start,), *digits, (end,)):
             color = line[right:right + 3]
+            if samples and color not in palette:
+                # Fractional cell edges can leave exactly one blended
+                # pixel between solid marker runs in a native raster.
+                right += 3
+                color = line[right:right + 3]
             if color not in desired:
                 break
             left = right
