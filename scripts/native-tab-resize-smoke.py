@@ -27,6 +27,19 @@ def ready_color(columns):
     return (24 + columns % 180, 239, 97)
 
 
+def resize_frame_evidence(painted, previous_cols, current_cols):
+    """Classify one sample, never combining old/new markers across phases."""
+    assert REPLAY_COLOR not in painted, 'An intermediate CLI replay reached the screen'
+    if current_cols == previous_cols:
+        return 'awaiting-pty-resize'
+    previous = ready_color(previous_cols)
+    current = ready_color(current_cols)
+    assert previous != current, 'Resize fixture marker colors collide'
+    if previous in painted:
+        return 'mixed' if current in painted else 'previous-only'
+    return 'current-only' if current in painted else 'unmarked'
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True, type=Path)
@@ -202,21 +215,29 @@ while True:
             wait(old_frame, 'original frame')
             run('xdotool', 'windowsize', '--sync', window, '1296', '800')
             began = time.monotonic()
-            retained_frame_seen = False
+            previous_marker_seen = False
+            previous_only_seen = False
+            mixed_samples = 0
 
             def new_frame():
-                nonlocal retained_frame_seen
-                painted = colors()
-                assert REPLAY_COLOR not in painted, 'An intermediate CLI replay reached the screen'
+                nonlocal previous_marker_seen, previous_only_seen, mixed_samples
+                # Observe PTY resize before capturing the associated pixels.
                 latest = records()[-1]
-                if latest['cols'] == resized[-1]['cols']:
-                    return False
-                retained_frame_seen |= old_color in painted
-                return ready_color(latest['cols']) in painted
+                evidence = resize_frame_evidence(colors(), resized[-1]['cols'], latest['cols'])
+                previous_marker_seen |= evidence in ('previous-only', 'mixed')
+                previous_only_seen |= evidence == 'previous-only'
+                mixed_samples += evidence == 'mixed'
+                return evidence == 'current-only'
 
             wait(new_frame, 'complete resize repaint')
-            assert retained_frame_seen, 'The previous frame disappeared during the CLI replay'
-            result['retained_previous_frame'] = retained_frame_seen
+            assert previous_marker_seen, 'The previous frame disappeared during the CLI replay'
+            # A mixed sample preserves the previous marker as in the original
+            # smoke, but cannot witness an old-only frame or prove completion.
+            result['retained_previous_frame'] = previous_only_seen
+            result['previous_frame_evidence'] = (
+                'post-resize-previous-only' if previous_only_seen else 'inconclusive-mixed-only'
+            )
+            result['mixed_marker_samples'] = mixed_samples
             result['settled_frame_ms'] = round((time.monotonic() - began) * 1000)
         finally:
             capture.close()
