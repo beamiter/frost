@@ -44,6 +44,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--page-up-only', action='store_true',
+                        help='Run the independent synthetic ordinal PageUp case')
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     for program in ['Xvfb', 'openbox', 'xdotool', 'bash']:
@@ -101,6 +103,13 @@ while True:
     stripe((24 + cols % 180, 239, 97))
     print('\\x1b[?2026l', end='', flush=True)
 ''')
+    if args.page_up_only:
+        fixture.write_text(
+            'import sys\n'
+            'sys.path.insert(0, ' + repr(str(Path(__file__).resolve().parent)) + ')\n'
+            'from native_page_up import producer\n'
+            'from pathlib import Path\n'
+            'producer(Path(' + repr(str(root)) + '))\n')
     bashrc = root / 'bashrc'
     bashrc.write_text("PS1='\\[\\e]133;A\\a\\]$ \\[\\e]133;B\\a\\]'\n"
                       "PROMPT_COMMAND=\"printf '\\e]0;SHELL_RESIZE_FIXTURE\\a'\"\n")
@@ -176,6 +185,14 @@ while True:
         window = wait(lambda: run('xdotool', 'search', '--onlyvisible', '--pid', app.pid,
                                  check=False).stdout.strip().splitlines(), 'Frost window')[-1]
         run('xdotool', 'windowactivate', '--sync', window)
+        if args.page_up_only:
+            from native_page_up import exercise
+
+            result['scope'] = 'native X11 terminal-owned PageUp with synthetic inline ANSI rows'
+            wait(lambda: (root / 'ordinal-ready.json').exists(), 'ordinal producer ready')
+            result['page_up'] = exercise(root, env, app, window, run, wait, key)
+            result['status'] = 'pass'
+            return
         wait(lambda: log_path.exists() and records(), 'CLI fixture output')
         time.sleep(1)
         before = records()
