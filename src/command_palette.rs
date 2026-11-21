@@ -39,6 +39,7 @@ fn bound_palette_query(query: impl Into<String>) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaletteAction {
     GreetCompanion,
+    RemoteDesktop,
     NewTab,
     CloseTab,
     NextTab,
@@ -680,6 +681,13 @@ impl PaletteState {
                 binding: Some("terminal:clear"),
                 shortcut: "",
                 action: PaletteAction::ClearScreen,
+            },
+            PaletteItem {
+                name: "Remote Desktop",
+                description: "Open a JWM remote desktop viewer",
+                binding: Some("remote:desktop"),
+                shortcut: "",
+                action: PaletteAction::RemoteDesktop,
             },
             PaletteItem {
                 name: "Install or update jsh",
