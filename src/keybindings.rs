@@ -143,6 +143,7 @@ pub enum Command {
 
     /// Explicit application-only greeting; deliberately has no default chord.
     OrganismHello,
+    RemoteDesktop,
 
     // === 字体缩放 ===
     FontZoomIn,
@@ -158,6 +159,7 @@ impl std::fmt::Display for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Command::OrganismHello => write!(f, "organism:hello"),
+            Command::RemoteDesktop => write!(f, "remote:desktop"),
             Command::SessionNew => write!(f, "session:new"),
             Command::SessionClose => write!(f, "session:close"),
             Command::SessionNext => write!(f, "session:next"),
@@ -258,6 +260,7 @@ impl std::str::FromStr for Command {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "organism:hello" => Ok(Command::OrganismHello),
+            "remote:desktop" => Ok(Command::RemoteDesktop),
             "session:new" => Ok(Command::SessionNew),
             "session:close" => Ok(Command::SessionClose),
             "session:next" => Ok(Command::SessionNext),

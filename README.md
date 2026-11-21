@@ -435,6 +435,7 @@ install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 | Workflow 选择器 | `Ctrl+Shift+M`（带参数的模板进入逐参数表单；未声明 `default` 的参数必填，留空时 Insert 拒绝渲染；渲染结果只回填到提示符不执行） |
 | AI Chats | `Ctrl+Shift+Alt+A`（跨重启保存会话；也可从命令面板打开） |
 | 命令面板 | `Ctrl+Shift+P` |
+| JWM 远程桌面 | 命令面板 **Remote Desktop**（可绑定 `remote:desktop`） |
 | 快速切换标签 | `Ctrl+Shift+L` |
 | 标签 1–8 / 最后一个 | `Ctrl+1`…`Ctrl+8` / `Ctrl+9` |
 | 左右 / 上下分屏 | `Ctrl+Shift+E` / `Ctrl+Shift+D`（拆分聚焦 pane；同向并入同级，异向嵌套子分屏，最多 12 个 pane） |

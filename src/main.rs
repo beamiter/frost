@@ -85,6 +85,9 @@ mod reference_icon;
 mod reference_organism;
 mod relative_scroll_admission;
 mod remote_fs;
+mod remote_desktop;
+#[path = "../vendor/jwm-remote/client.rs"]
+mod jwm_remote_session;
 mod remote_host_editor;
 mod review_text;
 mod search;
@@ -4661,6 +4664,7 @@ fn main() -> iced::Result {
 
 #[derive(Debug, Clone)]
 enum Message {
+    RemoteDesktop(remote_desktop::Event),
     /// Explicit confirmation to exit a quarantined process, including live jobs.
     ExitAfterInputOverload,
     Eva(eva_companion::Event),
@@ -7610,6 +7614,7 @@ struct Frost {
     tab_switcher: Option<TabSwitcherState>,
     /// Remote host picker: one opening identity, profile snapshot and selection.
     remote_picker: Option<RemotePickerState>,
+    remote_desktop: Option<remote_desktop::Panel>,
     remote_host_editor: remote_host_editor::RemoteHostEditor,
     /// History-picker overlay (Ctrl+Shift+H): fuzzy search over the persisted
     /// command-history index; Enter types the selection into the opening pane.
@@ -7888,6 +7893,7 @@ impl Frost {
             jsh_notice_dismissed: false,
             tab_switcher: None,
             remote_picker: None,
+            remote_desktop: None,
             remote_host_editor: remote_host_editor::RemoteHostEditor::default(),
             history_picker: None,
             prompt_recall_enter_latch: PromptRecallEnterLatch::default(),
@@ -8582,6 +8588,7 @@ impl Frost {
             && self.block_review.is_none()
             && self.block_clear_confirm.is_none()
             && self.remote_picker.is_none()
+            && self.remote_desktop.is_none()
             && self.tab_close_confirm.is_none()
             && self.sidebar_menu.is_none()
             && self.sidebar_dialog.is_none()
@@ -8661,6 +8668,7 @@ impl Frost {
             && self.block_review.is_none()
             && self.block_clear_confirm.is_none()
             && self.remote_picker.is_none()
+            && self.remote_desktop.is_none()
             && self.tab_close_confirm.is_none()
             && self.sidebar_menu.is_none()
             && self.sidebar_dialog.is_none()
@@ -12278,6 +12286,14 @@ impl Frost {
                 self.equalize_panes();
                 Task::none()
             }
+            C::RemoteDesktop => {
+                if self.remote_desktop.is_none() {
+                    self.remote_desktop = Some(remote_desktop::Panel::default());
+                }
+                return Some(iced::widget::operation::focus(iced::widget::Id::new(
+                    remote_desktop::HOST_INPUT,
+                )));
+            }
             C::OrganismHello => {
                 let target = self.sessions.get(self.active).map(|session| session.id);
                 self.greet_companion(target);
@@ -12662,6 +12678,7 @@ impl Frost {
             || self.tab_menu.is_some()
             || self.tab_switcher.is_some()
             || self.remote_picker.is_some()
+            || self.remote_desktop.is_some()
             || self.agent_sessions.open
             || self.agent_sessions.remote.open
             || self.agent_sessions.menu_open
@@ -15880,6 +15897,9 @@ impl Frost {
         }
         self.palette.record_use(action);
         match action {
+            PaletteAction::RemoteDesktop => self
+                .dispatch_command(keybindings::Command::RemoteDesktop)
+                .unwrap_or_else(Task::none),
             PaletteAction::GreetCompanion => {
                 self.greet_companion(greeting_target);
                 Task::none()
@@ -18315,6 +18335,12 @@ impl Frost {
                     log::info!("jsh notice: {}", prompt.banner_title());
                 }
             }
+            Message::RemoteDesktop(remote_desktop::Event::Close) => self.remote_desktop = None,
+            Message::RemoteDesktop(event) => {
+                if let Some(panel) = self.remote_desktop.as_mut() {
+                    panel.update(event);
+                }
+            }
             Message::RemotePickerClose => self.remote_picker = None,
             Message::RemotePickerConnect(identity, profile) => {
                 let Some(index) = remote_picker_target_index(
@@ -19908,6 +19934,20 @@ impl Frost {
                 return self.update(Message::Key(event));
             }
             Message::Key(event) => {
+                if self.remote_desktop.is_some() {
+                    self.native_enter_ownership.lock().claim_held();
+                    if matches!(
+                        &event,
+                        keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                            repeat: false,
+                            ..
+                        }
+                    ) {
+                        self.remote_desktop = None;
+                    }
+                    return Task::none();
+                }
                 if self.agent_sessions.delete_confirmation.is_some() {
                     self.native_enter_ownership.lock().claim_held();
                     if matches!(
@@ -29082,6 +29122,10 @@ impl Frost {
         } else {
             root
         };
+        let root = crate::widget_identity_scope::transient_overlay(
+            root,
+            self.remote_desktop.as_ref().map(|panel| panel.view(self)),
+        );
         let root: Element<'_, Message> = if let Some(confirm) = self.block_clear_confirm {
             stack![root, self.block_clear_confirm_view(confirm)].into()
         } else {
@@ -34793,6 +34837,11 @@ impl Frost {
                 iced::time::every(std::time::Duration::from_millis(250))
                     .map(|_| Message::AgentSessionsTick),
             );
+        }
+        if self.remote_desktop.as_ref().is_some_and(remote_desktop::Panel::active) {
+            subs.push(iced::time::every(jwm_remote_session::TICK).map(|_| {
+                Message::RemoteDesktop(remote_desktop::Event::Tick)
+            }));
         }
         if let Some(eva) = self.eva.as_ref() {
             subs.push(eva.subscription());
