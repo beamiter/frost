@@ -241,6 +241,16 @@ jobs:
           /usr/bin/python3 scripts/test-native-page-up.py -v
           # Only the synthetic ANSI producer runs; this is not a Codex CLI test.
           /usr/bin/python3 scripts/native-tab-resize-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --output native-smoke-artifacts/x11-ordinal-page --page-up-only
+      - name: Exercise X11 synthetic inline held drag across controlled output
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          fixture_home="$(mktemp -d "$RUNNER_TEMP/frost-held-drag-home.XXXXXXXX")"
+          export HOME="$fixture_home"
+          /usr/bin/python3 scripts/test-native-held-drag.py -v
+          # The producer is synthetic ANSI, not a Codex CLI or external endpoint.
+          /usr/bin/python3 scripts/native-tab-resize-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --output native-smoke-artifacts/x11-ordinal-held-drag --held-drag-only
       - name: Preserve screenshots and PTY evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

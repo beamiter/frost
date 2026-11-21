@@ -44,11 +44,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
-    parser.add_argument('--page-up-only', action='store_true',
-                        help='Run the independent synthetic ordinal PageUp case')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--page-up-only', action='store_true',
+                      help='Run the independent synthetic ordinal PageUp case')
+    mode.add_argument('--held-drag-only', action='store_true',
+                      help='Run the independent synthetic held-drag case')
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
-    for program in ['Xvfb', 'openbox', 'xdotool', 'bash']:
+    dependencies = ['Xvfb', 'openbox', 'xdotool', 'bash']
+    if args.held_drag_only:
+        dependencies.append('xclip')
+    for program in dependencies:
         if not shutil.which(program):
             parser.error('Missing test dependency: ' + program)
     os.umask(0o077)
@@ -103,11 +109,12 @@ while True:
     stripe((24 + cols % 180, 239, 97))
     print('\\x1b[?2026l', end='', flush=True)
 ''')
-    if args.page_up_only:
+    if args.page_up_only or args.held_drag_only:
+        producer_module = 'native_page_up' if args.page_up_only else 'native_held_drag'
         fixture.write_text(
             'import sys\n'
             'sys.path.insert(0, ' + repr(str(Path(__file__).resolve().parent)) + ')\n'
-            'from native_page_up import producer\n'
+            'from ' + producer_module + ' import producer\n'
             'from pathlib import Path\n'
             'producer(Path(' + repr(str(root)) + '))\n')
     bashrc = root / 'bashrc'
@@ -191,6 +198,14 @@ while True:
             result['scope'] = 'native X11 terminal-owned PageUp with synthetic inline ANSI rows'
             wait(lambda: (root / 'ordinal-ready.json').exists(), 'ordinal producer ready')
             result['page_up'] = exercise(root, env, app, window, run, wait, key)
+            result['status'] = 'pass'
+            return
+        if args.held_drag_only:
+            from native_held_drag import exercise
+
+            result['scope'] = 'native X11 held-drag selection with synthetic inline ANSI append'
+            wait(lambda: (root / 'held-ready.json').exists(), 'held producer ready')
+            result['held_drag'] = exercise(root, env, app, window, run, wait)
             result['status'] = 'pass'
             return
         wait(lambda: log_path.exists() and records(), 'CLI fixture output')
