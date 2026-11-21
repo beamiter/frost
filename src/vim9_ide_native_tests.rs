@@ -59,7 +59,7 @@ fn wait_for(
 }
 
 #[cfg(target_os = "linux")]
-fn child_exited_without_reaping(session: &Session) -> bool {
+fn observe_child_exit_without_reaping(session: &Session) -> Option<bool> {
     // SAFETY: zero initialization is valid for siginfo_t, and waitid writes
     // only that structure. WNOWAIT leaves reaping to the owning production Pty.
     unsafe {
@@ -70,9 +70,80 @@ fn child_exited_without_reaping(session: &Session) -> bool {
             &mut info,
             libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
         );
-        assert_eq!(result, 0, "waitid: {}", std::io::Error::last_os_error());
-        info.si_pid() != 0
+        (result == 0).then(|| info.si_pid() != 0)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn child_exited_without_reaping(session: &Session) -> bool {
+    observe_child_exit_without_reaping(session)
+        .unwrap_or_else(|| panic!("waitid: {}", std::io::Error::last_os_error()))
+}
+
+#[cfg(target_os = "linux")]
+fn diagnostic_file_matches(path: &Path, expected: &[u8]) -> Option<bool> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take((expected.len() + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes == expected)
+}
+
+#[cfg(target_os = "linux")]
+fn quit_error_diagnostic(error: &str) -> (&'static str, Option<u16>) {
+    match error {
+        "Vim is busy with a command, operator or completion; finish it before this action" => {
+            return ("vim-busy", None);
+        }
+        "A Vim workbench plugin is waiting for input; finish it before another IDE action" => {
+            return ("vim-workbench-busy", None);
+        }
+        "A save is waiting for Vim to finish input; wait for it before another IDE action" => {
+            return ("vim-save-pending", None);
+        }
+        _ => {}
+    }
+    if let Some(reason) = error.strip_prefix("Vim9 bridge disconnected: ") {
+        return if matches!(
+            reason,
+            "Invalid native Vim buffer paint frame"
+                | "Editor state exceeds the 1 MiB frame limit"
+                | "Unterminated editor frame exceeds the 1 MiB limit"
+                | "Editor response has no request id"
+        ) {
+            ("bridge-frame-rejected", None)
+        } else {
+            ("bridge-disconnected", None)
+        };
+    }
+    if error.starts_with("Vim9 bridge: ") {
+        return ("bridge-listener", None);
+    }
+    // Never print raw text, even on unexpected error origins. Only retain a
+    // numeric Vim code from a conventional exception prefix.
+    let candidate = error
+        .strip_prefix("Vim:")
+        .or_else(|| {
+            error
+                .strip_prefix("Vim(")?
+                .split_once("):")
+                .map(|(_, rest)| rest)
+        })
+        .unwrap_or(error);
+    let code = candidate
+        .strip_prefix('E')
+        .and_then(|s| s.split_once(':'))
+        .map(|(code, _)| code)
+        .filter(|code| (2..=5).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|code| code.parse().ok());
+    if code.is_some() {
+        return ("vim-error-code", code);
+    }
+    ("unclassified", None)
 }
 
 #[test]
@@ -100,13 +171,21 @@ fn real_vim9_native_pty() {
     });
     assert!(session.write_pty(b"0inative \x1b"));
     wait_for(&mut session, &editor, |s| s.modified && s.mode == "n");
-    editor.send(Vim9Command::Quit).unwrap();
+    let quit_request = editor.send(Vim9Command::Quit).unwrap();
     let refused = wait_for(&mut session, &editor, |s| {
         s.pending == 0 && s.error.is_some()
     });
+    let quit_error = refused.error.as_deref().unwrap();
     assert!(
-        refused.error.as_ref().unwrap().contains("E37")
-            || refused.error.as_ref().unwrap().contains("E162")
+        quit_error.contains("E37") || quit_error.contains("E162"),
+        "dirty Quit request {quit_request}: diagnostic={:?}, connected={}, modified={}, normal_mode={}, remaining_commands={}, child_alive={:?}, fixture_file_unchanged={:?}",
+        quit_error_diagnostic(quit_error),
+        refused.connected,
+        refused.modified,
+        refused.mode == "n",
+        refused.pending,
+        observe_child_exit_without_reaping(&session).map(|exited| !exited),
+        diagnostic_file_matches(&first, b"original\nsecond\n"),
     );
     assert!(
         !child_exited_without_reaping(&session),
