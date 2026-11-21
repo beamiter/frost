@@ -231,7 +231,7 @@ jobs:
           FROST_SMOKE_POINTER: ${{ runner.temp }}/frost-clipboard/native-pointer
         run: python3 scripts/native-overload-smoke.py --binary native-smoke-artifacts/overload-fixture/native-overload-fixture --manifest native-smoke-artifacts/overload-fixture/manifest.json --backend wayland --output native-smoke-artifacts/wayland-overload
       - name: Exercise one X11 synthetic inline scrollback PageUp
-        if: ${{ success() && steps.install.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         timeout-minutes: 3
         shell: bash
         run: |
