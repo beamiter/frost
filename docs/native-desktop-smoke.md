@@ -6,6 +6,14 @@ The gate checks each Normal, Block and Chat mode, typed and platform-pasted comm
 
 Artifacts include actual window screenshots, compositor/application logs, the installed executable SHA256, environment package versions and shell-written sentinels. Sentinels are proof of shell execution through input, not a full raw PTY transcript. Failures preserve artifacts and fail CI. The workflow builds with `cargo build --release --locked --bin frost`, installs that optimized binary, and compares installed bytes with the build output before exercising it. Artifact hashes identify the binary actually tested.
 
+## Offline Responses fixture contract (test only)
+
+The Native Desktop workflow runs `/usr/bin/python3 scripts/test-native-codex-responses-fixture.py -v` as a separate two-minute check. This exercises a real IPv4 loopback HTTP connection, but **does not start Codex or a desktop** and uses no network outside loopback, account, credentials, or external model. The fixture borrows the event shapes from the [Codex SDK harness pinned at `rust-v0.167.0-alpha.4`](https://github.com/openai/codex/blob/fb036d4ebd89f263d34a1f888c279ce85bb383c6/sdk/python/tests/app_server_harness.py); the independent X11 tab-resize smoke still uses a synthetic CLI. Neither is proof of the actual Codex TUI, GPU, or physical input behavior.
+
+A future native driver can create a separate fresh HOME, CODEX_HOME, XDG directories and working directory for each of Scrollback and Fullscreen. The fixture serves one fixed synthetic prompt and two explicitly released batches of short numbered text. After the first barrier, observe the rendered rows before starting input. Release the second batch while testing, require an intermediate native frame while the input is still held, and record selected text or measured page distance before permitting completion. A loopback flush receipt is not a screen presentation receipt. Verify the effective mode and keep same-size tab return separate from intentional PTY resize.
+
+That integration must use a checksum-verified public CLI on a disposable runner, keep deployment-managed policy and the sandbox in force, and actually constrain egress to the fixture. A loopback provider configuration alone does not restrict egress. Do not reuse any personal profile or credentials, and do not run the native test when those isolation requirements are unavailable.
+
 ## Still required before R11 is complete
 
 Live mode changes and multi-output scaling remain separate acceptance work. Restart/recovery, single-output fractional scaling, and genuine normal-mode Wayland IME are exercised by the extended fixtures below. Release-profile acceptance requires a successful run of the optimized installed candidate. Unicode keyboard text or paste must not be presented as IME testing. Software headless rendering is not a physical GPU test.

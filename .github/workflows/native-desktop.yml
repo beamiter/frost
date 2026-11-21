@@ -68,6 +68,9 @@ jobs:
           python3 scripts/test-native-mission-observation.py
       - name: Check X11 tab-resize evidence classifier
         run: /usr/bin/python3 scripts/test-native-tab-resize-evidence.py -v
+      - name: Check isolated Codex Responses fixture contract
+        timeout-minutes: 2
+        run: /usr/bin/python3 scripts/test-native-codex-responses-fixture.py -v
       - name: Build production binary
         run: cargo build --release --locked --bin frost
       - name: Stage installed application
