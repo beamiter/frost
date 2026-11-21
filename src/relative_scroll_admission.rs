@@ -229,4 +229,69 @@ mod tests {
         let (a, g, s, t) = setup();
         assert!(!a.permits(&t, &s, 4, None, &g.snapshot()));
     }
+
+    #[test]
+    fn selected_reader_tab_return_rejects_stale_intent_but_accepts_first_full_page() {
+        use crate::transcript_canvas::TranscriptCanvas;
+        use std::time::{Duration, Instant};
+
+        let scope = domain();
+        let (admission, boundary, reader_session, old) = setup();
+        let sibling_session = Identity::default();
+        let (rows, cols) = (scope.rows, scope.cols);
+        // These identities and epochs model the caller; native routing is tested separately.
+
+        let mut reader = TranscriptCanvas::default();
+        let mut sibling = TranscriptCanvas::default();
+        let start = Instant::now();
+        reader.reconcile(40, 100, rows, cols);
+        reader.applied(40);
+        reader.scroll(0.25, true, start);
+        reader.set_text_selection_active(true);
+        reader.scroll(20.0, false, start);
+        reader.advance(start + Duration::from_millis(30));
+        reader.applied(reader.row());
+        assert!(reader.animating());
+        let parked = reader.position_rows();
+
+        // No advancing frames for the first tab while fresh output and a sibling exist.
+        for appended in 1..=16 {
+            reader.reconcile(reader.row() + 1, 100 + appended, rows, cols);
+            reader.applied(reader.row());
+            sibling.reconcile(0, 100 + appended, rows, cols);
+            sibling.applied(sibling.row());
+        }
+        let rebased = reader.position_rows();
+        assert!((rebased - parked - 16.0).abs() < 1e-9);
+        reader.resume_visible();
+        assert_eq!(reader.position_rows(), rebased);
+        assert!(!reader.animating());
+
+        let permits = |token, session, epoch| {
+            admission.permits(token, session, epoch, Some(&scope), &boundary.snapshot())
+        };
+        assert!(!permits(&old, &sibling_session, 4));
+        assert!(
+            !permits(&old, &reader_session, 6),
+            "stale pre-switch paging"
+        );
+        let fresh = admission.capture(&reader_session, 6).unwrap();
+        assert!(permits(&fresh, &reader_session, 6));
+        let admitted_at = start + Duration::from_secs(1);
+        let page = (rows - 2) as f64;
+        reader.scroll(page, false, admitted_at);
+        assert!(reader.animating());
+        assert_eq!(reader.position_rows(), rebased);
+        let mut applied_row = reader.row();
+        for i in 1..=120 {
+            reader.advance(admitted_at + Duration::from_millis(i * 16));
+            reader.set_text_selection_active(true);
+            reader.reconcile(applied_row + 1, 116 + i as usize, rows, cols);
+            applied_row = reader.row();
+            reader.applied(applied_row);
+        }
+        assert!(!reader.animating());
+        assert!(!reader.following());
+        assert!((reader.position_rows() - rebased - 120.0 - page).abs() < 1e-9);
+    }
 }
