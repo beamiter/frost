@@ -47,6 +47,8 @@ mod history_picker;
 mod image_drop;
 mod immersive_command;
 mod inspector_layout;
+#[path = "../vendor/jwm-remote/client.rs"]
+mod jwm_remote_session;
 mod keybindings;
 mod kitty_graphics;
 #[cfg(test)]
@@ -84,10 +86,8 @@ mod reference_conversation;
 mod reference_icon;
 mod reference_organism;
 mod relative_scroll_admission;
-mod remote_fs;
 mod remote_desktop;
-#[path = "../vendor/jwm-remote/client.rs"]
-mod jwm_remote_session;
+mod remote_fs;
 mod remote_host_editor;
 mod review_text;
 mod search;
@@ -34838,10 +34838,15 @@ impl Frost {
                     .map(|_| Message::AgentSessionsTick),
             );
         }
-        if self.remote_desktop.as_ref().is_some_and(remote_desktop::Panel::active) {
-            subs.push(iced::time::every(jwm_remote_session::TICK).map(|_| {
-                Message::RemoteDesktop(remote_desktop::Event::Tick)
-            }));
+        if self
+            .remote_desktop
+            .as_ref()
+            .is_some_and(remote_desktop::Panel::active)
+        {
+            subs.push(
+                iced::time::every(jwm_remote_session::TICK)
+                    .map(|_| Message::RemoteDesktop(remote_desktop::Event::Tick)),
+            );
         }
         if let Some(eva) = self.eva.as_ref() {
             subs.push(eva.subscription());
