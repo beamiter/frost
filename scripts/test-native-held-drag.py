@@ -19,7 +19,8 @@ from PIL import Image, ImageDraw
 
 import native_held_drag as driver
 from native_held_drag import (
-    APPEND_ROWS, DSR, DSR_REPLY, PROBE, ROW_COUNT, clipboard_matches, fixture_line, highlight, probe_geometry,
+    APPEND_ROWS, DSR, DSR_REPLY, PRESS_PROBE, PROBE, ROW_COUNT, clipboard_matches,
+    fixture_line, highlight, pressed_anchor, probe_geometry,
     verify_chronology,
 )
 from native_row_witness import Frame, Grid, InvalidWitness, marker_colors
@@ -31,15 +32,19 @@ YS = tuple(12 + n * 16 for n in range(len(ROWS)))
 GRID = Grid(('native-fixture',), XY, YS)
 PROBES = tuple(12 + col * 12 for col in (12, 15, 19))
 SELECTED = (95, 109, 130)
+ANCHOR_X = 12 + 6 * 12
+PRESS_SELECTED = (84, 112, 89)
 
 
-def raster(started, finished, selected=(), offsets=ROWS, probes=PROBES):
+def raster(started, finished, selected=(), offsets=ROWS, probes=PROBES, pressed=False):
     img = Image.new('RGB', (260, 140), (0, 0, 0))
     draw = ImageDraw.Draw(img)
     for row, y in zip(offsets, YS):
         for x, color in zip(XY, marker_colors(row)):
             draw.rectangle((x - 1, y - 1, x + 1, y + 1), fill=color)
     y = YS[4]
+    draw.rectangle((ANCHOR_X - 2, y - 2, ANCHOR_X + 2, y + 2),
+                   fill=PRESS_SELECTED if pressed else PRESS_PROBE)
     for x in probes:
         draw.rectangle((x - 2, y - 2, x + 2, y + 2), fill=SELECTED if x in selected else PROBE)
     return Frame(GRID, img, started, finished)
@@ -50,20 +55,28 @@ class HeldDragWitnessTest(unittest.TestCase):
         baseline = raster(1, 2)
         y, probes, start_x, early_x, end_x = probe_geometry(baseline, ROW)
         self.assertEqual((y, probes), (YS[4], PROBES))
-        self.assertEqual((start_x, early_x, end_x), (96, 180, 216))
+        self.assertEqual((start_x, early_x, end_x), (ANCHOR_X, 180, 216))
         with self.assertRaises(InvalidWitness):
             probe_geometry(raster(1, 2, probes=(PROBES[0], PROBES[1] - 3, PROBES[2])), ROW)
-        held = raster(5, 6, selected=PROBES[:1])
+        pressed = raster(4, 5, pressed=True)
+        self.assertEqual(pressed_anchor(pressed, ROWS, y, ANCHOR_X, probes), PRESS_SELECTED)
+        for invalid in (baseline, raster(4, 5, selected=PROBES[:1], pressed=True)):
+            with self.assertRaises(InvalidWitness):
+                pressed_anchor(invalid, ROWS, y, ANCHOR_X, probes)
+        held = raster(7, 8, selected=PROBES[:1], pressed=True)
         selected = highlight(held, ROWS, y, probes, False)
         self.assertEqual(selected, SELECTED)
-        extended = raster(12, 13, selected=PROBES[:2])
+        extended = raster(13, 14, selected=PROBES[:2], pressed=True)
         self.assertEqual(highlight(extended, ROWS, y, probes, True, selected), selected)
-        verify_chronology(baseline, 3, 4, held, 7, 8, 9, 10, extended, 14)
-        for seq in ((7, 8, 11, 10, 14), (7, 8, 9, 10, 12), (7, 7, 7, 10, 14),
-                    (5, 8, 9, 10, 14)):
+        verify_chronology(baseline, 3, pressed, 6, held, 9, 10, 11, 12, extended, 15)
+        for seq in ((9, 10, 13, 12, 15), (9, 10, 11, 12, 13), (9, 9, 9, 12, 15),
+                    (7, 10, 11, 12, 15)):
             admitted, flush, ack, extend, up = seq
             with self.assertRaises(InvalidWitness):
-                verify_chronology(baseline, 3, 4, held, admitted, flush, ack, extend, extended, up)
+                verify_chronology(baseline, 3, pressed, 6, held, admitted, flush, ack, extend,
+                                  extended, up)
+        with self.assertRaises(InvalidWitness):
+            verify_chronology(baseline, 3, pressed, 4, held, 9, 10, 11, 12, extended, 15)
         for invalid in (held, raster(12, 13, selected=PROBES),
                         raster(12, 13, selected=PROBES[:2], offsets=tuple(n + 1 for n in ROWS))):
             with self.assertRaises(InvalidWitness):
@@ -72,15 +85,15 @@ class HeldDragWitnessTest(unittest.TestCase):
     def test_probes_select_exact_row_specific_visible_text(self):
         for row in (1, 273, 312):
             visible = re.sub(r'\x1b\[[;0-9]+m', '', fixture_line(row))
-            self.assertEqual(visible[7:18], f'R{row:04d} AB CD')
-            self.assertEqual([visible[i] for i in (12, 15, 19)], [' ', ' ', ' '])
+            self.assertEqual(visible[6:18], f' R{row:04d} AB CD')
+            self.assertEqual([visible[i] for i in (6, 12, 15, 19)], [' ', ' ', ' ', ' '])
 
 
 class DriverBoundaryTest(unittest.TestCase):
     def test_release_and_copy_follow_two_native_witnesses(self):
         # Substitute only display/terminal boundaries to test driver ordering.
-        for lose_extended_paint in (False, True):
-            with self.subTest(lose_extended_paint=lose_extended_paint), tempfile.TemporaryDirectory() as td:
+        for loss in (None, 'pressed', 'extended'):
+            with self.subTest(loss=loss), tempfile.TemporaryDirectory() as td:
                 root = Path(td)
                 actions = []
                 phase = 'baseline'
@@ -91,7 +104,7 @@ class DriverBoundaryTest(unittest.TestCase):
                 app.poll = lambda: None
                 captured = tuple(range(ROW_COUNT - 7, ROW_COUNT + 1))
                 chosen = captured[4]
-                exact = f'R{chosen:04d} AB CD'
+                exact = f' R{chosen:04d} AB CD'
 
                 def flush_record(name, **fields):
                     (root / name).write_text(json.dumps({
@@ -110,11 +123,15 @@ class DriverBoundaryTest(unittest.TestCase):
                                 x = 13 + col * 10
                                 paint.rectangle((x, y, x + 9, y + 13), fill=color)
                             if n == chosen:
+                                anchor_color = (PRESS_SELECTED if phase in ('down', 'held', 'extended', 'up')
+                                                and loss != 'pressed' else PRESS_PROBE)
+                                x = 13 + 6 * 10
+                                paint.rectangle((x, y, x + 9, y + 13), fill=anchor_color)
                                 for col in (12, 15, 19):
                                     x = 13 + col * 10
                                     selected = (col == 12 and phase in ('held', 'extended', 'up') or
                                                 col == 15 and phase in ('extended', 'up')
-                                                and not lose_extended_paint)
+                                                and loss != 'extended')
                                     paint.rectangle((x, y, x + 9, y + 13),
                                                     fill=SELECTED if selected else PROBE)
                         return img
@@ -131,11 +148,14 @@ class DriverBoundaryTest(unittest.TestCase):
                         output = driver.TITLE
                     elif command[:2] == ['xdotool', 'getwindowgeometry']:
                         output = 'owned-grid'
+                    elif command[:2] == ['xdotool', 'mousedown']:
+                        actions.append('down')
+                        phase = 'down'
                     elif command[:2] == ['xdotool', 'mousemove']:
-                        if 'mousedown' in command:
-                            actions.append('down')
-                            phase = 'down'
+                        if phase == 'baseline':
+                            actions.append('place')
                         elif phase == 'down':
+                            self.assertTrue((root / 'held-pressed.png').exists())
                             actions.append('first-move')
                             phase = 'held'
                         elif phase == 'held':
@@ -179,15 +199,20 @@ class DriverBoundaryTest(unittest.TestCase):
 
                 with (patch.object(driver, 'X11StripCapture', FakeCapture),
                       patch.object(driver, 'clipboard_matches', clipboard)):
-                    if lose_extended_paint:
-                        with self.assertRaisesRegex(TimeoutError, 'extended held'):
+                    if loss:
+                        error = 'native press anchor' if loss == 'pressed' else 'extended held'
+                        with self.assertRaisesRegex(TimeoutError, error):
                             driver.exercise(root, {'DISPLAY': ':fixture'}, app, 'window', run, wait)
-                        self.assertEqual(actions, ['down', 'first-move', 'flush', 'ack',
-                                                   'extend', 'up', 'close'])
+                        if loss == 'pressed':
+                            self.assertEqual(actions, ['place', 'down', 'up', 'close'])
+                            self.assertFalse((root / 'append-held-rows').exists())
+                        else:
+                            self.assertEqual(actions, ['place', 'down', 'first-move', 'flush', 'ack',
+                                                       'extend', 'up', 'close'])
                         self.assertFalse((root / 'held-finish').exists())
                     else:
                         result = driver.exercise(root, {'DISPLAY': ':fixture'}, app, 'window', run, wait)
-                        self.assertEqual(actions, ['down', 'first-move', 'flush', 'ack',
+                        self.assertEqual(actions, ['place', 'down', 'first-move', 'flush', 'ack',
                                                    'extend', 'up', 'copy', 'close'])
                         self.assertEqual(result['row'], chosen)
                         self.assertTrue(result['primary_exact'] and result['clipboard_exact'])

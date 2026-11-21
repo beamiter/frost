@@ -14,13 +14,15 @@ from native_x11_capture import X11StripCapture
 
 APPEND_ROWS = 12
 PROBE = (11, 40, 66)
+PRESS_PROBE = (27, 69, 31)
+PRESS_ANSI = '\x1b[48;2;27;69;31m \x1b[0m'
 PROBE_ANSI = '\x1b[48;2;11;40;66m \x1b[0m'
 DSR = b'\x1b[5n'
 DSR_REPLY = b'\x1b[0n'
 
 
 def fixture_line(row):
-    return marker_ansi(row) + f'  R{row:04d}' + PROBE_ANSI + 'AB' + PROBE_ANSI + 'CD ' + PROBE_ANSI
+    return marker_ansi(row) + ' ' + PRESS_ANSI + f'R{row:04d}' + PROBE_ANSI + 'AB' + PROBE_ANSI + 'CD ' + PROBE_ANSI
 
 
 def probe_geometry(frame, row):
@@ -55,10 +57,21 @@ def probe_geometry(frame, row):
     for x in centers:
         if _pixel(frame.image, x, y) != PROBE:
             raise InvalidWitness('Baseline probe is not solid')
-    # Columns: start marker[0..4], spaces[5..6], Rdddd[7..11],
-    # probe[12], AB[13..14], probe[15], CD[16..17], space[18], control[19].
-    return (y, tuple(centers), round(inner - 5 * pitch),
-            round(inner + 2 * pitch), round(inner + 5 * pitch))
+    # Columns: marker[0..4], blank[5], press[6], Rdddd[7..11],
+    # probe[12], AB[13..14], probe[15], CD[16..17], blank[18], control[19].
+    anchor = round(inner - 6 * pitch)
+    if _pixel(frame.image, anchor, y) != PRESS_PROBE:
+        raise InvalidWitness('Missing exact blank press anchor control')
+    return (y, tuple(centers), anchor, round(inner + 2 * pitch), round(inner + 5 * pitch))
+
+
+def pressed_anchor(frame, ids, y, anchor, probes):
+    if row_ids(frame) != ids:
+        raise InvalidWitness('Press displaced its numbered history viewport')
+    color = _pixel(frame.image, anchor, y)
+    if color == PRESS_PROBE or any(_pixel(frame.image, x, y) != PROBE for x in probes):
+        raise InvalidWitness('Expected only the press anchor to be highlighted')
+    return color
 
 
 def highlight(frame, ids, y, probes, extended, selected=None):
@@ -72,9 +85,10 @@ def highlight(frame, ids, y, probes, extended, selected=None):
     return first
 
 
-def verify_chronology(baseline, down, move, held, admitted, flushed, acked,
+def verify_chronology(baseline, down, pressed, move, held, admitted, flushed, acked,
                       extend, extended, up):
-    if not (baseline.finished < down <= move < held.started < held.finished < admitted
+    if not (baseline.finished < down < pressed.started < pressed.finished < move
+            < held.started < held.finished < admitted
             <= flushed < acked < extend < extended.started < extended.finished < up):
         raise InvalidWitness('Held-drag input, append, and native capture were not ordered')
 
@@ -208,19 +222,35 @@ def exercise(root, env, app, window, run, wait):
         baseline, (y, probes, start_x, early_x, final_x) = stable(
             None, lambda frame: probe_geometry(frame, row), 'unselected native baseline')
         baseline.image.save(root / 'held-baseline.png')
-        expected = f'R{row:04d} AB CD'
+        expected = f' R{row:04d} AB CD'
         if any(clipboard_matches(selection, expected, env)
                for selection in ('primary', 'clipboard')):
             raise InvalidWitness('Clipboard already contains expected witness before input')
         if target() != owner:
             raise InvalidWitness('Held fixture geometry changed before input')
-        run('xdotool', 'mousemove', start_x, y, 'mousedown', '1')
+        run('xdotool', 'mousemove', start_x, y)
+        run('xdotool', 'mousedown', '1')
         pressed = True
         down = time.monotonic_ns()
+        # XTest request completion alone does not establish that Frost has
+        # observed the starting cursor. Do not queue the drag endpoint until
+        # the distinct press anchor is painted on two native samples.
+        pressed_frame, press_rgb = stable(
+            baseline.grid, lambda f: pressed_anchor(f, ids, y, start_x, probes),
+            'native press anchor before first movement')
+        pressed_frame.image.save(root / 'held-pressed.png')
+        if target() != owner:
+            raise InvalidWitness('Held fixture lost its input target after press')
+
+        def selection(f, extended, expected_rgb=None):
+            if _pixel(f.image, start_x, y) != press_rgb:
+                raise InvalidWitness('Drag discarded its observed press anchor')
+            return highlight(f, ids, y, probes, extended, expected_rgb)
+
         run('xdotool', 'mousemove', early_x, y)
         move = time.monotonic_ns()
         held, selection_rgb = stable(
-            baseline.grid, lambda f: highlight(f, ids, y, probes, False), 'first held highlight')
+            baseline.grid, lambda f: selection(f, False), 'first held highlight')
         held.image.save(root / 'held-intermediate.png')
         admitted = time.monotonic_ns()
         gate('append-held-rows')
@@ -235,14 +265,14 @@ def exercise(root, env, app, window, run, wait):
         run('xdotool', 'mousemove', final_x, y)
         extend = time.monotonic_ns()
         extended, _ = stable(baseline.grid,
-            lambda f: highlight(f, ids, y, probes, True, selection_rgb), 'extended held highlight')
+            lambda f: selection(f, True, selection_rgb), 'extended held highlight')
         extended.image.save(root / 'held-extended.png')
         if target() != owner:
             raise InvalidWitness('Held fixture geometry changed before release')
         up = time.monotonic_ns()
         run('xdotool', 'mouseup', '1')
         pressed = False
-        verify_chronology(baseline, down, move, held, admitted, append['monotonic_ns'],
+        verify_chronology(baseline, down, pressed_frame, move, held, admitted, append['monotonic_ns'],
                           ack['monotonic_ns'], extend, extended, up)
         wait(lambda: clipboard_matches('primary', expected, env), 'exact PRIMARY after native release')
         cap.capture().save(root / 'held-released.png')
@@ -254,7 +284,7 @@ def exercise(root, env, app, window, run, wait):
         result = {'row': row, 'initial': initial, 'append': append, 'parser_ack': ack,
                   'primary_exact': True, 'clipboard_exact': True,
                   'capture_intervals_ns': [[f.started, f.finished] for f in
-                                           (baseline, held, extended)],
+                                           (baseline, pressed_frame, held, extended)],
                   'input_and_gate_ns': [down, move, admitted, extend, up]}
         return result
     except Exception:
