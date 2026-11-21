@@ -66,6 +66,8 @@ jobs:
           python3 scripts/test-native-cleanup.py
           python3 scripts/test-native-desktop-navigation.py
           python3 scripts/test-native-mission-observation.py
+      - name: Check X11 tab-resize evidence classifier
+        run: /usr/bin/python3 scripts/test-native-tab-resize-evidence.py -v
       - name: Build production binary
         run: cargo build --release --locked --bin frost
       - name: Stage installed application
@@ -146,6 +148,13 @@ jobs:
       - name: Exercise X11 production input
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend x11 --output native-smoke-artifacts/x11
+      - name: Exercise X11 synthetic inline CLI tab return and resize
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          # The fixture creates its own Xvfb display on this hosted runner.
+          export HOME="$(mktemp -d "$RUNNER_TEMP/frost-tab-resize-home.XXXXXXXX")"
+          /usr/bin/python3 scripts/native-tab-resize-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --output native-smoke-artifacts/x11-tab-resize
       - name: Exercise Wayland production input
         timeout-minutes: 10
         env:
