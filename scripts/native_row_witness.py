@@ -68,7 +68,8 @@ def _pixel(img, x, y):
     return colors.pop()
 
 
-def row_ids(frame):
+def decoded_row_ids(frame):
+    """Decode every intact observed row marker, without asserting a sequence."""
     frame.grid.validate(frame.image)
     require(frame.started < frame.finished, 'Invalid capture duration')
     ids = []
@@ -80,9 +81,15 @@ def row_ids(frame):
                 'Unrecognized synthetic row marker color')
         a, b, c = [bank.index(color) for bank, color in zip(NIBBLE_COLORS, colors[1:-1])]
         ids.append((a << 8) + (b << 4) + c)
-    require(ids[0] >= 1 and all(b == a + 1 for a, b in zip(ids, ids[1:])),
-            'Synthetic rows are not a contiguous ordered span')
+    require(all(row >= 1 for row in ids), 'Invalid synthetic row marker')
     return tuple(ids)
+
+
+def row_ids(frame):
+    ids = decoded_row_ids(frame)
+    require(all(b == a + 1 for a, b in zip(ids, ids[1:])),
+            'Synthetic rows are not a contiguous ordered span')
+    return ids
 
 
 def verify_page_up(before, after, key_events, *, pty_rows, ownership, fixture_flushes=()):

@@ -9,7 +9,7 @@ import tty
 
 from native_row_witness import (
     Frame, Grid, InvalidWitness, MARKER_END, MARKER_START, NIBBLE_COLORS,
-    marker_ansi, row_ids, verify_page_up,
+    decoded_row_ids, marker_ansi, row_ids, verify_page_up,
 )
 from native_x11_capture import X11StripCapture
 
@@ -96,17 +96,21 @@ def first_complete_return_sample(frame, expected_grid, expected_rows, key_interv
         return None
     if frame.grid != expected_grid:
         raise InvalidWitness('Returned viewport changed grid identity')
+    if len(expected_rows) != len(expected_grid.y):
+        raise InvalidWitness('Expected return rows do not cover the measured grid')
     sent, returned = key_interval
     if not sent <= returned < frame.started < frame.finished:
         raise InvalidWitness('Tab return capture did not follow input injection')
     try:
-        observed = row_ids(frame)
+        observed = decoded_row_ids(frame)
     except InvalidWitness:
         # Incomplete/ambiguous paint is not counted as a native frame receipt.
         return None
-    if observed != expected_rows:
-        raise InvalidWitness(f'First complete returned viewport starts at {observed[0]}, '
-                             f'not retained row {expected_rows[0]}')
+    for index, (actual, expected) in enumerate(zip(observed, expected_rows)):
+        if actual != expected:
+            mismatch = f'starts at {actual}' if index == 0 else f'row {index + 1} is {actual}'
+            raise InvalidWitness(f'First complete returned viewport {mismatch}, '
+                                 f'not retained row {expected}')
     return observed
 
 

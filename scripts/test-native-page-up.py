@@ -87,6 +87,19 @@ class PageCalibrationTest(unittest.TestCase):
 
 
 class TabReturnFirstCompleteTest(unittest.TestCase):
+    def test_fully_marked_noncontiguous_return_fails_without_retry(self):
+        exact, parked = image_with_markers(range(239, 243), 13, 26, 6, 8)
+        grid = calibrate_grid(exact, ('same-window',), parked)
+        for rows in ((239, 240, 271, 272), (239, 240, 240, 242)):
+            with self.subTest(rows=rows):
+                mixed, _ = image_with_markers(rows, 13, 26, 6, 8)
+                frame = Frame(grid, mixed, 120, 130)
+                with self.assertRaisesRegex(InvalidWitness, 'not a contiguous'):
+                    row_ids(frame)  # Ordinary PageUp still needs a contiguous span.
+                with self.assertRaisesRegex(InvalidWitness, 'not retained row'):
+                    first_complete_return_sample(frame, grid, parked, (100, 110),
+                                                 target_before=True, target_after=True)
+
     def test_exact_parked_rows_are_required_at_the_first_complete_sample(self):
         parked_image, parked = image_with_markers(range(239, 247), 13, 26, 6, 8)
         tail_image, _ = image_with_markers(range(269, 277), 13, 26, 6, 8)
