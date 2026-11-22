@@ -22,18 +22,15 @@ impl Drop for Scratch {
 }
 
 fn pump(session: &mut Session) {
-    session.flush_write_queue();
-    let mut bytes = [0u8; 16384];
     for _ in 0..32 {
-        // SAFETY: this test owns a live Session and its nonblocking master fd;
-        // the stack buffer is writable for the advertised byte count.
-        let n = unsafe { libc::read(session.master_fd, bytes.as_mut_ptr().cast(), bytes.len()) };
-        if n <= 0 {
+        let Ok(event) = session.pty.events().try_recv() else {
             break;
+        };
+        if let crate::SessionEvent::Output(bytes) = event {
+            session.terminal.process_batch(bytes.as_bytes());
+            session.flush_responses();
+            session.refresh();
         }
-        session.terminal.process_batch(&bytes[..n as usize]);
-        session.flush_responses();
-        session.refresh();
     }
 }
 
@@ -59,25 +56,11 @@ fn wait_for(
 }
 
 #[cfg(target_os = "linux")]
-fn observe_child_exit_without_reaping(session: &Session) -> Option<bool> {
-    // SAFETY: zero initialization is valid for siginfo_t, and waitid writes
-    // only that structure. WNOWAIT leaves reaping to the owning production Pty.
-    unsafe {
-        let mut info: libc::siginfo_t = std::mem::zeroed();
-        let result = libc::waitid(
-            libc::P_PID,
-            session.pty.get_child_pid() as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        );
-        (result == 0).then(|| info.si_pid() != 0)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn child_exited_without_reaping(session: &Session) -> bool {
-    observe_child_exit_without_reaping(session)
-        .unwrap_or_else(|| panic!("waitid: {}", std::io::Error::last_os_error()))
+fn child_exited(session: &Session) -> bool {
+    session
+        .pty
+        .inspect_transport(|pty| pty.cached_exit_code())
+        .is_some()
 }
 
 #[cfg(target_os = "linux")]
@@ -184,13 +167,10 @@ fn real_vim9_native_pty() {
         refused.modified,
         refused.mode == "n",
         refused.pending,
-        observe_child_exit_without_reaping(&session).map(|exited| !exited),
+        !child_exited(&session),
         diagnostic_file_matches(&first, b"original\nsecond\n"),
     );
-    assert!(
-        !child_exited_without_reaping(&session),
-        "dirty Vim must remain alive"
-    );
+    assert!(!child_exited(&session), "dirty Vim must remain alive");
     assert_eq!(fs::read_to_string(&first).unwrap(), "original\nsecond\n");
     editor.send(Vim9Command::Save).unwrap();
     wait_for(&mut session, &editor, |s| s.pending == 0 && !s.modified);
@@ -249,7 +229,7 @@ fn real_vim9_native_pty() {
     assert_eq!(found.diagnostics[0].filename, first.to_str().unwrap());
     editor.send(Vim9Command::Quit).unwrap();
     let until = Instant::now() + Duration::from_secs(5);
-    while !child_exited_without_reaping(&session) {
+    while !child_exited(&session) {
         assert!(
             Instant::now() < until,
             "saved Vim must exit after native Quit"

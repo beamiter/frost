@@ -181,28 +181,30 @@ mod tests {
 
     #[test]
     fn actual_form_navigation_never_focuses_background_inputs() {
+        use crate::test_renderer::{software_renderer, HeadlessRenderer};
         use iced::advanced::{layout, widget::Tree, Layout};
         use iced::widget::{column, container, text_input};
         let input = |id| text_input("value", "text").id(id).on_input(|_| ());
-        let mut element: iced::Element<'_, (), iced::Theme, ()> = column![
+        let mut element: iced::Element<'_, (), iced::Theme, HeadlessRenderer> = column![
             input("outside-before"),
             container(column![input("inside-first"), input("inside-last")]).id(FORM_ID),
             input("outside-after"),
         ]
         .into();
+        let renderer = software_renderer();
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
             &mut tree,
-            &(),
+            &renderer,
             &layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 400.0)),
         );
-        let apply = |element: &mut iced::Element<'_, (), iced::Theme, ()>,
+        let apply = |element: &mut iced::Element<'_, (), iced::Theme, HeadlessRenderer>,
                      tree: &mut Tree,
                      mut op: Box<dyn Operation>| {
             loop {
                 element
                     .as_widget_mut()
-                    .operate(tree, Layout::new(&node), &(), op.as_mut());
+                    .operate(tree, Layout::new(&node), &renderer, op.as_mut());
                 match op.finish() {
                     operation::Outcome::Chain(next) => op = next,
                     _ => break,
@@ -238,9 +240,12 @@ mod tests {
             for expected in [Some(last), None, Some(first)] {
                 apply(&mut element, &mut tree, focus_operation(backwards));
                 let mut focused = Focused::default();
-                element
-                    .as_widget_mut()
-                    .operate(&mut tree, Layout::new(&node), &(), &mut focused);
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut focused,
+                );
                 assert_eq!(
                     focused.0,
                     expected.into_iter().map(Id::new).collect::<Vec<_>>()

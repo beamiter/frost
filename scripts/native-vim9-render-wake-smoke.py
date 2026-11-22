@@ -31,6 +31,7 @@ def main():
     args = parser.parse_args()
     if not 4 <= args.samples <= 200:
         parser.error('--samples must be between 4 and 200')
+    os.umask(0o077)
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     for folder in ('config', 'state', 'data', 'cache', 'runtime', 'project'):

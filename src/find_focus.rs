@@ -308,9 +308,9 @@ fn restore_focus<P: text::Paragraph>(state: &mut text_input::State<P>, value: &V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_renderer::{software_renderer, HeadlessRenderer, InputState};
     use iced::widget::{button, row, text_input};
 
-    type InputState = text_input::State<<() as text::Renderer>::Paragraph>;
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Message {
         Input(String),
@@ -331,7 +331,7 @@ mod tests {
                     let query = "aé👩‍💻z";
                     let value = Value::new(query);
                     let id = Id::new("find-test");
-                    let mut element: Element<'_, Message, iced::Theme, ()> = row![
+                    let mut element: Element<'_, Message, iced::Theme, HeadlessRenderer> = row![
                         input(
                             id.clone(),
                             query,
@@ -343,10 +343,11 @@ mod tests {
                     ]
                     .into();
                     let mut tree = Tree::new(element.as_widget());
+                    let renderer = software_renderer();
                     let viewport = Rectangle::with_size(Size::new(400.0, 100.0));
                     let node = element.as_widget_mut().layout(
                         &mut tree,
-                        &(),
+                        &renderer,
                         &layout::Limits::new(Size::ZERO, viewport.size()),
                     );
                     state(&mut tree).focus();
@@ -354,21 +355,22 @@ mod tests {
                     let before = state(&mut tree).cursor().state(&value);
                     let point = node.children()[1].bounds().center();
                     let mut messages = Vec::new();
-                    let update = |element: &mut Element<'_, Message, iced::Theme, ()>,
-                                  tree: &mut Tree,
-                                  messages: &mut Vec<Message>,
-                                  event| {
-                        element.as_widget_mut().update(
-                            tree,
-                            &event,
-                            Layout::new(&node),
-                            mouse::Cursor::Available(point),
-                            &(),
-                            &mut iced::advanced::clipboard::Null,
-                            &mut Shell::new(messages),
-                            &viewport,
-                        );
-                    };
+                    let update =
+                        |element: &mut Element<'_, Message, iced::Theme, HeadlessRenderer>,
+                         tree: &mut Tree,
+                         messages: &mut Vec<Message>,
+                         event| {
+                            element.as_widget_mut().update(
+                                tree,
+                                &event,
+                                Layout::new(&node),
+                                mouse::Cursor::Available(point),
+                                &renderer,
+                                &mut iced::advanced::clipboard::Null,
+                                &mut Shell::new(messages),
+                                &viewport,
+                            );
+                        };
                     update(
                         &mut element,
                         &mut tree,
@@ -411,7 +413,7 @@ mod tests {
                         element.as_widget_mut().operate(
                             &mut tree,
                             Layout::new(&node),
-                            &(),
+                            &renderer,
                             &mut Refocus(id.clone()),
                         );
                         assert!(state(&mut tree).is_focused());
@@ -438,7 +440,7 @@ mod tests {
     #[test]
     fn ordinary_outside_click_and_other_focus_operations_are_unchanged() {
         let id = Id::new("find-test");
-        let mut element: Element<'_, (), iced::Theme, ()> = input(
+        let mut element: Element<'_, (), iced::Theme, HeadlessRenderer> = input(
             id.clone(),
             "draft",
             text_input("", "draft").width(100).on_input(|_| ()),
@@ -446,10 +448,11 @@ mod tests {
             true,
         );
         let mut tree = Tree::new(element.as_widget());
+        let renderer = software_renderer();
         let viewport = Rectangle::with_size(Size::new(400.0, 100.0));
         let node = element.as_widget_mut().layout(
             &mut tree,
-            &(),
+            &renderer,
             &layout::Limits::new(Size::ZERO, viewport.size()),
         );
         let input_state = |tree: &mut Tree| {
@@ -461,7 +464,7 @@ mod tests {
         element.as_widget_mut().operate(
             &mut tree,
             Layout::new(&node),
-            &(),
+            &renderer,
             &mut operation::focusable::focus(id),
         );
         assert!(input_state(&mut tree));
@@ -470,7 +473,7 @@ mod tests {
             &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
             Layout::new(&node),
             mouse::Cursor::Available(iced::Point::new(300.0, 50.0)),
-            &(),
+            &renderer,
             &mut iced::advanced::clipboard::Null,
             &mut Shell::new(&mut Vec::new()),
             &viewport,
@@ -479,7 +482,7 @@ mod tests {
         element.as_widget_mut().operate(
             &mut tree,
             Layout::new(&node),
-            &(),
+            &renderer,
             &mut Refocus(Id::new("missing")),
         );
         assert!(!input_state(&mut tree));
@@ -534,15 +537,16 @@ mod tests {
 #[cfg(test)]
 mod keyboard_cursor_tests {
     use super::*;
+    use crate::test_renderer::{software_renderer, HeadlessRenderer, InputState};
 
     #[test]
     fn keyboard_reveal_refocus_preserves_unicode_caret_and_directed_selection() {
-        type State = text_input::State<<() as text::Renderer>::Paragraph>;
+        let renderer = software_renderer();
         for (start, end) in [(2, 2), (1, 3), (3, 1)] {
             let query = "aé👩‍💻z";
             let value = Value::new(query);
             let id = Id::new("find-key-cursor");
-            let mut element: Element<'_, bool, iced::Theme, ()> = input(
+            let mut element: Element<'_, bool, iced::Theme, HeadlessRenderer> = input(
                 id.clone(),
                 query,
                 iced::widget::text_input("", query)
@@ -555,10 +559,10 @@ mod keyboard_cursor_tests {
             let viewport = Rectangle::with_size(Size::new(300.0, 60.0));
             let node = element.as_widget_mut().layout(
                 &mut tree,
-                &(),
+                &renderer,
                 &layout::Limits::new(Size::ZERO, viewport.size()),
             );
-            let state = tree.children[0].state.downcast_mut::<State>();
+            let state = tree.children[0].state.downcast_mut::<InputState>();
             state.focus();
             state.select_range(start, end);
             let before = state.cursor().state(&value);
@@ -579,17 +583,20 @@ mod keyboard_cursor_tests {
                 &event,
                 Layout::new(&node),
                 mouse::Cursor::Unavailable,
-                &(),
+                &renderer,
                 &mut iced::advanced::clipboard::Null,
                 &mut shell,
                 &viewport,
             );
             assert!(shell.is_event_captured());
             assert_eq!(messages, [true]);
-            element
-                .as_widget_mut()
-                .operate(&mut tree, Layout::new(&node), &(), &mut Refocus(id));
-            let state = tree.children[0].state.downcast_mut::<State>();
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut Refocus(id),
+            );
+            let state = tree.children[0].state.downcast_mut::<InputState>();
             assert!(state.is_focused());
             assert_eq!(state.cursor().state(&value), before);
             assert_eq!(messages, [true], "no synthetic query input or IME commit");

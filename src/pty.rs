@@ -8,6 +8,7 @@ const DEFAULT_SHELL_NAME: &str = "jsh";
 #[cfg(unix)]
 mod unix_pty {
     use super::*;
+    use std::os::fd::{AsFd, BorrowedFd, IntoRawFd};
     use std::path::Path;
     use std::sync::OnceLock;
     use std::time::{Duration, Instant};
@@ -333,11 +334,6 @@ mod unix_pty {
     }
 
     /// Outcome of polling the PTY fd alongside the shutdown pipe.
-    pub enum ReaderPoll {
-        Data,
-        Timeout,
-        Shutdown,
-    }
 
     /// This process's own `PATH`, for the `host::` resolvers. `None` means "no
     /// search path" there rather than "use ours", so it is passed explicitly.
@@ -873,8 +869,8 @@ mod unix_pty {
                 // fixed error record if any post-fork setup syscall fails; a
                 // successful execve atomically closes its write end, yielding
                 // EOF to the parent.
-                let (startup_read, startup_write) = match Self::make_shutdown_pipe() {
-                    Ok(pipe) => pipe,
+                let (startup_read, startup_write) = match jterm_core::pty_reader::shutdown_pipe() {
+                    Ok((reader, writer)) => (reader.into_raw_fd(), writer.into_raw_fd()),
                     Err(error) => {
                         libc::close(master);
                         libc::close(slave);
@@ -1023,148 +1019,41 @@ mod unix_pty {
             self.master
         }
 
-        /// Create a self-pipe used to wake the reader thread on shutdown.
-        /// Returns (read_end, write_end). Closing the write end makes a `poll`
-        /// on the read end report POLLHUP immediately.
-        pub fn make_shutdown_pipe() -> Result<(RawFd, RawFd)> {
-            let mut fds = [0 as RawFd; 2];
-            // CLOEXEC is essential here. A later terminal session is created with
-            // fork/exec; if it inherits an older subscription's write end, closing
-            // that subscription can never deliver POLLHUP to its reader thread.
-            // pipe2 makes creation + CLOEXEC atomic on Linux/Android.
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-            if rc != 0 {
-                return Err(anyhow!(
-                    "Failed to create shutdown pipe: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            for &fd in &fds {
-                let flags = unsafe { libc::fcntl(fd, libc::F_GETFD, 0) };
-                if flags < 0
-                    || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
-                {
-                    let error = std::io::Error::last_os_error();
-                    unsafe {
-                        libc::close(fds[0]);
-                        libc::close(fds[1]);
-                    }
-                    return Err(anyhow!("Failed to set pipe CLOEXEC: {error}"));
-                }
-            }
-            Ok((fds[0], fds[1]))
-        }
-
-        /// Poll the PTY fd for readability while also watching `shutdown_fd`.
-        /// Shutdown takes priority: if the shutdown pipe's write end was closed
-        /// (POLLHUP) — or the PTY fd became invalid because the session was
-        /// dropped — this returns `Shutdown` WITHOUT reporting data, so the
-        /// caller never reads from a PTY fd whose number may have been reused.
-        /// `timeout_ms` is a total monotonic wait budget, including EINTR
-        /// retries. Zero performs an immediate poll; negative values wait
-        /// indefinitely. A timeout is not EOF and does not consume PTY data.
-        pub fn wait_fd_or_shutdown(
-            fd: RawFd,
-            shutdown_fd: RawFd,
-            timeout_ms: i32,
-        ) -> Result<ReaderPoll> {
-            Self::wait_fd_or_shutdown_with(fd, shutdown_fd, timeout_ms, Instant::now, |fds, ms| {
-                // SAFETY: fds is a valid 2-element array for the duration of poll.
-                let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, ms) };
-                if ready < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(ready)
-                }
-            })
-        }
-
-        fn wait_fd_or_shutdown_with(
-            fd: RawFd,
-            shutdown_fd: RawFd,
-            timeout_ms: i32,
-            mut now: impl FnMut() -> Instant,
-            mut poll: impl FnMut(&mut [libc::pollfd; 2], i32) -> std::io::Result<i32>,
-        ) -> Result<ReaderPoll> {
-            // Infinite waits retain their old behavior and avoid clock reads.
-            let budget =
-                (timeout_ms >= 0).then(|| (now(), Duration::from_millis(timeout_ms as u64)));
-            let mut remaining_ms = timeout_ms;
-            let mut fds = [
-                libc::pollfd {
-                    fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: shutdown_fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-            ];
-            let ready = loop {
-                match poll(&mut fds, remaining_ms) {
-                    Ok(ready) => break ready,
-                    Err(error) if error.raw_os_error() == Some(libc::EINTR) => {
-                        if let Some((started, timeout)) = budget {
-                            let elapsed = now().duration_since(started);
-                            if elapsed >= timeout {
-                                return Ok(ReaderPoll::Timeout);
-                            }
-                            // Round up: a positive sub-millisecond remainder
-                            // must not turn into repeated nonblocking polls.
-                            remaining_ms = startup_timeout_ms(timeout - elapsed);
-                        }
-                    }
-                    Err(error) => return Err(anyhow!("Failed to poll PTY: {error}")),
-                }
-            };
-            if ready == 0 {
-                return Ok(ReaderPoll::Timeout);
-            }
-            // Shutdown signaled (write end closed -> POLLHUP, or any activity).
-            if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
-            {
-                return Ok(ReaderPoll::Shutdown);
-            }
-            // PTY fd closed out from under us -> treat as a clean shutdown.
-            if fds[0].revents & libc::POLLNVAL != 0 {
-                return Ok(ReaderPoll::Shutdown);
-            }
-            if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-                return Ok(ReaderPoll::Data);
-            }
-            Ok(ReaderPoll::Timeout)
-        }
-
         /// Single non-blocking write. Returns bytes written, `Ok(0)` if the
         /// buffer is full (WouldBlock), or an error for a real failure.
         pub fn write(&mut self, data: &[u8]) -> Result<usize> {
             // One nonblocking syscall shares the fault linearization fence.
             // EINTR retries release it, so a fault cannot starve behind retries.
             loop {
-                let write = iced::advanced::subscription::Event::with_native_input_write(|| {
-                    // SAFETY: master is an owned descriptor and data is readable.
-                    let n = unsafe { libc::write(self.master, data.as_ptr().cast(), data.len()) };
-                    if n < 0 {
-                        Err(std::io::Error::last_os_error())
-                    } else {
-                        Ok(n as usize)
-                    }
-                });
-                match write {
-                    None => return Err(anyhow!("native input overloaded; restart required")),
-                    Some(Ok(n)) => return Ok(n),
-                    Some(Err(err)) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(0),
-                    Some(Err(err)) if err.raw_os_error() == Some(libc::EINTR) => continue,
-                    Some(Err(err)) => return Err(anyhow!("Failed to write to PTY: {}", err)),
+                match self.write_once(data) {
+                    Ok(count) => return Ok(count),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(0),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(anyhow!("Failed to write to PTY: {error}")),
                 }
             }
+        }
+
+        fn write_once(&self, data: &[u8]) -> std::io::Result<usize> {
+            iced::advanced::subscription::Event::with_native_input_write(|| {
+                // SAFETY: master is still owned and data is readable for the syscall.
+                let count = unsafe { libc::write(self.master, data.as_ptr().cast(), data.len()) };
+                if count < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(count as usize)
+                }
+            })
+            .unwrap_or_else(|| {
+                Err(std::io::Error::other(
+                    "native input overloaded; restart required",
+                ))
+            })
+        }
+
+        pub(crate) fn child_is_running(&self) -> bool {
+            self.lifecycle == ChildLifecycle::Running
+                && matches!(Self::observe_child_exit(self.child_pid), Ok(None))
         }
 
         pub fn resize(&mut self, cols: usize, rows: usize) -> Result<()> {
@@ -1198,6 +1087,11 @@ mod unix_pty {
             self.exit_code_cached
         }
 
+        #[cfg(test)]
+        pub(crate) fn cached_exit_code(&self) -> Option<i32> {
+            self.exit_code_cached
+        }
+
         /// Observe a child's exit status without consuming it (`waitid` with
         /// `WNOWAIT`). `Ok(None)` means still running; `Ok(Some(code))` means
         /// exited — decoded like a wait status, negative for `-signal` — while
@@ -1209,40 +1103,14 @@ mod unix_pty {
         /// ever becoming a second reaper.
         pub fn observe_child_exit(child_pid: i32) -> std::io::Result<Option<i32>> {
             loop {
-                // `waitid` may leave siginfo unspecified after EINTR. Start
-                // from a zeroed record on every attempt so WNOHANG's no-event
-                // result remains zero.
-                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                // SAFETY: `info` is writable, P_PID scopes the observation to
-                // our forked child, and WNOWAIT explicitly preserves its wait
-                // status for the cleanup/reap step in `finish_observed_exit`.
-                let result = unsafe {
-                    libc::waitid(
-                        libc::P_PID,
-                        child_pid as libc::id_t,
-                        &mut info,
-                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                    )
-                };
-                if result != 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::EINTR) {
-                        return Err(error);
+                match jterm_core::process::observe_child_exit(child_pid, true) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => {
+                        return result.map(|exit| {
+                            exit.map(|outcome| outcome.negative_signal_code().unwrap_or(-1))
+                        });
                     }
-                    continue;
                 }
-                // SAFETY: a successful waitid initializes siginfo. With
-                // WNOHANG, si_pid == 0 means the selected child has not
-                // changed state.
-                if unsafe { info.si_pid() } != child_pid {
-                    return Ok(None);
-                }
-                let code = match info.si_code {
-                    libc::CLD_EXITED => unsafe { info.si_status() },
-                    libc::CLD_KILLED | libc::CLD_DUMPED => -unsafe { info.si_status() },
-                    _ => -1,
-                };
-                return Ok(Some(code));
             }
         }
 
@@ -1299,13 +1167,9 @@ mod unix_pty {
                     "waitpid returned no status for an observed PTY exit",
                 ));
             }
-            let code = if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status) as i32
-            } else if libc::WIFSIGNALED(status) {
-                -(libc::WTERMSIG(status) as i32)
-            } else {
-                -1
-            };
+            let code = jterm_core::process::decode_wait_status(status)
+                .and_then(jterm_core::process::ChildExitOutcome::negative_signal_code)
+                .unwrap_or(-1);
             self.exit_code_cached = Some(code);
             self.lifecycle = ChildLifecycle::Reaped;
             Ok(code)
@@ -1344,49 +1208,45 @@ mod unix_pty {
         }
 
         pub fn terminate(&mut self) -> Result<()> {
-            // Lifecycle checks must precede every signal. In particular, a
-            // second call after the detached reaper starts must not target a
-            // stale pid/pgid that the OS may eventually reuse.
-            if self.lifecycle != ChildLifecycle::Running {
-                return Ok(());
+            if self.begin_termination() {
+                let child_pid = self.child_pid;
+                std::thread::spawn(move || {
+                    std::thread::sleep(TERMINATION_GRACE);
+                    Self::kill_and_reap(child_pid);
+                });
             }
-            if !self.is_alive() {
-                return Ok(());
-            }
+            Ok(())
+        }
 
-            // Claim teardown before sending anything. Subsequent terminate()
-            // calls (including from Drop or queued exit events) are now no-ops.
+        fn begin_termination(&mut self) -> bool {
+            // Neither a completed natural exit nor a previously delegated
+            // termination can target this numeric PID again.
+            if self.lifecycle != ChildLifecycle::Running || !self.is_alive() {
+                return false;
+            }
             self.lifecycle = ChildLifecycle::TerminationStarted;
             self.exit_code_cached = Some(-libc::SIGTERM);
-
-            // SAFETY: kill 向进程组(负 PID)发送信号；child_pid 通过 setsid 成为
-            // 会话/进程组 leader。The WNOHANG check above also ensures the
-            // direct child has not already been reaped.
-            let pgid = -self.child_pid;
+            // SAFETY: this live child is a session/process-group leader and
+            // its PID is still owned by this Pty.
             unsafe {
-                let _ = libc::kill(pgid, libc::SIGHUP);
+                let _ = libc::kill(-self.child_pid, libc::SIGHUP);
                 let _ = libc::kill(self.child_pid, libc::SIGTERM);
             }
+            true
+        }
 
-            // Otherwise escalate on a detached thread instead of sleeping here —
-            // terminate() runs from Drop, often on the UI thread, which must not
-            // block for the grace period. The thread only captures the pid (in
-            // its own process group), so there's no aliasing with `self`.
-            let child_pid = self.child_pid;
-            std::thread::spawn(move || unsafe {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                // Observe without reaping. Even if TERM already ended the
-                // leader, its zombie must pin the PID/PGID until we have killed
-                // same-group descendants that ignored HUP/TERM. Reaping first
-                // would both leak those jobs and permit numeric PID reuse.
-                if let Err(error) = Self::observe_child_exit(child_pid) {
-                    // ECHILD means ownership has already been lost; never send
-                    // a signal to a potentially recycled PID or process group.
-                    if error.raw_os_error() != Some(libc::ECHILD) {
-                        log::warn!("could not observe terminating PTY child: {error}");
-                    }
-                    return;
+        fn kill_and_reap(child_pid: i32) {
+            // Keep the zombie PID/PGID anchor until the final group signal.
+            // An ECHILD from observation means another owner consumed it.
+            if let Err(error) = Self::observe_child_exit(child_pid) {
+                if error.raw_os_error() != Some(libc::ECHILD) {
+                    log::warn!("could not observe terminating PTY child: {error}");
                 }
+                return;
+            }
+            // SAFETY: the owned leader has not been reaped, and waitpid
+            // targets only that direct child after signaling.
+            unsafe {
                 let _ = libc::kill(-child_pid, libc::SIGKILL);
                 let _ = libc::kill(child_pid, libc::SIGKILL);
                 let mut status = 0;
@@ -1397,8 +1257,91 @@ mod unix_pty {
                         break;
                     }
                 }
-            });
-            Ok(())
+            }
+        }
+    }
+
+    const TERMINATION_GRACE: Duration = Duration::from_millis(50);
+
+    impl AsFd for Pty {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            // SAFETY: the owning Pty closes this descriptor only in Drop.
+            unsafe { BorrowedFd::borrow_raw(self.master) }
+        }
+    }
+
+    impl jterm_core::session_actor::SessionTransport for Pty {
+        fn read(
+            &mut self,
+            buffer: &mut [u8],
+        ) -> Result<jterm_core::session_actor::ReadOutcome, String> {
+            jterm_core::pty_reader::read_master(self.as_fd(), buffer)
+                .map_err(|error| error.to_string())
+        }
+
+        fn write(
+            &mut self,
+            data: &[u8],
+        ) -> Result<jterm_core::session_actor::WriteOutcome, String> {
+            use jterm_core::session_actor::WriteOutcome;
+            match Pty::write(self, data).map_err(|error| error.to_string())? {
+                0 => Ok(WriteOutcome::WouldBlock),
+                count => Ok(WriteOutcome::Written(count)),
+            }
+        }
+
+        fn resize(&mut self, cols: usize, rows: usize) -> Result<(), String> {
+            Pty::resize(self, cols, rows).map_err(|error| error.to_string())
+        }
+
+        fn is_alive(&mut self) -> bool {
+            self.child_is_running()
+        }
+
+        fn try_reap(&mut self) -> Option<i32> {
+            self.exited_code()
+        }
+
+        fn wait_timeout(&mut self, timeout_ms: u64) -> Result<i32, String> {
+            let started = Instant::now();
+            let timeout = Duration::from_millis(timeout_ms);
+            loop {
+                if let Some(status) = self.try_reap() {
+                    return Ok(status);
+                }
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err("PTY child exit is not ready".into());
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(25)));
+            }
+        }
+
+        fn observe_before_reap_pid(&self) -> Option<i32> {
+            Some(self.child_pid)
+        }
+
+        fn write_control_byte(&mut self, byte: u8) -> bool {
+            matches!(self.write_once(&[byte]), Ok(1))
+        }
+
+        fn input_admitted() -> bool {
+            !iced::advanced::subscription::Event::input_overloaded()
+        }
+
+        fn termination_grace(&self) -> Duration {
+            TERMINATION_GRACE
+        }
+
+        fn signal_terminate(&mut self) {
+            self.begin_termination();
+        }
+
+        fn force_kill_and_reap(&mut self) {
+            if self.lifecycle == ChildLifecycle::TerminationStarted {
+                Self::kill_and_reap(self.child_pid);
+                self.lifecycle = ChildLifecycle::Reaped;
+            }
         }
     }
 
@@ -1419,282 +1362,6 @@ mod unix_pty {
     }
 
     #[cfg(test)]
-    mod reader_poll_tests {
-        use super::*;
-        use std::cell::Cell;
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-        fn interrupted() -> std::io::Result<i32> {
-            Err(std::io::Error::from_raw_os_error(libc::EINTR))
-        }
-
-        #[test]
-        fn reader_poll_100_interruptions_share_one_50ms_budget() {
-            let start = Instant::now();
-            let ticks = Cell::new(0);
-            let mut waits = Vec::new();
-            let result = Pty::wait_fd_or_shutdown_with(
-                -1,
-                -1,
-                50,
-                || start + Duration::from_micros(ticks.get() * 500),
-                |_, ms| {
-                    waits.push(ms);
-                    ticks.set(ticks.get() + 1);
-                    assert!(ticks.get() <= 100, "EINTR reset the original budget");
-                    interrupted()
-                },
-            )
-            .unwrap();
-            assert!(matches!(result, ReaderPoll::Timeout));
-            assert_eq!(waits.len(), 100);
-            assert_eq!(&waits[..4], &[50, 50, 49, 49]);
-            assert_eq!(waits.last(), Some(&1));
-            assert!(waits.iter().all(|&ms| ms > 0));
-        }
-
-        #[test]
-        fn reader_poll_zero_still_polls_once_and_does_not_spin_on_eintr() {
-            let mut calls = 0;
-            let result = Pty::wait_fd_or_shutdown_with(-1, -1, 0, Instant::now, |_, ms| {
-                calls += 1;
-                assert_eq!(calls, 1);
-                assert_eq!(ms, 0);
-                interrupted()
-            })
-            .unwrap();
-            assert!(matches!(result, ReaderPoll::Timeout));
-        }
-
-        #[test]
-        fn reader_poll_negative_waits_retry_without_reading_clock() {
-            for timeout in [-1, -17, i32::MIN] {
-                let mut calls = 0;
-                let result = Pty::wait_fd_or_shutdown_with(
-                    -1,
-                    -1,
-                    timeout,
-                    || panic!("infinite wait must not read the clock"),
-                    |fds, ms| {
-                        assert_eq!(ms, timeout);
-                        calls += 1;
-                        if calls <= 100 {
-                            interrupted()
-                        } else {
-                            fds[1].revents = libc::POLLHUP;
-                            Ok(1)
-                        }
-                    },
-                )
-                .unwrap();
-                assert!(matches!(result, ReaderPoll::Shutdown));
-                assert_eq!(calls, 101);
-            }
-        }
-
-        #[test]
-        fn reader_poll_rounds_positive_remainder_up_and_preserves_ready_result() {
-            let start = Instant::now();
-            let elapsed = Cell::new(Duration::ZERO);
-            let mut waits = Vec::new();
-            let result = Pty::wait_fd_or_shutdown_with(
-                -1,
-                -1,
-                50,
-                || start + elapsed.get(),
-                |fds, ms| {
-                    waits.push(ms);
-                    if waits.len() == 1 {
-                        elapsed.set(Duration::from_micros(49_999));
-                        interrupted()
-                    } else {
-                        assert_eq!(waits.len(), 2);
-                        elapsed.set(Duration::from_secs(1));
-                        fds[0].revents = libc::POLLIN;
-                        fds[1].revents = libc::POLLHUP;
-                        Ok(2)
-                    }
-                },
-            )
-            .unwrap();
-            assert_eq!(waits, [50, 1]);
-            assert!(matches!(result, ReaderPoll::Shutdown));
-        }
-
-        #[test]
-        fn reader_poll_non_eintr_errors_are_not_timeout_or_eof() {
-            let error = match Pty::wait_fd_or_shutdown_with(-1, -1, 50, Instant::now, |_, _| {
-                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
-            }) {
-                Err(error) => error,
-                Ok(_) => panic!("poll failure must propagate"),
-            };
-            assert!(error.to_string().contains("Failed to poll PTY"));
-        }
-
-        fn pipe() -> (OwnedFd, OwnedFd) {
-            let (r, w) = Pty::make_shutdown_pipe().unwrap();
-            // SAFETY: make_shutdown_pipe transfers two distinct owned descriptors.
-            unsafe { (OwnedFd::from_raw_fd(r), OwnedFd::from_raw_fd(w)) }
-        }
-
-        fn write_byte(fd: &OwnedFd) {
-            let byte = b'x';
-            // SAFETY: fd is live and the byte is valid for this write.
-            assert_eq!(
-                unsafe { libc::write(fd.as_raw_fd(), (&byte as *const u8).cast(), 1) },
-                1
-            );
-        }
-
-        #[test]
-        fn reader_poll_kernel_idle_blocks_and_timeout_does_not_consume_data() {
-            let (data, writer) = pipe();
-            let (shutdown, _keep_open) = pipe();
-            let start = Instant::now();
-            assert!(matches!(
-                Pty::wait_fd_or_shutdown(data.as_raw_fd(), shutdown.as_raw_fd(), 50).unwrap(),
-                ReaderPoll::Timeout
-            ));
-            assert!(
-                start.elapsed() >= Duration::from_millis(40),
-                "idle poll must block"
-            );
-            assert!(
-                start.elapsed() < Duration::from_secs(2),
-                "idle wait exceeded budget tolerance"
-            );
-            write_byte(&writer);
-            assert!(matches!(
-                Pty::wait_fd_or_shutdown(data.as_raw_fd(), shutdown.as_raw_fd(), 0).unwrap(),
-                ReaderPoll::Data
-            ));
-            let mut byte = 0u8;
-            assert_eq!(
-                unsafe { libc::read(data.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) },
-                1
-            );
-            assert_eq!(byte, b'x');
-            drop(writer);
-            assert!(
-                matches!(
-                    Pty::wait_fd_or_shutdown(data.as_raw_fd(), shutdown.as_raw_fd(), 0).unwrap(),
-                    ReaderPoll::Data
-                ),
-                "HUP remains readable EOF, not timeout/shutdown"
-            );
-            assert_eq!(
-                unsafe { libc::read(data.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) },
-                0
-            );
-        }
-
-        #[test]
-        fn reader_poll_kernel_finite_and_infinite_waits_are_cancellable() {
-            for timeout in [5000, -1] {
-                let (data, _writer) = pipe();
-                let (shutdown, close_to_cancel) = pipe();
-                std::thread::scope(|scope| {
-                    let cancel = scope.spawn(move || {
-                        std::thread::sleep(Duration::from_millis(20));
-                        drop(close_to_cancel);
-                    });
-                    let start = Instant::now();
-                    assert!(matches!(
-                        Pty::wait_fd_or_shutdown(data.as_raw_fd(), shutdown.as_raw_fd(), timeout)
-                            .unwrap(),
-                        ReaderPoll::Shutdown
-                    ));
-                    assert!(start.elapsed() < Duration::from_secs(2));
-                    cancel.join().unwrap();
-                });
-            }
-        }
-
-        #[test]
-        fn reader_poll_kernel_shutdown_wins_simultaneous_readiness() {
-            let (data, writer) = pipe();
-            let (shutdown, cancel) = pipe();
-            write_byte(&writer);
-            write_byte(&cancel);
-            assert!(matches!(
-                Pty::wait_fd_or_shutdown(data.as_raw_fd(), shutdown.as_raw_fd(), 0).unwrap(),
-                ReaderPoll::Shutdown
-            ));
-            drop(cancel);
-            assert!(matches!(
-                Pty::wait_fd_or_shutdown(data.as_raw_fd(), shutdown.as_raw_fd(), 0).unwrap(),
-                ReaderPoll::Shutdown
-            ));
-        }
-
-        #[test]
-        fn reader_poll_kernel_invalid_fd_is_shutdown() {
-            let (shutdown, _writer) = pipe();
-            // F_DUPFD cannot allocate at RLIMIT_NOFILE; using the limit itself
-            // is an invalid positive fd without racing descriptor reuse.
-            let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-            assert_eq!(
-                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
-                0
-            );
-            let limit = unsafe { limit.assume_init() }.rlim_cur;
-            let invalid = i32::try_from(limit).unwrap_or(i32::MAX);
-            assert!(matches!(
-                Pty::wait_fd_or_shutdown(invalid, shutdown.as_raw_fd(), 0).unwrap(),
-                ReaderPoll::Shutdown
-            ));
-        }
-
-        #[test]
-        fn reader_poll_kernel_real_pty_data_and_hangup_remain_data() {
-            let (mut master, mut slave) = (-1, -1);
-            assert_eq!(
-                unsafe {
-                    libc::openpty(
-                        &mut master,
-                        &mut slave,
-                        std::ptr::null_mut(),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                    )
-                },
-                0
-            );
-            // SAFETY: successful openpty transfers ownership of these descriptors.
-            let (master, slave) =
-                unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-            // Avoid retaining the slave across unrelated concurrent execs,
-            // which would postpone the hangup this test is about to observe.
-            for fd in [&master, &slave] {
-                let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
-                assert!(flags >= 0);
-                assert_eq!(
-                    unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) },
-                    0
-                );
-            }
-            let (shutdown, _keep_open) = pipe();
-            write_byte(&slave);
-            assert!(matches!(
-                Pty::wait_fd_or_shutdown(master.as_raw_fd(), shutdown.as_raw_fd(), 1000).unwrap(),
-                ReaderPoll::Data
-            ));
-            let mut byte = 0u8;
-            assert_eq!(
-                unsafe { libc::read(master.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) },
-                1
-            );
-            assert_eq!(byte, b'x');
-            drop(slave);
-            assert!(matches!(
-                Pty::wait_fd_or_shutdown(master.as_raw_fd(), shutdown.as_raw_fd(), 1000).unwrap(),
-                ReaderPoll::Data
-            ));
-        }
-    }
-
-    #[cfg(test)]
     mod lifecycle_tests {
         use super::*;
 
@@ -1702,7 +1369,9 @@ mod unix_pty {
             partial_status: Option<u8>,
             keep_writer_open: bool,
         ) -> (RawFd, libc::pid_t) {
-            let (read_fd, write_fd) = Pty::make_shutdown_pipe().expect("create test startup pipe");
+            let (reader, writer) =
+                jterm_core::pty_reader::shutdown_pipe().expect("create test startup pipe");
+            let (read_fd, write_fd) = (reader.into_raw_fd(), writer.into_raw_fd());
             let pid = unsafe { libc::fork() };
             if pid < 0 {
                 unsafe {
@@ -2112,7 +1781,7 @@ mod windows_pty {
 }
 
 #[cfg(unix)]
-pub use unix_pty::{Pty, ReaderPoll};
+pub use unix_pty::Pty;
 
 /// Absolute shell path a pane would spawn, exposed for task provenance:
 /// [`SemanticCommandContext`](crate::agent_task::SemanticCommandContext)

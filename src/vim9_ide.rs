@@ -329,7 +329,6 @@ pub(super) enum Message {
         entry_id: uuid::Uuid,
         frame: Option<std::sync::Arc<vim9::Vim9RenderFrame>>,
     },
-    Drain,
     Keyboard(iced::window::Id, keyboard::Event, bool),
     Modifiers(keyboard::Modifiers),
     Ime(input_method::Event),
@@ -1605,11 +1604,6 @@ impl Ide {
                     }
                 }
             }
-            Message::Drain => {
-                if let Some(s) = &mut self.session {
-                    s.flush_write_queue();
-                }
-            }
             Message::ScrollFrame => self.flush_native_input(),
             Message::Terminal(message) => match *message {
                 super::Message::PtyOutput(id, fd, bytes, _) => {
@@ -1640,12 +1634,23 @@ impl Ide {
                         s.refresh();
                     }
                 }
+                super::Message::PtyIoError(id, fd, error)
+                    if self
+                        .session
+                        .as_ref()
+                        .is_some_and(|s| s.id == id && s.master_fd == fd) =>
+                {
+                    self.error = Some(error);
+                }
                 super::Message::PtyExited(id, fd, status)
                     if self
                         .session
                         .as_ref()
                         .is_some_and(|s| s.id == id && s.master_fd == fd) =>
                 {
+                    if let Some(session) = &self.session {
+                        session.pty.freeze_after_exit();
+                    }
                     self.child_exited = true;
                     if let Some(completion) = self.completion.take() {
                         completion.finish(status);
@@ -2315,19 +2320,9 @@ impl Ide {
         }
         if let Some(s) = self.session.as_ref().filter(|_| !self.child_exited) {
             subscriptions.push(
-                super::pty_subscription(super::PtySubscriptionKey {
-                    id: s.id,
-                    master_fd: s.master_fd,
-                    reader_fd: s.reader_fd.clone(),
-                    watch_source: s.watch_source.clone(),
-                    child_pid: s.pty.get_child_pid(),
-                })
-                .map(|message| Message::Terminal(Box::new(message))),
+                super::pty_subscription(s.pty_subscription_key())
+                    .map(|message| Message::Terminal(Box::new(message))),
             );
-            if s.has_pending_write() {
-                subscriptions
-                    .push(iced::time::every(Duration::from_millis(8)).map(|_| Message::Drain));
-            }
         }
         Subscription::batch(subscriptions)
     }

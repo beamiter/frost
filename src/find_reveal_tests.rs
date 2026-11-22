@@ -1,9 +1,8 @@
 // Headless event tests for the production Find widget and stable reveal guard.
 use super::*;
-use iced::advanced::{layout, mouse, text as advanced_text, widget::Tree, Layout, Shell};
+use crate::test_renderer::{software_renderer, HeadlessRenderer, InputState};
+use iced::advanced::{layout, mouse, widget::Tree, Layout, Shell};
 use iced::{Element, Event, Rectangle, Size};
-
-type InputState = text_input::State<<() as advanced_text::Renderer>::Paragraph>;
 
 fn enter(modifiers: keyboard::Modifiers, repeat: bool, pressed: bool) -> Event {
     let key = keyboard::Key::Named(keyboard::key::Named::Enter);
@@ -30,8 +29,9 @@ fn enter(modifiers: keyboard::Modifiers, repeat: bool, pressed: bool) -> Event {
 }
 
 struct FindWidget {
-    element: Element<'static, Message, iced::Theme, ()>,
+    element: Element<'static, Message, iced::Theme, HeadlessRenderer>,
     tree: Tree,
+    renderer: HeadlessRenderer,
     node: layout::Node,
     viewport: Rectangle,
     target: Option<SearchRevealTarget>,
@@ -41,7 +41,7 @@ impl FindWidget {
     fn element(
         target: Option<SearchRevealTarget>,
         enabled: bool,
-    ) -> Element<'static, Message, iced::Theme, ()> {
+    ) -> Element<'static, Message, iced::Theme, HeadlessRenderer> {
         let callback = target.map(|target| {
             Box::new(move |event| Message::SearchRevealKey(Box::new(target.clone()), event))
                 as Box<dyn Fn(keyboard::Event) -> Message>
@@ -60,10 +60,11 @@ impl FindWidget {
     fn new(target: Option<SearchRevealTarget>, focused: bool) -> Self {
         let mut element = Self::element(target.clone(), true);
         let mut tree = Tree::new(element.as_widget());
+        let renderer = software_renderer();
         let viewport = Rectangle::with_size(Size::new(300.0, 60.0));
         let node = element.as_widget_mut().layout(
             &mut tree,
-            &(),
+            &renderer,
             &layout::Limits::new(Size::ZERO, viewport.size()),
         );
         if focused {
@@ -72,6 +73,7 @@ impl FindWidget {
         Self {
             element,
             tree,
+            renderer,
             node,
             viewport,
             target,
@@ -83,7 +85,7 @@ impl FindWidget {
         self.tree.diff(self.element.as_widget());
         self.node = self.element.as_widget_mut().layout(
             &mut self.tree,
-            &(),
+            &self.renderer,
             &layout::Limits::new(Size::ZERO, self.viewport.size()),
         );
     }
@@ -92,7 +94,7 @@ impl FindWidget {
         self.element.as_widget_mut().operate(
             &mut self.tree,
             Layout::new(&self.node),
-            &(),
+            &self.renderer,
             &mut iced::advanced::widget::operation::focusable::focus(
                 iced::advanced::widget::Id::new(id),
             ),
@@ -111,7 +113,7 @@ impl FindWidget {
             &event,
             Layout::new(&self.node),
             cursor,
-            &(),
+            &self.renderer,
             &mut iced::advanced::clipboard::Null,
             &mut shell,
             &self.viewport,

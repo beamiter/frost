@@ -47,8 +47,7 @@ mod history_picker;
 mod image_drop;
 mod immersive_command;
 mod inspector_layout;
-#[path = "../vendor/jwm-remote/client.rs"]
-mod jwm_remote_session;
+use jterm_core::jterm_remote_client as jwm_remote_session;
 mod keybindings;
 mod kitty_graphics;
 #[cfg(test)]
@@ -110,20 +109,20 @@ mod workflow_focus;
 mod workflow_picker;
 mod workflows;
 mod workspace_chat_bridge;
-mod workspace_context;
+use jterm_core::agent_workspace::controllers::context as workspace_context;
 mod workspace_inspector;
 mod workspace_mission;
 mod workspace_navigation_surface;
-mod workspace_remote;
+use jterm_core::agent_workspace::controllers::remote as workspace_remote;
 mod workspace_remote_ui;
-mod workspace_review;
-mod workspace_scope;
-mod workspace_sessions_bridge;
-mod workspace_tools;
+use jterm_core::agent_workspace::controllers::cli_sessions as workspace_sessions_bridge;
+use jterm_core::agent_workspace::controllers::review as workspace_review;
+use jterm_core::agent_workspace::controllers::scope as workspace_scope;
+use jterm_core::agent_workspace::controllers::tools as workspace_tools;
 mod workspace_visibility;
 
 use std::hash::Hash;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::RawFd;
 use std::sync::{Arc, Mutex};
 
 use config::Config;
@@ -132,7 +131,11 @@ use iced::widget::{
     text, text_input, tooltip, Space,
 };
 use iced::{keyboard, Color, Element, Length, Size, Subscription, Task};
-use pty::{Pty, ReaderPoll};
+use jterm_core::{
+    runtime_wake::WakeSink,
+    session_actor::{SessionActor, SessionEvent, SplitWriteLimits},
+};
+use pty::Pty;
 use terminal::{
     ProjectedViewport, ProjectionKey, ProjectionPolicy, ProjectionViewState, TerminalState,
 };
@@ -1490,8 +1493,6 @@ const MAX_PTY_RESPONSE_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 /// Byte caps alone do not cover allocator/Vec metadata for one-byte writes.
 const MAX_PTY_QUEUE_ENTRIES: usize = 4096;
 const PTY_QUEUE_COALESCE_BYTES: usize = 64 * 1024;
-/// Maximum queued input written during one UI update.
-const PTY_WRITE_DRAIN_BUDGET: usize = 256 * 1024;
 /// jagent accepts at most 16 KiB per proposed command; reserve framing,
 /// Ctrl+U and submitting CR before moving the state machine to approved.
 const MAX_AGENT_APPROVAL_PAYLOAD_BYTES: usize = 16 * 1024 + 32;
@@ -4953,6 +4954,7 @@ enum Message {
     SetAgentMaxTurns(u32),
     PtyOutput(usize, RawFd, Vec<u8>, Option<organism_watch::SourceStamp>),
     PtyExited(usize, RawFd, i32),
+    PtyIoError(usize, RawFd, String),
     Key(keyboard::Event),
     /// An input-method (IME) composition event: open/close, pre-edit updates,
     /// and committed text.
@@ -5183,7 +5185,6 @@ enum Message {
     BlinkTick,
     /// Redraw the compact elapsed-time badge on a visible running block.
     BlockElapsedTick,
-    PtyWriteTick,
     SearchRefreshTick,
     HistoryReflowTick,
     TerminalPresentationTick,
@@ -5332,18 +5333,8 @@ enum TabMenuAction {
 struct PtySubscriptionKey {
     id: usize,
     master_fd: RawFd,
-    reader_fd: Arc<OwnedFd>,
-    watch_source: organism_watch::SourceAuthority,
-    /// The session leader's pid. The reader thread probes it to tell a closed
-    /// slave stream (a possibly transient hangup) apart from a real child
-    /// exit — observing only, never reaping: reaping stays with the
-    /// session's `Pty`.
-    child_pid: i32,
-}
-
-struct PtyWriteChunk {
-    data: Vec<u8>,
-    response: bool,
+    events: crossbeam_channel::Receiver<SessionEvent>,
+    wake: Arc<tokio::sync::Notify>,
 }
 
 impl PartialEq for PtySubscriptionKey {
@@ -5394,7 +5385,8 @@ struct Session {
     id: usize,
     ime_identity: Arc<()>,
     terminal: TerminalState,
-    pty: Pty,
+    pty: SessionActor<Pty>,
+    child_pid: i32,
     /// Explicit argv owns this PTY as work, even if its root child is the
     /// foreground group. This comes from spawn admission, never a tab title.
     command_owned: bool,
@@ -5402,7 +5394,7 @@ struct Session {
     inline_agent_launch: bool,
     shell_identity: companion_host::shell_identity::ShellIdentity,
     master_fd: RawFd,
-    reader_fd: Arc<OwnedFd>,
+    pty_wake: Arc<tokio::sync::Notify>,
     watch_source: organism_watch::SourceAuthority,
     watch_receiver: organism_watch::SourceReceiver,
     /// One immutable materialization shared by rendering, links, and stable
@@ -5458,12 +5450,6 @@ struct Session {
     /// comparison or refill. The key covers every builder input, so a hit is
     /// identical to a fresh build.
     block_chrome_cache: std::cell::RefCell<Option<BlockChromeCache>>,
-    /// Non-blocking PTY writes may be partial. Keep the remainder here and let a
-    /// short-lived timer drain it without ever stalling iced's UI thread.
-    write_queue: std::collections::VecDeque<PtyWriteChunk>,
-    write_queue_offset: usize,
-    queued_write_bytes: usize,
-    queued_response_bytes: usize,
     /// Host clipboard access is asynchronous. Limit PTY-originated reads to one
     /// per session so a hostile child cannot accumulate work across UI batches.
     clipboard_read_in_flight: bool,
@@ -5862,19 +5848,25 @@ impl Session {
         )
         .map_err(|error| anyhow::anyhow!("cannot create terminal session: {error}"))?;
         let master_fd = pty.master_fd();
+        let child_pid = pty.get_child_pid();
         let shell_identity = companion_host::shell_identity::ShellIdentity::capture(
-            pty.get_child_pid(),
+            child_pid,
             shell_program.as_deref().map(std::path::Path::new),
         );
-        let reader_fd = unsafe { libc::fcntl(master_fd, libc::F_DUPFD_CLOEXEC, 0) };
-        if reader_fd < 0 {
-            return Err(anyhow::anyhow!(
-                "cannot duplicate PTY reader: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` returned a fresh owned descriptor.
-        let reader_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(reader_fd) });
+        let pty_wake = Arc::new(tokio::sync::Notify::new());
+        let wake = Arc::clone(&pty_wake);
+        let pty = SessionActor::start_with_split_writes(
+            pty,
+            WakeSink::new(move || wake.notify_one()),
+            SplitWriteLimits {
+                user_bytes: MAX_PTY_WRITE_QUEUE_BYTES,
+                response_bytes: MAX_PTY_RESPONSE_QUEUE_BYTES,
+                entries: MAX_PTY_QUEUE_ENTRIES,
+                coalesce_bytes: PTY_QUEUE_COALESCE_BYTES,
+            },
+        )
+        .map_err(anyhow::Error::msg)?;
+        let watch_source = organism_watch::SourceAuthority::from_runtime(pty.output_source());
         let inline_agent_launch = command_argv
             .map(crate::immersive_command::reading_agent_argv)
             .unwrap_or_else(|| {
@@ -5911,12 +5903,13 @@ impl Session {
             ime_identity: Arc::new(()),
             terminal,
             pty,
+            child_pid,
             command_owned: command_argv.is_some(),
             inline_agent_launch,
             shell_identity,
             master_fd,
-            reader_fd,
-            watch_source: organism_watch::SourceAuthority::default(),
+            pty_wake,
+            watch_source,
             watch_receiver: organism_watch::SourceReceiver::default(),
             projection,
             inline_text_frame: None,
@@ -5939,10 +5932,6 @@ impl Session {
             block_reading: block_review::ReadingHistory::default(),
             block_bookmarks: block_mode::BlockBookmarks::default(),
             block_chrome_cache: std::cell::RefCell::new(None),
-            write_queue: std::collections::VecDeque::new(),
-            write_queue_offset: 0,
-            queued_write_bytes: 0,
-            queued_response_bytes: 0,
             clipboard_read_in_flight: false,
             osc52_pending_refusals: None,
             osc5522_pending_refusals: None,
@@ -6039,7 +6028,7 @@ impl Session {
     fn fg_proc(&self) -> Option<String> {
         let pgid = jterm_core::process::tty_foreground_pgid(self.master_fd)?;
         // Hide when the foreground process *is* the shell — that's the idle case.
-        if pgid == self.pty.get_child_pid() {
+        if pgid == self.child_pid {
             return None;
         }
         let comm = jterm_core::process::process_comm(pgid)?;
@@ -6053,7 +6042,7 @@ impl Session {
     }
 
     fn observed_ssh_command(&self) -> Option<jterm_core::process::ObservedSshCommand> {
-        jterm_core::process::observed_ssh_command(self.master_fd, self.pty.get_child_pid())
+        jterm_core::process::observed_ssh_command(self.master_fd, self.child_pid)
     }
 
     /// Agent approval requires both a trusted terminal-state boundary and the
@@ -6065,12 +6054,12 @@ impl Session {
         if !status.is_ready() {
             return status;
         }
-        if !self.pty.is_alive() {
+        if !self.pty_is_alive() {
             return terminal::AgentPromptStatus::ShellIntegrationUnavailable;
         }
         agent_prompt_status_with_foreground(
             status,
-            self.pty.get_child_pid(),
+            self.child_pid,
             jterm_core::process::tty_foreground_pgid(self.master_fd),
         )
     }
@@ -6520,88 +6509,39 @@ impl Session {
         }
     }
 
-    fn queue_accepts_entry(
-        queue: &std::collections::VecDeque<PtyWriteChunk>,
-        len: usize,
-        response: bool,
-    ) -> bool {
-        queue.len() < MAX_PTY_QUEUE_ENTRIES
-            || queue.back().is_some_and(|back| {
-                back.response == response
-                    && len <= PTY_QUEUE_COALESCE_BYTES.saturating_sub(back.data.len())
-            })
+    fn pty_is_alive(&self) -> bool {
+        self.pty.inspect_transport(Pty::child_is_running)
     }
 
-    fn push_queue_owned(
-        queue: &mut std::collections::VecDeque<PtyWriteChunk>,
-        data: Vec<u8>,
-        response: bool,
-    ) {
-        let coalesce = queue.back().is_some_and(|back| {
-            back.response == response
-                && data.len() <= PTY_QUEUE_COALESCE_BYTES.saturating_sub(back.data.len())
-        });
-        if coalesce {
-            if let Some(back) = queue.back_mut() {
-                back.data.extend_from_slice(&data);
-                return;
-            }
+    fn pty_subscription_key(&self) -> PtySubscriptionKey {
+        PtySubscriptionKey {
+            id: self.id,
+            master_fd: self.master_fd,
+            events: self.pty.events().clone(),
+            wake: Arc::clone(&self.pty_wake),
         }
-        queue.push_back(PtyWriteChunk { data, response });
     }
 
-    fn push_queue_copy(
-        queue: &mut std::collections::VecDeque<PtyWriteChunk>,
-        data: &[u8],
-        response: bool,
-    ) {
-        let coalesce = queue.back().is_some_and(|back| {
-            back.response == response
-                && data.len() <= PTY_QUEUE_COALESCE_BYTES.saturating_sub(back.data.len())
-        });
-        if coalesce {
-            if let Some(back) = queue.back_mut() {
-                back.data.extend_from_slice(data);
-                return;
-            }
-        }
-        queue.push_back(PtyWriteChunk {
-            data: data.to_vec(),
-            response,
-        });
+    fn pty_activity(&self) -> companion_host::pty_session::Activity {
+        self.pty
+            .try_inspect_transport(Pty::session_activity)
+            .unwrap_or(companion_host::pty_session::Activity::Unknown)
     }
 
     fn flush_responses(&mut self) {
         let out = self.terminal.get_output();
-        if out.is_empty() {
+        if out.is_empty() || iced::advanced::subscription::Event::input_overloaded() {
             return;
         }
-        if !self.flush_write_queue() {
-            return;
+        match self.pty.write_response(out) {
+            Ok(()) => self.terminal.note_protocol_response(),
+            Err(error) => log::warn!("[PTY] response rejected for session {}: {error}", self.id),
         }
-        if out.len() > MAX_PTY_RESPONSE_QUEUE_BYTES.saturating_sub(self.queued_response_bytes)
-            || !Self::queue_accepts_entry(&self.write_queue, out.len(), true)
-        {
-            log::warn!(
-                "[PTY] response queue limit reached for session {} ({} queued, {} incoming)",
-                self.id,
-                self.queued_response_bytes,
-                out.len()
-            );
-            return;
-        }
-        self.queued_response_bytes += out.len();
-        Self::push_queue_owned(&mut self.write_queue, out, true);
-        self.terminal.note_protocol_response();
-        let _ = self.flush_write_queue();
     }
 
-    /// Drain prior work and report whether a user payload can be prepared while
-    /// staying inside both the byte and allocation-count limits.
-    fn can_queue_user_bytes(&mut self, len: usize) -> bool {
-        self.flush_write_queue()
-            && len <= MAX_PTY_WRITE_QUEUE_BYTES.saturating_sub(self.queued_write_bytes)
-            && Self::queue_accepts_entry(&self.write_queue, len, false)
+    fn can_queue_user_bytes(&self, len: usize) -> bool {
+        !iced::advanced::subscription::Event::input_overloaded()
+            && self.pty.can_queue_user_input(len).is_ok()
     }
 
     /// True while this tab is a held-open task transcript whose child has
@@ -6618,7 +6558,7 @@ impl Session {
         if self.transcript_read_only() {
             return None;
         }
-        let child = self.pty.get_child_pid();
+        let child = self.child_pid;
         let foreground = jterm_core::process::tty_foreground_pgid(self.master_fd);
         match foreground {
             Some(group) if group != child => {
@@ -6636,7 +6576,7 @@ impl Session {
             if !self.shell_identity.matches_current_program() {
                 return Some("The shell was replaced by a command.");
             }
-            match self.pty.session_activity() {
+            match self.pty_activity() {
                 companion_host::pty_session::Activity::Busy => {
                     return Some("A background process is still attached.")
                 }
@@ -6663,13 +6603,14 @@ impl Session {
         })
     }
 
-    fn chat_backlog(&self) -> chat_mode::InputBacklog {
-        chat_mode::InputBacklog {
-            entries: self.write_queue.len(),
-            offset: self.write_queue_offset,
-            user_bytes: self.queued_write_bytes,
-            response_bytes: self.queued_response_bytes,
-        }
+    fn chat_backlog(&self) -> Option<chat_mode::InputBacklog> {
+        let backlog = self.pty.input_backlog().ok()?;
+        Some(chat_mode::InputBacklog {
+            entries: backlog.entries,
+            offset: 0,
+            user_bytes: backlog.user_bytes,
+            response_bytes: backlog.response_bytes,
+        })
     }
 
     fn chat_control_bytes(&self, kind: chat_mode::ControlKind) -> Option<Vec<u8>> {
@@ -6720,7 +6661,7 @@ impl Session {
         // a process-name cache. Shell builtins (e.g. read) legitimately share
         // the shell PGID and remain interruptible.
         let foreground = jterm_core::process::tty_foreground_pgid(self.master_fd)?;
-        if kind == ControlKind::Submit && foreground != self.pty.get_child_pid() {
+        if kind == ControlKind::Submit && foreground != self.child_pid {
             return None;
         }
         Some(ControlToken {
@@ -6741,7 +6682,7 @@ impl Session {
         let bytes = self.chat_control_bytes(kind)?;
         chat_mode::control_enabled(
             &bytes,
-            self.chat_backlog(),
+            self.chat_backlog()?,
             input_ready && !self.transcript_read_only() && self.terminal.preedit_text.is_empty(),
         )
         .then(|| self.chat_control_token(kind))
@@ -6752,10 +6693,12 @@ impl Session {
         let Some(bytes) = self.chat_control_bytes(displayed.kind()) else {
             return false;
         };
-        let backlog = self.chat_backlog();
+        let Some(backlog) = self.chat_backlog() else {
+            return false;
+        };
         let input_ready =
             input_ready && !self.transcript_read_only() && self.terminal.preedit_text.is_empty();
-        if !chat_mode::control_enabled(&bytes, backlog, input_ready) || !self.pty.is_alive() {
+        if !chat_mode::control_enabled(&bytes, backlog, input_ready) || !self.pty_is_alive() {
             return false;
         }
         // This is the final writer admission. No FIFO flush, append, scheduled
@@ -6767,7 +6710,13 @@ impl Session {
             &bytes,
             backlog,
             input_ready,
-            |byte| self.pty.write(byte),
+            |byte| {
+                Ok::<_, ()>(usize::from(
+                    self.pty.try_write_control_byte(byte[0], |foreground| {
+                        foreground == displayed.foreground
+                    }),
+                ))
+            },
         );
         if accepted {
             self.note_cli_keyboard_input(&bytes, true);
@@ -6793,8 +6742,8 @@ impl Session {
         self.transcript_canvas.navigate(0);
     }
 
-    /// Queue data in-order and make one non-blocking drain attempt. Returns false
-    /// if the bounded queue rejected the write or the PTY has failed.
+    /// Queue data in-order. The actor either accepts the complete message or
+    /// refuses it before the writer sees any of its bytes.
     fn write_pty(&mut self, data: &[u8]) -> bool {
         self.write_pty_with_origin(data, true)
     }
@@ -6821,70 +6770,20 @@ impl Session {
         if self.transcript_read_only() {
             return false;
         }
-        if !self.can_queue_user_bytes(data.len()) {
-            log::warn!(
-                "[PTY] input backpressure for session {} ({} input, {} response, {} incoming)",
-                self.id,
-                self.queued_write_bytes,
-                self.queued_response_bytes,
-                data.len()
-            );
-            return false;
-        }
-        self.queued_write_bytes += data.len();
-        Self::push_queue_copy(&mut self.write_queue, data, false);
-        // The write may complete before its echo returns through the reader.
-        // Taint the current OSC 133 prompt now so Agent approval cannot race a
-        // locally typed-but-not-yet-visible edit line.
-        if taint_prompt {
-            self.terminal.note_user_input(data);
-        }
-        self.flush_write_queue()
-    }
-
-    fn flush_write_queue(&mut self) -> bool {
-        if iced::advanced::subscription::Event::input_overloaded() {
-            return false;
-        }
-        let mut budget = PTY_WRITE_DRAIN_BUDGET;
-        while let Some(front) = self.write_queue.front() {
-            if budget == 0 {
-                return true;
+        match self.pty.write(data) {
+            Ok(()) => {
+                // The UI processes the possible echo only after this update
+                // returns, so prompt taint is visible before parser ingestion.
+                if taint_prompt {
+                    self.terminal.note_user_input(data);
+                }
+                true
             }
-            let front_len = front.data.len();
-            let is_response = front.response;
-            let end = (self.write_queue_offset + budget).min(front_len);
-            match self.pty.write(&front.data[self.write_queue_offset..end]) {
-                Ok(0) => return true,
-                Ok(written) => {
-                    budget = budget.saturating_sub(written);
-                    self.write_queue_offset += written;
-                    if is_response {
-                        self.queued_response_bytes =
-                            self.queued_response_bytes.saturating_sub(written);
-                    } else {
-                        self.queued_write_bytes = self.queued_write_bytes.saturating_sub(written);
-                    }
-                    if self.write_queue_offset == front_len {
-                        self.write_queue.pop_front();
-                        self.write_queue_offset = 0;
-                    }
-                }
-                Err(error) => {
-                    log::warn!("[PTY] write failed for session {}: {error}", self.id);
-                    self.write_queue.clear();
-                    self.write_queue_offset = 0;
-                    self.queued_write_bytes = 0;
-                    self.queued_response_bytes = 0;
-                    return false;
-                }
+            Err(error) => {
+                log::warn!("[PTY] input rejected for session {}: {error}", self.id);
+                false
             }
         }
-        true
-    }
-
-    fn has_pending_write(&self) -> bool {
-        self.queued_write_bytes != 0 || self.queued_response_bytes != 0
     }
 
     /// Working directory of the shell child, used when spawning a sibling and
@@ -6898,7 +6797,7 @@ impl Session {
         self.terminal
             .current_working_dir()
             .map(str::to_string)
-            .or_else(|| jterm_core::process::process_cwd(self.pty.get_child_pid()))
+            .or_else(|| jterm_core::process::process_cwd(self.child_pid))
     }
 }
 
@@ -10687,13 +10586,19 @@ impl Frost {
         if index >= self.sessions.len() {
             return Task::none();
         }
+        let mut release_queued = false;
         for gesture in retire_closing_terminal_mouse_gestures(
             self.sessions[index].id,
             &mut self.terminal_mouse_gestures,
             &mut self.click_tracker,
         ) {
-            self.finish_cancelled_terminal_mouse_gesture(gesture);
+            release_queued |= self.finish_cancelled_terminal_mouse_gesture(gesture);
         }
+        let input_grace = if release_queued {
+            std::time::Duration::from_millis(8)
+        } else {
+            std::time::Duration::ZERO
+        };
         self.invalidate_sidebar_remote_follow_intent();
         // Session removal can invalidate a tab/pane drag source or target and
         // reindex every remaining leaf. Cancel while all stable identities are
@@ -10720,7 +10625,7 @@ impl Frost {
                 eva.allow_final_session_close();
             }
             let exit = self.exit_flushing_durable_state();
-            let _ = self.sessions[0].pty.terminate();
+            self.sessions[0].pty.stop_after_pending_input(input_grace);
             return exit;
         }
         if index == self.active {
@@ -10760,7 +10665,7 @@ impl Frost {
         // dropped from it in `prune_closed_pane` once we know whether the tab
         // itself went away.
 
-        let _ = sess.pty.terminate();
+        sess.pty.stop_after_pending_input(input_grace);
         // `prune_closed_pane` is authoritative for `active` (it must pick a
         // neighbor leaf when the focused pane's session is the one closing).
         let old_active = self.active;
@@ -13312,7 +13217,7 @@ impl Frost {
                 // task. SSH/tmux-style wrappers fail closed here.
                 let recorded = zone.cwd.clone().expect("eligibility guarantees a cwd");
                 let reported = sess.terminal.current_working_dir().map(str::to_string);
-                let process = jterm_core::process::process_cwd(sess.pty.get_child_pid());
+                let process = jterm_core::process::process_cwd(sess.child_pid);
                 if !block_mode::verified_local_command_cwd(
                     &recorded,
                     reported.as_deref(),
@@ -13409,7 +13314,7 @@ impl Frost {
                 let command_truncated = zone.command_truncated;
                 let recorded = zone.cwd.clone();
                 let reported = sess.terminal.current_working_dir().map(str::to_string);
-                let process = jterm_core::process::process_cwd(sess.pty.get_child_pid());
+                let process = jterm_core::process::process_cwd(sess.child_pid);
                 if let Some(reason) = block_mode::retry_replay_disabled_reason(
                     command.as_deref(),
                     command_truncated,
@@ -14723,19 +14628,17 @@ impl Frost {
     /// Route a grid mouse interaction either to the running application (when it
     /// has enabled mouse reporting and Shift is not held) or to local selection
     /// and scrollback handling.
-    fn finish_cancelled_terminal_mouse_gesture(&mut self, gesture: TerminalMouseGesture) {
-        if let Some(index) = self.session_index_by_id(gesture.session_id) {
-            let session = &mut self.sessions[index];
-            if gesture.button == MouseButton::Left && session.terminal.inline_text_dragging() {
-                session.terminal.finish_inline_text_selection(false);
-                session.refresh();
-            }
-            if let Some(report) =
-                cancelled_terminal_mouse_report(gesture, &session.terminal, self.modifiers)
-            {
-                session.write_pty(&report);
-            }
+    fn finish_cancelled_terminal_mouse_gesture(&mut self, gesture: TerminalMouseGesture) -> bool {
+        let Some(index) = self.session_index_by_id(gesture.session_id) else {
+            return false;
+        };
+        let session = &mut self.sessions[index];
+        if gesture.button == MouseButton::Left && session.terminal.inline_text_dragging() {
+            session.terminal.finish_inline_text_selection(false);
+            session.refresh();
         }
+        cancelled_terminal_mouse_report(gesture, &session.terminal, self.modifiers)
+            .is_some_and(|report| session.write_pty(&report))
     }
 
     fn handle_retained_inline_mouse(&mut self, index: usize, input: MouseInput) -> Task<Message> {
@@ -17338,10 +17241,7 @@ impl Frost {
             // Return, widget submit, or paste already in the downstream sink.
             // Never resume an old shell containing a partially received command.
             for session in &mut self.sessions {
-                session.write_queue.clear();
-                session.write_queue_offset = 0;
-                session.queued_write_bytes = 0;
-                session.queued_response_bytes = 0;
+                session.pty.close_input();
             }
             return match message {
                 Message::ExitAfterInputOverload => {
@@ -17375,7 +17275,7 @@ impl Frost {
             .sessions
             .get(self.active)
             .filter(|session| !session.transcript_read_only())
-            .map(|session| (session.id, session.pty.master_fd()));
+            .map(|session| (session.id, session.master_fd));
         let geometry_allowed = match &message {
             Message::PtyOutput(id, fd, ..) => geometry_owner == Some((*id, *fd)),
             Message::PtyExited(..) | Message::WindowClose | Message::TabCloseConfirmYes => false,
@@ -17399,7 +17299,7 @@ impl Frost {
             .sessions
             .get(self.active)
             .filter(|session| !session.transcript_read_only())
-            .map(|session| (session.id, session.pty.master_fd()));
+            .map(|session| (session.id, session.master_fd));
         if geometry_allowed && geometry_owner.is_some() && current_owner == geometry_owner {
             // One deduplicated budget sync covers early-return reducers too.
             self.sync_block_reading_bar_geometry();
@@ -19835,7 +19735,16 @@ impl Frost {
                     sess.refresh();
                 }
             }
-            Message::PtyExited(id, fd, _code) => {
+            Message::PtyIoError(id, fd, error) => {
+                if self
+                    .sessions
+                    .iter()
+                    .any(|session| session.id == id && session.master_fd == fd)
+                {
+                    self.push_toast(error, ToastKind::Warning);
+                }
+            }
+            Message::PtyExited(id, fd, code) => {
                 if let Some(index) = self
                     .sessions
                     .iter()
@@ -19850,23 +19759,11 @@ impl Frost {
                         .task_manager
                         .task_for_terminal_session(&session_key)
                         .is_some();
-                    let exit_code = self.sessions[index].pty.exited_code();
-                    if exit_code.is_none() {
-                        // Observed parent exit is not completed session cleanup.
-                        // Retry asynchronously; id/fd matching above prevents a
-                        // late retry from closing a replacement session.
-                        return Task::perform(
-                            async move {
-                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                                (id, fd, _code)
-                            },
-                            |(id, fd, code)| Message::PtyExited(id, fd, code),
-                        );
-                    }
+                    self.sessions[index].pty.freeze_after_exit();
                     let feedback = agent_task_ui::task_terminal_exit_feedback(
                         &mut self.task_manager,
                         &session_key,
-                        exit_code,
+                        Some(code),
                     );
                     if task_bound {
                         self.organism.forget_session(id);
@@ -22051,17 +21948,6 @@ impl Frost {
                 self.blink_on = !self.blink_on;
             }
             Message::BlockElapsedTick => {}
-            Message::PtyWriteTick => {
-                let mut failed = false;
-                for session in &mut self.sessions {
-                    if !session.flush_write_queue() {
-                        failed = true;
-                    }
-                }
-                if failed {
-                    self.push_toast("Terminal input write failed", ToastKind::Warning);
-                }
-            }
             Message::SearchRefreshTick => {
                 let active_reflow_pending = self
                     .sessions
@@ -26031,9 +25917,7 @@ impl Frost {
         let sess = self.sessions.get(self.active)?;
         // Fail closed on missing foreground proof as well as OSC busy state.
         // A primary-screen child must retain its keys even with stale shell marks.
-        if jterm_core::process::tty_foreground_pgid(sess.master_fd)
-            != Some(sess.pty.get_child_pid())
-        {
+        if jterm_core::process::tty_foreground_pgid(sess.master_fd) != Some(sess.child_pid) {
             return None;
         }
         let selected = sess.block_selection.active();
@@ -31612,7 +31496,7 @@ impl Frost {
                 }
                 let recorded = zone.cwd.clone().expect("eligibility guarantees a cwd");
                 let reported = sess.terminal.current_working_dir().map(str::to_string);
-                let process = jterm_core::process::process_cwd(sess.pty.get_child_pid());
+                let process = jterm_core::process::process_cwd(sess.child_pid);
                 if !block_mode::verified_local_command_cwd(
                     &recorded,
                     reported.as_deref(),
@@ -32217,8 +32101,7 @@ impl Frost {
         if let Err(error) = binding {
             // The PTY is live but never gained task authority; tear it down
             // and restore the pre-spawn task state.
-            let mut session = session;
-            let _ = session.pty.terminate();
+            session.pty.stop();
             if failed_terminal_retry.is_none() && !native_recovery {
                 let _ = self.task_manager.update_status(
                     task_id,
@@ -32381,8 +32264,7 @@ impl Frost {
             .task_manager
             .bind_validation_session(task_id, session_key)
         {
-            let mut session = session;
-            let _ = session.pty.terminate();
+            session.pty.stop();
             self.push_toast(error.to_string(), ToastKind::Warning);
             return;
         }
@@ -34822,15 +34704,7 @@ impl Frost {
         let mut subs: Vec<Subscription<Message>> = self
             .sessions
             .iter()
-            .map(|s| {
-                pty_subscription(PtySubscriptionKey {
-                    id: s.id,
-                    master_fd: s.master_fd,
-                    reader_fd: Arc::clone(&s.reader_fd),
-                    watch_source: s.watch_source.clone(),
-                    child_pid: s.pty.get_child_pid(),
-                })
-            })
+            .map(|session| pty_subscription(session.pty_subscription_key()))
             .collect();
         if self.has_desktop_agent_sessions() {
             subs.push(
@@ -35260,12 +35134,6 @@ impl Frost {
         };
         if let Some(interval) = running_badge_interval {
             subs.push(iced::time::every(interval).map(|_| Message::BlockElapsedTick));
-        }
-        if self.sessions.iter().any(Session::has_pending_write) {
-            subs.push(
-                iced::time::every(std::time::Duration::from_millis(8))
-                    .map(|_| Message::PtyWriteTick),
-            );
         }
         if self.search.is_open && self.search_dirty {
             // Live search refreshes are debounced to 300 ms (ember's
@@ -36169,172 +36037,24 @@ fn pty_subscription(key: PtySubscriptionKey) -> Subscription<Message> {
 }
 
 fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Message> {
-    use iced::futures::{SinkExt, StreamExt};
+    use iced::futures::SinkExt;
+
     iced::stream::channel(
         2,
         move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
             let id = key.id;
             let fd = key.master_fd;
-            let mut watch_source = key.watch_source.start();
-            // Each message is capped at 1 MiB below. Two shallow handoff queues
-            // keep only a few MiB resident per session while backpressuring read(2).
-            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(2);
-            // Self-pipe so dropping this subscription (session/tab closed) wakes the
-            // reader thread and stops it BEFORE it can read from a PTY fd whose
-            // number may have been reused by a freshly spawned session.
-            let (shutdown_r, shutdown_w) = match Pty::make_shutdown_pipe() {
-                Ok((read_fd, write_fd)) => {
-                    // SAFETY: make_shutdown_pipe returns two fresh owned fds.
-                    unsafe {
-                        (
-                            OwnedFd::from_raw_fd(read_fd),
-                            OwnedFd::from_raw_fd(write_fd),
-                        )
+            loop {
+                let message = match key.events.try_recv() {
+                    Ok(event) => pty_event_message(id, fd, event),
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        key.wake.notified().await;
+                        continue;
                     }
-                }
-                Err(error) => {
-                    log::error!("[PTY] failed to create reader shutdown pipe: {error}");
-                    let _ = output.send(Message::PtyExited(id, fd, -1)).await;
-                    return;
-                }
-            };
-            let reader_fd = key.reader_fd;
-            let child_pid = key.child_pid;
-            let spawn_result = std::thread::Builder::new()
-                .name(format!("frost-pty-{id}"))
-                .spawn(move || {
-                    let reader_raw = reader_fd.as_raw_fd();
-                    let shutdown_raw = shutdown_r.as_raw_fd();
-                    // Drain everything currently readable into one message instead of
-                    // emitting a separate message per 64 KiB read. Bursty output (e.g.
-                    // `cat bigfile`) then triggers far fewer process/refresh/render
-                    // cycles, while a lone keystroke still hits WouldBlock immediately
-                    // and is delivered with no added latency. Capped so the UI gets a
-                    // chance to repaint between very large bursts.
-                    const COALESCE_CAP: usize = 1 << 20; // 1 MiB per message
-                    let mut buf = vec![0u8; 65536];
-                    let mut parent_probe_at = std::time::Instant::now();
-                    loop {
-                        if std::time::Instant::now() >= parent_probe_at {
-                            if matches!(
-                                Pty::wait_fd_or_shutdown(reader_raw, shutdown_raw, 0),
-                                Ok(ReaderPoll::Shutdown)
-                            ) {
-                                break;
-                            }
-                            if publish_observed_parent_exit(
-                                id,
-                                fd,
-                                reader_raw,
-                                child_pid,
-                                &mut tx,
-                                &mut watch_source,
-                            ) {
-                                break;
-                            }
-                            parent_probe_at =
-                                std::time::Instant::now() + std::time::Duration::from_millis(200);
-                        }
-                        match Pty::wait_fd_or_shutdown(reader_raw, shutdown_raw, 200) {
-                            Ok(ReaderPoll::Shutdown) => break,
-                            Ok(ReaderPoll::Timeout) => continue,
-                            Ok(ReaderPoll::Data) => {
-                                let mut acc: Vec<u8> = Vec::new();
-                                let mut first_read = None;
-                                let mut hangup = false;
-                                let mut errored = false;
-                                loop {
-                                    let n = unsafe {
-                                        libc::read(
-                                            reader_raw,
-                                            buf.as_mut_ptr() as *mut libc::c_void,
-                                            buf.len(),
-                                        )
-                                    };
-                                    if n > 0 {
-                                        first_read.get_or_insert_with(std::time::Instant::now);
-                                        acc.extend_from_slice(&buf[..n as usize]);
-                                        if acc.len() >= COALESCE_CAP {
-                                            break;
-                                        }
-                                    } else if n == 0 {
-                                        // read(2) == 0 on a PTY master is a
-                                        // hangup, the same class as EIO below.
-                                        hangup = true;
-                                        break;
-                                    } else {
-                                        let err = std::io::Error::last_os_error();
-                                        if err.kind() == std::io::ErrorKind::WouldBlock {
-                                            break;
-                                        }
-                                        if err.raw_os_error() == Some(libc::EINTR) {
-                                            continue;
-                                        }
-                                        // Linux PTY masters report EIO (rather
-                                        // than read(2) == 0) once the final
-                                        // slave fd closes. The child may still
-                                        // be alive; never fabricate an exit
-                                        // from the fd state alone.
-                                        if err.raw_os_error() == Some(libc::EIO) {
-                                            hangup = true;
-                                            break;
-                                        }
-                                        errored = true;
-                                        break;
-                                    }
-                                }
-                                if !acc.is_empty()
-                                    && iced::futures::executor::block_on(tx.send(
-                                        Message::PtyOutput(
-                                            id,
-                                            fd,
-                                            acc,
-                                            first_read.and_then(|at| watch_source.stamp(at)),
-                                        ),
-                                    ))
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                                if errored {
-                                    let _ = iced::futures::executor::block_on(
-                                        tx.send(Message::PtyExited(id, fd, -1)),
-                                    );
-                                    break;
-                                }
-                                if hangup {
-                                    match wait_out_hangup(
-                                        id,
-                                        fd,
-                                        reader_raw,
-                                        shutdown_raw,
-                                        child_pid,
-                                        &mut tx,
-                                        &mut watch_source,
-                                    ) {
-                                        HangupOutcome::Recovered => continue,
-                                        HangupOutcome::Exited | HangupOutcome::Shutdown => break,
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                let _ = iced::futures::executor::block_on(
-                                    tx.send(Message::PtyExited(id, fd, -1)),
-                                );
-                                break;
-                            }
-                        }
-                    }
-                });
-            if let Err(error) = spawn_result {
-                log::error!("[PTY] failed to spawn reader thread: {error}");
-                let _ = output.send(Message::PtyExited(id, fd, -1)).await;
-                return;
-            }
-            // Dropping this owned write end (subscription removed) signals the reader.
-            let _shutdown_guard = shutdown_w;
-            while let Some(msg) = rx.next().await {
-                if output.send(msg).await.is_err() {
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                };
+                let exited = matches!(message, Message::PtyExited(..));
+                if output.send(message).await.is_err() || exited {
                     break;
                 }
             }
@@ -36342,170 +36062,18 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
     )
 }
 
-/// A descendant may keep the slave open indefinitely after its parent exits.
-/// Observe the owned parent independently of EOF, retaining its wait status for
-/// the UI's session drain/reap. Preserve a bounded readable tail before Exit.
-fn publish_observed_parent_exit(
-    id: usize,
-    fd: RawFd,
-    reader_raw: RawFd,
-    child_pid: i32,
-    tx: &mut iced::futures::channel::mpsc::Sender<Message>,
-    watch_source: &mut organism_watch::SourceWriter,
-) -> bool {
-    use iced::futures::SinkExt;
-    let code = match Pty::observe_child_exit(child_pid) {
-        Ok(Some(code)) => code,
-        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => -1,
-        Ok(None) | Err(_) => return false,
-    };
-    const CAP: usize = 1 << 20;
-    let mut output = Vec::new();
-    let mut buffer = [0u8; 65536];
-    let mut first_read = None;
-    while output.len() < CAP {
-        let available = buffer.len().min(CAP - output.len());
-        let count = unsafe { libc::read(reader_raw, buffer.as_mut_ptr().cast(), available) };
-        if count > 0 {
-            first_read.get_or_insert_with(std::time::Instant::now);
-            output.extend_from_slice(&buffer[..count as usize]);
-        } else if count < 0
-            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-        {
-            continue;
-        } else {
-            break;
+fn pty_event_message(id: usize, fd: RawFd, event: SessionEvent) -> Message {
+    match event {
+        SessionEvent::Output(batch) => {
+            let stamp = batch
+                .fragments()
+                .next()
+                .and_then(|part| part.origin)
+                .map(organism_watch::SourceStamp::from_runtime);
+            Message::PtyOutput(id, fd, batch.into_bytes(), stamp)
         }
-    }
-    if output.len() == CAP {
-        log::warn!("PTY natural-exit tail reached 1 MiB; remaining output may be omitted");
-    }
-    if !output.is_empty()
-        && iced::futures::executor::block_on(tx.send(Message::PtyOutput(
-            id,
-            fd,
-            output,
-            first_read.and_then(|at| watch_source.stamp(at)),
-        )))
-        .is_err()
-    {
-        return true;
-    }
-    let _ = iced::futures::executor::block_on(tx.send(Message::PtyExited(id, fd, code)));
-    true
-}
-
-/// Outcome of riding out a PTY hangup in the reader thread.
-enum HangupOutcome {
-    /// The slave side is open again (or data arrived); resume normal reading.
-    Recovered,
-    /// The child is actually gone, or the stream is genuinely broken; the
-    /// exit message has been queued.
-    Exited,
-    /// The session was closed while probing; leave quietly.
-    Shutdown,
-}
-
-/// Ride out a PTY hangup (Linux EIO, or `read(2) == 0` elsewhere): the slave
-/// stream is closed, but the child may still be alive — a daemonized
-/// program, or one that did setsid and closed its ctty — and may even reopen
-/// /dev/tty later. Probe with bounded backoff (50→250 ms) and declare exit
-/// only once waitid says the child is gone, never from the fd state alone.
-/// The backoff wait is paced by the shutdown pipe so session close stays
-/// prompt; an EIO master stays permanently readable and cannot pace it.
-fn wait_out_hangup(
-    id: usize,
-    fd: RawFd,
-    reader_raw: RawFd,
-    shutdown_raw: RawFd,
-    child_pid: i32,
-    tx: &mut iced::futures::channel::mpsc::Sender<Message>,
-    watch_source: &mut organism_watch::SourceWriter,
-) -> HangupOutcome {
-    use iced::futures::SinkExt;
-
-    const PROBE_DELAY_MAX: std::time::Duration = std::time::Duration::from_millis(250);
-    let mut probe_delay = std::time::Duration::from_millis(50);
-    let mut buf = vec![0u8; 65536];
-    loop {
-        // Recovery probe: a live child may have reopened /dev/tty since the
-        // hangup. Data or WouldBlock both mean the slave side lives again.
-        let n = loop {
-            let n =
-                unsafe { libc::read(reader_raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            break n;
-        };
-        if n > 0 {
-            let stamp = watch_source.stamp(std::time::Instant::now());
-            let data = buf[..n as usize].to_vec();
-            if iced::futures::executor::block_on(tx.send(Message::PtyOutput(id, fd, data, stamp)))
-                .is_err()
-            {
-                return HangupOutcome::Shutdown;
-            }
-            return HangupOutcome::Recovered;
-        }
-        if n < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                return HangupOutcome::Recovered;
-            }
-            if error.raw_os_error() != Some(libc::EIO) {
-                // A genuine read error keeps the pre-hangup behavior.
-                let _ = iced::futures::executor::block_on(tx.send(Message::PtyExited(id, fd, -1)));
-                return HangupOutcome::Exited;
-            }
-        }
-        // Still hung up (read(2) == 0 or EIO). Declare exit only when the
-        // child is actually gone; WNOWAIT leaves the real status for the
-        // session's Pty to reap, so task terminals keep their true code.
-        match Pty::observe_child_exit(child_pid) {
-            Ok(Some(code)) => {
-                let _ =
-                    iced::futures::executor::block_on(tx.send(Message::PtyExited(id, fd, code)));
-                return HangupOutcome::Exited;
-            }
-            Ok(None) => {}
-            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
-                // Reaped elsewhere (session teardown won the race): gone.
-                let _ = iced::futures::executor::block_on(tx.send(Message::PtyExited(id, fd, -1)));
-                return HangupOutcome::Exited;
-            }
-            Err(error) => {
-                // Unknown is not evidence of exit; keep probing.
-                log::warn!("[PTY] waitid(WNOWAIT) failed while probing PTY child: {error}");
-            }
-        }
-        // Pace the next probe through the shutdown pipe alone.
-        let mut shutdown_poll = libc::pollfd {
-            fd: shutdown_raw,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = loop {
-            // SAFETY: shutdown_poll is a valid stack pollfd and shutdown_raw
-            // is owned by the caller for the duration of this wait.
-            let ready =
-                unsafe { libc::poll(&mut shutdown_poll, 1, probe_delay.as_millis() as i32) };
-            if ready >= 0 {
-                break ready;
-            }
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EINTR) {
-                return HangupOutcome::Shutdown;
-            }
-        };
-        if ready > 0
-            && shutdown_poll.revents
-                & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
-                != 0
-        {
-            return HangupOutcome::Shutdown;
-        }
-        probe_delay = PROBE_DELAY_MAX.min(probe_delay.saturating_mul(2));
+        SessionEvent::Exit(code) => Message::PtyExited(id, fd, code),
+        SessionEvent::Error(error) => Message::PtyIoError(id, fd, error),
     }
 }
 
@@ -37001,6 +36569,9 @@ fn xterm_modify_other_keys_encode(
 mod block_browser_tests;
 
 #[cfg(test)]
+mod test_renderer;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn remapped_live_projection_matches_canvas_before_first_frame() {
@@ -37196,7 +36767,7 @@ mod tests {
         for session in [&interactive, &command] {
             let deadline = Instant::now() + Duration::from_secs(3);
             while jterm_core::process::tty_foreground_pgid(session.master_fd)
-                != Some(session.pty.get_child_pid())
+                != Some(session.child_pid)
             {
                 assert!(
                     Instant::now() < deadline,
@@ -37207,7 +36778,7 @@ mod tests {
         }
         assert!(!interactive.command_owned);
         let deadline = Instant::now() + Duration::from_secs(3);
-        while interactive.pty.session_activity() != companion_host::pty_session::Activity::Idle {
+        while interactive.pty_activity() != companion_host::pty_session::Activity::Idle {
             assert!(
                 Instant::now() < deadline,
                 "fixture shell still has attached startup work"
@@ -37253,10 +36824,10 @@ mod tests {
             command.close_blocker().is_some(),
             "a root command is work regardless of its tab label"
         );
-        let pid = command.pty.get_child_pid();
+        let pid = command.child_pid;
         assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
         let deadline = Instant::now() + Duration::from_secs(3);
-        while command.pty.is_alive() {
+        while command.pty_is_alive() {
             assert!(Instant::now() < deadline, "fixture command did not exit");
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -37276,7 +36847,7 @@ mod tests {
         session.pty.write(b"exec /bin/sleep 30\n").unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         let sleep = std::fs::canonicalize("/bin/sleep").unwrap();
-        let executable = format!("/proc/{}/exe", session.pty.get_child_pid());
+        let executable = format!("/proc/{}/exe", session.child_pid);
         while std::fs::read_link(&executable).ok().as_ref() != Some(&sleep) {
             assert!(Instant::now() < deadline, "real exec did not replace shell");
             std::thread::sleep(Duration::from_millis(10));
@@ -38272,10 +37843,10 @@ mod tests {
             .0;
         for gate in [
             "chat_mode::control_enabled",
-            "self.pty.is_alive()",
+            "self.pty_is_alive()",
             "self.chat_control_token",
             "chat_mode::admit_control",
-            "self.pty.write(byte)",
+            "self.pty.try_write_control_byte",
             "if accepted",
         ] {
             assert!(admission.contains(gate), "missing writer gate {gate}");
@@ -38294,7 +37865,7 @@ mod tests {
             "ChatSurface::Running",
             "self.terminal.watch_generation()?",
             "tty_foreground_pgid(self.master_fd)?",
-            "self.pty.get_child_pid()",
+            "self.child_pid",
         ] {
             assert!(owner.contains(gate), "missing action ownership {gate}");
         }
@@ -39648,21 +39219,18 @@ mod tests {
     }
 
     #[test]
-    fn watch_source_stamp_is_created_in_both_native_handoff_paths() {
+    fn watch_source_stamps_runtime_output_with_the_native_read_time() {
         let source = include_str!("main.rs");
         let stream = source.split_once("fn pty_stream(").unwrap().1;
         let stream = stream
-            .split_once("/// Outcome of riding out a PTY hangup")
+            .split_once("fn organism_modifier_only_key(")
             .unwrap()
             .0;
-        assert!(stream.contains("let mut watch_source = key.watch_source.start();"));
-        assert!(stream.contains("const COALESCE_CAP: usize = 1 << 20"));
-        assert!(stream.contains("let mut buf = vec![0u8; 65536]"));
-        assert!(stream.contains("first_read.get_or_insert_with(std::time::Instant::now)"));
-        assert!(stream.contains("first_read.and_then(|at| watch_source.stamp(at))"));
-        let hangup = source.split_once("fn wait_out_hangup(").unwrap().1;
-        assert!(hangup.contains("let stamp = watch_source.stamp(std::time::Instant::now());"));
-        assert!(hangup.contains("Message::PtyOutput(id, fd, data, stamp)"));
+        assert!(stream.contains("key.events.try_recv()"));
+        assert!(stream.contains("SessionEvent::Output(batch)"));
+        assert!(stream.contains("SourceStamp::from_runtime"));
+        assert!(stream.contains("Message::PtyOutput(id, fd, batch.into_bytes(), stamp)"));
+        assert!(!stream.contains("Instant::now"));
     }
 
     #[test]
@@ -40251,8 +39819,8 @@ mod tests {
     ///
     /// `save_session_snapshot` records each pane's working directory, and for
     /// a shell without OSC 7 integration — plain bash, say — that value can
-    /// only come from `/proc/<pid>/cwd` of the live child. `Pty::terminate`
-    /// returns as soon as SIGHUP/SIGTERM are away and its reaper waits 50 ms
+    /// only come from `/proc/<pid>/cwd` of the live child. The session actor
+    /// returns after SIGHUP/SIGTERM are away and its reaper waits 50 ms
     /// before reaping, so a snapshot taken after it reads the cwd link of a
     /// zombie: gone, and the session is persisted with no directory at all.
     /// Signal ordering around a real child is not observable from a unit test,
@@ -40263,7 +39831,7 @@ mod tests {
         let branch = braced_block_after(&source, "if self.sessions.len() == 1 {");
         // Built rather than written out, so this test's own source does not
         // count as one of the call sites it is looking for.
-        let signal = format!("pty.{}()", "terminate");
+        let signal = format!("pty.{}(", "stop_after_pending_input");
         let flush = format!("self.exit_flushing_durable_state{}", "()");
         let signal_at = branch
             .find(&signal)
@@ -44608,30 +44176,6 @@ mod tests {
     }
 
     #[test]
-    fn tiny_pty_writes_are_coalesced_and_entry_bounded() {
-        let mut queue = std::collections::VecDeque::new();
-        for _ in 0..1000 {
-            Session::push_queue_copy(&mut queue, b"x", false);
-        }
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].data.len(), 1000);
-
-        Session::push_queue_copy(&mut queue, b"response", true);
-        Session::push_queue_copy(&mut queue, b"later-input", false);
-        assert_eq!(queue.len(), 3, "different classes must preserve FIFO order");
-        assert!(!queue[0].response);
-        assert!(queue[1].response);
-        assert!(!queue[2].response);
-
-        queue.resize_with(MAX_PTY_QUEUE_ENTRIES, || PtyWriteChunk {
-            data: Vec::new(),
-            response: false,
-        });
-        queue.back_mut().expect("queue is populated").data = vec![0; PTY_QUEUE_COALESCE_BYTES];
-        assert!(!Session::queue_accepts_entry(&queue, 1, false));
-    }
-
-    #[test]
     fn modified_function_keys_keep_their_xterm_modifier_parameters() {
         let cases = [
             (
@@ -45878,23 +45422,23 @@ mod tests {
 
     #[test]
     fn workflow_argument_widget_cannot_bypass_owned_enter() {
+        use crate::test_renderer::{software_renderer, HeadlessRenderer, InputState};
         use iced::advanced::{layout, widget::Tree, Layout, Shell, Widget};
+        let renderer = software_renderer();
         for location in [keyboard::Location::Standard, keyboard::Location::Numpad] {
             let mut latch = PromptRecallEnterLatch::default();
             assert!(!latch.consume(&history_enter_event(true, false, location), true));
-            let mut input = workflow_argument_input::<()>(
+            let mut input = workflow_argument_input::<HeadlessRenderer>(
                 workflow_picker::WorkflowArgsIdentity::default(),
                 0,
                 "value",
                 "A",
             );
-            let mut tree = Tree::new(&input as &dyn Widget<Message, iced::Theme, ()>);
-            tree.state
-                .downcast_mut::<iced::widget::text_input::State<()>>()
-                .focus();
+            let mut tree = Tree::new(&input as &dyn Widget<Message, iced::Theme, HeadlessRenderer>);
+            tree.state.downcast_mut::<InputState>().focus();
             let node = input.layout(
                 &mut tree,
-                &(),
+                &renderer,
                 &layout::Limits::new(Size::ZERO, Size::new(400.0, 40.0)),
                 None,
             );
@@ -45907,7 +45451,7 @@ mod tests {
                 &iced::Event::Keyboard(repeat.clone()),
                 Layout::new(&node),
                 iced::mouse::Cursor::Unavailable,
-                &(),
+                &renderer,
                 &mut clipboard,
                 &mut shell,
                 &iced::Rectangle::new(iced::Point::ORIGIN, Size::new(400.0, 40.0)),
@@ -45932,21 +45476,21 @@ mod tests {
 
     #[test]
     fn workflow_argument_ime_edit_precedes_routed_confirmation() {
+        use crate::test_renderer::{software_renderer, HeadlessRenderer, InputState};
         use iced::advanced::input_method::Event as Ime;
         use iced::advanced::{layout, widget::Tree, Layout, Shell, Widget};
-        let mut input = workflow_argument_input::<()>(
+        let renderer = software_renderer();
+        let mut input = workflow_argument_input::<HeadlessRenderer>(
             workflow_picker::WorkflowArgsIdentity::default(),
             0,
             "value",
             "A",
         );
-        let mut tree = Tree::new(&input as &dyn Widget<Message, iced::Theme, ()>);
-        tree.state
-            .downcast_mut::<iced::widget::text_input::State<()>>()
-            .focus();
+        let mut tree = Tree::new(&input as &dyn Widget<Message, iced::Theme, HeadlessRenderer>);
+        tree.state.downcast_mut::<InputState>().focus();
         let node = input.layout(
             &mut tree,
-            &(),
+            &renderer,
             &layout::Limits::new(Size::ZERO, Size::new(400.0, 40.0)),
             None,
         );
@@ -45963,7 +45507,7 @@ mod tests {
                 &event,
                 Layout::new(&node),
                 iced::mouse::Cursor::Unavailable,
-                &(),
+                &renderer,
                 &mut clipboard,
                 &mut shell,
                 &iced::Rectangle::new(iced::Point::ORIGIN, Size::new(400.0, 40.0)),
@@ -45984,6 +45528,7 @@ mod tests {
 
     #[test]
     fn history_ime_commit_updates_the_real_input_before_enter_confirmation() {
+        use crate::test_renderer::{software_renderer, HeadlessRenderer, InputState};
         use iced::advanced::input_method::Event as Ime;
         use iced::advanced::{layout, widget::Tree, Clipboard, Layout, Shell, Widget};
         let mut picker = history_picker::HistoryPickerState::new(
@@ -46000,13 +45545,11 @@ mod tests {
                 .collect(),
         );
         picker.set_query("probe-a");
-        let mut input: iced::widget::TextInput<'_, String, iced::Theme, ()> =
+        let mut input: iced::widget::TextInput<'_, String, iced::Theme, HeadlessRenderer> =
             iced::widget::TextInput::new("Recall", picker.query()).on_input(|query| query);
-        let mut tree = Tree::new(&input as &dyn Widget<String, iced::Theme, ()>);
-        tree.state
-            .downcast_mut::<iced::widget::text_input::State<()>>()
-            .focus();
-        let renderer = ();
+        let mut tree = Tree::new(&input as &dyn Widget<String, iced::Theme, HeadlessRenderer>);
+        tree.state.downcast_mut::<InputState>().focus();
+        let renderer = software_renderer();
         let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, 40.0));
         let node = input.layout(&mut tree, &renderer, &limits, None);
         let mut messages = Vec::new();
@@ -47185,7 +46728,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn transient_pty_hangup_waits_for_real_exit_and_recovers_output() {
-        use iced::futures::StreamExt;
         use std::os::unix::fs::PermissionsExt;
 
         let unique = format!(
@@ -47210,89 +46752,42 @@ mod tests {
         let argv = vec![script];
         let pty = Pty::new_with_cwd(80, 24, Some("/"), None, None, Some(&argv))
             .expect("spawn hangup test shell");
-        let (shutdown_r, shutdown_w) = Pty::make_shutdown_pipe().unwrap();
-        let _shutdown_guard = shutdown_w;
-        let (mut tx, mut rx) = iced::futures::channel::mpsc::channel(2);
-        let id = 77;
-        let fd = pty.master_fd();
-
-        // Observe the initial hangup the way the reader loop does: poll the
-        // master until the child has closed every slave fd (Linux EIO).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut probe = [0u8; 4096];
-        loop {
-            let n = unsafe { libc::read(fd, probe.as_mut_ptr() as *mut libc::c_void, probe.len()) };
-            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "child never closed its slave fds"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        let events = collect_native_pty_events(pty);
+        let mut recovered = Vec::new();
+        for event in &events[..events.len() - 1] {
+            let SessionEvent::Output(bytes) = event else {
+                panic!("actor reported a failure before real exit: {event:?}");
+            };
+            recovered.extend_from_slice(bytes.as_bytes());
         }
+        assert_eq!(recovered, b"recovered");
+        assert!(matches!(events.last(), Some(SessionEvent::Exit(7))));
 
-        // The old implementation emitted PtyExited(-1) here, causing the live
-        // child to be dropped and killed before it could reopen /dev/tty.
-        let outcome = wait_out_hangup(
-            id,
-            fd,
-            fd,
-            shutdown_r,
-            pty.get_child_pid(),
-            &mut tx,
-            &mut organism_watch::SourceAuthority::default().start(),
-        );
-        assert!(matches!(outcome, HangupOutcome::Recovered));
-        let output = match iced::futures::executor::block_on(rx.next()) {
-            Some(Message::PtyOutput(msg_id, msg_fd, bytes, _)) => {
-                assert_eq!((msg_id, msg_fd), (id, fd));
-                bytes
-            }
-            other => panic!("expected recovered PTY output, got {other:?}"),
-        };
-        assert_eq!(output, b"recovered");
-
-        // The child then exits for real. Wait for the second hangup the same
-        // way, then the probe must report the genuine status — never a
-        // fabricated exit while the child was still alive.
-        loop {
-            let n = unsafe { libc::read(fd, probe.as_mut_ptr() as *mut libc::c_void, probe.len()) };
-            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "child never exited after recovery"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let outcome = wait_out_hangup(
-            id,
-            fd,
-            fd,
-            shutdown_r,
-            pty.get_child_pid(),
-            &mut tx,
-            &mut organism_watch::SourceAuthority::default().start(),
-        );
-        assert!(matches!(outcome, HangupOutcome::Exited));
-        match iced::futures::executor::block_on(rx.next()) {
-            Some(Message::PtyExited(msg_id, msg_fd, code)) => {
-                assert_eq!((msg_id, msg_fd), (id, fd));
-                assert_eq!(code, 7);
-            }
-            other => panic!("expected a real PTY exit, got {other:?}"),
-        }
-
-        drop(pty);
         let _ = std::fs::remove_file(script_path);
+    }
+
+    #[cfg(unix)]
+    fn collect_native_pty_events(pty: Pty) -> Vec<SessionEvent> {
+        let actor = SessionActor::start(pty, WakeSink::new(|| {})).unwrap();
+        let mut events = Vec::new();
+        loop {
+            let event = actor
+                .events()
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("session actor ended without reporting the child exit");
+            let is_exit = matches!(event, SessionEvent::Exit(_));
+            events.push(event);
+            if is_exit {
+                assert!(actor.input_drained().is_err(), "exit retired the writer");
+                break;
+            }
+        }
+        events
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn parent_exit_is_observed_while_background_slave_stays_open_and_tail_is_preserved() {
-        use iced::futures::StreamExt;
         let root = std::env::temp_dir().join(format!("frost-open-slave-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let helper = root.join("child.py");
@@ -47302,7 +46797,7 @@ mod tests {
         let command = format!("/usr/bin/python3 {} & while [ ! -s {} ]; do sleep .01; done; printf retained-tail; exit 7",
                               quote(&helper.to_string_lossy()), quote(&marker.to_string_lossy()));
         let argv = vec!["/bin/sh".into(), "-c".into(), command];
-        let mut pty = Pty::new_with_cwd(80, 24, Some("/tmp"), None, None, Some(&argv)).unwrap();
+        let pty = Pty::new_with_cwd(80, 24, Some("/tmp"), None, None, Some(&argv)).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while Pty::observe_child_exit(pty.get_child_pid()).unwrap() != Some(7) {
             assert!(std::time::Instant::now() < deadline);
@@ -47322,37 +46817,21 @@ mod tests {
             0,
             "background child really keeps the slave open"
         );
-        let (mut tx, mut rx) = iced::futures::channel::mpsc::channel(4);
-        assert!(publish_observed_parent_exit(
-            77,
-            fd,
-            fd,
-            pty.get_child_pid(),
-            &mut tx,
-            &mut organism_watch::SourceAuthority::default().start()
-        ));
-        match iced::futures::executor::block_on(rx.next()).unwrap() {
-            Message::PtyOutput(77, actual_fd, bytes, _) => {
-                assert_eq!(actual_fd, fd);
-                assert_eq!(bytes, b"retained-tail");
-            }
-            other => panic!("final parent output missing before exit: {other:?}"),
-        }
+        let child = pty.get_child_pid();
+        let events = collect_native_pty_events(pty);
         assert!(
-            matches!(iced::futures::executor::block_on(rx.next()), Some(Message::PtyExited(77, actual_fd, 7)) if actual_fd == fd)
+            matches!(
+                events.as_slice(),
+                [SessionEvent::Output(bytes), SessionEvent::Exit(7)] if bytes.as_bytes() == b"retained-tail"
+            ),
+            "final parent output missing before exit: {events:?}"
         );
         assert_eq!(
-            Pty::observe_child_exit(pty.get_child_pid()).unwrap(),
-            Some(7),
-            "reader never reaps the anchor"
+            Pty::observe_child_exit(child).unwrap_err().raw_os_error(),
+            Some(libc::ECHILD),
+            "actor reported exit only after reaping the anchor"
         );
-        while pty.exited_code().is_none() {
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(pty.exited_code(), Some(7));
         assert!(!jterm_core::process::process_stat(job).is_some_and(|state| state.is_live()));
-        drop(pty);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -48852,7 +48331,7 @@ mod tests {
             "sess.terminal.zone_by_id(id)",
             "session_id = sess.id",
             "jterm_core::process::tty_foreground_pgid(sess.master_fd)",
-            "Some(sess.pty.get_child_pid())",
+            "Some(sess.child_pid)",
             "pane.session == self.active",
             "focused_action: Some(BlockMenuAction::Details)",
         ] {

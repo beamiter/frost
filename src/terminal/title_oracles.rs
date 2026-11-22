@@ -1,6 +1,6 @@
 //! Source-locked original Frost title observer; immutable expected values are external.
 //! Every Debug lane retains the complete value, never fingerprints/truncation.
-use super::*;
+use super::{replay_frame_debug::frame_lane, *};
 use serde_json::{json, Value};
 fn lane(value: impl std::fmt::Debug) -> Value {
     Value::String(format!("{value:?}"))
@@ -47,6 +47,7 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         lane(t.colors.dynamic_cursor_color),
     );
     out.insert("dynamic_palette".into(), lane(t.colors.dynamic_palette));
+    super::replay_protocol::observe(t, &mut out, Value::String);
     fields!(
         scrollback,
         selection,
@@ -89,24 +90,14 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         ime_enabled,
         preedit_text,
         preedit_selection,
-        modes,
         output_buffer,
-        keyboard_enhancement_flags,
-        keyboard_enhancement_stack,
-        alt_keyboard_enhancement_flags,
-        alt_keyboard_enhancement_stack,
-        xterm_modify_other_keys,
-        xterm_format_other_keys,
         pending_clipboard_requests,
         pending_paste_password,
         grid_version,
         row_versions,
-        visible_cells_cache,
         frame_revision,
         frame_layout,
-        original_visible_cells_cache,
         history_revision,
-        projected_viewport_cache,
         projection_plan_cache,
         next_projected_view_revision,
         next_projection_plan_revision,
@@ -183,6 +174,18 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
     }
     out.insert("parser".into(), lane(t.parser.snapshot()));
     out.insert(
+        "visible_cells_cache".into(),
+        frame_lane(&t.visible_cells_cache),
+    );
+    out.insert(
+        "original_visible_cells_cache".into(),
+        frame_lane(&t.original_visible_cells_cache),
+    );
+    out.insert(
+        "projected_viewport_cache".into(),
+        frame_lane(&t.projected_viewport_cache),
+    );
+    out.insert(
         "sync_output_start".into(),
         json!(t.sync_output_start.is_some()),
     );
@@ -219,8 +222,8 @@ struct ObservedSeed {
 }
 fn retained_snapshot(seed: &ObservedSeed) -> BTreeMap<String, Value> {
     let mut out = full_snapshot(&seed.terminal);
-    out.insert("retained_rows".into(), lane(&seed.retained_rows));
-    out.insert("retained_view".into(), lane(&seed.retained_view));
+    out.insert("retained_rows".into(), frame_lane(&seed.retained_rows));
+    out.insert("retained_view".into(), frame_lane(&seed.retained_view));
     out.insert(
         "retained_rows_is_current".into(),
         json!(seed

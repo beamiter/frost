@@ -34,8 +34,8 @@ impl std::ops::DerefMut for TestApp {
 impl Drop for TestApp {
     fn drop(&mut self) {
         for session in &mut self.0.sessions {
-            if session.pty.is_alive() {
-                let pid = session.pty.get_child_pid();
+            if session.pty_is_alive() {
+                let pid = session.child_pid;
                 // The unreaped child still pins its PID and session PGID.
                 unsafe {
                     libc::kill(-pid, libc::SIGKILL);
@@ -48,7 +48,7 @@ impl Drop for TestApp {
             let mut any_alive = false;
             for session in &mut self.0.sessions {
                 // Do not short-circuit: every Pty must observe/reap its child.
-                any_alive |= session.pty.is_alive();
+                any_alive |= session.pty_is_alive();
             }
             if !any_alive || Instant::now() >= deadline {
                 break;
@@ -156,7 +156,7 @@ fn run_child(root: &Path) {
         let original = (
             app.sessions[0].id,
             app.sessions[0].master_fd,
-            app.sessions[0].pty.get_child_pid(),
+            app.sessions[0].child_pid,
             Arc::clone(&app.sessions[0].ime_identity),
         );
         let cursor = app.sessions[0].terminal.get_cursor_pos();
@@ -264,7 +264,7 @@ fn run_child(root: &Path) {
         );
         assert_eq!(app.sessions[0].id, original.0);
         assert_eq!(app.sessions[0].master_fd, original.1);
-        assert_eq!(app.sessions[0].pty.get_child_pid(), original.2);
+        assert_eq!(app.sessions[0].child_pid, original.2);
         assert!(Arc::ptr_eq(&app.sessions[0].ime_identity, &original.3));
         assert_eq!(
             snapshot(&mut app, 0, root),
@@ -298,28 +298,21 @@ fn send(app: &mut Frost, index: usize, bytes: &[u8]) {
 }
 
 fn pump(app: &mut Frost) {
-    let sources: Vec<_> = app.sessions.iter().map(|s| (s.id, s.master_fd)).collect();
-    for (id, fd) in sources {
-        let mut ready = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // The normal subscription is not running in this reducer fixture.
-        if unsafe { libc::poll(&mut ready, 1, 5) } > 0 && ready.revents & libc::POLLIN != 0 {
-            let mut bytes = [0u8; 8192];
-            let n = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
-            assert!(n > 0, "fixture PTY unexpectedly closed");
-            let _ = app.update(Message::PtyOutput(
-                id,
-                fd,
-                bytes[..n as usize].to_vec(),
-                None,
-            ));
-        }
-    }
-    for session in &mut app.sessions {
-        assert!(session.flush_write_queue());
+    // The Iced subscription is absent in the fixture. Consume the same actor
+    // events and preserve their source metadata at the real reducer boundary.
+    let messages: Vec<_> = app
+        .sessions
+        .iter()
+        .flat_map(|session| {
+            session
+                .pty
+                .events()
+                .try_iter()
+                .map(move |event| pty_event_message(session.id, session.master_fd, event))
+        })
+        .collect();
+    for message in messages {
+        let _ = app.update(message);
     }
 }
 
@@ -336,7 +329,7 @@ fn wait_prompt(app: &mut Frost, index: usize) {
 }
 
 fn snapshot(app: &mut Frost, index: usize, root: &Path) -> (usize, String) {
-    let report = root.join(app.sessions[index].pty.get_child_pid().to_string());
+    let report = root.join(app.sessions[index].child_pid.to_string());
     let _ = std::fs::remove_file(&report);
     send(app, index, b"\x18\x04");
     let deadline = Instant::now() + Duration::from_secs(5);

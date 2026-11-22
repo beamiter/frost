@@ -1,3 +1,12 @@
+use jterm_engine::grid::{
+    AsciiOverwritePolicy, RegionDirection, RegionWrapPolicy, WideCellEditPolicy,
+    WideContinuationProtection,
+};
+use jterm_engine::protocol_state::{ProtocolState, TerminalModes};
+use jterm_engine::screen::{
+    default_tab_stops, resize_tab_stops, AlternateRestorePolicy, AlternateScreenControls, Charset,
+    CursorControls, CursorDrawing, SavedCursorState, TabStopOrigin,
+};
 use jterm_engine::titles::FrostTitleState;
 mod visible_rows;
 pub use visible_rows::RowView;
@@ -31,13 +40,17 @@ mod projection_properties;
 #[cfg(test)]
 mod projection_state_properties;
 #[cfg(test)]
+mod replay_frame_debug;
+#[cfg(test)]
+mod replay_protocol;
+#[cfg(test)]
 mod title_oracles;
 
 use jterm_engine::parser::{
     CaptureEnd, Event as ParserEvent, Parser, ParserLimits, ParserProfile, PendingKind,
     RejectReason, StringKind,
 };
-// Row allocation, compression and projection policies remain Frost-owned.
+// Row identity allocation and projection policy remain Frost-owned.
 pub use jterm_engine::{
     Color, CursorShape, HyperlinkId, RawRowId, StyleFlags, TerminalCell, UnderlineStyle,
 };
@@ -151,8 +164,6 @@ fn is_token_suffix_wrapper(c: char) -> bool {
     )
 }
 
-const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?65;1;9c";
-const SECONDARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[>1;7802;0c";
 const XTERM_VERSION_RESPONSE: &[u8] = b"\x1bP>|VTE(7802)\x1b\\";
 const MAX_TERMINAL_TITLE_CHARS: usize = 256;
 /// OSC 8 fields are terminal-controlled input. Bound both fields before
@@ -288,6 +299,7 @@ impl TerminalGrid {
     }
 
     #[inline]
+    #[cfg(test)]
     fn cells_mut(&mut self) -> &mut [TerminalCell] {
         self.storage.cells_mut()
     }
@@ -300,6 +312,31 @@ impl TerminalGrid {
     #[inline]
     fn bump_identity_revision(&mut self) {
         self.identity_revision = self.identity_revision.wrapping_add(1).max(1);
+    }
+
+    fn shift_row_region(
+        &mut self,
+        direction: RegionDirection,
+        rows: std::ops::RangeInclusive<usize>,
+        blank: TerminalCell,
+        wrap_policy: RegionWrapPolicy,
+    ) -> bool {
+        if self
+            .storage
+            .shift_rows(direction, rows, 1, blank, wrap_policy, fresh_raw_row_id)
+            .is_none()
+        {
+            return false;
+        }
+        self.bump_identity_revision();
+        true
+    }
+
+    fn discard_top_rows_for_resize(&mut self, count: usize, blank: TerminalCell) {
+        // The resize immediately discards the vacated rows at the bottom.
+        // Reserve fresh row IDs only for positions retained by the resize.
+        self.storage.scroll_up_by(count, blank);
+        self.bump_identity_revision();
     }
 
     pub fn get_row(&self, row: usize) -> Vec<TerminalCell> {
@@ -394,6 +431,7 @@ impl TerminalGrid {
         self.bump_identity_revision();
     }
 
+    #[cfg(test)]
     pub fn iter_mut(&mut self) -> std::slice::ChunksMut<'_, TerminalCell> {
         self.storage.iter_mut()
     }
@@ -416,20 +454,26 @@ impl std::ops::IndexMut<usize> for TerminalGrid {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ScrollbackLine {
-    data: CompressedLineData,
-    pub is_wrapped: bool,
-    cols: u16,
-    raw_row_id: RawRowId,
-    projected_active_len: u16,
-    projected_wide_continuations: SmallVec<[u16; 2]>,
+    storage: jterm_engine::ScrollbackLine,
 }
 
-#[derive(Clone, Debug)]
-enum CompressedLineData {
-    Plain(String, u16),
-    Encoded(Vec<u8>),
+impl std::fmt::Debug for ScrollbackLine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keep the historical snapshot fields and compressed bytes stable.
+        f.debug_struct("ScrollbackLine")
+            .field("data", &self.storage.content())
+            .field("is_wrapped", &self.is_wrapped())
+            .field("cols", &self.columns())
+            .field("raw_row_id", &self.raw_row_id())
+            .field("projected_active_len", &self.reflow_content_len())
+            .field(
+                "projected_wide_continuations",
+                &self.reflow_wide_continuations(),
+            )
+            .finish()
+    }
 }
 
 /// One searchable buffer row: either borrowed narrow text with an identity
@@ -472,13 +516,7 @@ impl RawRowLayout {
         raw_row: RawRowId,
     ) -> Self {
         let mut active_len = cells.len();
-        while active_len > 0
-            && cells[active_len - 1].character == ' '
-            && cells[active_len - 1].background == Color::Default
-            && !cells[active_len - 1].flags.wide()
-            && !cells[active_len - 1].flags.wide_continuation()
-            && cells[active_len - 1].hyperlink_id.is_none()
-        {
+        while active_len > 0 && cells[active_len - 1].is_reflow_trimmable_blank() {
             active_len -= 1;
         }
         let wide_continuations = cells[..active_len]
@@ -506,122 +544,48 @@ impl ScrollbackLine {
         is_wrapped: bool,
         raw_row_id: RawRowId,
     ) -> Self {
-        let cols = cells.len() as u16;
-        // Cache exactly the geometry used by P0 history reflow. This is not
-        // compression's retention rule: foreground/style-only trailing blanks
-        // remain encoded for round trips but are structural projection padding.
-        let projected_active_len = cells
-            .iter()
-            .rposition(|cell| {
-                cell.character != ' '
-                    || cell.background != Color::Default
-                    || cell.flags.wide()
-                    || cell.flags.wide_continuation()
-                    || !cell.hyperlink_id.is_none()
-            })
-            .map_or(0, |col| col + 1);
-        let projected_wide_continuations = cells[..projected_active_len]
-            .iter()
-            .enumerate()
-            .filter_map(|(col, cell)| {
-                if cell.flags.wide_continuation() {
-                    u16::try_from(col).ok()
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let projected_active_len = u16::try_from(projected_active_len).unwrap_or(u16::MAX);
-        let trailing_blanks = cells
-            .iter()
-            .rev()
-            .take_while(|c| {
-                c.character == ' '
-                    && c.foreground == Color::Default
-                    && c.background == Color::Default
-                    && c.flags.is_default_style()
-                    && !c.flags.wide()
-                    && !c.flags.wide_continuation()
-                    && c.hyperlink_id.is_none()
-            })
-            .count();
-
-        let active_len = cells.len() - trailing_blanks;
-        let all_default_attrs = cells[..active_len].iter().all(|c| {
-            c.foreground == Color::Default
-                && c.background == Color::Default
-                && c.flags.is_default_style()
-                && !c.flags.wide()
-                && !c.flags.wide_continuation()
-                && c.hyperlink_id.is_none()
-        });
-
-        if all_default_attrs {
-            let text: String = cells[..active_len].iter().map(|c| c.character).collect();
-            ScrollbackLine {
-                data: CompressedLineData::Plain(text, trailing_blanks as u16),
-                is_wrapped,
-                cols,
-                raw_row_id,
-                projected_active_len,
-                projected_wide_continuations,
-            }
-        } else {
-            let encoded = Self::encode_cells(&cells[..active_len]);
-            ScrollbackLine {
-                data: CompressedLineData::Encoded(encoded),
-                is_wrapped,
-                cols,
-                raw_row_id,
-                projected_active_len,
-                projected_wide_continuations,
-            }
-        }
+        let mut storage =
+            jterm_engine::ScrollbackLine::compress_preserving_blink(cells, is_wrapped);
+        storage.set_raw_row_id(raw_row_id);
+        Self { storage }
     }
 
     /// Identity of this retained physical scrollback row.
     pub fn raw_row_id(&self) -> RawRowId {
-        self.raw_row_id
+        self.storage.raw_row_id()
+    }
+
+    pub fn columns(&self) -> usize {
+        self.storage.columns()
+    }
+
+    pub fn is_wrapped(&self) -> bool {
+        self.storage.is_wrapped
+    }
+
+    fn reflow_content_len(&self) -> usize {
+        self.storage.reflow_content_len()
+    }
+
+    fn reflow_wide_continuations(&self) -> &[u16] {
+        self.storage.reflow_wide_continuations()
     }
 
     pub fn decompress(&self) -> Vec<TerminalCell> {
         #[cfg(test)]
         PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.set(count.get() + 1));
-        match &self.data {
-            CompressedLineData::Plain(text, trailing) => {
-                let mut cells: Vec<TerminalCell> = text
-                    .chars()
-                    .map(|ch| TerminalCell {
-                        character: ch,
-                        ..Default::default()
-                    })
-                    .collect();
-                cells.resize(cells.len() + *trailing as usize, TerminalCell::default());
-                cells
-            }
-            CompressedLineData::Encoded(data) => Self::decode_cells(data, self.cols as usize),
-        }
+        self.storage.decompress()
     }
 
-    /// Searchable text for this retained row without materializing cells.
-    /// `Plain` rows are borrowed directly: their active cells are narrow
-    /// with default attributes by construction, so the character index is
-    /// the terminal column and trailing blanks stay unsearchable exactly
-    /// like the decompressed path's structural-padding trim. `Encoded` rows
-    /// within the streaming width budget are borrowed too, then streamed
-    /// with their original cell columns. Oversized rows keep the bulk path.
+    /// Keep Frost's streaming search admission around the shared retained row.
+    /// Oversized encoded rows use the bulk path to limit search scratch churn.
     pub fn search_text(&self) -> SearchLine<'_> {
-        match &self.data {
-            CompressedLineData::Plain(text, _) => SearchLine::Text(text),
-            // Very wide rows exceed the small scratch retention budget. Keep
-            // their existing bulk decode/search path: streaming saves memory
-            // churn at terminal widths but can cost latency on oversized rows.
-            // 4096 single-column spans fit the 64 KiB map budget on 64-bit;
-            // lowercase expansions may exceed it and are released after use.
-            CompressedLineData::Encoded(_) if self.cols > 4096 => {
+        match self.storage.content() {
+            jterm_engine::ScrollbackContent::Plain(text, _) => SearchLine::Text(text),
+            jterm_engine::ScrollbackContent::Encoded(_) if self.columns() > 4096 => {
                 SearchLine::Cells(Cow::Owned(self.decompress()))
             }
-            CompressedLineData::Encoded(_) => SearchLine::Scrollback(self),
+            jterm_engine::ScrollbackContent::Encoded(_) => SearchLine::Scrollback(self),
         }
     }
 
@@ -631,15 +595,15 @@ impl ScrollbackLine {
         PROJECTION_HISTORY_LAYOUT_ROWS.with(|count| count.set(count.get() + 1));
         RawRowLayout {
             absolute_row,
-            raw_row: self.raw_row_id,
-            active_len: usize::from(self.projected_active_len),
+            raw_row: self.raw_row_id(),
+            active_len: self.reflow_content_len(),
             wide_continuations: self
-                .projected_wide_continuations
+                .reflow_wide_continuations()
                 .iter()
                 .copied()
                 .map(usize::from)
                 .collect(),
-            wrapped: self.is_wrapped,
+            wrapped: self.is_wrapped(),
         }
     }
 
@@ -648,298 +612,12 @@ impl ScrollbackLine {
         self.decompress()
     }
 
-    fn encode_color(color: &Color, buf: &mut Vec<u8>) {
-        match color {
-            Color::Default => buf.push(0),
-            Color::Black => buf.push(1),
-            Color::Red => buf.push(2),
-            Color::Green => buf.push(3),
-            Color::Yellow => buf.push(4),
-            Color::Blue => buf.push(5),
-            Color::Magenta => buf.push(6),
-            Color::Cyan => buf.push(7),
-            Color::White => buf.push(8),
-            Color::BrightBlack => buf.push(9),
-            Color::BrightRed => buf.push(10),
-            Color::BrightGreen => buf.push(11),
-            Color::BrightYellow => buf.push(12),
-            Color::BrightBlue => buf.push(13),
-            Color::BrightMagenta => buf.push(14),
-            Color::BrightCyan => buf.push(15),
-            Color::BrightWhite => buf.push(16),
-            Color::Indexed(i) => {
-                buf.push(17);
-                buf.push(*i);
-            }
-            Color::Rgb(r, g, b) => {
-                buf.push(18);
-                buf.push(*r);
-                buf.push(*g);
-                buf.push(*b);
-            }
-        }
-    }
-
-    fn decode_color(data: &[u8], pos: &mut usize) -> Color {
-        if *pos >= data.len() {
-            return Color::Default;
-        }
-        let tag = data[*pos];
-        *pos += 1;
-        match tag {
-            0 => Color::Default,
-            1 => Color::Black,
-            2 => Color::Red,
-            3 => Color::Green,
-            4 => Color::Yellow,
-            5 => Color::Blue,
-            6 => Color::Magenta,
-            7 => Color::Cyan,
-            8 => Color::White,
-            9 => Color::BrightBlack,
-            10 => Color::BrightRed,
-            11 => Color::BrightGreen,
-            12 => Color::BrightYellow,
-            13 => Color::BrightBlue,
-            14 => Color::BrightMagenta,
-            15 => Color::BrightCyan,
-            16 => Color::BrightWhite,
-            17 => {
-                let i = data.get(*pos).copied().unwrap_or(0);
-                *pos += 1;
-                Color::Indexed(i)
-            }
-            18 => {
-                let r = data.get(*pos).copied().unwrap_or(0);
-                let g = data.get(*pos + 1).copied().unwrap_or(0);
-                let b = data.get(*pos + 2).copied().unwrap_or(0);
-                *pos += 3;
-                Color::Rgb(r, g, b)
-            }
-            _ => Color::Default,
-        }
-    }
-
-    fn encode_flags(flags: &StyleFlags) -> u8 {
-        let mut f = 0u8;
-        if flags.bold() {
-            f |= 1;
-        }
-        if flags.italic() {
-            f |= 2;
-        }
-        match flags.underline() {
-            UnderlineStyle::None => {}
-            UnderlineStyle::Single => f |= 4,
-            UnderlineStyle::Double => f |= 8,
-            UnderlineStyle::Curly => f |= 12,
-            UnderlineStyle::Dotted => f |= 16,
-            UnderlineStyle::Dashed => f |= 20,
-        }
-        if flags.inverse() {
-            f |= 32;
-        }
-        if flags.dim() {
-            f |= 64;
-        }
-        if flags.strikethrough() {
-            f |= 128;
-        }
-        f
-    }
-
-    fn decode_flags(f: u8) -> StyleFlags {
-        let underline = match (f >> 2) & 0x7 {
-            0 => UnderlineStyle::None,
-            1 => UnderlineStyle::Single,
-            2 => UnderlineStyle::Double,
-            3 => UnderlineStyle::Curly,
-            4 => UnderlineStyle::Dotted,
-            5 => UnderlineStyle::Dashed,
-            _ => UnderlineStyle::None,
-        };
-        let mut flags = StyleFlags::new();
-        flags.set_bold(f & 1 != 0);
-        flags.set_italic(f & 2 != 0);
-        flags.set_underline(underline);
-        flags.set_inverse(f & 32 != 0);
-        flags.set_dim(f & 64 != 0);
-        flags.set_strikethrough(f & 128 != 0);
-        flags
-    }
-
-    fn encode_cells(cells: &[TerminalCell]) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(cells.len() * 3);
-        let mut i = 0;
-        while i < cells.len() {
-            let cell = &cells[i];
-            let ch_str = cell.character.to_string();
-            let ch_bytes = ch_str.as_bytes();
-
-            // RLE: count consecutive identical cells (packed flags comparison is a single u16 ==)
-            let mut run = 1u8;
-            while (run as u16) < 255 && (i + run as usize) < cells.len() {
-                let next = &cells[i + run as usize];
-                if next.character == cell.character
-                    && next.foreground == cell.foreground
-                    && next.background == cell.background
-                    && next.flags == cell.flags
-                    && next.hyperlink_id == cell.hyperlink_id
-                {
-                    run += 1;
-                } else {
-                    break;
-                }
-            }
-
-            // Format:
-            // [char_len:1][char_bytes][fg][bg][style_flags:1][extra_flags:1]
-            // [hyperlink_id:2][run:1]
-            // style_flags uses every bit, so blink shares extra_flags with the
-            // two wide-character markers.
-            buf.push(ch_bytes.len() as u8);
-            buf.extend_from_slice(ch_bytes);
-            Self::encode_color(&cell.foreground, &mut buf);
-            Self::encode_color(&cell.background, &mut buf);
-            let f = Self::encode_flags(&cell.flags);
-            buf.push(f);
-            let extra_flags = if cell.flags.wide() { 1u8 } else { 0 }
-                | if cell.flags.wide_continuation() { 2 } else { 0 }
-                | if cell.flags.blink() { 4 } else { 0 };
-            buf.push(extra_flags);
-            buf.extend_from_slice(&cell.hyperlink_id.as_raw().to_le_bytes());
-            buf.push(run);
-
-            i += run as usize;
-        }
-        buf
-    }
-
-    fn decode_cells(data: &[u8], cols: usize) -> Vec<TerminalCell> {
-        let mut cells = Vec::with_capacity(cols);
-        let mut pos = 0;
-        while pos < data.len() {
-            let ch_len = data[pos] as usize;
-            pos += 1;
-            if pos + ch_len > data.len() {
-                break;
-            }
-            let ch = std::str::from_utf8(&data[pos..pos + ch_len])
-                .ok()
-                .and_then(|s| s.chars().next())
-                .unwrap_or(' ');
-            pos += ch_len;
-
-            let fg = Self::decode_color(data, &mut pos);
-            let bg = Self::decode_color(data, &mut pos);
-            let f = data.get(pos).copied().unwrap_or(0);
-            pos += 1;
-            let extra_flags = data.get(pos).copied().unwrap_or(0);
-            pos += 1;
-            let hyperlink = u16::from_le_bytes([
-                data.get(pos).copied().unwrap_or(0),
-                data.get(pos + 1).copied().unwrap_or(0),
-            ]);
-            pos += 2;
-            let run = data.get(pos).copied().unwrap_or(1).max(1);
-            pos += 1;
-
-            let mut flags = Self::decode_flags(f);
-            flags.set_wide(extra_flags & 1 != 0);
-            flags.set_wide_continuation(extra_flags & 2 != 0);
-            flags.set_blink(extra_flags & 4 != 0);
-
-            let cell = TerminalCell {
-                character: ch,
-                foreground: fg,
-                background: bg,
-                flags,
-                hyperlink_id: HyperlinkId::from_raw(hyperlink),
-            };
-            for _ in 0..run {
-                cells.push(cell);
-            }
-        }
-        // Pad to cols
-        cells.resize(cols, TerminalCell::default());
-        cells
-    }
-
-    /// Upper bound for search's initial per-row scratch reservation.
     pub(crate) fn search_column_count(&self) -> usize {
-        usize::from(self.cols)
+        self.columns()
     }
 
-    /// Visit retained cells without allocating a decompressed row. Implicit
-    /// trailing default blanks cannot affect searchable text and are omitted.
-    pub(crate) fn visit_search_cells(&self, mut visit: impl FnMut(usize, TerminalCell)) {
-        match &self.data {
-            CompressedLineData::Plain(text, _) => {
-                for (column, character) in text.chars().enumerate() {
-                    visit(
-                        column,
-                        TerminalCell {
-                            character,
-                            ..Default::default()
-                        },
-                    );
-                }
-            }
-            CompressedLineData::Encoded(data) => {
-                Self::visit_encoded_cells(data, usize::from(self.cols), visit);
-            }
-        }
-    }
-
-    // Keep this storage-format reader in parity with decode_cells. Unlike the
-    // bulk path, it emits only the retained prefix and allocates no cell vector.
-    // Differential tests compare it with the pinned pre-streaming decoder.
-    fn visit_encoded_cells(data: &[u8], cols: usize, mut visit: impl FnMut(usize, TerminalCell)) {
-        let mut column = 0;
-        let mut pos = 0;
-        while pos < data.len() && column < cols {
-            let ch_len = data[pos] as usize;
-            pos += 1;
-            if pos + ch_len > data.len() {
-                break;
-            }
-            let ch = std::str::from_utf8(&data[pos..pos + ch_len])
-                .ok()
-                .and_then(|s| s.chars().next())
-                .unwrap_or(' ');
-            pos += ch_len;
-
-            let fg = Self::decode_color(data, &mut pos);
-            let bg = Self::decode_color(data, &mut pos);
-            let f = data.get(pos).copied().unwrap_or(0);
-            pos += 1;
-            let extra_flags = data.get(pos).copied().unwrap_or(0);
-            pos += 1;
-            let hyperlink = u16::from_le_bytes([
-                data.get(pos).copied().unwrap_or(0),
-                data.get(pos + 1).copied().unwrap_or(0),
-            ]);
-            pos += 2;
-            let run = data.get(pos).copied().unwrap_or(1).max(1);
-            pos += 1;
-
-            let mut flags = Self::decode_flags(f);
-            flags.set_wide(extra_flags & 1 != 0);
-            flags.set_wide_continuation(extra_flags & 2 != 0);
-            flags.set_blink(extra_flags & 4 != 0);
-
-            let cell = TerminalCell {
-                character: ch,
-                foreground: fg,
-                background: bg,
-                flags,
-                hyperlink_id: HyperlinkId::from_raw(hyperlink),
-            };
-            for _ in 0..usize::from(run).min(cols - column) {
-                visit(column, cell);
-                column += 1;
-            }
-        }
+    pub(crate) fn visit_search_cells(&self, visit: impl FnMut(usize, TerminalCell)) {
+        self.storage.visit_search_cells(visit);
     }
 }
 
@@ -2977,13 +2655,6 @@ impl ProjectedSelectionEndpoint {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Charset {
-    #[default]
-    Ascii,
-    DecSpecialGraphics,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClipboardReadKind {
     MimeList,
@@ -3460,80 +3131,6 @@ struct CompletedCommandMetadata {
     completion_provenance: crate::block_mode::CompletionProvenance,
 }
 
-#[derive(Clone, Debug, Default)]
-struct TerminalModes {
-    bits: u64,
-}
-
-impl TerminalModes {
-    const fn bit_index(mode: u16) -> Option<u32> {
-        match mode {
-            7 => Some(0),
-            25 => Some(1),
-            1000 => Some(2),
-            1001 => Some(3),
-            1002 => Some(4),
-            1003 => Some(5),
-            1004 => Some(6),
-            1006 => Some(7),
-            1049 => Some(8),
-            2004 => Some(9),
-            2026 => Some(10),
-            2031 => Some(11),
-            5522 => Some(12),
-            1 => Some(13),    // DECCKM application cursor keys
-            4 => Some(14),    // IRM insert/replace mode
-            6 => Some(15),    // DECOM origin mode
-            1005 => Some(16), // UTF-8 mouse encoding
-            1015 => Some(17), // urxvt mouse encoding
-            66 => Some(18),   // DECNKM application keypad mode (ESC = / ESC >)
-            47 => Some(19),   // Alternate screen buffer
-            1047 => Some(20), // Alternate screen buffer
-            1048 => Some(21), // Save/restore cursor
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn contains(&self, mode: &u16) -> bool {
-        match Self::bit_index(*mode) {
-            Some(bit) => self.bits & (1 << bit) != 0,
-            None => false,
-        }
-    }
-
-    #[inline]
-    fn insert(&mut self, mode: u16) {
-        if let Some(bit) = Self::bit_index(mode) {
-            self.bits |= 1 << bit;
-        }
-    }
-
-    #[inline]
-    fn remove(&mut self, mode: &u16) {
-        if let Some(bit) = Self::bit_index(*mode) {
-            self.bits &= !(1 << bit);
-        }
-    }
-}
-
-/// Full cursor state saved by DECSC (ESC 7) / CSI s and restored by DECRC (ESC 8) / CSI u.
-/// Per the VT spec this captures more than position: SGR attributes, the active charsets,
-/// and origin mode.
-#[derive(Clone, Copy)]
-struct SavedCursor {
-    row: usize,
-    col: usize,
-    fg: Color,
-    bg: Color,
-    flags: StyleFlags,
-    g0: Charset,
-    g1: Charset,
-    active: Charset,
-    origin_mode: bool,
-    pending_wrap: bool,
-}
-
 pub struct TerminalState {
     pub grid: TerminalGrid,
     alt_grid: TerminalGrid,
@@ -3569,15 +3166,15 @@ pub struct TerminalState {
 
     pub cursor_row: usize,
     pub cursor_col: usize,
-    // Cursor position saved when switching to the alternate screen (mode 1049).
+    // Cursor position saved when switching to the alternate screen.
     // Kept separate from the DECSC slot so the two don't clobber each other.
     saved_cursor_row: usize,
     saved_cursor_col: usize,
     // DECSC/DECRC (and CSI s/u) saved full cursor state.
-    saved_cursor: Option<SavedCursor>,
+    saved_cursor: Option<SavedCursorState>,
     // Full primary-screen drawing state saved across alt-buffer swaps so
     // fullscreen app colors do not leak into hidden main-buffer resizes.
-    saved_primary_screen_state: Option<SavedCursor>,
+    saved_primary_screen_state: Option<SavedCursorState>,
     saved_primary_global_bg: Color,
     saved_primary_cursor_shape: CursorShape,
     saved_primary_colors: DynamicColorState,
@@ -3626,17 +3223,14 @@ pub struct TerminalState {
     /// selection, used to highlight it in the over-the-spot overlay.
     pub preedit_selection: Option<std::ops::Range<usize>>,
 
-    modes: TerminalModes,
+    protocol: ProtocolState,
+    // IRM and DECOM control screen drawing.
+    insert_mode: bool,
+    origin_mode: bool,
 
     // Output buffer for DSR/CPR responses to be sent back to PTY
     pub output_buffer: Vec<u8>,
 
-    keyboard_enhancement_flags: u16,
-    keyboard_enhancement_stack: Vec<u16>,
-    alt_keyboard_enhancement_flags: u16,
-    alt_keyboard_enhancement_stack: Vec<u16>,
-    xterm_modify_other_keys: u16,
-    xterm_format_other_keys: u16,
     pending_clipboard_requests: Vec<ClipboardReadRequest>,
     pending_paste_password: Option<String>,
 
@@ -3856,77 +3450,17 @@ pub struct CompletedCommand {
 }
 
 impl TerminalState {
-    fn parse_csi_params(param_bytes: &[u8]) -> SmallVec<[u16; 8]> {
-        let mut params = SmallVec::new();
-        let mut current: u16 = 0;
-        let mut has_digits = false;
-
-        for &byte in param_bytes {
-            match byte {
-                b'0'..=b'9' => {
-                    current = current
-                        .saturating_mul(10)
-                        .saturating_add((byte - b'0') as u16);
-                    has_digits = true;
-                }
-                b';' | b':' => {
-                    if has_digits {
-                        params.push(current);
-                    }
-                    current = 0;
-                    has_digits = false;
-                }
-                _ => {}
-            }
-        }
-
-        if has_digits {
-            params.push(current);
-        }
-
-        params
-    }
-
-    /// Parse SGR parameters into groups. Top-level parameters are separated by ';';
-    /// within a group, ':' introduces sub-parameters (ISO 8613-6 / curly underline,
-    /// e.g. `4:3` or `38:2:r:g:b`). Empty fields parse as 0 so positions are preserved.
-    fn parse_sgr_groups(param_bytes: &[u8]) -> SmallVec<[SmallVec<[u16; 6]>; 8]> {
-        let mut groups: SmallVec<[SmallVec<[u16; 6]>; 8]> = SmallVec::new();
-        let mut group: SmallVec<[u16; 6]> = SmallVec::new();
-        let mut current: u16 = 0;
-
-        for &byte in param_bytes {
-            match byte {
-                b'0'..=b'9' => {
-                    current = current
-                        .saturating_mul(10)
-                        .saturating_add((byte - b'0') as u16);
-                }
-                b':' => {
-                    group.push(current);
-                    current = 0;
-                }
-                b';' => {
-                    group.push(current);
-                    groups.push(std::mem::take(&mut group));
-                    current = 0;
-                }
-                _ => {}
-            }
-        }
-        group.push(current);
-        groups.push(group);
-        groups
+    fn initial_protocol_modes() -> TerminalModes {
+        let mut modes = TerminalModes::default();
+        modes.insert(25); // Cursor visible.
+        modes.insert(7); // Autowrap on.
+        modes
     }
 
     pub fn new(cols: usize, rows: usize) -> Self {
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
         let grid = TerminalGrid::new(rows, cols);
         let alt_grid = TerminalGrid::new(rows, cols);
-
-        let mut modes = TerminalModes::default();
-        modes.insert(25);
-        modes.insert(7);
 
         TerminalState {
             grid,
@@ -3958,7 +3492,7 @@ impl TerminalState {
             saved_primary_global_bg: Color::Default,
             saved_primary_cursor_shape: CursorShape::default(),
             saved_primary_colors: DynamicColorState::default(),
-            tab_stops: Self::default_tab_stops(cols),
+            tab_stops: default_tab_stops(cols, TabStopOrigin::Clear),
             last_printed_char: None,
             pending_wrap: false,
             alt_cursor_row: 0,
@@ -3987,14 +3521,10 @@ impl TerminalState {
             preedit_selection: None,
             scroll_region_top: 0,
             scroll_region_bottom: rows.saturating_sub(1),
-            modes,
+            protocol: ProtocolState::with_modes(Self::initial_protocol_modes()),
+            insert_mode: false,
+            origin_mode: false,
             output_buffer: Vec::new(),
-            keyboard_enhancement_flags: 0,
-            keyboard_enhancement_stack: Vec::new(),
-            alt_keyboard_enhancement_flags: 0,
-            alt_keyboard_enhancement_stack: Vec::new(),
-            xterm_modify_other_keys: 0,
-            xterm_format_other_keys: 0,
             pending_clipboard_requests: Vec::new(),
             pending_paste_password: None,
             kitty_graphics: KittyGraphicsState::new(),
@@ -4124,7 +3654,7 @@ impl TerminalState {
         // flip unprompted, with the same report DSR 996 answers. The caller
         // flushes it: nothing else drains the buffer while the PTY is quiet.
         let is_dark = self.default_background_is_dark();
-        if self.modes.contains(&2031) && is_dark != was_dark {
+        if self.protocol.modes().contains(&2031) && is_dark != was_dark {
             let report: &[u8] = if is_dark {
                 b"\x1b[?997;1n"
             } else {
@@ -4165,90 +3695,24 @@ impl TerminalState {
             .extend_from_slice(self.osc_reply_terminator);
     }
 
-    fn append_osc_color_response(&mut self, command: &str, color: (u8, u8, u8)) {
-        let response = format!(
-            "\x1b]{};rgb:{:04x}/{:04x}/{:04x}",
-            command,
-            (color.0 as u16) * 257,
-            (color.1 as u16) * 257,
-            (color.2 as u16) * 257,
-        );
-        self.output_buffer.extend_from_slice(response.as_bytes());
-        self.output_buffer
-            .extend_from_slice(self.osc_reply_terminator);
-    }
-
-    fn append_osc_palette_response(&mut self, idx: u8, color: (u8, u8, u8)) {
-        let response = format!(
-            "\x1b]4;{};rgb:{:04x}/{:04x}/{:04x}",
-            idx,
-            (color.0 as u16) * 257,
-            (color.1 as u16) * 257,
-            (color.2 as u16) * 257,
-        );
-        self.output_buffer.extend_from_slice(response.as_bytes());
-        self.output_buffer
-            .extend_from_slice(self.osc_reply_terminator);
-    }
-
-    fn default_256_color(idx: u8) -> (u8, u8, u8) {
-        const ANSI: [(u8, u8, u8); 16] = [
-            (0, 0, 0),
-            (205, 0, 0),
-            (0, 205, 0),
-            (205, 205, 0),
-            (0, 0, 238),
-            (205, 0, 205),
-            (0, 205, 205),
-            (229, 229, 229),
-            (127, 127, 127),
-            (255, 0, 0),
-            (0, 255, 0),
-            (255, 255, 0),
-            (92, 92, 255),
-            (255, 0, 255),
-            (0, 255, 255),
-            (255, 255, 255),
-        ];
-        match idx {
-            0..=15 => ANSI[idx as usize],
-            16..=231 => {
-                let idx = idx - 16;
-                let r_idx = idx / 36;
-                let g_idx = (idx % 36) / 6;
-                let b_idx = idx % 6;
-                let scale = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
-                (scale(r_idx), scale(g_idx), scale(b_idx))
-            }
-            232..=255 => {
-                let gray = 8 + (idx - 232) * 10;
-                (gray, gray, gray)
-            }
-        }
-    }
-
     fn handle_osc_color(&mut self, command: &str, value: &str) {
-        if value == "?" {
-            // Query: respond with current color
-            let color = match command {
-                "10" => self
-                    .colors
-                    .dynamic_fg
-                    .unwrap_or(self.theme_default_colors.fg),
-                "11" => self.effective_default_bg(),
-                "12" => self
-                    .colors
-                    .dynamic_cursor_color
-                    .unwrap_or(self.theme_default_colors.cursor),
-                _ => return,
-            };
-            self.append_osc_color_response(command, color);
-        } else if let Some(rgb) = Self::parse_color_spec(value) {
-            match command {
-                "10" => self.colors.dynamic_fg = Some(rgb),
-                "11" => self.colors.dynamic_bg = Some(rgb),
-                "12" => self.colors.dynamic_cursor_color = Some(rgb),
-                _ => {}
+        use jterm_engine::colors::TerminalDefaultColors;
+        use jterm_engine::semantics::Effect;
+
+        let defaults = TerminalDefaultColors {
+            foreground: self.theme_default_colors.fg,
+            background: self.theme_default_colors.bg,
+            cursor: self.theme_default_colors.cursor,
+            ansi: self
+                .theme_ansi_colors
+                .unwrap_or_else(|| TerminalDefaultColors::default().ansi),
+        };
+        for effect in
+            self.colors
+                .apply_frost_osc(command, value, self.osc_reply_terminator, defaults)
+        {
+            if let Effect::Reply(bytes) = effect {
+                self.output_buffer.extend(bytes);
             }
         }
     }
@@ -4361,73 +3825,6 @@ impl TerminalState {
     #[cfg(test)]
     fn osc8_interned_count(&self) -> usize {
         self.osc8_hyperlinks.len()
-    }
-
-    fn reset_osc_color(&mut self, command: &str) {
-        match command {
-            "110" => self.colors.dynamic_fg = None,
-            "111" => self.colors.dynamic_bg = None,
-            "112" => self.colors.dynamic_cursor_color = None,
-            _ => {}
-        }
-    }
-
-    fn handle_osc_palette(&mut self, value: &str) {
-        let mut parts = value.split(';');
-        while let Some(idx_s) = parts.next() {
-            let Some(color_s) = parts.next() else {
-                break;
-            };
-            let Ok(idx) = idx_s.parse::<u8>() else {
-                continue;
-            };
-            if color_s == "?" {
-                let theme = self
-                    .theme_ansi_colors
-                    .and_then(|ansi| ansi.get(idx as usize).copied());
-                let color = self.colors.dynamic_palette[idx as usize]
-                    .or(theme)
-                    .unwrap_or_else(|| Self::default_256_color(idx));
-                self.append_osc_palette_response(idx, color);
-            } else if let Some(rgb) = Self::parse_color_spec(color_s) {
-                self.colors.dynamic_palette[idx as usize] = Some(rgb);
-            }
-        }
-    }
-
-    fn reset_osc_palette(&mut self, value: &str) {
-        if value.is_empty() {
-            self.colors.dynamic_palette = [None; 256];
-            return;
-        }
-        for idx_s in value.split(';').filter(|s| !s.is_empty()) {
-            if let Ok(idx) = idx_s.parse::<u8>() {
-                self.colors.dynamic_palette[idx as usize] = None;
-            }
-        }
-    }
-
-    fn parse_color_spec(spec: &str) -> Option<(u8, u8, u8)> {
-        // Parse rgb:RR/GG/BB or rgb:RRRR/GGGG/BBBB or #RRGGBB
-        if let Some(hex) = spec.strip_prefix('#') {
-            if hex.len() == 6 && hex.is_ascii() {
-                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-                return Some((r, g, b));
-            }
-        } else if let Some(rgb) = spec.strip_prefix("rgb:") {
-            let parts: Vec<&str> = rgb.split('/').collect();
-            if parts.len() == 3 {
-                let r = u16::from_str_radix(parts[0], 16).ok()?;
-                let g = u16::from_str_radix(parts[1], 16).ok()?;
-                let b = u16::from_str_radix(parts[2], 16).ok()?;
-                // Normalize to 8-bit
-                let scale = if parts[0].len() == 4 { 257 } else { 1 };
-                return Some(((r / scale) as u8, (g / scale) as u8, (b / scale) as u8));
-            }
-        }
-        None
     }
 
     /// Whether OSC 133 metadata text is unsafe to correlate on or to show.
@@ -4570,8 +3967,8 @@ impl TerminalState {
                 let line = &self.scrollback[absolute_row];
                 let cells = line.decompress();
                 (
-                    append_cells(&mut capture, &cells, line.is_wrapped),
-                    line.is_wrapped,
+                    append_cells(&mut capture, &cells, line.is_wrapped()),
+                    line.is_wrapped(),
                 )
             } else {
                 let grid_row = absolute_row - self.scrollback.len();
@@ -4906,14 +4303,11 @@ impl TerminalState {
                     // OSC 8 - Hyperlinks
                     // Format: ESC ] 8 ; params ; URI ST
                     self.handle_osc8(value);
-                } else if command == "4" {
-                    self.handle_osc_palette(value);
-                } else if command == "10" || command == "11" || command == "12" {
+                } else if matches!(
+                    command,
+                    "4" | "104" | "10" | "11" | "12" | "110" | "111" | "112"
+                ) {
                     self.handle_osc_color(command, value);
-                } else if command == "110" || command == "111" || command == "112" {
-                    self.reset_osc_color(command);
-                } else if command == "104" {
-                    self.reset_osc_palette(value);
                 } else if command == "9" {
                     // Desktop notification (iTerm2/ConEmu)
                     if self.pending_notifications.len() < 8 {
@@ -6308,7 +5702,7 @@ impl TerminalState {
     #[allow(dead_code)] // Used by the Stage A resolver before consumer wiring lands.
     fn retained_raw_row(&self, absolute_row: usize) -> Option<(RawRowId, usize)> {
         if let Some(line) = self.scrollback.get(absolute_row) {
-            return Some((line.raw_row_id, line.cols as usize));
+            return Some((line.raw_row_id(), line.columns()));
         }
         let grid_row = absolute_row.checked_sub(self.scrollback.len())?;
         Some((self.grid.raw_row_id(grid_row)?, self.grid.row_len()))
@@ -6625,7 +6019,7 @@ impl TerminalState {
         let mut logical_line = 1usize;
         for row in start..end.saturating_sub(1) {
             let wrapped = if row < self.scrollback.len() {
-                self.scrollback[row].is_wrapped
+                self.scrollback[row].is_wrapped()
             } else {
                 self.grid
                     .row_wrapped()
@@ -6711,8 +6105,8 @@ impl TerminalState {
                 let line = &self.scrollback[row];
                 let cells = line.decompress();
                 (
-                    line.is_wrapped,
-                    segment_len(&cells, first_col, line.is_wrapped),
+                    line.is_wrapped(),
+                    segment_len(&cells, first_col, line.is_wrapped()),
                 )
             } else {
                 let grid_row = row - self.scrollback.len();
@@ -6980,7 +6374,7 @@ impl TerminalState {
                     .filter(|cell| !cell.flags.wide_continuation())
                     .map(|cell| cell.character)
                     .collect();
-                (text, line.is_wrapped)
+                (text, line.is_wrapped())
             } else {
                 let grid_row = abs_row - scrollback_len;
                 if grid_row >= self.grid.rows() {
@@ -7155,52 +6549,17 @@ impl TerminalState {
             })
     }
 
-    fn set_keyboard_enhancement_flags(&mut self, flags: u16, mode: u16) {
-        match mode {
-            1 => self.keyboard_enhancement_flags = flags,
-            2 => self.keyboard_enhancement_flags |= flags,
-            3 => self.keyboard_enhancement_flags &= !flags,
-            _ => {}
-        }
-    }
-
-    fn push_keyboard_enhancement_flags(&mut self, flags: u16) {
-        if self.keyboard_enhancement_stack.len() >= 32 {
-            self.keyboard_enhancement_stack.remove(0);
-        }
-        self.keyboard_enhancement_stack
-            .push(self.keyboard_enhancement_flags);
-        self.keyboard_enhancement_flags = flags;
-    }
-
-    fn pop_keyboard_enhancement_flags(&mut self, count: usize) {
-        for _ in 0..count.max(1) {
-            match self.keyboard_enhancement_stack.pop() {
-                Some(flags) => self.keyboard_enhancement_flags = flags,
-                None => {
-                    self.keyboard_enhancement_flags = 0;
-                    break;
-                }
-            }
-        }
-    }
-
     fn decrqm_private_mode_state(&self, mode: u16) -> u8 {
         match mode {
-            1
-            | 6
-            | 7
-            | 25
-            | 47
-            | 66
-            | 1000..=1006
-            | 1015
-            | 1047..=1049
-            | 2004
-            | 2026
-            | 2031
-            | 5522 => {
-                if self.modes.contains(&mode) {
+            6 => {
+                if self.origin_mode {
+                    1
+                } else {
+                    2
+                }
+            }
+            1 | 7 | 25 | 47 | 66 | 1000..=1006 | 1015 | 1047..=1049 | 2004 | 2026 | 2031 | 5522 => {
+                if self.protocol.modes().contains(&mode) {
                     1
                 } else {
                     2
@@ -7216,7 +6575,7 @@ impl TerminalState {
     fn decrqm_ansi_mode_state(&self, mode: u16) -> u8 {
         match mode {
             4 => {
-                if self.modes.contains(&4) {
+                if self.insert_mode {
                     1
                 } else {
                     2
@@ -7525,24 +6884,16 @@ impl TerminalState {
     /// IRM (insert mode): shift cells at/after `col` right by `count`, dropping the
     /// rightmost `count` cells off the end of the row.
     fn shift_cells_right(&mut self, row: usize, col: usize, count: usize) {
-        let cols = self.grid.row_len();
-        if count == 0 || col >= cols {
-            return;
-        }
-        // A pair straddling `col` would come out `count` columns apart, and a
-        // lead pushed into the last column loses its continuation off the end;
-        // both halves go, exactly as ICH does.
-        self.blank_wide_pair_at(row, col);
         let blank = self.create_blank_cell();
-        let line = &mut self.grid[row];
-        if col + count < cols {
-            line.copy_within(col..cols - count, col + count);
+        if self.grid.storage.insert_blank_cells(
+            row,
+            col,
+            count,
+            blank,
+            WideCellEditPolicy::ClearBoundaryPairs,
+        ) {
+            self.mark_row_dirty(row);
         }
-        for cell in &mut line[col..(col + count).min(cols)] {
-            *cell = blank;
-        }
-        self.blank_dangling_wide_at_row_end(row);
-        self.mark_row_dirty(row);
     }
 
     /// Merge a zero-width combining mark into the preceding base cell when the
@@ -7577,115 +6928,60 @@ impl TerminalState {
         }
     }
 
-    fn default_tab_stops(cols: usize) -> Vec<bool> {
-        (0..cols).map(|c| c % 8 == 0 && c != 0).collect()
+    fn cursor_controls(&mut self) -> CursorControls<'_> {
+        CursorControls {
+            rows: self.grid.rows(),
+            cols: self.grid.cols(),
+            row: &mut self.cursor_row,
+            col: &mut self.cursor_col,
+            top: &mut self.scroll_region_top,
+            bottom: &mut self.scroll_region_bottom,
+            origin_mode: &mut self.origin_mode,
+            pending_wrap: &mut self.pending_wrap,
+            tab_stops: &mut self.tab_stops,
+        }
     }
 
-    /// Next tab stop strictly right of `col`, or the last column if none.
-    fn next_tab_stop(&self, col: usize) -> usize {
-        let cols = self.grid.row_len();
-        let mut c = col + 1;
-        while c < cols {
-            if self.tab_stops.get(c).copied().unwrap_or(false) {
-                return c;
-            }
-            c += 1;
+    fn alternate_screen_controls(&mut self) -> AlternateScreenControls<'_, TerminalGrid> {
+        let rows = self.grid.rows();
+        AlternateScreenControls {
+            grid: &mut self.grid,
+            alt_grid: &mut self.alt_grid,
+            use_alt_buffer: &mut self.use_alt_buffer,
+            cursor: CursorDrawing {
+                position: (&mut self.cursor_row, &mut self.cursor_col),
+                fg: &mut self.current_fg,
+                bg: &mut self.current_bg,
+                flags: &mut self.current_flags,
+                g0: &mut self.g0_charset,
+                g1: &mut self.g1_charset,
+                active: &mut self.active_charset,
+                origin_mode: &mut self.origin_mode,
+                pending_wrap: &mut self.pending_wrap,
+            },
+            primary_position: (&mut self.saved_cursor_row, &mut self.saved_cursor_col),
+            alternate_position: (&mut self.alt_cursor_row, &mut self.alt_cursor_col),
+            saved_primary: &mut self.saved_primary_screen_state,
+            margins: (&mut self.scroll_region_top, &mut self.scroll_region_bottom),
+            rows,
         }
-        cols.saturating_sub(1)
-    }
-
-    /// Previous tab stop strictly left of `col`, or column 0 if none.
-    fn prev_tab_stop(&self, col: usize) -> usize {
-        let mut c = col;
-        while c > 0 {
-            c -= 1;
-            if self.tab_stops.get(c).copied().unwrap_or(false) {
-                return c;
-            }
-        }
-        0
     }
 
     fn save_cursor(&mut self) {
-        self.saved_cursor = Some(SavedCursor {
-            row: self.cursor_row,
-            col: self.cursor_col,
-            fg: self.current_fg,
-            bg: self.current_bg,
-            flags: self.current_flags,
-            g0: self.g0_charset,
-            g1: self.g1_charset,
-            active: self.active_charset,
-            origin_mode: self.modes.contains(&6),
-            pending_wrap: self.pending_wrap,
-        });
-    }
-
-    fn snapshot_cursor_state(&self) -> SavedCursor {
-        SavedCursor {
-            row: self.cursor_row,
-            col: self.cursor_col,
-            fg: self.current_fg,
-            bg: self.current_bg,
-            flags: self.current_flags,
-            g0: self.g0_charset,
-            g1: self.g1_charset,
-            active: self.active_charset,
-            origin_mode: self.modes.contains(&6),
-            pending_wrap: self.pending_wrap,
-        }
+        let autowrap = self.protocol.modes().contains(&7);
+        self.saved_cursor = Some(self.alternate_screen_controls().cursor.snapshot(autowrap));
     }
 
     fn restore_cursor(&mut self) {
-        if let Some(s) = self.saved_cursor {
-            self.cursor_row = s.row.min(self.grid.rows().saturating_sub(1));
-            self.cursor_col = s.col.min(self.grid.row_len().saturating_sub(1));
-            self.current_fg = s.fg;
-            self.current_bg = s.bg;
-            self.current_flags = s.flags;
-            self.g0_charset = s.g0;
-            self.g1_charset = s.g1;
-            self.active_charset = s.active;
-            if s.origin_mode {
-                self.modes.insert(6);
-            } else {
-                self.modes.remove(&6);
-            }
-            self.pending_wrap = s.pending_wrap;
-        } else {
-            self.cursor_row = 0;
-            self.cursor_col = 0;
-            self.pending_wrap = false;
-        }
-    }
-
-    /// Place the cursor for CUP/HVP (CSI H / f). Honors DECOM origin mode: when set,
-    /// the row is relative to the scroll region and clamped within it.
-    fn place_cursor(&mut self, row_1based: usize, col_1based: usize) {
-        self.pending_wrap = false;
-        let row0 = row_1based.saturating_sub(1);
-        let col0 = col_1based.saturating_sub(1);
-        if self.modes.contains(&6) {
-            self.cursor_row = (self.scroll_region_top + row0).min(self.scroll_region_bottom);
-        } else {
-            self.cursor_row = row0.min(self.grid.rows().saturating_sub(1));
-        }
-        self.cursor_col = col0.min(self.grid.row_len().saturating_sub(1));
-    }
-
-    /// VPA (CSI d): move to an absolute row, honoring origin mode, keeping the column.
-    fn set_cursor_row_abs(&mut self, row_1based: usize) {
-        self.pending_wrap = false;
-        let row0 = row_1based.saturating_sub(1);
-        if self.modes.contains(&6) {
-            self.cursor_row = (self.scroll_region_top + row0).min(self.scroll_region_bottom);
-        } else {
-            self.cursor_row = row0.min(self.grid.rows().saturating_sub(1));
-        }
+        let saved = self.saved_cursor.clone();
+        let (rows, cols) = (self.grid.rows(), self.grid.cols());
+        self.alternate_screen_controls()
+            .cursor
+            .restore(saved.as_ref(), rows, cols);
     }
 
     fn put_char(&mut self, ch: char, track_idle_output: bool) {
-        let ch = self.translate_char(ch);
+        let ch = self.active_charset.translate(ch);
         let width = crate::char_width::cached_char_width(ch);
         if width == 0 {
             self.combine_with_previous(ch);
@@ -7694,7 +6990,7 @@ impl TerminalState {
 
         let cols = self.grid.row_len();
         let blank_cell = self.create_blank_cell();
-        let autowrap = self.modes.contains(&7);
+        let autowrap = self.protocol.modes().contains(&7);
 
         if self.pending_wrap {
             self.pending_wrap = false;
@@ -7724,35 +7020,24 @@ impl TerminalState {
         let write_col = self.cursor_col;
 
         // IRM insert mode (mode 4): make room by shifting the row right.
-        if self.modes.contains(&4) {
+        if self.insert_mode {
             self.shift_cells_right(self.cursor_row, self.cursor_col, width);
         }
 
-        // Overwriting either half of a double-width character must clear the
-        // other half. `width` covers both the cell written and, for a wide
-        // character, the cell claimed as its own continuation below: landing
-        // that continuation on somebody else's lead orphans *its* continuation
-        // one column further right, and a later write there would then blank
-        // this character's continuation while "repairing" the stale pair.
-        self.split_wide_pairs_around(self.cursor_row, self.cursor_col, self.cursor_col + width);
-
-        // Write character
-        let cell = self.grid.get_mut(self.cursor_row, self.cursor_col);
-        cell.character = ch;
-        cell.foreground = self.current_fg;
-        cell.background = self.current_bg;
-        cell.flags = self.current_flags;
-        cell.flags.set_wide(width == 2);
-        cell.flags.set_wide_continuation(false);
-        cell.hyperlink_id = HyperlinkId::from_raw(self.current_hyperlink.unwrap_or(0));
-
-        // Set up wide character continuation cell if needed
-        if width == 2 && self.cursor_col + 1 < cols {
-            let cont_cell = self.grid.get_mut(self.cursor_row, self.cursor_col + 1);
-            *cont_cell = blank_cell;
-            cont_cell.flags.set_wide_continuation(true);
-            cont_cell.hyperlink_id = HyperlinkId::from_raw(self.current_hyperlink.unwrap_or(0));
-        }
+        self.grid.storage.overwrite_graphic(
+            self.cursor_row,
+            self.cursor_col,
+            width,
+            TerminalCell {
+                character: ch,
+                foreground: self.current_fg,
+                background: self.current_bg,
+                flags: self.current_flags,
+                hyperlink_id: HyperlinkId::from_raw(self.current_hyperlink.unwrap_or(0)),
+            },
+            blank_cell,
+            WideContinuationProtection::FromBlank,
+        );
 
         self.cursor_col += width;
         self.last_printed_char = Some(ch);
@@ -7769,7 +7054,7 @@ impl TerminalState {
 
     fn put_ascii_run(&mut self, bytes: &[u8]) {
         let cols = self.grid.row_len();
-        let autowrap = self.modes.contains(&7);
+        let autowrap = self.protocol.modes().contains(&7);
         let mut pos = 0;
         if let Some(&last) = bytes.last() {
             self.last_printed_char = Some(last as char);
@@ -7786,47 +7071,30 @@ impl TerminalState {
             let remaining = cols - self.cursor_col;
             let chunk_len = (bytes.len() - pos).min(remaining);
 
-            // Write chunk to grid directly through a single row slice
-            // (avoids recomputing row*cols + bounds-check on every cell)
-            let fg = self.current_fg;
-            let bg = self.current_bg;
-            let mut flags = self.current_flags;
-            flags.set_wide(false);
-            flags.set_wide_continuation(false);
-            let hyperlink = self.current_hyperlink.unwrap_or(0);
+            let rendition = TerminalCell {
+                character: ' ',
+                foreground: self.current_fg,
+                background: self.current_bg,
+                flags: self.current_flags,
+                hyperlink_id: HyperlinkId::from_raw(self.current_hyperlink.unwrap_or(0)),
+            };
             let col = self.cursor_col;
             let end = col + chunk_len;
+            let chunk = &bytes[pos..pos + chunk_len];
             self.note_idle_background_cells(
                 col,
                 end,
-                bytes[pos..pos + chunk_len]
-                    .iter()
-                    .any(|byte| !byte.is_ascii_whitespace()),
+                chunk.iter().any(|byte| !byte.is_ascii_whitespace()),
             );
             let blank = self.create_blank_cell();
-            // Preserve the wide-cell pair invariant at both edges of the bulk
-            // overwrite. The interior is fully replaced below, but a CJK body or
-            // continuation just outside the slice must not be left orphaned.
-            if col > 0
-                && self
-                    .grid
-                    .get(self.cursor_row, col)
-                    .flags
-                    .wide_continuation()
-            {
-                *self.grid.get_mut(self.cursor_row, col - 1) = blank;
-            }
-            if end < cols && self.grid.get(self.cursor_row, end - 1).flags.wide() {
-                *self.grid.get_mut(self.cursor_row, end) = blank;
-            }
-            let row = &mut self.grid[self.cursor_row][col..col + chunk_len];
-            for (cell, &byte) in row.iter_mut().zip(&bytes[pos..pos + chunk_len]) {
-                cell.character = byte as char;
-                cell.foreground = fg;
-                cell.background = bg;
-                cell.flags = flags;
-                cell.hyperlink_id = HyperlinkId::from_raw(hyperlink);
-            }
+            self.grid.storage.overwrite_ascii(
+                self.cursor_row,
+                col,
+                chunk,
+                rendition,
+                blank,
+                AsciiOverwritePolicy::FrostLegacy,
+            );
 
             self.cursor_col += chunk_len;
             pos += chunk_len;
@@ -7840,65 +7108,6 @@ impl TerminalState {
                     self.pending_wrap = true;
                 }
             }
-        }
-    }
-
-    /// Blank both halves of a double-width pair straddling `col`.
-    ///
-    /// A shift that moves one half without the other leaves an orphaned glyph
-    /// beside a stale spacer, and the row's column arithmetic goes one out per
-    /// orphan. `col` may be either half, or one past the row.
-    fn blank_wide_pair_at(&mut self, row: usize, col: usize) {
-        let cols = self.grid.row_len();
-        if row >= self.grid.rows() || col > cols || cols == 0 {
-            return;
-        }
-        let blank = self.create_blank_cell();
-        if col < cols && self.grid.get(row, col).flags.wide_continuation() && col > 0 {
-            *self.grid.get_mut(row, col - 1) = blank;
-            *self.grid.get_mut(row, col) = blank;
-        } else if col < cols && self.grid.get(row, col).flags.wide() && col + 1 < cols {
-            *self.grid.get_mut(row, col) = blank;
-            *self.grid.get_mut(row, col + 1) = blank;
-        } else if col > 0 && col <= cols && self.grid.get(row, col - 1).flags.wide() {
-            // The window's right edge sits between a lead and its continuation.
-            *self.grid.get_mut(row, col - 1) = blank;
-            if col < cols {
-                *self.grid.get_mut(row, col) = blank;
-            }
-        }
-    }
-
-    /// Blank the double-width halves that overwriting `start..end` orphans.
-    ///
-    /// Only the two edges of the span can have a partner outside it: a lead at
-    /// `start - 1` whose continuation is about to go, and a continuation at
-    /// `end` whose lead is about to go. Ported from ember
-    /// `src/terminal/state.rs::split_wide_pairs_around`.
-    fn split_wide_pairs_around(&mut self, row: usize, start: usize, end: usize) {
-        let cols = self.grid.row_len();
-        if row >= self.grid.rows() || start >= end || start >= cols {
-            return;
-        }
-        let end = end.min(cols);
-        let blank = self.create_blank_cell();
-        if start > 0 && self.grid.get(row, start - 1).flags.wide() {
-            *self.grid.get_mut(row, start - 1) = blank;
-        }
-        if end < cols && self.grid.get(row, end).flags.wide_continuation() {
-            *self.grid.get_mut(row, end) = blank;
-        }
-    }
-
-    /// A lead in the final column has nowhere to keep its continuation.
-    fn blank_dangling_wide_at_row_end(&mut self, row: usize) {
-        let cols = self.grid.row_len();
-        if row >= self.grid.rows() || cols == 0 {
-            return;
-        }
-        if self.grid.get(row, cols - 1).flags.wide() {
-            let blank = self.create_blank_cell();
-            *self.grid.get_mut(row, cols - 1) = blank;
         }
     }
 
@@ -8166,26 +7375,15 @@ impl TerminalState {
     }
 
     fn scroll_region_down(&mut self, top: usize, bottom: usize) {
-        if top >= self.grid.rows() || bottom >= self.grid.rows() || top > bottom {
-            return;
-        }
-        let cols = self.grid.row_len();
-        // Shift rows down: move [top..bottom) to [top+1..=bottom]
-        let src_start = top * cols;
-        let src_end = bottom * cols;
-        let dst = (top + 1) * cols;
         let blank = self.create_blank_cell();
-        self.grid.cells_mut().copy_within(src_start..src_end, dst);
-        // Clear top row
-        self.grid.cells_mut()[src_start..src_start + cols].fill(blank);
-        self.grid
-            .row_wrapped_mut()
-            .copy_within(top..bottom, top + 1);
-        self.grid.row_wrapped_mut()[top] = false;
-        self.grid.row_ids_mut().copy_within(top..bottom, top + 1);
-        self.grid.row_ids_mut()[top] = fresh_raw_row_id();
-        self.grid.bump_identity_revision();
-        self.mark_rows_dirty(top, bottom);
+        if self.grid.shift_row_region(
+            RegionDirection::Down,
+            top..=bottom,
+            blank,
+            RegionWrapPolicy::MoveWithRows,
+        ) {
+            self.mark_rows_dirty(top, bottom);
+        }
     }
 
     fn scroll_region_up(&mut self, top: usize, bottom: usize) {
@@ -8193,7 +7391,6 @@ impl TerminalState {
             return;
         }
 
-        let cols = self.grid.row_len();
         // VTE saves lines scrolled off the top margin into scrollback whenever
         // the scrolling region starts at the first screen row. The bottom margin
         // may be above the last row so TUIs can keep prompts/status lines fixed
@@ -8215,24 +7412,13 @@ impl TerminalState {
                 None
             };
 
-        let src_start = (top + 1) * cols;
-        let src_end = (bottom + 1) * cols;
-        let dst_start = top * cols;
         let blank = self.create_blank_cell();
-        self.grid
-            .cells_mut()
-            .copy_within(src_start..src_end, dst_start);
-        let blank_start = bottom * cols;
-        self.grid.cells_mut()[blank_start..blank_start + cols].fill(blank);
-        self.grid
-            .row_wrapped_mut()
-            .copy_within(top + 1..=bottom, top);
-        self.grid.row_wrapped_mut()[bottom] = false;
-        self.grid
-            .row_ids_mut()
-            .copy_within(top + 1..bottom + 1, top);
-        self.grid.row_ids_mut()[bottom] = fresh_raw_row_id();
-        self.grid.bump_identity_revision();
+        self.grid.shift_row_region(
+            RegionDirection::Up,
+            top..=bottom,
+            blank,
+            RegionWrapPolicy::MoveWithRows,
+        );
 
         self.mark_rows_dirty(top, bottom);
 
@@ -8278,61 +7464,6 @@ impl TerminalState {
             b'0' => Charset::DecSpecialGraphics,
             _ => Charset::Ascii,
         }
-    }
-
-    fn translate_char(&self, ch: char) -> char {
-        match self.active_charset {
-            Charset::Ascii => ch,
-            Charset::DecSpecialGraphics => match ch {
-                '`' => '◆',
-                'a' => '▒',
-                'f' => '°',
-                'g' => '±',
-                'j' => '┘',
-                'k' => '┐',
-                'l' => '┌',
-                'm' => '└',
-                'n' => '┼',
-                'o' => '⎺',
-                'p' => '⎻',
-                'q' => '─',
-                'r' => '⎼',
-                's' => '⎽',
-                't' => '├',
-                'u' => '┤',
-                'v' => '┴',
-                'w' => '┬',
-                'x' => '│',
-                'y' => '≤',
-                'z' => '≥',
-                '{' => 'π',
-                '|' => '≠',
-                '}' => '£',
-                '~' => '·',
-                _ => ch,
-            },
-        }
-    }
-
-    fn clear_cell(&mut self, row: usize, col: usize) {
-        let cols = self.grid.row_len();
-        let bg_color = self.current_bg;
-        let blank_cell = TerminalCell {
-            character: ' ',
-            foreground: Color::Default,
-            background: bg_color,
-            flags: StyleFlags::default(),
-            hyperlink_id: HyperlinkId::NONE,
-        };
-        // If clearing a continuation cell, also clear the wide character body
-        if self.grid.get(row, col).flags.wide_continuation() && col > 0 {
-            *self.grid.get_mut(row, col - 1) = blank_cell;
-        }
-        // If clearing a wide character body, also clear the continuation cell
-        if self.grid.get(row, col).flags.wide() && col + 1 < cols {
-            *self.grid.get_mut(row, col + 1) = blank_cell;
-        }
-        *self.grid.get_mut(row, col) = blank_cell;
     }
 
     /// P3 优化：批量处理输入数据，只在处理完成后触发一次网格版本更新
@@ -8433,7 +7564,7 @@ impl TerminalState {
             self.last_synced_primary_screen_snapshot =
                 self.visible_screen_snapshot().unwrap_or_default();
         }
-        self.modes.remove(&2026);
+        self.protocol.modes_mut().remove(&2026);
         self.sync_output_active = false;
         self.sync_output_start = None;
         self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
@@ -8441,24 +7572,24 @@ impl TerminalState {
 
     #[allow(dead_code)]
     pub fn is_focus_event_mode(&self) -> bool {
-        self.modes.contains(&1004)
+        self.protocol.modes().contains(&1004)
     }
 
     #[allow(dead_code)]
     pub fn is_bracketed_paste_mode(&self) -> bool {
-        self.modes.contains(&2004)
+        self.protocol.modes().contains(&2004)
     }
 
     #[allow(dead_code)]
     pub fn emit_focus_in(&mut self) {
-        if self.modes.contains(&1004) {
+        if self.protocol.modes().contains(&1004) {
             self.output_buffer.extend_from_slice(b"\x1b[I");
         }
     }
 
     #[allow(dead_code)]
     pub fn emit_focus_out(&mut self) {
-        if self.modes.contains(&1004) {
+        if self.protocol.modes().contains(&1004) {
             self.output_buffer.extend_from_slice(b"\x1b[O");
         }
     }
@@ -8481,9 +7612,8 @@ impl TerminalState {
         let mut at = 0;
         let mut capture_active = false;
         loop {
-            self.parser.set_ascii_batching(
-                self.active_charset == Charset::Ascii && !self.modes.contains(&4),
-            );
+            self.parser
+                .set_ascii_batching(self.active_charset == Charset::Ascii && !self.insert_mode);
             let rejected_before = self.parser.rejected_count();
             let step = self.parser.next(&input[at..]);
             if step.abandoned_apc {
@@ -8504,7 +7634,7 @@ impl TerminalState {
                     ParserEvent::Boundary => {}
                     ParserEvent::Print(ch) => self.put_char(ch, true),
                     ParserEvent::Ascii(bytes) => {
-                        if self.active_charset == Charset::Ascii && !self.modes.contains(&4) {
+                        if self.active_charset == Charset::Ascii && !self.insert_mode {
                             self.put_ascii_run(bytes);
                         } else {
                             for &byte in bytes {
@@ -8513,22 +7643,13 @@ impl TerminalState {
                         }
                     }
                     ParserEvent::Control(byte) => match byte {
-                        8 => {
-                            self.pending_wrap = false;
-                            self.cursor_col = self.cursor_col.saturating_sub(1);
-                        }
-                        9 => {
-                            self.pending_wrap = false;
-                            self.cursor_col = self.next_tab_stop(self.cursor_col);
-                        }
+                        8 => self.cursor_controls().move_backward(1),
+                        9 => self.cursor_controls().tab_forward(1),
                         10..=12 => {
                             self.pending_wrap = false;
                             self.index();
                         }
-                        13 => {
-                            self.pending_wrap = false;
-                            self.cursor_col = 0;
-                        }
+                        13 => self.cursor_controls().set_column(1),
                         14 => self.active_charset = self.g1_charset,
                         15 => self.active_charset = self.g0_charset,
                         _ => {} // Frost ignores BEL and other unhandled C0.
@@ -8553,17 +7674,13 @@ impl TerminalState {
                                     self.pending_wrap = false;
                                     self.reverse_index();
                                 }
-                                b'H' => {
-                                    if let Some(stop) = self.tab_stops.get_mut(self.cursor_col) {
-                                        *stop = true;
-                                    }
-                                }
+                                b'H' => self.cursor_controls().set_tab_stop(true),
                                 b'c' => self.full_reset(),
                                 b'>' => {
-                                    self.modes.remove(&66);
+                                    self.protocol.modes_mut().remove(&66);
                                 }
                                 b'=' => {
-                                    self.modes.insert(66);
+                                    self.protocol.modes_mut().insert(66);
                                 }
                                 _ => {}
                             }
@@ -8576,12 +7693,12 @@ impl TerminalState {
                     }
                     ParserEvent::Csi {
                         raw_params,
+                        params,
                         private_prefix,
                         intermediates,
                         final_byte,
                         ..
                     } => {
-                        let params = Self::parse_csi_params(&raw_params);
                         self.handle_escape_sequence(
                             &params,
                             &raw_params,
@@ -8655,272 +7772,133 @@ impl TerminalState {
         private_prefix: Option<u8>,
         intermediates: &[u8],
     ) {
-        if matches!(
-            cmd,
-            'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'I' | 'Z' | 'f' | 'd' | '`'
-        ) {
-            self.pending_wrap = false;
-        }
-
+        let first = params.first().copied();
+        let count = first.unwrap_or(1).max(1) as usize;
         match cmd {
-            'A' => {
-                // CUU - cursor up. Stops at the top margin (or row 0 if the
-                // cursor starts above the region); never scrolls.
-                let n = params.first().copied().unwrap_or(1).max(1) as usize;
-                let limit = if self.cursor_row >= self.scroll_region_top {
-                    self.scroll_region_top
-                } else {
-                    0
-                };
-                self.cursor_row = self.cursor_row.saturating_sub(n).max(limit);
-            }
-            'B' => {
-                // CUD - cursor down. Stops at the bottom margin (or last row if
-                // the cursor starts below the region); never scrolls.
-                let n = params.first().copied().unwrap_or(1).max(1) as usize;
-                let limit = if self.cursor_row <= self.scroll_region_bottom {
-                    self.scroll_region_bottom
-                } else {
-                    self.grid.rows() - 1
-                };
-                self.cursor_row = (self.cursor_row + n).min(limit);
-            }
-            'C' => {
-                let n = params.first().copied().unwrap_or(1).max(1) as usize;
-                self.cursor_col = (self.cursor_col + n).min(self.grid.row_len() - 1);
-            }
-            'D' => {
-                let n = params.first().copied().unwrap_or(1).max(1) as usize;
-                self.cursor_col = self.cursor_col.saturating_sub(n);
-            }
+            'A' => self.cursor_controls().move_up(count),
+            'B' => self.cursor_controls().move_down(count),
+            'C' => self.cursor_controls().move_forward(count),
+            'D' => self.cursor_controls().move_backward(count),
             'E' => {
-                // CNL - cursor next line. Down n, to column 0, bounded by the
-                // bottom margin (matching CUD); never scrolls.
-                let n = params.first().copied().unwrap_or(1).max(1) as usize;
-                let limit = if self.cursor_row <= self.scroll_region_bottom {
-                    self.scroll_region_bottom
-                } else {
-                    self.grid.rows() - 1
-                };
-                self.cursor_row = (self.cursor_row + n).min(limit);
-                self.cursor_col = 0;
+                let mut cursor = self.cursor_controls();
+                cursor.move_down(count);
+                cursor.set_column(1);
             }
             'F' => {
-                // CPL - cursor previous line. Up n, to column 0, bounded by the
-                // top margin (matching CUU); never scrolls.
-                let n = params.first().copied().unwrap_or(1).max(1) as usize;
-                let limit = if self.cursor_row >= self.scroll_region_top {
-                    self.scroll_region_top
-                } else {
-                    0
-                };
-                self.cursor_row = self.cursor_row.saturating_sub(n).max(limit);
-                self.cursor_col = 0;
+                let mut cursor = self.cursor_controls();
+                cursor.move_up(count);
+                cursor.set_column(1);
             }
-            'G' | '`' => {
-                // CHA / HPA - move cursor to absolute column (1-based)
-                let col = params.first().copied().unwrap_or(1) as usize;
-                self.cursor_col = col.saturating_sub(1).min(self.grid.row_len() - 1);
-            }
-            'd' => {
-                // VPA - move cursor to absolute row (1-based), honoring origin mode
-                let row = params.first().copied().unwrap_or(1) as usize;
-                self.set_cursor_row_abs(row);
-            }
-            'I' => {
-                // CHT - cursor forward tabulation (n tab stops)
-                let n = params.first().copied().unwrap_or(1).max(1) as usize;
-                for _ in 0..n {
-                    self.cursor_col = self.next_tab_stop(self.cursor_col);
-                }
-            }
-            'Z' => {
-                // CBT - cursor backward tabulation (n tab stops)
-                let n = params.first().copied().unwrap_or(1).max(1) as usize;
-                for _ in 0..n {
-                    self.cursor_col = self.prev_tab_stop(self.cursor_col);
-                }
-            }
+            'G' | '`' => self
+                .cursor_controls()
+                .set_column(first.unwrap_or(1) as usize),
+            'd' => self.cursor_controls().set_row(first.unwrap_or(1) as usize),
+            'I' => self.cursor_controls().tab_forward(count),
+            'Z' => self.cursor_controls().tab_backward(count),
             'b' => {
-                // REP - repeat the last printed character n times
-                let n = params.first().copied().unwrap_or(1).max(1) as usize;
+                // REP - repeat the last printed character n times.
                 if let Some(ch) = self.last_printed_char {
-                    for _ in 0..n {
+                    for _ in 0..count {
                         self.put_char(ch, false);
                     }
                 }
             }
-            'g' => {
-                // TBC - tab clear (0 = at cursor, 3 = all)
-                match params.first().copied().unwrap_or(0) {
-                    0 => {
-                        if let Some(stop) = self.tab_stops.get_mut(self.cursor_col) {
-                            *stop = false;
-                        }
-                    }
-                    3 => {
-                        for stop in self.tab_stops.iter_mut() {
-                            *stop = false;
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            'g' => match first.unwrap_or(0) {
+                0 => self.cursor_controls().set_tab_stop(false),
+                3 => self.cursor_controls().clear_all_tab_stops(),
+                _ => {}
+            },
             'H' => {
-                let row = params.first().copied().unwrap_or(1) as usize;
+                let row = first.unwrap_or(1) as usize;
                 let col = params.get(1).copied().unwrap_or(1) as usize;
-                self.place_cursor(row, col);
+                self.cursor_controls().set_position(row, col);
             }
             'f' => {
                 if private_prefix == Some(b'>') && intermediates.is_empty() {
-                    let resource = params.first().copied().unwrap_or(0);
+                    // Frost's legacy CSI f dispatch clears wrap even for XTFMTKEYS.
+                    self.pending_wrap = false;
+                    let resource = first.unwrap_or(0);
                     let value = params.get(1).copied().unwrap_or(0);
                     if resource == 4 {
                         crate::debug_log!(
                             "[XTFMTKEYS] formatOtherKeys={} previous={}",
                             value,
-                            self.xterm_format_other_keys
+                            self.protocol.xterm_format_other_keys()
                         );
-                        self.xterm_format_other_keys = value;
+                        self.protocol.set_xterm_format_other_keys(value);
                     }
                 } else {
-                    let row = params.first().copied().unwrap_or(1) as usize;
+                    let row = first.unwrap_or(1) as usize;
                     let col = params.get(1).copied().unwrap_or(1) as usize;
-                    self.place_cursor(row, col);
+                    self.cursor_controls().set_position(row, col);
                 }
             }
-            'J' => {
-                match params.first().copied().unwrap_or(0) {
-                    0 => {
-                        if self.cursor_row == 0 && self.cursor_col == 0 {
-                            self.inline_cli_screen_erased();
-                        }
-                        // Clear from cursor to end of display
-                        for col in self.cursor_col..self.grid.row_len() {
-                            self.clear_cell(self.cursor_row, col);
-                        }
-                        for row in (self.cursor_row + 1)..self.grid.rows() {
-                            for col in 0..self.grid.row_len() {
-                                self.clear_cell(row, col);
-                            }
-                        }
-                        self.mark_rows_dirty(self.cursor_row, self.grid.rows().saturating_sub(1));
+            'J' => match params.first().copied().unwrap_or(0) {
+                0 => {
+                    if self.cursor_row == 0 && self.cursor_col == 0 {
+                        self.inline_cli_screen_erased();
                     }
-                    1 => {
-                        // Clear from start to cursor
-                        for row in 0..=self.cursor_row {
-                            let end_col = if row == self.cursor_row {
-                                self.cursor_col + 1
-                            } else {
-                                self.grid.row_len()
-                            };
-                            for col in 0..end_col {
-                                self.clear_cell(row, col);
-                            }
-                        }
-                        self.mark_rows_dirty(0, self.cursor_row);
+                    let cols = self.grid.row_len();
+                    let blank = self.create_blank_cell();
+                    self.grid
+                        .storage
+                        .erase_cells(self.cursor_row, self.cursor_col..cols, blank);
+                    for row in self.cursor_row + 1..self.grid.rows() {
+                        self.grid.storage.erase_cells(row, 0..cols, blank);
                     }
-                    2 => {
-                        // ED 2: erase the whole screen but leave the cursor in place.
-                        self.clear_screen_no_home();
-                    }
-                    3 => {
-                        // Clear scrollback (xterm extension)
-                        self.erase_saved_lines();
-                    }
-                    _ => {}
+                    self.mark_rows_dirty(self.cursor_row, self.grid.rows().saturating_sub(1));
                 }
-            }
+                1 => {
+                    let cols = self.grid.row_len();
+                    let blank = self.create_blank_cell();
+                    for row in 0..self.cursor_row {
+                        self.grid.storage.erase_cells(row, 0..cols, blank);
+                    }
+                    self.grid
+                        .storage
+                        .erase_cells(self.cursor_row, 0..self.cursor_col + 1, blank);
+                    self.mark_rows_dirty(0, self.cursor_row);
+                }
+                2 => self.clear_screen_no_home(),
+                3 => self.erase_saved_lines(),
+                _ => {}
+            },
             'K' => {
-                // Clear line
-                match params.first().copied().unwrap_or(0) {
-                    0 => {
-                        // Clear from cursor to end of line
-                        for col in self.cursor_col..self.grid.row_len() {
-                            self.clear_cell(self.cursor_row, col);
-                        }
-                        self.mark_row_dirty(self.cursor_row);
-                    }
-                    1 => {
-                        // Clear from start of line to cursor
-                        for col in 0..=self.cursor_col {
-                            self.clear_cell(self.cursor_row, col);
-                        }
-                        self.mark_row_dirty(self.cursor_row);
-                    }
-                    2 => {
-                        // Clear entire line
-                        for col in 0..self.grid.row_len() {
-                            self.clear_cell(self.cursor_row, col);
-                        }
-                        self.mark_row_dirty(self.cursor_row);
-                    }
-                    _ => {}
-                }
-            }
-            'L' => {
-                let n = params.first().copied().unwrap_or(1).max(1) as usize;
-                // Cap the repeat count at the size of the thing being edited.
-                // After that many iterations the region is already entirely
-                // blank, so a larger N only buys O(N · region · cols) cell
-                // copies on the UI thread — `printf '\e[65535L'`, or the same
-                // bytes out of a binary file or a hostile remote stream, is
-                // hundreds of millions of copies. ember caps all six of these.
-                let n = n.min(
-                    self.scroll_region_bottom
-                        .saturating_sub(self.cursor_row)
-                        .saturating_add(1),
-                );
+                let cols = self.grid.row_len();
+                let span = match params.first().copied().unwrap_or(0) {
+                    0 => self.cursor_col..cols,
+                    1 => 0..self.cursor_col + 1,
+                    2 => 0..cols,
+                    _ => return,
+                };
                 let blank = self.create_blank_cell();
-                for _ in 0..n {
-                    if self.cursor_row >= self.scroll_region_top
-                        && self.cursor_row <= self.scroll_region_bottom
-                    {
-                        let cols = self.grid.row_len();
-                        let src_start = self.cursor_row * cols;
-                        let src_end = self.scroll_region_bottom * cols;
-                        let dst = (self.cursor_row + 1) * cols;
-                        self.grid.cells_mut().copy_within(src_start..src_end, dst);
-                        self.grid.cells_mut()[src_start..src_start + cols].fill(blank);
-                        self.grid.row_ids_mut().copy_within(
-                            self.cursor_row..self.scroll_region_bottom,
-                            self.cursor_row + 1,
-                        );
-                        self.grid.row_ids_mut()[self.cursor_row] = fresh_raw_row_id();
-                        self.grid.bump_identity_revision();
-                    }
-                }
-                self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
+                self.grid.storage.erase_cells(self.cursor_row, span, blank);
+                self.mark_row_dirty(self.cursor_row);
             }
-            'M' => {
-                let n = params.first().copied().unwrap_or(1).max(1) as usize;
-                // Same cap as IL: see the comment there.
-                let n = n.min(
-                    self.scroll_region_bottom
-                        .saturating_sub(self.cursor_row)
-                        .saturating_add(1),
-                );
-                let blank = self.create_blank_cell();
-                for _ in 0..n {
-                    if self.cursor_row >= self.scroll_region_top
-                        && self.cursor_row <= self.scroll_region_bottom
-                    {
-                        let cols = self.grid.row_len();
-                        let src_start = (self.cursor_row + 1) * cols;
-                        let src_end = (self.scroll_region_bottom + 1) * cols;
-                        let dst = self.cursor_row * cols;
-                        self.grid.cells_mut().copy_within(src_start..src_end, dst);
-                        let blank_start = self.scroll_region_bottom * cols;
-                        self.grid.cells_mut()[blank_start..blank_start + cols].fill(blank);
-                        self.grid.row_ids_mut().copy_within(
-                            self.cursor_row + 1..self.scroll_region_bottom + 1,
-                            self.cursor_row,
+            'L' | 'M' => {
+                let direction = if cmd == 'L' {
+                    RegionDirection::Down
+                } else {
+                    RegionDirection::Up
+                };
+                let cursor = self.cursor_row;
+                let bottom = self.scroll_region_bottom;
+                if (self.scroll_region_top..=bottom).contains(&cursor) {
+                    let blank = self.create_blank_cell();
+                    let count = (params.first().copied().unwrap_or(1).max(1) as usize)
+                        .min(bottom - cursor + 1);
+                    // Frost allocates each row at its original iteration step,
+                    // keeping physical wrap flags and the grid revision cadence.
+                    for _ in 0..count {
+                        self.grid.shift_row_region(
+                            direction,
+                            cursor..=bottom,
+                            blank,
+                            RegionWrapPolicy::KeepPhysicalIndices,
                         );
-                        self.grid.row_ids_mut()[self.scroll_region_bottom] = fresh_raw_row_id();
-                        self.grid.bump_identity_revision();
                     }
                 }
-                self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
+                self.mark_rows_dirty(cursor, bottom);
             }
             'm' => {
                 if private_prefix == Some(b'>') && intermediates.is_empty() {
@@ -8930,13 +7908,20 @@ impl TerminalState {
                         crate::debug_log!(
                             "[XTMODKEYS] modifyOtherKeys={} previous={}",
                             value,
-                            self.xterm_modify_other_keys
+                            self.protocol.xterm_modify_other_keys()
                         );
-                        self.xterm_modify_other_keys = value;
+                        self.protocol.set_xterm_modify_other_keys(value);
                     }
                 } else {
                     // SGR - Select Graphic Rendition
-                    self.handle_sgr(&Self::parse_sgr_groups(raw_params));
+                    if let Some(color) = jterm_engine::semantics::frost_legacy_sgr(
+                        raw_params,
+                        &mut self.current_fg,
+                        &mut self.current_bg,
+                        &mut self.current_flags,
+                    ) {
+                        self.global_bg = color;
+                    }
                 }
             }
             's' => {
@@ -8953,9 +7938,10 @@ impl TerminalState {
                         Some(b'?') => {
                             crate::debug_log!(
                                 "[KEYBOARD_PROTO] query current kitty flags -> {}",
-                                self.keyboard_enhancement_flags
+                                self.protocol.keyboard_enhancement_flags()
                             );
-                            let response = format!("\x1b[?{}u", self.keyboard_enhancement_flags);
+                            let response =
+                                format!("\x1b[?{}u", self.protocol.keyboard_enhancement_flags());
                             self.output_buffer.extend_from_slice(response.as_bytes());
                         }
                         Some(b'=') => {
@@ -8965,35 +7951,35 @@ impl TerminalState {
                                 "[KEYBOARD_PROTO] set kitty flags flags={} mode={} previous={}",
                                 flags,
                                 mode,
-                                self.keyboard_enhancement_flags
+                                self.protocol.keyboard_enhancement_flags()
                             );
-                            self.set_keyboard_enhancement_flags(flags, mode);
+                            self.protocol.set_keyboard_enhancement_flags(flags, mode);
                             crate::debug_log!(
                                 "[KEYBOARD_PROTO] new kitty flags={}",
-                                self.keyboard_enhancement_flags
+                                self.protocol.keyboard_enhancement_flags()
                             );
                         }
                         Some(b'>') => {
                             let flags = params.first().copied().unwrap_or(0);
                             crate::debug_log!(
                                 "[KEYBOARD_PROTO] push kitty flags current={} new={}",
-                                self.keyboard_enhancement_flags,
+                                self.protocol.keyboard_enhancement_flags(),
                                 flags
                             );
-                            self.push_keyboard_enhancement_flags(flags);
+                            self.protocol.push_keyboard_enhancement_flags(flags);
                         }
                         Some(b'<') => {
                             let count = params.first().copied().unwrap_or(1) as usize;
                             crate::debug_log!(
                                 "[KEYBOARD_PROTO] pop kitty flags count={} current={} stack_depth={}",
                                 count,
-                                self.keyboard_enhancement_flags,
-                                self.keyboard_enhancement_stack.len()
+                                self.protocol.keyboard_enhancement_flags(),
+                                self.protocol.keyboard_enhancement_stack().len()
                             );
-                            self.pop_keyboard_enhancement_flags(count);
+                            self.protocol.pop_keyboard_enhancement_flags(count);
                             crate::debug_log!(
                                 "[KEYBOARD_PROTO] new kitty flags={}",
-                                self.keyboard_enhancement_flags
+                                self.protocol.keyboard_enhancement_flags()
                             );
                         }
                         _ => {}
@@ -9083,20 +8069,12 @@ impl TerminalState {
                 }
             }
             'c' => {
-                if intermediates.is_empty() {
-                    match private_prefix {
-                        None => {
-                            crate::debug_log!("[DA] primary device attributes request");
-                            self.output_buffer
-                                .extend_from_slice(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE);
-                        }
-                        Some(b'>') => {
-                            crate::debug_log!("[DA] secondary device attributes request");
-                            self.output_buffer
-                                .extend_from_slice(SECONDARY_DEVICE_ATTRIBUTES_RESPONSE);
-                        }
-                        _ => {}
-                    }
+                if let Some(reply) = jterm_engine::semantics::legacy_device_attributes_reply(
+                    private_prefix,
+                    intermediates,
+                ) {
+                    crate::debug_log!("[DA] device attributes request prefix={private_prefix:?}");
+                    self.output_buffer.extend_from_slice(reply);
                 }
             }
             'p' => {
@@ -9140,79 +8118,38 @@ impl TerminalState {
                 // scroll region from a mode number: restoring 1049 clamps to
                 // the bottom row, every line feed then scrolls inside that one
                 // row, and the screen looks frozen.
-                let top = match params.first().copied().unwrap_or(1) {
-                    0 => 1,
-                    v => v as usize,
-                };
+                let top = first.unwrap_or(1).max(1) as usize;
                 let bottom = match params.get(1).copied().unwrap_or(self.grid.rows() as u16) {
                     0 => self.grid.rows(),
                     v => v as usize,
                 };
 
-                // Convert from 1-indexed to 0-indexed, and clamp to valid range
-                self.scroll_region_top = top
-                    .saturating_sub(1)
-                    .min(self.grid.rows().saturating_sub(1));
-                self.scroll_region_bottom = bottom
-                    .saturating_sub(1)
-                    .min(self.grid.rows().saturating_sub(1));
-
-                // If range is invalid, reset to full screen
-                if self.scroll_region_top > self.scroll_region_bottom {
-                    self.scroll_region_top = 0;
-                    self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
-                }
-
-                // Move cursor to home position when setting scroll region. In
-                // origin mode (DECOM) home is the top of the scroll region, not
-                // the absolute top of the screen.
-                self.cursor_row = if self.modes.contains(&6) {
-                    self.scroll_region_top
-                } else {
-                    0
-                };
-                self.cursor_col = 0;
-                self.pending_wrap = false;
+                self.cursor_controls().set_scroll_region(top, bottom);
             }
             '@' => {
-                // ICH shares IRM's bounded bulk shift and wide-cell repair.
-                let n = params.first().copied().unwrap_or(1).max(1) as usize;
-                let n = n.min(self.grid.row_len().saturating_sub(self.cursor_col));
-                self.shift_cells_right(self.cursor_row, self.cursor_col, n);
+                let count = params.first().copied().unwrap_or(1).max(1) as usize;
+                self.shift_cells_right(self.cursor_row, self.cursor_col, count);
             }
             'P' => {
-                // DCH - Delete Character(s)
-                let n = params.first().copied().unwrap_or(1).max(1) as usize;
-                // Beyond the remaining columns the row is already blank; see IL.
-                let n = n.min(self.grid.row_len().saturating_sub(self.cursor_col));
-                let blank_cell = self.create_blank_cell();
-                // Deleting one half of a double-width character has to take the
-                // other half with it, at both edges of the deleted window: the
-                // lead left standing to the left of it, and the continuation the
-                // shift would drag in from the right.
-                self.blank_wide_pair_at(self.cursor_row, self.cursor_col);
-                self.blank_wide_pair_at(self.cursor_row, self.cursor_col + n);
-                if n > 0 {
-                    let cols = self.grid.row_len();
-                    let line = &mut self.grid[self.cursor_row];
-                    line.copy_within(self.cursor_col + n..cols, self.cursor_col);
-                    line[cols - n..].fill(blank_cell);
-                }
-                // Mark row as dirty after modification
+                let count = params.first().copied().unwrap_or(1).max(1) as usize;
+                let blank = self.create_blank_cell();
+                self.grid.storage.delete_cells(
+                    self.cursor_row,
+                    self.cursor_col,
+                    count,
+                    blank,
+                    WideCellEditPolicy::ClearBoundaryPairs,
+                );
                 self.mark_row_dirty(self.cursor_row);
             }
             'X' => {
-                // ECH - Erase Character(s)
-                let n = params.first().copied().unwrap_or(1).max(1) as usize;
-                for i in 0..n {
-                    let col = self.cursor_col + i;
-                    if col < self.grid.row_len() {
-                        self.clear_cell(self.cursor_row, col);
-                    } else {
-                        break;
-                    }
-                }
-                // Mark row as dirty after modification
+                let count = params.first().copied().unwrap_or(1).max(1) as usize;
+                let blank = self.create_blank_cell();
+                self.grid.storage.erase_cells(
+                    self.cursor_row,
+                    self.cursor_col..self.cursor_col.saturating_add(count),
+                    blank,
+                );
                 self.mark_row_dirty(self.cursor_row);
             }
             'q' => {
@@ -9239,195 +8176,12 @@ impl TerminalState {
         }
     }
 
-    /// Resolve an extended color (SGR 38/48/58) from either the colon sub-parameter
-    /// form (within a single group, e.g. `38:2:r:g:b` or `38:2:cs:r:g:b`) or the
-    /// legacy semicolon form (`38;2;r;g;b`), advancing `gi` past consumed groups.
-    fn parse_ext_color(groups: &[SmallVec<[u16; 6]>], gi: &mut usize) -> Option<Color> {
-        let g = &groups[*gi];
-        if g.len() >= 2 {
-            // Colon sub-parameter form: everything lives in this group.
-            match g[1] {
-                5 => g.get(2).map(|&n| Color::Indexed(n as u8)),
-                2 => {
-                    // 38:2:r:g:b (len 5) or 38:2:colorspace:r:g:b (len >= 6)
-                    if g.len() >= 6 {
-                        Some(Color::Rgb(g[3] as u8, g[4] as u8, g[5] as u8))
-                    } else if g.len() >= 5 {
-                        Some(Color::Rgb(g[2] as u8, g[3] as u8, g[4] as u8))
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            }
-        } else {
-            // Legacy semicolon form: the kind and components are separate groups.
-            let first = |idx: usize| groups.get(idx).and_then(|x| x.first().copied());
-            match first(*gi + 1) {
-                Some(5) => {
-                    let n = first(*gi + 2);
-                    *gi += 2;
-                    n.map(|n| Color::Indexed(n as u8))
-                }
-                Some(2) => {
-                    let (r, gg, b) = (first(*gi + 2), first(*gi + 3), first(*gi + 4));
-                    *gi += 4;
-                    match (r, gg, b) {
-                        (Some(r), Some(gg), Some(b)) => {
-                            Some(Color::Rgb(r as u8, gg as u8, b as u8))
-                        }
-                        _ => None,
-                    }
-                }
-                _ => None,
-            }
-        }
-    }
-
-    fn handle_sgr(&mut self, groups: &[SmallVec<[u16; 6]>]) {
-        // CSI m with no parameters is a full reset.
-        if groups.len() == 1 && groups[0].len() == 1 && groups[0][0] == 0 {
-            self.current_flags = StyleFlags::default();
-            self.current_fg = Color::Default;
-            self.current_bg = Color::Default;
-            return;
-        }
-
-        let mut gi = 0;
-        while gi < groups.len() {
-            let g = &groups[gi];
-            let param = g.first().copied().unwrap_or(0);
-            match param {
-                0 => {
-                    self.current_flags = StyleFlags::default();
-                    self.current_fg = Color::Default;
-                    self.current_bg = Color::Default;
-                }
-                1 => self.current_flags.set_bold(true),
-                2 => self.current_flags.set_dim(true),
-                3 => self.current_flags.set_italic(true),
-                4 => {
-                    // Colon sub-parameter (4:n) selects the underline style; plain 4 is
-                    // a single underline. Semicolon-separated values are NOT consumed here.
-                    let style = if g.len() >= 2 { g[1] } else { 1 };
-                    self.current_flags.set_underline(match style {
-                        0 => UnderlineStyle::None,
-                        1 => UnderlineStyle::Single,
-                        2 => UnderlineStyle::Double,
-                        3 => UnderlineStyle::Curly,
-                        4 => UnderlineStyle::Dotted,
-                        5 => UnderlineStyle::Dashed,
-                        _ => UnderlineStyle::Single,
-                    });
-                }
-                5 => self.current_flags.set_blink(true),
-                7 => self.current_flags.set_inverse(true),
-                9 => self.current_flags.set_strikethrough(true),
-                21 => self.current_flags.set_underline(UnderlineStyle::Double),
-                22 => {
-                    self.current_flags.set_bold(false);
-                    self.current_flags.set_dim(false);
-                }
-                23 => self.current_flags.set_italic(false),
-                24 => self.current_flags.set_underline(UnderlineStyle::None),
-                25 => self.current_flags.set_blink(false),
-                27 => self.current_flags.set_inverse(false),
-                29 => self.current_flags.set_strikethrough(false),
-                39 => self.current_fg = Color::Default,
-                30..=37 => {
-                    self.current_fg = match param {
-                        30 => Color::Black,
-                        31 => Color::Red,
-                        32 => Color::Green,
-                        33 => Color::Yellow,
-                        34 => Color::Blue,
-                        35 => Color::Magenta,
-                        36 => Color::Cyan,
-                        37 => Color::White,
-                        _ => Color::Default,
-                    };
-                }
-                49 => self.current_bg = Color::Default,
-                40..=47 => {
-                    self.current_bg = match param {
-                        40 => Color::Black,
-                        41 => Color::Red,
-                        42 => Color::Green,
-                        43 => Color::Yellow,
-                        44 => Color::Blue,
-                        45 => Color::Magenta,
-                        46 => Color::Cyan,
-                        47 => Color::White,
-                        _ => Color::Default,
-                    };
-                    self.global_bg = self.current_bg; // Update global background
-                }
-                90..=97 => {
-                    self.current_fg = match param {
-                        90 => Color::BrightBlack,
-                        91 => Color::BrightRed,
-                        92 => Color::BrightGreen,
-                        93 => Color::BrightYellow,
-                        94 => Color::BrightBlue,
-                        95 => Color::BrightMagenta,
-                        96 => Color::BrightCyan,
-                        97 => Color::BrightWhite,
-                        _ => Color::Default,
-                    };
-                }
-                100..=107 => {
-                    self.current_bg = match param {
-                        100 => Color::BrightBlack,
-                        101 => Color::BrightRed,
-                        102 => Color::BrightGreen,
-                        103 => Color::BrightYellow,
-                        104 => Color::BrightBlue,
-                        105 => Color::BrightMagenta,
-                        106 => Color::BrightCyan,
-                        107 => Color::BrightWhite,
-                        _ => Color::Default,
-                    };
-                    self.global_bg = self.current_bg; // Update global background
-                }
-                38 => {
-                    if let Some(color) = Self::parse_ext_color(groups, &mut gi) {
-                        self.current_fg = color;
-                    }
-                }
-                48 => {
-                    if let Some(color) = Self::parse_ext_color(groups, &mut gi) {
-                        self.current_bg = color;
-                        self.global_bg = self.current_bg;
-                    }
-                }
-                58 => {
-                    // SGR 58: set underline color. We don't render a distinct
-                    // underline color yet, but its arguments MUST be consumed so
-                    // the legacy `58;2;r;g;b` form doesn't leak r/g/b as SGR codes.
-                    let _ = Self::parse_ext_color(groups, &mut gi);
-                }
-                59 => {
-                    // SGR 59: reset underline color to default - no-op.
-                }
-                _ => {}
-            }
-            gi += 1;
-        }
-    }
-
     /// DECALN (ESC # 8): fill the entire screen with 'E', used for alignment tests.
     fn decaln(&mut self) {
-        for row in self.grid.iter_mut() {
-            for cell in row.iter_mut() {
-                *cell = TerminalCell {
-                    character: 'E',
-                    foreground: Color::Default,
-                    background: Color::Default,
-                    flags: StyleFlags::default(),
-                    hyperlink_id: HyperlinkId::NONE,
-                };
-            }
-        }
+        self.grid.storage.fill_cells(TerminalCell {
+            character: 'E',
+            ..TerminalCell::default()
+        });
         self.cursor_row = 0;
         self.cursor_col = 0;
         self.pending_wrap = false;
@@ -9452,11 +8206,11 @@ impl TerminalState {
         self.active_charset = Charset::Ascii;
         self.scroll_region_top = 0;
         self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
-        self.tab_stops = Self::default_tab_stops(self.grid.row_len());
+        self.tab_stops = default_tab_stops(self.grid.row_len(), TabStopOrigin::Clear);
         self.saved_cursor = None;
-        self.modes = TerminalModes::default();
-        self.modes.insert(25); // cursor visible
-        self.modes.insert(7); // autowrap on
+        *self.protocol.modes_mut() = Self::initial_protocol_modes();
+        self.insert_mode = false;
+        self.origin_mode = false;
         self.scroll_offset = 0;
         self.pending_wrap = false;
         // xterm RIS also discards saved lines and resets cursor style, dynamic
@@ -9504,10 +8258,12 @@ impl TerminalState {
         self.last_synced_primary_screen_snapshot.clear();
         self.cursor_shape = CursorShape::default();
         self.colors.reset_dynamic();
-        self.keyboard_enhancement_flags = 0;
-        self.keyboard_enhancement_stack.clear();
-        self.alt_keyboard_enhancement_flags = 0;
-        self.alt_keyboard_enhancement_stack.clear();
+        // RIS clears both screen-local Kitty stacks. Frost historically
+        // retains the global xterm keyboard settings across this reset.
+        self.protocol.reset_keyboard_enhancement();
+        self.protocol.switch_screen();
+        self.protocol.reset_keyboard_enhancement();
+        self.protocol.switch_screen();
         self.clear_text_selection();
         self.current_hyperlink = None;
         self.osc8_hyperlinks.clear();
@@ -9536,10 +8292,10 @@ impl TerminalState {
         self.saved_cursor = None;
         // Reset the modes DECSTR is defined to touch: DECOM (6) off, IRM (4) off,
         // DECTCEM (25) on, DECAWM (7) on. Leave everything else as-is.
-        self.modes.remove(&6);
-        self.modes.remove(&4);
-        self.modes.insert(25);
-        self.modes.insert(7);
+        self.origin_mode = false;
+        self.insert_mode = false;
+        self.protocol.modes_mut().insert(25);
+        self.protocol.modes_mut().insert(7);
         self.pending_wrap = false;
     }
 
@@ -9567,18 +8323,8 @@ impl TerminalState {
         } else {
             self.archive_visible_screen_to_scrollback();
         }
-        let bg_color = self.current_bg;
-        for row in self.grid.iter_mut() {
-            for cell in row.iter_mut() {
-                *cell = TerminalCell {
-                    character: ' ',
-                    foreground: Color::Default,
-                    background: bg_color,
-                    flags: StyleFlags::default(),
-                    hyperlink_id: HyperlinkId::NONE,
-                };
-            }
-        }
+        let blank = self.create_blank_cell();
+        self.grid.storage.fill_cells(blank);
         self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
     }
 
@@ -9588,13 +8334,15 @@ impl TerminalState {
             // Everything else (GATM 1, ERM 6, VEM 7, LNM 20, …) is ignored so
             // it can't collide with the identically-numbered DEC private modes.
             if mode == 4 {
-                self.modes.insert(4);
+                self.insert_mode = true;
             }
             return;
         }
         // Revoke even a mode round-trip hidden inside one PTY batch. A fresh
         // view must not reinterpret an already queued local scroll as app input.
-        if matches!(mode, 1000..=1003 | 1005 | 1006 | 1015) && !self.modes.contains(&mode) {
+        if matches!(mode, 1000..=1003 | 1005 | 1006 | 1015)
+            && !self.protocol.modes().contains(&mode)
+        {
             self.projection_scroll_guard.revoke();
         }
         match mode {
@@ -9604,110 +8352,69 @@ impl TerminalState {
             }
             25 => {
                 // Show cursor (mode 25)
-                self.modes.insert(25);
+                self.protocol.modes_mut().insert(25);
             }
             1004 => {
                 // Focus event reporting
-                self.modes.insert(1004);
+                self.protocol.modes_mut().insert(1004);
             }
             2004 => {
                 // Bracketed paste mode
-                self.modes.insert(2004);
+                self.protocol.modes_mut().insert(2004);
             }
             1000..=1003 => {
                 // Mouse reporting modes
-                self.modes.insert(mode);
+                self.protocol.modes_mut().insert(mode);
             }
             1006 => {
                 // SGR mouse reporting format
-                self.modes.insert(mode);
+                self.protocol.modes_mut().insert(mode);
             }
             1048 => {
                 // Save cursor (DECSC equivalent), no buffer switch.
                 self.save_cursor();
-                self.modes.insert(1048);
+                self.protocol.modes_mut().insert(1048);
             }
             47 | 1047 | 1049 => {
-                if self.disable_alt_screen {
+                if self.disable_alt_screen || self.use_alt_buffer {
                     return;
                 }
-                // Alternate screen buffer (47/1047 = swap only, 1049 also saves
-                // the main-screen cursor). We treat all three as a buffer swap.
-                if !self.use_alt_buffer {
-                    // Save main buffer state (cursor position)
-                    self.saved_cursor_row = self.cursor_row;
-                    self.saved_cursor_col = self.cursor_col;
-                    self.saved_primary_screen_state = Some(self.snapshot_cursor_state());
-                    self.saved_primary_global_bg = self.global_bg;
-                    self.saved_primary_cursor_shape = self.cursor_shape;
-                    self.saved_primary_colors = self.colors.clone();
+                self.saved_primary_global_bg = self.global_bg;
+                self.saved_primary_cursor_shape = self.cursor_shape;
+                self.saved_primary_colors = self.colors.clone();
+                self.scroll_offset = 0;
+                self.provisional_alt_snapshot = None;
 
-                    // Reset scroll offset so we don't show scrollback in alt buffer
-                    self.scroll_offset = 0;
-                    self.provisional_alt_snapshot = None;
-
-                    // Switch to alternate buffer
-                    std::mem::swap(&mut self.grid, &mut self.alt_grid);
-                    self.alt_cursor_row = self.cursor_row;
-                    self.alt_cursor_col = self.cursor_col;
-                    std::mem::swap(
-                        &mut self.keyboard_enhancement_flags,
-                        &mut self.alt_keyboard_enhancement_flags,
-                    );
-                    std::mem::swap(
-                        &mut self.keyboard_enhancement_stack,
-                        &mut self.alt_keyboard_enhancement_stack,
-                    );
-                    self.watch_batch.interrupted = true;
-                    self.watch_batch.boundary = true;
-                    self.projection_scroll_guard.revoke();
-                    self.use_alt_buffer = true;
-                    self.organism_idle_cwd = None;
-                    // Retained cells keep their keys, but an unterminated
-                    // primary-screen link must not arm alternate-screen text.
-                    self.current_hyperlink = None;
-
-                    // Selection anchors are absolute (scrollback+grid) row indices
-                    // tied to the buffer that was visible. After a buffer swap they
-                    // would highlight unrelated lines, so drop the selection.
-                    self.clear_text_selection();
-                    // DECSTBM is a per-buffer attribute; reset to full-screen so a
-                    // partial scroll region from the main buffer doesn't leak in.
-                    self.scroll_region_top = 0;
-                    self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
-
-                    // Clear alt buffer and move cursor to home
-                    self.clear_screen();
-                    self.modes.insert(mode);
-                }
+                // Frost saves the primary cursor and clears the alternate grid
+                // for 47, 1047 and 1049 alike.
+                let autowrap = self.protocol.modes().contains(&7);
+                let entered = self.alternate_screen_controls().enter(true, autowrap);
+                debug_assert!(entered);
+                self.protocol.switch_screen();
+                self.watch_batch.interrupted = true;
+                self.watch_batch.boundary = true;
+                self.projection_scroll_guard.revoke();
+                self.organism_idle_cwd = None;
+                self.current_hyperlink = None;
+                self.clear_text_selection();
+                self.clear_screen();
+                self.protocol.modes_mut().insert(mode);
             }
             2026 => {
                 // Synchronized output: suppress rendering until cleared
-                self.modes.insert(2026);
+                self.protocol.modes_mut().insert(2026);
                 self.sync_output_active = true;
                 self.sync_output_start
                     .get_or_insert_with(std::time::Instant::now);
             }
-            6 => {
-                // DECOM origin mode. `place_cursor` and `set_cursor_row_abs`
-                // already read this bit, and `decrqm_private_mode_state`
-                // advertises the mode as recognized — but without an arm here it
-                // landed in the catch-all below, which records the bit and
-                // leaves the cursor where it was. Setting DECOM homes to the
-                // top of the scroll region.
-                self.modes.insert(6);
-                self.cursor_row = self.scroll_region_top;
-                self.cursor_col = 0;
-                self.pending_wrap = false;
-            }
+            6 => self.cursor_controls().set_origin_mode(true),
             7 => {
                 // Autowrap mode
-                self.modes.insert(7);
+                self.protocol.modes_mut().insert(7);
             }
-            _ => {
-                // Unknown mode, just store it
-                self.modes.insert(mode);
-            }
+            // Keep Frost's legacy admission independent of engine profiles.
+            1 | 66 | 1005 | 1015 | 2031 | 5522 => self.protocol.modes_mut().insert(mode),
+            _ => {}
         }
     }
 
@@ -9715,13 +8422,14 @@ impl TerminalState {
         if !private {
             // ANSI Reset Mode (CSI Pn l). Only IRM (4) is implemented.
             if mode == 4 {
-                self.modes.remove(&4);
+                self.insert_mode = false;
             }
             return;
         }
         // Revoke even a mode round-trip hidden inside one PTY batch. A fresh
         // view must not reinterpret an already queued local scroll as app input.
-        if matches!(mode, 1000..=1003 | 1005 | 1006 | 1015) && self.modes.contains(&mode) {
+        if matches!(mode, 1000..=1003 | 1005 | 1006 | 1015) && self.protocol.modes().contains(&mode)
+        {
             self.projection_scroll_guard.revoke();
         }
         match mode {
@@ -9730,90 +8438,47 @@ impl TerminalState {
             }
             25 => {
                 // Hide cursor
-                self.modes.remove(&25);
+                self.protocol.modes_mut().remove(&25);
             }
             1004 => {
                 // Disable focus event reporting
-                self.modes.remove(&1004);
+                self.protocol.modes_mut().remove(&1004);
             }
             2004 => {
                 // Disable bracketed paste mode
-                self.modes.remove(&2004);
+                self.protocol.modes_mut().remove(&2004);
             }
             1000..=1003 => {
                 // Disable mouse reporting
-                self.modes.remove(&mode);
+                self.protocol.modes_mut().remove(&mode);
             }
             1006 => {
                 // Disable SGR mouse reporting format
-                self.modes.remove(&mode);
+                self.protocol.modes_mut().remove(&mode);
             }
             1048 => {
                 // Restore cursor (DECRC equivalent), no buffer switch.
                 self.restore_cursor();
-                self.modes.remove(&1048);
+                self.protocol.modes_mut().remove(&1048);
             }
             47 | 1047 | 1049 => {
-                // Restore main screen buffer
-                if self.use_alt_buffer {
-                    // Save alt buffer state (cursor position)
-                    self.alt_cursor_row = self.cursor_row;
-                    self.alt_cursor_col = self.cursor_col;
-
-                    // Switch back to main buffer
-                    std::mem::swap(&mut self.grid, &mut self.alt_grid);
-                    self.cursor_row = self.saved_cursor_row;
-                    self.cursor_col = self.saved_cursor_col;
-                    std::mem::swap(
-                        &mut self.keyboard_enhancement_flags,
-                        &mut self.alt_keyboard_enhancement_flags,
-                    );
-                    std::mem::swap(
-                        &mut self.keyboard_enhancement_stack,
-                        &mut self.alt_keyboard_enhancement_stack,
-                    );
+                if let Some(effect) = self
+                    .alternate_screen_controls()
+                    .leave(AlternateRestorePolicy::Frost)
+                {
+                    self.protocol.switch_screen();
                     self.watch_batch.interrupted = true;
                     self.watch_batch.boundary = true;
                     self.projection_scroll_guard.revoke();
-                    self.use_alt_buffer = false;
                     // Whatever the alternate screen last left in scrollback is
                     // all that remains of it, so it stops being provisional.
                     self.provisional_alt_snapshot = None;
-                    self.modes.remove(&mode);
-                    self.pending_wrap = false;
+                    self.protocol.modes_mut().remove(&mode);
                     // Likewise, alt-screen OSC 8 state never leaks back onto
                     // newly printed primary-screen cells.
                     self.current_hyperlink = None;
 
-                    // See the matching set_mode arm: clear selection because its
-                    // anchors point into the alt buffer, and reset DECSTBM so the
-                    // alt buffer's scroll region doesn't carry into the main one.
                     self.clear_text_selection();
-                    self.scroll_region_top = 0;
-                    self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
-
-                    // Restore the hidden primary screen's drawing state so any
-                    // resize that happened while a fullscreen app was active
-                    // does not leave the main buffer tinted with alt colors.
-                    if let Some(saved) = self.saved_primary_screen_state.take() {
-                        self.current_fg = saved.fg;
-                        self.current_bg = saved.bg;
-                        self.current_flags = saved.flags;
-                        self.g0_charset = saved.g0;
-                        self.g1_charset = saved.g1;
-                        self.active_charset = saved.active;
-                        if saved.origin_mode {
-                            self.modes.insert(6);
-                        } else {
-                            self.modes.remove(&6);
-                        }
-                        self.pending_wrap = saved.pending_wrap;
-                    } else {
-                        self.current_fg = Color::Default;
-                        self.current_bg = Color::Default;
-                        self.current_flags = StyleFlags::default();
-                        self.modes.remove(&6);
-                    }
                     self.global_bg = self.saved_primary_global_bg;
                     self.saved_primary_global_bg = Color::Default;
                     self.cursor_shape = self.saved_primary_cursor_shape;
@@ -9822,29 +8487,20 @@ impl TerminalState {
 
                     // Mark all rows dirty after grid swap to force full re-render
                     // Increment by rows+1 to trigger grid_version_jumped in ui.rs
-                    self.grid_version += self.grid.rows() as u64 + 1;
+                    self.grid_version += effect.dirty_rows.len() as u64 + 1;
                     self.row_versions.fill(self.grid_version);
                 }
             }
             2026 => {
                 self.finish_synchronized_output();
             }
-            6 => {
-                // Resetting DECOM homes to the absolute top-left, not to the
-                // scroll region's top. See the matching arm in `set_mode`.
-                self.modes.remove(&6);
-                self.cursor_row = 0;
-                self.cursor_col = 0;
-                self.pending_wrap = false;
-            }
+            6 => self.cursor_controls().set_origin_mode(false),
             7 => {
                 // Disable autowrap
-                self.modes.remove(&7);
+                self.protocol.modes_mut().remove(&7);
             }
-            _ => {
-                // Unknown mode, just remove it
-                self.modes.remove(&mode);
-            }
+            1 | 66 | 1005 | 1015 | 2031 | 5522 => self.protocol.modes_mut().remove(&mode),
+            _ => {}
         }
     }
 
@@ -9895,7 +8551,7 @@ impl TerminalState {
         col: usize,
     ) -> Option<RawCellOrigin> {
         let width = if absolute_row < self.scrollback.len() {
-            self.scrollback.get(absolute_row)?.cols as usize
+            self.scrollback.get(absolute_row)?.columns()
         } else {
             self.grid.cols()
         };
@@ -10022,7 +8678,7 @@ impl TerminalState {
 
     fn cursor_enabled(&self) -> bool {
         // DEC mode 25 is independent of how a host viewport is scrolled.
-        self.modes.contains(&25)
+        self.protocol.modes().contains(&25)
     }
 
     pub fn is_cursor_visible(&self) -> bool {
@@ -10066,24 +8722,13 @@ impl TerminalState {
         self.settle_pending_saved_line_purge();
     }
 
-    /// Project only mouse wire modes; Frost keeps its distinct mode storage,
-    /// lifecycle and input routing. Never reinterpret the host bit layout.
-    fn mouse_wire_modes(&self) -> jterm_engine::protocol_state::TerminalModes {
-        let mut modes = jterm_engine::protocol_state::TerminalModes::default();
-        for mode in [1000, 1002, 1003, 1005, 1006, 1015] {
-            if self.modes.contains(&mode) {
-                modes.insert(mode);
-            }
-        }
-        modes
-    }
-
     pub fn get_mouse_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
-        self.mouse_wire_modes().get_mouse_report(button, col, row)
+        self.protocol.modes().get_mouse_report(button, col, row)
     }
 
     pub fn get_mouse_release_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
-        self.mouse_wire_modes()
+        self.protocol
+            .modes()
             .get_mouse_release_report(button, col, row)
     }
 
@@ -10094,12 +8739,12 @@ impl TerminalState {
     }
 
     pub fn is_mouse_enabled(&self) -> bool {
-        self.modes.contains(&1000) || self.modes.contains(&1002) || self.modes.contains(&1003)
+        self.protocol.modes().is_mouse_enabled()
     }
 
     /// True when the app requested button-drag (1002) or any-motion (1003) reporting.
     pub fn is_mouse_motion_enabled(&self) -> bool {
-        self.modes.contains(&1002) || self.modes.contains(&1003)
+        self.protocol.modes().should_report_mouse_motion(true)
     }
 
     /// Public view of the alt-screen mode switch; block-mode chrome (and
@@ -10109,11 +8754,11 @@ impl TerminalState {
     }
 
     pub fn is_bracketed_paste_enabled(&self) -> bool {
-        self.modes.contains(&2004)
+        self.protocol.modes().contains(&2004)
     }
 
     pub fn is_application_cursor_keys(&self) -> bool {
-        self.modes.contains(&1)
+        self.protocol.modes().contains(&1)
     }
 
     /// How much of the shell's work this terminal can actually see.
@@ -10304,19 +8949,19 @@ impl TerminalState {
     }
 
     pub fn is_application_keypad(&self) -> bool {
-        self.modes.contains(&66)
+        self.protocol.modes().contains(&66)
     }
 
     pub fn keyboard_enhancement_flags(&self) -> u16 {
-        self.keyboard_enhancement_flags
+        self.protocol.keyboard_enhancement_flags()
     }
 
     pub fn xterm_modify_other_keys(&self) -> u16 {
-        self.xterm_modify_other_keys
+        self.protocol.xterm_modify_other_keys()
     }
 
     pub fn xterm_format_other_keys(&self) -> u16 {
-        self.xterm_format_other_keys
+        self.protocol.xterm_format_other_keys()
     }
 
     /// True only when the app asked for every key press as an escape code, i.e.
@@ -10326,7 +8971,7 @@ impl TerminalState {
     /// Treating it as a keyboard mode turned ordinary typing into CSI-u reports
     /// and lost the shifted form of every character.
     pub fn is_report_all_keys_enabled(&self) -> bool {
-        (self.keyboard_enhancement_flags & 0b1000) != 0
+        (self.protocol.keyboard_enhancement_flags() & 0b1000) != 0
     }
 
     pub fn build_paste_event(&mut self, mime_types: &[String]) -> Vec<u8> {
@@ -10501,7 +9146,7 @@ impl TerminalState {
                 let row = self.raw_row_id_at_absolute(start)?;
                 let previous = start.checked_sub(1)?;
                 let wrapped = if previous < self.scrollback.len() {
-                    self.scrollback[previous].is_wrapped
+                    self.scrollback[previous].is_wrapped()
                 } else {
                     *self
                         .grid
@@ -10554,7 +9199,7 @@ impl TerminalState {
             let row = self.raw_row_id_at_absolute(start)?;
             let wrapped = start.checked_sub(1).is_some_and(|previous| {
                 if previous < self.scrollback.len() {
-                    self.scrollback[previous].is_wrapped
+                    self.scrollback[previous].is_wrapped()
                 } else {
                     self.grid
                         .row_wrapped()
@@ -10789,7 +9434,7 @@ impl TerminalState {
             return None;
         }
         let retained_history = old.history_len - evicted;
-        if retained_history > 0 && self.scrollback.get(retained_history - 1)?.is_wrapped {
+        if retained_history > 0 && self.scrollback.get(retained_history - 1)?.is_wrapped() {
             return None;
         }
         // These identities certify a pure append/front-eviction operation,
@@ -11013,8 +9658,8 @@ impl TerminalState {
         let mut i = 0;
 
         while i < lines.len() {
-            let group_first_source = lines[i].raw_row_id.is_tracked().then_some(RowSource {
-                raw_row: lines[i].raw_row_id,
+            let group_first_source = lines[i].raw_row_id().is_tracked().then_some(RowSource {
+                raw_row: lines[i].raw_row_id(),
                 raw_absolute_row: raw_absolute_start + i,
             });
             let mut logical_cells: Vec<TerminalCell> = Vec::new();
@@ -11024,11 +9669,11 @@ impl TerminalState {
                 let retained = Self::strip_trailing_blanks(&decompressed);
                 let view_col_start = logical_cells.len();
                 logical_cells.extend_from_slice(retained);
-                if !retained.is_empty() && line.raw_row_id.is_tracked() {
+                if !retained.is_empty() && line.raw_row_id().is_tracked() {
                     logical_spans.push(LineOriginSpan {
                         view_col_start,
                         view_col_end: logical_cells.len(),
-                        raw_row: line.raw_row_id,
+                        raw_row: line.raw_row_id(),
                         raw_col_start: 0,
                         raw_absolute_row,
                     });
@@ -11036,7 +9681,7 @@ impl TerminalState {
             };
 
             append_line(&lines[i], raw_absolute_start + i);
-            while i < lines.len() && lines[i].is_wrapped {
+            while i < lines.len() && lines[i].is_wrapped() {
                 i += 1;
                 if i < lines.len() {
                     append_line(&lines[i], raw_absolute_start + i);
@@ -11163,7 +9808,7 @@ impl TerminalState {
             .scrollback
             .len()
             .saturating_sub(self.scroll_offset + rows);
-        while start_idx > 0 && self.scrollback[start_idx - 1].is_wrapped {
+        while start_idx > 0 && self.scrollback[start_idx - 1].is_wrapped() {
             start_idx -= 1;
         }
         let history: Vec<_> = self.scrollback.iter().skip(start_idx).cloned().collect();
@@ -13536,7 +12181,7 @@ impl TerminalState {
                 };
 
                 let row_is_wrapped = if abs_row < scrollback_len {
-                    self.scrollback[abs_row].is_wrapped
+                    self.scrollback[abs_row].is_wrapped()
                 } else {
                     let grid_row = abs_row - scrollback_len;
                     grid_row < grid_rows && self.grid.row_wrapped()[grid_row]
@@ -13602,13 +12247,7 @@ impl TerminalState {
 
     fn strip_trailing_blanks(cells: &[TerminalCell]) -> &[TerminalCell] {
         let mut end = cells.len();
-        while end > 0
-            && cells[end - 1].character == ' '
-            && cells[end - 1].background == Color::Default
-            && !cells[end - 1].flags.wide()
-            && !cells[end - 1].flags.wide_continuation()
-            && cells[end - 1].hyperlink_id.is_none()
-        {
+        while end > 0 && cells[end - 1].is_reflow_trimmable_blank() {
             end -= 1;
         }
         &cells[..end]
@@ -13628,7 +12267,7 @@ impl TerminalState {
             let mut logical_line: Vec<TerminalCell> = Vec::new();
             let decompressed = lines[i].decompress();
             logical_line.extend_from_slice(Self::strip_trailing_blanks(&decompressed));
-            while i < len && lines[i].is_wrapped {
+            while i < len && lines[i].is_wrapped() {
                 i += 1;
                 if i < len {
                     let dc = lines[i].decompress();
@@ -13659,7 +12298,7 @@ impl TerminalState {
                 }
                 if result.len() > group_start {
                     if let Some(last) = result.last_mut() {
-                        last.is_wrapped = false;
+                        last.storage.is_wrapped = false;
                     }
                 }
                 continue;
@@ -13719,7 +12358,7 @@ impl TerminalState {
             let mut wrapped = false;
             if let Some(line) = line {
                 group_open = true;
-                wrapped = line.is_wrapped;
+                wrapped = line.is_wrapped();
                 let decompressed = line.decompress();
                 #[cfg(test)]
                 BOUNDED_REFLOW_PEAK.with(|peak| {
@@ -13910,6 +12549,7 @@ impl TerminalState {
         let active_blank_cell = self.create_blank_cell();
         let primary_blank_bg = if self.use_alt_buffer {
             self.saved_primary_screen_state
+                .as_ref()
                 .map(|state| state.bg)
                 .unwrap_or(Color::Default)
         } else {
@@ -13937,7 +12577,6 @@ impl TerminalState {
             // the cursor above row 0; any remainder is truncated from the bottom.
             let top_remove = to_remove.saturating_sub(blank_below).min(self.cursor_row);
             if top_remove > 0 {
-                let cols_now = self.grid.row_len();
                 for r in 0..top_remove {
                     let line = ScrollbackLine::compress_with_raw_row_id(
                         &self.grid[r],
@@ -13946,14 +12585,8 @@ impl TerminalState {
                     );
                     self.push_scrollback_compressed(line);
                 }
-                let src_start = top_remove * cols_now;
-                let total = old_rows * cols_now;
-                self.grid.cells_mut().copy_within(src_start..total, 0);
                 self.grid
-                    .row_wrapped_mut()
-                    .copy_within(top_remove..old_rows, 0);
-                self.grid.row_ids_mut().copy_within(top_remove..old_rows, 0);
-                self.grid.bump_identity_revision();
+                    .discard_top_rows_for_resize(top_remove, active_blank_cell);
                 self.cursor_row -= top_remove;
                 self.saved_cursor_row = self.saved_cursor_row.saturating_sub(top_remove);
             }
@@ -13985,13 +12618,7 @@ impl TerminalState {
 
         // Keep the tab-stop table sized to the new column count, defaulting any
         // newly added columns to the standard every-8 stops.
-        if cols != self.tab_stops.len() {
-            let old_len = self.tab_stops.len();
-            self.tab_stops.resize(cols, false);
-            for (c, stop) in self.tab_stops.iter_mut().enumerate().skip(old_len) {
-                *stop = c % 8 == 0 && c != 0;
-            }
-        }
+        resize_tab_stops(&mut self.tab_stops, cols, TabStopOrigin::Clear);
 
         // Resizing the live grid must not cancel a user's scrollback read. A
         // row shrink may have pushed grid rows into history above, and the
@@ -14183,7 +12810,7 @@ mod tests {
             "unknown",
         ] {
             assert_eq!(
-                super::TerminalState::parse_color_spec(invalid),
+                jterm_engine::colors::DynamicColorState::parse_frost_color_spec(invalid),
                 None,
                 "{invalid}"
             );
@@ -14196,7 +12823,10 @@ mod tests {
             ("rgb:1/ff/100", (1, 255, 0)),
             ("rgb:0100/ffff/0100", (0, 255, 0)),
         ] {
-            assert_eq!(super::TerminalState::parse_color_spec(spec), Some(expected));
+            assert_eq!(
+                jterm_engine::colors::DynamicColorState::parse_frost_color_spec(spec),
+                Some(expected)
+            );
         }
     }
 
@@ -15930,13 +14560,15 @@ mod tests {
         };
         cell.flags.set_bold(true);
         cell.flags.set_blink(true);
-        // Frost's retained format includes blink in extra_flags, unlike the
-        // engine's current scrollback format. Only the cell types are shared.
-        let encoded = ScrollbackLine::encode_cells(&[cell]);
+        // Frost's retained format includes blink in extra_flags.
+        let line = ScrollbackLine::compress(&[cell], false);
+        let jterm_engine::ScrollbackContent::Encoded(encoded) = line.storage.content() else {
+            panic!("styled row must use encoded storage");
+        };
         assert_eq!(encoded, [1, b'A', 0, 0, 1, 4, 0x34, 0x12, 1]);
-        assert_eq!(ScrollbackLine::decode_cells(&encoded, 1), [cell]);
+        assert_eq!(line.decompress(), [cell]);
         let mut streamed = Vec::new();
-        ScrollbackLine::visit_encoded_cells(&encoded, 1, |col, decoded| {
+        line.visit_search_cells(|col, decoded| {
             streamed.push((col, decoded));
         });
         assert_eq!(streamed, [(0, cell)]);
@@ -16362,10 +14994,10 @@ mod tests {
         for _ in 0..10_000 {
             terminal.push_scrollback_compressed(ScrollbackLine::compress(&cells, false));
         }
-        assert!(terminal
-            .scrollback
-            .iter()
-            .all(|line| matches!(line.data, super::CompressedLineData::Encoded(_))));
+        assert!(terminal.scrollback.iter().all(|line| matches!(
+            line.storage.content(),
+            jterm_engine::ScrollbackContent::Encoded(_)
+        )));
 
         super::PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.set(0));
         super::PROJECTED_HISTORY_LAYOUT_BYTE_SCAN_COUNT.with(|count| count.set(0));
@@ -17037,8 +15669,7 @@ mod tests {
         assert!(range.start.col < range.end.col);
         terminal.process_input(b"\r\n\r\n\r\n");
         assert!(terminal.scrollback.iter().any(|line| {
-            line.raw_row_id() == range.start.row
-                && usize::from(line.projected_active_len) == range.start.col
+            line.raw_row_id() == range.start.row && line.reflow_content_len() == range.start.col
         }));
 
         let identity = terminal.get_projected_viewport(true);
@@ -17963,6 +16594,46 @@ mod tests {
     }
 
     #[test]
+    fn repeated_line_edits_keep_physical_wraps_and_frost_identity_order() {
+        let mut terminal = TerminalState::new(3, 6);
+        for (row, marker) in "ABCDEF".chars().enumerate() {
+            terminal.grid[row][0].character = marker;
+        }
+        let wraps = [true, false, true, false, true, false];
+        terminal.grid.row_wrapped_mut().copy_from_slice(&wraps);
+        let ids = terminal.grid.row_ids().to_vec();
+        let revision = terminal.grid.identity_revision;
+
+        // Rows two through five are the scroll region. Begin editing at row three.
+        terminal.process_batch(b"\x1b[2;5r\x1b[3;1H\x1b[2L");
+        assert_eq!(terminal.grid.row_wrapped(), wraps);
+        assert_eq!(terminal.grid.identity_revision, revision + 2);
+        assert_eq!(terminal.grid[2][0].character, ' ');
+        assert_eq!(terminal.grid[3][0].character, ' ');
+        assert_eq!(terminal.grid[4][0].character, 'C');
+        let inserted = terminal.grid.row_ids();
+        assert_eq!(
+            [inserted[0], inserted[1], inserted[4], inserted[5]],
+            [ids[0], ids[1], ids[2], ids[5]]
+        );
+        assert!(inserted[2] > inserted[3] && inserted[3] > ids[5]);
+
+        terminal.process_batch(b"\x1b[2M");
+        assert_eq!(terminal.grid.row_wrapped(), wraps);
+        assert_eq!(terminal.grid.identity_revision, revision + 4);
+        assert_eq!(terminal.grid[2][0].character, 'C');
+        assert_eq!(terminal.grid[3][0].character, ' ');
+        assert_eq!(terminal.grid[4][0].character, ' ');
+        let deleted = terminal.grid.row_ids();
+        assert_eq!(
+            [deleted[0], deleted[1], deleted[2], deleted[5]],
+            [ids[0], ids[1], ids[2], ids[5]]
+        );
+        assert!(deleted[4] > deleted[3] && deleted[3] > ids[5]);
+        assert!(terminal.scrollback.is_empty());
+    }
+
+    #[test]
     fn resize_preserves_retained_rows_but_normalization_reidentifies_history() {
         let mut terminal = TerminalState::new(5, 4);
         for row in 0..4 {
@@ -18356,6 +17027,27 @@ mod tests {
 
         assert_eq!(terminal.scroll_region_top, 2);
         assert_eq!((terminal.cursor_row, terminal.cursor_col), (2, 0));
+    }
+
+    #[test]
+    fn custom_tab_stops_survive_resize_and_ris_restores_frost_defaults() {
+        let mut terminal = TerminalState::new(12, 4);
+        assert!(!terminal.tab_stops[0]);
+        terminal.process_input(b"\x1b[3g\x1b[5G\x1bH");
+        terminal.on_resize(20, 4);
+
+        terminal.process_input(b"\r\t");
+        assert_eq!(terminal.cursor_col, 4);
+        terminal.process_input(b"\x1b[I");
+        assert_eq!(terminal.cursor_col, 16);
+        terminal.process_input(b"\x1b[Z");
+        assert_eq!(terminal.cursor_col, 4);
+
+        terminal.process_input(b"\x1b[g\r\t");
+        assert_eq!(terminal.cursor_col, 16);
+        terminal.process_input(b"\x1bc\t");
+        assert_eq!(terminal.cursor_col, 8);
+        assert!(!terminal.tab_stops[0]);
     }
 
     #[test]
@@ -18827,6 +17519,33 @@ mod tests {
         assert!(terminal.grid[0][2].flags.wide());
         assert!(terminal.grid[0][3].flags.wide_continuation());
         assert_eq!(terminal.cursor_col, 4);
+    }
+
+    #[test]
+    fn width_three_print_and_repeat_keep_the_legacy_cells_and_archived_identity() {
+        let mut terminal = TerminalState::new(8, 2);
+        let row_id = terminal.grid.raw_row_id(0).unwrap();
+        terminal.process_input("abcdef\r\u{17d8}".as_bytes());
+        assert_eq!(terminal.get_cursor_pos(), (0, 3));
+        terminal.process_input(b"\x1b[b");
+        assert_eq!(terminal.get_cursor_pos(), (0, 6));
+
+        let printed: Vec<_> = (0..6).map(|col| *terminal.grid.get(0, col)).collect();
+        assert_eq!(
+            printed
+                .iter()
+                .map(|cell| cell.character)
+                .collect::<String>(),
+            "\u{17d8}bc\u{17d8}ef",
+        );
+        assert!(printed
+            .iter()
+            .all(|cell| !cell.flags.wide() && !cell.flags.wide_continuation()));
+
+        terminal.process_input(b"\r\n\r\n");
+        let archived = terminal.scrollback.front().unwrap();
+        assert_eq!(archived.raw_row_id(), row_id);
+        assert_eq!(&archived.decompress()[..6], printed.as_slice());
     }
 
     #[test]
@@ -20186,13 +18905,39 @@ mod tests {
     }
 
     #[test]
+    fn protocol_state_preserves_frost_screen_swaps_and_reset_rules() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.process_input(b"\x1b[>4;2m\x1b[>4;1f\x1b[=17u\x1b[>32768u\x1b[?1002;1006h");
+        terminal.process_input(b"\x1b[?1049h\x1b[?u");
+        assert_eq!(terminal.get_output(), b"\x1b[?0u");
+
+        terminal.process_input(
+            b"\x1b[=8u\x1b[>16384u\x1b[?12;1007;1034;1036h\x1b[4h\x1b[?6h\x1b[!p\x1b[?u\x1b[4$p\x1b[?6$p",
+        );
+        assert_eq!(terminal.get_output(), b"\x1b[?16384u\x1b[4;2$y\x1b[?6;2$y");
+        for unsupported in [12, 1007, 1034, 1036] {
+            assert!(!terminal.protocol.modes().contains(&unsupported));
+        }
+        assert_eq!(terminal.get_mouse_report(0, 0, 0).unwrap(), b"\x1b[<0;1;1M");
+
+        terminal.process_input(b"\x1b[?1049l\x1b[?u\x1b[<0u\x1b[?u\x1b[?1049h\x1b[?u");
+        assert_eq!(terminal.get_output(), b"\x1b[?32768u\x1b[?17u\x1b[?16384u");
+
+        terminal.process_input(b"\x1bc\x1b[?u\x1b[?1049h\x1b[?u\x1b[<u\x1b[?u");
+        assert_eq!(terminal.get_output(), b"\x1b[?0u\x1b[?0u\x1b[?0u");
+        assert!(!terminal.is_mouse_enabled());
+        assert_eq!(terminal.xterm_modify_other_keys(), 2);
+        assert_eq!(terminal.xterm_format_other_keys(), 1);
+    }
+
+    #[test]
     fn report_all_keys_follows_the_kitty_flag_not_theme_notifications() {
         let mut terminal = TerminalState::new(8, 2);
 
         // Mode 2031 is the in-band theme-change notification, not a keyboard
         // mode: it is tracked, but the keyboard stays in its legacy encoding.
         terminal.process_input(b"\x1b[?2031h");
-        assert!(terminal.modes.contains(&2031));
+        assert!(terminal.protocol.modes().contains(&2031));
         assert!(!terminal.is_report_all_keys_enabled());
 
         terminal.process_input(b"\x1b[?2031l");
@@ -20572,6 +19317,36 @@ mod tests {
     }
 
     #[test]
+    fn alternate_modes_restore_primary_cursor_wrap_and_keep_decsc_separate() {
+        for mode in [47, 1047, 1049] {
+            let mut terminal = TerminalState::new(12, 6);
+            terminal.process_input(b"\x1b[2;5H\x1b7\x1b[31;44m\x1b[3;12HX");
+            let saved_background = terminal.current_bg;
+            let primary_id = terminal.grid.raw_row_id(2).expect("tracked primary row");
+
+            terminal.process_input(format!("\x1b[?{mode}h").as_bytes());
+            assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 0));
+            assert!(!terminal.pending_wrap);
+            assert_ne!(terminal.grid.raw_row_id(2), Some(primary_id));
+
+            terminal.process_input(b"\x1b[33;42m\x1b[4;6H\x1b[?1049h\x1b[?7l");
+            assert_eq!((terminal.cursor_row, terminal.cursor_col), (3, 5));
+            terminal.process_input(format!("\x1b[?{mode}l").as_bytes());
+            assert_eq!(terminal.grid.raw_row_id(2), Some(primary_id));
+            assert_eq!((terminal.cursor_row, terminal.cursor_col), (2, 11));
+            assert_eq!(terminal.current_bg, saved_background);
+            assert!(terminal.pending_wrap);
+            assert!(!terminal.protocol.modes().contains(&7));
+
+            terminal.process_input(b"\x1b8");
+            assert_eq!((terminal.cursor_row, terminal.cursor_col), (1, 4));
+            assert_eq!(terminal.current_bg, Color::Default);
+            assert!(!terminal.pending_wrap);
+            assert!(!terminal.protocol.modes().contains(&7));
+        }
+    }
+
+    #[test]
     fn printable_at_last_column_defers_autowrap_until_next_printable() {
         let mut terminal = TerminalState::new(4, 3);
 
@@ -20818,16 +19593,16 @@ mod tests {
         // The first three rows scrolled into history: plain text stays a
         // borrowed string while styled/wide rows keep encoded cell data.
         assert!(matches!(
-            &terminal.scrollback[0].data,
-            super::CompressedLineData::Plain(..)
+            terminal.scrollback[0].storage.content(),
+            jterm_engine::ScrollbackContent::Plain(..)
         ));
         assert!(matches!(
-            &terminal.scrollback[1].data,
-            super::CompressedLineData::Encoded(_)
+            terminal.scrollback[1].storage.content(),
+            jterm_engine::ScrollbackContent::Encoded(_)
         ));
         assert!(matches!(
-            &terminal.scrollback[2].data,
-            super::CompressedLineData::Encoded(_)
+            terminal.scrollback[2].storage.content(),
+            jterm_engine::ScrollbackContent::Encoded(_)
         ));
 
         let mut cache = None;
@@ -21446,7 +20221,7 @@ mod tests {
         let output_start = zone.output_start.expect("retained output rows");
 
         assert!(if output_start < terminal.scrollback.len() {
-            terminal.scrollback[output_start].is_wrapped
+            terminal.scrollback[output_start].is_wrapped()
         } else {
             terminal.grid.row_wrapped()[output_start - terminal.scrollback.len()]
         });
@@ -21906,6 +20681,26 @@ mod tests {
 
     #[test]
     fn bulk_row_edits_match_serial_cells_metadata_and_cache() {
+        // Original Frost boundary rule, kept separate from the shared editor.
+        fn blank_reference_pair(line: &mut [TerminalCell], col: usize, blank: TerminalCell) {
+            if col > 0
+                && line
+                    .get(col)
+                    .is_some_and(|cell| cell.flags.wide_continuation())
+            {
+                line[col - 1] = blank;
+                line[col] = blank;
+            } else if col + 1 < line.len() && line[col].flags.wide() {
+                line[col] = blank;
+                line[col + 1] = blank;
+            } else if col > 0 && line[col - 1].flags.wide() {
+                line[col - 1] = blank;
+                if let Some(cell) = line.get_mut(col) {
+                    *cell = blank;
+                }
+            }
+        }
+
         for cols in [8, 12, 40] {
             for text in ["ab界cd", "界界界界", "abcdefghijklmnop"] {
                 for column in [0, 1, 3, cols - 1] {
@@ -21931,14 +20726,20 @@ mod tests {
                                 let before_version = actual.grid_version;
                                 let n = count.max(1).min(cols - column);
                                 let blank = expected.create_blank_cell();
-                                expected.blank_wide_pair_at(row, column);
+                                blank_reference_pair(&mut expected.grid[row], column, blank);
                                 if command == '@' {
                                     for _ in 0..n {
                                         expected.grid.insert_cell_in_row(row, column, blank);
                                     }
-                                    expected.blank_dangling_wide_at_row_end(row);
+                                    if expected.grid[row][cols - 1].flags.wide() {
+                                        expected.grid[row][cols - 1] = blank;
+                                    }
                                 } else {
-                                    expected.blank_wide_pair_at(row, column + n);
+                                    blank_reference_pair(
+                                        &mut expected.grid[row],
+                                        column + n,
+                                        blank,
+                                    );
                                     for _ in 0..n {
                                         expected.grid.remove_cell_from_row(row, column);
                                         *expected.grid.get_mut(row, cols - 1) = blank;
@@ -22694,7 +21495,7 @@ mod tests {
         let mut terminal = TerminalState::new(12, 6);
         terminal.scroll_region_top = 2;
         terminal.scroll_region_bottom = 4;
-        terminal.modes.insert(6);
+        terminal.origin_mode = true;
         terminal.cursor_row = 3;
         terminal.cursor_col = 11;
         terminal.pending_wrap = true;
@@ -22709,7 +21510,7 @@ mod tests {
         let mut terminal = TerminalState::new(12, 6);
         terminal.scroll_region_top = 2;
         terminal.scroll_region_bottom = 4;
-        terminal.modes.insert(6);
+        terminal.origin_mode = true;
         terminal.cursor_row = 3;
         terminal.cursor_col = 11;
         terminal.pending_wrap = true;
@@ -22720,11 +21521,10 @@ mod tests {
         assert_eq!(terminal.get_output(), b"\x1b[?4;12R");
         terminal.process_input(b"5n\x1b[6");
         assert_eq!(terminal.get_output(), b"\x1b[0n");
-        terminal.process_input(b"n\x1b[c\x1b[>c");
-        assert_eq!(
-            terminal.get_output(),
-            b"\x1b[4;12R\x1b[?65;1;9c\x1b[>1;7802;0c"
-        );
+        terminal.process_input(b"n\x1b[7c\x1b[>123");
+        assert_eq!(terminal.get_output(), b"\x1b[4;12R\x1b[?65;1;9c");
+        terminal.process_input(b"c\x1b[?c\x1b[=c\x1b[$c\x1b[>$c\x1b[?6n");
+        assert_eq!(terminal.get_output(), b"\x1b[>1;7802;0c\x1b[?4;12R");
         assert_eq!((terminal.cursor_row, terminal.cursor_col), (3, 11));
         assert!(terminal.pending_wrap);
     }
@@ -22901,7 +21701,7 @@ mod tests {
                     terminal.grid[0][1].character, 'k',
                     "prefix={prefix:?}, split={split}"
                 );
-                assert!(!terminal.modes.contains(&2004));
+                assert!(!terminal.protocol.modes().contains(&2004));
                 assert!(terminal.titles.window_title.is_empty());
             }
         }
@@ -24046,113 +22846,6 @@ mod block_spacing_tests {
                 .is_none());
         }
         PROJECTION_PLAN_BUILD_COUNT.with(|count| assert_eq!(count.get(), 1));
-    }
-}
-
-// Regression oracle pinned to fb477d1c; deliberately independent of the streaming visitor.
-#[cfg(test)]
-impl ScrollbackLine {
-    fn pinned_decode_cells(data: &[u8], cols: usize) -> Vec<TerminalCell> {
-        let mut cells = Vec::with_capacity(cols);
-        let mut pos = 0;
-        while pos < data.len() {
-            let ch_len = data[pos] as usize;
-            pos += 1;
-            if pos + ch_len > data.len() {
-                break;
-            }
-            let ch = std::str::from_utf8(&data[pos..pos + ch_len])
-                .ok()
-                .and_then(|s| s.chars().next())
-                .unwrap_or(' ');
-            pos += ch_len;
-
-            let fg = Self::decode_color(data, &mut pos);
-            let bg = Self::decode_color(data, &mut pos);
-            let f = data.get(pos).copied().unwrap_or(0);
-            pos += 1;
-            let extra_flags = data.get(pos).copied().unwrap_or(0);
-            pos += 1;
-            let hyperlink = u16::from_le_bytes([
-                data.get(pos).copied().unwrap_or(0),
-                data.get(pos + 1).copied().unwrap_or(0),
-            ]);
-            pos += 2;
-            let run = data.get(pos).copied().unwrap_or(1).max(1);
-            pos += 1;
-
-            let mut flags = Self::decode_flags(f);
-            flags.set_wide(extra_flags & 1 != 0);
-            flags.set_wide_continuation(extra_flags & 2 != 0);
-            flags.set_blink(extra_flags & 4 != 0);
-
-            let cell = TerminalCell {
-                character: ch,
-                foreground: fg,
-                background: bg,
-                flags,
-                hyperlink_id: HyperlinkId::from_raw(hyperlink),
-            };
-            for _ in 0..run {
-                cells.push(cell);
-            }
-        }
-        // Pad to cols
-        cells.resize(cols, TerminalCell::default());
-        cells
-    }
-}
-
-#[cfg(test)]
-mod decoder_parity {
-    use super::*;
-    #[test]
-    fn stored_decoder_rle_boundary_clipping_parity() {
-        let cell = TerminalCell {
-            character: 'İ',
-            foreground: Color::Rgb(1, 2, 3),
-            hyperlink_id: HyperlinkId::from_raw(65535),
-            ..Default::default()
-        };
-        for n in [0, 1, 254, 255, 256, 510, 511, 600] {
-            let bytes = ScrollbackLine::encode_cells(&vec![cell; n]);
-            for cols in [0, 1, 17, 254, 255, 256, 511, 601] {
-                for length in 0..=bytes.len() {
-                    let mut streamed = Vec::new();
-                    ScrollbackLine::visit_encoded_cells(&bytes[..length], cols, |_, cell| {
-                        streamed.push(cell)
-                    });
-                    streamed.resize(cols, TerminalCell::default());
-                    assert_eq!(
-                        streamed,
-                        ScrollbackLine::pinned_decode_cells(&bytes[..length], cols)
-                    );
-                }
-            }
-        }
-    }
-    #[test]
-    fn stored_decoder_matches_pinned_oracle_on_truncation_and_runs() {
-        let mut seed = 0xdefaced_u64;
-        for length in 0..128 {
-            for _ in 0..64 {
-                let mut bytes = Vec::new();
-                for _ in 0..length {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 7;
-                    seed ^= seed << 17;
-                    bytes.push(seed as u8);
-                }
-                for cols in [0, 1, 2, 17, 255, 512] {
-                    let mut streamed = Vec::new();
-                    ScrollbackLine::visit_encoded_cells(&bytes, cols, |_, cell| {
-                        streamed.push(cell)
-                    });
-                    streamed.resize(cols, TerminalCell::default());
-                    assert_eq!(streamed, ScrollbackLine::pinned_decode_cells(&bytes, cols));
-                }
-            }
-        }
     }
 }
 

@@ -5,6 +5,7 @@ use crate::native_companion::{
     self as admission, BodyGuards, Interaction, Observation, SessionOwner,
 };
 use crate::organism::{AttentionFacts, Motion, Organism};
+use crate::test_renderer::{software_renderer, HeadlessRenderer};
 use iced::advanced::{layout, renderer, widget::Tree, Layout, Shell, Widget};
 use iced::{mouse, Event, Size};
 use jterm_core::organism_live::LiveActivityKnowledge as Knowledge;
@@ -122,7 +123,7 @@ fn with_widget(test: impl FnOnce(&mut TermWidget<'_, Output>, Rectangle, &mut Or
 }
 
 fn tree(widget: &TermWidget<'_, Output>) -> Tree {
-    Tree::new(widget as &dyn Widget<Output, iced::Theme, ()>)
+    Tree::new(widget as &dyn Widget<Output, iced::Theme, HeadlessRenderer>)
 }
 
 fn send(
@@ -133,22 +134,23 @@ fn send(
     event: Event,
     point: Point,
 ) -> (Vec<Output>, bool) {
-    let node = <TermWidget<'_, Output> as Widget<Output, iced::Theme, ()>>::layout(
+    let renderer = software_renderer();
+    let node = <TermWidget<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::layout(
         widget,
         tree,
-        &(),
+        &renderer,
         &layout::Limits::new(Size::ZERO, bounds.size()),
     )
     .move_to(bounds.position());
     let mut output = Vec::new();
     let mut shell = Shell::new(&mut output);
-    <TermWidget<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+    <TermWidget<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
         widget,
         tree,
         &event,
         Layout::new(&node),
         mouse::Cursor::Available(point),
-        &(),
+        &renderer,
         &mut iced::advanced::clipboard::Null,
         &mut shell,
         &viewport,
@@ -162,13 +164,13 @@ fn moved(point: Point) -> Event {
 }
 
 fn paint(widget: &TermWidget<'_, Output>, tree: &Tree, bounds: Rectangle, viewport: Rectangle) {
-    // Actual Widget::draw runs with Iced's debug-only null renderer. Geometry
-    // assertions inspect the same production helpers draw/update consume.
+    // Draw without a window. Geometry assertions inspect the same production
+    // helpers that draw and update consume.
     let node = layout::Node::new(bounds.size()).move_to(bounds.position());
-    <TermWidget<'_, Output> as Widget<Output, iced::Theme, ()>>::draw(
+    <TermWidget<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::draw(
         widget,
         tree,
-        &mut (),
+        &mut software_renderer(),
         &iced::Theme::Dark,
         &renderer::Style::default(),
         Layout::new(&node),

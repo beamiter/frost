@@ -2,18 +2,23 @@
   "original_sealed_files": 213,
   "original_fixture_unchanged": true,
   "original_production_base": "3ff47cbea7992108aa271fd0553ff088270cb617",
-  "consumer_core": "57ed89a62fdd61db060a3c976ab9e8cdac9ae823",
+  "consumer_core": "466e4ea5dc1e4df12432291a11514c8402db148a",
   "replay_changes": [
     "Original source guard replaced by fixed bounded corpus verification; original guard preserved separately.",
     "Fresh subprocess worker plus bounded streaming zstd full record comparison against unchanged original expected.",
     "Eight original dynamic lanes read active colors / saved_primary_colors fields; names and full values unchanged.",
-    "Explicit Copy-value Debug calls remove needless borrowing; expected remains immutable."
+    "Explicit Copy-value Debug calls remove needless borrowing; expected remains immutable.",
+    "Render admitted frame IDs with the original Stamp syntax for exact comparison. Numeric IDs and all other fields are retained.",
+    "Use distinct title and color worker fixture directories and recursion markers for concurrent runs.",
+    "Read mode and keyboard observations from the shared ProtocolState using the original Frost lane names and values."
   ],
   "files": {
-    "src/terminal/color_oracles.rs": "66fbe6b3a237ab7c342adafb6eaa55d50dc2e4326680d10326f9f5243649bcfd",
+    "src/terminal/color_oracles.rs": "d9e078b6132f55fc693ea6f8bab724a86eefe8cd63b4525af5e2ef2772295f76",
     "src/terminal/color_replay_transport/lanes.rs": "4987c6bb2eec3c5f7eeb67acfba08239999d957f1a463774a68d78f5b94b2568",
     "src/terminal/color_replay_transport/mod.rs": "6adf49d60768f7d45db2bd835be800b61f73babfc6a75bed9c11f627b27e191e",
-    "src/terminal/color_replay_transport/worker.rs": "bd6d68b0ff3011a550824f348d874eeeb0810b9b11a9c49023c7ed4bb395fbe4"
+    "src/terminal/color_replay_transport/worker.rs": "a5c3aedf7ab09ad6ee87cb94347b95d52667405f8364a0dfa72eed4554b01eea",
+    "src/terminal/replay_frame_debug.rs": "2074085027ec791795f8b483aff06e08358c264b454c901babdd3880fe653ec6",
+    "src/terminal/replay_protocol.rs": "4c4ef05818a05b5c10df0cf31caa14b75829e3d2deb248a091a2e75a2fa76f96"
   },
   "repository_fixture_files": 2,
   "private_provenance_files": 211

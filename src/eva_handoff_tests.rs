@@ -13,8 +13,8 @@ struct App(Frost);
 impl Drop for App {
     fn drop(&mut self) {
         for session in &mut self.0.sessions {
-            if session.pty.is_alive() {
-                let pid = session.pty.get_child_pid();
+            if session.pty_is_alive() {
+                let pid = session.child_pid;
                 unsafe {
                     libc::kill(-pid, libc::SIGKILL);
                     libc::kill(pid, libc::SIGKILL);
@@ -25,7 +25,7 @@ impl Drop for App {
         loop {
             let mut alive = false;
             for session in &mut self.0.sessions {
-                alive |= session.pty.is_alive();
+                alive |= session.pty_is_alive();
             }
             if !alive || Instant::now() >= deadline {
                 break;

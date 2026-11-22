@@ -21,6 +21,17 @@ pub(crate) struct SourceStamp {
     pub read_at: Instant,
 }
 
+impl SourceStamp {
+    pub fn from_runtime(origin: jterm_core::output_batch::OutputOrigin) -> Self {
+        Self {
+            epoch: origin.source,
+            seq: origin.sequence,
+            read_at: origin.read_at,
+        }
+    }
+}
+
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct SourceWriter {
     authority: SourceAuthority,
@@ -29,11 +40,16 @@ pub(crate) struct SourceWriter {
 }
 
 impl SourceAuthority {
+    pub fn from_runtime(epoch: Option<u64>) -> Self {
+        Self(Arc::new(AtomicU64::new(epoch.unwrap_or(0))))
+    }
+
     pub fn epoch(&self) -> Option<u64> {
         let value = self.0.load(Ordering::Acquire);
         (value != 0).then_some(value)
     }
 
+    #[cfg(test)]
     pub fn start(&self) -> SourceWriter {
         static NEXT_SOURCE: AtomicU64 = AtomicU64::new(1);
         let mut candidate = NEXT_SOURCE.load(Ordering::Acquire);
@@ -62,6 +78,7 @@ impl SourceAuthority {
     }
 }
 
+#[cfg(test)]
 impl SourceWriter {
     pub fn stamp(&mut self, read_at: Instant) -> Option<SourceStamp> {
         let seq = self.next?;

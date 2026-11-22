@@ -1,7 +1,7 @@
 {
   "format": "frost-title-replay-overlay-v1",
   "original_commit": "ada5ae0cb2ff14b5b1177128aec3595c534f3a27",
-  "consumer_core_commit": "e23a2efa3a1c1faeb1867e7b94ec7ad1c8823b22",
+  "consumer_core_commit": "466e4ea5dc1e4df12432291a11514c8402db148a",
   "expected": "sealed-evidence/frost-title-original.jsonl.zst",
   "expected_sha256": "8dd591c50ade8546d6d438e1c08837ceaf59c2d2e9462bd9209e75987051887b",
   "dev_dependency_edges": {
@@ -11,13 +11,18 @@
   "observer_changes": [
     "remove capture-only source guard in replay",
     "map three title fields to single titles owner preserving labels and seeds",
-    "replace only transport/orchestration with bounded fresh Rust zstd replay"
+    "replace only transport/orchestration with bounded fresh Rust zstd replay",
+    "Render admitted frame IDs with the original Stamp syntax for exact comparison. Numeric IDs and all other fields are retained.",
+    "Use distinct title and color worker fixture directories and recursion markers for concurrent runs.",
+    "Read mode and keyboard observations from the shared ProtocolState using the original Frost lane names and values."
   ],
   "helper_change": "same cfg(test) Kitty observer relocated before tests for Clippy; exact removal restores original complete file",
   "source_sha256": {
-    "src/terminal/title_oracles.rs": "4742df0c42bfe86709a585a0792425bfd8403525fa381fc0a11aa373803428a6",
+    "src/terminal/title_oracles.rs": "94bb55d84f295e458310a309184d208e55da0542b357a359594ff3398c0b8f16",
     "src/terminal/title_replay_transport/mod.rs": "be58e6f3f123d921c547fa59f1c9dd53d405ef0337aa1fca3ddfadac5da86585",
-    "src/terminal/title_replay_transport/worker.rs": "f19d351eca1f4790fc002edc64bcad209f7ffbe830ec7f3e60e2ff83ef004a0f",
-    "src/terminal/title_replay_transport/lanes.rs": "4987c6bb2eec3c5f7eeb67acfba08239999d957f1a463774a68d78f5b94b2568"
+    "src/terminal/title_replay_transport/worker.rs": "8547cc208d3e5df70259d95baca064df74820f20fec56f5fa57ba5b5071560bf",
+    "src/terminal/title_replay_transport/lanes.rs": "4987c6bb2eec3c5f7eeb67acfba08239999d957f1a463774a68d78f5b94b2568",
+    "src/terminal/replay_frame_debug.rs": "2074085027ec791795f8b483aff06e08358c264b454c901babdd3880fe653ec6",
+    "src/terminal/replay_protocol.rs": "4c4ef05818a05b5c10df0cf31caa14b75829e3d2deb248a091a2e75a2fa76f96"
   }
 }

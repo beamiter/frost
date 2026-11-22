@@ -2472,7 +2472,7 @@ impl Frost {
                 "{event} open={} drawer={} visible={} tab={:?} center={:?} session={} bash_pid={} tabs={} active_tab={} position_rows={} following={} anchor={:?} input_active={}",
                 self.reference_inspector_open, self.reference_inspector_drawer,
                 self.reference_inspector_visible(), self.reference_inspector_tab,
-                self.reference_layout().center, session.id, session.pty.get_child_pid(),
+                self.reference_layout().center, session.id, session.child_pid,
                 self.tabs.len(), self.active_tab, session.transcript_canvas.position_rows(),
                 session.transcript_canvas.following(), anchor, self.terminal_input_active());
         }

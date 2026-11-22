@@ -244,10 +244,9 @@ mod tests {
 
     #[test]
     fn toast_overlay_preserves_complete_query_and_replacement_input() {
-        use iced::advanced::text;
+        use crate::test_renderer::{software_renderer, HeadlessRenderer, InputState};
         use iced::keyboard::{self, key::Code, key::Physical, Key, Location, Modifiers};
         use iced::widget::{scrollable, text as label, text_input};
-        type InputState = text_input::State<<() as text::Renderer>::Paragraph>;
 
         fn input(tree: &mut Tree) -> &mut InputState {
             fn find(tree: &mut Tree) -> Option<&mut InputState> {
@@ -259,7 +258,7 @@ mod tests {
             }
             find(tree).unwrap()
         }
-        fn view(query: &str, toast: bool) -> Element<'_, String, iced::Theme, ()> {
+        fn view(query: &str, toast: bool) -> Element<'_, String, iced::Theme, HeadlessRenderer> {
             let search = text_input("Search tasks", query).on_input(std::convert::identity);
             transient_overlay(
                 scrollable(search).width(220).height(120).into(),
@@ -273,13 +272,14 @@ mod tests {
             character: char,
             modifiers: Modifiers,
         ) -> Vec<String> {
+            let renderer = software_renderer();
             let mut element = view(query, toast);
             tree.diff(element.as_widget());
             assert!(input(tree).is_focused());
             let viewport = Rectangle::with_size(Size::new(300.0, 160.0));
             let node = element.as_widget_mut().layout(
                 tree,
-                &(),
+                &renderer,
                 &layout::Limits::new(Size::ZERO, viewport.size()),
             );
             let key = Key::Character(character.to_string().into());
@@ -298,7 +298,7 @@ mod tests {
                 &Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)),
                 Layout::new(&node),
                 mouse::Cursor::Unavailable,
-                &(),
+                &renderer,
                 &mut iced::advanced::clipboard::Null,
                 &mut Shell::new(&mut modifier_messages),
                 &viewport,
@@ -311,7 +311,7 @@ mod tests {
                 &event,
                 Layout::new(&node),
                 mouse::Cursor::Unavailable,
-                &(),
+                &renderer,
                 &mut iced::advanced::clipboard::Null,
                 &mut shell,
                 &viewport,

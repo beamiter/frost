@@ -205,10 +205,10 @@ fn frame_adapter_retained_copy_control() {
     let shape_frame = terminal.get_live_cell_frame();
     assert_eq!(shape_frame.cursor().shape, CursorShape::Beam);
     assert_eq!(new_frame_cells(&row_frame, &shape_frame), 0);
-    terminal.modes.remove(&25);
+    terminal.protocol.modes_mut().remove(&25);
     let hidden = terminal.get_live_cell_frame();
     assert!(!hidden.cursor().visible);
-    terminal.modes.insert(25);
+    terminal.protocol.modes_mut().insert(25);
     let shown = terminal.get_live_cell_frame();
     assert!(shown.cursor().visible);
     assert_eq!(new_frame_cells(&hidden, &shown), 0);

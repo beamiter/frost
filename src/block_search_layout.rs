@@ -157,10 +157,12 @@ mod tests {
 
     #[test]
     fn real_scroll_operation_reveals_selection_or_feedback_and_keeps_query_fixed() {
+        use crate::test_renderer::{software_renderer, HeadlessRenderer};
         use iced::advanced::{layout, widget::Tree, Layout};
         use iced::widget::{column, container, scrollable, Space};
         use iced::Length;
 
+        let renderer = software_renderer();
         for (panel_id, scroll_id, selected_id, target_id) in [
             (PANEL_ID, SCROLL_ID, SELECTED_ID, SELECTED_ID),
             (PANEL_ID, SCROLL_ID, SELECTED_ID, FEEDBACK_ID),
@@ -171,7 +173,7 @@ mod tests {
                 "block-menu-selected",
             ),
         ] {
-            let mut element: iced::Element<'_, (), iced::Theme, ()> = container(
+            let mut element: iced::Element<'_, (), iced::Theme, HeadlessRenderer> = container(
                 column![
                     container(Space::new().height(28)).id("query"),
                     scrollable(column![
@@ -192,13 +194,16 @@ mod tests {
             let mut tree = Tree::new(element.as_widget());
             let node = element.as_widget_mut().layout(
                 &mut tree,
-                &(),
+                &renderer,
                 &layout::Limits::new(Size::ZERO, Size::new(280.0, 200.0)),
             );
             let mut apply = |mut op: Box<dyn Operation>| loop {
-                element
-                    .as_widget_mut()
-                    .operate(&mut tree, Layout::new(&node), &(), op.as_mut());
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    op.as_mut(),
+                );
                 match op.finish() {
                     operation::Outcome::Chain(next) => op = next,
                     _ => break,
@@ -217,9 +222,12 @@ mod tests {
                 selected_id: Some(selected_id),
                 ..Reveal::default()
             };
-            element
-                .as_widget_mut()
-                .operate(&mut tree, Layout::new(&node), &(), &mut measured);
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut measured,
+            );
             let (viewport, translation) = measured.viewport.unwrap();
             let target = measured.selected.or(measured.feedback).unwrap();
             assert_eq!(viewport.y, 48.0); // Query + padding + gap never scroll.

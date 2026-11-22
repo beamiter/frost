@@ -2910,6 +2910,7 @@ mod tests {
             Mouse(NativeInput),
             Wheel(NativeWheel),
         }
+        use crate::test_renderer::{software_renderer, HeadlessRenderer};
         let frame = Arc::new(direct_frame());
         let completion_frame = Arc::new(Vim9RenderFrame {
             completion: Some(Default::default()),
@@ -2960,14 +2961,15 @@ mod tests {
                 false,
                 Output::Wheel,
             );
-        let mut tree = Tree::new(&widget as &dyn Widget<Output, iced::Theme, ()>);
+        let mut renderer = software_renderer();
+        let mut tree = Tree::new(&widget as &dyn Widget<Output, iced::Theme, HeadlessRenderer>);
         let bounds = Rectangle::with_size(Size::new(640.0, 400.0));
         let node = layout::Node::new(bounds.size());
         let point = Point::new(340.0, 35.0);
-        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::draw(
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::draw(
             &widget,
             &tree,
-            &mut (),
+            &mut renderer,
             &iced::Theme::Dark,
             &renderer::Style::default(),
             Layout::new(&node),
@@ -2975,7 +2977,7 @@ mod tests {
             &bounds,
         );
         let mut output = Vec::new();
-        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
             &mut widget,
             &mut tree,
             &Event::Mouse(mouse::Event::WheelScrolled {
@@ -2983,7 +2985,7 @@ mod tests {
             }),
             Layout::new(&node),
             mouse::Cursor::Available(point),
-            &(),
+            &renderer,
             &mut iced::advanced::clipboard::Null,
             &mut Shell::new(&mut output),
             &bounds,
@@ -3000,7 +3002,7 @@ mod tests {
             .borrow_mut()
             .wheel(&frame, local_metrics(metrics), wheel);
         let mut shell = Shell::new(&mut output);
-        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
             &mut widget,
             &mut tree,
             &Event::Window(iced::window::Event::RedrawRequested(
@@ -3008,7 +3010,7 @@ mod tests {
             )),
             Layout::new(&node),
             mouse::Cursor::Available(point),
-            &(),
+            &renderer,
             &mut iced::advanced::clipboard::Null,
             &mut shell,
             &bounds,
@@ -3030,13 +3032,13 @@ mod tests {
                 modifiers: keyboard::Modifiers::default(),
             }),
         ] {
-            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
                 &mut widget,
                 &mut tree,
                 &event,
                 Layout::new(&node),
                 mouse::Cursor::Available(point),
-                &(),
+                &renderer,
                 &mut iced::advanced::clipboard::Null,
                 &mut Shell::new(&mut output),
                 &bounds,
@@ -3047,10 +3049,10 @@ mod tests {
                 "IME lifecycle and key releases must not cancel precision motion"
             );
         }
-        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::draw(
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::draw(
             &widget,
             &tree,
-            &mut (),
+            &mut renderer,
             &iced::Theme::Dark,
             &renderer::Style::default(),
             Layout::new(&node),
@@ -3061,36 +3063,36 @@ mod tests {
             mouse::Event::ButtonPressed(mouse::Button::Left),
             mouse::Event::ButtonReleased(mouse::Button::Left),
         ] {
-            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
                 &mut widget,
                 &mut tree,
                 &Event::Mouse(event),
                 Layout::new(&node),
                 mouse::Cursor::Available(point),
-                &(),
+                &renderer,
                 &mut iced::advanced::clipboard::Null,
                 &mut Shell::new(&mut output),
                 &bounds,
             );
         }
         state.borrow_mut().clear();
-        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::draw(
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::draw(
             &widget,
             &tree,
-            &mut (),
+            &mut renderer,
             &iced::Theme::Dark,
             &renderer::Style::default(),
             Layout::new(&node),
             mouse::Cursor::Available(point),
             &bounds,
         );
-        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
             &mut widget,
             &mut tree,
             &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
             Layout::new(&node),
             mouse::Cursor::Available(point),
-            &(),
+            &renderer,
             &mut iced::advanced::clipboard::Null,
             &mut Shell::new(&mut output),
             &bounds,
@@ -3108,7 +3110,7 @@ mod tests {
             "the real terminal widget must see the first click when counting a multi-click"
         );
         output.clear();
-        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
             &mut widget,
             &mut tree,
             &Event::Mouse(mouse::Event::WheelScrolled {
@@ -3116,7 +3118,7 @@ mod tests {
             }),
             Layout::new(&node),
             mouse::Cursor::Available(point),
-            &(),
+            &renderer,
             &mut iced::advanced::clipboard::Null,
             &mut Shell::new(&mut output),
             &bounds,
@@ -3130,7 +3132,7 @@ mod tests {
         // presentation still advertises normal-mode semantic scrolling.
         widget.frame = Some(&completion_frame);
         output.clear();
-        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
             &mut widget,
             &mut tree,
             &Event::Mouse(mouse::Event::WheelScrolled {
@@ -3138,7 +3140,7 @@ mod tests {
             }),
             Layout::new(&node),
             mouse::Cursor::Available(point),
-            &(),
+            &renderer,
             &mut iced::advanced::clipboard::Null,
             &mut Shell::new(&mut output),
             &bounds,
@@ -3169,7 +3171,7 @@ mod tests {
         *input_frame.borrow_mut() = render_only.clone();
         widget.frame = Some(&render_only);
         output.clear();
-        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
             &mut widget,
             &mut tree,
             &Event::Mouse(mouse::Event::WheelScrolled {
@@ -3177,7 +3179,7 @@ mod tests {
             }),
             Layout::new(&node),
             mouse::Cursor::Available(point),
-            &(),
+            &renderer,
             &mut iced::advanced::clipboard::Null,
             &mut Shell::new(&mut output),
             &bounds,
@@ -3197,13 +3199,13 @@ mod tests {
             mouse::Event::ButtonPressed(mouse::Button::Left),
             mouse::Event::ButtonReleased(mouse::Button::Left),
         ] {
-            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
                 &mut widget,
                 &mut tree,
                 &Event::Mouse(event),
                 Layout::new(&node),
                 mouse::Cursor::Available(point),
-                &(),
+                &renderer,
                 &mut iced::advanced::clipboard::Null,
                 &mut Shell::new(&mut output),
                 &bounds,
@@ -3217,10 +3219,10 @@ mod tests {
         assert!(output
             .iter()
             .all(|event| matches!(event, Output::Mouse(NativeInput::Handled))));
-        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::draw(
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::draw(
             &widget,
             &tree,
-            &mut (),
+            &mut renderer,
             &iced::Theme::Dark,
             &renderer::Style::default(),
             Layout::new(&node),
@@ -3239,13 +3241,13 @@ mod tests {
             mouse::Event::ButtonPressed(mouse::Button::Middle),
             mouse::Event::ButtonReleased(mouse::Button::Middle),
         ] {
-            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
                 &mut widget,
                 &mut tree,
                 &Event::Mouse(event),
                 Layout::new(&node),
                 mouse::Cursor::Available(point),
-                &(),
+                &renderer,
                 &mut iced::advanced::clipboard::Null,
                 &mut Shell::new(&mut output),
                 &bounds,
@@ -3266,7 +3268,7 @@ mod tests {
         output.clear();
         let enter = keyboard::Key::Named(keyboard::key::Named::Enter);
         let mut shell = Shell::new(&mut output);
-        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
             &mut widget,
             &mut tree,
             &Event::Keyboard(keyboard::Event::KeyPressed {
@@ -3280,7 +3282,7 @@ mod tests {
             }),
             Layout::new(&node),
             mouse::Cursor::Available(point),
-            &(),
+            &renderer,
             &mut iced::advanced::clipboard::Null,
             &mut shell,
             &bounds,
@@ -3291,7 +3293,7 @@ mod tests {
         );
         assert!(output.is_empty());
         // Disabling semantic input on one split must not affect its peer.
-        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+        <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
             &mut widget,
             &mut tree,
             &Event::Mouse(mouse::Event::WheelScrolled {
@@ -3299,7 +3301,7 @@ mod tests {
             }),
             Layout::new(&node),
             mouse::Cursor::Available(Point::new(20.0, 35.0)),
-            &(),
+            &renderer,
             &mut iced::advanced::clipboard::Null,
             &mut Shell::new(&mut output),
             &bounds,
@@ -3309,24 +3311,24 @@ mod tests {
         for expected in [keyboard::Modifiers::CTRL, keyboard::Modifiers::SHIFT] {
             state.borrow_mut().seed_modifiers(expected);
             output.clear();
-            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
                 &mut widget,
                 &mut tree,
                 &Event::Keyboard(keyboard::Event::ModifiersChanged(expected)),
                 Layout::new(&node),
                 mouse::Cursor::Available(point),
-                &(),
+                &renderer,
                 &mut iced::advanced::clipboard::Null,
                 &mut Shell::new(&mut output),
                 &bounds,
             );
-            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
                 &mut widget,
                 &mut tree,
                 &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
                 Layout::new(&node),
                 mouse::Cursor::Available(point),
-                &(),
+                &renderer,
                 &mut iced::advanced::clipboard::Null,
                 &mut Shell::new(&mut output),
                 &bounds,
@@ -3344,7 +3346,7 @@ mod tests {
                 matches!(raw, MouseInput::Press { ctrl, shift, .. } if ctrl == expected.control() && shift == expected.shift())
             );
             let snapshot = state.borrow().capture_body_mouse();
-            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+            <NativeBuffer<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
                 &mut widget,
                 &mut tree,
                 &Event::Keyboard(keyboard::Event::ModifiersChanged(
@@ -3352,7 +3354,7 @@ mod tests {
                 )),
                 Layout::new(&node),
                 mouse::Cursor::Available(point),
-                &(),
+                &renderer,
                 &mut iced::advanced::clipboard::Null,
                 &mut Shell::new(&mut output),
                 &bounds,
@@ -3373,6 +3375,7 @@ mod tests {
 
     #[test]
     fn fallback_draw_retires_the_old_fractional_image_but_consumes_its_press_tail() {
+        use crate::test_renderer::{software_renderer, HeadlessRenderer};
         let frame = Arc::new(direct_frame());
         let mut state = ScrollState::default();
         let bounds = Rectangle::with_size(Size::new(640.0, 400.0));
@@ -3407,17 +3410,23 @@ mod tests {
         .on_mouse(|input| state.borrow_mut().compatibility_mouse(input));
         let mut widget = NativeBuffer::new(input, None, metrics, Font::MONOSPACE, true, true)
             .scroll(&state, keyboard::Modifiers::default(), true, |_| None);
-        let mut tree = Tree::new(&widget as &dyn Widget<Option<MouseInput>, iced::Theme, ()>);
+        let mut renderer = software_renderer();
+        let mut tree =
+            Tree::new(&widget as &dyn Widget<Option<MouseInput>, iced::Theme, HeadlessRenderer>);
         let node = layout::Node::new(bounds.size());
         let point = Point::new(340.0, 35.0);
         let mut output = Vec::new();
-        <NativeBuffer<'_, Option<MouseInput>> as Widget<Option<MouseInput>, iced::Theme, ()>>::update(
+        <NativeBuffer<'_, Option<MouseInput>> as Widget<
+            Option<MouseInput>,
+            iced::Theme,
+            HeadlessRenderer,
+        >>::update(
             &mut widget,
             &mut tree,
             &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
             Layout::new(&node),
             mouse::Cursor::Available(point),
-            &(),
+            &renderer,
             &mut iced::advanced::clipboard::Null,
             &mut Shell::new(&mut output),
             &bounds,
@@ -3427,10 +3436,14 @@ mod tests {
             output[0].is_none(),
             "the old moving image still owns this press"
         );
-        <NativeBuffer<'_, Option<MouseInput>> as Widget<Option<MouseInput>, iced::Theme, ()>>::draw(
+        <NativeBuffer<'_, Option<MouseInput>> as Widget<
+            Option<MouseInput>,
+            iced::Theme,
+            HeadlessRenderer,
+        >>::draw(
             &widget,
             &tree,
-            &mut (),
+            &mut renderer,
             &iced::Theme::Dark,
             &renderer::Style::default(),
             Layout::new(&node),
@@ -3442,13 +3455,17 @@ mod tests {
             mouse::Event::ButtonReleased(mouse::Button::Left),
             mouse::Event::ButtonPressed(mouse::Button::Left),
         ] {
-            <NativeBuffer<'_, Option<MouseInput>> as Widget<Option<MouseInput>, iced::Theme, ()>>::update(
+            <NativeBuffer<'_, Option<MouseInput>> as Widget<
+                Option<MouseInput>,
+                iced::Theme,
+                HeadlessRenderer,
+            >>::update(
                 &mut widget,
                 &mut tree,
                 &Event::Mouse(event),
                 Layout::new(&node),
                 mouse::Cursor::Available(point),
-                &(),
+                &renderer,
                 &mut iced::advanced::clipboard::Null,
                 &mut Shell::new(&mut output),
                 &bounds,

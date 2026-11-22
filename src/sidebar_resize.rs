@@ -238,19 +238,21 @@ impl<Message, Renderer: renderer::Renderer> Widget<Message, iced::Theme, Rendere
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_renderer::{software_renderer, HeadlessRenderer};
     use iced::advanced::widget::Tree;
 
     fn send(
-        element: &mut Element<'_, Action, iced::Theme, ()>,
+        element: &mut Element<'_, Action, iced::Theme, HeadlessRenderer>,
         tree: &mut Tree,
         event: Event,
         pointer: Point,
     ) -> (Vec<Action>, bool) {
+        let renderer = software_renderer();
         let node = element
             .as_widget_mut()
             .layout(
                 tree,
-                &(),
+                &renderer,
                 &layout::Limits::new(Size::ZERO, Size::new(300.0, 400.0)),
             )
             .move_to(Point::new(100.0, 20.0));
@@ -261,7 +263,7 @@ mod tests {
             &event,
             Layout::new(&node),
             mouse::Cursor::Available(pointer),
-            &(),
+            &renderer,
             &mut iced::advanced::clipboard::Null,
             &mut shell,
             &Rectangle::with_size(Size::new(800.0, 600.0)),
@@ -272,7 +274,7 @@ mod tests {
 
     #[test]
     fn actual_grip_captures_only_its_press_and_reports_window_coordinates() {
-        let mut grip: Element<'_, Action, iced::Theme, ()> = grip(
+        let mut grip: Element<'_, Action, iced::Theme, HeadlessRenderer> = grip(
             11.0,
             false,
             iced::Color::WHITE,
@@ -301,7 +303,8 @@ mod tests {
 
     #[test]
     fn capture_owns_moves_and_release_outside_grip_but_leaves_keyboard_alone() {
-        let mut capture: Element<'_, Action, iced::Theme, ()> = capture(|action| action);
+        let mut capture: Element<'_, Action, iced::Theme, HeadlessRenderer> =
+            capture(|action| action);
         let mut tree = Tree::new(capture.as_widget());
         let point = Point::new(700.0, 250.0);
         let (messages, captured) = send(

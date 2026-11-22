@@ -2111,7 +2111,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=c8d7933352930e5097ee210e22997d6ab7eb1051#c8d7933352930e5097ee210e22997d6ab7eb1051"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=466e4ea5dc1e4df12432291a11514c8402db148a#466e4ea5dc1e4df12432291a11514c8402db148a"
 dependencies = [
  "companion-client",
  "companion-core",
@@ -2121,6 +2121,9 @@ dependencies = [
  "eva-character-atlas",
  "fuzzy-matcher",
  "jagent",
+ "jterm_engine",
+ "jterm_remote_client",
+ "jterm_runtime",
  "libc",
  "log",
  "lru 0.19.0",
@@ -2141,9 +2144,31 @@ dependencies = [
 [[package]]
 name = "jterm_engine"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=c8d7933352930e5097ee210e22997d6ab7eb1051#c8d7933352930e5097ee210e22997d6ab7eb1051"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=466e4ea5dc1e4df12432291a11514c8402db148a#466e4ea5dc1e4df12432291a11514c8402db148a"
 dependencies = [
  "smallvec",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "jterm_remote_client"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=466e4ea5dc1e4df12432291a11514c8402db148a#466e4ea5dc1e4df12432291a11514c8402db148a"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "jterm_runtime"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=466e4ea5dc1e4df12432291a11514c8402db148a#466e4ea5dc1e4df12432291a11514c8402db148a"
+dependencies = [
+ "crossbeam-channel",
+ "libc",
+ "log",
+ "parking_lot",
 ]
 
 [[package]]

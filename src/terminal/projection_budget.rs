@@ -1,5 +1,5 @@
 //! Allocation-free preflight. Counts are structural limits, not process RSS.
-use super::{CompressedLineData, ScrollbackLine};
+use super::ScrollbackLine;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectionResource {
@@ -108,17 +108,14 @@ pub(super) fn history<'a>(
             limits.source_rows,
             ProjectionResource::SourceRows,
         )?;
-        let wide = line.projected_wide_continuations.len();
+        let wide = line.reflow_wide_continuations().len();
         result.wide = add(result.wide, wide)?;
         check(
             result.wide,
             limits.wide,
             ProjectionResource::WideContinuations,
         )?;
-        let data_bytes = match &line.data {
-            CompressedLineData::Plain(text, _) => text.len(),
-            CompressedLineData::Encoded(data) => data.len(),
-        };
+        let data_bytes = line.storage.search_encoded_bytes();
         result.source_bytes = add(
             result.source_bytes,
             add(
@@ -126,7 +123,7 @@ pub(super) fn history<'a>(
                 add(data_bytes, mul(wide, std::mem::size_of::<u16>())?)?,
             )?,
         )?;
-        result.decoded_cells = add(result.decoded_cells, usize::from(line.cols))?;
+        result.decoded_cells = add(result.decoded_cells, line.columns())?;
         if raw_materialization {
             check(
                 result.source_bytes,
@@ -139,7 +136,7 @@ pub(super) fn history<'a>(
                 ProjectionResource::DecodedCells,
             )?;
         }
-        group_cells = add(group_cells, usize::from(line.projected_active_len))?;
+        group_cells = add(group_cells, line.reflow_content_len())?;
         group_wide = add(group_wide, wide)?;
         group_rows = add(group_rows, 1)?;
         let visible_cells = group_cells
@@ -151,7 +148,7 @@ pub(super) fn history<'a>(
             limits.rows,
             ProjectionResource::PlanRows,
         )?;
-        if !line.is_wrapped {
+        if !line.is_wrapped() {
             finish_group(
                 &mut result,
                 group_cells,
@@ -267,7 +264,7 @@ mod tests {
         let mut blank = TerminalCell::default();
         blank.flags.set_bold(true);
         let line = ScrollbackLine::compress(&[blank; 32], false);
-        assert_eq!(line.projected_active_len, 0);
+        assert_eq!(line.reflow_content_len(), 0);
         let limits = Limits {
             decoded_cells: 31,
             ..Limits::default()
@@ -448,7 +445,7 @@ impl super::TerminalState {
             .scrollback
             .len()
             .saturating_sub(add(self.scroll_offset, rows)?);
-        while start > 0 && self.scrollback[start - 1].is_wrapped {
+        while start > 0 && self.scrollback[start - 1].is_wrapped() {
             start -= 1;
         }
         let estimate = history(self.scrollback.iter().skip(start), cols, limits, true)?;
@@ -927,7 +924,7 @@ impl super::TerminalState {
                 slices = add(slices, 1)?;
                 check(slices, limits.slices, ProjectionResource::RawSlices)?;
                 if let Some(source) = self.scrollback.get(slice.source.absolute_row) {
-                    decoded = add(decoded, usize::from(source.cols))?;
+                    decoded = add(decoded, source.columns())?;
                     check(
                         decoded,
                         limits.decoded_cells,

@@ -18,7 +18,10 @@ fn fingerprint(bytes: &[u8]) -> Value {
 }
 
 fn lane(value: impl std::fmt::Debug) -> Value {
-    let text = format!("{value:?}");
+    text_lane(format!("{value:?}"))
+}
+
+fn text_lane(text: String) -> Value {
     if text.len() <= 192 {
         Value::String(text)
     } else {
@@ -86,6 +89,7 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
         lane(t.colors.dynamic_cursor_color),
     );
     out.insert("dynamic_palette".into(), lane(t.colors.dynamic_palette));
+    super::replay_protocol::observe(t, &mut out, text_lane);
     fields!(
         current_working_dir,
         organism_idle_cwd,
@@ -96,13 +100,6 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
         current_hyperlink,
         osc8_hyperlinks,
         output_buffer,
-        modes,
-        keyboard_enhancement_flags,
-        keyboard_enhancement_stack,
-        alt_keyboard_enhancement_flags,
-        alt_keyboard_enhancement_stack,
-        xterm_modify_other_keys,
-        xterm_format_other_keys,
         pending_clipboard_requests,
         pending_paste_password,
         pending_osc52_clipboard_set,
@@ -209,7 +206,7 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
         lane(
             t.scrollback
                 .iter()
-                .map(|r| (r.decompress(), r.is_wrapped))
+                .map(|r| (r.decompress(), r.is_wrapped()))
                 .collect::<Vec<_>>(),
         ),
     );

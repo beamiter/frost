@@ -4428,11 +4428,12 @@ mod tests {
 #[cfg(test)]
 mod workspace_navigation_tree_tests {
     use super::{workspace_navigation_child, workspace_navigation_key};
+    use crate::test_renderer::{software_renderer, HeadlessRenderer};
     use iced::advanced::{layout, widget::Tree};
     use iced::widget::{button, keyed, text};
     use iced::{Element, Size};
 
-    fn view(conversations: &[&str]) -> Element<'static, String, iced::Theme, ()> {
+    fn view(conversations: &[&str]) -> Element<'static, String, iced::Theme, HeadlessRenderer> {
         let mut rows = keyed::Column::new()
             .push(
                 1_u64,
@@ -4454,6 +4455,7 @@ mod workspace_navigation_tree_tests {
 
     #[test]
     fn workspace_navigation_hydration_reconciles_different_widget_kinds() {
+        let renderer = software_renderer();
         let mut tree = Tree::new(view(&[]).as_widget());
         // The async host catalog inserts scoped rows before an existing plain
         // header. Keyed Column can reuse that header's tree for the new row.
@@ -4468,7 +4470,7 @@ mod workspace_navigation_tree_tests {
             tree.diff(element.as_widget());
             let node = element.as_widget_mut().layout(
                 &mut tree,
-                &(),
+                &renderer,
                 &layout::Limits::new(Size::ZERO, Size::new(300.0, 600.0)),
             );
             assert_eq!(tree.children.len(), conversations.len() + 3);

@@ -212,8 +212,10 @@ mod tests {
     impl Fixture {
         fn new(mode: &str) -> Self {
             let n = NEXT.fetch_add(1, Ordering::Relaxed);
-            let dir =
-                std::env::temp_dir().join(format!("frost-worker-proof-{}-{n}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!(
+                "frost-color-worker-proof-{}-{n}",
+                std::process::id()
+            ));
             fs::create_dir(&dir).unwrap();
             let bin = dir.join("fake.sh");
             let corpus = dir.join("input");
@@ -246,7 +248,7 @@ esac
                 bin,
                 corpus,
                 hash,
-                marker: format!("FROST_TEST_CHILD_{}_{n}", std::process::id()),
+                marker: format!("FROST_COLOR_TEST_CHILD_{}_{n}", std::process::id()),
             }
         }
         fn run(&self) -> io::Result<PathBuf> {

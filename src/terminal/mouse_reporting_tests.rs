@@ -8,7 +8,7 @@ fn shared_mouse_all_mode_combinations_preserve_encoding_precedence() {
         let mut terminal = TerminalState::new(20, 5);
         for (bit, mode) in modes.into_iter().enumerate() {
             if mask & (1 << bit) != 0 {
-                terminal.modes.insert(mode);
+                terminal.set_mode(mode, true);
             }
         }
         let (press, release): (Option<&[u8]>, Option<&[u8]>) = if mask & 7 == 0 {
@@ -38,28 +38,28 @@ fn shared_mouse_all_mode_combinations_preserve_encoding_precedence() {
 #[test]
 fn shared_mouse_extreme_coordinates_and_buttons_never_wrap() {
     let mut terminal = TerminalState::new(20, 5);
-    terminal.modes.insert(1000);
+    terminal.set_mode(1000, true);
     assert_eq!(
         terminal
             .get_mouse_report(255, usize::MAX, usize::MAX)
             .unwrap(),
         b"\x1b[M\xff\xff\xff"
     );
-    terminal.modes.insert(1005);
+    terminal.set_mode(1005, true);
     assert_eq!(
         terminal
             .get_mouse_report(255, usize::MAX, usize::MAX)
             .unwrap(),
         b"\x1b[M\xc4\x9f\xdf\xbf\xdf\xbf"
     );
-    terminal.modes.insert(1015);
+    terminal.set_mode(1015, true);
     assert_eq!(
         terminal
             .get_mouse_report(255, usize::MAX, usize::MAX)
             .unwrap(),
         format!("\x1b[287;{0};{0}M", usize::MAX).as_bytes()
     );
-    terminal.modes.insert(1006);
+    terminal.set_mode(1006, true);
     assert_eq!(
         terminal
             .get_mouse_report(255, usize::MAX, usize::MAX)
@@ -78,21 +78,22 @@ fn shared_mouse_extreme_coordinates_and_buttons_never_wrap() {
 fn unrelated_host_modes_cannot_enable_mouse_reports() {
     let mut terminal = TerminalState::new(20, 5);
     for mode in [
-        1, 4, 6, 7, 25, 47, 66, 1001, 1004, 1047, 1048, 1049, 2004, 2026, 2031, 5522,
+        1, 6, 7, 25, 47, 66, 1001, 1004, 1047, 1048, 1049, 2004, 2026, 2031, 5522,
     ] {
-        terminal.modes.insert(mode);
+        terminal.set_mode(mode, true);
     }
     assert!(terminal.get_mouse_report(0, 0, 0).is_none());
     assert!(terminal.get_mouse_release_report(0, 0, 0).is_none());
-    assert!(terminal.modes.contains(&4));
-    assert!(terminal.modes.contains(&6));
+    terminal.set_mode(4, false);
+    assert!(terminal.insert_mode);
+    assert!(terminal.origin_mode);
 }
 
 #[test]
 fn shared_mouse_utf8_button_boundaries_are_valid_through_host_adapter() {
     let mut terminal = TerminalState::new(20, 5);
-    terminal.modes.insert(1000);
-    terminal.modes.insert(1005);
+    terminal.set_mode(1000, true);
+    terminal.set_mode(1005, true);
     for (button, wire, release) in [
         (95, &b"\x1b[M\x7f!!"[..], &b"\x1b[M?!!"[..]),
         (96, &b"\x1b[M\xc2\x80!!"[..], &b"\x1b[M#!!"[..]),
@@ -127,10 +128,10 @@ fn shared_mouse_release_preserves_each_modifier_and_discards_legacy_button_bits(
     ] {
         for base in [0, 1, 2, 32, 64, 128, 192] {
             let mut terminal = TerminalState::new(20, 5);
-            terminal.modes.insert(1002);
+            terminal.set_mode(1002, true);
             for mode in [0, 1005, 1015, 1006] {
                 if mode != 0 {
-                    terminal.modes.insert(mode);
+                    terminal.set_mode(mode, true);
                 }
                 let expected = match mode {
                     1006 => format!("\x1b[<{};1;1m", base | mods).into_bytes(),

@@ -2586,6 +2586,7 @@ mod tests {
 
     #[test]
     fn focus_report_publishes_changes_and_clears_after_the_field_disappears() {
+        use crate::test_renderer::{software_renderer, HeadlessRenderer};
         use iced::advanced::widget::{operation, Id, Tree};
         use iced::advanced::{layout, Layout, Shell};
         use iced::widget::{button, column, text_input};
@@ -2598,7 +2599,9 @@ mod tests {
             Press,
         }
         let id = Id::new("task-search-test");
-        let view = |reported: bool, with_input: bool| -> Element<'static, Msg, iced::Theme, ()> {
+        let view = |reported: bool,
+                    with_input: bool|
+         -> Element<'static, Msg, iced::Theme, HeadlessRenderer> {
             let mut content = column![button("Next").on_press(Msg::Press)];
             if with_input {
                 content = content.push(
@@ -2609,6 +2612,7 @@ mod tests {
             }
             report_input_focus(content, reported, Msg::Focus)
         };
+        let renderer = software_renderer();
         let viewport = Rectangle::with_size(Size::new(400.0, 200.0));
         let redraw = iced::Event::Window(iced::window::Event::RedrawRequested(
             std::time::Instant::now(),
@@ -2617,11 +2621,11 @@ mod tests {
         let mut tree = Tree::new(element.as_widget());
         let mut node = element.as_widget_mut().layout(
             &mut tree,
-            &(),
+            &renderer,
             &layout::Limits::new(Size::ZERO, viewport.size()),
         );
         let mut messages = Vec::new();
-        let update = |element: &mut Element<'static, Msg, iced::Theme, ()>,
+        let update = |element: &mut Element<'static, Msg, iced::Theme, HeadlessRenderer>,
                       tree: &mut Tree,
                       node: &layout::Node,
                       event: &iced::Event,
@@ -2631,7 +2635,7 @@ mod tests {
                 event,
                 Layout::new(node),
                 iced::mouse::Cursor::Unavailable,
-                &(),
+                &renderer,
                 &mut iced::advanced::clipboard::Null,
                 &mut Shell::new(messages),
                 &viewport,
@@ -2642,7 +2646,7 @@ mod tests {
         element.as_widget_mut().operate(
             &mut tree,
             Layout::new(&node),
-            &(),
+            &renderer,
             &mut operation::focusable::focus(id.clone()),
         );
         update(&mut element, &mut tree, &node, &redraw, &mut messages);
@@ -2654,7 +2658,7 @@ mod tests {
         tree.diff(element.as_widget());
         node = element.as_widget_mut().layout(
             &mut tree,
-            &(),
+            &renderer,
             &layout::Limits::new(Size::ZERO, viewport.size()),
         );
         messages.clear();
@@ -2677,7 +2681,7 @@ mod tests {
         tree.diff(element.as_widget());
         node = element.as_widget_mut().layout(
             &mut tree,
-            &(),
+            &renderer,
             &layout::Limits::new(Size::ZERO, viewport.size()),
         );
         update(&mut element, &mut tree, &node, &redraw, &mut messages);

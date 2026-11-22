@@ -6839,6 +6839,7 @@ mod block_spacing_render_tests {
 mod mode_gesture_tests {
     use super::*;
     use crate::config::TerminalMode;
+    use crate::test_renderer::{software_renderer, HeadlessRenderer};
     const MODES: [TerminalMode; 3] = [
         TerminalMode::Normal,
         TerminalMode::Block,
@@ -7204,10 +7205,10 @@ mod mode_gesture_tests {
         widget
     }
     fn tree(widget: &TermWidget<'_, Output>) -> Tree {
-        Tree::new(widget as &dyn Widget<Output, iced::Theme, ()>)
+        Tree::new(widget as &dyn Widget<Output, iced::Theme, HeadlessRenderer>)
     }
     fn diff(tree: &mut Tree, widget: &TermWidget<'_, Output>) {
-        tree.diff(widget as &dyn Widget<Output, iced::Theme, ()>);
+        tree.diff(widget as &dyn Widget<Output, iced::Theme, HeadlessRenderer>);
     }
     fn send(
         widget: &mut TermWidget<'_, Output>,
@@ -7227,13 +7228,14 @@ mod mode_gesture_tests {
         let node = layout::Node::new(bounds.size());
         let mut messages = Vec::new();
         let mut shell = Shell::new(&mut messages);
-        <TermWidget<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+        let renderer = software_renderer();
+        <TermWidget<'_, Output> as Widget<Output, iced::Theme, HeadlessRenderer>>::update(
             widget,
             tree,
             &event,
             Layout::new(&node),
             mouse::Cursor::Available(point),
-            &(),
+            &renderer,
             &mut iced::advanced::clipboard::Null,
             &mut shell,
             &bounds,
@@ -7674,7 +7676,7 @@ mod mode_gesture_tests {
         let projection = terminal.get_projected_viewport(false);
         let theme = Theme::default();
         let point = Point::new(40.0, 25.0);
-        let build = |mode, epoch| -> Element<'_, Output, iced::Theme, ()> {
+        let build = |mode, epoch| -> Element<'_, Output, iced::Theme, HeadlessRenderer> {
             let panes = Element::new(fixture(&projection, &theme, mode, epoch));
             let bar =
                 (mode == TerminalMode::Block).then(|| iced::widget::Space::new().height(10).into());
@@ -7683,27 +7685,29 @@ mod mode_gesture_tests {
                 .height(Length::Fill)
                 .into()
         };
-        let send_composed =
-            |element: &mut Element<'_, Output, iced::Theme, ()>, tree: &mut Tree, event| {
-                let bounds = Rectangle::with_size(Size::new(600.0, 150.0));
-                let node = element.as_widget_mut().layout(
-                    tree,
-                    &(),
-                    &layout::Limits::new(Size::ZERO, bounds.size()),
-                );
-                let mut messages = Vec::new();
-                element.as_widget_mut().update(
-                    tree,
-                    &event,
-                    Layout::new(&node),
-                    mouse::Cursor::Available(point),
-                    &(),
-                    &mut iced::advanced::clipboard::Null,
-                    &mut Shell::new(&mut messages),
-                    &bounds,
-                );
-                messages
-            };
+        let renderer = software_renderer();
+        let send_composed = |element: &mut Element<'_, Output, iced::Theme, HeadlessRenderer>,
+                             tree: &mut Tree,
+                             event| {
+            let bounds = Rectangle::with_size(Size::new(600.0, 150.0));
+            let node = element.as_widget_mut().layout(
+                tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, bounds.size()),
+            );
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            messages
+        };
         for before in MODES {
             for after in MODES {
                 if before == after {
@@ -7771,7 +7775,7 @@ mod mode_gesture_tests {
         let projection = terminal.get_projected_viewport(false);
         let theme = Theme::default();
         let point = Point::new(40.0, 25.0);
-        let build = |epoch| -> Element<'_, Output, iced::Theme, ()> {
+        let build = |epoch| -> Element<'_, Output, iced::Theme, HeadlessRenderer> {
             iced::widget::container(crate::terminal_panes_body(
                 None,
                 Element::new(fixture(&projection, &theme, TerminalMode::Normal, epoch)),
@@ -7780,11 +7784,14 @@ mod mode_gesture_tests {
             .height(Length::Fill)
             .into()
         };
-        let send = |element: &mut Element<'_, Output, iced::Theme, ()>, tree: &mut Tree, event| {
+        let renderer = software_renderer();
+        let send = |element: &mut Element<'_, Output, iced::Theme, HeadlessRenderer>,
+                    tree: &mut Tree,
+                    event| {
             let bounds = Rectangle::with_size(Size::new(600.0, 150.0));
             let node = element.as_widget_mut().layout(
                 tree,
-                &(),
+                &renderer,
                 &layout::Limits::new(Size::ZERO, bounds.size()),
             );
             let mut messages = Vec::new();
@@ -7793,7 +7800,7 @@ mod mode_gesture_tests {
                 &event,
                 Layout::new(&node),
                 mouse::Cursor::Available(point),
-                &(),
+                &renderer,
                 &mut iced::advanced::clipboard::Null,
                 &mut Shell::new(&mut messages),
                 &bounds,
@@ -8026,7 +8033,7 @@ mod mode_gesture_tests {
             .find("self.finish_cancelled_terminal_mouse_gesture(gesture)")
             .unwrap();
         assert!(finish < close.find("self.sessions.remove(index)").unwrap());
-        assert!(finish < close.find("pty.terminate()").unwrap());
+        assert!(finish < close.find("pty.stop_after_pending_input(").unwrap());
     }
     #[test]
     fn pane_owner_composed_tabs_close_zoom_and_swap_do_not_transfer_selection() {
@@ -8034,7 +8041,7 @@ mod mode_gesture_tests {
         let projection = terminal.get_projected_viewport(false);
         let theme = Theme::default();
         let point = Point::new(40.0, 25.0);
-        let build = |ids: &[usize], epoch| -> Element<'_, Output, iced::Theme, ()> {
+        let build = |ids: &[usize], epoch| -> Element<'_, Output, iced::Theme, HeadlessRenderer> {
             let mut panes = iced::widget::Row::new();
             for &id in ids {
                 panes = panes.push(Element::new(
@@ -8047,11 +8054,14 @@ mod mode_gesture_tests {
                 .height(Length::Fill)
                 .into()
         };
-        let send = |element: &mut Element<'_, Output, iced::Theme, ()>, tree: &mut Tree, event| {
+        let renderer = software_renderer();
+        let send = |element: &mut Element<'_, Output, iced::Theme, HeadlessRenderer>,
+                    tree: &mut Tree,
+                    event| {
             let bounds = Rectangle::with_size(Size::new(600.0, 150.0));
             let node = element.as_widget_mut().layout(
                 tree,
-                &(),
+                &renderer,
                 &layout::Limits::new(Size::ZERO, bounds.size()),
             );
             let mut messages = Vec::new();
@@ -8060,7 +8070,7 @@ mod mode_gesture_tests {
                 &event,
                 Layout::new(&node),
                 mouse::Cursor::Available(point),
-                &(),
+                &renderer,
                 &mut iced::advanced::clipboard::Null,
                 &mut Shell::new(&mut messages),
                 &bounds,

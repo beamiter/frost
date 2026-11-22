@@ -1272,18 +1272,13 @@ Missing project directories or session files are reported before resume, and
 archived Codex conversations must be unarchived with Codex first. The library
 reads local history without modifying it or calling a model service.
 
-The four terminals use the shared `jterm_core` session catalog implementation.
-Frost production and development builds resolve the exact Cargo-locked Git commit
-`57ed89a62fdd61db060a3c976ab9e8cdac9ae823`, not a sibling checkout. This source
-upgrade shares the engine parser, cell/grid primitives and the 256-scalar
-`FrostTitleState` window/icon/title-stack owner. Frost retains title admission,
-outbound sanitization and RIS title retention, as well as projection, compression
-and remaining terminal semantic policy. The engine uses the same
-Git revision as the session core. Shared runtime ownership and native visual
-acceptance are still unfinished. The checked-in `packaging/jterm-core-*` archive exports verified immutable blobs
-from that same revision, including the independent engine. Its revision, Git tree
-and SHA-256 are recorded together; it is not used by the exact-Git production path. Application CI and
-cross-terminal native verification remain separate evidence.
+Frost uses the shared `jterm_core` session catalog and read-only Workspace
+controllers. Cargo locks the core, engine and runtime at
+`466e4ea5dc1e4df12432291a11514c8402db148a`. The shared session actor handles
+terminal and Vim9 PTY input and output. Frost retains its title admission,
+outbound sanitization, RIS title retention and display projection. The
+`packaging/jterm-core-*` archives record earlier source revisions with their
+Git tree and SHA-256.
 
 The session library ranks exact IDs and titles ahead of incidental preview matches.
 Choose **This folder** to include the captured terminal directory and its subfolders,

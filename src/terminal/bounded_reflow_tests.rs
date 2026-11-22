@@ -13,25 +13,15 @@ fn assert_tail(source: &[ScrollbackLine], cols: usize, cap: usize) {
     assert_eq!(actual.len(), reference.len() - tail);
     for (a, b) in actual.iter().zip(&reference[tail..]) {
         assert_eq!(a.decompress(), b.decompress());
-        assert_eq!(a.is_wrapped, b.is_wrapped);
-        assert_eq!(a.cols, b.cols);
-        assert_eq!(a.projected_active_len, b.projected_active_len);
-        assert_eq!(
-            a.projected_wide_continuations,
-            b.projected_wide_continuations
-        );
-        assert!(a.raw_row_id.is_tracked());
-        assert!(!source.iter().any(|s| s.raw_row_id == a.raw_row_id));
+        assert_eq!(a.is_wrapped(), b.is_wrapped());
+        assert_eq!(a.columns(), b.columns());
+        assert_eq!(a.reflow_content_len(), b.reflow_content_len());
+        assert_eq!(a.reflow_wide_continuations(), b.reflow_wide_continuations());
+        assert!(a.raw_row_id().is_tracked());
+        assert!(!source.iter().any(|s| s.raw_row_id() == a.raw_row_id()));
     }
     let peak = BOUNDED_REFLOW_PEAK.with(|p| p.get());
-    assert!(
-        peak.0
-            <= source
-                .iter()
-                .map(|s| usize::from(s.cols))
-                .max()
-                .unwrap_or(0)
-    );
+    assert!(peak.0 <= source.iter().map(|s| s.columns()).max().unwrap_or(0));
     assert!(peak.1 <= cols);
     assert!(peak.2 <= cap);
 }
@@ -57,7 +47,7 @@ fn bounded_reflow_real_output_wide_to_narrow_never_materializes_full_expansion()
     assert_eq!(BOUNDED_REFLOW_PEAK.with(|p| p.get()), (64, 1, 64));
     for (a, b) in terminal.scrollback.iter().zip(&old[4032..]) {
         assert_eq!(a.decompress(), b.decompress());
-        assert_eq!(a.is_wrapped, b.is_wrapped);
+        assert_eq!(a.is_wrapped(), b.is_wrapped());
     }
 }
 
