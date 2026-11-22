@@ -1,7 +1,7 @@
 {
   "format": "frost-title-replay-overlay-v1",
   "original_commit": "ada5ae0cb2ff14b5b1177128aec3595c534f3a27",
-  "consumer_core_commit": "466e4ea5dc1e4df12432291a11514c8402db148a",
+  "consumer_core_commit": "dfc87c88acf3f9877680d2dad6a5885eb7209974",
   "expected": "sealed-evidence/frost-title-original.jsonl.zst",
   "expected_sha256": "8dd591c50ade8546d6d438e1c08837ceaf59c2d2e9462bd9209e75987051887b",
   "dev_dependency_edges": {
