@@ -251,6 +251,17 @@ jobs:
           /usr/bin/python3 scripts/test-native-held-drag.py -v
           # The producer is synthetic ANSI, not a Codex CLI or external endpoint.
           /usr/bin/python3 scripts/native-tab-resize-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --output native-smoke-artifacts/x11-ordinal-held-drag --held-drag-only
+      - name: Exercise first complete X11 same-size tab returns
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          fixture_home="$(mktemp -d "$RUNNER_TEMP/frost-tab-return-home.XXXXXXXX")"
+          export HOME="$fixture_home"
+          # Only the synthetic inline ANSI fixture runs; test tail and parked history independently.
+          timeout --kill-after=5s 120s /usr/bin/python3 scripts/native-tab-resize-smoke.py \
+            --binary "$RUNNER_TEMP/frost-installed/bin/frost" \
+            --output native-smoke-artifacts/x11-first-complete-tab-return --page-up-tab-return
       - name: Preserve screenshots and PTY evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
