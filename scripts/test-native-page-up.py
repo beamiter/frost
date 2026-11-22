@@ -16,7 +16,7 @@ import unittest
 
 from PIL import Image, ImageDraw
 
-from native_page_up import ROW_COUNT, calibrate_grid
+from native_page_up import ROW_COUNT, calibrate_grid, first_complete_return_sample
 from native_row_witness import Frame, InvalidWitness, marker_colors, row_ids
 
 
@@ -84,6 +84,40 @@ class PageCalibrationTest(unittest.TestCase):
         img.paste(copy, (70, 0))
         with self.assertRaisesRegex(InvalidWitness, 'Multiple synthetic'):
             calibrate_grid(img, ('same-window',), seq)
+
+
+class TabReturnFirstCompleteTest(unittest.TestCase):
+    def test_exact_parked_rows_are_required_at_the_first_complete_sample(self):
+        parked_image, parked = image_with_markers(range(239, 247), 13, 26, 6, 8)
+        tail_image, _ = image_with_markers(range(269, 277), 13, 26, 6, 8)
+        grid = calibrate_grid(parked_image, ('same-window',), parked)
+        target = dict(target_before=True, target_after=True)
+        first = Frame(grid, parked_image, 120, 130)
+        self.assertEqual(first_complete_return_sample(first, grid, parked, (100, 110), **target),
+                         parked)
+        # Do not retry a complete but incorrect tail frame until the right one appears.
+        with self.assertRaisesRegex(InvalidWitness, 'starts at 269'):
+            first_complete_return_sample(Frame(grid, tail_image, 120, 130), grid, parked,
+                                         (100, 110), **target)
+
+    def test_only_title_bracketed_well_ordered_complete_samples_count(self):
+        image, rows = image_with_markers(range(239, 247), 13, 26, 6, 8)
+        grid = calibrate_grid(image, ('same-window',), rows)
+        first = Frame(grid, image, 120, 130)
+        for before, after in ((False, True), (True, False)):
+            self.assertIsNone(first_complete_return_sample(
+                first, grid, rows, (100, 110), target_before=before, target_after=after))
+        image.putpixel((grid.x[0], grid.y[0]), (0, 0, 0))
+        self.assertIsNone(first_complete_return_sample(
+            first, grid, rows, (100, 110), target_before=True, target_after=True))
+        with self.assertRaisesRegex(InvalidWitness, 'did not follow'):
+            first_complete_return_sample(first, grid, rows, (100, 125),
+                                         target_before=True, target_after=True)
+        wrong_target = calibrate_grid(
+            image_with_markers(rows, 13, 26, 6, 8)[0], ('other-window',), rows)
+        with self.assertRaisesRegex(InvalidWitness, 'grid identity'):
+            first_complete_return_sample(first, wrong_target, rows, (100, 110),
+                                         target_before=True, target_after=True)
 
 
 class OrdinalProducerTest(unittest.TestCase):

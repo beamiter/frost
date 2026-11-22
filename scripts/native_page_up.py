@@ -89,6 +89,27 @@ def wait_file(root, name):
     raise TimeoutError('Missing producer gate: ' + name)
 
 
+def first_complete_return_sample(frame, expected_grid, expected_rows, key_interval,
+                                 *, target_before, target_after):
+    """A wrong complete frame is evidence against retention, not a retry."""
+    if not target_before or not target_after:
+        return None
+    if frame.grid != expected_grid:
+        raise InvalidWitness('Returned viewport changed grid identity')
+    sent, returned = key_interval
+    if not sent <= returned < frame.started < frame.finished:
+        raise InvalidWitness('Tab return capture did not follow input injection')
+    try:
+        observed = row_ids(frame)
+    except InvalidWitness:
+        # Incomplete/ambiguous paint is not counted as a native frame receipt.
+        return None
+    if observed != expected_rows:
+        raise InvalidWitness(f'First complete returned viewport starts at {observed[0]}, '
+                             f'not retained row {expected_rows[0]}')
+    return observed
+
+
 def producer(root):
     """No child CLI, mouse reporting, alternate screen, or query injection."""
     generation = 0
@@ -129,7 +150,7 @@ def producer(root):
     wait_file(root, 'producer-finish')
 
 
-def exercise(root, env, app, window, run, wait, key):
+def exercise(root, env, app, window, run, wait, key, *, tab_return=False):
     root.joinpath('emit-ordinal-rows').touch(exist_ok=False)
 
     def read(name):
@@ -180,15 +201,67 @@ def exercise(root, env, app, window, run, wait, key):
 
         return wait(sample, 'two stable decoded native ordinal frames')
 
+    def first_return(grid, rows, label):
+        if (run('xdotool', 'getactivewindow').stdout.strip() != window or
+                'SHELL_RESIZE_FIXTURE' not in run('xdotool', 'getwindowname', window).stdout):
+            raise InvalidWitness('Tab return did not start on the disposable shell tab')
+
+        def on_cli_tab():
+            if app.poll() is not None or run('xdotool', 'getactivewindow').stdout.strip() != window:
+                raise InvalidWitness('Tab return left the dedicated fixture window')
+            return TITLE in run('xdotool', 'getwindowname', window).stdout
+
+        sent = time.monotonic_ns()
+        run('xdotool', 'key', '--clearmodifiers', 'ctrl+Prior')
+        returned = time.monotonic_ns()
+        unqualified = 0
+
+        def sample():
+            nonlocal unqualified
+            if not on_cli_tab():
+                return None
+            if identity() != grid.target:
+                raise InvalidWitness('Tab return changed window geometry or PTY identity')
+            frame = observe(grid)
+            on_target_after = on_cli_tab()
+            if on_target_after and identity() != grid.target:
+                raise InvalidWitness('Tab return capture straddled a changed target')
+            try:
+                observed = first_complete_return_sample(
+                    frame, grid, rows, (sent, returned),
+                    target_before=True, target_after=on_target_after)
+            except InvalidWitness:
+                frame.image.save(root / f'ordinal-return-{label}-wrong.png')
+                raise
+            if observed is None:
+                unqualified += 1
+                return None
+            frame.image.save(root / f'ordinal-return-{label}.png')
+            return frame
+
+        frame = wait(sample, f'first complete same-grid {label} return')
+        return frame, {
+            'first': rows[0],
+            'rows': len(rows),
+            'unqualified_samples_after_title': unqualified,
+            'key_interval_ns': [sent, returned],
+            'capture_interval_ns': [frame.started, frame.finished],
+        }
+
     try:
         target = identity()
         first = witnessed(expected)
         first.image.save(root / 'ordinal-before-tab.png')
         key('ctrl+shift+t', 'SHELL_RESIZE_FIXTURE')
-        key('ctrl+Prior', TITLE)
+        returns = {}
+        if tab_return:
+            before, returns['tail'] = first_return(first.grid, expected, 'tail')
+        else:
+            key('ctrl+Prior', TITLE)
         if identity() != target:
             raise InvalidWitness('Tab return changed window or grid identity')
-        before = witnessed(expected, first.grid)
+        if not tab_return:
+            before = witnessed(expected, first.grid)
         before.image.save(root / 'ordinal-before-page.png')
         if identity() != target:
             raise InvalidWitness('Synthetic CLI lost ownership before PageUp')
@@ -204,6 +277,11 @@ def exercise(root, env, app, window, run, wait, key):
         result = verify_page_up(before, after, [('Prior', sent, returned)],
                                 pty_rows=flush['rows'], ownership='frost-scrollback',
                                 fixture_flushes=(flush['monotonic_ns'],))
+        if tab_return:
+            key('ctrl+Next', 'SHELL_RESIZE_FIXTURE')
+            _, returns['parked'] = first_return(
+                first.grid, tuple(row - page for row in expected), 'parked')
+            result['tab_return_first_complete'] = returns
         root.joinpath('check-ordinal-input').touch(exist_ok=False)
         receipt = wait(lambda: read('ordinal-input.json'), 'ordinal producer input readback')
         for field in ('pid', 'tty', 'rows', 'cols', 'resize_generation'):

@@ -47,6 +47,8 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--page-up-only', action='store_true',
                       help='Run the independent synthetic ordinal PageUp case')
+    mode.add_argument('--page-up-tab-return', action='store_true',
+                      help='Also verify first complete tail and parked tab-return raster receipts')
     mode.add_argument('--held-drag-only', action='store_true',
                       help='Run the independent synthetic held-drag case')
     args = parser.parse_args()
@@ -109,8 +111,8 @@ while True:
     stripe((24 + cols % 180, 239, 97))
     print('\\x1b[?2026l', end='', flush=True)
 ''')
-    if args.page_up_only or args.held_drag_only:
-        producer_module = 'native_page_up' if args.page_up_only else 'native_held_drag'
+    if args.page_up_only or args.page_up_tab_return or args.held_drag_only:
+        producer_module = 'native_held_drag' if args.held_drag_only else 'native_page_up'
         fixture.write_text(
             'import sys\n'
             'sys.path.insert(0, ' + repr(str(Path(__file__).resolve().parent)) + ')\n'
@@ -192,12 +194,13 @@ while True:
         window = wait(lambda: run('xdotool', 'search', '--onlyvisible', '--pid', app.pid,
                                  check=False).stdout.strip().splitlines(), 'Frost window')[-1]
         run('xdotool', 'windowactivate', '--sync', window)
-        if args.page_up_only:
+        if args.page_up_only or args.page_up_tab_return:
             from native_page_up import exercise
 
             result['scope'] = 'native X11 terminal-owned PageUp with synthetic inline ANSI rows'
             wait(lambda: (root / 'ordinal-ready.json').exists(), 'ordinal producer ready')
-            result['page_up'] = exercise(root, env, app, window, run, wait, key)
+            result['page_up'] = exercise(
+                root, env, app, window, run, wait, key, tab_return=args.page_up_tab_return)
             result['status'] = 'pass'
             return
         if args.held_drag_only:
