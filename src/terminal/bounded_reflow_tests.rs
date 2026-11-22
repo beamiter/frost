@@ -1,5 +1,41 @@
 use super::*;
 
+#[test]
+fn dense_scroll_history_budget_applies_to_pushes_and_reflow() {
+    use jterm_engine::retained_history::RETAINED_HISTORY_BYTES;
+
+    let mut terminal = TerminalState::new(128, 4);
+    let cells: Vec<_> = (0..512)
+        .map(|column| TerminalCell {
+            character: 'λ',
+            background: Color::Rgb(column as u8, (column / 256) as u8, 88),
+            ..TerminalCell::default()
+        })
+        .collect();
+    let dense = ScrollbackLine::compress(&cells, false);
+    let charge = dense.clone().retained_bytes();
+    let keep = RETAINED_HISTORY_BYTES / charge;
+    terminal.set_max_scrollback(keep * 8);
+    terminal.push_scrollback_compressed(dense.clone());
+    let oldest = terminal.scrollback.front().unwrap().raw_row_id();
+    for _ in 0..=keep {
+        let mut row = dense.clone();
+        row.storage.set_raw_row_id(fresh_raw_row_id());
+        terminal.push_scrollback_compressed(row);
+    }
+    assert_eq!(terminal.scrollback.len(), keep);
+    assert_eq!(terminal.scrollback.retained_bytes(), keep * charge);
+    assert_ne!(terminal.scrollback.front().unwrap().raw_row_id(), oldest);
+    assert_eq!(terminal.scrollback.back().unwrap().decompress(), cells);
+
+    assert!(terminal.normalize_scrollback_width());
+    assert!(!terminal.scrollback.over_budget(terminal.max_scrollback));
+    let last = terminal.scrollback.back().unwrap().decompress();
+    assert_eq!(&last, &cells[cells.len() - last.len()..]);
+    terminal.purge_saved_lines(terminal.scrollback.len());
+    assert_eq!(terminal.scrollback.retained_bytes(), 0);
+}
+
 fn assert_tail(source: &[ScrollbackLine], cols: usize, cap: usize) {
     let reference = TerminalState::reflow_lines(source, cols, &TerminalCell::default());
     let tail = reference.len().saturating_sub(cap);

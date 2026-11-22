@@ -3,6 +3,7 @@ use jterm_engine::grid::{
     WideContinuationProtection,
 };
 use jterm_engine::protocol_state::{ProtocolState, TerminalModes};
+use jterm_engine::retained_history::{RetainedHistory, RetainedRow};
 use jterm_engine::screen::{
     default_tab_stops, resize_tab_stops, AlternateRestorePolicy, AlternateScreenControls, Charset,
     CursorControls, CursorDrawing, SavedCursorState, TabStopOrigin,
@@ -457,6 +458,12 @@ impl std::ops::IndexMut<usize> for TerminalGrid {
 #[derive(Clone)]
 pub struct ScrollbackLine {
     storage: jterm_engine::ScrollbackLine,
+}
+
+impl RetainedRow for ScrollbackLine {
+    fn retained_bytes(&self) -> usize {
+        RetainedRow::retained_bytes(&self.storage)
+    }
 }
 
 impl std::fmt::Debug for ScrollbackLine {
@@ -3134,7 +3141,7 @@ struct CompletedCommandMetadata {
 pub struct TerminalState {
     pub grid: TerminalGrid,
     alt_grid: TerminalGrid,
-    pub scrollback: VecDeque<ScrollbackLine>,
+    pub scrollback: RetainedHistory<ScrollbackLine>,
     pub selection: Option<Selection>,
     projected_selection: Option<ProjectedSelection>,
     inline_text_selection: Option<InlineTextSelection>,
@@ -3465,7 +3472,7 @@ impl TerminalState {
         TerminalState {
             grid,
             alt_grid,
-            scrollback: VecDeque::new(),
+            scrollback: RetainedHistory::default(),
             selection: None,
             projected_selection: None,
             inline_text_selection: None,
@@ -5429,7 +5436,7 @@ impl TerminalState {
         if rows == 0 {
             return;
         }
-        self.scrollback.drain(..rows);
+        self.scrollback.discard_prefix(rows);
         self.on_scrollback_rows_trimmed(rows);
         self.settle_zone_row_trim();
         self.clear_text_selection();
@@ -5830,7 +5837,7 @@ impl TerminalState {
             })
             .collect();
         self.cleared_blocks = Some(ClearedBlocksSnapshot {
-            scrollback: self.scrollback.drain(..retained_scrollback_start).collect(),
+            scrollback: self.scrollback.take_prefix(retained_scrollback_start),
             grid_rows: stashed_grid_rows,
             zones: std::mem::take(&mut self.command_zones),
             provenance: std::mem::take(&mut self.finished_output_provenance),
@@ -5922,10 +5929,8 @@ impl TerminalState {
                 restored = restored.saturating_sub(1);
             }
         }
-        while self.scrollback.len() > self.max_scrollback {
-            self.scrollback.pop_front();
-            self.on_scrollback_rows_trimmed(1);
-        }
+        let trimmed = self.scrollback.trim_oldest(self.max_scrollback);
+        self.on_scrollback_rows_trimmed(trimmed);
         self.settle_zone_row_trim();
         self.enforce_captured_output_budget(Self::MAX_CAPTURED_OUTPUT_BYTES);
 
@@ -7358,10 +7363,14 @@ impl TerminalState {
         if self.use_alt_buffer && !allow_alt_buffer {
             return;
         }
-        if self.scrollback.len() >= self.max_scrollback {
+        let mut trimmed = 0;
+        while !self.scrollback.is_empty()
+            && self.scrollback.needs_room_for(&line, self.max_scrollback)
+        {
             self.scrollback.pop_front();
-            self.on_scrollback_rows_trimmed(1);
+            trimmed += 1;
         }
+        self.on_scrollback_rows_trimmed(trimmed);
         self.scrollback.push_back(line);
         self.scrollback_pushes = self.scrollback_pushes.wrapping_add(1);
         self.bump_history_revision();
@@ -8650,11 +8659,7 @@ impl TerminalState {
     pub fn set_max_scrollback(&mut self, max_scrollback: usize) {
         self.max_scrollback = max_scrollback.max(1);
 
-        let mut trimmed = 0usize;
-        while self.scrollback.len() > self.max_scrollback {
-            self.scrollback.pop_front();
-            trimmed += 1;
-        }
+        let trimmed = self.scrollback.trim_oldest(self.max_scrollback);
         self.on_scrollback_rows_trimmed(trimmed);
         self.settle_zone_row_trim();
 
@@ -12332,82 +12337,36 @@ impl TerminalState {
         new_cols: usize,
         blank_cell: &TerminalCell,
         retain_rows: usize,
-    ) -> VecDeque<ScrollbackLine> {
-        assert!(new_cols > 0);
-        let mut result = VecDeque::new();
-        let mut emit = |cells: &[TerminalCell], wrapped: bool| {
-            let line = ScrollbackLine::compress(cells, wrapped);
-            if retain_rows != 0 {
-                if result.len() == retain_rows {
-                    result.pop_front();
+    ) -> RetainedHistory<ScrollbackLine> {
+        let mut result = RetainedHistory::default();
+        let source = lines.into_iter().map(|line| {
+            let cells = line.decompress();
+            #[cfg(test)]
+            BOUNDED_REFLOW_PEAK.with(|peak| {
+                let (source, row, retained) = peak.get();
+                peak.set((source.max(cells.len()), row, retained));
+            });
+            (cells, line.is_wrapped())
+        });
+        jterm_engine::history_reflow::reflow_cell_rows(
+            source,
+            new_cols,
+            *blank_cell,
+            |cells, wrapped| {
+                let line = ScrollbackLine::compress(cells, wrapped);
+                if retain_rows != 0 {
+                    while !result.is_empty() && result.needs_room_for(&line, retain_rows) {
+                        result.pop_front();
+                    }
+                    result.push_back(line);
                 }
-                result.push_back(line);
                 #[cfg(test)]
                 BOUNDED_REFLOW_PEAK.with(|peak| {
-                    let (a, b, c) = peak.get();
-                    peak.set((a, b, c.max(result.len())));
+                    let (source, row, retained) = peak.get();
+                    peak.set((source, row.max(cells.len()), retained.max(result.len())));
                 });
-            }
-        };
-        let mut row = Vec::with_capacity(new_cols);
-        let mut group_open = false;
-        let mut group_has_cells = false;
-        // A final sentinel ends a wrapped group whose continuation was evicted
-        // or absent. It must not add an extra empty line after a hard newline.
-        for line in lines.into_iter().map(Some).chain(std::iter::once(None)) {
-            let mut wrapped = false;
-            if let Some(line) = line {
-                group_open = true;
-                wrapped = line.is_wrapped();
-                let decompressed = line.decompress();
-                #[cfg(test)]
-                BOUNDED_REFLOW_PEAK.with(|peak| {
-                    let (a, b, c) = peak.get();
-                    peak.set((a.max(decompressed.len()), b, c));
-                });
-                let cells = Self::strip_trailing_blanks(&decompressed);
-                group_has_cells |= !cells.is_empty();
-                for &cell in cells {
-                    if new_cols == 1 && cell.flags.wide_continuation() {
-                        continue;
-                    }
-                    if row.len() == new_cols {
-                        if new_cols > 1 && cell.flags.wide_continuation() {
-                            // Match legacy: keep body and continuation together
-                            // rather than splitting at a new physical row edge.
-                            let body = row.pop().expect("full row");
-                            row.resize(new_cols, *blank_cell);
-                            emit(&row, true);
-                            row.clear();
-                            row.push(body);
-                        } else {
-                            emit(&row, true);
-                            row.clear();
-                        }
-                    }
-                    let mut cell = cell;
-                    if new_cols == 1 {
-                        cell.flags.set_wide(false);
-                    }
-                    row.push(cell);
-                    debug_assert!(row.len() <= new_cols);
-                    #[cfg(test)]
-                    BOUNDED_REFLOW_PEAK.with(|peak| {
-                        let (a, b, c) = peak.get();
-                        peak.set((a, b.max(row.len()), c));
-                    });
-                }
-            }
-            if group_open && !wrapped {
-                if !row.is_empty() || !group_has_cells {
-                    row.resize(new_cols, *blank_cell);
-                    emit(&row, false);
-                    row.clear();
-                }
-                group_open = false;
-                group_has_cells = false;
-            }
-        }
+            },
+        );
         result
     }
 
@@ -12449,7 +12408,7 @@ impl TerminalState {
         // Historical padding must stay neutral even when a live application has
         // a non-default background active at the instant the resize settles.
         let blank_cell = TerminalCell::default();
-        let source = std::mem::take(&mut self.scrollback);
+        let source = std::mem::take(&mut self.scrollback).into_rows();
         self.scrollback =
             Self::reflow_lines_bounded(source, cols, &blank_cell, self.max_scrollback);
         self.bump_history_revision();
@@ -12564,18 +12523,16 @@ impl TerminalState {
         // BOTTOM rows (where the prompt/cursor usually live). The cursor is kept
         // on-screen. (Column reflow on width change is not done here.)
         if !self.use_alt_buffer && old_rows > rows {
-            let to_remove = old_rows - rows;
-            // Blank rows below the cursor go first, as in xterm, VTE and
-            // alacritty: a prompt near the top of a mostly empty pane must not
-            // be scrolled up into history (which a later grow never restores)
-            // just because a split took some of its height.
-            let blank_below = (self.cursor_row + 1..old_rows)
-                .rev()
-                .take_while(|&r| Self::strip_trailing_blanks(&self.grid[r]).is_empty())
-                .count();
-            // Then take as many rows off the top as possible without scrolling
-            // the cursor above row 0; any remainder is truncated from the bottom.
-            let top_remove = to_remove.saturating_sub(blank_below).min(self.cursor_row);
+            let top_remove = jterm_engine::screen::rows_to_archive_on_height_shrink(
+                old_rows,
+                rows,
+                self.cursor_row,
+                |row| {
+                    self.grid[row]
+                        .iter()
+                        .all(TerminalCell::is_reflow_trimmable_blank)
+                },
+            );
             if top_remove > 0 {
                 for r in 0..top_remove {
                     let line = ScrollbackLine::compress_with_raw_row_id(
@@ -14975,11 +14932,11 @@ mod tests {
         assert_eq!(plan.rows[2].row_source, None);
 
         let actual = terminal.materialize_identity_projection_plan(&plan);
-        let mut expected =
-            TerminalState::reflow_projected_origins(terminal.scrollback.make_contiguous(), 6, 0)
-                .into_iter()
-                .map(|line| line.cells)
-                .collect::<Vec<_>>();
+        let history: Vec<_> = terminal.scrollback.iter().cloned().collect();
+        let mut expected = TerminalState::reflow_projected_origins(&history, 6, 0)
+            .into_iter()
+            .map(|line| line.cells)
+            .collect::<Vec<_>>();
         expected.extend(terminal.grid.to_vec());
         assert_eq!(actual, expected, "UNTRACKED affects origins, never cells");
     }

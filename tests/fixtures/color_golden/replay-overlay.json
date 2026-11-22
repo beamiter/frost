@@ -2,7 +2,7 @@
   "original_sealed_files": 213,
   "original_fixture_unchanged": true,
   "original_production_base": "3ff47cbea7992108aa271fd0553ff088270cb617",
-  "consumer_core": "32297ea559ad217169c4127022dd084758a6c329",
+  "consumer_core": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
   "replay_changes": [
     "Original source guard replaced by fixed bounded corpus verification; original guard preserved separately.",
     "Fresh subprocess worker plus bounded streaming zstd full record comparison against unchanged original expected.",

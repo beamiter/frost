@@ -772,7 +772,10 @@ mod cache_tests {
         let trimmed = terminal.cached_history_estimate(8, limits).unwrap();
         assert_eq!(trimmed.source_rows, 1);
         // Same-length history changes are revision-owned, not length-owned.
-        terminal.scrollback[0] = ScrollbackLine::compress(&[], false);
+        terminal
+            .scrollback
+            .replace(0, ScrollbackLine::compress(&[], false))
+            .unwrap();
         terminal.bump_history_revision();
         let replaced = terminal.cached_history_estimate(8, limits).unwrap();
         assert_ne!(replaced, trimmed);
