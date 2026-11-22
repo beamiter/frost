@@ -9039,10 +9039,13 @@ impl TerminalState {
                         // DECXCPR: the same position as CPR, but the reply
                         // keeps the `?` so it cannot be mistaken for a
                         // modified F3 key (`CSI 1 ; Pm R`).
-                        let row = self.cursor_row + 1;
-                        let col = self.cursor_col + 1;
-                        let response = format!("\x1b[?{};{}R", row, col);
-                        self.output_buffer.extend(response.as_bytes());
+                        self.output_buffer.extend(
+                            jterm_engine::semantics::frost_legacy_cursor_position_reply(
+                                self.cursor_row,
+                                self.cursor_col,
+                                true,
+                            ),
+                        );
                     }
                     996 => {
                         // Colour-scheme query (the report mode 2031 sends
@@ -9068,10 +9071,13 @@ impl TerminalState {
                     }
                     6 => {
                         // CPR - Cursor Position Report: CSI row ; col R (1-indexed)
-                        let row = (self.cursor_row + 1) as u16;
-                        let col = (self.cursor_col + 1) as u16;
-                        let response = format!("\x1b[{};{}R", row, col);
-                        self.output_buffer.extend(response.as_bytes());
+                        self.output_buffer.extend(
+                            jterm_engine::semantics::frost_legacy_cursor_position_reply(
+                                self.cursor_row,
+                                self.cursor_col,
+                                false,
+                            ),
+                        );
                     }
                     _ => {}
                 }
@@ -22681,6 +22687,46 @@ mod tests {
             String::from_utf8(terminal.get_output()).unwrap(),
             "\x1b[?3;7R\x1b[3;7R"
         );
+    }
+
+    #[test]
+    fn frost_cursor_reports_stay_absolute_while_origin_and_wrap_are_pending() {
+        let mut terminal = TerminalState::new(12, 6);
+        terminal.scroll_region_top = 2;
+        terminal.scroll_region_bottom = 4;
+        terminal.modes.insert(6);
+        terminal.cursor_row = 3;
+        terminal.cursor_col = 11;
+        terminal.pending_wrap = true;
+        terminal.process_input(b"\x1b[5n\x1b[?6n\x1b[6n");
+        assert_eq!(terminal.get_output(), b"\x1b[0n\x1b[?4;12R\x1b[4;12R");
+        assert_eq!((terminal.cursor_row, terminal.cursor_col), (3, 11));
+        assert!(terminal.pending_wrap);
+    }
+
+    #[test]
+    fn fragmented_frost_cursor_reports_preserve_query_order_and_admission() {
+        let mut terminal = TerminalState::new(12, 6);
+        terminal.scroll_region_top = 2;
+        terminal.scroll_region_bottom = 4;
+        terminal.modes.insert(6);
+        terminal.cursor_row = 3;
+        terminal.cursor_col = 11;
+        terminal.pending_wrap = true;
+
+        terminal.process_input(b"\x1b[?");
+        assert!(terminal.get_output().is_empty());
+        terminal.process_input(b"6n\x1b[?5n\x1b[>6n\x1b[?6$n\x1b[");
+        assert_eq!(terminal.get_output(), b"\x1b[?4;12R");
+        terminal.process_input(b"5n\x1b[6");
+        assert_eq!(terminal.get_output(), b"\x1b[0n");
+        terminal.process_input(b"n\x1b[c\x1b[>c");
+        assert_eq!(
+            terminal.get_output(),
+            b"\x1b[4;12R\x1b[?65;1;9c\x1b[>1;7802;0c"
+        );
+        assert_eq!((terminal.cursor_row, terminal.cursor_col), (3, 11));
+        assert!(terminal.pending_wrap);
     }
 
     /// Kimi Code picks its palette from `CSI ? 996 n`.
