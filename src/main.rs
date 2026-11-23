@@ -4954,6 +4954,7 @@ enum Message {
     SetAgentMaxTurns(u32),
     PtyOutput(usize, RawFd, Vec<u8>, Option<organism_watch::SourceStamp>),
     PtyExited(usize, RawFd, i32),
+    PtyExitTail(usize, RawFd, jterm_core::exit_status::ExitTail),
     PtyIoError(usize, RawFd, String),
     Key(keyboard::Event),
     /// An input-method (IME) composition event: open/close, pre-edit updates,
@@ -19742,6 +19743,15 @@ impl Frost {
                     .any(|session| session.id == id && session.master_fd == fd)
                 {
                     self.push_toast(error, ToastKind::Warning);
+                }
+            }
+            Message::PtyExitTail(id, fd, tail) => {
+                if let Some(notice) = tail.notice().filter(|_| {
+                    self.sessions
+                        .iter()
+                        .any(|session| session.id == id && session.master_fd == fd)
+                }) {
+                    self.push_toast(notice.to_owned(), ToastKind::Warning);
                 }
             }
             Message::PtyExited(id, fd, code) => {
@@ -36073,6 +36083,7 @@ fn pty_event_message(id: usize, fd: RawFd, event: SessionEvent) -> Message {
             Message::PtyOutput(id, fd, batch.into_bytes(), stamp)
         }
         SessionEvent::Exit(code) => Message::PtyExited(id, fd, code),
+        SessionEvent::ExitTail(tail) => Message::PtyExitTail(id, fd, tail),
         SessionEvent::Error(error) => Message::PtyIoError(id, fd, error),
     }
 }
