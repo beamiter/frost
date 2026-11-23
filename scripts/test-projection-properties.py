@@ -34,6 +34,8 @@ code = '#![allow(dead_code)]\nuse smallvec::SmallVec;\n'
 # Use the same engine cell types as the live terminal, never a test-only copy.
 shared_start = source.index('pub use jterm_engine::{')
 code += source[shared_start:source.index(';', shared_start) + 1] + '\n'
+code += 'use jterm_engine::grid::{RegionDirection, RegionWrapPolicy};\n'
+code += 'use jterm_engine::retained_history::{RetainedHistory, RetainedRow};\n'
 code += 'use std::{borrow::Cow, collections::{BTreeMap, BTreeSet, HashMap, VecDeque}, sync::atomic::{AtomicU64, Ordering}};\n'
 code += '#[path = ' + json.dumps(str(ROOT / 'src/terminal/visible_rows.rs')) + '] mod visible_rows; use visible_rows::{VisibleRows, RowView};\n'
 code += item('thread_local!') + '\n'
@@ -68,10 +70,10 @@ for marker in ['pub enum ChatRole {', 'pub struct ChatRow {']:
     code += chat[start:chat.index(marker)] + declaration + '\n'
 code += '}\n'
 code += '''
-struct TerminalState { scrollback: VecDeque<ScrollbackLine>, grid: TerminalGrid }
+struct TerminalState { scrollback: RetainedHistory<ScrollbackLine>, grid: TerminalGrid }
 impl TerminalState {
     fn new(cols: usize, rows: usize) -> Self {
-        Self { scrollback: VecDeque::new(), grid: TerminalGrid::new(rows, cols) }
+        Self { scrollback: RetainedHistory::default(), grid: TerminalGrid::new(rows, cols) }
     }
 '''
 for method in ['identity_projection_plan', 'projected_row_real_column_bounds', 'materialize_projection_plan', 'materialize_projection_plan_with_margin', 'projection_indexes']:
