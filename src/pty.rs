@@ -333,8 +333,6 @@ mod unix_pty {
         }
     }
 
-    /// Outcome of polling the PTY fd alongside the shutdown pipe.
-
     /// This process's own `PATH`, for the `host::` resolvers. `None` means "no
     /// search path" there rather than "use ours", so it is passed explicitly.
     fn search_path() -> Option<std::ffi::OsString> {
