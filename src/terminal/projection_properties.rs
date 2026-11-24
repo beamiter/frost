@@ -647,8 +647,9 @@ fn check_dense_collapse_case(
     }
     let mut terminal = TerminalState::new(width, original.len());
     for (row, cells) in original.iter().enumerate() {
-        terminal.screen.grid.set_row(row, cells.clone());
-        terminal.screen.grid.row_wrapped_mut()[row] = wrapped[row];
+        let retained = cells.len().min(width);
+        terminal.screen.grid[row][..retained].copy_from_slice(&cells[..retained]);
+        terminal.screen.grid.row_wrapped[row] = wrapped[row];
     }
     let ids: Vec<_> = (0..original.len())
         .map(|row| terminal.screen.grid.raw_row_id(row).unwrap())
@@ -1759,10 +1760,10 @@ fn seeded_live_grid_raw_endpoint_copy_is_invariant_under_legal_chrome() {
                 }
                 col += 1;
             }
-            terminal.screen.grid.set_row(row, cells.clone());
+            terminal.screen.grid[row].copy_from_slice(&cells);
             original.push(cells);
             let soft = row + 1 < rows && rng.pick(2) == 0;
-            terminal.screen.grid.row_wrapped_mut()[row] = soft;
+            terminal.screen.grid.row_wrapped[row] = soft;
             wrapped.push(soft);
             let chrome_rows = 1 + rng.pick(3);
             boundaries.push(ChromeBoundary {

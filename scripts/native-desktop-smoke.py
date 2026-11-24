@@ -93,7 +93,7 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
         self.processes.append(proc)
         return proc
 
-    def start_desktop(self):
+    def start_desktop(self, *, capture_backdrop=True):
         if self.backend == 'x11':
             self.env['DISPLAY'] = ':99'
             server = self.spawn(['Xvfb', ':99', '-screen', '0', '1280x900x24', '-nolisten', 'tcp'], 'xvfb')
@@ -133,7 +133,7 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
             self.env['SWAYSOCK'] = str(ipc)
             assert server.poll() is None
         time.sleep(1)
-        if self.backend == 'wayland':
+        if self.backend == 'wayland' and capture_backdrop:
             # Measure the empty private compositor before launching Frost.
             # Glass edge checks composite source RGBA over this observation,
             # never infer the background or expected panel color from the app.

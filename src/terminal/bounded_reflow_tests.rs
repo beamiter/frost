@@ -20,7 +20,8 @@ fn dense_scroll_history_budget_applies_to_pushes_and_reflow() {
     let oldest = terminal.scrollback.front().unwrap().raw_row_id();
     for _ in 0..=keep {
         let mut row = dense.clone();
-        row.storage.set_raw_row_id(fresh_raw_row_id());
+        row.storage
+            .set_raw_row_id(RawRowId::allocate_process_unique());
         terminal.push_scrollback_compressed(row);
     }
     assert_eq!(terminal.scrollback.len(), keep);

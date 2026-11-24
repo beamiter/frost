@@ -300,7 +300,7 @@ impl super::TerminalState {
                 || self.projection_selection_revision(viewport).is_some())
             && viewport.source_revision.grid == self.grid_version
             && viewport.source_revision.history == self.history_revision
-            && viewport.source_revision.row_identity == self.screen.grid.identity_revision
+            && viewport.source_revision.row_identity == self.screen.grid.identity_revision()
             && viewport.source_revision.alternate_screen == self.screen.use_alt_buffer
     }
 
@@ -330,7 +330,7 @@ impl super::TerminalState {
             source_revision: super::ProjectionSourceRevision {
                 grid: self.grid_version,
                 history: self.history_revision,
-                row_identity: self.screen.grid.identity_revision,
+                row_identity: self.screen.grid.identity_revision(),
                 alternate_screen: self.screen.use_alt_buffer,
             },
             view_revision: 0,
@@ -1126,7 +1126,7 @@ impl super::TerminalState {
         let key = (
             self.grid_version,
             self.history_revision,
-            self.screen.grid.identity_revision,
+            self.screen.grid.identity_revision(),
             rows,
             cols,
             self.scroll_offset,

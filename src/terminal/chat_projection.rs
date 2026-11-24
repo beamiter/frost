@@ -120,7 +120,7 @@ impl TerminalState {
                 .enumerate()
                 .rev()
                 .find(|(row, cells)| {
-                    self.screen.grid.row_wrapped()[*row]
+                    self.screen.grid.row_wrapped[*row]
                         || cells.iter().any(|cell| *cell != TerminalCell::default())
                 })
                 .map_or(self.scrollback.len(), |(row, _)| {
@@ -884,7 +884,7 @@ mod tests {
         );
         prompt(&mut terminal);
         terminal.process_batch(b"/current/path");
-        let raw_wraps = terminal.screen.grid.row_wrapped().to_vec();
+        let raw_wraps = terminal.screen.grid.row_wrapped.to_vec();
         let detector = crate::link::LinkDetector::new(crate::link::LinkDetectionConfig::default());
         let mut state = ProjectionViewState::new();
         let initial = snapshot(&mut terminal, &mut state);
@@ -924,7 +924,7 @@ mod tests {
             ));
         }
         assert!(checked_seam && checked_contiguous);
-        assert_eq!(terminal.screen.grid.row_wrapped(), raw_wraps);
+        assert_eq!(terminal.screen.grid.row_wrapped.as_slice(), raw_wraps);
     }
 
     #[test]

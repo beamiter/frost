@@ -166,8 +166,8 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
                 g.cols(),
                 g.to_vec(),
                 g.row_ids(),
-                g.row_wrapped(),
-                g.identity_revision,
+                g.row_wrapped.as_slice(),
+                g.identity_revision(),
             )),
         );
     }

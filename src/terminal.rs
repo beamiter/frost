@@ -5,8 +5,7 @@ use jterm_engine::grid::{
 use jterm_engine::protocol_state::{ProtocolState, TerminalModes};
 use jterm_engine::retained_history::{RetainedHistory, RetainedRow};
 use jterm_engine::screen::{
-    default_tab_stops, resize_tab_stops, AlternateRestorePolicy, Charset, ScreenState,
-    TabStopOrigin,
+    default_tab_stops, AlternateRestorePolicy, Charset, ScreenState, TabStopOrigin,
 };
 use jterm_engine::titles::FrostTitleState;
 mod visible_rows;
@@ -51,9 +50,9 @@ use jterm_engine::parser::{
     CaptureEnd, Event as ParserEvent, Parser, ParserLimits, ParserProfile, PendingKind,
     RejectReason, StringKind,
 };
-// Row identity allocation and projection policy remain Frost-owned.
 pub use jterm_engine::{
-    Color, CursorShape, HyperlinkId, RawRowId, StyleFlags, TerminalCell, UnderlineStyle,
+    Color, CursorShape, HyperlinkId, RawRowId, StyleFlags, TerminalCell, TerminalGrid,
+    UnderlineStyle,
 };
 
 use crate::kitty_graphics::{KittyGraphicsState, KittyImage, KittyPlacement};
@@ -62,7 +61,6 @@ use jterm_core::click_cursor;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use unicode_normalization::UnicodeNormalization;
 
@@ -213,252 +211,11 @@ struct Osc8Hyperlink {
     id: Option<String>,
 }
 
-/// Allocate row identity in the host, not the engine. IDs survive physical
-/// moves; zero remains fail-closed after the monotonic allocator is exhausted.
-fn fresh_raw_row_id() -> RawRowId {
-    static NEXT_RAW_ROW_ID: AtomicU64 = AtomicU64::new(1);
-    NEXT_RAW_ROW_ID
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-            next.checked_add(1)
-        })
-        .map(RawRowId::new)
-        .unwrap_or(RawRowId::UNTRACKED)
-}
-
 pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
     (
         cols.clamp(1, MAX_TERMINAL_COLS),
         rows.clamp(1, MAX_TERMINAL_ROWS),
     )
-}
-
-/// Frost's host policy around the shared physical grid. Cells, row identities
-/// and wrap flags have one backing store; allocation and projection revision
-/// policy stay here until the frontends agree on their structural contract.
-#[derive(Clone)]
-pub struct TerminalGrid {
-    storage: jterm_engine::TerminalGrid,
-    identity_revision: u64,
-}
-
-impl AsRef<jterm_engine::TerminalGrid> for TerminalGrid {
-    fn as_ref(&self) -> &jterm_engine::TerminalGrid {
-        &self.storage
-    }
-}
-
-impl TerminalGrid {
-    pub fn new(rows: usize, cols: usize) -> Self {
-        let mut storage = jterm_engine::TerminalGrid::new(rows, cols);
-        for id in storage.row_ids_mut() {
-            *id = fresh_raw_row_id();
-        }
-        Self {
-            storage,
-            identity_revision: 1,
-        }
-    }
-
-    #[inline]
-    pub fn get(&self, row: usize, col: usize) -> &TerminalCell {
-        self.storage.get(row, col)
-    }
-
-    #[inline]
-    pub fn get_mut(&mut self, row: usize, col: usize) -> &mut TerminalCell {
-        self.storage.get_mut(row, col)
-    }
-
-    #[inline]
-    pub fn rows(&self) -> usize {
-        self.storage.rows()
-    }
-
-    #[inline]
-    pub fn cols(&self) -> usize {
-        self.storage.cols()
-    }
-
-    /// Identity of a retained physical grid row; out-of-range stays absent.
-    #[inline]
-    pub fn raw_row_id(&self, row: usize) -> Option<RawRowId> {
-        self.storage.row_ids().get(row).copied()
-    }
-
-    #[inline]
-    fn row_ids(&self) -> &[RawRowId] {
-        self.storage.row_ids()
-    }
-
-    #[inline]
-    fn row_ids_mut(&mut self) -> &mut [RawRowId] {
-        self.storage.row_ids_mut()
-    }
-
-    #[inline]
-    pub fn row_wrapped(&self) -> &[bool] {
-        &self.storage.row_wrapped
-    }
-
-    #[inline]
-    fn row_wrapped_mut(&mut self) -> &mut [bool] {
-        &mut self.storage.row_wrapped
-    }
-
-    #[inline]
-    #[cfg(test)]
-    fn cells_mut(&mut self) -> &mut [TerminalCell] {
-        self.storage.cells_mut()
-    }
-
-    #[inline]
-    fn row_slice(&self, row: usize) -> Option<&[TerminalCell]> {
-        (row < self.rows()).then(|| &self.storage[row])
-    }
-
-    #[inline]
-    fn bump_identity_revision(&mut self) {
-        self.identity_revision = self.identity_revision.wrapping_add(1).max(1);
-    }
-
-    fn shift_row_region(
-        &mut self,
-        direction: RegionDirection,
-        rows: std::ops::RangeInclusive<usize>,
-        blank: TerminalCell,
-        wrap_policy: RegionWrapPolicy,
-    ) -> bool {
-        if self
-            .storage
-            .shift_rows(direction, rows, 1, blank, wrap_policy, fresh_raw_row_id)
-            .is_none()
-        {
-            return false;
-        }
-        self.bump_identity_revision();
-        true
-    }
-
-    fn discard_top_rows_for_resize(&mut self, count: usize, blank: TerminalCell) {
-        // The resize immediately discards the vacated rows at the bottom.
-        // Reserve fresh row IDs only for positions retained by the resize.
-        self.storage.scroll_up_by(count, blank);
-        self.bump_identity_revision();
-    }
-
-    pub fn get_row(&self, row: usize) -> Vec<TerminalCell> {
-        self.storage[row].to_vec()
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.rows()
-    }
-
-    #[inline]
-    pub fn row_len(&self) -> usize {
-        self.storage.row_len()
-    }
-
-    #[allow(dead_code)]
-    pub fn set_row(&mut self, row: usize, cells: Vec<TerminalCell>) {
-        let copy_len = cells.len().min(self.cols());
-        self.storage[row][..copy_len].copy_from_slice(&cells[..copy_len]);
-    }
-
-    #[cfg(test)]
-    pub fn to_vec(&self) -> Vec<Vec<TerminalCell>> {
-        self.storage.to_vec()
-    }
-
-    #[cfg(test)]
-    pub fn insert_cell_in_row(&mut self, row: usize, col: usize, cell: TerminalCell) {
-        self.storage.insert_cell_in_row(row, col, cell);
-    }
-
-    #[cfg(test)]
-    pub fn remove_cell_from_row(&mut self, row: usize, col: usize) {
-        self.storage.remove_cell_from_row(row, col);
-    }
-
-    #[allow(dead_code)]
-    pub fn remove_first_row(&mut self) -> (Vec<TerminalCell>, bool) {
-        let removed = self.get_row(0);
-        let was_wrapped = self.row_wrapped()[0];
-        self.shift_rows_up();
-        (removed, was_wrapped)
-    }
-
-    /// Preserve Frost's single-row shift, including a fresh blank-row identity.
-    #[inline]
-    pub fn shift_rows_up(&mut self) {
-        let rows = self.rows();
-        // The original method required a nonempty grid; do not silently turn
-        // invalid calls into a revision-changing no-op during this migration.
-        assert!(rows > 0, "cannot shift an empty terminal grid");
-        self.storage.scroll_up_by(1, TerminalCell::default());
-        self.storage.row_ids_mut()[rows - 1] = fresh_raw_row_id();
-        self.bump_identity_revision();
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.storage.is_empty()
-    }
-
-    /// Resize shared storage, preserving Frost's wide-pair cleanup and row IDs.
-    pub fn resize(&mut self, new_rows: usize, new_cols: usize, default_cell: TerminalCell) {
-        let copy_rows = self.rows().min(new_rows);
-        self.storage.resize(new_rows, new_cols, default_cell);
-        for row in 0..copy_rows {
-            let line = &mut self.storage[row];
-            for col in 0..new_cols {
-                if line[col].flags.wide()
-                    && (col + 1 >= new_cols || !line[col + 1].flags.wide_continuation())
-                {
-                    line[col] = default_cell;
-                }
-            }
-            for col in 0..new_cols {
-                if line[col].flags.wide_continuation() && (col == 0 || !line[col - 1].flags.wide())
-                {
-                    line[col] = default_cell;
-                }
-            }
-        }
-        // Frost historically allocates for every destination row, then keeps
-        // retained rows' IDs. Preserve that cadence, including discarded IDs.
-        for (row, id) in self.storage.row_ids_mut().iter_mut().enumerate() {
-            let fresh = fresh_raw_row_id();
-            if row >= copy_rows {
-                *id = fresh;
-            }
-        }
-        self.bump_identity_revision();
-    }
-
-    #[cfg(test)]
-    pub fn iter_mut(&mut self) -> std::slice::ChunksMut<'_, TerminalCell> {
-        self.storage.iter_mut()
-    }
-
-    pub fn iter(&self) -> std::slice::Chunks<'_, TerminalCell> {
-        self.storage.iter()
-    }
-}
-
-impl std::ops::Index<usize> for TerminalGrid {
-    type Output = [TerminalCell];
-    fn index(&self, row: usize) -> &[TerminalCell] {
-        &self.storage[row]
-    }
-}
-
-impl std::ops::IndexMut<usize> for TerminalGrid {
-    fn index_mut(&mut self, row: usize) -> &mut [TerminalCell] {
-        &mut self.storage[row]
-    }
 }
 
 #[derive(Clone)]
@@ -549,7 +306,7 @@ impl RawRowLayout {
 
 impl ScrollbackLine {
     pub fn compress(cells: &[TerminalCell], is_wrapped: bool) -> Self {
-        Self::compress_with_raw_row_id(cells, is_wrapped, fresh_raw_row_id())
+        Self::compress_with_raw_row_id(cells, is_wrapped, RawRowId::allocate_process_unique())
     }
 
     fn compress_with_raw_row_id(
@@ -3145,7 +2902,7 @@ struct CompletedCommandMetadata {
 }
 
 pub struct TerminalState {
-    pub screen: ScreenState<TerminalGrid>,
+    pub screen: ScreenState,
     pub scrollback: RetainedHistory<ScrollbackLine>,
     pub selection: Option<Selection>,
     projected_selection: Option<ProjectedSelection>,
@@ -3433,11 +3190,8 @@ impl TerminalState {
 
     pub fn new(cols: usize, rows: usize) -> Self {
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
-        let grid = TerminalGrid::new(rows, cols);
-        let alt_grid = TerminalGrid::new(rows, cols);
-
         TerminalState {
-            screen: ScreenState::with_grid_pair(grid, alt_grid, TabStopOrigin::Clear),
+            screen: ScreenState::new_frost_legacy(rows, cols),
             scrollback: RetainedHistory::default(),
             selection: None,
             projected_selection: None,
@@ -3920,7 +3674,7 @@ impl TerminalState {
                 )
             } else {
                 let grid_row = absolute_row - self.scrollback.len();
-                let wrapped = self.screen.grid.row_wrapped()[grid_row];
+                let wrapped = self.screen.grid.row_wrapped[grid_row];
                 (
                     append_cells(&mut capture, &self.screen.grid[grid_row], wrapped),
                     wrapped,
@@ -5786,12 +5540,8 @@ impl TerminalState {
         // the grid get fresh identities below, since a dead row's id must not
         // alias when the row is reused (the scroll/erase rule).
         let stashed_grid_rows: Vec<ScrollbackLine> = (0..completed_grid_rows)
-            .map(|row| {
-                ScrollbackLine::compress_with_raw_row_id(
-                    &self.screen.grid[row],
-                    self.screen.grid.row_wrapped()[row],
-                    self.screen.grid.row_ids()[row],
-                )
+            .map(|row| ScrollbackLine {
+                storage: self.screen.grid.archive_frost_legacy_row(row),
             })
             .collect();
         self.cleared_blocks = Some(ClearedBlocksSnapshot {
@@ -5813,8 +5563,8 @@ impl TerminalState {
             let blank = TerminalCell::default();
             for row in 0..completed_grid_rows {
                 self.screen.grid[row].fill(blank);
-                self.screen.grid.row_wrapped_mut()[row] = false;
-                self.screen.grid.row_ids_mut()[row] = fresh_raw_row_id();
+                self.screen.grid.row_wrapped[row] = false;
+                self.screen.grid.row_ids_mut()[row] = RawRowId::allocate_process_unique();
             }
             self.mark_rows_dirty(0, completed_grid_rows - 1);
         } else {
@@ -5989,7 +5739,7 @@ impl TerminalState {
             } else {
                 self.screen
                     .grid
-                    .row_wrapped()
+                    .row_wrapped
                     .get(row - self.scrollback.len())
                     .copied()
                     .unwrap_or(false)
@@ -6080,7 +5830,7 @@ impl TerminalState {
                 )
             } else {
                 let grid_row = row - self.scrollback.len();
-                let wrapped = *self.screen.grid.row_wrapped().get(grid_row)?;
+                let wrapped = *self.screen.grid.row_wrapped.get(grid_row)?;
                 let cells = self.screen.grid.row_slice(grid_row)?;
                 (wrapped, segment_len(cells, first_col, wrapped))
             };
@@ -6360,7 +6110,7 @@ impl TerminalState {
                     .filter(|cell| !cell.flags.wide_continuation())
                     .map(|cell| cell.character)
                     .collect();
-                (text, self.screen.grid.row_wrapped()[grid_row])
+                (text, self.screen.grid.row_wrapped[grid_row])
             };
             if !wrapped {
                 // Hard line end: trailing cell padding is not real output.
@@ -6822,7 +6572,7 @@ impl TerminalState {
     /// (pushing to scrollback only for a full-screen region); otherwise it just
     /// moves down. Used by autowrap and linefeed so both stay region-aware.
     fn wrap_to_next_line(&mut self) {
-        self.screen.grid.row_wrapped_mut()[self.screen.cursor_row] = true;
+        self.screen.grid.row_wrapped[self.screen.cursor_row] = true;
         self.screen.cursor_col = 0;
         self.index();
     }
@@ -6861,7 +6611,7 @@ impl TerminalState {
     /// rightmost `count` cells off the end of the row.
     fn shift_cells_right(&mut self, row: usize, col: usize, count: usize) {
         let blank = self.create_blank_cell();
-        if self.screen.grid.storage.insert_blank_cells(
+        if self.screen.grid.insert_blank_cells(
             row,
             col,
             count,
@@ -6958,7 +6708,7 @@ impl TerminalState {
             self.shift_cells_right(self.screen.cursor_row, self.screen.cursor_col, width);
         }
 
-        self.screen.grid.storage.overwrite_graphic(
+        self.screen.grid.overwrite_graphic(
             self.screen.cursor_row,
             self.screen.cursor_col,
             width,
@@ -7021,7 +6771,7 @@ impl TerminalState {
                 chunk.iter().any(|byte| !byte.is_ascii_whitespace()),
             );
             let blank = self.create_blank_cell();
-            self.screen.grid.storage.overwrite_ascii(
+            self.screen.grid.overwrite_ascii(
                 self.screen.cursor_row,
                 col,
                 chunk,
@@ -7046,17 +6796,7 @@ impl TerminalState {
     }
 
     fn create_blank_cell(&self) -> TerminalCell {
-        self.blank_cell_with_bg(self.screen.current_bg)
-    }
-
-    fn blank_cell_with_bg(&self, bg: Color) -> TerminalCell {
-        TerminalCell {
-            character: ' ',
-            foreground: Color::Default,
-            background: bg,
-            flags: StyleFlags::default(),
-            hyperlink_id: HyperlinkId::NONE,
-        }
+        self.screen.create_blank_cell()
     }
 
     fn blank_line(&self, cols: usize) -> Vec<TerminalCell> {
@@ -7159,10 +6899,8 @@ impl TerminalState {
         // the prefix-eviction shift used when real rows move into history.
         let selection = self.selection.take();
         for row in first..=last {
-            let line = ScrollbackLine::compress(
-                &self.screen.grid[row],
-                self.screen.grid.row_wrapped()[row],
-            );
+            let line =
+                ScrollbackLine::compress(&self.screen.grid[row], self.screen.grid.row_wrapped[row]);
             self.push_scrollback_compressed_with_options(line, allow_alt_buffer);
         }
         let appended = self.scrollback_pushes.wrapping_sub(before) as usize;
@@ -7322,12 +7060,19 @@ impl TerminalState {
 
     fn scroll_region_down(&mut self, top: usize, bottom: usize) {
         let blank = self.create_blank_cell();
-        if self.screen.grid.shift_row_region(
-            RegionDirection::Down,
-            top..=bottom,
-            blank,
-            RegionWrapPolicy::MoveWithRows,
-        ) {
+        if self
+            .screen
+            .grid
+            .shift_rows(
+                RegionDirection::Down,
+                top..=bottom,
+                1,
+                blank,
+                RegionWrapPolicy::MoveWithRows,
+                RawRowId::allocate_process_unique,
+            )
+            .is_some()
+        {
             self.mark_rows_dirty(top, bottom);
         }
     }
@@ -7350,21 +7095,21 @@ impl TerminalState {
             && !self.inline_cli_owner_active();
         let scrollback_line =
             if scrolls_off_screen_top && (!self.screen.use_alt_buffer || allow_alt_scrollback) {
-                Some(ScrollbackLine::compress_with_raw_row_id(
-                    &self.screen.grid[top],
-                    self.screen.grid.row_wrapped()[top],
-                    self.screen.grid.row_ids()[top],
-                ))
+                Some(ScrollbackLine {
+                    storage: self.screen.grid.archive_frost_legacy_row(top),
+                })
             } else {
                 None
             };
 
         let blank = self.create_blank_cell();
-        self.screen.grid.shift_row_region(
+        self.screen.grid.shift_rows(
             RegionDirection::Up,
             top..=bottom,
+            1,
             blank,
             RegionWrapPolicy::MoveWithRows,
+            RawRowId::allocate_process_unique,
         );
 
         self.mark_rows_dirty(top, bottom);
@@ -7793,13 +7538,13 @@ impl TerminalState {
                     }
                     let cols = self.screen.grid.row_len();
                     let blank = self.create_blank_cell();
-                    self.screen.grid.storage.erase_cells(
+                    self.screen.grid.erase_cells(
                         self.screen.cursor_row,
                         self.screen.cursor_col..cols,
                         blank,
                     );
                     for row in self.screen.cursor_row + 1..self.screen.grid.rows() {
-                        self.screen.grid.storage.erase_cells(row, 0..cols, blank);
+                        self.screen.grid.erase_cells(row, 0..cols, blank);
                     }
                     self.mark_rows_dirty(
                         self.screen.cursor_row,
@@ -7810,9 +7555,9 @@ impl TerminalState {
                     let cols = self.screen.grid.row_len();
                     let blank = self.create_blank_cell();
                     for row in 0..self.screen.cursor_row {
-                        self.screen.grid.storage.erase_cells(row, 0..cols, blank);
+                        self.screen.grid.erase_cells(row, 0..cols, blank);
                     }
-                    self.screen.grid.storage.erase_cells(
+                    self.screen.grid.erase_cells(
                         self.screen.cursor_row,
                         0..self.screen.cursor_col + 1,
                         blank,
@@ -7834,7 +7579,6 @@ impl TerminalState {
                 let blank = self.create_blank_cell();
                 self.screen
                     .grid
-                    .storage
                     .erase_cells(self.screen.cursor_row, span, blank);
                 self.mark_row_dirty(self.screen.cursor_row);
             }
@@ -7853,11 +7597,13 @@ impl TerminalState {
                     // Frost allocates each row at its original iteration step,
                     // keeping physical wrap flags and the grid revision cadence.
                     for _ in 0..count {
-                        self.screen.grid.shift_row_region(
+                        self.screen.grid.shift_rows(
                             direction,
                             cursor..=bottom,
+                            1,
                             blank,
                             RegionWrapPolicy::KeepPhysicalIndices,
+                            RawRowId::allocate_process_unique,
                         );
                     }
                 }
@@ -8108,7 +7854,7 @@ impl TerminalState {
             'P' => {
                 let count = params.first().copied().unwrap_or(1).max(1) as usize;
                 let blank = self.create_blank_cell();
-                self.screen.grid.storage.delete_cells(
+                self.screen.grid.delete_cells(
                     self.screen.cursor_row,
                     self.screen.cursor_col,
                     count,
@@ -8120,7 +7866,7 @@ impl TerminalState {
             'X' => {
                 let count = params.first().copied().unwrap_or(1).max(1) as usize;
                 let blank = self.create_blank_cell();
-                self.screen.grid.storage.erase_cells(
+                self.screen.grid.erase_cells(
                     self.screen.cursor_row,
                     self.screen.cursor_col..self.screen.cursor_col.saturating_add(count),
                     blank,
@@ -8153,7 +7899,7 @@ impl TerminalState {
 
     /// DECALN (ESC # 8): fill the entire screen with 'E', used for alignment tests.
     fn decaln(&mut self) {
-        self.screen.grid.storage.fill_cells(TerminalCell {
+        self.screen.grid.fill_cells(TerminalCell {
             character: 'E',
             ..TerminalCell::default()
         });
@@ -8299,7 +8045,7 @@ impl TerminalState {
             self.archive_visible_screen_to_scrollback();
         }
         let blank = self.create_blank_cell();
-        self.screen.grid.storage.fill_cells(blank);
+        self.screen.grid.fill_cells(blank);
         self.mark_rows_dirty(0, self.screen.grid.rows().saturating_sub(1));
     }
 
@@ -8768,11 +8514,11 @@ impl TerminalState {
 
         let cursor_row = self.screen.cursor_row.min(rows - 1);
         let mut first = cursor_row;
-        while first > 0 && self.screen.grid.row_wrapped()[first - 1] {
+        while first > 0 && self.screen.grid.row_wrapped[first - 1] {
             first -= 1;
         }
         let mut last = cursor_row;
-        while last + 1 < rows && self.screen.grid.row_wrapped()[last] {
+        while last + 1 < rows && self.screen.grid.row_wrapped[last] {
             last += 1;
         }
 
@@ -9002,7 +8748,7 @@ impl TerminalState {
             .map(|(grid_row, cells)| {
                 RawRowLayout::from_cells(
                     cells,
-                    self.screen.grid.row_wrapped()[grid_row],
+                    self.screen.grid.row_wrapped[grid_row],
                     history_len + grid_row,
                     self.screen.grid.row_ids()[grid_row],
                 )
@@ -9138,7 +8884,7 @@ impl TerminalState {
                     *self
                         .screen
                         .grid
-                        .row_wrapped()
+                        .row_wrapped
                         .get(previous - self.scrollback.len())?
                 };
                 (!wrapped && (background || self.spacing_prompt_rows.contains(&row))).then_some(row)
@@ -9168,10 +8914,10 @@ impl TerminalState {
             .rev()
             .take_while(|&row| {
                 self.scrollback.len() + row >= protected
-                    && !self.screen.grid.row_wrapped()[row]
+                    && !self.screen.grid.row_wrapped[row]
                     && row
                         .checked_sub(1)
-                        .is_none_or(|previous| !self.screen.grid.row_wrapped()[previous])
+                        .is_none_or(|previous| !self.screen.grid.row_wrapped[previous])
                     && self.screen.grid[row]
                         .iter()
                         .all(|cell| *cell == TerminalCell::default())
@@ -9191,7 +8937,7 @@ impl TerminalState {
                 } else {
                     self.screen
                         .grid
-                        .row_wrapped()
+                        .row_wrapped
                         .get(previous - self.scrollback.len())
                         .copied()
                         .unwrap_or(true)
@@ -9494,7 +9240,7 @@ impl TerminalState {
         let grid_layouts = self.screen.grid.iter().enumerate().map(|(index, cells)| {
             RawRowLayout::from_cells(
                 cells,
-                self.screen.grid.row_wrapped()[index],
+                self.screen.grid.row_wrapped[index],
                 scrolled + index,
                 self.screen.grid.row_ids()[index],
             )
@@ -9581,10 +9327,10 @@ impl TerminalState {
             scrollback_pushes: self.scrollback_pushes,
             full_screen_scroll_revision: self.full_screen_scroll_revision,
             grid_row_ids: self.screen.grid.row_ids().iter().copied().collect(),
-            row_identity_revision: self.screen.grid.identity_revision,
+            row_identity_revision: self.screen.grid.identity_revision(),
             rows: self.screen.grid.rows(),
             cols,
-            row_wrapped: self.screen.grid.row_wrapped().iter().copied().collect(),
+            row_wrapped: self.screen.grid.row_wrapped.iter().copied().collect(),
             policy_revision: policy.revision(),
             policy_ids: policy.ids(),
             block_spacing: policy.block_spacing,
@@ -9908,7 +9654,7 @@ impl TerminalState {
             cursor: self.frame_cursor(),
             grid_version: self.grid_version,
             history_revision: self.history_revision,
-            row_identity_revision: self.screen.grid.identity_revision,
+            row_identity_revision: self.screen.grid.identity_revision(),
             scroll_offset: self.scroll_offset,
             rows,
             cols,
@@ -9994,7 +9740,7 @@ impl TerminalState {
             source_revision: ProjectionSourceRevision {
                 grid: self.grid_version,
                 history: self.history_revision,
-                row_identity: self.screen.grid.identity_revision,
+                row_identity: self.screen.grid.identity_revision(),
                 alternate_screen: self.screen.use_alt_buffer,
             },
             view_revision,
@@ -10243,7 +9989,7 @@ impl TerminalState {
             cursor: self.frame_cursor(),
             grid_version: self.grid_version,
             history_revision: self.history_revision,
-            row_identity_revision: self.screen.grid.identity_revision,
+            row_identity_revision: self.screen.grid.identity_revision(),
             scroll_offset: self.scroll_offset,
             rows,
             cols,
@@ -10348,7 +10094,7 @@ impl TerminalState {
             source_revision: ProjectionSourceRevision {
                 grid: self.grid_version,
                 history: self.history_revision,
-                row_identity: self.screen.grid.identity_revision,
+                row_identity: self.screen.grid.identity_revision(),
                 alternate_screen: self.screen.use_alt_buffer,
             },
             view_revision,
@@ -11012,7 +10758,7 @@ impl TerminalState {
                             || std::sync::Arc::from(cells),
                             |old| old.rows()[index].cells.clone(),
                         ),
-                        wrapped: self.screen.grid.row_wrapped()[index],
+                        wrapped: self.screen.grid.row_wrapped[index],
                     }
                 })
                 .collect::<Vec<_>>();
@@ -11062,7 +10808,7 @@ impl TerminalState {
 
         if self.scroll_offset == 0 {
             // Fast path: just get current grid wrapped flags
-            self.screen.grid.row_wrapped().to_vec()
+            self.screen.grid.row_wrapped.clone()
         } else {
             // Slow path: need to reconstruct from scrollback
             // For simplicity, when scrolling we disable wrapped link detection
@@ -11220,10 +10966,10 @@ impl TerminalState {
                 .as_ref()
                 .is_none_or(|chat| self.chat_key_is_current(chat))
             && key.history_revision == self.history_revision
-            && key.row_identity_revision == self.screen.grid.identity_revision
+            && key.row_identity_revision == self.screen.grid.identity_revision()
             && key.rows == self.screen.grid.rows()
             && key.cols == self.screen.grid.row_len().max(1)
-            && key.row_wrapped.as_slice() == self.screen.grid.row_wrapped()
+            && key.row_wrapped.as_slice() == self.screen.grid.row_wrapped
             && key.next_zone_id == self.next_zone_id
             && key.zone_count == self.command_zones.len()
             && key.provenance_count == self.finished_output_provenance.len()
@@ -12192,7 +11938,7 @@ impl TerminalState {
                     self.scrollback[abs_row].is_wrapped()
                 } else {
                     let grid_row = abs_row - scrollback_len;
-                    grid_row < grid_rows && self.screen.grid.row_wrapped()[grid_row]
+                    grid_row < grid_rows && self.screen.grid.row_wrapped[grid_row]
                 };
 
                 if abs_row < scrollback_len {
@@ -12504,77 +12250,14 @@ impl TerminalState {
                 }
             }
         }
-        let old_rows = self.screen.grid.rows();
-        let had_full_screen_region = old_rows == 0
-            || (self.screen.scroll_region_top == 0
-                && self.screen.scroll_region_bottom + 1 >= old_rows);
-
-        let active_blank_cell = self.create_blank_cell();
-        let primary_blank_bg = if self.screen.use_alt_buffer {
-            self.screen
-                .saved_primary_screen_state
-                .as_ref()
-                .map(|state| state.bg)
-                .unwrap_or(Color::Default)
-        } else {
-            self.screen.current_bg
-        };
-        let primary_blank_cell = self.blank_cell_with_bg(primary_blank_bg);
-        let alt_blank_cell = active_blank_cell;
-
-        // When the row count shrinks on the primary screen, mirror a real
-        // terminal: push the oldest on-screen lines into scrollback and shift the
-        // rest up, rather than letting TerminalGrid::resize silently truncate the
-        // BOTTOM rows (where the prompt/cursor usually live). The cursor is kept
-        // on-screen. (Column reflow on width change is not done here.)
-        if !self.screen.use_alt_buffer && old_rows > rows {
-            let top_remove = jterm_engine::screen::rows_to_archive_on_height_shrink(
-                old_rows,
-                rows,
-                self.screen.cursor_row,
-                |row| {
-                    self.screen.grid[row]
-                        .iter()
-                        .all(TerminalCell::is_reflow_trimmable_blank)
-                },
-            );
-            if top_remove > 0 {
-                for r in 0..top_remove {
-                    let line = ScrollbackLine::compress_with_raw_row_id(
-                        &self.screen.grid[r],
-                        self.screen.grid.row_wrapped()[r],
-                        self.screen.grid.row_ids()[r],
-                    );
-                    self.push_scrollback_compressed(line);
-                }
-                self.screen
-                    .grid
-                    .discard_top_rows_for_resize(top_remove, active_blank_cell);
-                self.screen.cursor_row -= top_remove;
-                self.screen.saved_cursor_row =
-                    self.screen.saved_cursor_row.saturating_sub(top_remove);
-                if let Some(saved) = self.screen.saved_state.as_mut() {
-                    saved.row = saved.row.saturating_sub(top_remove);
-                }
-            }
-            // Those pushes can evict the oldest scrollback rows, which only
-            // *accumulates* a zone rebase. Settle it before returning: this is
-            // a public entry point, and every caller that reads
-            // `command_zones` afterwards — the block menu, the agent's block
-            // context, the journal correlation — would otherwise see anchors
-            // pointing at rows that have already moved. The other trim sites
-            // each settle at their own boundary; this one is reached from the
-            // window manager rather than from the ingest path, so it settles
-            // here rather than inheriting one.
-            self.settle_zone_row_trim();
+        let geometry = self.screen.resize_frost_legacy(rows, cols);
+        for line in geometry.transferred {
+            self.push_scrollback_compressed(ScrollbackLine { storage: line });
         }
-
-        if self.screen.use_alt_buffer {
-            self.screen.grid.resize(rows, cols, alt_blank_cell);
-            self.screen.alt_grid.resize(rows, cols, primary_blank_cell);
-        } else {
-            self.screen.grid.resize(rows, cols, active_blank_cell);
-            self.screen.alt_grid.resize(rows, cols, active_blank_cell);
+        if !self.screen.use_alt_buffer && geometry.old_rows > rows {
+            // A resize can evict retained rows. Rebase command-zone anchors
+            // before returning them to the caller.
+            self.settle_zone_row_trim();
         }
 
         // CRITICAL: Sync row_versions size with grid size to prevent dirty mark loss
@@ -12583,17 +12266,11 @@ impl TerminalState {
             self.row_versions.resize(rows, self.grid_version);
         }
 
-        // Keep the tab-stop table sized to the new column count, defaulting any
-        // newly added columns to the standard every-8 stops.
-        resize_tab_stops(&mut self.screen.tab_stops, cols, TabStopOrigin::Clear);
-
         // Resizing the live grid must not cancel a user's scrollback read. A
         // row shrink may have pushed grid rows into history above, and the
         // push helper already increased the offset to keep the same top row.
         // Growing or changing width leaves the retained-history distance valid.
         self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
-        self.screen.cursor_row = self.screen.cursor_row.min(rows.saturating_sub(1));
-        self.screen.cursor_col = self.screen.cursor_col.min(cols.saturating_sub(1));
         // Width resize mutates grid rows, but retained scrollback keeps its old
         // width until the deferred normalization pass. Clamp a C-row column
         // only while that row is still in the resized (possibly hidden
@@ -12611,26 +12288,6 @@ impl TerminalState {
         self.current_output_extent_row = self
             .current_output_extent_row
             .map(|row| row.min(last_buffer_row));
-        self.screen.pending_wrap = false;
-        self.screen.saved_cursor_row = self.screen.saved_cursor_row.min(rows.saturating_sub(1));
-        self.screen.saved_cursor_col = self.screen.saved_cursor_col.min(cols.saturating_sub(1));
-        self.screen.alt_cursor_row = self.screen.alt_cursor_row.min(rows.saturating_sub(1));
-        self.screen.alt_cursor_col = self.screen.alt_cursor_col.min(cols.saturating_sub(1));
-        if had_full_screen_region {
-            self.screen.scroll_region_top = 0;
-            self.screen.scroll_region_bottom = rows.saturating_sub(1);
-        } else {
-            self.screen.scroll_region_top =
-                self.screen.scroll_region_top.min(rows.saturating_sub(1));
-            self.screen.scroll_region_bottom =
-                self.screen.scroll_region_bottom.min(rows.saturating_sub(1));
-
-            if self.screen.scroll_region_top > self.screen.scroll_region_bottom {
-                self.screen.scroll_region_top = 0;
-                self.screen.scroll_region_bottom = rows.saturating_sub(1);
-            }
-        }
-
         // Resizing mutates every structural assumption behind the visible-cell
         // cache. Bump the version and invalidate explicitly; otherwise a cached
         // pre-resize Arc can be returned with stale row/column dimensions.
@@ -14896,7 +14553,7 @@ mod tests {
         wide[1].flags.set_wide_continuation(true);
         terminal.push_scrollback_compressed(ScrollbackLine::compress(&wide, true));
         terminal.screen.grid.get_mut(0, 0).character = 'G';
-        terminal.screen.grid.row_wrapped_mut()[0] = true;
+        terminal.screen.grid.row_wrapped[0] = true;
 
         let plan = terminal.identity_projection_plan(1);
         assert_eq!(
@@ -15019,7 +14676,10 @@ mod tests {
         assert!(projection.is_identity());
         assert!(projection.uses_identity_fast_path());
         assert_eq!(projection.cells(), expected.as_ref());
-        assert_eq!(projection.row_wrapped(), terminal.screen.grid.row_wrapped());
+        assert_eq!(
+            projection.row_wrapped(),
+            terminal.screen.grid.row_wrapped.as_slice()
+        );
         assert!(std::sync::Arc::ptr_eq(&expected, &projection.cells));
 
         for (row, row_id) in row_ids.into_iter().enumerate() {
@@ -15157,7 +14817,7 @@ mod tests {
             .iter()
             .position(|row| *row == range.start.row)
             .expect("range row retained");
-        terminal.screen.grid.row_ids_mut()[row] = super::fresh_raw_row_id();
+        terminal.screen.grid.row_ids_mut()[row] = super::RawRowId::allocate_process_unique();
         assert_eq!(terminal.finished_output_range(zone_id), None);
     }
 
@@ -16600,18 +16260,14 @@ mod tests {
             terminal.screen.grid[row][0].character = marker;
         }
         let wraps = [true, false, true, false, true, false];
-        terminal
-            .screen
-            .grid
-            .row_wrapped_mut()
-            .copy_from_slice(&wraps);
+        terminal.screen.grid.row_wrapped.copy_from_slice(&wraps);
         let ids = terminal.screen.grid.row_ids().to_vec();
-        let revision = terminal.screen.grid.identity_revision;
+        let revision = terminal.screen.grid.identity_revision();
 
         // Rows two through five are the scroll region. Begin editing at row three.
         terminal.process_batch(b"\x1b[2;5r\x1b[3;1H\x1b[2L");
-        assert_eq!(terminal.screen.grid.row_wrapped(), wraps);
-        assert_eq!(terminal.screen.grid.identity_revision, revision + 2);
+        assert_eq!(terminal.screen.grid.row_wrapped.as_slice(), wraps);
+        assert_eq!(terminal.screen.grid.identity_revision(), revision + 2);
         assert_eq!(terminal.screen.grid[2][0].character, ' ');
         assert_eq!(terminal.screen.grid[3][0].character, ' ');
         assert_eq!(terminal.screen.grid[4][0].character, 'C');
@@ -16623,8 +16279,8 @@ mod tests {
         assert!(inserted[2] > inserted[3] && inserted[3] > ids[5]);
 
         terminal.process_batch(b"\x1b[2M");
-        assert_eq!(terminal.screen.grid.row_wrapped(), wraps);
-        assert_eq!(terminal.screen.grid.identity_revision, revision + 4);
+        assert_eq!(terminal.screen.grid.row_wrapped.as_slice(), wraps);
+        assert_eq!(terminal.screen.grid.identity_revision(), revision + 4);
         assert_eq!(terminal.screen.grid[2][0].character, 'C');
         assert_eq!(terminal.screen.grid[3][0].character, ' ');
         assert_eq!(terminal.screen.grid[4][0].character, ' ');
@@ -19421,7 +19077,7 @@ mod tests {
         assert_eq!(terminal.screen.cursor_row, 1);
         assert_eq!(terminal.screen.cursor_col, 1);
         assert_eq!(terminal.screen.grid[1][0].character, 'X');
-        assert!(terminal.screen.grid.row_wrapped()[0]);
+        assert!(terminal.screen.grid.row_wrapped[0]);
     }
 
     #[test]
@@ -20282,7 +19938,7 @@ mod tests {
         assert!(if output_start < terminal.scrollback.len() {
             terminal.scrollback[output_start].is_wrapped()
         } else {
-            terminal.screen.grid.row_wrapped()[output_start - terminal.scrollback.len()]
+            terminal.screen.grid.row_wrapped[output_start - terminal.scrollback.len()]
         });
         assert_eq!(terminal.zone_output_line_row(id, 0), None);
         assert_eq!(terminal.zone_output_line_row(id, 1), Some(output_start));
@@ -20732,7 +20388,7 @@ mod tests {
                 assert_eq!(terminal.get_cursor_pos(), cursor);
                 terminal.process_batch(b"Z");
                 assert_eq!(terminal.get_cursor_pos(), (1, 1));
-                assert!(terminal.screen.grid.row_wrapped()[0]);
+                assert!(terminal.screen.grid.row_wrapped[0]);
                 assert_eq!(terminal.screen.grid.get(1, 0).character, 'Z');
             }
         }
@@ -20777,7 +20433,7 @@ mod tests {
                                 expected.process_batch(setup.as_bytes());
                                 let row = actual.screen.cursor_row;
                                 let row_id = actual.screen.grid.raw_row_id(row);
-                                let wraps = actual.screen.grid.row_wrapped().to_vec();
+                                let wraps = actual.screen.grid.row_wrapped.to_vec();
                                 let cursor = actual.get_cursor_pos();
                                 let pending_wrap = actual.screen.pending_wrap;
                                 // Prime the visible cache before changing cells.
@@ -20814,7 +20470,7 @@ mod tests {
                                 );
                                 assert!(actual.row_versions[row] > before_version);
                                 assert_eq!(actual.screen.grid.raw_row_id(row), row_id);
-                                assert_eq!(actual.screen.grid.row_wrapped(), wraps);
+                                assert_eq!(actual.screen.grid.row_wrapped.as_slice(), wraps);
                                 assert_eq!(actual.get_cursor_pos(), cursor);
                                 assert_eq!(actual.screen.pending_wrap, pending_wrap);
                             }
@@ -22403,7 +22059,7 @@ mod block_spacing_tests {
         terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b[19;1H");
         terminal.process_input(b"                         ");
         terminal.process_input(b"\x1b[1;3H");
-        assert!(terminal.screen.grid.row_wrapped()[18]);
+        assert!(terminal.screen.grid.row_wrapped[18]);
         assert!(terminal.screen.grid[19]
             .iter()
             .all(|cell| *cell == TerminalCell::default()));
@@ -22725,7 +22381,7 @@ mod block_spacing_tests {
         );
         let mut wrapped = fixture(24, 8);
         let boundary = wrapped.command_zones[1].prompt_start;
-        wrapped.screen.grid.row_wrapped_mut()[boundary - 1] = true;
+        wrapped.screen.grid.row_wrapped[boundary - 1] = true;
         let plan = wrapped.collapsed_projection_plan(24, &normal());
         assert_eq!(
             spacer_count(&plan),

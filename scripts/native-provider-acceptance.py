@@ -97,7 +97,9 @@ def cpu_ticks():
     return int(fields[11]) + int(fields[12])
 
 try:
-    s.start_desktop()
+    # The provider test needs the mapped host frame. Some headless outputs
+    # wait for surface damage before serving a capture of an empty desktop.
+    s.start_desktop(capture_backdrop=False)
     s.spawn(['wtype', '-s', '600000', '-k', 'F24'], 'provider-seat-keyboard')
     stream = log.open('w')
     s.logs.append(stream)

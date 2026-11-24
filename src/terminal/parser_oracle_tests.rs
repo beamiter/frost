@@ -213,7 +213,10 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
     );
     out.insert(
         "wraps".into(),
-        lane((t.screen.grid.row_wrapped(), t.screen.alt_grid.row_wrapped())),
+        lane((
+            t.screen.grid.row_wrapped.as_slice(),
+            t.screen.alt_grid.row_wrapped.as_slice(),
+        )),
     );
     out.insert(
         "history_cells".into(),

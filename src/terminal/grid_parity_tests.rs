@@ -226,6 +226,21 @@ impl std::ops::IndexMut<usize> for OriginalGrid {
     }
 }
 
+fn tracked_grid(rows: usize, cols: usize) -> TerminalGrid {
+    TerminalGrid::with_row_ids(rows, cols, RawRowId::allocate_process_unique)
+}
+
+fn shift_grid_up(grid: &mut TerminalGrid) {
+    grid.shift_rows(
+        RegionDirection::Up,
+        0..=grid.rows() - 1,
+        1,
+        TerminalCell::default(),
+        RegionWrapPolicy::MoveWithRows,
+        RawRowId::allocate_process_unique,
+    );
+}
+
 #[derive(Default)]
 struct IdentityMap {
     actual_to_original: HashMap<RawRowId, RawRowId>,
@@ -238,14 +253,13 @@ impl IdentityMap {
             (actual.rows(), actual.cols()),
             (original.rows(), original.cols())
         );
-        assert_eq!(actual.len(), original.len());
         assert_eq!(actual.row_len(), original.row_len());
         assert_eq!(actual.is_empty(), original.is_empty());
-        assert_eq!(actual.identity_revision, original.identity_revision);
-        assert_eq!(actual.row_wrapped(), original.row_wrapped);
+        assert_eq!(actual.identity_revision(), original.identity_revision);
+        assert_eq!(actual.row_wrapped.as_slice(), original.row_wrapped);
         for row in 0..actual.rows() {
             assert_eq!(&actual[row], &original[row]);
-            assert_eq!(actual.get_row(row), original.get_row(row));
+            assert_eq!(actual[row].to_vec(), original.get_row(row));
             assert_eq!(actual.row_slice(row), Some(&original[row]));
             let a = actual.raw_row_id(row).unwrap();
             let o = original.raw_row_id(row).unwrap();
@@ -304,7 +318,7 @@ fn shared_grid_matches_original_for_seeded_storage_operations() {
         let mut seed = 0x4652_4f53_5447_5244u64.wrapping_add(case);
         let rows = next(&mut seed) as usize % 6;
         let cols = next(&mut seed) as usize % 9;
-        let mut actual = TerminalGrid::new(rows, cols);
+        let mut actual = tracked_grid(rows, cols);
         let mut original = OriginalGrid::new(rows, cols);
         let mut identity = IdentityMap::default();
         identity.assert_grid(&actual, &original);
@@ -317,7 +331,7 @@ fn shared_grid_matches_original_for_seeded_storage_operations() {
                 0 => {
                     let rows = next(&mut seed) as usize % 6;
                     let cols = next(&mut seed) as usize % 9;
-                    actual.resize(rows, cols, cell);
+                    actual.resize_frost_legacy(rows, cols, cell);
                     original.resize(rows, cols, cell);
                 }
                 1 if row < actual.rows() && col < actual.cols() => {
@@ -327,7 +341,8 @@ fn shared_grid_matches_original_for_seeded_storage_operations() {
                 }
                 2 if row < actual.rows() => {
                     let cells = vec![cell; col];
-                    actual.set_row(row, cells.clone());
+                    let retained = cells.len().min(actual.cols());
+                    actual[row][..retained].copy_from_slice(&cells[..retained]);
                     original.set_row(row, cells);
                 }
                 3 => {
@@ -339,11 +354,11 @@ fn shared_grid_matches_original_for_seeded_storage_operations() {
                     original.remove_cell_from_row(row, col);
                 }
                 5 if actual.rows() > 0 => {
-                    actual.shift_rows_up();
+                    shift_grid_up(&mut actual);
                     original.shift_rows_up();
                 }
                 6 if row < actual.rows() => {
-                    actual.row_wrapped_mut()[row] = cell.flags.blink();
+                    actual.row_wrapped[row] = cell.flags.blink();
                     original.row_wrapped[row] = cell.flags.blink();
                 }
                 7 if row < actual.rows() => {
@@ -359,7 +374,9 @@ fn shared_grid_matches_original_for_seeded_storage_operations() {
                     }
                 }
                 9 if actual.rows() > 0 => {
-                    assert_eq!(actual.remove_first_row(), original.remove_first_row());
+                    let removed = (actual[0].to_vec(), actual.row_wrapped[0]);
+                    shift_grid_up(&mut actual);
+                    assert_eq!(removed, original.remove_first_row());
                 }
                 _ => {}
             }
@@ -375,7 +392,7 @@ fn zero_and_small_grid_resizes_match_original() {
         for cols in 0..=3 {
             for new_rows in 0..=3 {
                 for new_cols in 0..=3 {
-                    let mut actual = TerminalGrid::new(rows, cols);
+                    let mut actual = tracked_grid(rows, cols);
                     let mut original = OriginalGrid::new(rows, cols);
                     let mut identity = IdentityMap::default();
                     identity.assert_grid(&actual, &original);
@@ -393,17 +410,17 @@ fn zero_and_small_grid_resizes_match_original() {
                             actual[0][1] = continuation;
                             original[0][1] = continuation;
                         }
-                        actual.row_wrapped_mut()[0] = true;
+                        actual.row_wrapped[0] = true;
                         original.row_wrapped[0] = true;
                     }
                     let blank = TerminalCell {
                         background: Color::Blue,
                         ..Default::default()
                     };
-                    actual.resize(new_rows, new_cols, blank);
+                    actual.resize_frost_legacy(new_rows, new_cols, blank);
                     original.resize(new_rows, new_cols, blank);
                     identity.assert_grid(&actual, &original);
-                    actual.resize(rows, cols, TerminalCell::default());
+                    actual.resize_frost_legacy(rows, cols, TerminalCell::default());
                     original.resize(rows, cols, TerminalCell::default());
                     identity.assert_grid(&actual, &original);
                 }
@@ -413,28 +430,22 @@ fn zero_and_small_grid_resizes_match_original() {
 }
 
 #[test]
-fn zero_grid_invalid_operations_keep_original_panic_contract() {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-    for cols in [0, 1, 3] {
-        let mut actual = TerminalGrid::new(0, cols);
-        let mut original = OriginalGrid::new(0, cols);
-        assert!(catch_unwind(AssertUnwindSafe(|| actual.shift_rows_up())).is_err());
-        assert!(catch_unwind(AssertUnwindSafe(|| original.shift_rows_up())).is_err());
-    }
+fn zero_width_grid_keeps_original_iteration_contract() {
+    use std::panic::catch_unwind;
     for rows in [0, 1, 3] {
-        let actual = TerminalGrid::new(rows, 0);
+        let actual = tracked_grid(rows, 0);
         let original = OriginalGrid::new(rows, 0);
         assert!(catch_unwind(|| actual.to_vec()).is_err());
         assert!(catch_unwind(|| original.to_vec()).is_err());
         assert!(catch_unwind(|| actual.iter()).is_err());
         assert!(catch_unwind(|| original.iter()).is_err());
-        assert_eq!(actual.get_row(0), original.get_row(0));
+        assert_eq!(actual[0].to_vec(), original.get_row(0));
     }
 }
 
 #[test]
-fn row_identity_and_revision_preserve_frost_host_policy() {
-    let mut grid = TerminalGrid::new(3, 2);
+fn row_identity_and_revision_preserve_frost_legacy_policy() {
+    let mut grid = tracked_grid(3, 2);
     let first = grid.row_ids().to_vec();
     assert!(first.iter().all(|id| id.is_tracked()));
     assert_eq!(
@@ -442,53 +453,26 @@ fn row_identity_and_revision_preserve_frost_host_policy() {
         3
     );
     grid.row_ids_mut()[1] = RawRowId::UNTRACKED;
-    grid.row_wrapped_mut()[1] = true;
-    grid.shift_rows_up();
-    assert_eq!(grid.identity_revision, 2);
+    grid.row_wrapped[1] = true;
+    shift_grid_up(&mut grid);
+    assert_eq!(grid.identity_revision(), 2);
     assert_eq!(grid.row_ids()[0], RawRowId::UNTRACKED);
     assert_eq!(grid.row_ids()[1], first[2]);
     assert!(grid.row_ids()[2].is_tracked());
     assert!(!first.contains(&grid.row_ids()[2]));
-    assert_eq!(grid.row_wrapped(), [true, false, false]);
+    assert_eq!(grid.row_wrapped, [true, false, false]);
     let retained = grid.row_ids().to_vec();
-    grid.resize(5, 1, TerminalCell::default());
-    assert_eq!(grid.identity_revision, 3);
+    grid.resize_frost_legacy(5, 1, TerminalCell::default());
+    assert_eq!(grid.identity_revision(), 3);
     assert_eq!(&grid.row_ids()[..3], retained);
     assert!(grid.row_ids()[3..]
         .iter()
         .all(|id| id.is_tracked() && !retained.contains(id)));
     assert_ne!(grid.row_ids()[3], grid.row_ids()[4]);
-    grid.identity_revision = u64::MAX;
-    grid.resize(5, 1, TerminalCell::default());
-    assert_eq!(grid.identity_revision, 1);
-    grid.resize(0, 0, TerminalCell::default());
-    assert_eq!(grid.identity_revision, 2);
+    grid.resize_frost_legacy(0, 0, TerminalCell::default());
+    assert_eq!(grid.identity_revision(), 4);
     assert!(grid.row_ids().is_empty());
-    grid.resize(1, 1, TerminalCell::default());
+    grid.resize_frost_legacy(1, 1, TerminalCell::default());
     assert!(grid.raw_row_id(0).unwrap().is_tracked());
     assert!(!retained.contains(&grid.raw_row_id(0).unwrap()));
-}
-
-#[test]
-fn host_grid_views_alias_the_engine_storage() {
-    let mut grid = TerminalGrid::new(2, 3);
-    assert!(std::ptr::eq(grid.get(0, 0), grid.storage.get(0, 0)));
-    assert!(std::ptr::eq(
-        grid.row_ids().as_ptr(),
-        grid.storage.row_ids().as_ptr()
-    ));
-    assert!(std::ptr::eq(
-        grid.row_wrapped().as_ptr(),
-        grid.storage.row_wrapped.as_ptr()
-    ));
-    grid.storage[0][0].character = 'x';
-    assert_eq!(grid[0][0].character, 'x');
-    grid[1][2].character = 'y';
-    assert_eq!(grid.storage[1][2].character, 'y');
-    grid.cells_mut()[1].character = 'z';
-    assert_eq!(grid.storage[0][1].character, 'z');
-    let clone = grid.clone();
-    assert!(!std::ptr::eq(grid.get(0, 0), clone.get(0, 0)));
-    assert_eq!(grid.row_ids(), clone.row_ids());
-    assert_eq!(grid.identity_revision, clone.identity_revision);
 }
