@@ -8,329 +8,24 @@ const DEFAULT_SHELL_NAME: &str = "jsh";
 #[cfg(unix)]
 mod unix_pty {
     use super::*;
-    use std::os::fd::{AsFd, BorrowedFd, IntoRawFd};
+    use jterm_core::native_pty_launch::{
+        launch_pty, PtyLaunch, PtyLaunchError, StartupError, StartupStage, WorkingDirectory,
+    };
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
     use std::path::Path;
     use std::sync::OnceLock;
     use std::time::{Duration, Instant};
-
-    // Keep local launches effectively immediate while allowing automounts and
-    // network-backed working directories a reasonable window to resolve.
-    // Most importantly, this bounds the synchronous fork-to-exec handshake.
-    const CHILD_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
     // Identifying the `jsh` on PATH runs once per process and blocks the first
     // PTY spawn, so keep the window short: our own shell answers `--version`
     // immediately, and anything slower is not worth waiting on.
     const JSH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-    #[derive(Clone, Copy)]
-    #[repr(i32)]
-    enum ChildSetupStage {
-        ParentDeathSignal = 1,
-        ParentAlreadyExited = 2,
-        CreateSession = 3,
-        ChangeDirectory = 4,
-        SetControllingTerminal = 5,
-        DuplicateStdin = 6,
-        DuplicateStdout = 7,
-        DuplicateStderr = 8,
-        ExecuteShell = 9,
-    }
-
-    impl ChildSetupStage {
-        fn name(value: i32) -> &'static str {
-            match value {
-                1 => "prctl(PR_SET_PDEATHSIG)",
-                2 => "parent-liveness check",
-                3 => "setsid",
-                4 => "chdir",
-                5 => "ioctl(TIOCSCTTY)",
-                6 => "dup2(stdin)",
-                7 => "dup2(stdout)",
-                8 => "dup2(stderr)",
-                9 => "execve",
-                _ => "unknown child setup stage",
-            }
-        }
-    }
-
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ChildLifecycle {
         Running,
         TerminationStarted,
         Reaped,
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    unsafe fn current_errno() -> libc::c_int {
-        // SAFETY: called immediately after a failed libc syscall in the forked
-        // child. Reading thread-local errno does not allocate or acquire locks.
-        unsafe { *libc::__errno_location() }
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    unsafe fn current_errno() -> libc::c_int {
-        // `last_os_error` only snapshots errno. Keep this fallback for Unix
-        // targets whose libc does not expose Linux's `__errno_location`.
-        std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO)
-    }
-
-    /// Report a fork-to-exec setup failure to the parent and terminate without
-    /// running destructors. The fixed two-word record is well below PIPE_BUF,
-    /// and this child-side path uses only async-signal-safe libc operations.
-    unsafe fn child_setup_failed_with_errno(
-        error_fd: RawFd,
-        stage: ChildSetupStage,
-        errno: libc::c_int,
-    ) -> ! {
-        let record = [stage as libc::c_int, errno];
-        let mut offset = 0usize;
-        let len = std::mem::size_of_val(&record);
-        let ptr = record.as_ptr().cast::<u8>();
-
-        while offset < len {
-            // SAFETY: `record` remains alive until `_exit`, and `offset < len`.
-            let written = unsafe {
-                libc::write(
-                    error_fd,
-                    ptr.add(offset).cast::<libc::c_void>(),
-                    len - offset,
-                )
-            };
-            if written > 0 {
-                offset += written as usize;
-            } else if written < 0 && unsafe { current_errno() } == libc::EINTR {
-                continue;
-            } else {
-                break;
-            }
-        }
-        unsafe { libc::_exit(127) }
-    }
-
-    unsafe fn child_setup_failed(error_fd: RawFd, stage: ChildSetupStage) -> ! {
-        let errno = unsafe { current_errno() };
-        unsafe { child_setup_failed_with_errno(error_fd, stage, errno) }
-    }
-
-    unsafe fn reap_child_blocking(child_pid: libc::pid_t) {
-        let mut status = 0;
-        loop {
-            let result = unsafe { libc::waitpid(child_pid, &mut status, 0) };
-            if result >= 0 || unsafe { current_errno() } != libc::EINTR {
-                break;
-            }
-        }
-    }
-
-    unsafe fn kill_and_reap_child(child_pid: libc::pid_t) {
-        // The child may or may not have completed setsid(), so target both its
-        // prospective process group and the process itself.
-        unsafe {
-            let _ = libc::kill(-child_pid, libc::SIGKILL);
-            let _ = libc::kill(child_pid, libc::SIGKILL);
-            reap_child_blocking(child_pid);
-        }
-    }
-
-    fn startup_timeout_ms(remaining: Duration) -> libc::c_int {
-        let whole_ms = remaining.as_millis();
-        let rounded_ms = whole_ms + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
-        rounded_ms.clamp(1, libc::c_int::MAX as u128) as libc::c_int
-    }
-
-    unsafe fn abort_child_startup(
-        startup_read: RawFd,
-        child_pid: libc::pid_t,
-        error: anyhow::Error,
-    ) -> Result<()> {
-        // Close first so a child still attempting to report an error cannot
-        // keep the handshake alive while it is being torn down.
-        unsafe {
-            let _ = libc::close(startup_read);
-            kill_and_reap_child(child_pid);
-        }
-        Err(error)
-    }
-
-    /// Wait for either a child setup error record or CLOEXEC EOF from execve.
-    ///
-    /// `startup_read` is owned by this function. Every return path closes it;
-    /// error paths also kill and reap the child before returning.
-    unsafe fn wait_for_child_startup(
-        startup_read: RawFd,
-        child_pid: libc::pid_t,
-        timeout: Duration,
-    ) -> Result<()> {
-        let mut record = [0 as libc::c_int; 2];
-        let record_len = std::mem::size_of_val(&record);
-        let mut received = 0usize;
-        let started = Instant::now();
-
-        loop {
-            let elapsed = started.elapsed();
-            if elapsed >= timeout {
-                return unsafe {
-                    abort_child_startup(
-                        startup_read,
-                        child_pid,
-                        anyhow!(
-                            "Timed out after {} ms during PTY child fork-to-exec startup \
-                             (child setup through execve; received {received}/{record_len} \
-                             status bytes)",
-                            timeout.as_millis()
-                        ),
-                    )
-                };
-            }
-
-            let mut poll_fd = libc::pollfd {
-                fd: startup_read,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ready = unsafe {
-                libc::poll(
-                    &mut poll_fd,
-                    1,
-                    startup_timeout_ms(timeout.saturating_sub(elapsed)),
-                )
-            };
-            if ready < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                return unsafe {
-                    abort_child_startup(
-                        startup_read,
-                        child_pid,
-                        anyhow!("Failed to poll PTY child during fork-to-exec startup: {error}"),
-                    )
-                };
-            }
-            if ready == 0 {
-                return unsafe {
-                    abort_child_startup(
-                        startup_read,
-                        child_pid,
-                        anyhow!(
-                            "Timed out after {} ms during PTY child fork-to-exec startup \
-                             (child setup through execve; received {received}/{record_len} \
-                             status bytes)",
-                            timeout.as_millis()
-                        ),
-                    )
-                };
-            }
-
-            let revents = poll_fd.revents;
-            if revents & libc::POLLNVAL != 0 {
-                return unsafe {
-                    abort_child_startup(
-                        startup_read,
-                        child_pid,
-                        anyhow!("Invalid startup status fd during PTY child fork-to-exec startup"),
-                    )
-                };
-            }
-            if revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
-                return unsafe {
-                    abort_child_startup(
-                        startup_read,
-                        child_pid,
-                        anyhow!(
-                            "Unexpected poll events 0x{revents:x} during PTY child \
-                             fork-to-exec startup"
-                        ),
-                    )
-                };
-            }
-
-            // POLLHUP may arrive together with POLLIN. Always read first so a
-            // complete or partial failure record already in the pipe is not
-            // mistaken for successful exec EOF.
-            let n = unsafe {
-                libc::read(
-                    startup_read,
-                    record
-                        .as_mut_ptr()
-                        .cast::<u8>()
-                        .add(received)
-                        .cast::<libc::c_void>(),
-                    record_len - received,
-                )
-            };
-            if n > 0 {
-                received += n as usize;
-                if received < record_len {
-                    continue;
-                }
-
-                unsafe {
-                    let _ = libc::close(startup_read);
-                    reap_child_blocking(child_pid);
-                }
-                let stage = ChildSetupStage::name(record[0]);
-                let errno = record[1];
-                let error = std::io::Error::from_raw_os_error(errno);
-                return Err(anyhow!(
-                    "Failed to start PTY child during {stage}: {error} (errno {errno})"
-                ));
-            }
-            if n == 0 {
-                if received != 0 {
-                    return unsafe {
-                        abort_child_startup(
-                            startup_read,
-                            child_pid,
-                            anyhow!(
-                                "Incomplete PTY child startup status during fork-to-exec \
-                                 startup ({received}/{record_len} bytes)"
-                            ),
-                        )
-                    };
-                }
-                if revents & libc::POLLERR != 0 {
-                    return unsafe {
-                        abort_child_startup(
-                            startup_read,
-                            child_pid,
-                            anyhow!(
-                                "Startup status pipe failed during PTY child fork-to-exec startup"
-                            ),
-                        )
-                    };
-                }
-
-                // EOF without an error record is the success signal: execve
-                // closed the child's CLOEXEC write end.
-                unsafe {
-                    let _ = libc::close(startup_read);
-                }
-                return Ok(());
-            }
-
-            let error = std::io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) if revents & libc::POLLERR == 0 => continue,
-                _ => {
-                    return unsafe {
-                        abort_child_startup(
-                            startup_read,
-                            child_pid,
-                            anyhow!(
-                                "Failed to read PTY child status during fork-to-exec startup: \
-                                 {error}"
-                            ),
-                        )
-                    };
-                }
-            }
-        }
     }
 
     /// This process's own `PATH`, for the `host::` resolvers. `None` means "no
@@ -588,7 +283,7 @@ mod unix_pty {
     }
 
     pub struct Pty {
-        master: RawFd,
+        master: OwnedFd,
         child_pid: i32,
         session: companion_host::pty_session::PtySession,
         exit_code_cached: Option<i32>,
@@ -650,359 +345,167 @@ mod unix_pty {
                 .or(configured_agent.as_deref())
                 .map(crate::agent_cli::inline_argv);
             let command_argv = inline_command.as_deref();
-            // Reject malformed explicit commands before openpty: returning
-            // from the later argv builder would otherwise leak both raw fds.
+            // Reject malformed commands before looking up the shell or allocating a PTY.
             if command_argv.is_some_and(|argv| argv.is_empty()) {
                 return Err(anyhow!("command argv must not be empty"));
             }
-            // Reject stale session-history paths before allocating a PTY or
-            // forking. The child still reports chdir failures through the setup
-            // pipe below, closing the validation-to-fork race.
+            // Report stale session-history paths before launching. The shared
+            // launcher checks chdir again in the child.
             if let Some(dir) = cwd {
-                let metadata = std::fs::metadata(dir)
-                    .map_err(|error| anyhow!("Invalid PTY working directory '{}': {error}", dir))?;
+                let metadata = std::fs::metadata(dir).map_err(|error| {
+                    PtyLaunchError::PrepareWorkingDirectory(std::io::Error::new(
+                        error.kind(),
+                        format!("Invalid PTY working directory '{dir}': {error}"),
+                    ))
+                })?;
                 if !metadata.is_dir() {
-                    return Err(anyhow!(
-                        "PTY working directory is not a directory: '{}'",
-                        dir
-                    ));
+                    return Err(PtyLaunchError::PrepareWorkingDirectory(std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        format!("PTY working directory is not a directory: '{dir}'"),
+                    ))
+                    .into());
                 }
             }
 
-            // Resolved before the PTY exists so a "no usable shell" failure is a
-            // plain error return instead of an fd-closing path inside the unsafe
-            // block. It is a pure lookup; nothing below it depends on ordering.
             let shell_path = choose_shell(configured_shell, cwd)?;
-            // A shell that exits right away takes the whole window down with
-            // it, so make the choice visible in the log for that diagnosis.
             log::info!("[PTY] starting shell: {shell_path}");
 
-            // SAFETY: 这个 unsafe 块包含多个 libc 系统调用用于 PTY 创建和进程 fork。
-            // 所有的 libc 调用都检查了返回值并正确处理错误。
-            // 文件描述符的生命周期被正确管理（成功时存储在 PtySession 中，失败时关闭）。
-            // fork 后的子进程分支永不返回（通过 execve 或 exit），避免了未定义行为。
-            unsafe {
-                // 1. 创建 PTY
-                let mut master = 0;
-                let mut slave = 0;
+            let shell_name = std::path::Path::new(&shell_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("sh")
+                .to_string();
 
-                let win_size = libc::winsize {
-                    ws_row: pty_dimension(rows),
-                    ws_col: pty_dimension(cols),
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
-                };
+            let shell_cstr = CString::new(shell_path.as_str())
+                .map_err(|_| anyhow!("shell path contains NUL"))?;
+            let dash_shell_cstr = CString::new(format!("-{shell_name}"))
+                .map_err(|_| anyhow!("shell name contains NUL"))?;
+            let login_arg = if shell_name == "bash" {
+                Some(CString::new("-l").unwrap())
+            } else {
+                None
+            };
+            let session_flag = CString::new("--session").unwrap();
+            let session_id_cstr = session_id.and_then(|s| CString::new(s).ok());
+            // `find_executable_in` is exec-bit checked and absolutizing, so
+            // the separate is_executable filter this used to carry is gone.
+            let bash_path = if shell_name == "jsh" {
+                jterm_core::host::find_executable_in("bash", search_path().as_deref())
+                    .map(|path| path.to_string_lossy().into_owned())
+            } else {
+                None
+            };
 
-                if libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    &win_size,
-                ) != 0
-                {
-                    return Err(anyhow!("Failed to open PTY"));
-                }
-
-                // 2. 设置 master 非阻塞模式
-                let flags = libc::fcntl(master, libc::F_GETFL, 0);
-                if flags < 0 || libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-                    let error = std::io::Error::last_os_error();
-                    libc::close(master);
-                    libc::close(slave);
-                    return Err(anyhow!("Failed to make PTY non-blocking: {error}"));
-                }
-
-                // 设置 FD_CLOEXEC，防止子进程继承
-                let fd_flags = libc::fcntl(master, libc::F_GETFD, 0);
-                if fd_flags < 0
-                    || libc::fcntl(master, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) < 0
-                {
-                    let error = std::io::Error::last_os_error();
-                    libc::close(master);
-                    libc::close(slave);
-                    return Err(anyhow!("Failed to set PTY CLOEXEC: {error}"));
-                }
-
-                // Prepare everything that needs heap allocation or environment
-                // lookups BEFORE fork(). iced spawns winit/wgpu worker threads, so
-                // this is a multithreaded process; between fork() and execve() only
-                // async-signal-safe calls are legal. malloc/getenv/setenv are not —
-                // if another thread held the allocator lock at fork time the child
-                // could deadlock. So argv and a custom envp are built here and the
-                // child branch only reads already-allocated memory.
-                let shell_name = std::path::Path::new(&shell_path)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("sh")
-                    .to_string();
-
-                macro_rules! cstr_or_bail {
-                    ($e:expr, $msg:expr) => {
-                        match CString::new($e) {
-                            Ok(c) => c,
-                            Err(_) => {
-                                libc::close(master);
-                                libc::close(slave);
-                                return Err(anyhow!($msg));
-                            }
-                        }
-                    };
-                }
-
-                let shell_cstr = cstr_or_bail!(shell_path.clone(), "shell path contains NUL");
-                let dash_shell_cstr =
-                    cstr_or_bail!(format!("-{}", shell_name), "shell name contains NUL");
-                let login_arg = if shell_name == "bash" {
-                    Some(CString::new("-l").unwrap())
-                } else {
-                    None
-                };
-                let session_flag = CString::new("--session").unwrap();
-                let session_id_cstr = session_id.and_then(|s| CString::new(s).ok());
-                // `find_executable_in` is exec-bit checked and absolutizing, so
-                // the separate is_executable filter this used to carry is gone.
-                let bash_path = if shell_name == "jsh" {
-                    jterm_core::host::find_executable_in("bash", search_path().as_deref())
-                        .map(|path| path.to_string_lossy().into_owned())
-                } else {
-                    None
-                };
-
-                // A one-shot helper (for example the jsh installer) is exec'd
-                // exactly as given: no login-shell wrapping, no --session.
-                let command_cstrings: Option<(CString, Vec<CString>)> = match command_argv {
-                    Some(argv) => {
-                        let program = argv
-                            .first()
-                            .ok_or_else(|| anyhow!("command argv must not be empty"))?;
-                        // execve does not search PATH, so resolve the helper's
-                        // program the way execvp would — against the cwd the
-                        // child will be in. On failure the token is passed
-                        // through unchanged so the child's exec error is
-                        // reported through the startup pipe with the name the
-                        // caller actually asked for.
-                        let program_path = jterm_core::host::resolve_executable(
-                            program,
-                            search_path().as_deref(),
-                            cwd,
-                        )
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .unwrap_or_else(|_| program.clone());
-                        let mut args = Vec::with_capacity(argv.len());
-                        for arg in argv {
-                            args.push(cstr_or_bail!(arg.clone(), "command argument contains NUL"));
-                        }
-                        Some((
-                            cstr_or_bail!(program_path, "command path contains NUL"),
-                            args,
-                        ))
+            // A one-shot helper (for example the jsh installer) is exec'd
+            // exactly as given: no login-shell wrapping, no --session.
+            let command_cstrings: Option<(CString, Vec<CString>)> = match command_argv {
+                Some(argv) => {
+                    let program = argv
+                        .first()
+                        .ok_or_else(|| anyhow!("command argv must not be empty"))?;
+                    // execve does not search PATH, so resolve the helper's
+                    // program the way execvp would — against the cwd the
+                    // child will be in. On failure the token is passed
+                    // through unchanged so the child's exec error is
+                    // reported through the startup pipe with the name the
+                    // caller actually asked for.
+                    let program_path = jterm_core::host::resolve_executable(
+                        program,
+                        search_path().as_deref(),
+                        cwd,
+                    )
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| program.clone());
+                    let mut args = Vec::with_capacity(argv.len());
+                    for arg in argv {
+                        args.push(
+                            CString::new(arg.as_str())
+                                .map_err(|_| anyhow!("command argument contains NUL"))?,
+                        );
                     }
-                    None => None,
-                };
+                    Some((
+                        CString::new(program_path)
+                            .map_err(|_| anyhow!("command path contains NUL"))?,
+                        args,
+                    ))
+                }
+                None => None,
+            };
 
-                let (exec_cstr, argv_cstrings): (CString, Vec<CString>) =
-                    if let Some(command) = command_cstrings {
-                        command
-                    } else if let ("jsh", Some(bash_path)) = (shell_name.as_str(), bash_path) {
-                        // Bash sources user startup first; restore the managed
-                        // child PATH immediately before exec so rc files cannot
-                        // accidentally hide native Vim from the jsh prompt.
-                        let mut argv = vec![
-                            CString::new("bash").unwrap(),
-                            CString::new("-ic").unwrap(),
-                            CString::new(jterm_core::vim9::VIM9_SHELL_EXEC).unwrap(),
-                            shell_cstr.clone(),
-                        ];
+            let (exec_cstr, argv_cstrings): (CString, Vec<CString>) =
+                if let Some(command) = command_cstrings {
+                    command
+                } else if let ("jsh", Some(bash_path)) = (shell_name.as_str(), bash_path) {
+                    // Bash sources user startup first; restore the managed
+                    // child PATH immediately before exec so rc files cannot
+                    // accidentally hide native Vim from the jsh prompt.
+                    let mut argv = vec![
+                        CString::new("bash").unwrap(),
+                        CString::new("-ic").unwrap(),
+                        CString::new(jterm_core::vim9::VIM9_SHELL_EXEC).unwrap(),
+                        shell_cstr.clone(),
+                    ];
+                    if let Some(ref sid) = session_id_cstr {
+                        argv.push(session_flag.clone());
+                        argv.push(sid.clone());
+                    }
+                    (
+                        CString::new(bash_path).map_err(|_| anyhow!("bash path contains NUL"))?,
+                        argv,
+                    )
+                } else {
+                    let mut argv = vec![dash_shell_cstr.clone()];
+                    if let Some(ref arg) = login_arg {
+                        argv.push(arg.clone());
+                    }
+                    if shell_name == "jsh" {
                         if let Some(ref sid) = session_id_cstr {
                             argv.push(session_flag.clone());
                             argv.push(sid.clone());
                         }
-                        (cstr_or_bail!(bash_path, "bash path contains NUL"), argv)
-                    } else {
-                        let mut argv = vec![dash_shell_cstr.clone()];
-                        if let Some(ref arg) = login_arg {
-                            argv.push(arg.clone());
-                        }
-                        if shell_name == "jsh" {
-                            if let Some(ref sid) = session_id_cstr {
-                                argv.push(session_flag.clone());
-                                argv.push(sid.clone());
-                            }
-                        }
-                        (shell_cstr.clone(), argv)
-                    };
-
-                // argv pointers borrow the CStrings above; both outlive the fork.
-                let mut argv_ptrs: Vec<*const libc::c_char> =
-                    argv_cstrings.iter().map(|arg| arg.as_ptr()).collect();
-                argv_ptrs.push(std::ptr::null());
-
-                // The child's whole environment, built here because between
-                // fork() and execve() only async-signal-safe calls are legal:
-                // setenv and malloc could deadlock on a lock another iced/wgpu
-                // worker thread held at the moment of the fork. `child_env`
-                // returns a ready CString block so the child only collects
-                // pointers and execve's.
-                let env_cstrings =
-                    match jterm_core::child_env::envp(&child_env_options(), extra_env) {
-                        Ok(block) => crate::agent_cli::environment(block),
-                        Err(error) => {
-                            libc::close(master);
-                            libc::close(slave);
-                            return Err(anyhow!("Failed to build the child environment: {error}"));
-                        }
-                    };
-                let mut envp: Vec<*const libc::c_char> =
-                    env_cstrings.iter().map(|c| c.as_ptr()).collect();
-                envp.push(std::ptr::null());
-
-                // cwd prepared before fork; chdir() itself is async-signal-safe.
-                let cwd_cstr = match cwd {
-                    Some(dir) => Some(cstr_or_bail!(dir, "working directory contains NUL")),
-                    None => None,
-                };
-
-                // A CLOEXEC pipe is the exec handshake. The child writes a
-                // fixed error record if any post-fork setup syscall fails; a
-                // successful execve atomically closes its write end, yielding
-                // EOF to the parent.
-                let (startup_read, startup_write) = match jterm_core::pty_reader::shutdown_pipe() {
-                    Ok((reader, writer)) => (reader.into_raw_fd(), writer.into_raw_fd()),
-                    Err(error) => {
-                        libc::close(master);
-                        libc::close(slave);
-                        return Err(anyhow!("Failed to create PTY startup pipe: {error}"));
                     }
+                    (shell_cstr.clone(), argv)
                 };
-                // Poll is the authority for waiting. Keep the subsequent read
-                // non-blocking as a second guard against spurious readiness or
-                // a partial status record whose writer remains open.
-                let startup_flags = libc::fcntl(startup_read, libc::F_GETFL, 0);
-                if startup_flags < 0
-                    || libc::fcntl(
-                        startup_read,
-                        libc::F_SETFL,
-                        startup_flags | libc::O_NONBLOCK,
-                    ) < 0
+
+            let env_cstrings = jterm_core::child_env::envp(&child_env_options(), extra_env)
+                .map(crate::agent_cli::environment)
+                .map_err(|error| anyhow!("Failed to build the child environment: {error}"))?;
+            let cwd_cstr = cwd.map(CString::new).transpose().map_err(|error| {
+                PtyLaunchError::PrepareWorkingDirectory(std::io::Error::from(error))
+            })?;
+            let directory = cwd_cstr
+                .as_deref()
+                .map_or(WorkingDirectory::Inherit, WorkingDirectory::Path);
+            launch_pty(PtyLaunch {
+                executable: &exec_cstr,
+                argv: &argv_cstrings,
+                environment: &env_cstrings,
+                directory,
+                rows: pty_dimension(rows),
+                columns: pty_dimension(cols),
+                parent_death_signal: true,
+            })
+            .map_err(|error| {
+                if let PtyLaunchError::Start(StartupError::Child {
+                    stage: StartupStage::Exec,
+                    error: cause,
+                }) = &error
                 {
-                    let error = std::io::Error::last_os_error();
-                    libc::close(startup_read);
-                    libc::close(startup_write);
-                    libc::close(master);
-                    libc::close(slave);
-                    return Err(anyhow!(
-                        "Failed to make PTY startup status pipe non-blocking: {error}"
-                    ));
-                }
-
-                // 3. Fork 子进程. Remember the parent so the child can close the
-                // small fork→prctl race where the parent dies before PDEATHSIG is
-                // installed.
-                let parent_pid = libc::getpid();
-                // Capture process-global state before fork so the child branch
-                // only needs the returned integer with async-signal-safe
-                // close(2).
-                let inherited_instance_lock_fd =
-                    crate::session_persistence::inherited_instance_lock_fd();
-                let fork_result = libc::fork();
-
-                if fork_result < 0 {
-                    libc::close(startup_read);
-                    libc::close(startup_write);
-                    libc::close(master);
-                    libc::close(slave);
-                    return Err(anyhow!("Failed to fork"));
-                }
-
-                if fork_result == 0 {
-                    // ===== 子进程分支：以下只允许 async-signal-safe 调用 =====
-                    // A flock is bound to the inherited open-file description,
-                    // not to this process. Close the inherited single-instance
-                    // lock copy before anything that could stall, so a stuck
-                    // pre-exec child can never outlive the primary process
-                    // while retaining the lock.
-                    if inherited_instance_lock_fd >= 0 {
-                        libc::close(inherited_instance_lock_fd);
-                    }
-                    libc::close(startup_read);
-                    libc::close(master);
-
-                    // 父进程死亡信号：父进程(frost)退出时此进程收到 SIGTERM，
-                    // 作为 SIGKILL/panic 情况下避免孤儿进程的最后一道防线。
-                    #[cfg(target_os = "linux")]
-                    {
-                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-                            child_setup_failed(startup_write, ChildSetupStage::ParentDeathSignal);
-                        }
-                        if libc::getppid() != parent_pid {
-                            child_setup_failed_with_errno(
-                                startup_write,
-                                ChildSetupStage::ParentAlreadyExited,
-                                libc::ESRCH,
-                            );
-                        }
-                    }
-
-                    // 新建会话/进程组，使其成为会话 leader，便于按进程组发信号。
-                    if libc::setsid() < 0 {
-                        child_setup_failed(startup_write, ChildSetupStage::CreateSession);
-                    }
-
-                    // 切换工作目录（CString 已在 fork 前构造好）。
-                    if let Some(ref dir_cstr) = cwd_cstr {
-                        if libc::chdir(dir_cstr.as_ptr()) != 0 {
-                            child_setup_failed(startup_write, ChildSetupStage::ChangeDirectory);
-                        }
-                    }
-
-                    // 设置 slave 为控制终端
-                    if libc::ioctl(slave, libc::TIOCSCTTY, 0) != 0 {
-                        child_setup_failed(startup_write, ChildSetupStage::SetControllingTerminal);
-                    }
-
-                    if libc::dup2(slave, libc::STDIN_FILENO) < 0 {
-                        child_setup_failed(startup_write, ChildSetupStage::DuplicateStdin);
-                    }
-                    if libc::dup2(slave, libc::STDOUT_FILENO) < 0 {
-                        child_setup_failed(startup_write, ChildSetupStage::DuplicateStdout);
-                    }
-                    if libc::dup2(slave, libc::STDERR_FILENO) < 0 {
-                        child_setup_failed(startup_write, ChildSetupStage::DuplicateStderr);
-                    }
-                    if slave > libc::STDERR_FILENO {
-                        libc::close(slave);
-                    }
-
-                    // 执行 shell，使用 fork 前构造好的 argv 与 envp。
-                    libc::execve(exec_cstr.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr());
-
-                    // execve 仅在出错时返回。
-                    child_setup_failed(startup_write, ChildSetupStage::ExecuteShell);
+                    let message = format!("PTY child setup failed at execve: {cause}");
+                    anyhow::Error::new(error).context(message)
                 } else {
-                    // 父进程分支
-                    libc::close(startup_write);
-                    // 关闭 slave
-                    libc::close(slave);
-
-                    if let Err(error) =
-                        wait_for_child_startup(startup_read, fork_result, CHILD_STARTUP_TIMEOUT)
-                    {
-                        libc::close(master);
-                        return Err(error);
-                    }
-
-                    Ok(Pty {
-                        master,
-                        child_pid: fork_result as i32,
-                        session: companion_host::pty_session::PtySession::capture(
-                            fork_result as i32,
-                        ),
-                        exit_code_cached: None,
-                        lifecycle: ChildLifecycle::Running,
-                    })
+                    error.into()
                 }
-            }
+            })?
+            .adopt(|master, child_pid| {
+                Ok(Self {
+                    master,
+                    child_pid,
+                    session: companion_host::pty_session::PtySession::capture(child_pid),
+                    exit_code_cached: None,
+                    lifecycle: ChildLifecycle::Running,
+                })
+            })
         }
 
         pub fn get_child_pid(&self) -> i32 {
@@ -1014,7 +517,7 @@ mod unix_pty {
         }
 
         pub fn master_fd(&self) -> RawFd {
-            self.master
+            self.master.as_raw_fd()
         }
 
         /// Single non-blocking write. Returns bytes written, `Ok(0)` if the
@@ -1035,7 +538,8 @@ mod unix_pty {
         fn write_once(&self, data: &[u8]) -> std::io::Result<usize> {
             iced::advanced::subscription::Event::with_native_input_write(|| {
                 // SAFETY: master is still owned and data is readable for the syscall.
-                let count = unsafe { libc::write(self.master, data.as_ptr().cast(), data.len()) };
+                let count =
+                    unsafe { libc::write(self.master_fd(), data.as_ptr().cast(), data.len()) };
                 if count < 0 {
                     Err(std::io::Error::last_os_error())
                 } else {
@@ -1066,7 +570,7 @@ mod unix_pty {
                 };
 
                 if libc::ioctl(
-                    self.master,
+                    self.master_fd(),
                     libc::TIOCSWINSZ,
                     (&win_size) as *const _ as *mut libc::c_void,
                 ) < 0
@@ -1263,8 +767,7 @@ mod unix_pty {
 
     impl AsFd for Pty {
         fn as_fd(&self) -> BorrowedFd<'_> {
-            // SAFETY: the owning Pty closes this descriptor only in Drop.
-            unsafe { BorrowedFd::borrow_raw(self.master) }
+            self.master.as_fd()
         }
     }
 
@@ -1346,11 +849,6 @@ mod unix_pty {
     impl Drop for Pty {
         fn drop(&mut self) {
             let _ = self.terminate();
-            // SAFETY: close 关闭文件描述符。master 是有效的 fd，
-            // 关闭后不会再使用（因为这是 Drop 实现）。
-            unsafe {
-                let _ = libc::close(self.master);
-            }
         }
     }
 
@@ -1362,121 +860,6 @@ mod unix_pty {
     #[cfg(test)]
     mod lifecycle_tests {
         use super::*;
-
-        unsafe fn make_test_startup_child(
-            partial_status: Option<u8>,
-            keep_writer_open: bool,
-        ) -> (RawFd, libc::pid_t) {
-            let (reader, writer) =
-                jterm_core::pty_reader::shutdown_pipe().expect("create test startup pipe");
-            let (read_fd, write_fd) = (reader.into_raw_fd(), writer.into_raw_fd());
-            let pid = unsafe { libc::fork() };
-            if pid < 0 {
-                unsafe {
-                    let _ = libc::close(read_fd);
-                    let _ = libc::close(write_fd);
-                }
-                panic!(
-                    "fork test startup child: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            if pid == 0 {
-                unsafe {
-                    let _ = libc::close(read_fd);
-                    // The production child immediately execs, which closes every
-                    // unrelated CLOEXEC descriptor. This fixture can deliberately
-                    // pause before exit, so emulate that boundary explicitly: if
-                    // it retained a process-wide flock opened by another parallel
-                    // test, dropping the lock in the parent would not release it
-                    // until this child was killed. Keep the status writer at one
-                    // known descriptor and close everything above it.
-                    const STATUS_FD: RawFd = 3;
-                    if write_fd != STATUS_FD {
-                        if libc::dup2(write_fd, STATUS_FD) < 0 {
-                            libc::_exit(126);
-                        }
-                        let _ = libc::close(write_fd);
-                    }
-                    #[cfg(target_os = "linux")]
-                    let close_range_unavailable =
-                        libc::close_range(STATUS_FD as libc::c_uint + 1, libc::c_uint::MAX, 0) != 0;
-                    #[cfg(not(target_os = "linux"))]
-                    let close_range_unavailable = true;
-                    if close_range_unavailable {
-                        // This test module only exercises Unix targets. The
-                        // conservative old-kernel fallback avoids allocation
-                        // after fork. Test processes keep descriptors in this
-                        // low range; production takes the exec/CLOEXEC path.
-                        for fd in (STATUS_FD + 1)..1024 {
-                            let _ = libc::close(fd);
-                        }
-                    }
-                    if let Some(byte) = partial_status {
-                        let _ =
-                            libc::write(STATUS_FD, (&byte as *const u8).cast::<libc::c_void>(), 1);
-                    }
-                    if keep_writer_open {
-                        loop {
-                            libc::pause();
-                        }
-                    }
-                    let _ = libc::close(STATUS_FD);
-                    libc::_exit(0);
-                }
-            }
-
-            unsafe {
-                let _ = libc::close(write_fd);
-            }
-            (read_fd, pid)
-        }
-
-        #[test]
-        fn startup_handshake_times_out_after_partial_record_and_reaps_child() {
-            let (read_fd, pid) = unsafe { make_test_startup_child(Some(1), true) };
-            let started = Instant::now();
-            let error = unsafe {
-                wait_for_child_startup(read_fd, pid, Duration::from_millis(50))
-                    .expect_err("a child holding a partial record must time out")
-            };
-
-            assert!(
-                error.to_string().contains("fork-to-exec startup"),
-                "unexpected error: {error:#}"
-            );
-            assert!(
-                error.to_string().contains("received 1/"),
-                "partial byte count missing from error: {error:#}"
-            );
-            assert!(
-                started.elapsed() < Duration::from_secs(2),
-                "startup timeout exceeded its bounded cleanup window"
-            );
-
-            let mut status = 0;
-            let wait_result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-            assert_eq!(wait_result, -1, "startup child was not already reaped");
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ECHILD)
-            );
-        }
-
-        #[test]
-        fn startup_handshake_rejects_eof_after_partial_record() {
-            let (read_fd, pid) = unsafe { make_test_startup_child(Some(1), false) };
-            let error = unsafe {
-                wait_for_child_startup(read_fd, pid, Duration::from_secs(1))
-                    .expect_err("EOF after a partial record must be rejected")
-            };
-            assert!(
-                error
-                    .to_string()
-                    .contains("Incomplete PTY child startup status"),
-                "unexpected error: {error:#}"
-            );
-        }
 
         #[cfg(target_os = "linux")]
         #[test]
@@ -1956,6 +1339,9 @@ mod tests {
             error.to_string().contains("Invalid PTY working directory"),
             "unexpected error: {error:#}"
         );
+        assert!(error
+            .downcast_ref::<jterm_core::native_pty_launch::PtyLaunchError>()
+            .is_some_and(jterm_core::native_pty_launch::PtyLaunchError::failed_working_directory));
     }
 
     #[cfg(unix)]
