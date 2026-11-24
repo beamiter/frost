@@ -12546,6 +12546,9 @@ impl TerminalState {
                     .discard_top_rows_for_resize(top_remove, active_blank_cell);
                 self.cursor_row -= top_remove;
                 self.saved_cursor_row = self.saved_cursor_row.saturating_sub(top_remove);
+                if let Some(saved) = self.saved_cursor.as_mut() {
+                    saved.row = saved.row.saturating_sub(top_remove);
+                }
             }
             // Those pushes can evict the oldest scrollback rows, which only
             // *accumulates* a zone rebase. Settle it before returning: this is
@@ -16880,6 +16883,19 @@ mod tests {
 
         assert_eq!(terminal.scroll_region_top, 0);
         assert_eq!(terminal.scroll_region_bottom, 5);
+    }
+
+    #[test]
+    fn height_shrink_keeps_the_saved_prompt_origin_on_its_live_row() {
+        let mut terminal = TerminalState::new(12, 6);
+        terminal.process_input(b"one\r\ntwo\r\noutput\r\n\x1b7prompt\r\ndraft\r\nstatus");
+        terminal.on_resize(9, 4);
+        assert_eq!(terminal.scrollback.len(), 2);
+
+        terminal.process_input(b"\x1b8\x1b[Jrepaint");
+        assert_eq!(terminal.grid[0][0].character, 'o');
+        assert_eq!(terminal.grid[1][0].character, 'r');
+        assert_eq!(terminal.grid[2][0].character, ' ');
     }
 
     #[test]
