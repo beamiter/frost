@@ -2,6 +2,7 @@
 //! shared-storage migration. Keep its storage/mutation algorithms independent
 //! of the engine; only names and the test-local ID allocator differ.
 use super::*;
+use jterm_engine::grid::RegionWrapPolicy;
 use std::cell::Cell;
 use std::collections::HashMap;
 
