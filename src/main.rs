@@ -47,6 +47,8 @@ mod history_picker;
 mod image_drop;
 mod immersive_command;
 mod inspector_layout;
+#[cfg(target_os = "linux")]
+mod notebook;
 use jterm_core::jterm_remote_client as jwm_remote_session;
 mod keybindings;
 mod kitty_graphics;
@@ -3128,6 +3130,8 @@ enum SidebarPanel {
 enum SidebarMenuAction {
     OpenDirectory,
     Preview,
+    #[cfg(target_os = "linux")]
+    OpenNotebook,
     NewFile,
     NewFolder,
     Rename,
@@ -3143,6 +3147,8 @@ fn sidebar_menu_action_label(action: SidebarMenuAction, multi: usize) -> String 
     match action {
         SidebarMenuAction::OpenDirectory => "Open Folder".to_string(),
         SidebarMenuAction::Preview => "Preview file".to_string(),
+        #[cfg(target_os = "linux")]
+        SidebarMenuAction::OpenNotebook => "Open Notebook".to_string(),
         SidebarMenuAction::NewFile => "New File".to_string(),
         SidebarMenuAction::NewFolder => "New Folder".to_string(),
         SidebarMenuAction::Rename => "Rename".to_string(),
@@ -4674,6 +4680,12 @@ enum Message {
     ReferenceInspectorToggle,
     FilePreviewLoaded(usize, u64, Result<file_preview::Preview, String>),
     FilePreviewAction(u64, file_preview::Action),
+    #[cfg(target_os = "linux")]
+    NotebookLoaded(notebook::PageId, Result<notebook::Snapshot, String>),
+    #[cfg(target_os = "linux")]
+    NotebookAction(notebook::PageId, notebook::Action),
+    #[cfg(target_os = "linux")]
+    NotebookTick,
     ReferenceNavigationToggle,
     ReferenceNavigationClose,
     SidebarResize(sidebar_resize::Side, sidebar_resize::Action),
@@ -9238,6 +9250,18 @@ impl Frost {
                 .unwrap_or_else(|| menu.path.clone())
         };
         match action {
+            #[cfg(target_os = "linux")]
+            SidebarMenuAction::OpenNotebook => {
+                if !menu.is_dir
+                    && menu.targets.len() == 1
+                    && !self.sidebar.location.is_remote()
+                    && notebook::is_path(&menu.path)
+                {
+                    self.open_files_notebook(&menu.path)
+                } else {
+                    Task::none()
+                }
+            }
             SidebarMenuAction::Preview => {
                 if !menu.is_dir && menu.targets.len() == 1 && !self.sidebar.location.is_remote() {
                     self.preview_file_tree_path(&menu.path)
@@ -9564,20 +9588,23 @@ impl Frost {
 
     fn sidebar_menu_action_list(
         &self,
+        path: &std::path::Path,
         targets_len: usize,
         is_dir: bool,
     ) -> Vec<(SidebarMenuAction, bool, String)> {
         let paste_available = self.sidebar_clipboard.is_some();
-        let preview = SidebarMenuAction::Preview;
-        let preview =
-            (targets_len == 1 && !is_dir && !self.sidebar.location.is_remote()).then(|| {
-                (
-                    preview,
-                    true,
-                    sidebar_menu_action_label(preview, targets_len),
-                )
-            });
-        preview
+        #[cfg(not(target_os = "linux"))]
+        let _ = path;
+        let mut local_actions = Vec::new();
+        if targets_len == 1 && !is_dir && !self.sidebar.location.is_remote() {
+            let available = |action| (action, true, sidebar_menu_action_label(action, targets_len));
+            #[cfg(target_os = "linux")]
+            if notebook::is_path(path) {
+                local_actions.push(available(SidebarMenuAction::OpenNotebook));
+            }
+            local_actions.push(available(SidebarMenuAction::Preview));
+        }
+        local_actions
             .into_iter()
             .chain(
                 sidebar::files_menu_action_enabled(targets_len, is_dir, paste_available)
@@ -9613,7 +9640,7 @@ impl Frost {
         targets: Vec<(std::path::PathBuf, bool)>,
         generation: u64,
     ) -> SidebarMenuState {
-        let actions = self.sidebar_menu_action_list(targets.len(), is_dir);
+        let actions = self.sidebar_menu_action_list(&path, targets.len(), is_dir);
         let enabled: Vec<bool> = actions.iter().map(|(_, on, _)| *on).collect();
         // A press into Files can arrive before the first tracked pointer move.
         let inspector_left = self.win_size.width - self.reference_inspector_width();
@@ -9682,7 +9709,7 @@ impl Frost {
         let Some(menu) = self.sidebar_menu.as_ref() else {
             return Task::none();
         };
-        let actions = self.sidebar_menu_action_list(menu.targets.len(), menu.is_dir);
+        let actions = self.sidebar_menu_action_list(&menu.path, menu.targets.len(), menu.is_dir);
         let enabled: Vec<bool> = actions.iter().map(|(_, on, _)| *on).collect();
         let cursor = menu.cursor;
         match key {
@@ -17544,6 +17571,20 @@ impl Frost {
             Message::FilePreviewLoaded(session_id, token, result) => {
                 return self.file_preview_loaded(session_id, token, result);
             }
+            #[cfg(target_os = "linux")]
+            Message::NotebookLoaded(id, result) => {
+                let active = self.sessions.get(self.active).map(|session| session.id);
+                self.file_preview.notebook.complete(active, id, result);
+            }
+            #[cfg(target_os = "linux")]
+            Message::NotebookAction(id, action) => {
+                let active = self.sessions.get(self.active).map(|session| session.id);
+                return self.file_preview.notebook.update(active, id, action);
+            }
+            #[cfg(target_os = "linux")]
+            Message::NotebookTick => {
+                self.file_preview.notebook.poll();
+            }
             Message::ReferenceInspectorToggle => {
                 self.file_preview.close();
                 self.finish_sidebar_resize();
@@ -23654,7 +23695,7 @@ impl Frost {
             }
             None => "Paste".to_string(),
         };
-        let actions = self.sidebar_menu_action_list(multi, state.is_dir);
+        let actions = self.sidebar_menu_action_list(&state.path, multi, state.is_dir);
         let action_rows = actions.len();
         for (index, (action, enabled, label)) in actions.into_iter().enumerate() {
             let label = if action == SidebarMenuAction::Paste {
@@ -34719,6 +34760,13 @@ impl Frost {
             .iter()
             .map(|session| pty_subscription(session.pty_subscription_key()))
             .collect();
+        #[cfg(target_os = "linux")]
+        if self.file_preview.notebook.has_jobs() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(50))
+                    .map(|_| Message::NotebookTick),
+            );
+        }
         if self.has_desktop_agent_sessions() {
             subs.push(
                 iced::time::every(std::time::Duration::from_millis(250))

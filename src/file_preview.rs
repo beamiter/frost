@@ -240,6 +240,25 @@ impl ReadTarget {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn read_tree_notebook(path: &Path) -> Result<String, String> {
+    use jterm_core::notebook::MAX_LOCAL_NOTEBOOK_BYTES;
+    let target = ReadTarget::tree_file(path)?;
+    let file = open_regular(&target.base, &target.relative).map_err(|error| error.message)?;
+    let limit = MAX_LOCAL_NOTEBOOK_BYTES as u64;
+    if file.metadata().map_err(|error| error.to_string())?.len() > limit {
+        return Err("Notebook exceeds 1 MiB".into());
+    }
+    let mut source = String::new();
+    file.take(limit + 1)
+        .read_to_string(&mut source)
+        .map_err(|error| error.to_string())?;
+    if source.len() > MAX_LOCAL_NOTEBOOK_BYTES {
+        return Err("Notebook exceeds 1 MiB".into());
+    }
+    Ok(source)
+}
+
 #[cfg(test)]
 pub(crate) fn load(path: &str, cwd: &Path) -> Result<Preview, String> {
     ReadTarget::reference(path, cwd)?.load()
@@ -473,10 +492,16 @@ pub(crate) struct Panel {
     page: Option<Page>,
     reader: Option<(usize, u64)>,
     next_token: u64,
+    #[cfg(target_os = "linux")]
+    pub(crate) notebook: crate::notebook::Panel,
 }
 
 impl Panel {
     pub(crate) fn is_visible_for(&self, active: Option<usize>) -> bool {
+        #[cfg(target_os = "linux")]
+        if self.notebook.visible_for(active) {
+            return true;
+        }
         self.page
             .as_ref()
             .is_some_and(|page| Some(page.session) == active)
@@ -500,6 +525,8 @@ impl Panel {
     pub(crate) fn close(&mut self) {
         // The reading slot remains occupied until its blocking task returns.
         self.page = None;
+        #[cfg(target_os = "linux")]
+        self.notebook.close();
     }
 }
 
@@ -577,6 +604,31 @@ impl Frost {
         self.present_file_preview(session.id, ReadTarget::tree_file(path), false)
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_files_notebook(&mut self, path: &Path) -> Task<Message> {
+        let Some(session) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let id = match self.file_preview.notebook.open(session.id) {
+            Ok(id) => id,
+            Err(error) => {
+                self.push_toast(error, ToastKind::Warning);
+                return Task::none();
+            }
+        };
+        self.file_preview.page = None;
+        self.show_file_inspector();
+        let path = path.to_owned();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || crate::notebook::Snapshot::load(&path))
+                    .await
+                    .unwrap_or_else(|_| Err("Notebook reader stopped".into()))
+            },
+            move |result| Message::NotebookLoaded(id, result),
+        )
+    }
+
     fn present_file_preview(
         &mut self,
         session_id: usize,
@@ -593,6 +645,8 @@ impl Frost {
         let Some(token) = self.file_preview.next_token.checked_add(1) else {
             return Task::none();
         };
+        #[cfg(target_os = "linux")]
+        self.file_preview.notebook.close();
         self.file_preview.next_token = token;
         self.file_preview.page = Some(Page {
             session: session_id,
@@ -617,17 +671,21 @@ impl Frost {
             viewport_height: (self.win_size.height - 240.0).max(80.0),
             zoom: ImageZoom::Fit,
         });
+        self.show_file_inspector();
+        if confirm {
+            Task::none()
+        } else {
+            self.start_file_preview_read()
+        }
+    }
+
+    fn show_file_inspector(&mut self) {
         self.reference_inspector_tab = InspectorTab::Files;
         self.reference_navigation_drawer = false;
         self.reference_inspector_open = true;
         self.reference_inspector_drawer = true;
         self.sidebar_files_focused = false;
         self.sync_reference_inspector_geometry();
-        if confirm {
-            Task::none()
-        } else {
-            self.start_file_preview_read()
-        }
     }
 
     fn start_file_preview_read(&mut self) -> Task<Message> {
@@ -831,6 +889,10 @@ impl Frost {
 
     pub(crate) fn file_preview_view(&self) -> Element<'_, Message> {
         let active = self.sessions.get(self.active).map(|session| session.id);
+        #[cfg(target_os = "linux")]
+        if let Some(notebook) = self.file_preview.notebook.view(active) {
+            return notebook;
+        }
         let Some(page) = self
             .file_preview
             .page
@@ -1155,6 +1217,22 @@ mod tests {
         assert!(!accepts_request(None, (1, 2), Some(1)));
         assert!(!accepts_request(Some((1, 2)), (1, 2), Some(2)));
         assert!(!accepts_request(Some((1, 2)), (2, 2), Some(2)));
+    }
+
+    #[test]
+    fn notebook_reads_a_selected_regular_file_and_rejects_a_redirect_or_over_limit_file() {
+        let fixture = Fixture::new();
+        let note = fixture.0.join("selected.jtnb.md");
+        std::fs::write(&note, "Notebook data\n").unwrap();
+        assert_eq!(read_tree_notebook(&note).unwrap(), "Notebook data\n");
+        let redirect = fixture.0.join("alias.jtnb.md");
+        symlink(&note, &redirect).unwrap();
+        assert!(read_tree_notebook(&redirect).is_err());
+        std::fs::File::create(&note)
+            .unwrap()
+            .set_len(jterm_core::notebook::MAX_LOCAL_NOTEBOOK_BYTES as u64 + 1)
+            .unwrap();
+        assert!(read_tree_notebook(&note).is_err());
     }
     #[test]
     fn stale_completion_cannot_release_a_different_read_or_reopen_a_closed_preview() {
