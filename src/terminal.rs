@@ -2468,6 +2468,7 @@ const MAX_PENDING_COMPLETED_COMMANDS: usize = 32;
 const MAX_CONSUMED_EXECUTION_IDS: usize = 256;
 /// Decoded byte ceiling for an OSC 7 working directory. The same 4 KiB the
 /// OSC 133 `cwd` param uses, which is also Linux's own pathname limit.
+#[cfg(test)]
 const MAX_OSC7_CWD_BYTES: usize = jterm_core::execution_journal::MAX_CWD_BYTES;
 /// Bound on retained finalized OSC 133 zones; the push path and the
 /// undo-clear restore both evict the oldest beyond it.
@@ -6202,67 +6203,12 @@ impl TerminalState {
     /// the file-tree sidebar and the cwd a split inherits, so without it a shell
     /// on the far side of ssh could point the sidebar at any local directory it
     /// named — and the session snapshot would restore the next launch there.
-    /// Ported from ember `src/terminal/state.rs::decode_osc7_cwd`.
     fn decode_osc7_cwd(value: &str) -> Option<String> {
-        let path_part = if let Some(rest) = value.strip_prefix("file://") {
-            let slash = rest.find('/')?;
-            if !Self::osc7_host_is_local(&rest[..slash]) {
-                return None;
-            }
-            &rest[slash..]
-        } else if value.starts_with('/') {
-            value
-        } else {
-            // A relative path has no anchor here — the shell's idea of "here" is
-            // exactly what this sequence was supposed to tell us.
-            return None;
-        };
-
-        // Percent-decode by hand: the alphabet is three characters wide and a
-        // url crate is not worth linking for it.
-        //
-        // Bounded to the same ceiling the OSC 133 `cwd` param already had. The
-        // OSC 133 path beside this one was capped while this one was not, even
-        // though this value is the wider liability: it is retained for the
-        // life of the pane, cloned into every command zone that has no `cwd`
-        // of its own, written into the session snapshot, and inherited by
-        // every split — so an unbounded one is paid for repeatedly rather than
-        // once. A path this long cannot name a real directory either: Linux
-        // caps a pathname at 4096 bytes.
-        let bytes = path_part.as_bytes();
-        if bytes.len() > MAX_OSC7_CWD_BYTES.saturating_mul(3) {
-            return None;
-        }
-        let mut out = Vec::with_capacity(bytes.len().min(MAX_OSC7_CWD_BYTES));
-        let mut i = 0;
-        while i < bytes.len() {
-            if out.len() >= MAX_OSC7_CWD_BYTES {
-                return None;
-            }
-            if bytes[i] == b'%' && i + 2 < bytes.len() {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
-                out.push(u8::from_str_radix(hex, 16).ok()?);
-                i += 3;
-            } else {
-                out.push(bytes[i]);
-                i += 1;
-            }
-        }
-        let decoded = String::from_utf8(out).ok()?;
-        // A decoded path with an interior NUL cannot be opened and would be
-        // truncated by any C API it reached, so reject it rather than store it.
-        // Visual spoofing and other controls are the same class of authority
-        // confusion for the sidebar and inherited splits.
-        if decoded.is_empty()
-            || decoded.contains('\0')
-            || decoded.chars().any(|character| {
-                character.is_control()
-                    || jterm_core::review_input::is_visual_spoofing_character(character)
-            })
-        {
-            return None;
-        }
-        Some(decoded)
+        jterm_engine::shell_markers::decode_osc7_cwd(
+            value,
+            Self::osc7_host_is_local,
+            jterm_core::review_input::is_visual_spoofing_character,
+        )
     }
 
     fn osc7_host_is_local(host: &str) -> bool {
@@ -7363,7 +7309,8 @@ impl TerminalState {
                             self.output_buffer.extend(bytes);
                         }
                         Effect::GlobalBackground(color) => self.global_bg = color,
-                        Effect::Row(_) | Effect::CursorReposition { .. } | Effect::Bell => {
+                        Effect::Row(mutation) => self.mark_row_dirty(mutation.row),
+                        Effect::CursorReposition { .. } | Effect::Bell => {
                             unreachable!("Frost local CSI produced an unexpected effect")
                         }
                     }
@@ -7418,108 +7365,18 @@ impl TerminalState {
                 3 => self.erase_saved_lines(),
                 _ => {}
             },
-            'K' => {
-                let cols = self.screen.grid.row_len();
-                let span = match params.first().copied().unwrap_or(0) {
-                    0 => self.screen.cursor_col..cols,
-                    1 => 0..self.screen.cursor_col + 1,
-                    2 => 0..cols,
-                    _ => return,
-                };
-                let blank = self.create_blank_cell();
-                self.screen
-                    .grid
-                    .erase_cells(self.screen.cursor_row, span, blank);
-                self.mark_row_dirty(self.screen.cursor_row);
-            }
             'L' | 'M' => {
                 let direction = if cmd == 'L' {
                     RegionDirection::Down
                 } else {
                     RegionDirection::Up
                 };
-                let cursor = self.screen.cursor_row;
-                let bottom = self.screen.scroll_region_bottom;
-                if (self.screen.scroll_region_top..=bottom).contains(&cursor) {
-                    let blank = self.create_blank_cell();
-                    let count = (params.first().copied().unwrap_or(1).max(1) as usize)
-                        .min(bottom - cursor + 1);
-                    // Frost allocates each row at its original iteration step,
-                    // keeping physical wrap flags and the grid revision cadence.
-                    for _ in 0..count {
-                        self.screen.grid.shift_rows(
-                            direction,
-                            cursor..=bottom,
-                            1,
-                            blank,
-                            RegionWrapPolicy::KeepPhysicalIndices,
-                            RawRowId::allocate_process_unique,
-                        );
-                    }
-                }
-                self.mark_rows_dirty(cursor, bottom);
-            }
-            's' => {
-                if private_prefix.is_none() && intermediates.is_empty() {
-                    self.save_cursor();
-                }
-            }
-            'u' => {
-                if intermediates.is_empty() {
-                    match private_prefix {
-                        None => {
-                            self.restore_cursor();
-                        }
-                        Some(b'?') => {
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] query current kitty flags -> {}",
-                                self.protocol.keyboard_enhancement_flags()
-                            );
-                            let response =
-                                format!("\x1b[?{}u", self.protocol.keyboard_enhancement_flags());
-                            self.output_buffer.extend_from_slice(response.as_bytes());
-                        }
-                        Some(b'=') => {
-                            let flags = params.first().copied().unwrap_or(0);
-                            let mode = params.get(1).copied().unwrap_or(1);
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] set kitty flags flags={} mode={} previous={}",
-                                flags,
-                                mode,
-                                self.protocol.keyboard_enhancement_flags()
-                            );
-                            self.protocol.set_keyboard_enhancement_flags(flags, mode);
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] new kitty flags={}",
-                                self.protocol.keyboard_enhancement_flags()
-                            );
-                        }
-                        Some(b'>') => {
-                            let flags = params.first().copied().unwrap_or(0);
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] push kitty flags current={} new={}",
-                                self.protocol.keyboard_enhancement_flags(),
-                                flags
-                            );
-                            self.protocol.push_keyboard_enhancement_flags(flags);
-                        }
-                        Some(b'<') => {
-                            let count = params.first().copied().unwrap_or(1) as usize;
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] pop kitty flags count={} current={} stack_depth={}",
-                                count,
-                                self.protocol.keyboard_enhancement_flags(),
-                                self.protocol.keyboard_enhancement_stack().len()
-                            );
-                            self.protocol.pop_keyboard_enhancement_flags(count);
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] new kitty flags={}",
-                                self.protocol.keyboard_enhancement_flags()
-                            );
-                        }
-                        _ => {}
-                    }
-                }
+                let damage = jterm_engine::semantics::frost_legacy_splice_lines(
+                    &mut self.screen,
+                    direction,
+                    count,
+                );
+                self.mark_rows_dirty(*damage.start(), *damage.end());
             }
             'S' => {
                 // Scroll up (Scroll Up, SU) - content moves up, new lines appear at bottom
@@ -7589,32 +7446,6 @@ impl TerminalState {
                 for &mode in params {
                     self.reset_mode(mode, private);
                 }
-            }
-            '@' => {
-                let count = params.first().copied().unwrap_or(1).max(1) as usize;
-                self.shift_cells_right(self.screen.cursor_row, self.screen.cursor_col, count);
-            }
-            'P' => {
-                let count = params.first().copied().unwrap_or(1).max(1) as usize;
-                let blank = self.create_blank_cell();
-                self.screen.grid.delete_cells(
-                    self.screen.cursor_row,
-                    self.screen.cursor_col,
-                    count,
-                    blank,
-                    WideCellEditPolicy::ClearBoundaryPairs,
-                );
-                self.mark_row_dirty(self.screen.cursor_row);
-            }
-            'X' => {
-                let count = params.first().copied().unwrap_or(1).max(1) as usize;
-                let blank = self.create_blank_cell();
-                self.screen.grid.erase_cells(
-                    self.screen.cursor_row,
-                    self.screen.cursor_col..self.screen.cursor_col.saturating_add(count),
-                    blank,
-                );
-                self.mark_row_dirty(self.screen.cursor_row);
             }
             'q' if private_prefix == Some(b'>')
                 && intermediates.is_empty()
