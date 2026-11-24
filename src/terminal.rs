@@ -6167,49 +6167,6 @@ impl TerminalState {
             })
     }
 
-    fn decrqm_private_mode_state(&self, mode: u16) -> u8 {
-        match mode {
-            6 => {
-                if self.screen.origin_mode {
-                    1
-                } else {
-                    2
-                }
-            }
-            1 | 7 | 25 | 47 | 66 | 1000..=1006 | 1015 | 1047..=1049 | 2004 | 2026 | 2031 | 5522 => {
-                if self.protocol.modes().contains(&mode) {
-                    1
-                } else {
-                    2
-                }
-            }
-            _ => 0,
-        }
-    }
-
-    /// DECRQM state of an ANSI (non-private) mode: IRM is the only one
-    /// frost switches; LNM is answered as permanently reset (4) because a
-    /// line feed here never implies a carriage return.
-    fn decrqm_ansi_mode_state(&self, mode: u16) -> u8 {
-        match mode {
-            4 => {
-                if self.screen.insert_mode {
-                    1
-                } else {
-                    2
-                }
-            }
-            20 => 4,
-            _ => 0,
-        }
-    }
-
-    fn report_private_mode_status(&mut self, mode: u16) {
-        let state = self.decrqm_private_mode_state(mode);
-        let response = format!("\x1b[?{};{}$y", mode, state);
-        self.output_buffer.extend_from_slice(response.as_bytes());
-    }
-
     /// The cwd the child last reported through OSC 7, if any.
     pub fn current_working_dir(&self) -> Option<&str> {
         self.current_working_dir.as_deref()
@@ -7365,68 +7322,63 @@ impl TerminalState {
         intermediates: &[u8],
     ) {
         let first = params.first().copied();
+        if private_prefix == Some(b'>') && intermediates.is_empty() && first == Some(4) {
+            match cmd {
+                'f' => {
+                    crate::debug_log!(
+                        "[XTFMTKEYS] formatOtherKeys={} previous={}",
+                        params.get(1).copied().unwrap_or(0),
+                        self.protocol.xterm_format_other_keys()
+                    );
+                }
+                'm' => {
+                    crate::debug_log!(
+                        "[XTMODKEYS] modifyOtherKeys={} previous={}",
+                        params.get(1).copied().unwrap_or(0),
+                        self.protocol.xterm_modify_other_keys()
+                    );
+                }
+                _ => {}
+            }
+        }
+        if cmd.is_ascii() {
+            use jterm_engine::semantics::{dispatch_frost_legacy_csi, Dispatch, Effect};
+            if let Dispatch::Handled(effects) = dispatch_frost_legacy_csi(
+                &mut self.screen,
+                &mut self.protocol,
+                raw_params,
+                params,
+                cmd as u8,
+                private_prefix,
+                intermediates,
+            ) {
+                for effect in effects {
+                    match effect {
+                        Effect::Reply(bytes) => {
+                            if cmd == 'c' {
+                                crate::debug_log!(
+                                    "[DA] device attributes request prefix={private_prefix:?}"
+                                );
+                            }
+                            self.output_buffer.extend(bytes);
+                        }
+                        Effect::GlobalBackground(color) => self.global_bg = color,
+                        Effect::Row(_) | Effect::CursorReposition { .. } | Effect::Bell => {
+                            unreachable!("Frost local CSI produced an unexpected effect")
+                        }
+                    }
+                }
+                return;
+            }
+        }
         let count = first.unwrap_or(1).max(1) as usize;
         match cmd {
-            'A' => self.screen.cursor_controls().move_up(count),
-            'B' => self.screen.cursor_controls().move_down(count),
-            'C' => self.screen.cursor_controls().move_forward(count),
-            'D' => self.screen.cursor_controls().move_backward(count),
-            'E' => {
-                let mut cursor = self.screen.cursor_controls();
-                cursor.move_down(count);
-                cursor.set_column(1);
-            }
-            'F' => {
-                let mut cursor = self.screen.cursor_controls();
-                cursor.move_up(count);
-                cursor.set_column(1);
-            }
-            'G' | '`' => self
-                .screen
-                .cursor_controls()
-                .set_column(first.unwrap_or(1) as usize),
-            'd' => self
-                .screen
-                .cursor_controls()
-                .set_row(first.unwrap_or(1) as usize),
-            'I' => self.screen.cursor_controls().tab_forward(count),
-            'Z' => self.screen.cursor_controls().tab_backward(count),
             'b' => {
                 // REP - repeat the last printed character n times.
                 if let Some(ch) = self.screen.last_printed_char {
                     for _ in 0..count {
                         self.put_char(ch, false);
                     }
-                }
-            }
-            'g' => match first.unwrap_or(0) {
-                0 => self.screen.cursor_controls().set_tab_stop(false),
-                3 => self.screen.cursor_controls().clear_all_tab_stops(),
-                _ => {}
-            },
-            'H' => {
-                let row = first.unwrap_or(1) as usize;
-                let col = params.get(1).copied().unwrap_or(1) as usize;
-                self.screen.cursor_controls().set_position(row, col);
-            }
-            'f' => {
-                if private_prefix == Some(b'>') && intermediates.is_empty() {
-                    // Frost's legacy CSI f dispatch clears wrap even for XTFMTKEYS.
-                    self.screen.pending_wrap = false;
-                    let resource = first.unwrap_or(0);
-                    let value = params.get(1).copied().unwrap_or(0);
-                    if resource == 4 {
-                        crate::debug_log!(
-                            "[XTFMTKEYS] formatOtherKeys={} previous={}",
-                            value,
-                            self.protocol.xterm_format_other_keys()
-                        );
-                        self.protocol.set_xterm_format_other_keys(value);
-                    }
-                } else {
-                    let row = first.unwrap_or(1) as usize;
-                    let col = params.get(1).copied().unwrap_or(1) as usize;
-                    self.screen.cursor_controls().set_position(row, col);
                 }
             }
             'J' => match params.first().copied().unwrap_or(0) {
@@ -7506,30 +7458,6 @@ impl TerminalState {
                     }
                 }
                 self.mark_rows_dirty(cursor, bottom);
-            }
-            'm' => {
-                if private_prefix == Some(b'>') && intermediates.is_empty() {
-                    let resource = params.first().copied().unwrap_or(0);
-                    let value = params.get(1).copied().unwrap_or(0);
-                    if resource == 4 {
-                        crate::debug_log!(
-                            "[XTMODKEYS] modifyOtherKeys={} previous={}",
-                            value,
-                            self.protocol.xterm_modify_other_keys()
-                        );
-                        self.protocol.set_xterm_modify_other_keys(value);
-                    }
-                } else {
-                    // SGR - Select Graphic Rendition
-                    if let Some(color) = jterm_engine::semantics::frost_legacy_sgr(
-                        raw_params,
-                        &mut self.screen.current_fg,
-                        &mut self.screen.current_bg,
-                        &mut self.screen.current_flags,
-                    ) {
-                        self.global_bg = color;
-                    }
-                }
             }
             's' => {
                 if private_prefix.is_none() && intermediates.is_empty() {
@@ -7633,81 +7561,18 @@ impl TerminalState {
                     self.handle_window_ops(params);
                 }
             }
-            'n' if private_prefix == Some(b'?') && intermediates.is_empty() => {
-                // DEC-private DSR.
-                match params.first().copied().unwrap_or(0) {
-                    6 => {
-                        // DECXCPR: the same position as CPR, but the reply
-                        // keeps the `?` so it cannot be mistaken for a
-                        // modified F3 key (`CSI 1 ; Pm R`).
-                        self.output_buffer.extend(
-                            jterm_engine::semantics::frost_legacy_cursor_position_reply(
-                                self.screen.cursor_row,
-                                self.screen.cursor_col,
-                                true,
-                            ),
-                        );
-                    }
-                    996 => {
-                        // Colour-scheme query (the report mode 2031 sends
-                        // unprompted): 1 = dark, 2 = light, judged from the
-                        // background actually painted behind default cells.
-                        let scheme = if self.default_background_is_dark() {
-                            1
-                        } else {
-                            2
-                        };
-                        let response = format!("\x1b[?997;{}n", scheme);
-                        self.output_buffer.extend(response.as_bytes());
-                    }
-                    _ => {}
-                }
-            }
-            'n' if private_prefix.is_none() && intermediates.is_empty() => {
-                // DSR - Device Status Report
-                match params.first().copied().unwrap_or(0) {
-                    5 => {
-                        // Report device OK: CSI 0 n
-                        self.output_buffer.extend_from_slice(b"\x1b[0n");
-                    }
-                    6 => {
-                        // CPR - Cursor Position Report: CSI row ; col R (1-indexed)
-                        self.output_buffer.extend(
-                            jterm_engine::semantics::frost_legacy_cursor_position_reply(
-                                self.screen.cursor_row,
-                                self.screen.cursor_col,
-                                false,
-                            ),
-                        );
-                    }
-                    _ => {}
-                }
-            }
-            'c' => {
-                if let Some(reply) = jterm_engine::semantics::legacy_device_attributes_reply(
-                    private_prefix,
-                    intermediates,
-                ) {
-                    crate::debug_log!("[DA] device attributes request prefix={private_prefix:?}");
-                    self.output_buffer.extend_from_slice(reply);
-                }
-            }
-            'p' => {
-                if intermediates == *b"!" && private_prefix.is_none() {
-                    // DECSTR (CSI ! p) - soft terminal reset.
-                    self.soft_reset();
-                } else if private_prefix == Some(b'?') && intermediates == *b"$" {
-                    for &mode in params {
-                        self.report_private_mode_status(mode);
-                    }
-                } else if private_prefix.is_none() && intermediates == *b"$" {
-                    // DECRQM for ANSI modes: `CSI Pa ; Ps $ y`, no `?`.
-                    for &mode in params {
-                        let state = self.decrqm_ansi_mode_state(mode);
-                        let response = format!("\x1b[{};{}$y", mode, state);
-                        self.output_buffer.extend_from_slice(response.as_bytes());
-                    }
-                }
+            'n' if private_prefix == Some(b'?')
+                && intermediates.is_empty()
+                && first == Some(996) =>
+            {
+                // The actual default background is a host paint property.
+                let scheme = if self.default_background_is_dark() {
+                    1
+                } else {
+                    2
+                };
+                let response = format!("\x1b[?997;{scheme}n");
+                self.output_buffer.extend(response.as_bytes());
             }
             'h' => {
                 // Set mode: DECSET (CSI ? Pn h) vs ANSI SM (CSI Pn h). The two
@@ -7724,26 +7589,6 @@ impl TerminalState {
                 for &mode in params {
                     self.reset_mode(mode, private);
                 }
-            }
-            'r' if private_prefix.is_none() && intermediates.is_empty() => {
-                // Set scroll region (DECSTBM). A private prefix makes this
-                // XTRESTORE (`CSI ? Pm r`, the counterpart of the XTSAVE the
-                // 's' arm below already guards), and an intermediate makes it
-                // DECCARA (`CSI Pm $ r`). Executing either as DECSTBM sets a
-                // scroll region from a mode number: restoring 1049 clamps to
-                // the bottom row, every line feed then scrolls inside that one
-                // row, and the screen looks frozen.
-                let top = first.unwrap_or(1).max(1) as usize;
-                let bottom = match params
-                    .get(1)
-                    .copied()
-                    .unwrap_or(self.screen.grid.rows() as u16)
-                {
-                    0 => self.screen.grid.rows(),
-                    v => v as usize,
-                };
-
-                self.screen.cursor_controls().set_scroll_region(top, bottom);
             }
             '@' => {
                 let count = params.first().copied().unwrap_or(1).max(1) as usize;
@@ -7771,25 +7616,12 @@ impl TerminalState {
                 );
                 self.mark_row_dirty(self.screen.cursor_row);
             }
-            'q' => {
-                if private_prefix == Some(b'>')
-                    && intermediates.is_empty()
-                    && params.first().copied().unwrap_or(0) == 0
-                {
-                    crate::debug_log!("[XTVERSION] report terminal version request");
-                    self.output_buffer.extend_from_slice(XTERM_VERSION_RESPONSE);
-                }
-
-                // DECSCUSR - Set cursor style
-                if private_prefix.is_none() && intermediates == *b" " {
-                    let shape = params.first().copied().unwrap_or(0) as u8;
-                    self.screen.cursor_shape = match shape {
-                        0..=2 => CursorShape::Block,
-                        3 | 4 => CursorShape::Underline,
-                        5 | 6 => CursorShape::Beam,
-                        _ => CursorShape::Block,
-                    };
-                }
+            'q' if private_prefix == Some(b'>')
+                && intermediates.is_empty()
+                && first.unwrap_or(0) == 0 =>
+            {
+                crate::debug_log!("[XTVERSION] report terminal version request");
+                self.output_buffer.extend_from_slice(XTERM_VERSION_RESPONSE);
             }
             _ => {}
         }
@@ -7893,29 +7725,6 @@ impl TerminalState {
         self.kitty_graphics.clear();
         self.parser.reset();
         self.clear_screen();
-    }
-
-    /// DECSTR (CSI ! p): soft terminal reset. Unlike RIS this does NOT clear the
-    /// screen or scrollback; it resets modes, margins, SGR, charsets and the
-    /// saved cursor to their power-on defaults.
-    fn soft_reset(&mut self) {
-        self.screen.current_fg = Color::Default;
-        self.screen.current_bg = Color::Default;
-        self.global_bg = Color::Default;
-        self.screen.current_flags = StyleFlags::default();
-        self.screen.g0_charset = Charset::Ascii;
-        self.screen.g1_charset = Charset::Ascii;
-        self.screen.active_charset = Charset::Ascii;
-        self.screen.scroll_region_top = 0;
-        self.screen.scroll_region_bottom = self.screen.grid.rows().saturating_sub(1);
-        self.screen.saved_state = None;
-        // Reset the modes DECSTR is defined to touch: DECOM (6) off, IRM (4) off,
-        // DECTCEM (25) on, DECAWM (7) on. Leave everything else as-is.
-        self.screen.origin_mode = false;
-        self.screen.insert_mode = false;
-        self.protocol.modes_mut().insert(25);
-        self.protocol.modes_mut().insert(7);
-        self.screen.pending_wrap = false;
     }
 
     fn clear_screen(&mut self) {
