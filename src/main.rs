@@ -41556,13 +41556,19 @@ mod tests {
         last[0].character = 'Z';
         terminal
             .scrollback
-            .push_back(terminal::ScrollbackLine::compress_frost_legacy(&first, false));
+            .push_back(terminal::ScrollbackLine::compress_frost_legacy(
+                &first, false,
+            ));
         terminal
             .scrollback
-            .push_back(terminal::ScrollbackLine::compress_frost_legacy(&empty, false));
+            .push_back(terminal::ScrollbackLine::compress_frost_legacy(
+                &empty, false,
+            ));
         terminal
             .scrollback
-            .push_back(terminal::ScrollbackLine::compress_frost_legacy(&last, false));
+            .push_back(terminal::ScrollbackLine::compress_frost_legacy(
+                &last, false,
+            ));
         terminal.command_zones.push_back(terminal::CommandZone {
             id: 41,
             prompt_start: 0,
