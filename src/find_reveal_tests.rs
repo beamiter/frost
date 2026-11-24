@@ -225,7 +225,7 @@ fn keyboard_target_excludes_closed_dirty_no_match_visible_and_offscreen() {
 #[test]
 fn keyboard_reveal_uses_current_target_and_changes_only_its_collapse_policy() {
     let mut fixture = search_reveal_fixture();
-    let raw = fixture.terminal.grid.to_vec();
+    let raw = fixture.terminal.screen.grid.to_vec();
     let query = fixture.search.query.clone();
     let index = fixture.search.current_match_index;
     let mut widget = FindWidget::new(target(&fixture, false), true);
@@ -245,7 +245,7 @@ fn keyboard_reveal_uses_current_target_and_changes_only_its_collapse_policy() {
     ));
     assert!(!fixture.policy.is_collapsed(target.zone_id));
     assert!(fixture.policy.is_collapsed(fixture.other_zone));
-    assert_eq!(fixture.terminal.grid.to_vec(), raw);
+    assert_eq!(fixture.terminal.screen.grid.to_vec(), raw);
     assert_eq!(fixture.search.query, query);
     assert_eq!(fixture.search.current_match_index, index);
     let revision = fixture.policy.revision();

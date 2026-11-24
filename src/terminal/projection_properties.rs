@@ -430,7 +430,7 @@ fn check_case(case: usize, limit: usize) {
             &plan,
             &selected_all(&plan),
             &terminal.scrollback,
-            &terminal.grid,
+            &terminal.screen.grid,
         );
         assert_eq!(
             copied.as_deref(),
@@ -647,11 +647,11 @@ fn check_dense_collapse_case(
     }
     let mut terminal = TerminalState::new(width, original.len());
     for (row, cells) in original.iter().enumerate() {
-        terminal.grid.set_row(row, cells.clone());
-        terminal.grid.row_wrapped_mut()[row] = wrapped[row];
+        terminal.screen.grid.set_row(row, cells.clone());
+        terminal.screen.grid.row_wrapped_mut()[row] = wrapped[row];
     }
     let ids: Vec<_> = (0..original.len())
-        .map(|row| terminal.grid.raw_row_id(row).unwrap())
+        .map(|row| terminal.screen.grid.raw_row_id(row).unwrap())
         .collect();
     assert_eq!(ids.iter().collect::<BTreeSet<_>>().len(), ids.len());
     let resolved: Vec<_> = ranges
@@ -779,7 +779,7 @@ fn check_dense_collapse_case(
                 &plan,
                 &selected_all(&plan),
                 &terminal.scrollback,
-                &terminal.grid
+                &terminal.screen.grid
             ),
             Some(String::new()),
             "{name}: all hidden"
@@ -794,7 +794,12 @@ fn check_dense_collapse_case(
                 selection.mode = mode;
                 let expected_text = dense_collapse_text(&expected, &original, a, b, mode);
                 assert_eq!(
-                    copy_projected_cells(&plan, &selection, &terminal.scrollback, &terminal.grid),
+                    copy_projected_cells(
+                        &plan,
+                        &selection,
+                        &terminal.scrollback,
+                        &terminal.screen.grid
+                    ),
                     Some(expected_text),
                     "{name}: endpoints={a:?}..{b:?} mode={mode:?}"
                 );
@@ -1201,7 +1206,7 @@ fn collapsed_prefix_selection_never_retargets_visible_suffix() {
             &plan,
             &selected_all(&plan),
             &terminal.scrollback,
-            &terminal.grid
+            &terminal.screen.grid
         ),
         Some("\nCDEFGH".to_owned())
     );
@@ -1238,18 +1243,19 @@ fn materializer_decodes_each_visible_source_once_when_rows_join() {
 fn selected_text_covers_live_wide_partial_reverse_block_and_chrome() {
     let mut terminal = TerminalState::new(8, 2);
     for (col, ch) in ['X', '中', ' ', 'Y', 'é'].into_iter().enumerate() {
-        terminal.grid.get_mut(0, col).character = ch;
+        terminal.screen.grid.get_mut(0, col).character = ch;
     }
-    terminal.grid.get_mut(0, 1).flags.set_wide(true);
+    terminal.screen.grid.get_mut(0, 1).flags.set_wide(true);
     terminal
+        .screen
         .grid
         .get_mut(0, 2)
         .flags
         .set_wide_continuation(true);
     for (col, ch) in "ABCDEFGH".chars().enumerate() {
-        terminal.grid.get_mut(1, col).character = ch;
+        terminal.screen.grid.get_mut(1, col).character = ch;
     }
-    let id = terminal.grid.raw_row_id(1).unwrap();
+    let id = terminal.screen.grid.raw_row_id(1).unwrap();
     let plan = terminal.identity_projection_plan(8).splice_native_chrome(
         &[ChromeBoundary {
             next: id,
@@ -1270,8 +1276,13 @@ fn selected_text_covers_live_wide_partial_reverse_block_and_chrome() {
         selection.active.point = end;
         selection.mode = mode;
         assert_eq!(
-            copy_projected_cells(&plan, &selection, &terminal.scrollback, &terminal.grid)
-                .as_deref(),
+            copy_projected_cells(
+                &plan,
+                &selection,
+                &terminal.scrollback,
+                &terminal.screen.grid
+            )
+            .as_deref(),
             Some(expected)
         );
     }
@@ -1349,7 +1360,7 @@ fn hidden_guard_preserves_suffix_and_trailing_blank_fallback() {
             &all_hidden,
             &selected_all(&all_hidden),
             &terminal.scrollback,
-            &terminal.grid
+            &terminal.screen.grid
         ),
         Some(String::new())
     );
@@ -1602,7 +1613,7 @@ fn seeded_partial_history_selections_match_independent_eager_text() {
                             &plan,
                             &selection,
                             &terminal.scrollback,
-                            &terminal.grid,
+                            &terminal.screen.grid,
                         )
                         .as_deref(),
                         Some(expected.as_str()),
@@ -1656,8 +1667,13 @@ fn partial_history_selection_keeps_blank_rows_and_soft_wraps_distinct() {
         selection.active.point = active;
         selection.mode = mode;
         assert_eq!(
-            copy_projected_cells(&plan, &selection, &terminal.scrollback, &terminal.grid)
-                .as_deref(),
+            copy_projected_cells(
+                &plan,
+                &selection,
+                &terminal.scrollback,
+                &terminal.screen.grid
+            )
+            .as_deref(),
             Some(expected),
             "anchor={anchor:?} active={active:?} mode={mode:?}"
         );
@@ -1743,14 +1759,14 @@ fn seeded_live_grid_raw_endpoint_copy_is_invariant_under_legal_chrome() {
                 }
                 col += 1;
             }
-            terminal.grid.set_row(row, cells.clone());
+            terminal.screen.grid.set_row(row, cells.clone());
             original.push(cells);
             let soft = row + 1 < rows && rng.pick(2) == 0;
-            terminal.grid.row_wrapped_mut()[row] = soft;
+            terminal.screen.grid.row_wrapped_mut()[row] = soft;
             wrapped.push(soft);
             let chrome_rows = 1 + rng.pick(3);
             boundaries.push(ChromeBoundary {
-                next: terminal.grid.raw_row_id(row).unwrap(),
+                next: terminal.screen.grid.raw_row_id(row).unwrap(),
                 kind: ChromeKind::Organism,
                 rows: chrome_rows,
             });
@@ -1778,7 +1794,7 @@ fn seeded_live_grid_raw_endpoint_copy_is_invariant_under_legal_chrome() {
         for (document_row, raw_row) in expected_document.iter().enumerate() {
             for (col, _) in original[0].iter().enumerate() {
                 let expected_origin = raw_row.map(|row| RawCellOrigin {
-                    row: terminal.grid.raw_row_id(row).unwrap(),
+                    row: terminal.screen.grid.raw_row_id(row).unwrap(),
                     col,
                 });
                 assert_eq!(
@@ -1804,7 +1820,7 @@ fn seeded_live_grid_raw_endpoint_copy_is_invariant_under_legal_chrome() {
                     selection.anchor.point = (document_row_for_raw[a.0], a.1);
                     selection.active.point = (document_row_for_raw[b.0], b.1);
                     selection.mode = mode;
-                    assert_eq!(copy_projected_cells(&plan, &selection, &terminal.scrollback, &terminal.grid),
+                    assert_eq!(copy_projected_cells(&plan, &selection, &terminal.scrollback, &terminal.screen.grid),
                                Some(expected.clone()),
                                "seed={LIVE_CHROME_SEED:#x} case={case} width={width} sample={sample} a={a:?} b={b:?} mode={mode:?}");
                     checked += 1;

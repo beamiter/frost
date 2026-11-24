@@ -21,7 +21,11 @@ fn zones(values: &VecDeque<CommandZone>) -> Value {
 }
 fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::new();
-    macro_rules! fields { ($($f:ident),* $(,)?) => {$(out.insert(stringify!($f).into(), lane(&t.$f));)*}; }
+    macro_rules! fields {
+        ($owner:expr; $($field:ident),* $(,)?) => {
+            $(out.insert(stringify!($field).into(), lane(&($owner).$field));)*
+        };
+    }
     out.insert("window_title".into(), lane(&t.titles.window_title));
     out.insert("icon_title".into(), lane(&t.titles.icon_title));
     out.insert("title_stack".into(), lane(&t.titles.title_stack));
@@ -49,7 +53,37 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         lane(t.saved_primary_colors.dynamic_palette),
     );
     super::replay_protocol::observe(t, &mut out, Value::String);
-    fields!(
+    fields!(t.screen;
+        use_alt_buffer,
+        cursor_row,
+        cursor_col,
+        saved_cursor_row,
+        saved_cursor_col,
+        tab_stops,
+        last_printed_char,
+        pending_wrap,
+        alt_cursor_row,
+        alt_cursor_col,
+        cursor_shape,
+        current_fg,
+        current_bg,
+        current_flags,
+        scroll_region_top,
+        scroll_region_bottom,
+        g0_charset,
+        g1_charset,
+        active_charset,
+    );
+    let link = t.screen.current_hyperlink;
+    out.insert(
+        "current_hyperlink".into(),
+        lane((!link.is_none()).then_some(link.as_raw())),
+    );
+    out.insert(
+        "saved_primary_cursor_shape".into(),
+        lane(t.screen.saved_primary_cursor_shape.unwrap_or_default()),
+    );
+    fields!(t;
         scrollback,
         selection,
         projected_selection,
@@ -61,33 +95,13 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         max_scrollback,
         inline_cli_launch_floor,
         inline_cli_command_scope,
-        use_alt_buffer,
         disable_alt_screen,
         viewport_pixel_width,
         viewport_pixel_height,
-        cursor_row,
-        cursor_col,
-        saved_cursor_row,
-        saved_cursor_col,
         saved_primary_global_bg,
-        saved_primary_cursor_shape,
-        tab_stops,
-        last_printed_char,
-        pending_wrap,
-        alt_cursor_row,
-        alt_cursor_col,
-        cursor_shape,
-        current_fg,
-        current_bg,
-        current_flags,
         current_working_dir,
         organism_idle_cwd,
         global_bg,
-        scroll_region_top,
-        scroll_region_bottom,
-        g0_charset,
-        g1_charset,
-        active_charset,
         ime_enabled,
         preedit_text,
         preedit_selection,
@@ -102,7 +116,6 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         projection_plan_cache,
         next_projected_view_revision,
         next_projection_plan_revision,
-        current_hyperlink,
         osc8_hyperlinks,
         sync_output_active,
         last_archived_screen_snapshot,
@@ -146,7 +159,7 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         current_command_truncated,
         captured_output_bytes,
     );
-    for (name, g) in [("grid", &t.grid), ("alt_grid", &t.alt_grid)] {
+    for (name, g) in [("grid", &t.screen.grid), ("alt_grid", &t.screen.alt_grid)] {
         out.insert(
             name.into(),
             lane((
@@ -160,8 +173,11 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         );
     }
     for (name, s) in [
-        ("saved_cursor", &t.saved_cursor),
-        ("saved_primary_screen_state", &t.saved_primary_screen_state),
+        ("saved_cursor", &t.screen.saved_state),
+        (
+            "saved_primary_screen_state",
+            &t.screen.saved_primary_screen_state,
+        ),
     ] {
         out.insert(
             name.into(),
@@ -248,8 +264,8 @@ fn seed(which: usize) -> ObservedSeed {
     t.max_scrollback = 8;
     // First seed only in the dedicated worker must start the global ID domain.
     if which == 0 && std::env::var_os("FROST_COLOR_ALLOCATOR_FIRST").is_some() {
-        assert_eq!(t.grid.row_ids()[0], RawRowId::new(1));
-        assert_eq!(t.alt_grid.row_ids()[0], RawRowId::new(6));
+        assert_eq!(t.screen.grid.row_ids()[0], RawRowId::new(1));
+        assert_eq!(t.screen.alt_grid.row_ids()[0], RawRowId::new(6));
         std::env::remove_var("FROST_COLOR_ALLOCATOR_FIRST");
     }
     // Actual production batches establish history, rich cells, output provenance,

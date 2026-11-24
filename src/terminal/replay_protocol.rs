@@ -19,8 +19,8 @@ pub(super) fn observe(
     .enumerate()
     {
         let enabled = match mode {
-            4 => terminal.insert_mode,
-            6 => terminal.origin_mode,
+            4 => terminal.screen.insert_mode,
+            6 => terminal.screen.origin_mode,
             _ => protocol.modes().contains(&mode),
         };
         bits |= u64::from(enabled) << index;

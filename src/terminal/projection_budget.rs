@@ -300,8 +300,8 @@ impl super::TerminalState {
                 || self.projection_selection_revision(viewport).is_some())
             && viewport.source_revision.grid == self.grid_version
             && viewport.source_revision.history == self.history_revision
-            && viewport.source_revision.row_identity == self.grid.identity_revision
-            && viewport.source_revision.alternate_screen == self.use_alt_buffer
+            && viewport.source_revision.row_identity == self.screen.grid.identity_revision
+            && viewport.source_revision.alternate_screen == self.screen.use_alt_buffer
     }
 
     /// Empty unavailable snapshots deliberately contain no live/raw cells:
@@ -330,8 +330,8 @@ impl super::TerminalState {
             source_revision: super::ProjectionSourceRevision {
                 grid: self.grid_version,
                 history: self.history_revision,
-                row_identity: self.grid.identity_revision,
-                alternate_screen: self.use_alt_buffer,
+                row_identity: self.screen.grid.identity_revision,
+                alternate_screen: self.screen.use_alt_buffer,
             },
             view_revision: 0,
             identity_fast_path: false,
@@ -380,11 +380,11 @@ impl super::TerminalState {
         let limits = Limits::current();
         let estimate = self.cached_history_estimate(cols, limits)?;
         check(
-            add(estimate.source_rows, self.grid.rows())?,
+            add(estimate.source_rows, self.screen.grid.rows())?,
             limits.source_rows,
             ProjectionResource::SourceRows,
         )?;
-        let grid_wide = self.grid.iter().try_fold(0usize, |count, row| {
+        let grid_wide = self.screen.grid.iter().try_fold(0usize, |count, row| {
             add(
                 count,
                 row.iter()
@@ -397,8 +397,8 @@ impl super::TerminalState {
             limits.wide,
             ProjectionResource::WideContinuations,
         )?;
-        let base_rows = add(estimate.rows, self.grid.rows())?;
-        let base_slices = add(estimate.slices, self.grid.rows())?;
+        let base_rows = add(estimate.rows, self.screen.grid.rows())?;
+        let base_slices = add(estimate.slices, self.screen.grid.rows())?;
         let collapses = self.resolved_collapses(policy);
         // resolved_collapses rejects every overlapping component. Disjoint
         // intervals can split existing slices only at their two endpoints;
@@ -478,7 +478,7 @@ impl super::TerminalState {
         block_mode: bool,
         policy: &super::ProjectionPolicy,
     ) -> Result<()> {
-        let key = self.projection_plan_cache_key(self.grid.cols().max(1), policy);
+        let key = self.projection_plan_cache_key(self.screen.grid.cols().max(1), policy);
         if let Some((old, grid, offset, mode, limits, result)) = &self.projection_budget_cache {
             if old == &key
                 && *grid == self.grid_version
@@ -492,13 +492,13 @@ impl super::TerminalState {
         #[cfg(test)]
         PREFLIGHT_SCANS.with(|count| count.set(count.get() + 1));
         let result = if block_mode
-            && !self.use_alt_buffer
+            && !self.screen.use_alt_buffer
             && !policy.is_identity()
             && !(policy.chat && self.chat_plan_key(policy).is_none())
         {
-            self.plan_preflight(self.grid.cols().max(1), policy)
+            self.plan_preflight(self.screen.grid.cols().max(1), policy)
         } else {
-            self.cached_raw_preflight(self.grid.rows(), self.grid.cols().max(1))
+            self.cached_raw_preflight(self.screen.grid.rows(), self.screen.grid.cols().max(1))
         };
         self.projection_budget_cache = Some((
             key,
@@ -1112,7 +1112,7 @@ mod authority_tests {
         // the host paint/source revision before parsing. process_input is the
         // lower-level parser test primitive and deliberately does not do so.
         terminal.process_batch(b"x");
-        assert_eq!(terminal.grid[0][0].character, 'x');
+        assert_eq!(terminal.screen.grid[0][0].character, 'x');
         assert_ne!(terminal.grid_version, prior_grid_revision);
         assert!(!terminal.projection_interaction_allowed(&current));
         // Immutable geometry remains readable; this does not authorize a live
@@ -1126,7 +1126,7 @@ impl super::TerminalState {
         let key = (
             self.grid_version,
             self.history_revision,
-            self.grid.identity_revision,
+            self.screen.grid.identity_revision,
             rows,
             cols,
             self.scroll_offset,

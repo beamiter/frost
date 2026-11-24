@@ -5,8 +5,8 @@ use jterm_engine::grid::{
 use jterm_engine::protocol_state::{ProtocolState, TerminalModes};
 use jterm_engine::retained_history::{RetainedHistory, RetainedRow};
 use jterm_engine::screen::{
-    default_tab_stops, resize_tab_stops, AlternateRestorePolicy, AlternateScreenControls, Charset,
-    CursorControls, CursorDrawing, SavedCursorState, TabStopOrigin,
+    default_tab_stops, resize_tab_stops, AlternateRestorePolicy, Charset, ScreenState,
+    TabStopOrigin,
 };
 use jterm_engine::titles::FrostTitleState;
 mod visible_rows;
@@ -239,6 +239,12 @@ pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
 pub struct TerminalGrid {
     storage: jterm_engine::TerminalGrid,
     identity_revision: u64,
+}
+
+impl AsRef<jterm_engine::TerminalGrid> for TerminalGrid {
+    fn as_ref(&self) -> &jterm_engine::TerminalGrid {
+        &self.storage
+    }
 }
 
 impl TerminalGrid {
@@ -3139,8 +3145,7 @@ struct CompletedCommandMetadata {
 }
 
 pub struct TerminalState {
-    pub grid: TerminalGrid,
-    alt_grid: TerminalGrid,
+    pub screen: ScreenState<TerminalGrid>,
     pub scrollback: RetainedHistory<ScrollbackLine>,
     pub selection: Option<Selection>,
     projected_selection: Option<ProjectedSelection>,
@@ -3166,39 +3171,13 @@ pub struct TerminalState {
     max_scrollback: usize,
     inline_cli_launch_floor: Option<usize>,
     inline_cli_command_scope: Option<(u64, usize)>,
-    use_alt_buffer: bool,
     disable_alt_screen: bool,
     viewport_pixel_width: u32,
     viewport_pixel_height: u32,
 
-    pub cursor_row: usize,
-    pub cursor_col: usize,
-    // Cursor position saved when switching to the alternate screen.
-    // Kept separate from the DECSC slot so the two don't clobber each other.
-    saved_cursor_row: usize,
-    saved_cursor_col: usize,
-    // DECSC/DECRC (and CSI s/u) saved full cursor state.
-    saved_cursor: Option<SavedCursorState>,
-    // Full primary-screen drawing state saved across alt-buffer swaps so
-    // fullscreen app colors do not leak into hidden main-buffer resizes.
-    saved_primary_screen_state: Option<SavedCursorState>,
     saved_primary_global_bg: Color,
-    saved_primary_cursor_shape: CursorShape,
     saved_primary_colors: DynamicColorState,
-    // Per-column horizontal tab stops (HTS/TBC); index = column.
-    tab_stops: Vec<bool>,
-    // Last printed character, for REP (CSI b).
-    last_printed_char: Option<char>,
-    // DEC Last Column Flag: writing in the final column defers autowrap until
-    // the next printable character. VTE preserves this through DECSC/DECRC.
-    pending_wrap: bool,
-    alt_cursor_row: usize,
-    alt_cursor_col: usize,
-    pub cursor_shape: CursorShape,
 
-    current_fg: Color,
-    current_bg: Color,
-    current_flags: StyleFlags,
     // One engine owner; Frost retains ingest/query policy and RIS retention.
     titles: FrostTitleState,
     /// Working directory the child reported through OSC 7, if any. Without it
@@ -3212,16 +3191,8 @@ pub struct TerminalState {
     // Global background color set by vim (CSI ... m)
     pub global_bg: Color,
 
-    // Scrolling region (DECSTBM)
-    scroll_region_top: usize,
-    scroll_region_bottom: usize,
-
     // Sole live byte scanner. Host semantic/capture policy stays below.
     parser: Parser,
-
-    g0_charset: Charset,
-    g1_charset: Charset,
-    active_charset: Charset,
 
     // IME support
     pub ime_enabled: bool,
@@ -3231,9 +3202,6 @@ pub struct TerminalState {
     pub preedit_selection: Option<std::ops::Range<usize>>,
 
     protocol: ProtocolState,
-    // IRM and DECOM control screen drawing.
-    insert_mode: bool,
-    origin_mode: bool,
 
     // Output buffer for DSR/CPR responses to be sent back to PTY
     pub output_buffer: Vec<u8>,
@@ -3274,7 +3242,6 @@ pub struct TerminalState {
     // OSC 8 hyperlink tracking. Cells retain only the compact terminal-local
     // key; targets live in this bounded interner and are revalidated when
     // materialized into clickable view spans.
-    current_hyperlink: Option<u16>,
     osc8_hyperlinks: Vec<Arc<Osc8Hyperlink>>,
     osc8_hyperlink_keys: HashMap<Arc<Osc8Hyperlink>, u16>,
 
@@ -3470,8 +3437,7 @@ impl TerminalState {
         let alt_grid = TerminalGrid::new(rows, cols);
 
         TerminalState {
-            grid,
-            alt_grid,
+            screen: ScreenState::with_grid_pair(grid, alt_grid, TabStopOrigin::Clear),
             scrollback: RetainedHistory::default(),
             selection: None,
             projected_selection: None,
@@ -3486,28 +3452,11 @@ impl TerminalState {
             max_scrollback: 10000,
             inline_cli_launch_floor: None,
             inline_cli_command_scope: None,
-            use_alt_buffer: false,
             disable_alt_screen: false,
             viewport_pixel_width: (cols as u32).saturating_mul(8),
             viewport_pixel_height: (rows as u32).saturating_mul(16),
-            cursor_row: 0,
-            cursor_col: 0,
-            saved_cursor_row: 0,
-            saved_cursor_col: 0,
-            saved_cursor: None,
-            saved_primary_screen_state: None,
             saved_primary_global_bg: Color::Default,
-            saved_primary_cursor_shape: CursorShape::default(),
             saved_primary_colors: DynamicColorState::default(),
-            tab_stops: default_tab_stops(cols, TabStopOrigin::Clear),
-            last_printed_char: None,
-            pending_wrap: false,
-            alt_cursor_row: 0,
-            alt_cursor_col: 0,
-            cursor_shape: CursorShape::default(),
-            current_fg: Color::Default,
-            current_bg: Color::Default,
-            current_flags: StyleFlags::default(),
             titles: FrostTitleState::default(),
             current_working_dir: None,
             organism_idle_cwd: None,
@@ -3520,17 +3469,10 @@ impl TerminalState {
                 ParserProfile::FrostLegacyV1,
             )
             .expect("fixed Frost parser limits are valid"),
-            g0_charset: Charset::Ascii,
-            g1_charset: Charset::Ascii,
-            active_charset: Charset::Ascii,
             ime_enabled: false,
             preedit_text: String::new(),
             preedit_selection: None,
-            scroll_region_top: 0,
-            scroll_region_bottom: rows.saturating_sub(1),
             protocol: ProtocolState::with_modes(Self::initial_protocol_modes()),
-            insert_mode: false,
-            origin_mode: false,
             output_buffer: Vec::new(),
             pending_clipboard_requests: Vec::new(),
             pending_paste_password: None,
@@ -3556,7 +3498,6 @@ impl TerminalState {
             projection_failure_cache: None,
             next_projected_view_revision: 1,
             next_projection_plan_revision: 1,
-            current_hyperlink: None,
             osc8_hyperlinks: Vec::new(),
             osc8_hyperlink_keys: HashMap::new(),
             sync_output_active: false,
@@ -3729,11 +3670,11 @@ impl TerminalState {
     /// target armed across attacker-controlled text.
     fn handle_osc8(&mut self, value: &str) {
         let Some((params, uri)) = value.split_once(';') else {
-            self.current_hyperlink = None;
+            self.screen.current_hyperlink = HyperlinkId::NONE;
             return;
         };
         if uri.is_empty() {
-            self.current_hyperlink = None;
+            self.screen.current_hyperlink = HyperlinkId::NONE;
             return;
         }
 
@@ -3745,7 +3686,7 @@ impl TerminalState {
             || uri.contains('\u{fffd}')
             || jterm_core::review_input::contains_visual_spoofing(uri)
         {
-            self.current_hyperlink = None;
+            self.screen.current_hyperlink = HyperlinkId::NONE;
             return;
         }
         let id = params
@@ -3757,7 +3698,7 @@ impl TerminalState {
                 || id.chars().any(char::is_control)
                 || jterm_core::review_input::contains_visual_spoofing(id)
         }) {
-            self.current_hyperlink = None;
+            self.screen.current_hyperlink = HyperlinkId::NONE;
             return;
         }
 
@@ -3766,11 +3707,11 @@ impl TerminalState {
             id: id.map(str::to_owned),
         };
         if let Some(&key) = self.osc8_hyperlink_keys.get(&candidate) {
-            self.current_hyperlink = Some(key);
+            self.screen.current_hyperlink = HyperlinkId::from_raw(key);
             return;
         }
         if self.osc8_hyperlinks.len() >= MAX_OSC8_HYPERLINKS {
-            self.current_hyperlink = None;
+            self.screen.current_hyperlink = HyperlinkId::NONE;
             return;
         }
         let Some(key) = self
@@ -3779,13 +3720,13 @@ impl TerminalState {
             .checked_add(1)
             .and_then(|key| u16::try_from(key).ok())
         else {
-            self.current_hyperlink = None;
+            self.screen.current_hyperlink = HyperlinkId::NONE;
             return;
         };
         let target = Arc::new(candidate);
         self.osc8_hyperlinks.push(Arc::clone(&target));
         self.osc8_hyperlink_keys.insert(target, key);
-        self.current_hyperlink = Some(key);
+        self.screen.current_hyperlink = HyperlinkId::from_raw(key);
     }
 
     /// Materialize OSC 8 cell metadata into visible link spans. Every target
@@ -3937,7 +3878,7 @@ impl TerminalState {
             .current_command_extent_row
             .unwrap_or(start_row)
             .max(start_row);
-        let total_rows = self.scrollback.len() + self.grid.rows();
+        let total_rows = self.scrollback.len() + self.screen.grid.rows();
         if start_row >= total_rows {
             return None;
         }
@@ -3979,9 +3920,9 @@ impl TerminalState {
                 )
             } else {
                 let grid_row = absolute_row - self.scrollback.len();
-                let wrapped = self.grid.row_wrapped()[grid_row];
+                let wrapped = self.screen.grid.row_wrapped()[grid_row];
                 (
-                    append_cells(&mut capture, &self.grid[grid_row], wrapped),
+                    append_cells(&mut capture, &self.screen.grid[grid_row], wrapped),
                     wrapped,
                 )
             };
@@ -4007,7 +3948,7 @@ impl TerminalState {
     /// decoration, not accepted user input or a running builtin. Agent approval
     /// deliberately retains its stricter whole-input capture above.
     pub(crate) fn window_close_prompt_ready(&self) -> bool {
-        !self.use_alt_buffer
+        !self.screen.use_alt_buffer
             && self
                 .activity_facts()
                 .with_prompt_ready(|| {
@@ -4147,11 +4088,11 @@ impl TerminalState {
         // A primary-screen lifecycle deliberately survives an alternate-screen
         // detour, but the detour's cells and cursor coordinates never belong to
         // that lifecycle's command/output rows.
-        if self.use_alt_buffer {
+        if self.screen.use_alt_buffer {
             return;
         }
-        let absolute_row = self.scrollback.len() + self.cursor_row;
-        let raw_row_id = self.grid.raw_row_id(self.cursor_row);
+        let absolute_row = self.scrollback.len() + self.screen.cursor_row;
+        let raw_row_id = self.screen.grid.raw_row_id(self.screen.cursor_row);
         match self.current_zone_state {
             ZoneState::CommandStarted(_, _) => {
                 self.current_command_extent_row = Some(
@@ -4199,14 +4140,14 @@ impl TerminalState {
     /// update an existing candidate but cannot start one, and alt-screen bytes
     /// are deliberately excluded.
     fn note_idle_background_cells(&mut self, col: usize, col_end: usize, has_visible_text: bool) {
-        if self.use_alt_buffer
+        if self.screen.use_alt_buffer
             || self.idle_prompt_input_dirty
             || !matches!(self.current_zone_state, ZoneState::CommandStarted(_, _))
         {
             return;
         }
-        let row = self.scrollback.len().saturating_add(self.cursor_row);
-        let row_id = self.grid.raw_row_id(self.cursor_row);
+        let row = self.scrollback.len().saturating_add(self.screen.cursor_row);
+        let row_id = self.screen.grid.raw_row_id(self.screen.cursor_row);
         let Some(pending) = self.idle_background_output.as_mut() else {
             return;
         };
@@ -4245,7 +4186,7 @@ impl TerminalState {
     }
 
     fn idle_background_capture_active(&self) -> bool {
-        !self.use_alt_buffer
+        !self.screen.use_alt_buffer
             && !self.idle_prompt_input_dirty
             && matches!(self.current_zone_state, ZoneState::CommandStarted(_, _))
             && self.idle_background_output.is_some()
@@ -4298,7 +4239,7 @@ impl TerminalState {
                     // than blanking it.
                     let accepted = Self::decode_osc7_cwd(value);
                     let idle_cwd = accepted.as_deref().filter(|_| {
-                        !self.use_alt_buffer
+                        !self.screen.use_alt_buffer
                             && !self.is_command_running()
                             && !self.prompt_submission_pending
                     });
@@ -4380,10 +4321,10 @@ impl TerminalState {
         // primary-screen history. A command that flips to the alt screen
         // mid-lifecycle (vim) keeps its pending [`ZoneState`] and finalizes
         // normally when its `D` arrives back on the primary screen.
-        if self.use_alt_buffer {
+        if self.screen.use_alt_buffer {
             return;
         }
-        let absolute_row = self.scrollback.len() + self.cursor_row;
+        let absolute_row = self.scrollback.len() + self.screen.cursor_row;
         let mut parts = value.split(';');
         let mark = match parts.next() {
             Some("A") => 'A',
@@ -4576,7 +4517,7 @@ impl TerminalState {
                 // into a later command's duration.
                 if let Some(row) = self.raw_row_id_at_absolute(absolute_row) {
                     self.spacing_prompt_rows.retain(|previous| *previous != row);
-                    if self.cursor_col == 0 && !self.use_alt_buffer {
+                    if self.screen.cursor_col == 0 && !self.screen.use_alt_buffer {
                         self.spacing_prompt_rows.push_back(row);
                         while self.spacing_prompt_rows.len() > MAX_COMMAND_ZONES + 1 {
                             self.spacing_prompt_rows.pop_front();
@@ -4611,7 +4552,7 @@ impl TerminalState {
                 // Command start (user is typing the command)
                 if let ZoneState::PromptStarted(prompt_start) = self.current_zone_state {
                     self.current_zone_state = ZoneState::CommandStarted(prompt_start, absolute_row);
-                    self.current_command_start_col = Some(self.cursor_col);
+                    self.current_command_start_col = Some(self.screen.cursor_col);
                     self.current_command_extent_row = Some(absolute_row);
                     self.current_output_start_col = None;
                     self.current_output_start_row_id = None;
@@ -4636,8 +4577,8 @@ impl TerminalState {
                     self.idle_prompt_input_dirty = typeahead;
                     self.idle_background_output = Some(IdleBackgroundOutput::new(
                         absolute_row,
-                        self.cursor_col,
-                        self.grid.row_len(),
+                        self.screen.cursor_col,
+                        self.screen.grid.row_len(),
                     ));
                     self.prompt_submission_pending = false;
                     self.prompt_cancel_pending = false;
@@ -4671,8 +4612,9 @@ impl TerminalState {
                     self.current_command_truncated |= capture.truncated || metadata_truncated;
                     self.current_command_text = Some(captured_command.clone());
                     self.current_command_exact = command_exact;
-                    self.current_output_start_col = Some(self.cursor_col);
-                    self.current_output_start_row_id = self.grid.raw_row_id(self.cursor_row);
+                    self.current_output_start_col = Some(self.screen.cursor_col);
+                    self.current_output_start_row_id =
+                        self.screen.grid.raw_row_id(self.screen.cursor_row);
                     self.current_output_extent_row = None;
                     self.current_output_extent_col = None;
                     self.current_output_extent_row_id = None;
@@ -4865,7 +4807,7 @@ impl TerminalState {
                     out_start,
                     output_start_col,
                     absolute_row,
-                    self.cursor_col,
+                    self.screen.cursor_col,
                 );
                 let zone = CommandZone {
                     id: 0, // assigned by push_command_zone
@@ -5040,7 +4982,10 @@ impl TerminalState {
     /// the boundary row, include it even though the cursor never advanced to a
     /// following row (the common `printf foo` without a trailing newline).
     fn live_output_end_row(&self, boundary_row: usize) -> usize {
-        let total_rows = self.scrollback.len().saturating_add(self.grid.rows());
+        let total_rows = self
+            .scrollback
+            .len()
+            .saturating_add(self.screen.grid.rows());
         self.current_output_extent_row
             .map(|row| row.saturating_add(1))
             .unwrap_or(boundary_row)
@@ -5055,7 +5000,7 @@ impl TerminalState {
         end_row: usize,
         end_col: usize,
     ) -> Option<FinishedOutputProvenance> {
-        let total_rows = self.scrollback.len().checked_add(self.grid.rows())?;
+        let total_rows = self.scrollback.len().checked_add(self.screen.grid.rows())?;
         if start_row >= total_rows || end_row >= total_rows || start_row > end_row {
             return None;
         }
@@ -5078,7 +5023,8 @@ impl TerminalState {
                 line.decompress().get(end_col).copied()
             } else {
                 let grid_row = end_row.checked_sub(self.scrollback.len())?;
-                (end_col < self.grid.row_len()).then(|| *self.grid.get(grid_row, end_col))
+                (end_col < self.screen.grid.row_len())
+                    .then(|| *self.screen.grid.get(grid_row, end_col))
             }?;
             if end_cell.flags.wide_continuation() {
                 end_col = end_col.saturating_add(1).min(end_width);
@@ -5161,7 +5107,7 @@ impl TerminalState {
             self.current_output_extent_col?,
             boundary_row,
             boundary_col,
-            self.pending_wrap,
+            self.screen.pending_wrap,
         )
     }
 
@@ -5231,7 +5177,10 @@ impl TerminalState {
             .current_command_cwd
             .clone()
             .or_else(|| self.control_free_osc7_cwd());
-        let total_rows = self.scrollback.len().saturating_add(self.grid.rows());
+        let total_rows = self
+            .scrollback
+            .len()
+            .saturating_add(self.screen.grid.rows());
         let output_end = last_row.saturating_add(1).min(total_rows);
         let (prompt_start, output_start, output_start_col, output_end) = if rows_evicted {
             (0, None, 0, None)
@@ -5321,7 +5270,7 @@ impl TerminalState {
             out_start,
             output_start_col,
             boundary_row,
-            self.cursor_col,
+            self.screen.cursor_col,
         );
         let zone = CommandZone {
             id: 0, // assigned by push_command_zone
@@ -5418,7 +5367,7 @@ impl TerminalState {
     /// that prefix once the viewport is back at the bottom, so the app's request
     /// still lands without interrupting the read.
     fn erase_saved_lines(&mut self) {
-        if self.use_alt_buffer && self.inline_cli_owner_active() {
+        if self.screen.use_alt_buffer && self.inline_cli_owner_active() {
             return;
         }
         if self.scroll_offset > 0 || self.projected_saved_lines_held {
@@ -5448,7 +5397,7 @@ impl TerminalState {
     /// Apply a deferred [`Self::erase_saved_lines`] once the viewport follows
     /// the live bottom again.
     fn settle_pending_saved_line_purge(&mut self) {
-        if self.use_alt_buffer && self.inline_cli_owner_active() {
+        if self.screen.use_alt_buffer && self.inline_cli_owner_active() {
             return;
         }
         if self.pending_saved_line_purge > 0
@@ -5712,7 +5661,10 @@ impl TerminalState {
             return Some((line.raw_row_id(), line.columns()));
         }
         let grid_row = absolute_row.checked_sub(self.scrollback.len())?;
-        Some((self.grid.raw_row_id(grid_row)?, self.grid.row_len()))
+        Some((
+            self.screen.grid.raw_row_id(grid_row)?,
+            self.screen.grid.row_len(),
+        ))
     }
 
     #[allow(dead_code)] // Used by the Stage A resolver before consumer wiring lands.
@@ -5724,7 +5676,13 @@ impl TerminalState {
                 .map(|cell| cell.flags.wide_continuation());
         }
         let grid_row = absolute_row.checked_sub(self.scrollback.len())?;
-        (col < self.grid.row_len()).then(|| self.grid.get(grid_row, col).flags.wide_continuation())
+        (col < self.screen.grid.row_len()).then(|| {
+            self.screen
+                .grid
+                .get(grid_row, col)
+                .flags
+                .wide_continuation()
+        })
     }
 
     /// Resolve a finalized zone's live output rows to stable, exact raw-cell
@@ -5739,7 +5697,7 @@ impl TerminalState {
             return None;
         }
         let provenance = self.finished_output_provenance.get(&zone_id)?;
-        let total_rows = self.scrollback.len().checked_add(self.grid.rows())?;
+        let total_rows = self.scrollback.len().checked_add(self.screen.grid.rows())?;
         let start_absolute = zone.output_start?;
         let end_absolute = zone.output_end?;
         if start_absolute >= end_absolute
@@ -5796,8 +5754,8 @@ impl TerminalState {
             .unwrap_or(old_scrollback_len);
         let completed_grid_rows = live_start
             .map(|start| start.saturating_sub(old_scrollback_len))
-            .unwrap_or(self.grid.rows())
-            .min(self.grid.rows());
+            .unwrap_or(self.screen.grid.rows())
+            .min(self.screen.grid.rows());
 
         // Stash everything the clear removes. The stash is single-level: only
         // a clear that actually removed blocks replaces it, so a reflexive
@@ -5830,9 +5788,9 @@ impl TerminalState {
         let stashed_grid_rows: Vec<ScrollbackLine> = (0..completed_grid_rows)
             .map(|row| {
                 ScrollbackLine::compress_with_raw_row_id(
-                    &self.grid[row],
-                    self.grid.row_wrapped()[row],
-                    self.grid.row_ids()[row],
+                    &self.screen.grid[row],
+                    self.screen.grid.row_wrapped()[row],
+                    self.screen.grid.row_ids()[row],
                 )
             })
             .collect();
@@ -5854,9 +5812,9 @@ impl TerminalState {
         if completed_grid_rows > 0 {
             let blank = TerminalCell::default();
             for row in 0..completed_grid_rows {
-                self.grid[row].fill(blank);
-                self.grid.row_wrapped_mut()[row] = false;
-                self.grid.row_ids_mut()[row] = fresh_raw_row_id();
+                self.screen.grid[row].fill(blank);
+                self.screen.grid.row_wrapped_mut()[row] = false;
+                self.screen.grid.row_ids_mut()[row] = fresh_raw_row_id();
             }
             self.mark_rows_dirty(0, completed_grid_rows - 1);
         } else {
@@ -5883,7 +5841,7 @@ impl TerminalState {
     /// alt-screen app owns the viewport the stash is kept instead, so undo
     /// still works after it exits (anvil's rule).
     pub fn undo_clear_completed_blocks(&mut self) -> usize {
-        if self.use_alt_buffer {
+        if self.screen.use_alt_buffer {
             return 0;
         }
         let Some(snapshot) = self.cleared_blocks.take() else {
@@ -6012,7 +5970,10 @@ impl TerminalState {
             return None;
         }
         let start = zone.output_start?;
-        let total_rows = self.scrollback.len().saturating_add(self.grid.rows());
+        let total_rows = self
+            .scrollback
+            .len()
+            .saturating_add(self.screen.grid.rows());
         let end = zone.output_end?.min(total_rows);
         if start >= end {
             return None;
@@ -6026,7 +5987,8 @@ impl TerminalState {
             let wrapped = if row < self.scrollback.len() {
                 self.scrollback[row].is_wrapped()
             } else {
-                self.grid
+                self.screen
+                    .grid
                     .row_wrapped()
                     .get(row - self.scrollback.len())
                     .copied()
@@ -6071,7 +6033,10 @@ impl TerminalState {
             }
             (zone.output_start?, zone.output_start_col, zone.output_end?)
         };
-        let total_rows = self.scrollback.len().saturating_add(self.grid.rows());
+        let total_rows = self
+            .scrollback
+            .len()
+            .saturating_add(self.screen.grid.rows());
         let end = output_end.min(total_rows);
         let line_start = self.zone_output_line_row(id, line_no)?;
         if line_start >= end {
@@ -6115,8 +6080,8 @@ impl TerminalState {
                 )
             } else {
                 let grid_row = row - self.scrollback.len();
-                let wrapped = *self.grid.row_wrapped().get(grid_row)?;
-                let cells = self.grid.row_slice(grid_row)?;
+                let wrapped = *self.screen.grid.row_wrapped().get(grid_row)?;
+                let cells = self.screen.grid.row_slice(grid_row)?;
                 (wrapped, segment_len(cells, first_col, wrapped))
             };
 
@@ -6178,7 +6143,7 @@ impl TerminalState {
             | ZoneState::OutputStarted(prompt_start, _, _) => prompt_start,
             ZoneState::Idle => return None,
         };
-        let cursor = self.scrollback.len().saturating_add(self.cursor_row);
+        let cursor = self.scrollback.len().saturating_add(self.screen.cursor_row);
         let written = match self.current_zone_state {
             ZoneState::CommandStarted(_, _) => self.current_command_extent_row,
             ZoneState::OutputStarted(_, _, _) => self.current_output_extent_row,
@@ -6187,7 +6152,7 @@ impl TerminalState {
         let last_row = self
             .scrollback
             .len()
-            .saturating_add(self.grid.rows())
+            .saturating_add(self.screen.grid.rows())
             .saturating_sub(1);
         Some(
             written
@@ -6359,7 +6324,7 @@ impl TerminalState {
         max_bytes: usize,
     ) -> (String, bool) {
         let scrollback_len = self.scrollback.len();
-        let end = end.min(scrollback_len + self.grid.rows());
+        let end = end.min(scrollback_len + self.screen.grid.rows());
         if end <= start {
             return (String::new(), false);
         }
@@ -6382,20 +6347,20 @@ impl TerminalState {
                 (text, line.is_wrapped())
             } else {
                 let grid_row = abs_row - scrollback_len;
-                if grid_row >= self.grid.rows() {
+                if grid_row >= self.screen.grid.rows() {
                     break;
                 }
                 let first_col = if abs_row == start {
-                    start_col.min(self.grid.row_len())
+                    start_col.min(self.screen.grid.row_len())
                 } else {
                     0
                 };
-                let text: String = (first_col..self.grid.row_len())
-                    .map(|col| self.grid.get(grid_row, col))
+                let text: String = (first_col..self.screen.grid.row_len())
+                    .map(|col| self.screen.grid.get(grid_row, col))
                     .filter(|cell| !cell.flags.wide_continuation())
                     .map(|cell| cell.character)
                     .collect();
-                (text, self.grid.row_wrapped()[grid_row])
+                (text, self.screen.grid.row_wrapped()[grid_row])
             };
             if !wrapped {
                 // Hard line end: trailing cell padding is not real output.
@@ -6557,7 +6522,7 @@ impl TerminalState {
     fn decrqm_private_mode_state(&self, mode: u16) -> u8 {
         match mode {
             6 => {
-                if self.origin_mode {
+                if self.screen.origin_mode {
                     1
                 } else {
                     2
@@ -6580,7 +6545,7 @@ impl TerminalState {
     fn decrqm_ansi_mode_state(&self, mode: u16) -> u8 {
         match mode {
             4 => {
-                if self.insert_mode {
+                if self.screen.insert_mode {
                     1
                 } else {
                     2
@@ -6616,7 +6581,7 @@ impl TerminalState {
     /// Fresh, bounded directory evidence for the idle companion only. This
     /// never falls back to a previous command or to the sticky process cache.
     pub(crate) fn organism_idle_working_dir(&self) -> Option<&str> {
-        if self.use_alt_buffer
+        if self.screen.use_alt_buffer
             || self.prompt_submission_pending
             || !matches!(self.current_zone_state, ZoneState::CommandStarted(_, _))
         {
@@ -6857,32 +6822,38 @@ impl TerminalState {
     /// (pushing to scrollback only for a full-screen region); otherwise it just
     /// moves down. Used by autowrap and linefeed so both stay region-aware.
     fn wrap_to_next_line(&mut self) {
-        self.grid.row_wrapped_mut()[self.cursor_row] = true;
-        self.cursor_col = 0;
+        self.screen.grid.row_wrapped_mut()[self.screen.cursor_row] = true;
+        self.screen.cursor_col = 0;
         self.index();
     }
 
     /// IND / LF: move down one row, scrolling the active region at the bottom.
     fn index(&mut self) {
-        if self.cursor_row == self.scroll_region_bottom {
-            self.scroll_region_up(self.scroll_region_top, self.scroll_region_bottom);
-        } else if self.cursor_row + 1 < self.grid.rows() {
-            self.cursor_row += 1;
+        if self.screen.cursor_row == self.screen.scroll_region_bottom {
+            self.scroll_region_up(
+                self.screen.scroll_region_top,
+                self.screen.scroll_region_bottom,
+            );
+        } else if self.screen.cursor_row + 1 < self.screen.grid.rows() {
+            self.screen.cursor_row += 1;
         }
     }
 
     /// NEL: carriage return plus IND.
     fn next_line(&mut self) {
-        self.cursor_col = 0;
+        self.screen.cursor_col = 0;
         self.index();
     }
 
     /// RI: move up one row, scrolling the active region down at the top.
     fn reverse_index(&mut self) {
-        if self.cursor_row == self.scroll_region_top {
-            self.scroll_region_down(self.scroll_region_top, self.scroll_region_bottom);
-        } else if self.cursor_row > 0 {
-            self.cursor_row -= 1;
+        if self.screen.cursor_row == self.screen.scroll_region_top {
+            self.scroll_region_down(
+                self.screen.scroll_region_top,
+                self.screen.scroll_region_bottom,
+            );
+        } else if self.screen.cursor_row > 0 {
+            self.screen.cursor_row -= 1;
         }
     }
 
@@ -6890,7 +6861,7 @@ impl TerminalState {
     /// rightmost `count` cells off the end of the row.
     fn shift_cells_right(&mut self, row: usize, col: usize, count: usize) {
         let blank = self.create_blank_cell();
-        if self.grid.storage.insert_blank_cells(
+        if self.screen.grid.storage.insert_blank_cells(
             row,
             col,
             count,
@@ -6904,24 +6875,25 @@ impl TerminalState {
     /// Merge a zero-width combining mark into the preceding base cell when the
     /// pair has a single precomposed form (NFC); otherwise drop it.
     fn combine_with_previous(&mut self, mark: char) {
-        if self.cursor_col == 0 && !self.pending_wrap {
+        if self.screen.cursor_col == 0 && !self.screen.pending_wrap {
             return;
         }
-        let mut base_col = if self.pending_wrap {
-            self.cursor_col
+        let mut base_col = if self.screen.pending_wrap {
+            self.screen.cursor_col
         } else {
-            self.cursor_col - 1
+            self.screen.cursor_col - 1
         };
         if base_col > 0
             && self
+                .screen
                 .grid
-                .get(self.cursor_row, base_col)
+                .get(self.screen.cursor_row, base_col)
                 .flags
                 .wide_continuation()
         {
             base_col -= 1;
         }
-        let cell = self.grid.get_mut(self.cursor_row, base_col);
+        let cell = self.screen.grid.get_mut(self.screen.cursor_row, base_col);
         let mut combined = String::with_capacity(8);
         combined.push(cell.character);
         combined.push(mark);
@@ -6929,161 +6901,118 @@ impl TerminalState {
         let mut chars = nfc.chars();
         if let (Some(c0), None) = (chars.next(), chars.next()) {
             cell.character = c0;
-            self.mark_row_dirty(self.cursor_row);
-        }
-    }
-
-    fn cursor_controls(&mut self) -> CursorControls<'_> {
-        CursorControls {
-            rows: self.grid.rows(),
-            cols: self.grid.cols(),
-            row: &mut self.cursor_row,
-            col: &mut self.cursor_col,
-            top: &mut self.scroll_region_top,
-            bottom: &mut self.scroll_region_bottom,
-            origin_mode: &mut self.origin_mode,
-            pending_wrap: &mut self.pending_wrap,
-            tab_stops: &mut self.tab_stops,
-        }
-    }
-
-    fn alternate_screen_controls(&mut self) -> AlternateScreenControls<'_, TerminalGrid> {
-        let rows = self.grid.rows();
-        AlternateScreenControls {
-            grid: &mut self.grid,
-            alt_grid: &mut self.alt_grid,
-            use_alt_buffer: &mut self.use_alt_buffer,
-            cursor: CursorDrawing {
-                position: (&mut self.cursor_row, &mut self.cursor_col),
-                fg: &mut self.current_fg,
-                bg: &mut self.current_bg,
-                flags: &mut self.current_flags,
-                g0: &mut self.g0_charset,
-                g1: &mut self.g1_charset,
-                active: &mut self.active_charset,
-                origin_mode: &mut self.origin_mode,
-                pending_wrap: &mut self.pending_wrap,
-            },
-            primary_position: (&mut self.saved_cursor_row, &mut self.saved_cursor_col),
-            alternate_position: (&mut self.alt_cursor_row, &mut self.alt_cursor_col),
-            saved_primary: &mut self.saved_primary_screen_state,
-            margins: (&mut self.scroll_region_top, &mut self.scroll_region_bottom),
-            rows,
+            self.mark_row_dirty(self.screen.cursor_row);
         }
     }
 
     fn save_cursor(&mut self) {
-        let autowrap = self.protocol.modes().contains(&7);
-        self.saved_cursor = Some(self.alternate_screen_controls().cursor.snapshot(autowrap));
+        self.screen.save_cursor(self.protocol.modes().contains(&7));
     }
 
     fn restore_cursor(&mut self) {
-        let saved = self.saved_cursor.clone();
-        let (rows, cols) = (self.grid.rows(), self.grid.cols());
-        self.alternate_screen_controls()
-            .cursor
-            .restore(saved.as_ref(), rows, cols);
+        // FrostLegacyV1 restores the drawing state and keeps the live DECAWM.
+        let _ = self.screen.restore_cursor();
     }
 
     fn put_char(&mut self, ch: char, track_idle_output: bool) {
-        let ch = self.active_charset.translate(ch);
+        let ch = self.screen.active_charset.translate(ch);
         let width = crate::char_width::cached_char_width(ch);
         if width == 0 {
             self.combine_with_previous(ch);
             return;
         }
 
-        let cols = self.grid.row_len();
+        let cols = self.screen.grid.row_len();
         let blank_cell = self.create_blank_cell();
         let autowrap = self.protocol.modes().contains(&7);
 
-        if self.pending_wrap {
-            self.pending_wrap = false;
+        if self.screen.pending_wrap {
+            self.screen.pending_wrap = false;
             if autowrap {
                 self.wrap_to_next_line();
             }
         }
 
         // If character doesn't fit at end of line, handle based on autowrap mode
-        if self.cursor_col + width > cols {
+        if self.screen.cursor_col + width > cols {
             // Only wrap to next line if autowrap mode (mode 7) is enabled
             if autowrap {
                 self.wrap_to_next_line();
             } else {
                 // Autowrap disabled: clamp cursor to last column instead of wrapping
-                self.cursor_col = cols.saturating_sub(width);
+                self.screen.cursor_col = cols.saturating_sub(width);
             }
         }
 
         if track_idle_output {
             self.note_idle_background_cells(
-                self.cursor_col,
-                self.cursor_col.saturating_add(width),
+                self.screen.cursor_col,
+                self.screen.cursor_col.saturating_add(width),
                 !ch.is_whitespace(),
             );
         }
-        let write_col = self.cursor_col;
+        let write_col = self.screen.cursor_col;
 
         // IRM insert mode (mode 4): make room by shifting the row right.
-        if self.insert_mode {
-            self.shift_cells_right(self.cursor_row, self.cursor_col, width);
+        if self.screen.insert_mode {
+            self.shift_cells_right(self.screen.cursor_row, self.screen.cursor_col, width);
         }
 
-        self.grid.storage.overwrite_graphic(
-            self.cursor_row,
-            self.cursor_col,
+        self.screen.grid.storage.overwrite_graphic(
+            self.screen.cursor_row,
+            self.screen.cursor_col,
             width,
             TerminalCell {
                 character: ch,
-                foreground: self.current_fg,
-                background: self.current_bg,
-                flags: self.current_flags,
-                hyperlink_id: HyperlinkId::from_raw(self.current_hyperlink.unwrap_or(0)),
+                foreground: self.screen.current_fg,
+                background: self.screen.current_bg,
+                flags: self.screen.current_flags,
+                hyperlink_id: self.screen.current_hyperlink,
             },
             blank_cell,
             WideContinuationProtection::FromBlank,
         );
 
-        self.cursor_col += width;
-        self.last_printed_char = Some(ch);
-        if self.cursor_col >= cols {
-            self.cursor_col = cols.saturating_sub(width);
+        self.screen.cursor_col += width;
+        self.screen.last_printed_char = Some(ch);
+        if self.screen.cursor_col >= cols {
+            self.screen.cursor_col = cols.saturating_sub(width);
             if autowrap {
-                self.pending_wrap = true;
+                self.screen.pending_wrap = true;
             }
         }
         // Mark the row as dirty after writing character
-        self.mark_row_dirty(self.cursor_row);
+        self.mark_row_dirty(self.screen.cursor_row);
         self.mark_command_echo_extent(write_col, write_col.saturating_add(width));
     }
 
     fn put_ascii_run(&mut self, bytes: &[u8]) {
-        let cols = self.grid.row_len();
+        let cols = self.screen.grid.row_len();
         let autowrap = self.protocol.modes().contains(&7);
         let mut pos = 0;
         if let Some(&last) = bytes.last() {
-            self.last_printed_char = Some(last as char);
+            self.screen.last_printed_char = Some(last as char);
         }
 
         while pos < bytes.len() {
-            if self.pending_wrap {
-                self.pending_wrap = false;
+            if self.screen.pending_wrap {
+                self.screen.pending_wrap = false;
                 if autowrap {
                     self.wrap_to_next_line();
                 }
             }
 
-            let remaining = cols - self.cursor_col;
+            let remaining = cols - self.screen.cursor_col;
             let chunk_len = (bytes.len() - pos).min(remaining);
 
             let rendition = TerminalCell {
                 character: ' ',
-                foreground: self.current_fg,
-                background: self.current_bg,
-                flags: self.current_flags,
-                hyperlink_id: HyperlinkId::from_raw(self.current_hyperlink.unwrap_or(0)),
+                foreground: self.screen.current_fg,
+                background: self.screen.current_bg,
+                flags: self.screen.current_flags,
+                hyperlink_id: self.screen.current_hyperlink,
             };
-            let col = self.cursor_col;
+            let col = self.screen.cursor_col;
             let end = col + chunk_len;
             let chunk = &bytes[pos..pos + chunk_len];
             self.note_idle_background_cells(
@@ -7092,8 +7021,8 @@ impl TerminalState {
                 chunk.iter().any(|byte| !byte.is_ascii_whitespace()),
             );
             let blank = self.create_blank_cell();
-            self.grid.storage.overwrite_ascii(
-                self.cursor_row,
+            self.screen.grid.storage.overwrite_ascii(
+                self.screen.cursor_row,
                 col,
                 chunk,
                 rendition,
@@ -7101,23 +7030,23 @@ impl TerminalState {
                 AsciiOverwritePolicy::FrostLegacy,
             );
 
-            self.cursor_col += chunk_len;
+            self.screen.cursor_col += chunk_len;
             pos += chunk_len;
 
-            self.mark_row_dirty(self.cursor_row);
+            self.mark_row_dirty(self.screen.cursor_row);
             self.mark_command_echo_extent(col, end);
 
-            if self.cursor_col >= cols {
-                self.cursor_col = cols - 1;
+            if self.screen.cursor_col >= cols {
+                self.screen.cursor_col = cols - 1;
                 if autowrap {
-                    self.pending_wrap = true;
+                    self.screen.pending_wrap = true;
                 }
             }
         }
     }
 
     fn create_blank_cell(&self) -> TerminalCell {
-        self.blank_cell_with_bg(self.current_bg)
+        self.blank_cell_with_bg(self.screen.current_bg)
     }
 
     fn blank_cell_with_bg(&self, bg: Color) -> TerminalCell {
@@ -7150,7 +7079,7 @@ impl TerminalState {
 
     fn line_is_blank(&self, row: usize) -> bool {
         let blank = self.create_blank_cell();
-        self.grid[row].iter().all(|cell| {
+        self.screen.grid[row].iter().all(|cell| {
             cell.character == blank.character
                 && cell.foreground == blank.foreground
                 && cell.background == blank.background
@@ -7164,19 +7093,24 @@ impl TerminalState {
     }
 
     fn visible_screen_snapshot(&self) -> Option<Vec<String>> {
-        if self.grid.rows() == 0 {
+        if self.screen.grid.rows() == 0 {
             return None;
         }
 
-        let first = (0..self.grid.rows()).find(|&row| !self.line_is_blank(row));
-        let last = (0..self.grid.rows()).rfind(|&row| !self.line_is_blank(row));
+        let first = (0..self.screen.grid.rows()).find(|&row| !self.line_is_blank(row));
+        let last = (0..self.screen.grid.rows()).rfind(|&row| !self.line_is_blank(row));
         let (Some(first), Some(last)) = (first, last) else {
             return None;
         };
 
         Some(
             (first..=last)
-                .map(|row| self.grid[row].iter().map(|cell| cell.character).collect())
+                .map(|row| {
+                    self.screen.grid[row]
+                        .iter()
+                        .map(|cell| cell.character)
+                        .collect()
+                })
                 .collect(),
         )
     }
@@ -7201,12 +7135,12 @@ impl TerminalState {
         if self.inline_cli_owner_active() {
             return 0;
         }
-        if (self.use_alt_buffer && !allow_alt_buffer) || self.grid.rows() == 0 {
+        if (self.screen.use_alt_buffer && !allow_alt_buffer) || self.screen.grid.rows() == 0 {
             return 0;
         }
 
-        let first = (0..self.grid.rows()).find(|&row| !self.line_is_blank(row));
-        let last = (0..self.grid.rows()).rfind(|&row| !self.line_is_blank(row));
+        let first = (0..self.screen.grid.rows()).find(|&row| !self.line_is_blank(row));
+        let last = (0..self.screen.grid.rows()).rfind(|&row| !self.line_is_blank(row));
         let (Some(first), Some(last)) = (first, last) else {
             return 0;
         };
@@ -7225,7 +7159,10 @@ impl TerminalState {
         // the prefix-eviction shift used when real rows move into history.
         let selection = self.selection.take();
         for row in first..=last {
-            let line = ScrollbackLine::compress(&self.grid[row], self.grid.row_wrapped()[row]);
+            let line = ScrollbackLine::compress(
+                &self.screen.grid[row],
+                self.screen.grid.row_wrapped()[row],
+            );
             self.push_scrollback_compressed_with_options(line, allow_alt_buffer);
         }
         let appended = self.scrollback_pushes.wrapping_sub(before) as usize;
@@ -7360,7 +7297,7 @@ impl TerminalState {
         line: ScrollbackLine,
         allow_alt_buffer: bool,
     ) {
-        if self.use_alt_buffer && !allow_alt_buffer {
+        if self.screen.use_alt_buffer && !allow_alt_buffer {
             return;
         }
         let mut trimmed = 0;
@@ -7385,7 +7322,7 @@ impl TerminalState {
 
     fn scroll_region_down(&mut self, top: usize, bottom: usize) {
         let blank = self.create_blank_cell();
-        if self.grid.shift_row_region(
+        if self.screen.grid.shift_row_region(
             RegionDirection::Down,
             top..=bottom,
             blank,
@@ -7396,7 +7333,7 @@ impl TerminalState {
     }
 
     fn scroll_region_up(&mut self, top: usize, bottom: usize) {
-        if top >= self.grid.rows() || bottom >= self.grid.rows() || top > bottom {
+        if top >= self.screen.grid.rows() || bottom >= self.screen.grid.rows() || top > bottom {
             return;
         }
 
@@ -7408,21 +7345,22 @@ impl TerminalState {
 
         // Compress the removed line directly from the grid slice before mutating,
         // avoiding a per-line Vec allocation from get_row.
-        let allow_alt_scrollback =
-            self.use_alt_buffer && self.sync_output_active && !self.inline_cli_owner_active();
+        let allow_alt_scrollback = self.screen.use_alt_buffer
+            && self.sync_output_active
+            && !self.inline_cli_owner_active();
         let scrollback_line =
-            if scrolls_off_screen_top && (!self.use_alt_buffer || allow_alt_scrollback) {
+            if scrolls_off_screen_top && (!self.screen.use_alt_buffer || allow_alt_scrollback) {
                 Some(ScrollbackLine::compress_with_raw_row_id(
-                    &self.grid[top],
-                    self.grid.row_wrapped()[top],
-                    self.grid.row_ids()[top],
+                    &self.screen.grid[top],
+                    self.screen.grid.row_wrapped()[top],
+                    self.screen.grid.row_ids()[top],
                 ))
             } else {
                 None
             };
 
         let blank = self.create_blank_cell();
-        self.grid.shift_row_region(
+        self.screen.grid.shift_row_region(
             RegionDirection::Up,
             top..=bottom,
             blank,
@@ -7433,7 +7371,7 @@ impl TerminalState {
 
         if let Some(line) = scrollback_line {
             self.push_scrollback_compressed_with_options(line, allow_alt_scrollback);
-            if !self.use_alt_buffer && top == 0 && bottom + 1 == self.grid.rows() {
+            if !self.screen.use_alt_buffer && top == 0 && bottom + 1 == self.screen.grid.rows() {
                 self.full_screen_scroll_revision = self.full_screen_scroll_revision.wrapping_add(1);
             }
         }
@@ -7458,10 +7396,10 @@ impl TerminalState {
                     charset
                 );
                 if is_g0 {
-                    self.g0_charset = charset;
-                    self.active_charset = self.g0_charset;
+                    self.screen.g0_charset = charset;
+                    self.screen.active_charset = self.screen.g0_charset;
                 } else {
-                    self.g1_charset = charset;
+                    self.screen.g1_charset = charset;
                 }
             }
             _ => {}
@@ -7541,9 +7479,9 @@ impl TerminalState {
     /// that address a command with `i=` (kitten icat) no longer wait for a
     /// timeout.
     fn handle_kitty_graphics_apc(&mut self, payload: &[u8]) {
-        let cursor_col = self.cursor_col as u32;
-        let cursor_row = self.cursor_row as u32;
-        let buffer_row = self.scrollback.len().saturating_add(self.cursor_row);
+        let cursor_col = self.screen.cursor_col as u32;
+        let cursor_row = self.screen.cursor_row as u32;
+        let buffer_row = self.scrollback.len().saturating_add(self.screen.cursor_row);
         if let Err(_error) = self
             .kitty_graphics
             .parse_graphics_payload_at_buffer_row(payload, cursor_col, cursor_row, buffer_row)
@@ -7567,7 +7505,7 @@ impl TerminalState {
     }
 
     pub(crate) fn finish_synchronized_output(&mut self) {
-        if self.use_alt_buffer {
+        if self.screen.use_alt_buffer {
             self.archive_alt_screen_frame();
         } else {
             self.last_synced_primary_screen_snapshot =
@@ -7576,7 +7514,7 @@ impl TerminalState {
         self.protocol.modes_mut().remove(&2026);
         self.sync_output_active = false;
         self.sync_output_start = None;
-        self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+        self.mark_rows_dirty(0, self.screen.grid.rows().saturating_sub(1));
     }
 
     #[allow(dead_code)]
@@ -7621,8 +7559,9 @@ impl TerminalState {
         let mut at = 0;
         let mut capture_active = false;
         loop {
-            self.parser
-                .set_ascii_batching(self.active_charset == Charset::Ascii && !self.insert_mode);
+            self.parser.set_ascii_batching(
+                self.screen.active_charset == Charset::Ascii && !self.screen.insert_mode,
+            );
             let rejected_before = self.parser.rejected_count();
             let step = self.parser.next(&input[at..]);
             if step.abandoned_apc {
@@ -7631,7 +7570,7 @@ impl TerminalState {
             if self.parser.rejected_count() != rejected_before {
                 // Rejected opaque input may be an OSC 8 close/open. Clear
                 // active linkage without inspecting or reflecting payload.
-                self.current_hyperlink = None;
+                self.screen.current_hyperlink = HyperlinkId::NONE;
             }
             at += step.consumed;
             if step.capture.as_ref().is_some_and(|capture| capture.started) {
@@ -7643,7 +7582,8 @@ impl TerminalState {
                     ParserEvent::Boundary => {}
                     ParserEvent::Print(ch) => self.put_char(ch, true),
                     ParserEvent::Ascii(bytes) => {
-                        if self.active_charset == Charset::Ascii && !self.insert_mode {
+                        if self.screen.active_charset == Charset::Ascii && !self.screen.insert_mode
+                        {
                             self.put_ascii_run(bytes);
                         } else {
                             for &byte in bytes {
@@ -7652,15 +7592,15 @@ impl TerminalState {
                         }
                     }
                     ParserEvent::Control(byte) => match byte {
-                        8 => self.cursor_controls().move_backward(1),
-                        9 => self.cursor_controls().tab_forward(1),
+                        8 => self.screen.cursor_controls().move_backward(1),
+                        9 => self.screen.cursor_controls().tab_forward(1),
                         10..=12 => {
-                            self.pending_wrap = false;
+                            self.screen.pending_wrap = false;
                             self.index();
                         }
-                        13 => self.cursor_controls().set_column(1),
-                        14 => self.active_charset = self.g1_charset,
-                        15 => self.active_charset = self.g0_charset,
+                        13 => self.screen.cursor_controls().set_column(1),
+                        14 => self.screen.active_charset = self.screen.g1_charset,
+                        15 => self.screen.active_charset = self.screen.g0_charset,
                         _ => {} // Frost ignores BEL and other unhandled C0.
                     },
                     ParserEvent::Escape {
@@ -7672,18 +7612,18 @@ impl TerminalState {
                                 b'7' => self.save_cursor(),
                                 b'8' => self.restore_cursor(),
                                 b'E' => {
-                                    self.pending_wrap = false;
+                                    self.screen.pending_wrap = false;
                                     self.next_line();
                                 }
                                 b'D' => {
-                                    self.pending_wrap = false;
+                                    self.screen.pending_wrap = false;
                                     self.index();
                                 }
                                 b'M' => {
-                                    self.pending_wrap = false;
+                                    self.screen.pending_wrap = false;
                                     self.reverse_index();
                                 }
-                                b'H' => self.cursor_controls().set_tab_stop(true),
+                                b'H' => self.screen.cursor_controls().set_tab_stop(true),
                                 b'c' => self.full_reset(),
                                 b'>' => {
                                     self.protocol.modes_mut().remove(&66);
@@ -7784,48 +7724,52 @@ impl TerminalState {
         let first = params.first().copied();
         let count = first.unwrap_or(1).max(1) as usize;
         match cmd {
-            'A' => self.cursor_controls().move_up(count),
-            'B' => self.cursor_controls().move_down(count),
-            'C' => self.cursor_controls().move_forward(count),
-            'D' => self.cursor_controls().move_backward(count),
+            'A' => self.screen.cursor_controls().move_up(count),
+            'B' => self.screen.cursor_controls().move_down(count),
+            'C' => self.screen.cursor_controls().move_forward(count),
+            'D' => self.screen.cursor_controls().move_backward(count),
             'E' => {
-                let mut cursor = self.cursor_controls();
+                let mut cursor = self.screen.cursor_controls();
                 cursor.move_down(count);
                 cursor.set_column(1);
             }
             'F' => {
-                let mut cursor = self.cursor_controls();
+                let mut cursor = self.screen.cursor_controls();
                 cursor.move_up(count);
                 cursor.set_column(1);
             }
             'G' | '`' => self
+                .screen
                 .cursor_controls()
                 .set_column(first.unwrap_or(1) as usize),
-            'd' => self.cursor_controls().set_row(first.unwrap_or(1) as usize),
-            'I' => self.cursor_controls().tab_forward(count),
-            'Z' => self.cursor_controls().tab_backward(count),
+            'd' => self
+                .screen
+                .cursor_controls()
+                .set_row(first.unwrap_or(1) as usize),
+            'I' => self.screen.cursor_controls().tab_forward(count),
+            'Z' => self.screen.cursor_controls().tab_backward(count),
             'b' => {
                 // REP - repeat the last printed character n times.
-                if let Some(ch) = self.last_printed_char {
+                if let Some(ch) = self.screen.last_printed_char {
                     for _ in 0..count {
                         self.put_char(ch, false);
                     }
                 }
             }
             'g' => match first.unwrap_or(0) {
-                0 => self.cursor_controls().set_tab_stop(false),
-                3 => self.cursor_controls().clear_all_tab_stops(),
+                0 => self.screen.cursor_controls().set_tab_stop(false),
+                3 => self.screen.cursor_controls().clear_all_tab_stops(),
                 _ => {}
             },
             'H' => {
                 let row = first.unwrap_or(1) as usize;
                 let col = params.get(1).copied().unwrap_or(1) as usize;
-                self.cursor_controls().set_position(row, col);
+                self.screen.cursor_controls().set_position(row, col);
             }
             'f' => {
                 if private_prefix == Some(b'>') && intermediates.is_empty() {
                     // Frost's legacy CSI f dispatch clears wrap even for XTFMTKEYS.
-                    self.pending_wrap = false;
+                    self.screen.pending_wrap = false;
                     let resource = first.unwrap_or(0);
                     let value = params.get(1).copied().unwrap_or(0);
                     if resource == 4 {
@@ -7839,50 +7783,60 @@ impl TerminalState {
                 } else {
                     let row = first.unwrap_or(1) as usize;
                     let col = params.get(1).copied().unwrap_or(1) as usize;
-                    self.cursor_controls().set_position(row, col);
+                    self.screen.cursor_controls().set_position(row, col);
                 }
             }
             'J' => match params.first().copied().unwrap_or(0) {
                 0 => {
-                    if self.cursor_row == 0 && self.cursor_col == 0 {
+                    if self.screen.cursor_row == 0 && self.screen.cursor_col == 0 {
                         self.inline_cli_screen_erased();
                     }
-                    let cols = self.grid.row_len();
+                    let cols = self.screen.grid.row_len();
                     let blank = self.create_blank_cell();
-                    self.grid
-                        .storage
-                        .erase_cells(self.cursor_row, self.cursor_col..cols, blank);
-                    for row in self.cursor_row + 1..self.grid.rows() {
-                        self.grid.storage.erase_cells(row, 0..cols, blank);
+                    self.screen.grid.storage.erase_cells(
+                        self.screen.cursor_row,
+                        self.screen.cursor_col..cols,
+                        blank,
+                    );
+                    for row in self.screen.cursor_row + 1..self.screen.grid.rows() {
+                        self.screen.grid.storage.erase_cells(row, 0..cols, blank);
                     }
-                    self.mark_rows_dirty(self.cursor_row, self.grid.rows().saturating_sub(1));
+                    self.mark_rows_dirty(
+                        self.screen.cursor_row,
+                        self.screen.grid.rows().saturating_sub(1),
+                    );
                 }
                 1 => {
-                    let cols = self.grid.row_len();
+                    let cols = self.screen.grid.row_len();
                     let blank = self.create_blank_cell();
-                    for row in 0..self.cursor_row {
-                        self.grid.storage.erase_cells(row, 0..cols, blank);
+                    for row in 0..self.screen.cursor_row {
+                        self.screen.grid.storage.erase_cells(row, 0..cols, blank);
                     }
-                    self.grid
-                        .storage
-                        .erase_cells(self.cursor_row, 0..self.cursor_col + 1, blank);
-                    self.mark_rows_dirty(0, self.cursor_row);
+                    self.screen.grid.storage.erase_cells(
+                        self.screen.cursor_row,
+                        0..self.screen.cursor_col + 1,
+                        blank,
+                    );
+                    self.mark_rows_dirty(0, self.screen.cursor_row);
                 }
                 2 => self.clear_screen_no_home(),
                 3 => self.erase_saved_lines(),
                 _ => {}
             },
             'K' => {
-                let cols = self.grid.row_len();
+                let cols = self.screen.grid.row_len();
                 let span = match params.first().copied().unwrap_or(0) {
-                    0 => self.cursor_col..cols,
-                    1 => 0..self.cursor_col + 1,
+                    0 => self.screen.cursor_col..cols,
+                    1 => 0..self.screen.cursor_col + 1,
                     2 => 0..cols,
                     _ => return,
                 };
                 let blank = self.create_blank_cell();
-                self.grid.storage.erase_cells(self.cursor_row, span, blank);
-                self.mark_row_dirty(self.cursor_row);
+                self.screen
+                    .grid
+                    .storage
+                    .erase_cells(self.screen.cursor_row, span, blank);
+                self.mark_row_dirty(self.screen.cursor_row);
             }
             'L' | 'M' => {
                 let direction = if cmd == 'L' {
@@ -7890,16 +7844,16 @@ impl TerminalState {
                 } else {
                     RegionDirection::Up
                 };
-                let cursor = self.cursor_row;
-                let bottom = self.scroll_region_bottom;
-                if (self.scroll_region_top..=bottom).contains(&cursor) {
+                let cursor = self.screen.cursor_row;
+                let bottom = self.screen.scroll_region_bottom;
+                if (self.screen.scroll_region_top..=bottom).contains(&cursor) {
                     let blank = self.create_blank_cell();
                     let count = (params.first().copied().unwrap_or(1).max(1) as usize)
                         .min(bottom - cursor + 1);
                     // Frost allocates each row at its original iteration step,
                     // keeping physical wrap flags and the grid revision cadence.
                     for _ in 0..count {
-                        self.grid.shift_row_region(
+                        self.screen.grid.shift_row_region(
                             direction,
                             cursor..=bottom,
                             blank,
@@ -7925,9 +7879,9 @@ impl TerminalState {
                     // SGR - Select Graphic Rendition
                     if let Some(color) = jterm_engine::semantics::frost_legacy_sgr(
                         raw_params,
-                        &mut self.current_fg,
-                        &mut self.current_bg,
-                        &mut self.current_flags,
+                        &mut self.screen.current_fg,
+                        &mut self.screen.current_bg,
+                        &mut self.screen.current_flags,
                     ) {
                         self.global_bg = color;
                     }
@@ -8000,13 +7954,17 @@ impl TerminalState {
                 let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 // Beyond the region height the region is already blank; see IL.
                 let n = n.min(
-                    self.scroll_region_bottom
-                        .saturating_sub(self.scroll_region_top)
+                    self.screen
+                        .scroll_region_bottom
+                        .saturating_sub(self.screen.scroll_region_top)
                         .saturating_add(1),
                 );
                 // Scroll within the scroll region by moving lines
                 for _ in 0..n {
-                    self.scroll_region_up(self.scroll_region_top, self.scroll_region_bottom);
+                    self.scroll_region_up(
+                        self.screen.scroll_region_top,
+                        self.screen.scroll_region_bottom,
+                    );
                 }
             }
             'T' => {
@@ -8014,12 +7972,16 @@ impl TerminalState {
                 let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 // Beyond the region height the region is already blank; see IL.
                 let n = n.min(
-                    self.scroll_region_bottom
-                        .saturating_sub(self.scroll_region_top)
+                    self.screen
+                        .scroll_region_bottom
+                        .saturating_sub(self.screen.scroll_region_top)
                         .saturating_add(1),
                 );
                 for _ in 0..n {
-                    self.scroll_region_down(self.scroll_region_top, self.scroll_region_bottom);
+                    self.scroll_region_down(
+                        self.screen.scroll_region_top,
+                        self.screen.scroll_region_bottom,
+                    );
                 }
             }
             't' => {
@@ -8036,8 +7998,8 @@ impl TerminalState {
                         // modified F3 key (`CSI 1 ; Pm R`).
                         self.output_buffer.extend(
                             jterm_engine::semantics::frost_legacy_cursor_position_reply(
-                                self.cursor_row,
-                                self.cursor_col,
+                                self.screen.cursor_row,
+                                self.screen.cursor_col,
                                 true,
                             ),
                         );
@@ -8068,8 +8030,8 @@ impl TerminalState {
                         // CPR - Cursor Position Report: CSI row ; col R (1-indexed)
                         self.output_buffer.extend(
                             jterm_engine::semantics::frost_legacy_cursor_position_reply(
-                                self.cursor_row,
-                                self.cursor_col,
+                                self.screen.cursor_row,
+                                self.screen.cursor_col,
                                 false,
                             ),
                         );
@@ -8128,38 +8090,42 @@ impl TerminalState {
                 // the bottom row, every line feed then scrolls inside that one
                 // row, and the screen looks frozen.
                 let top = first.unwrap_or(1).max(1) as usize;
-                let bottom = match params.get(1).copied().unwrap_or(self.grid.rows() as u16) {
-                    0 => self.grid.rows(),
+                let bottom = match params
+                    .get(1)
+                    .copied()
+                    .unwrap_or(self.screen.grid.rows() as u16)
+                {
+                    0 => self.screen.grid.rows(),
                     v => v as usize,
                 };
 
-                self.cursor_controls().set_scroll_region(top, bottom);
+                self.screen.cursor_controls().set_scroll_region(top, bottom);
             }
             '@' => {
                 let count = params.first().copied().unwrap_or(1).max(1) as usize;
-                self.shift_cells_right(self.cursor_row, self.cursor_col, count);
+                self.shift_cells_right(self.screen.cursor_row, self.screen.cursor_col, count);
             }
             'P' => {
                 let count = params.first().copied().unwrap_or(1).max(1) as usize;
                 let blank = self.create_blank_cell();
-                self.grid.storage.delete_cells(
-                    self.cursor_row,
-                    self.cursor_col,
+                self.screen.grid.storage.delete_cells(
+                    self.screen.cursor_row,
+                    self.screen.cursor_col,
                     count,
                     blank,
                     WideCellEditPolicy::ClearBoundaryPairs,
                 );
-                self.mark_row_dirty(self.cursor_row);
+                self.mark_row_dirty(self.screen.cursor_row);
             }
             'X' => {
                 let count = params.first().copied().unwrap_or(1).max(1) as usize;
                 let blank = self.create_blank_cell();
-                self.grid.storage.erase_cells(
-                    self.cursor_row,
-                    self.cursor_col..self.cursor_col.saturating_add(count),
+                self.screen.grid.storage.erase_cells(
+                    self.screen.cursor_row,
+                    self.screen.cursor_col..self.screen.cursor_col.saturating_add(count),
                     blank,
                 );
-                self.mark_row_dirty(self.cursor_row);
+                self.mark_row_dirty(self.screen.cursor_row);
             }
             'q' => {
                 if private_prefix == Some(b'>')
@@ -8173,7 +8139,7 @@ impl TerminalState {
                 // DECSCUSR - Set cursor style
                 if private_prefix.is_none() && intermediates == *b" " {
                     let shape = params.first().copied().unwrap_or(0) as u8;
-                    self.cursor_shape = match shape {
+                    self.screen.cursor_shape = match shape {
                         0..=2 => CursorShape::Block,
                         3 | 4 => CursorShape::Underline,
                         5 | 6 => CursorShape::Beam,
@@ -8187,14 +8153,14 @@ impl TerminalState {
 
     /// DECALN (ESC # 8): fill the entire screen with 'E', used for alignment tests.
     fn decaln(&mut self) {
-        self.grid.storage.fill_cells(TerminalCell {
+        self.screen.grid.storage.fill_cells(TerminalCell {
             character: 'E',
             ..TerminalCell::default()
         });
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-        self.pending_wrap = false;
-        self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+        self.screen.cursor_row = 0;
+        self.screen.cursor_col = 0;
+        self.screen.pending_wrap = false;
+        self.mark_rows_dirty(0, self.screen.grid.rows().saturating_sub(1));
     }
 
     /// RIS (ESC c): reset the terminal to its initial state.
@@ -8202,26 +8168,26 @@ impl TerminalState {
         self.projection_scroll_guard.revoke();
         self.watch_batch.boundary = true;
         self.watch_batch.interrupted = true;
-        if self.use_alt_buffer {
+        if self.screen.use_alt_buffer {
             self.reset_mode(1049, true);
         }
         self.record_reset_interrupted_agent_command();
-        self.current_fg = Color::Default;
-        self.current_bg = Color::Default;
+        self.screen.current_fg = Color::Default;
+        self.screen.current_bg = Color::Default;
         self.global_bg = Color::Default;
-        self.current_flags = StyleFlags::default();
-        self.g0_charset = Charset::Ascii;
-        self.g1_charset = Charset::Ascii;
-        self.active_charset = Charset::Ascii;
-        self.scroll_region_top = 0;
-        self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
-        self.tab_stops = default_tab_stops(self.grid.row_len(), TabStopOrigin::Clear);
-        self.saved_cursor = None;
+        self.screen.current_flags = StyleFlags::default();
+        self.screen.g0_charset = Charset::Ascii;
+        self.screen.g1_charset = Charset::Ascii;
+        self.screen.active_charset = Charset::Ascii;
+        self.screen.scroll_region_top = 0;
+        self.screen.scroll_region_bottom = self.screen.grid.rows().saturating_sub(1);
+        self.screen.tab_stops = default_tab_stops(self.screen.grid.row_len(), TabStopOrigin::Clear);
+        self.screen.saved_state = None;
         *self.protocol.modes_mut() = Self::initial_protocol_modes();
-        self.insert_mode = false;
-        self.origin_mode = false;
+        self.screen.insert_mode = false;
+        self.screen.origin_mode = false;
         self.scroll_offset = 0;
-        self.pending_wrap = false;
+        self.screen.pending_wrap = false;
         // xterm RIS also discards saved lines and resets cursor style, dynamic
         // colors, keyboard-protocol state, selection, and any open hyperlink.
         if !self.scrollback.is_empty() {
@@ -8265,7 +8231,7 @@ impl TerminalState {
         self.current_command_started_at = None;
         self.last_archived_screen_snapshot.clear();
         self.last_synced_primary_screen_snapshot.clear();
-        self.cursor_shape = CursorShape::default();
+        self.screen.cursor_shape = CursorShape::default();
         self.colors.reset_dynamic();
         // RIS clears both screen-local Kitty stacks. Frost historically
         // retains the global xterm keyboard settings across this reset.
@@ -8274,7 +8240,7 @@ impl TerminalState {
         self.protocol.reset_keyboard_enhancement();
         self.protocol.switch_screen();
         self.clear_text_selection();
-        self.current_hyperlink = None;
+        self.screen.current_hyperlink = HyperlinkId::NONE;
         self.osc8_hyperlinks.clear();
         self.osc8_hyperlink_keys.clear();
         // RIS resets the graphics namespace with the text screen: neither a
@@ -8289,37 +8255,37 @@ impl TerminalState {
     /// screen or scrollback; it resets modes, margins, SGR, charsets and the
     /// saved cursor to their power-on defaults.
     fn soft_reset(&mut self) {
-        self.current_fg = Color::Default;
-        self.current_bg = Color::Default;
+        self.screen.current_fg = Color::Default;
+        self.screen.current_bg = Color::Default;
         self.global_bg = Color::Default;
-        self.current_flags = StyleFlags::default();
-        self.g0_charset = Charset::Ascii;
-        self.g1_charset = Charset::Ascii;
-        self.active_charset = Charset::Ascii;
-        self.scroll_region_top = 0;
-        self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
-        self.saved_cursor = None;
+        self.screen.current_flags = StyleFlags::default();
+        self.screen.g0_charset = Charset::Ascii;
+        self.screen.g1_charset = Charset::Ascii;
+        self.screen.active_charset = Charset::Ascii;
+        self.screen.scroll_region_top = 0;
+        self.screen.scroll_region_bottom = self.screen.grid.rows().saturating_sub(1);
+        self.screen.saved_state = None;
         // Reset the modes DECSTR is defined to touch: DECOM (6) off, IRM (4) off,
         // DECTCEM (25) on, DECAWM (7) on. Leave everything else as-is.
-        self.origin_mode = false;
-        self.insert_mode = false;
+        self.screen.origin_mode = false;
+        self.screen.insert_mode = false;
         self.protocol.modes_mut().insert(25);
         self.protocol.modes_mut().insert(7);
-        self.pending_wrap = false;
+        self.screen.pending_wrap = false;
     }
 
     fn clear_screen(&mut self) {
         self.clear_screen_no_home();
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-        self.pending_wrap = false;
+        self.screen.cursor_row = 0;
+        self.screen.cursor_col = 0;
+        self.screen.pending_wrap = false;
     }
 
     /// Erase the whole screen WITHOUT moving the cursor (ED / CSI 2 J).
     fn clear_screen_no_home(&mut self) {
         self.inline_cli_screen_erased();
         if self.sync_output_active {
-            if self.use_alt_buffer {
+            if self.screen.use_alt_buffer {
                 // The alternate screen holds no document, only the screen the
                 // app is currently painting, so an erase here is part of a
                 // repaint rather than history being destroyed. Treat it as one
@@ -8333,8 +8299,8 @@ impl TerminalState {
             self.archive_visible_screen_to_scrollback();
         }
         let blank = self.create_blank_cell();
-        self.grid.storage.fill_cells(blank);
-        self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+        self.screen.grid.storage.fill_cells(blank);
+        self.mark_rows_dirty(0, self.screen.grid.rows().saturating_sub(1));
     }
 
     fn set_mode(&mut self, mode: u16, private: bool) {
@@ -8343,7 +8309,7 @@ impl TerminalState {
             // Everything else (GATM 1, ERM 6, VEM 7, LNM 20, …) is ignored so
             // it can't collide with the identically-numbered DEC private modes.
             if mode == 4 {
-                self.insert_mode = true;
+                self.screen.insert_mode = true;
             }
             return;
         }
@@ -8385,11 +8351,11 @@ impl TerminalState {
                 self.protocol.modes_mut().insert(1048);
             }
             47 | 1047 | 1049 => {
-                if self.disable_alt_screen || self.use_alt_buffer {
+                if self.disable_alt_screen || self.screen.use_alt_buffer {
                     return;
                 }
                 self.saved_primary_global_bg = self.global_bg;
-                self.saved_primary_cursor_shape = self.cursor_shape;
+                self.screen.saved_primary_cursor_shape = Some(self.screen.cursor_shape);
                 self.saved_primary_colors = self.colors.clone();
                 self.scroll_offset = 0;
                 self.provisional_alt_snapshot = None;
@@ -8397,14 +8363,17 @@ impl TerminalState {
                 // Frost saves the primary cursor and clears the alternate grid
                 // for 47, 1047 and 1049 alike.
                 let autowrap = self.protocol.modes().contains(&7);
-                let entered = self.alternate_screen_controls().enter(true, autowrap);
+                let entered = self
+                    .screen
+                    .alternate_screen_controls()
+                    .enter(true, autowrap);
                 debug_assert!(entered);
                 self.protocol.switch_screen();
                 self.watch_batch.interrupted = true;
                 self.watch_batch.boundary = true;
                 self.projection_scroll_guard.revoke();
                 self.organism_idle_cwd = None;
-                self.current_hyperlink = None;
+                self.screen.current_hyperlink = HyperlinkId::NONE;
                 self.clear_text_selection();
                 self.clear_screen();
                 self.protocol.modes_mut().insert(mode);
@@ -8416,7 +8385,7 @@ impl TerminalState {
                 self.sync_output_start
                     .get_or_insert_with(std::time::Instant::now);
             }
-            6 => self.cursor_controls().set_origin_mode(true),
+            6 => self.screen.cursor_controls().set_origin_mode(true),
             7 => {
                 // Autowrap mode
                 self.protocol.modes_mut().insert(7);
@@ -8431,7 +8400,7 @@ impl TerminalState {
         if !private {
             // ANSI Reset Mode (CSI Pn l). Only IRM (4) is implemented.
             if mode == 4 {
-                self.insert_mode = false;
+                self.screen.insert_mode = false;
             }
             return;
         }
@@ -8472,6 +8441,7 @@ impl TerminalState {
             }
             47 | 1047 | 1049 => {
                 if let Some(effect) = self
+                    .screen
                     .alternate_screen_controls()
                     .leave(AlternateRestorePolicy::Frost)
                 {
@@ -8485,12 +8455,14 @@ impl TerminalState {
                     self.protocol.modes_mut().remove(&mode);
                     // Likewise, alt-screen OSC 8 state never leaks back onto
                     // newly printed primary-screen cells.
-                    self.current_hyperlink = None;
+                    self.screen.current_hyperlink = HyperlinkId::NONE;
 
                     self.clear_text_selection();
                     self.global_bg = self.saved_primary_global_bg;
                     self.saved_primary_global_bg = Color::Default;
-                    self.cursor_shape = self.saved_primary_cursor_shape;
+                    if let Some(shape) = self.screen.saved_primary_cursor_shape {
+                        self.screen.cursor_shape = shape;
+                    }
                     self.colors = self.saved_primary_colors.clone();
                     self.saved_primary_colors.reset_dynamic();
 
@@ -8503,7 +8475,7 @@ impl TerminalState {
             2026 => {
                 self.finish_synchronized_output();
             }
-            6 => self.cursor_controls().set_origin_mode(false),
+            6 => self.screen.cursor_controls().set_origin_mode(false),
             7 => {
                 // Disable autowrap
                 self.protocol.modes_mut().remove(&7);
@@ -8528,7 +8500,8 @@ impl TerminalState {
             .iter()
             .map(ScrollbackLine::search_text)
             .chain(
-                self.grid
+                self.screen
+                    .grid
                     .iter()
                     .map(|row| SearchLine::Cells(Cow::Borrowed(row))),
             )
@@ -8547,7 +8520,8 @@ impl TerminalState {
                 .map(ScrollbackLine::raw_row_id)
                 .filter(|row| row.is_tracked())
         } else {
-            self.grid
+            self.screen
+                .grid
                 .raw_row_id(absolute_row - self.scrollback.len())
                 .filter(|row| row.is_tracked())
         }
@@ -8562,7 +8536,7 @@ impl TerminalState {
         let width = if absolute_row < self.scrollback.len() {
             self.scrollback.get(absolute_row)?.columns()
         } else {
-            self.grid.cols()
+            self.screen.grid.cols()
         };
         if col >= width {
             return None;
@@ -8577,8 +8551,8 @@ impl TerminalState {
     /// centering historical matches when possible.
     pub fn reveal_buffer_row(&mut self, row: usize) {
         let history = self.scrollback.len();
-        let rows = self.grid.rows().max(1);
-        if row >= history + self.grid.rows() {
+        let rows = self.screen.grid.rows().max(1);
+        if row >= history + self.screen.grid.rows() {
             return;
         }
         let start = self.viewport_absolute_start();
@@ -8593,7 +8567,7 @@ impl TerminalState {
     /// Alternate-screen applications own their viewport; primary history is
     /// never exposed through their host scrollbar.
     pub fn set_scroll_offset(&mut self, offset: usize) {
-        if self.use_alt_buffer {
+        if self.screen.use_alt_buffer {
             self.scroll_offset = 0;
             return;
         }
@@ -8625,7 +8599,7 @@ impl TerminalState {
     }
 
     pub fn inline_cli_scope_floor(&self) -> Option<usize> {
-        (!self.use_alt_buffer)
+        (!self.screen.use_alt_buffer)
             .then(|| self.inline_cli_owner_floor())
             .flatten()
     }
@@ -8670,7 +8644,7 @@ impl TerminalState {
         // Turning the option on while an application is already in the alternate
         // buffer must first restore the primary buffer. The option only blocks
         // future *entries*; exit sequences are always honored.
-        if disable_alt_screen && !self.disable_alt_screen && self.use_alt_buffer {
+        if disable_alt_screen && !self.disable_alt_screen && self.screen.use_alt_buffer {
             self.reset_mode(1049, true);
         }
         self.disable_alt_screen = disable_alt_screen;
@@ -8714,13 +8688,13 @@ impl TerminalState {
     /// Publish a sub-row reader immediately, before another PTY batch can
     /// arrive. Such movement need not rebuild or repaint a whole-row viewport.
     pub fn hold_saved_lines_for_reading(&mut self) {
-        if !self.use_alt_buffer {
+        if !self.screen.use_alt_buffer {
             self.projected_saved_lines_held = true;
         }
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        if !self.use_alt_buffer {
+        if !self.screen.use_alt_buffer {
             self.projected_saved_lines_held = false;
         }
         self.scroll_offset = 0;
@@ -8755,7 +8729,7 @@ impl TerminalState {
     /// Public view of the alt-screen mode switch; block-mode chrome (and
     /// tests) read it — a full-screen app owns the whole grid.
     pub fn is_alt_buffer_active(&self) -> bool {
-        self.use_alt_buffer
+        self.screen.use_alt_buffer
     }
 
     pub fn is_bracketed_paste_enabled(&self) -> bool {
@@ -8786,24 +8760,24 @@ impl TerminalState {
     /// exact: a `Right` past the buffer end is what accepts jsh's inline
     /// suggestion.
     fn editable_span(&self) -> Option<click_cursor::InputSpan> {
-        let rows = self.grid.rows();
-        let cols = self.grid.cols();
+        let rows = self.screen.grid.rows();
+        let cols = self.screen.grid.cols();
         if rows == 0 || cols == 0 {
             return None;
         }
 
-        let cursor_row = self.cursor_row.min(rows - 1);
+        let cursor_row = self.screen.cursor_row.min(rows - 1);
         let mut first = cursor_row;
-        while first > 0 && self.grid.row_wrapped()[first - 1] {
+        while first > 0 && self.screen.grid.row_wrapped()[first - 1] {
             first -= 1;
         }
         let mut last = cursor_row;
-        while last + 1 < rows && self.grid.row_wrapped()[last] {
+        while last + 1 < rows && self.screen.grid.row_wrapped()[last] {
             last += 1;
         }
 
         let occupied = |row: usize, col: usize| {
-            let cell = self.grid.get(row, col);
+            let cell = self.screen.grid.get(row, col);
             // A wide character's continuation cell holds a blank but is
             // still occupied, so trailing CJK must not be trimmed away.
             cell.flags.wide_continuation() || !matches!(cell.character, ' ' | '\0' | '\u{a0}')
@@ -8844,7 +8818,8 @@ impl TerminalState {
                 gap_start -= 1;
             }
             if run_start - gap_start >= 3
-                && (end_row as i64, run_start as i64) > (cursor_row as i64, self.cursor_col as i64)
+                && (end_row as i64, run_start as i64)
+                    > (cursor_row as i64, self.screen.cursor_col as i64)
             {
                 end = scan_back(end_row, gap_start);
             }
@@ -8853,7 +8828,7 @@ impl TerminalState {
         // Trailing spaces the user typed are part of the buffer even though the
         // scan above cannot tell them from padding, so never place the end
         // before where the shell has its cursor.
-        let cursor = click_cursor::Cell::new(cursor_row as i64, self.cursor_col as i64);
+        let cursor = click_cursor::Cell::new(cursor_row as i64, self.screen.cursor_col as i64);
         if (end.row, end.col) < (cursor.row, cursor.col) {
             end = cursor;
         }
@@ -8885,8 +8860,8 @@ impl TerminalState {
         from: click_cursor::Cell,
         end: click_cursor::Cell,
     ) -> Option<click_cursor::Cell> {
-        let rows = self.grid.rows();
-        let cols = self.grid.cols();
+        let rows = self.screen.grid.rows();
+        let cols = self.screen.grid.cols();
         let mut row = from.row.max(0) as usize;
         let mut col = from.col.max(0) as usize;
         while row < rows && (row as i64, col as i64) < (end.row, end.col) {
@@ -8895,7 +8870,7 @@ impl TerminalState {
                 col = 0;
                 continue;
             }
-            if is_inline_suggestion_cell(self.grid.get(row, col)) {
+            if is_inline_suggestion_cell(self.screen.grid.get(row, col)) {
                 return Some(click_cursor::Cell::new(row as i64, col as i64));
             }
             col += 1;
@@ -8913,7 +8888,7 @@ impl TerminalState {
         let guards = click_cursor::Guards {
             enabled,
             mouse_reporting: self.is_mouse_enabled(),
-            alt_screen: self.use_alt_buffer,
+            alt_screen: self.screen.use_alt_buffer,
             scrolled_back: self.scroll_offset != 0,
             phase: self.shell_phase(),
         };
@@ -8921,8 +8896,9 @@ impl TerminalState {
             return Vec::new();
         }
 
-        let columns = self.grid.cols() as i64;
-        let cursor = click_cursor::Cell::new(self.cursor_row as i64, self.cursor_col as i64);
+        let columns = self.screen.grid.cols() as i64;
+        let cursor =
+            click_cursor::Cell::new(self.screen.cursor_row as i64, self.screen.cursor_col as i64);
         let click = click_cursor::Cell::new(click_row as i64, click_col as i64);
         let Some(span) = self.editable_span() else {
             return Vec::new();
@@ -8942,9 +8918,10 @@ impl TerminalState {
         let steps = click_cursor::char_steps(cursor, target, columns, |row, col| {
             row >= 0
                 && col >= 0
-                && (row as usize) < self.grid.rows()
-                && (col as usize) < self.grid.cols()
+                && (row as usize) < self.screen.grid.rows()
+                && (col as usize) < self.screen.grid.cols()
                 && self
+                    .screen
                     .grid
                     .get(row as usize, col as usize)
                     .flags
@@ -9017,14 +8994,19 @@ impl TerminalState {
             .enumerate()
             .map(|(absolute_row, line)| line.layout(absolute_row));
         let history_len = self.scrollback.len();
-        let grid_layouts = self.grid.iter().enumerate().map(|(grid_row, cells)| {
-            RawRowLayout::from_cells(
-                cells,
-                self.grid.row_wrapped()[grid_row],
-                history_len + grid_row,
-                self.grid.row_ids()[grid_row],
-            )
-        });
+        let grid_layouts = self
+            .screen
+            .grid
+            .iter()
+            .enumerate()
+            .map(|(grid_row, cells)| {
+                RawRowLayout::from_cells(
+                    cells,
+                    self.screen.grid.row_wrapped()[grid_row],
+                    history_len + grid_row,
+                    self.screen.grid.row_ids()[grid_row],
+                )
+            });
         ProjectionPlan::identity(history_layouts, grid_layouts, cols.max(1))
     }
 
@@ -9154,6 +9136,7 @@ impl TerminalState {
                     self.scrollback[previous].is_wrapped()
                 } else {
                     *self
+                        .screen
                         .grid
                         .row_wrapped()
                         .get(previous - self.scrollback.len())?
@@ -9175,21 +9158,21 @@ impl TerminalState {
         let Some(start) = self.running_zone_start().or_else(|| self.live_prompt_row()) else {
             return 0;
         };
-        let protected = (self.scrollback.len() + self.cursor_row + 1)
+        let protected = (self.scrollback.len() + self.screen.cursor_row + 1)
             .max(
                 self.active_app_extent_row()
                     .map_or(0, |row| row.saturating_add(1)),
             )
             .max(start.saturating_add(crate::block_mode::MIN_INPUT_ROWS));
-        (0..self.grid.rows())
+        (0..self.screen.grid.rows())
             .rev()
             .take_while(|&row| {
                 self.scrollback.len() + row >= protected
-                    && !self.grid.row_wrapped()[row]
+                    && !self.screen.grid.row_wrapped()[row]
                     && row
                         .checked_sub(1)
-                        .is_none_or(|previous| !self.grid.row_wrapped()[previous])
-                    && self.grid[row]
+                        .is_none_or(|previous| !self.screen.grid.row_wrapped()[previous])
+                    && self.screen.grid[row]
                         .iter()
                         .all(|cell| *cell == TerminalCell::default())
             })
@@ -9206,7 +9189,8 @@ impl TerminalState {
                 if previous < self.scrollback.len() {
                     self.scrollback[previous].is_wrapped()
                 } else {
-                    self.grid
+                    self.screen
+                        .grid
                         .row_wrapped()
                         .get(previous - self.scrollback.len())
                         .copied()
@@ -9290,7 +9274,7 @@ impl TerminalState {
             .splice_native_chrome(
                 &self.native_chrome_boundaries(policy),
                 self.native_chrome_tail_rows(policy),
-                self.grid.rows(),
+                self.screen.grid.rows(),
             )
     }
 
@@ -9507,12 +9491,12 @@ impl TerminalState {
             .skip(retained_history)
             .enumerate()
             .map(|(index, line)| line.layout(index));
-        let grid_layouts = self.grid.iter().enumerate().map(|(index, cells)| {
+        let grid_layouts = self.screen.grid.iter().enumerate().map(|(index, cells)| {
             RawRowLayout::from_cells(
                 cells,
-                self.grid.row_wrapped()[index],
+                self.screen.grid.row_wrapped()[index],
                 scrolled + index,
-                self.grid.row_ids()[index],
+                self.screen.grid.row_ids()[index],
             )
         });
         let mut suffix = ProjectionPlan::identity(history_layouts, grid_layouts, key.cols)
@@ -9596,11 +9580,11 @@ impl TerminalState {
             history_len: self.scrollback.len(),
             scrollback_pushes: self.scrollback_pushes,
             full_screen_scroll_revision: self.full_screen_scroll_revision,
-            grid_row_ids: self.grid.row_ids().iter().copied().collect(),
-            row_identity_revision: self.grid.identity_revision,
-            rows: self.grid.rows(),
+            grid_row_ids: self.screen.grid.row_ids().iter().copied().collect(),
+            row_identity_revision: self.screen.grid.identity_revision,
+            rows: self.screen.grid.rows(),
             cols,
-            row_wrapped: self.grid.row_wrapped().iter().copied().collect(),
+            row_wrapped: self.screen.grid.row_wrapped().iter().copied().collect(),
             policy_revision: policy.revision(),
             policy_ids: policy.ids(),
             block_spacing: policy.block_spacing,
@@ -9639,7 +9623,7 @@ impl TerminalState {
                             .as_slice()
                     } else {
                         let grid_row = slice.source.absolute_row - self.scrollback.len();
-                        &self.grid[grid_row]
+                        &self.screen.grid[grid_row]
                     };
                     let source_end = slice.source.col_start + slice.len;
                     let view_end = slice.view_col_start + slice.len;
@@ -9782,7 +9766,15 @@ impl TerminalState {
     fn live_view_provenance(&self, rows: usize, cols: usize) -> ProjectedProvenance {
         let mut origin_spans = Vec::with_capacity(rows);
         let mut row_sources = Vec::with_capacity(rows);
-        for (view_row, raw_row) in self.grid.row_ids().iter().copied().take(rows).enumerate() {
+        for (view_row, raw_row) in self
+            .screen
+            .grid
+            .row_ids()
+            .iter()
+            .copied()
+            .take(rows)
+            .enumerate()
+        {
             let source = raw_row.is_tracked().then_some(RowSource {
                 raw_row,
                 raw_absolute_row: self.scrollback.len() + view_row,
@@ -9842,12 +9834,12 @@ impl TerminalState {
             }));
         }
 
-        for (grid_row, raw_row) in self.grid.row_ids().iter().copied().enumerate() {
+        for (grid_row, raw_row) in self.screen.grid.row_ids().iter().copied().enumerate() {
             let view_row = history_rows + grid_row;
             if view_row >= rows {
                 break;
             }
-            cells.push(self.normalize_line_width(self.grid[grid_row].to_vec(), cols));
+            cells.push(self.normalize_line_width(self.screen.grid[grid_row].to_vec(), cols));
             let row_source = raw_row.is_tracked().then_some(RowSource {
                 raw_row,
                 raw_absolute_row: self.scrollback.len() + grid_row,
@@ -9888,7 +9880,9 @@ impl TerminalState {
         if let Some(reason) = self.projection_failure {
             return self.unavailable_viewport(reason);
         }
-        if let Err(reason) = self.cached_raw_preflight(self.grid.rows(), self.grid.cols().max(1)) {
+        if let Err(reason) =
+            self.cached_raw_preflight(self.screen.grid.rows(), self.screen.grid.cols().max(1))
+        {
             return self.unavailable_viewport(reason);
         }
 
@@ -9896,12 +9890,16 @@ impl TerminalState {
         // projected selection can never cross this boundary, while an
         // existing raw selection remains valid and must be preserved.
         self.projected_selection = None;
-        if self.use_alt_buffer {
+        if self.screen.use_alt_buffer {
             self.scroll_offset = 0;
         }
-        let rows = self.grid.rows();
-        let cols = if rows > 0 { self.grid.row_len() } else { 80 };
-        let mode = if block_mode && !self.use_alt_buffer {
+        let rows = self.screen.grid.rows();
+        let cols = if rows > 0 {
+            self.screen.grid.row_len()
+        } else {
+            80
+        };
+        let mode = if block_mode && !self.screen.use_alt_buffer {
             ProjectionMode::Identity
         } else {
             ProjectionMode::Bypass
@@ -9910,11 +9908,11 @@ impl TerminalState {
             cursor: self.frame_cursor(),
             grid_version: self.grid_version,
             history_revision: self.history_revision,
-            row_identity_revision: self.grid.identity_revision,
+            row_identity_revision: self.screen.grid.identity_revision,
             scroll_offset: self.scroll_offset,
             rows,
             cols,
-            use_alt_buffer: self.use_alt_buffer,
+            use_alt_buffer: self.screen.use_alt_buffer,
             mode,
             policy_revision: 0,
             policy_ids: SmallVec::new(),
@@ -9996,8 +9994,8 @@ impl TerminalState {
             source_revision: ProjectionSourceRevision {
                 grid: self.grid_version,
                 history: self.history_revision,
-                row_identity: self.grid.identity_revision,
-                alternate_screen: self.use_alt_buffer,
+                row_identity: self.screen.grid.identity_revision,
+                alternate_screen: self.screen.use_alt_buffer,
             },
             view_revision,
             identity_fast_path: self.scroll_offset == 0,
@@ -10006,7 +10004,7 @@ impl TerminalState {
             policy_revision: 0,
             policy_ids: std::sync::Arc::from([]),
             block_spacing: false,
-            document_rows: if self.use_alt_buffer {
+            document_rows: if self.screen.use_alt_buffer {
                 rows
             } else {
                 self.scrollback.len().saturating_add(rows)
@@ -10114,8 +10112,8 @@ impl TerminalState {
                         else {
                             continue;
                         };
-                        let Some(source) =
-                            (grid_row < self.grid.rows()).then(|| &self.grid[grid_row])
+                        let Some(source) = (grid_row < self.screen.grid.rows())
+                            .then(|| &self.screen.grid[grid_row])
                         else {
                             continue;
                         };
@@ -10239,17 +10237,17 @@ impl TerminalState {
         policy: &ProjectionPolicy,
         view_scroll_offset: usize,
     ) -> ProjectedViewportCacheKey {
-        let rows = self.grid.rows();
-        let cols = self.grid.cols().max(1);
+        let rows = self.screen.grid.rows();
+        let cols = self.screen.grid.cols().max(1);
         ProjectedViewportCacheKey {
             cursor: self.frame_cursor(),
             grid_version: self.grid_version,
             history_revision: self.history_revision,
-            row_identity_revision: self.grid.identity_revision,
+            row_identity_revision: self.screen.grid.identity_revision,
             scroll_offset: self.scroll_offset,
             rows,
             cols,
-            use_alt_buffer: self.use_alt_buffer,
+            use_alt_buffer: self.screen.use_alt_buffer,
             mode: ProjectionMode::Transformed,
             policy_revision: policy.revision(),
             policy_ids: policy.ids(),
@@ -10282,15 +10280,15 @@ impl TerminalState {
         self.projection_failure = None;
 
         if !block_mode
-            || self.use_alt_buffer
+            || self.screen.use_alt_buffer
             || policy.is_identity()
             || (policy.chat && self.chat_plan_key(policy).is_none())
         {
             return self.get_projected_viewport(block_mode);
         }
 
-        let rows = self.grid.rows();
-        let cols = self.grid.row_len().max(1);
+        let rows = self.screen.grid.rows();
+        let cols = self.screen.grid.row_len().max(1);
         let cache_key = self.projection_viewport_key(policy, view_scroll_offset);
         if let Some((failed_key, reason)) = &self.projection_material_failure {
             if failed_key == &cache_key {
@@ -10350,8 +10348,8 @@ impl TerminalState {
             source_revision: ProjectionSourceRevision {
                 grid: self.grid_version,
                 history: self.history_revision,
-                row_identity: self.grid.identity_revision,
-                alternate_screen: self.use_alt_buffer,
+                row_identity: self.screen.grid.identity_revision,
+                alternate_screen: self.screen.use_alt_buffer,
             },
             view_revision,
             identity_fast_path: false,
@@ -10388,10 +10386,10 @@ impl TerminalState {
         let scoped_policy = self.inline_cli_projection_policy();
         let policy = scoped_policy.as_ref().unwrap_or(policy);
 
-        if viewport.canvas_head || self.use_alt_buffer {
+        if viewport.canvas_head || self.screen.use_alt_buffer {
             return std::sync::Arc::clone(viewport);
         }
-        let cols = self.grid.row_len().max(1);
+        let cols = self.screen.grid.row_len().max(1);
         if viewport.mode != ProjectionMode::Transformed {
             // Keep one genuine predecessor row for fractional native scrolling.
             // The child PTY retains its exact grid dimensions and cursor space.
@@ -10477,7 +10475,7 @@ impl TerminalState {
         let materialized = match self.checked_materialize_projection(
             &plan,
             viewport.scroll_offset,
-            self.grid.rows(),
+            self.screen.grid.rows(),
             cols,
             true,
         ) {
@@ -10564,7 +10562,8 @@ impl TerminalState {
             .iter()
             .position(|line| line.raw_row_id() == raw_row)
             .or_else(|| {
-                self.grid
+                self.screen
+                    .grid
                     .row_ids()
                     .iter()
                     .position(|row| *row == raw_row)
@@ -10608,13 +10607,13 @@ impl TerminalState {
         let policy = scoped_policy.as_ref().unwrap_or(policy);
         let block_mode = block_mode || scoped_policy.is_some();
         let transformed = block_mode
-            && !self.use_alt_buffer
+            && !self.screen.use_alt_buffer
             && !policy.is_identity()
             && !(policy.chat && self.chat_plan_key(policy).is_none());
         // Publish the active reader before the next PTY batch. In particular,
         // a scoped CLI transcript leaves the legacy scroll_offset at zero.
         // Preserve primary ownership while an alternate screen is displayed.
-        if !self.use_alt_buffer {
+        if !self.screen.use_alt_buffer {
             self.projected_saved_lines_held =
                 (transformed && state.offset_from_bottom > 0) || state.reading_hold;
             if transformed {
@@ -10643,11 +10642,11 @@ impl TerminalState {
         self.projection_failure = None;
 
         if !block_mode
-            || self.use_alt_buffer
+            || self.screen.use_alt_buffer
             || (policy.chat && self.chat_plan_key(policy).is_none())
         {
             self.projected_selection = None;
-            if policy.chat && !self.use_alt_buffer {
+            if policy.chat && !self.screen.use_alt_buffer {
                 // D and the next A/B can arrive in different reads. Park a
                 // reader's raw history anchor through that native interval;
                 // otherwise the display jumps to the live grid and the next
@@ -10697,7 +10696,7 @@ impl TerminalState {
             return viewport;
         }
 
-        let cols = self.grid.row_len().max(1);
+        let cols = self.screen.grid.row_len().max(1);
         if state.last_plan_key.is_none() && self.scroll_offset > 0 {
             let identity = self.get_projected_viewport(true);
             state.top_anchor = Self::projected_top_anchor(&identity);
@@ -10721,7 +10720,7 @@ impl TerminalState {
 
         if state.last_plan_key.as_ref() != Some(&plan_key) {
             self.reanchor_projected_selection(&plan);
-            let max_start = plan.rows.len().saturating_sub(self.grid.rows());
+            let max_start = plan.rows.len().saturating_sub(self.screen.grid.rows());
             if state.follow_bottom {
                 state.offset_from_bottom = 0;
             } else if let Some(target) = state
@@ -10840,14 +10839,14 @@ impl TerminalState {
         let scoped_policy = self.inline_cli_projection_policy();
         let policy = scoped_policy.as_ref().unwrap_or(policy);
 
-        if policy.is_identity() || self.use_alt_buffer {
+        if policy.is_identity() || self.screen.use_alt_buffer {
             let Some(absolute) = self.retained_absolute_for_raw(origin.row) else {
                 return false;
             };
             self.reveal_buffer_row(absolute);
             return true;
         }
-        let cols = self.grid.row_len().max(1);
+        let cols = self.screen.grid.row_len().max(1);
         let plan_key = self.projection_plan_cache_key(cols, policy);
         let checked = match self.checked_collapsed_projection_plan(cols, policy) {
             Ok(plan) => plan,
@@ -10872,7 +10871,7 @@ impl TerminalState {
         else {
             return false;
         };
-        let max_start = plan.rows.len().saturating_sub(self.grid.rows());
+        let max_start = plan.rows.len().saturating_sub(self.screen.grid.rows());
         state.offset_from_bottom = max_start.saturating_sub(target.min(max_start));
         state.follow_bottom = false;
         state.top_anchor = Some(ProjectedTopAnchor::RawCell(origin));
@@ -10893,10 +10892,10 @@ impl TerminalState {
         let scoped_policy = self.inline_cli_projection_policy();
         let policy = scoped_policy.as_ref().unwrap_or(policy);
 
-        if policy.is_identity() || self.use_alt_buffer {
+        if policy.is_identity() || self.screen.use_alt_buffer {
             return false;
         }
-        let cols = self.grid.row_len().max(1);
+        let cols = self.screen.grid.row_len().max(1);
         let plan_key = self.projection_plan_cache_key(cols, policy);
         let checked = match self.checked_collapsed_projection_plan(cols, policy) {
             Ok(plan) => plan,
@@ -10920,7 +10919,7 @@ impl TerminalState {
             return false;
         }
 
-        let max_start = plan.rows.len().saturating_sub(self.grid.rows());
+        let max_start = plan.rows.len().saturating_sub(self.screen.grid.rows());
         state.offset_from_bottom = max_start.saturating_sub(summary_row.min(max_start));
         state.follow_bottom = false;
         state.top_anchor = Some(ProjectedTopAnchor::Summary {
@@ -10935,13 +10934,14 @@ impl TerminalState {
         // A host can temporarily retain an out-of-grid cursor during layout
         // changes. Frames require physical bounds: hide that paint cursor and
         // clamp its metadata without changing the terminal's protocol state.
-        let in_bounds = self.cursor_row < self.grid.rows() && self.cursor_col < self.grid.cols();
+        let in_bounds = self.screen.cursor_row < self.screen.grid.rows()
+            && self.screen.cursor_col < self.screen.grid.cols();
         jterm_engine::frame::Cursor {
-            row: self.cursor_row.min(self.grid.rows() - 1),
-            col: self.cursor_col.min(self.grid.cols() - 1),
-            pending_wrap: self.pending_wrap,
+            row: self.screen.cursor_row.min(self.screen.grid.rows() - 1),
+            col: self.screen.cursor_col.min(self.screen.grid.cols() - 1),
+            pending_wrap: self.screen.pending_wrap,
             visible: self.cursor_enabled() && in_bounds,
-            shape: self.cursor_shape,
+            shape: self.screen.cursor_shape,
         }
     }
 
@@ -10952,12 +10952,14 @@ impl TerminalState {
         if let Some(reason) = self.projection_failure {
             return self.unavailable_viewport(reason).cells.clone();
         }
-        if let Err(reason) = self.cached_raw_preflight(self.grid.rows(), self.grid.cols().max(1)) {
+        if let Err(reason) =
+            self.cached_raw_preflight(self.screen.grid.rows(), self.screen.grid.cols().max(1))
+        {
             return self.unavailable_viewport(reason).cells.clone();
         }
 
         use jterm_engine::frame::{Limits, Row, Screen, Stamp};
-        if self.use_alt_buffer {
+        if self.screen.use_alt_buffer {
             self.scroll_offset = 0;
         }
         let cursor = self.frame_cursor();
@@ -10969,14 +10971,14 @@ impl TerminalState {
                 return cells.clone();
             }
         }
-        let rows = self.grid.rows();
-        let cols = self.grid.cols();
+        let rows = self.screen.grid.rows();
+        let cols = self.screen.grid.cols();
         let (cells, provenance) = if self.scroll_offset == 0 {
             let old = self
                 .visible_cells_cache
                 .as_ref()
                 .and_then(|(_, _, rows, _)| rows.raw_frame());
-            let screen = if self.use_alt_buffer {
+            let screen = if self.screen.use_alt_buffer {
                 Screen::Alternate
             } else {
                 Screen::Primary
@@ -10995,6 +10997,7 @@ impl TerminalState {
                     .expect("frame layout exhausted");
             }
             let shared_rows = self
+                .screen
                 .grid
                 .iter()
                 .enumerate()
@@ -11009,7 +11012,7 @@ impl TerminalState {
                             || std::sync::Arc::from(cells),
                             |old| old.rows()[index].cells.clone(),
                         ),
-                        wrapped: self.grid.row_wrapped()[index],
+                        wrapped: self.screen.grid.row_wrapped()[index],
                     }
                 })
                 .collect::<Vec<_>>();
@@ -11050,16 +11053,16 @@ impl TerminalState {
     }
 
     pub fn get_cursor_pos(&self) -> (usize, usize) {
-        (self.cursor_row, self.cursor_col)
+        (self.screen.cursor_row, self.screen.cursor_col)
     }
 
     /// 获取当前可见行的wrapped状态，用于跨行链接检测
     pub fn get_visible_row_wrapped(&self) -> Vec<bool> {
-        let rows = self.grid.rows();
+        let rows = self.screen.grid.rows();
 
         if self.scroll_offset == 0 {
             // Fast path: just get current grid wrapped flags
-            self.grid.row_wrapped().to_vec()
+            self.screen.grid.row_wrapped().to_vec()
         } else {
             // Slow path: need to reconstruct from scrollback
             // For simplicity, when scrolling we disable wrapped link detection
@@ -11204,7 +11207,7 @@ impl TerminalState {
             && self.projection_plan_key_matches_current_source(key)
             && projection.source_revision.history == key.history_revision
             && projection.source_revision.row_identity == key.row_identity_revision
-            && projection.source_revision.alternate_screen == self.use_alt_buffer
+            && projection.source_revision.alternate_screen == self.screen.use_alt_buffer
             && plan.rows.len() == projection.document_rows()
             && plan.policy_revision == projection.policy_revision())
         .then_some(plan.plan_revision)
@@ -11217,10 +11220,10 @@ impl TerminalState {
                 .as_ref()
                 .is_none_or(|chat| self.chat_key_is_current(chat))
             && key.history_revision == self.history_revision
-            && key.row_identity_revision == self.grid.identity_revision
-            && key.rows == self.grid.rows()
-            && key.cols == self.grid.row_len().max(1)
-            && key.row_wrapped.as_slice() == self.grid.row_wrapped()
+            && key.row_identity_revision == self.screen.grid.identity_revision
+            && key.rows == self.screen.grid.rows()
+            && key.cols == self.screen.grid.row_len().max(1)
+            && key.row_wrapped.as_slice() == self.screen.grid.row_wrapped()
             && key.next_zone_id == self.next_zone_id
             && key.zone_count == self.command_zones.len()
             && key.provenance_count == self.finished_output_provenance.len()
@@ -11813,7 +11816,7 @@ impl TerminalState {
         let Some(sel) = self.selection else {
             return;
         };
-        let cols = self.grid.row_len();
+        let cols = self.screen.grid.row_len();
         let target_row = self.viewport_row_to_absolute(row);
         let origin_row = sel.anchor.0;
 
@@ -12052,7 +12055,7 @@ impl TerminalState {
         {
             return None;
         }
-        copy_projected_cells(plan, selection, &self.scrollback, &self.grid)
+        copy_projected_cells(plan, selection, &self.scrollback, &self.screen.grid)
     }
 
     pub(crate) fn select_link_in_projection(
@@ -12163,8 +12166,8 @@ impl TerminalState {
             };
             let mut result = String::new();
             let scrollback_len = self.scrollback.len();
-            let grid_rows = self.grid.rows();
-            let cols = self.grid.row_len();
+            let grid_rows = self.screen.grid.rows();
+            let cols = self.screen.grid.row_len();
             let total_rows = scrollback_len + grid_rows;
 
             let block = matches!(sel.mode, SelectionMode::Block);
@@ -12189,7 +12192,7 @@ impl TerminalState {
                     self.scrollback[abs_row].is_wrapped()
                 } else {
                     let grid_row = abs_row - scrollback_len;
-                    grid_row < grid_rows && self.grid.row_wrapped()[grid_row]
+                    grid_row < grid_rows && self.screen.grid.row_wrapped()[grid_row]
                 };
 
                 if abs_row < scrollback_len {
@@ -12206,7 +12209,7 @@ impl TerminalState {
                     let grid_row = abs_row - scrollback_len;
                     if grid_row < grid_rows {
                         for col in start_col..=end_col {
-                            let cell = self.grid.get(grid_row, col);
+                            let cell = self.screen.grid.get(grid_row, col);
                             if !cell.flags.wide_continuation() {
                                 result.push(cell.character);
                             }
@@ -12229,7 +12232,7 @@ impl TerminalState {
     pub fn scroll(&mut self, lines: isize) {
         // Native alternate-screen apps own scrolling, irrespective of whether
         // primary history or legacy synchronized snapshots are retained.
-        if self.use_alt_buffer {
+        if self.screen.use_alt_buffer {
             self.scroll_offset = 0;
             return;
         }
@@ -12404,7 +12407,7 @@ impl TerminalState {
             self.clear_text_selection();
             return false;
         }
-        let cols = self.grid.row_len().max(1);
+        let cols = self.screen.grid.row_len().max(1);
         // Historical padding must stay neutral even when a live application has
         // a non-default background active at the instant the resize settles.
         let blank_cell = TerminalCell::default();
@@ -12490,7 +12493,7 @@ impl TerminalState {
         }
 
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
-        if cols != self.grid.row_len() {
+        if cols != self.screen.grid.row_len() {
             if let Some(pending) = self.idle_background_output.as_mut() {
                 // The retained byte stream does not encode reflow. Do not
                 // present a mixed-width reconstruction as an exact snapshot.
@@ -12501,18 +12504,20 @@ impl TerminalState {
                 }
             }
         }
-        let old_rows = self.grid.rows();
+        let old_rows = self.screen.grid.rows();
         let had_full_screen_region = old_rows == 0
-            || (self.scroll_region_top == 0 && self.scroll_region_bottom + 1 >= old_rows);
+            || (self.screen.scroll_region_top == 0
+                && self.screen.scroll_region_bottom + 1 >= old_rows);
 
         let active_blank_cell = self.create_blank_cell();
-        let primary_blank_bg = if self.use_alt_buffer {
-            self.saved_primary_screen_state
+        let primary_blank_bg = if self.screen.use_alt_buffer {
+            self.screen
+                .saved_primary_screen_state
                 .as_ref()
                 .map(|state| state.bg)
                 .unwrap_or(Color::Default)
         } else {
-            self.current_bg
+            self.screen.current_bg
         };
         let primary_blank_cell = self.blank_cell_with_bg(primary_blank_bg);
         let alt_blank_cell = active_blank_cell;
@@ -12522,13 +12527,13 @@ impl TerminalState {
         // rest up, rather than letting TerminalGrid::resize silently truncate the
         // BOTTOM rows (where the prompt/cursor usually live). The cursor is kept
         // on-screen. (Column reflow on width change is not done here.)
-        if !self.use_alt_buffer && old_rows > rows {
+        if !self.screen.use_alt_buffer && old_rows > rows {
             let top_remove = jterm_engine::screen::rows_to_archive_on_height_shrink(
                 old_rows,
                 rows,
-                self.cursor_row,
+                self.screen.cursor_row,
                 |row| {
-                    self.grid[row]
+                    self.screen.grid[row]
                         .iter()
                         .all(TerminalCell::is_reflow_trimmable_blank)
                 },
@@ -12536,17 +12541,19 @@ impl TerminalState {
             if top_remove > 0 {
                 for r in 0..top_remove {
                     let line = ScrollbackLine::compress_with_raw_row_id(
-                        &self.grid[r],
-                        self.grid.row_wrapped()[r],
-                        self.grid.row_ids()[r],
+                        &self.screen.grid[r],
+                        self.screen.grid.row_wrapped()[r],
+                        self.screen.grid.row_ids()[r],
                     );
                     self.push_scrollback_compressed(line);
                 }
-                self.grid
+                self.screen
+                    .grid
                     .discard_top_rows_for_resize(top_remove, active_blank_cell);
-                self.cursor_row -= top_remove;
-                self.saved_cursor_row = self.saved_cursor_row.saturating_sub(top_remove);
-                if let Some(saved) = self.saved_cursor.as_mut() {
+                self.screen.cursor_row -= top_remove;
+                self.screen.saved_cursor_row =
+                    self.screen.saved_cursor_row.saturating_sub(top_remove);
+                if let Some(saved) = self.screen.saved_state.as_mut() {
                     saved.row = saved.row.saturating_sub(top_remove);
                 }
             }
@@ -12562,12 +12569,12 @@ impl TerminalState {
             self.settle_zone_row_trim();
         }
 
-        if self.use_alt_buffer {
-            self.grid.resize(rows, cols, alt_blank_cell);
-            self.alt_grid.resize(rows, cols, primary_blank_cell);
+        if self.screen.use_alt_buffer {
+            self.screen.grid.resize(rows, cols, alt_blank_cell);
+            self.screen.alt_grid.resize(rows, cols, primary_blank_cell);
         } else {
-            self.grid.resize(rows, cols, active_blank_cell);
-            self.alt_grid.resize(rows, cols, active_blank_cell);
+            self.screen.grid.resize(rows, cols, active_blank_cell);
+            self.screen.alt_grid.resize(rows, cols, active_blank_cell);
         }
 
         // CRITICAL: Sync row_versions size with grid size to prevent dirty mark loss
@@ -12578,15 +12585,15 @@ impl TerminalState {
 
         // Keep the tab-stop table sized to the new column count, defaulting any
         // newly added columns to the standard every-8 stops.
-        resize_tab_stops(&mut self.tab_stops, cols, TabStopOrigin::Clear);
+        resize_tab_stops(&mut self.screen.tab_stops, cols, TabStopOrigin::Clear);
 
         // Resizing the live grid must not cancel a user's scrollback read. A
         // row shrink may have pushed grid rows into history above, and the
         // push helper already increased the offset to keep the same top row.
         // Growing or changing width leaves the retained-history distance valid.
         self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
-        self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
-        self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
+        self.screen.cursor_row = self.screen.cursor_row.min(rows.saturating_sub(1));
+        self.screen.cursor_col = self.screen.cursor_col.min(cols.saturating_sub(1));
         // Width resize mutates grid rows, but retained scrollback keeps its old
         // width until the deferred normalization pass. Clamp a C-row column
         // only while that row is still in the resized (possibly hidden
@@ -12604,21 +12611,23 @@ impl TerminalState {
         self.current_output_extent_row = self
             .current_output_extent_row
             .map(|row| row.min(last_buffer_row));
-        self.pending_wrap = false;
-        self.saved_cursor_row = self.saved_cursor_row.min(rows.saturating_sub(1));
-        self.saved_cursor_col = self.saved_cursor_col.min(cols.saturating_sub(1));
-        self.alt_cursor_row = self.alt_cursor_row.min(rows.saturating_sub(1));
-        self.alt_cursor_col = self.alt_cursor_col.min(cols.saturating_sub(1));
+        self.screen.pending_wrap = false;
+        self.screen.saved_cursor_row = self.screen.saved_cursor_row.min(rows.saturating_sub(1));
+        self.screen.saved_cursor_col = self.screen.saved_cursor_col.min(cols.saturating_sub(1));
+        self.screen.alt_cursor_row = self.screen.alt_cursor_row.min(rows.saturating_sub(1));
+        self.screen.alt_cursor_col = self.screen.alt_cursor_col.min(cols.saturating_sub(1));
         if had_full_screen_region {
-            self.scroll_region_top = 0;
-            self.scroll_region_bottom = rows.saturating_sub(1);
+            self.screen.scroll_region_top = 0;
+            self.screen.scroll_region_bottom = rows.saturating_sub(1);
         } else {
-            self.scroll_region_top = self.scroll_region_top.min(rows.saturating_sub(1));
-            self.scroll_region_bottom = self.scroll_region_bottom.min(rows.saturating_sub(1));
+            self.screen.scroll_region_top =
+                self.screen.scroll_region_top.min(rows.saturating_sub(1));
+            self.screen.scroll_region_bottom =
+                self.screen.scroll_region_bottom.min(rows.saturating_sub(1));
 
-            if self.scroll_region_top > self.scroll_region_bottom {
-                self.scroll_region_top = 0;
-                self.scroll_region_bottom = rows.saturating_sub(1);
+            if self.screen.scroll_region_top > self.screen.scroll_region_bottom {
+                self.screen.scroll_region_top = 0;
+                self.screen.scroll_region_bottom = rows.saturating_sub(1);
             }
         }
 
@@ -12631,10 +12640,10 @@ impl TerminalState {
     }
 
     pub fn get_dimensions(&self) -> (usize, usize) {
-        if self.grid.is_empty() {
+        if self.screen.grid.is_empty() {
             (0, 0)
         } else {
-            (self.grid.row_len(), self.grid.rows())
+            (self.screen.grid.row_len(), self.screen.grid.rows())
         }
     }
 
@@ -12924,18 +12933,23 @@ mod tests {
         // Insert with the cursor on the continuation half of 中.
         terminal.process_input(b"\x1b[1;4H\x1b[2@");
 
-        for col in 0..terminal.grid.row_len() {
-            let cell = terminal.grid.get(0, col);
+        for col in 0..terminal.screen.grid.row_len() {
+            let cell = terminal.screen.grid.get(0, col);
             if cell.flags.wide() {
                 assert!(
-                    col + 1 < terminal.grid.row_len()
-                        && terminal.grid.get(0, col + 1).flags.wide_continuation(),
+                    col + 1 < terminal.screen.grid.row_len()
+                        && terminal
+                            .screen
+                            .grid
+                            .get(0, col + 1)
+                            .flags
+                            .wide_continuation(),
                     "lead at {col} lost its continuation"
                 );
             }
             if cell.flags.wide_continuation() {
                 assert!(
-                    col > 0 && terminal.grid.get(0, col - 1).flags.wide(),
+                    col > 0 && terminal.screen.grid.get(0, col - 1).flags.wide(),
                     "continuation at {col} lost its lead"
                 );
             }
@@ -12950,18 +12964,23 @@ mod tests {
         // Delete a window whose right edge falls inside 中.
         terminal.process_input(b"\x1b[1;2H\x1b[2P");
 
-        for col in 0..terminal.grid.row_len() {
-            let cell = terminal.grid.get(0, col);
+        for col in 0..terminal.screen.grid.row_len() {
+            let cell = terminal.screen.grid.get(0, col);
             if cell.flags.wide() {
                 assert!(
-                    col + 1 < terminal.grid.row_len()
-                        && terminal.grid.get(0, col + 1).flags.wide_continuation(),
+                    col + 1 < terminal.screen.grid.row_len()
+                        && terminal
+                            .screen
+                            .grid
+                            .get(0, col + 1)
+                            .flags
+                            .wide_continuation(),
                     "lead at {col} lost its continuation"
                 );
             }
             if cell.flags.wide_continuation() {
                 assert!(
-                    col > 0 && terminal.grid.get(0, col - 1).flags.wide(),
+                    col > 0 && terminal.screen.grid.get(0, col - 1).flags.wide(),
                     "continuation at {col} lost its lead"
                 );
             }
@@ -14094,7 +14113,7 @@ mod tests {
         // retained prefix itself remains strictly smaller than the byte cap.
         let mut row_dropped = super::TerminalState::new(1024, 256);
         for row in 0..256 {
-            for cell in &mut row_dropped.grid[row] {
+            for cell in &mut row_dropped.screen.grid[row] {
                 cell.character = 'x';
             }
         }
@@ -14109,14 +14128,14 @@ mod tests {
         // length alone must not turn it into a false truncation report.
         let mut exact = super::TerminalState::new(1024, 64);
         for row in 0..63 {
-            for cell in &mut exact.grid[row] {
+            for cell in &mut exact.screen.grid[row] {
                 cell.character = '\u{1f600}';
             }
         }
-        for cell in exact.grid[63].iter_mut().take(1008) {
+        for cell in exact.screen.grid[63].iter_mut().take(1008) {
             cell.character = '\u{1f600}';
         }
-        exact.grid[63][1008].character = 'x';
+        exact.screen.grid[63][1008].character = 'x';
         let (text, capped) = exact.rows_text(0, 64, CAP);
         assert_eq!(text.len(), CAP);
         assert!(!capped);
@@ -14539,7 +14558,7 @@ mod tests {
     fn opaque_hyperlink_ids_still_require_frost_interner_and_opener() {
         let mut terminal = TerminalState::new(8, 2);
         terminal.process_batch(b"\x1b]8;;https://example.com/x\x1b\\L");
-        let valid: jterm_engine::TerminalCell = terminal.grid[0][0];
+        let valid: jterm_engine::TerminalCell = terminal.screen.grid[0][0];
         assert!(!valid.hyperlink_id.is_none());
         assert_eq!(
             terminal.osc8_links_in_visible_cells(&[vec![valid]]).len(),
@@ -14791,7 +14810,7 @@ mod tests {
             let eager = TerminalState::reflow_projected_origins(&history, cols, 0);
             assert_eq!(
                 plan.rows.len(),
-                eager.len() + terminal.grid.rows(),
+                eager.len() + terminal.screen.grid.rows(),
                 "width {cols}"
             );
             for (planned, eager) in plan.rows.iter().zip(&eager) {
@@ -14876,8 +14895,8 @@ mod tests {
         wide[0].flags.set_wide(true);
         wide[1].flags.set_wide_continuation(true);
         terminal.push_scrollback_compressed(ScrollbackLine::compress(&wide, true));
-        terminal.grid.get_mut(0, 0).character = 'G';
-        terminal.grid.row_wrapped_mut()[0] = true;
+        terminal.screen.grid.get_mut(0, 0).character = 'G';
+        terminal.screen.grid.row_wrapped_mut()[0] = true;
 
         let plan = terminal.identity_projection_plan(1);
         assert_eq!(
@@ -14889,7 +14908,7 @@ mod tests {
         assert_eq!(
             plan.rows[1].row_source,
             Some(super::RowSource {
-                raw_row: terminal.grid.row_ids()[0],
+                raw_row: terminal.screen.grid.row_ids()[0],
                 raw_absolute_row: 1,
             })
         );
@@ -14903,9 +14922,9 @@ mod tests {
     #[test]
     fn identity_projection_plan_untracked_sources_keep_bytes_but_origins_fail_closed() {
         let mut terminal = TerminalState::new(6, 2);
-        terminal.grid.get_mut(0, 0).character = 'x';
-        terminal.grid.get_mut(1, 0).character = 'g';
-        terminal.grid.row_ids_mut()[1] = super::RawRowId::UNTRACKED;
+        terminal.screen.grid.get_mut(0, 0).character = 'x';
+        terminal.screen.grid.get_mut(1, 0).character = 'g';
+        terminal.screen.grid.row_ids_mut()[1] = super::RawRowId::UNTRACKED;
         let mut history_cells = vec![TerminalCell::default(); 6];
         history_cells[0].character = 'h';
         history_cells[1].foreground = Color::Red;
@@ -14926,7 +14945,7 @@ mod tests {
         assert_eq!(
             plan.rows[1].row_source,
             Some(super::RowSource {
-                raw_row: terminal.grid.row_ids()[0],
+                raw_row: terminal.screen.grid.row_ids()[0],
                 raw_absolute_row: 1,
             })
         );
@@ -14940,7 +14959,7 @@ mod tests {
             .into_iter()
             .map(|line| line.cells)
             .collect::<Vec<_>>();
-        expected.extend(terminal.grid.to_vec());
+        expected.extend(terminal.screen.grid.to_vec());
         assert_eq!(actual, expected, "UNTRACKED affects origins, never cells");
     }
 
@@ -14972,7 +14991,7 @@ mod tests {
             0,
             "cached layout planning must not scan encoded cell records"
         );
-        assert_eq!(plan.rows.len(), 10_000 + terminal.grid.rows());
+        assert_eq!(plan.rows.len(), 10_000 + terminal.screen.grid.rows());
         assert!(plan.raw_slice_count <= plan.rows.len());
         assert_eq!(
             plan.metadata_units(),
@@ -14986,19 +15005,25 @@ mod tests {
         let mut terminal = TerminalState::new(6, 3);
         terminal.process_batch("A中Z".as_bytes());
         let expected = terminal.get_visible_cells();
-        let row_ids: Vec<_> = (0..terminal.grid.rows())
-            .map(|row| terminal.grid.raw_row_id(row).expect("retained row id"))
+        let row_ids: Vec<_> = (0..terminal.screen.grid.rows())
+            .map(|row| {
+                terminal
+                    .screen
+                    .grid
+                    .raw_row_id(row)
+                    .expect("retained row id")
+            })
             .collect();
 
         let projection = terminal.get_projected_viewport(true);
         assert!(projection.is_identity());
         assert!(projection.uses_identity_fast_path());
         assert_eq!(projection.cells(), expected.as_ref());
-        assert_eq!(projection.row_wrapped(), terminal.grid.row_wrapped());
+        assert_eq!(projection.row_wrapped(), terminal.screen.grid.row_wrapped());
         assert!(std::sync::Arc::ptr_eq(&expected, &projection.cells));
 
         for (row, row_id) in row_ids.into_iter().enumerate() {
-            for col in 0..terminal.grid.cols() {
+            for col in 0..terminal.screen.grid.cols() {
                 let view = super::ViewportCell { row, col };
                 let origin = projection.view_to_raw(view).expect("live raw origin");
                 assert_eq!(origin, super::RawCellOrigin { row: row_id, col });
@@ -15028,7 +15053,11 @@ mod tests {
             "\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07中Z\x1b]133;D;0\x07".as_bytes(),
         );
         let zone_id = terminal.command_zones.back().expect("finished zone").id;
-        let row_id = terminal.grid.raw_row_id(0).expect("tracked output row");
+        let row_id = terminal
+            .screen
+            .grid
+            .raw_row_id(0)
+            .expect("tracked output row");
         let before_suffix = terminal
             .finished_output_range(zone_id)
             .expect("exact finished output");
@@ -15085,7 +15114,11 @@ mod tests {
             .expect("blank rows retain exact provenance");
         assert_eq!(
             range.end.row,
-            terminal.grid.raw_row_id(2).expect("last blank output row")
+            terminal
+                .screen
+                .grid
+                .raw_row_id(2)
+                .expect("last blank output row")
         );
         assert_eq!(range.end.col, 12);
         assert_eq!(
@@ -15097,9 +15130,9 @@ mod tests {
     #[test]
     fn finished_output_range_expands_wide_boundaries_and_rejects_replacement() {
         let mut terminal = TerminalState::new(8, 3);
-        terminal.grid[0][2].character = '中';
-        terminal.grid[0][2].flags.set_wide(true);
-        terminal.grid[0][3].flags.set_wide_continuation(true);
+        terminal.screen.grid[0][2].character = '中';
+        terminal.screen.grid[0][2].flags.set_wide(true);
+        terminal.screen.grid[0][3].flags.set_wide_continuation(true);
         let provenance = terminal
             .bind_finished_output_provenance(0, 3, 0, 3)
             .expect("wide boundaries become nonempty");
@@ -15118,12 +15151,13 @@ mod tests {
             .finished_output_range(zone_id)
             .expect("bound provenance");
         let row = terminal
+            .screen
             .grid
             .row_ids()
             .iter()
             .position(|row| *row == range.start.row)
             .expect("range row retained");
-        terminal.grid.row_ids_mut()[row] = super::fresh_raw_row_id();
+        terminal.screen.grid.row_ids_mut()[row] = super::fresh_raw_row_id();
         assert_eq!(terminal.finished_output_range(zone_id), None);
     }
 
@@ -15134,14 +15168,14 @@ mod tests {
             "\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07中Z\x1b]133;D;0\x07界$ next".as_bytes(),
         );
         let zone_id = terminal.command_zones.back().expect("finished zone").id;
-        let raw_before = terminal.grid.to_vec();
+        let raw_before = terminal.screen.grid.to_vec();
         let identity = terminal.identity_projection_plan(20);
         let mut policy = super::ProjectionPolicy::new();
         assert!(policy.collapse(zone_id));
         let collapsed = terminal.collapsed_projection_plan(20, &policy);
 
         assert_eq!(
-            terminal.grid.to_vec(),
+            terminal.screen.grid.to_vec(),
             raw_before,
             "projection is read-only"
         );
@@ -15218,7 +15252,11 @@ mod tests {
     fn collapse_plan_keeps_two_disjoint_ranges_on_one_raw_row() {
         let mut terminal = TerminalState::new(12, 2);
         terminal.process_input(b"abcdefghijkl");
-        let raw_row = terminal.grid.raw_row_id(0).expect("tracked grid row");
+        let raw_row = terminal
+            .screen
+            .grid
+            .raw_row_id(0)
+            .expect("tracked grid row");
         let base = terminal.identity_projection_plan(12);
         let collapses = [
             super::ResolvedCollapse {
@@ -15445,7 +15483,7 @@ mod tests {
         );
         assert!(live
             .iter()
-            .all(|&row| row < mid_batch.scrollback.len() + mid_batch.grid.rows()));
+            .all(|&row| row < mid_batch.scrollback.len() + mid_batch.screen.grid.rows()));
 
         // `on_resize` is the one trimming entry point reached from the window
         // manager rather than from the ingest path, so it has to settle on its
@@ -15474,7 +15512,7 @@ mod tests {
         assert_eq!(resized.pending_zone_row_trim, 0);
         let before = anchors(&resized);
         for row in 0..6 {
-            resized.cursor_row = resized.grid.rows().saturating_sub(1);
+            resized.screen.cursor_row = resized.screen.grid.rows().saturating_sub(1);
             resized.on_resize(20, 7 - row);
             assert_eq!(
                 resized.pending_zone_row_trim, 0,
@@ -15495,7 +15533,7 @@ mod tests {
         assert!(
             live_after
                 .iter()
-                .all(|&row| row < resized.scrollback.len() + resized.grid.rows()),
+                .all(|&row| row < resized.scrollback.len() + resized.screen.grid.rows()),
             "every retained anchor stays inside the buffer: {live_after:?}"
         );
     }
@@ -15654,7 +15692,7 @@ mod tests {
             .expect("exact output range");
         let mut policy = super::ProjectionPolicy::new();
         assert!(policy.collapse(zone_id));
-        terminal.current_bg = Color::Red;
+        terminal.screen.current_bg = Color::Red;
         let viewport = terminal.get_projected_viewport_with_policy(true, &policy, 2);
 
         assert_eq!(viewport.mode(), super::ProjectionMode::Transformed);
@@ -15783,12 +15821,12 @@ mod tests {
             .iter()
             .position(|row| matches!(row.kind, super::ProjectedRowKind::CollapsedSummary { .. }))
             .expect("summary in full plan");
-        let max_start = plan.rows.len().saturating_sub(terminal.grid.rows());
+        let max_start = plan.rows.len().saturating_sub(terminal.screen.grid.rows());
         let offset = max_start.saturating_sub(summary_row.min(max_start));
 
         super::PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.set(0));
         let materialized =
-            terminal.materialize_projection_plan(&plan, offset, terminal.grid.rows(), 80);
+            terminal.materialize_projection_plan(&plan, offset, terminal.screen.grid.rows(), 80);
         assert_eq!(materialized.document_start, summary_row);
         assert!(matches!(
             materialized.row_kinds[0],
@@ -15809,7 +15847,7 @@ mod tests {
     #[test]
     fn projected_structural_padding_ignores_the_live_sgr_background() {
         let mut terminal = TerminalState::new(6, 2);
-        terminal.current_bg = Color::Red;
+        terminal.screen.current_bg = Color::Red;
         let plan = terminal.identity_projection_plan(6);
         let materialized = terminal.materialize_projection_plan(&plan, 0, 4, 6);
 
@@ -15896,7 +15934,7 @@ mod tests {
             .expect("summary in document");
         let max_start = appended
             .document_rows()
-            .saturating_sub(terminal.grid.rows());
+            .saturating_sub(terminal.screen.grid.rows());
         let summary_offset = max_start.saturating_sub(summary_document_row.min(max_start));
         bottom.set_offset(summary_offset, &appended);
         let summary_top = terminal.get_projected_viewport_with_state(true, &policy, &mut bottom);
@@ -15953,7 +15991,9 @@ mod tests {
             .expect("effective collapse plan")
             .summary_row(first_id)
             .expect("first summary");
-        let max_start = initial.document_rows().saturating_sub(terminal.grid.rows());
+        let max_start = initial
+            .document_rows()
+            .saturating_sub(terminal.screen.grid.rows());
         state.set_offset(
             max_start.saturating_sub(summary_document_row.min(max_start)),
             &initial,
@@ -16485,20 +16525,20 @@ mod tests {
     #[test]
     fn raw_row_identity_follows_grid_rows_into_scrollback_and_survives_trim() {
         let mut terminal = TerminalState::new(4, 2);
-        terminal.grid[0][0].character = 'A';
-        terminal.grid[1][0].character = 'B';
-        let first = terminal.grid.raw_row_id(0).expect("first row id");
-        let second = terminal.grid.raw_row_id(1).expect("second row id");
-        terminal.cursor_row = 1;
+        terminal.screen.grid[0][0].character = 'A';
+        terminal.screen.grid[1][0].character = 'B';
+        let first = terminal.screen.grid.raw_row_id(0).expect("first row id");
+        let second = terminal.screen.grid.raw_row_id(1).expect("second row id");
+        terminal.screen.cursor_row = 1;
 
         terminal.process_batch(b"\n");
         assert_eq!(terminal.scrollback[0].raw_row_id(), first);
-        assert_eq!(terminal.grid.raw_row_id(0), Some(second));
-        let fresh_bottom = terminal.grid.raw_row_id(1).expect("fresh blank row");
+        assert_eq!(terminal.screen.grid.raw_row_id(0), Some(second));
+        let fresh_bottom = terminal.screen.grid.raw_row_id(1).expect("fresh blank row");
         assert_ne!(fresh_bottom, first);
         assert_ne!(fresh_bottom, second);
 
-        terminal.grid[1][0].character = 'C';
+        terminal.screen.grid[1][0].character = 'C';
         terminal.process_batch(b"\n");
         assert_eq!(terminal.scrollback[1].raw_row_id(), second);
         terminal.set_max_scrollback(1);
@@ -16524,54 +16564,58 @@ mod tests {
     fn inserted_deleted_and_reverse_indexed_rows_move_identity_with_content() {
         let mut inserted = TerminalState::new(3, 4);
         let before: Vec<_> = (0..4)
-            .map(|row| inserted.grid.raw_row_id(row).unwrap())
+            .map(|row| inserted.screen.grid.raw_row_id(row).unwrap())
             .collect();
         inserted.process_batch(b"\x1b[2;1H\x1b[L");
-        assert_eq!(inserted.grid.raw_row_id(0), Some(before[0]));
-        assert_ne!(inserted.grid.raw_row_id(1), Some(before[1]));
-        assert_eq!(inserted.grid.raw_row_id(2), Some(before[1]));
-        assert_eq!(inserted.grid.raw_row_id(3), Some(before[2]));
+        assert_eq!(inserted.screen.grid.raw_row_id(0), Some(before[0]));
+        assert_ne!(inserted.screen.grid.raw_row_id(1), Some(before[1]));
+        assert_eq!(inserted.screen.grid.raw_row_id(2), Some(before[1]));
+        assert_eq!(inserted.screen.grid.raw_row_id(3), Some(before[2]));
 
         let mut deleted = TerminalState::new(3, 4);
         let before: Vec<_> = (0..4)
-            .map(|row| deleted.grid.raw_row_id(row).unwrap())
+            .map(|row| deleted.screen.grid.raw_row_id(row).unwrap())
             .collect();
         deleted.process_batch(b"\x1b[2;1H\x1b[M");
-        assert_eq!(deleted.grid.raw_row_id(0), Some(before[0]));
-        assert_eq!(deleted.grid.raw_row_id(1), Some(before[2]));
-        assert_eq!(deleted.grid.raw_row_id(2), Some(before[3]));
-        assert!(!before.contains(&deleted.grid.raw_row_id(3).unwrap()));
+        assert_eq!(deleted.screen.grid.raw_row_id(0), Some(before[0]));
+        assert_eq!(deleted.screen.grid.raw_row_id(1), Some(before[2]));
+        assert_eq!(deleted.screen.grid.raw_row_id(2), Some(before[3]));
+        assert!(!before.contains(&deleted.screen.grid.raw_row_id(3).unwrap()));
 
         let mut reverse_indexed = TerminalState::new(3, 4);
         let before: Vec<_> = (0..4)
-            .map(|row| reverse_indexed.grid.raw_row_id(row).unwrap())
+            .map(|row| reverse_indexed.screen.grid.raw_row_id(row).unwrap())
             .collect();
         reverse_indexed.process_batch(b"\x1b[1;1H\x1bM");
-        assert!(!before.contains(&reverse_indexed.grid.raw_row_id(0).unwrap()));
-        assert_eq!(reverse_indexed.grid.raw_row_id(1), Some(before[0]));
-        assert_eq!(reverse_indexed.grid.raw_row_id(2), Some(before[1]));
-        assert_eq!(reverse_indexed.grid.raw_row_id(3), Some(before[2]));
+        assert!(!before.contains(&reverse_indexed.screen.grid.raw_row_id(0).unwrap()));
+        assert_eq!(reverse_indexed.screen.grid.raw_row_id(1), Some(before[0]));
+        assert_eq!(reverse_indexed.screen.grid.raw_row_id(2), Some(before[1]));
+        assert_eq!(reverse_indexed.screen.grid.raw_row_id(3), Some(before[2]));
     }
 
     #[test]
     fn repeated_line_edits_keep_physical_wraps_and_frost_identity_order() {
         let mut terminal = TerminalState::new(3, 6);
         for (row, marker) in "ABCDEF".chars().enumerate() {
-            terminal.grid[row][0].character = marker;
+            terminal.screen.grid[row][0].character = marker;
         }
         let wraps = [true, false, true, false, true, false];
-        terminal.grid.row_wrapped_mut().copy_from_slice(&wraps);
-        let ids = terminal.grid.row_ids().to_vec();
-        let revision = terminal.grid.identity_revision;
+        terminal
+            .screen
+            .grid
+            .row_wrapped_mut()
+            .copy_from_slice(&wraps);
+        let ids = terminal.screen.grid.row_ids().to_vec();
+        let revision = terminal.screen.grid.identity_revision;
 
         // Rows two through five are the scroll region. Begin editing at row three.
         terminal.process_batch(b"\x1b[2;5r\x1b[3;1H\x1b[2L");
-        assert_eq!(terminal.grid.row_wrapped(), wraps);
-        assert_eq!(terminal.grid.identity_revision, revision + 2);
-        assert_eq!(terminal.grid[2][0].character, ' ');
-        assert_eq!(terminal.grid[3][0].character, ' ');
-        assert_eq!(terminal.grid[4][0].character, 'C');
-        let inserted = terminal.grid.row_ids();
+        assert_eq!(terminal.screen.grid.row_wrapped(), wraps);
+        assert_eq!(terminal.screen.grid.identity_revision, revision + 2);
+        assert_eq!(terminal.screen.grid[2][0].character, ' ');
+        assert_eq!(terminal.screen.grid[3][0].character, ' ');
+        assert_eq!(terminal.screen.grid[4][0].character, 'C');
+        let inserted = terminal.screen.grid.row_ids();
         assert_eq!(
             [inserted[0], inserted[1], inserted[4], inserted[5]],
             [ids[0], ids[1], ids[2], ids[5]]
@@ -16579,12 +16623,12 @@ mod tests {
         assert!(inserted[2] > inserted[3] && inserted[3] > ids[5]);
 
         terminal.process_batch(b"\x1b[2M");
-        assert_eq!(terminal.grid.row_wrapped(), wraps);
-        assert_eq!(terminal.grid.identity_revision, revision + 4);
-        assert_eq!(terminal.grid[2][0].character, 'C');
-        assert_eq!(terminal.grid[3][0].character, ' ');
-        assert_eq!(terminal.grid[4][0].character, ' ');
-        let deleted = terminal.grid.row_ids();
+        assert_eq!(terminal.screen.grid.row_wrapped(), wraps);
+        assert_eq!(terminal.screen.grid.identity_revision, revision + 4);
+        assert_eq!(terminal.screen.grid[2][0].character, 'C');
+        assert_eq!(terminal.screen.grid[3][0].character, ' ');
+        assert_eq!(terminal.screen.grid[4][0].character, ' ');
+        let deleted = terminal.screen.grid.row_ids();
         assert_eq!(
             [deleted[0], deleted[1], deleted[2], deleted[5]],
             [ids[0], ids[1], ids[2], ids[5]]
@@ -16597,25 +16641,31 @@ mod tests {
     fn resize_preserves_retained_rows_but_normalization_reidentifies_history() {
         let mut terminal = TerminalState::new(5, 4);
         for row in 0..4 {
-            terminal.grid[row][0].character = char::from(b'A' + row as u8);
+            terminal.screen.grid[row][0].character = char::from(b'A' + row as u8);
         }
         let before: Vec<_> = (0..4)
-            .map(|row| terminal.grid.raw_row_id(row).expect("row id"))
+            .map(|row| terminal.screen.grid.raw_row_id(row).expect("row id"))
             .collect();
-        terminal.cursor_row = 3;
+        terminal.screen.cursor_row = 3;
         terminal.on_resize(5, 2);
 
         assert_eq!(terminal.scrollback[0].raw_row_id(), before[0]);
         assert_eq!(terminal.scrollback[1].raw_row_id(), before[1]);
-        assert_eq!(terminal.grid.raw_row_id(0), Some(before[2]));
-        assert_eq!(terminal.grid.raw_row_id(1), Some(before[3]));
+        assert_eq!(terminal.screen.grid.raw_row_id(0), Some(before[2]));
+        assert_eq!(terminal.screen.grid.raw_row_id(1), Some(before[3]));
 
         let retained_grid_ids = [before[2], before[3]];
         terminal.on_resize(5, 4);
-        assert_eq!(terminal.grid.raw_row_id(0), Some(retained_grid_ids[0]));
-        assert_eq!(terminal.grid.raw_row_id(1), Some(retained_grid_ids[1]));
-        assert!(!retained_grid_ids.contains(&terminal.grid.raw_row_id(2).unwrap()));
-        assert!(!retained_grid_ids.contains(&terminal.grid.raw_row_id(3).unwrap()));
+        assert_eq!(
+            terminal.screen.grid.raw_row_id(0),
+            Some(retained_grid_ids[0])
+        );
+        assert_eq!(
+            terminal.screen.grid.raw_row_id(1),
+            Some(retained_grid_ids[1])
+        );
+        assert!(!retained_grid_ids.contains(&terminal.screen.grid.raw_row_id(2).unwrap()));
+        assert!(!retained_grid_ids.contains(&terminal.screen.grid.raw_row_id(3).unwrap()));
 
         let old_history_ids: Vec<_> = terminal
             .scrollback
@@ -16784,8 +16834,8 @@ mod tests {
     #[test]
     fn projection_revisions_track_view_source_resize_and_alt_bypass() {
         let mut terminal = TerminalState::new(4, 2);
-        terminal.grid[0][0].character = 'A';
-        terminal.cursor_row = 1;
+        terminal.screen.grid[0][0].character = 'A';
+        terminal.screen.cursor_row = 1;
         terminal.process_batch(b"\n");
 
         let live = terminal.get_projected_viewport(true);
@@ -16881,8 +16931,8 @@ mod tests {
 
         terminal.on_resize(4, 6);
 
-        assert_eq!(terminal.scroll_region_top, 0);
-        assert_eq!(terminal.scroll_region_bottom, 5);
+        assert_eq!(terminal.screen.scroll_region_top, 0);
+        assert_eq!(terminal.screen.scroll_region_bottom, 5);
     }
 
     #[test]
@@ -16893,9 +16943,9 @@ mod tests {
         assert_eq!(terminal.scrollback.len(), 2);
 
         terminal.process_input(b"\x1b8\x1b[Jrepaint");
-        assert_eq!(terminal.grid[0][0].character, 'o');
-        assert_eq!(terminal.grid[1][0].character, 'r');
-        assert_eq!(terminal.grid[2][0].character, ' ');
+        assert_eq!(terminal.screen.grid[0][0].character, 'o');
+        assert_eq!(terminal.screen.grid[1][0].character, 'r');
+        assert_eq!(terminal.screen.grid[2][0].character, ' ');
     }
 
     #[test]
@@ -16904,8 +16954,8 @@ mod tests {
 
         terminal.process_input(b"\x1b[1;0r");
 
-        assert_eq!(terminal.scroll_region_top, 0);
-        assert_eq!(terminal.scroll_region_bottom, 3);
+        assert_eq!(terminal.screen.scroll_region_top, 0);
+        assert_eq!(terminal.screen.scroll_region_bottom, 3);
     }
 
     /// A repeat count is an attacker-controlled u16. Every one of these edits
@@ -16927,8 +16977,8 @@ mod tests {
         terminal.process_input(b"\x1b[65535P");
 
         // The grid survives, blanked, with its geometry intact.
-        assert_eq!(terminal.grid.rows(), 24);
-        assert_eq!(terminal.grid.row_len(), 80);
+        assert_eq!(terminal.screen.grid.rows(), 24);
+        assert_eq!(terminal.screen.grid.row_len(), 80);
     }
 
     /// The cap must not change what a reasonable count does.
@@ -16941,7 +16991,9 @@ mod tests {
         terminal.process_input(b"\x1b[2L");
 
         // Two blank lines inserted at the top pushed the text down by two.
-        let row2: String = (0..4).map(|c| terminal.grid.get(2, c).character).collect();
+        let row2: String = (0..4)
+            .map(|c| terminal.screen.grid.get(2, c).character)
+            .collect();
         assert_eq!(row2, "aaaa");
     }
 
@@ -16952,13 +17004,16 @@ mod tests {
     fn xtrestore_is_not_mistaken_for_decstbm() {
         let mut terminal = TerminalState::new(4, 4);
         terminal.process_input(b"\x1b[2;3H");
-        let (row, col) = (terminal.cursor_row, terminal.cursor_col);
+        let (row, col) = (terminal.screen.cursor_row, terminal.screen.cursor_col);
 
         terminal.process_input(b"\x1b[?1049r");
 
-        assert_eq!(terminal.scroll_region_top, 0);
-        assert_eq!(terminal.scroll_region_bottom, 3);
-        assert_eq!((terminal.cursor_row, terminal.cursor_col), (row, col));
+        assert_eq!(terminal.screen.scroll_region_top, 0);
+        assert_eq!(terminal.screen.scroll_region_bottom, 3);
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (row, col)
+        );
     }
 
     /// `CSI Pm $ r` is DECCARA — an intermediate byte rules DECSTBM out just as
@@ -16969,8 +17024,8 @@ mod tests {
 
         terminal.process_input(b"\x1b[1;1;2;2$r");
 
-        assert_eq!(terminal.scroll_region_top, 0);
-        assert_eq!(terminal.scroll_region_bottom, 3);
+        assert_eq!(terminal.screen.scroll_region_top, 0);
+        assert_eq!(terminal.screen.scroll_region_bottom, 3);
     }
 
     /// Setting DECOM homes to the top of the scroll region; resetting it homes
@@ -16983,11 +17038,17 @@ mod tests {
         terminal.process_input(b"\x1b[4;4H");
 
         terminal.process_input(b"\x1b[?6h");
-        assert_eq!((terminal.cursor_row, terminal.cursor_col), (1, 0));
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (1, 0)
+        );
 
         terminal.process_input(b"\x1b[3;3H");
         terminal.process_input(b"\x1b[?6l");
-        assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 0));
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (0, 0)
+        );
     }
 
     /// Under DECOM, DECSTBM's home is the new region's top row, not row 0.
@@ -16998,29 +17059,32 @@ mod tests {
 
         terminal.process_input(b"\x1b[3;6r");
 
-        assert_eq!(terminal.scroll_region_top, 2);
-        assert_eq!((terminal.cursor_row, terminal.cursor_col), (2, 0));
+        assert_eq!(terminal.screen.scroll_region_top, 2);
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (2, 0)
+        );
     }
 
     #[test]
     fn custom_tab_stops_survive_resize_and_ris_restores_frost_defaults() {
         let mut terminal = TerminalState::new(12, 4);
-        assert!(!terminal.tab_stops[0]);
+        assert!(!terminal.screen.tab_stops[0]);
         terminal.process_input(b"\x1b[3g\x1b[5G\x1bH");
         terminal.on_resize(20, 4);
 
         terminal.process_input(b"\r\t");
-        assert_eq!(terminal.cursor_col, 4);
+        assert_eq!(terminal.screen.cursor_col, 4);
         terminal.process_input(b"\x1b[I");
-        assert_eq!(terminal.cursor_col, 16);
+        assert_eq!(terminal.screen.cursor_col, 16);
         terminal.process_input(b"\x1b[Z");
-        assert_eq!(terminal.cursor_col, 4);
+        assert_eq!(terminal.screen.cursor_col, 4);
 
         terminal.process_input(b"\x1b[g\r\t");
-        assert_eq!(terminal.cursor_col, 16);
+        assert_eq!(terminal.screen.cursor_col, 16);
         terminal.process_input(b"\x1bc\t");
-        assert_eq!(terminal.cursor_col, 8);
-        assert!(!terminal.tab_stops[0]);
+        assert_eq!(terminal.screen.cursor_col, 8);
+        assert!(!terminal.screen.tab_stops[0]);
     }
 
     #[test]
@@ -17062,7 +17126,7 @@ mod tests {
         terminal.process_input(b"\x1b[r\x1b[1;1H\x1b[?2026l");
 
         assert!(
-            terminal.scrollback_len() > terminal.grid.rows(),
+            terminal.scrollback_len() > terminal.screen.grid.rows(),
             "expected main-screen synchronized output to retain more than one page"
         );
 
@@ -17245,8 +17309,8 @@ mod tests {
             "expected lines scrolled off a top-anchored region to remain scrollable"
         );
 
-        assert_eq!(terminal.grid[4][0].character, 'p');
-        assert_eq!(terminal.grid[5][0].character, 's');
+        assert_eq!(terminal.screen.grid[4][0].character, 'p');
+        assert_eq!(terminal.screen.grid[5][0].character, 's');
     }
 
     #[test]
@@ -17485,25 +17549,27 @@ mod tests {
 
         terminal.process_input("中文".as_bytes());
 
-        assert_eq!(terminal.grid[0][0].character, '中');
-        assert!(terminal.grid[0][0].flags.wide());
-        assert!(terminal.grid[0][1].flags.wide_continuation());
-        assert_eq!(terminal.grid[0][2].character, '文');
-        assert!(terminal.grid[0][2].flags.wide());
-        assert!(terminal.grid[0][3].flags.wide_continuation());
-        assert_eq!(terminal.cursor_col, 4);
+        assert_eq!(terminal.screen.grid[0][0].character, '中');
+        assert!(terminal.screen.grid[0][0].flags.wide());
+        assert!(terminal.screen.grid[0][1].flags.wide_continuation());
+        assert_eq!(terminal.screen.grid[0][2].character, '文');
+        assert!(terminal.screen.grid[0][2].flags.wide());
+        assert!(terminal.screen.grid[0][3].flags.wide_continuation());
+        assert_eq!(terminal.screen.cursor_col, 4);
     }
 
     #[test]
     fn width_three_print_and_repeat_keep_the_legacy_cells_and_archived_identity() {
         let mut terminal = TerminalState::new(8, 2);
-        let row_id = terminal.grid.raw_row_id(0).unwrap();
+        let row_id = terminal.screen.grid.raw_row_id(0).unwrap();
         terminal.process_input("abcdef\r\u{17d8}".as_bytes());
         assert_eq!(terminal.get_cursor_pos(), (0, 3));
         terminal.process_input(b"\x1b[b");
         assert_eq!(terminal.get_cursor_pos(), (0, 6));
 
-        let printed: Vec<_> = (0..6).map(|col| *terminal.grid.get(0, col)).collect();
+        let printed: Vec<_> = (0..6)
+            .map(|col| *terminal.screen.grid.get(0, col))
+            .collect();
         assert_eq!(
             printed
                 .iter()
@@ -17528,9 +17594,9 @@ mod tests {
         // Invalid lead byte (0xFF) and orphan continuation byte (0x80):
         // one U+FFFD each.
         terminal.process_input(b"\xff\x80");
-        assert_eq!(terminal.grid[0][0].character, '\u{FFFD}');
-        assert_eq!(terminal.grid[0][1].character, '\u{FFFD}');
-        assert_eq!(terminal.cursor_col, 2);
+        assert_eq!(terminal.screen.grid[0][0].character, '\u{FFFD}');
+        assert_eq!(terminal.screen.grid[0][1].character, '\u{FFFD}');
+        assert_eq!(terminal.screen.cursor_col, 2);
     }
 
     #[test]
@@ -17540,18 +17606,18 @@ mod tests {
         // Lead byte directly followed by ASCII: U+FFFD for the lead byte,
         // then the ASCII byte is printed normally.
         terminal.process_input(b"\xc3A");
-        assert_eq!(terminal.grid[0][0].character, '\u{FFFD}');
-        assert_eq!(terminal.grid[0][1].character, 'A');
+        assert_eq!(terminal.screen.grid[0][0].character, '\u{FFFD}');
+        assert_eq!(terminal.screen.grid[0][1].character, 'A');
 
         // Full length but invalid content (overlong encoding): a single
         // U+FFFD for the whole sequence.
         terminal.process_input(b"\xe0\x80\x80");
-        assert_eq!(terminal.grid[0][2].character, '\u{FFFD}');
+        assert_eq!(terminal.screen.grid[0][2].character, '\u{FFFD}');
 
         // Encoded surrogate half: likewise a single U+FFFD.
         terminal.process_input(b"\xed\xa0\x80");
-        assert_eq!(terminal.grid[0][3].character, '\u{FFFD}');
-        assert_eq!(terminal.cursor_col, 4);
+        assert_eq!(terminal.screen.grid[0][3].character, '\u{FFFD}');
+        assert_eq!(terminal.screen.cursor_col, 4);
     }
 
     #[test]
@@ -17561,17 +17627,17 @@ mod tests {
         // A valid sequence split across reads still decodes.
         terminal.process_input(b"\xe4\xb8");
         terminal.process_input(b"\xad");
-        assert_eq!(terminal.grid[0][0].character, '中');
+        assert_eq!(terminal.screen.grid[0][0].character, '中');
 
         // A pending sequence abandoned by the next read emits a single
         // U+FFFD (not one per buffered byte), and the buffered bytes can no
         // longer combine with a later continuation byte into a spurious char.
         terminal.process_input(b"\xe4\xb8");
         terminal.process_input(b"X\xa9");
-        assert_eq!(terminal.grid[0][2].character, '\u{FFFD}');
-        assert_eq!(terminal.grid[0][3].character, 'X');
-        assert_eq!(terminal.grid[0][4].character, '\u{FFFD}');
-        assert_eq!(terminal.cursor_col, 5);
+        assert_eq!(terminal.screen.grid[0][2].character, '\u{FFFD}');
+        assert_eq!(terminal.screen.grid[0][3].character, 'X');
+        assert_eq!(terminal.screen.grid[0][4].character, '\u{FFFD}');
+        assert_eq!(terminal.screen.cursor_col, 5);
     }
 
     #[test]
@@ -17668,41 +17734,41 @@ mod tests {
 
         // Overwrite only the continuation half of the first glyph.
         terminal.process_input(b"\x1b[1;2HA");
-        assert_eq!(terminal.grid[0][0].character, ' ');
-        assert!(!terminal.grid[0][0].flags.wide());
-        assert_eq!(terminal.grid[0][1].character, 'A');
-        assert!(!terminal.grid[0][1].flags.wide_continuation());
+        assert_eq!(terminal.screen.grid[0][0].character, ' ');
+        assert!(!terminal.screen.grid[0][0].flags.wide());
+        assert_eq!(terminal.screen.grid[0][1].character, 'A');
+        assert!(!terminal.screen.grid[0][1].flags.wide_continuation());
 
         // Overwrite only the body half of the second glyph.
         terminal.process_input(b"\x1b[1;3HB");
-        assert_eq!(terminal.grid[0][2].character, 'B');
-        assert!(!terminal.grid[0][2].flags.wide());
-        assert_eq!(terminal.grid[0][3].character, ' ');
-        assert!(!terminal.grid[0][3].flags.wide_continuation());
+        assert_eq!(terminal.screen.grid[0][2].character, 'B');
+        assert!(!terminal.screen.grid[0][2].flags.wide());
+        assert_eq!(terminal.screen.grid[0][3].character, ' ');
+        assert!(!terminal.screen.grid[0][3].flags.wide_continuation());
     }
 
     #[test]
     fn linefeed_at_bottom_pushes_to_scrollback_for_full_screen_region() {
         let mut terminal = TerminalState::new(4, 2);
-        terminal.grid[0][0].character = 'A';
-        terminal.grid[1][0].character = 'B';
-        terminal.cursor_row = 1;
-        terminal.cursor_col = 0;
+        terminal.screen.grid[0][0].character = 'A';
+        terminal.screen.grid[1][0].character = 'B';
+        terminal.screen.cursor_row = 1;
+        terminal.screen.cursor_col = 0;
 
         terminal.process_input(b"\n");
 
         assert_eq!(terminal.scrollback.len(), 1);
         assert_eq!(terminal.scrollback[0].decompress()[0].character, 'A');
-        assert_eq!(terminal.grid[0][0].character, 'B');
-        assert_eq!(terminal.grid[1][0].character, ' ');
+        assert_eq!(terminal.screen.grid[0][0].character, 'B');
+        assert_eq!(terminal.screen.grid[1][0].character, ' ');
     }
 
     #[test]
     fn visible_cells_keep_rectangular_shape_after_resize_with_scrollback() {
         let mut terminal = TerminalState::new(4, 2);
-        terminal.grid.get_mut(0, 0).character = 'A';
-        terminal.grid.get_mut(1, 0).character = 'B';
-        terminal.cursor_row = 1;
+        terminal.screen.grid.get_mut(0, 0).character = 'A';
+        terminal.screen.grid.get_mut(1, 0).character = 'B';
+        terminal.screen.cursor_row = 1;
 
         terminal.process_input(b"\n");
         terminal.on_resize(5, 2);
@@ -17828,8 +17894,8 @@ mod tests {
     #[test]
     fn history_reflow_padding_does_not_inherit_live_background() {
         let mut terminal = TerminalState::new(3, 2);
-        terminal.grid[0][0].character = 'A';
-        terminal.cursor_row = 1;
+        terminal.screen.grid[0][0].character = 'A';
+        terminal.screen.cursor_row = 1;
         terminal.process_input(b"\n");
         assert_eq!(terminal.scrollback.len(), 1);
 
@@ -17977,9 +18043,9 @@ mod tests {
 
         terminal.on_resize(1, 2);
 
-        assert_eq!(terminal.grid[0][0].character, ' ');
-        assert!(!terminal.grid[0][0].flags.wide());
-        assert!(!terminal.grid[0][0].flags.wide_continuation());
+        assert_eq!(terminal.screen.grid[0][0].character, ' ');
+        assert!(!terminal.screen.grid[0][0].flags.wide());
+        assert!(!terminal.screen.grid[0][0].flags.wide_continuation());
     }
 
     #[test]
@@ -18007,9 +18073,9 @@ mod tests {
     #[test]
     fn cursor_is_hidden_while_viewing_scrollback() {
         let mut terminal = TerminalState::new(4, 2);
-        terminal.grid.get_mut(0, 0).character = 'A';
-        terminal.grid.get_mut(1, 0).character = 'B';
-        terminal.cursor_row = 1;
+        terminal.screen.grid.get_mut(0, 0).character = 'A';
+        terminal.screen.grid.get_mut(1, 0).character = 'B';
+        terminal.screen.cursor_row = 1;
 
         terminal.process_input(b"\n");
 
@@ -18023,9 +18089,9 @@ mod tests {
     #[test]
     fn scroll_to_bottom_restores_live_cursor_visibility() {
         let mut terminal = TerminalState::new(4, 2);
-        terminal.grid.get_mut(0, 0).character = 'A';
-        terminal.grid.get_mut(1, 0).character = 'B';
-        terminal.cursor_row = 1;
+        terminal.screen.grid.get_mut(0, 0).character = 'A';
+        terminal.screen.grid.get_mut(1, 0).character = 'B';
+        terminal.screen.cursor_row = 1;
 
         terminal.process_input(b"\n");
         terminal.scroll(1);
@@ -18041,8 +18107,8 @@ mod tests {
 
         terminal.process_input(b"\x1b[36;44mA\x1b[39;49mB");
 
-        let first = &terminal.grid[0][0];
-        let second = &terminal.grid[0][1];
+        let first = &terminal.screen.grid[0][0];
+        let second = &terminal.screen.grid[0][1];
 
         assert_eq!(first.foreground, Color::Cyan);
         assert_eq!(first.background, Color::Blue);
@@ -18056,8 +18122,8 @@ mod tests {
 
         terminal.process_input(b"\x1b[44mAB\x1b[1;1H\x1b[K");
 
-        assert_eq!(terminal.grid[0][0].background, Color::Blue);
-        assert_eq!(terminal.grid[0][1].background, Color::Blue);
+        assert_eq!(terminal.screen.grid[0][0].background, Color::Blue);
+        assert_eq!(terminal.screen.grid[0][1].background, Color::Blue);
     }
 
     #[test]
@@ -18066,8 +18132,8 @@ mod tests {
 
         terminal.process_input(b"\x1b[7;36;44mA\x1b[mB");
 
-        let first = &terminal.grid[0][0];
-        let second = &terminal.grid[0][1];
+        let first = &terminal.screen.grid[0][0];
+        let second = &terminal.screen.grid[0][1];
 
         assert!(first.flags.inverse());
         assert_eq!(first.foreground, Color::Cyan);
@@ -18085,10 +18151,13 @@ mod tests {
         terminal.process_input(b"\x1b[38");
         terminal.process_input(b";2;81;175;239msrc");
 
-        assert_eq!(terminal.grid[0][0].character, 's');
-        assert_eq!(terminal.grid[0][1].character, 'r');
-        assert_eq!(terminal.grid[0][2].character, 'c');
-        assert_eq!(terminal.grid[0][0].foreground, Color::Rgb(81, 175, 239));
+        assert_eq!(terminal.screen.grid[0][0].character, 's');
+        assert_eq!(terminal.screen.grid[0][1].character, 'r');
+        assert_eq!(terminal.screen.grid[0][2].character, 'c');
+        assert_eq!(
+            terminal.screen.grid[0][0].foreground,
+            Color::Rgb(81, 175, 239)
+        );
     }
 
     #[test]
@@ -18100,11 +18169,11 @@ mod tests {
         terminal.process_input(b"A\x1b[3\r\n3mB\x1b[mC");
 
         assert!(terminal.parser.snapshot().pending_escape.is_empty());
-        assert_eq!(terminal.cursor_row, 1);
-        assert_eq!(terminal.grid[1][0].character, 'B');
-        assert_eq!(terminal.grid[1][0].foreground, Color::Yellow);
-        assert_eq!(terminal.grid[1][1].character, 'C');
-        assert_eq!(terminal.grid[1][1].foreground, Color::Default);
+        assert_eq!(terminal.screen.cursor_row, 1);
+        assert_eq!(terminal.screen.grid[1][0].character, 'B');
+        assert_eq!(terminal.screen.grid[1][0].foreground, Color::Yellow);
+        assert_eq!(terminal.screen.grid[1][1].character, 'C');
+        assert_eq!(terminal.screen.grid[1][1].foreground, Color::Default);
     }
 
     #[test]
@@ -18112,15 +18181,15 @@ mod tests {
         let mut terminal = TerminalState::new(16, 4);
 
         terminal.process_input(b"\x1b[3\r\n");
-        assert_eq!(terminal.cursor_row, 1);
+        assert_eq!(terminal.screen.cursor_row, 1);
         assert_eq!(terminal.parser.snapshot().pending_escape, b"\x1b[3");
 
         terminal.process_input(b"3mX");
 
         assert!(terminal.parser.snapshot().pending_escape.is_empty());
-        assert_eq!(terminal.cursor_row, 1);
-        assert_eq!(terminal.grid[1][0].character, 'X');
-        assert_eq!(terminal.grid[1][0].foreground, Color::Yellow);
+        assert_eq!(terminal.screen.cursor_row, 1);
+        assert_eq!(terminal.screen.grid[1][0].character, 'X');
+        assert_eq!(terminal.screen.grid[1][0].foreground, Color::Yellow);
     }
 
     #[test]
@@ -18130,8 +18199,8 @@ mod tests {
         terminal.process_input(b"\x1b");
         terminal.process_input(b"[31mX");
 
-        assert_eq!(terminal.grid[0][0].character, 'X');
-        assert_eq!(terminal.grid[0][0].foreground, Color::Red);
+        assert_eq!(terminal.screen.grid[0][0].character, 'X');
+        assert_eq!(terminal.screen.grid[0][0].foreground, Color::Red);
     }
 
     #[test]
@@ -18140,9 +18209,9 @@ mod tests {
 
         terminal.process_input(b"\x1b(0qx\x0fA");
 
-        assert_eq!(terminal.grid[0][0].character, '─');
-        assert_eq!(terminal.grid[0][1].character, '│');
-        assert_eq!(terminal.grid[0][2].character, 'A');
+        assert_eq!(terminal.screen.grid[0][0].character, '─');
+        assert_eq!(terminal.screen.grid[0][1].character, '│');
+        assert_eq!(terminal.screen.grid[0][2].character, 'A');
     }
 
     #[test]
@@ -18151,7 +18220,7 @@ mod tests {
 
         terminal.process_input(b"\x1b[0 qX");
 
-        assert_eq!(terminal.grid[0][0].character, 'X');
+        assert_eq!(terminal.screen.grid[0][0].character, 'X');
     }
 
     #[test]
@@ -18159,17 +18228,17 @@ mod tests {
         let mut terminal = TerminalState::new(8, 2);
 
         terminal.process_input(b"\x1b[2 q");
-        assert_eq!(terminal.cursor_shape, CursorShape::Block);
+        assert_eq!(terminal.screen.cursor_shape, CursorShape::Block);
 
         terminal.process_input(b"\x1b[3 q");
-        assert_eq!(terminal.cursor_shape, CursorShape::Underline);
+        assert_eq!(terminal.screen.cursor_shape, CursorShape::Underline);
         terminal.process_input(b"\x1b[4 q");
-        assert_eq!(terminal.cursor_shape, CursorShape::Underline);
+        assert_eq!(terminal.screen.cursor_shape, CursorShape::Underline);
 
         terminal.process_input(b"\x1b[5 q");
-        assert_eq!(terminal.cursor_shape, CursorShape::Beam);
+        assert_eq!(terminal.screen.cursor_shape, CursorShape::Beam);
         terminal.process_input(b"\x1b[6 q");
-        assert_eq!(terminal.cursor_shape, CursorShape::Beam);
+        assert_eq!(terminal.screen.cursor_shape, CursorShape::Beam);
     }
 
     #[test]
@@ -18179,9 +18248,9 @@ mod tests {
         terminal.process_input(b"AB");
         terminal.process_input(b"\x1b[?4uC");
 
-        assert_eq!(terminal.grid[0][0].character, 'A');
-        assert_eq!(terminal.grid[0][1].character, 'B');
-        assert_eq!(terminal.grid[0][2].character, 'C');
+        assert_eq!(terminal.screen.grid[0][0].character, 'A');
+        assert_eq!(terminal.screen.grid[0][1].character, 'B');
+        assert_eq!(terminal.screen.grid[0][2].character, 'C');
     }
 
     #[test]
@@ -18190,8 +18259,8 @@ mod tests {
 
         terminal.process_input(b"\x1b[>4;1mZ");
 
-        assert_eq!(terminal.grid[0][0].character, 'Z');
-        assert_eq!(terminal.grid[0][1].character, ' ');
+        assert_eq!(terminal.screen.grid[0][0].character, 'Z');
+        assert_eq!(terminal.screen.grid[0][1].character, ' ');
     }
 
     #[test]
@@ -18200,8 +18269,8 @@ mod tests {
 
         terminal.process_input(b"\x1bP$q q\x1b\\X");
 
-        assert_eq!(terminal.grid[0][0].character, 'X');
-        assert_eq!(terminal.grid[0][1].character, ' ');
+        assert_eq!(terminal.screen.grid[0][0].character, 'X');
+        assert_eq!(terminal.screen.grid[0][1].character, ' ');
     }
 
     #[test]
@@ -18214,8 +18283,8 @@ mod tests {
         assert_eq!((image.width, image.height), (1, 1));
         assert_eq!(image.data, [1, 2, 3, 4]);
         assert_eq!(terminal.kitty_graphics.get_placements().len(), 1);
-        assert_eq!(terminal.grid[0][0].character, 'X');
-        assert_eq!(terminal.grid[0][1].character, ' ');
+        assert_eq!(terminal.screen.grid[0][0].character, 'X');
+        assert_eq!(terminal.screen.grid[0][1].character, ' ');
     }
 
     #[test]
@@ -18360,7 +18429,7 @@ mod tests {
         // resume ordinary terminal parsing on the same input batch.
         terminal.process_input(b"\x1b\\Z");
         assert_eq!(terminal.parser.pending_kind(), super::PendingKind::None);
-        assert_eq!(terminal.grid[0][0].character, 'Z');
+        assert_eq!(terminal.screen.grid[0][0].character, 'Z');
 
         // The bytes after ST belong to the normal stream, not the APC. Even
         // when they make the whole read exceed the cap, a packet whose
@@ -18372,7 +18441,7 @@ mod tests {
         terminal.process_input(b"\x1b\\Y");
         assert_eq!(terminal.parser.pending_kind(), super::PendingKind::None);
         assert!(terminal.parser.snapshot().pending_apc.is_empty());
-        assert_eq!(terminal.grid[0][1].character, 'Y');
+        assert_eq!(terminal.screen.grid[0][1].character, 'Y');
     }
 
     #[test]
@@ -18394,7 +18463,7 @@ mod tests {
                 "APC was lost at input split {split_at}"
             );
             assert_eq!(
-                terminal.grid[0][0].character, ' ',
+                terminal.screen.grid[0][0].character, ' ',
                 "APC bytes leaked onto the grid at split {split_at}"
             );
         }
@@ -18437,7 +18506,7 @@ mod tests {
         assert!(terminal.parser.snapshot().pending_osc.is_empty());
         assert_eq!(terminal.titles.window_title, "title-x");
         // Bytes after the BEL are ordinary input again.
-        assert_eq!(terminal.grid[0][0].character, 'Z');
+        assert_eq!(terminal.screen.grid[0][0].character, 'Z');
     }
 
     #[test]
@@ -18457,7 +18526,7 @@ mod tests {
         terminal.process_input(b"\\Y");
         assert!(terminal.parser.snapshot().pending_osc.is_empty());
         assert_eq!(terminal.titles.window_title, "win");
-        assert_eq!(terminal.grid[0][0].character, 'Y');
+        assert_eq!(terminal.screen.grid[0][0].character, 'Y');
 
         // A non-ST ESC abandons OSC and starts SOS here, even across reads.
         let mut terminal = TerminalState::new(16, 2);
@@ -18465,7 +18534,7 @@ mod tests {
         terminal.process_input(b"Xb\x07");
         assert!(terminal.titles.window_title.is_empty());
         assert!(!terminal.parser.snapshot().pending_string.is_empty());
-        assert_eq!(terminal.grid[0][0].character, ' ');
+        assert_eq!(terminal.screen.grid[0][0].character, ' ');
     }
 
     #[test]
@@ -18489,7 +18558,7 @@ mod tests {
                     "OSC was lost at input split {split_at}"
                 );
                 assert_eq!(
-                    terminal.grid[0][0].character, ' ',
+                    terminal.screen.grid[0][0].character, ' ',
                     "OSC bytes leaked onto the grid at split {split_at}"
                 );
             }
@@ -18508,7 +18577,7 @@ mod tests {
             assert_eq!(terminal.parser.rejected_count(), 1);
             assert_eq!(terminal.parser.retained_bytes(), 0);
             assert!(terminal.titles.window_title.is_empty());
-            assert_eq!(terminal.grid[0][0].character, 'Z');
+            assert_eq!(terminal.screen.grid[0][0].character, 'Z');
             assert!(terminal.get_output().is_empty());
         }
     }
@@ -18530,7 +18599,7 @@ mod tests {
         terminal.process_input(b"\\Q");
         assert!(terminal.parser.snapshot().pending_string.is_empty());
         // The DCS payload is dropped; only the byte after ST lands.
-        assert_eq!(terminal.grid[0][0].character, 'Q');
+        assert_eq!(terminal.screen.grid[0][0].character, 'Q');
 
         // SOS and PM share the DCS shape: ST-terminated, payload dropped.
         let mut terminal = TerminalState::new(16, 2);
@@ -18540,7 +18609,7 @@ mod tests {
         terminal.process_input(b"\x1b^pm-payload\x1b");
         terminal.process_input(b"\\W");
         assert!(terminal.parser.snapshot().pending_string.is_empty());
-        assert_eq!(terminal.grid[0][0].character, 'W');
+        assert_eq!(terminal.screen.grid[0][0].character, 'W');
 
         // BEL does not terminate a DCS. Overflow stays opaque until ST.
         let mut terminal = TerminalState::new(64, 2);
@@ -18549,10 +18618,10 @@ mod tests {
         terminal.process_input(&oversized);
         assert_eq!(terminal.parser.rejected_count(), 1);
         terminal.process_input(b"SECRET\x07");
-        assert_eq!(terminal.grid[0][0].character, ' ');
+        assert_eq!(terminal.screen.grid[0][0].character, ' ');
         terminal.process_input(b"\x1b\\S");
         assert_eq!(terminal.parser.retained_bytes(), 0);
-        assert_eq!(terminal.grid[0][0].character, 'S');
+        assert_eq!(terminal.screen.grid[0][0].character, 'S');
     }
 
     #[test]
@@ -19062,13 +19131,13 @@ mod tests {
         // grows the deque.
         let mut terminal = TerminalState::new(2, 2);
         // Push three lines into scrollback.
-        terminal.grid.get_mut(0, 0).character = 'A';
-        terminal.grid.get_mut(1, 0).character = 'B';
-        terminal.cursor_row = 1;
+        terminal.screen.grid.get_mut(0, 0).character = 'A';
+        terminal.screen.grid.get_mut(1, 0).character = 'B';
+        terminal.screen.cursor_row = 1;
         terminal.process_input(b"\n");
-        terminal.grid.get_mut(1, 0).character = 'C';
+        terminal.screen.grid.get_mut(1, 0).character = 'C';
         terminal.process_input(b"\n");
-        terminal.grid.get_mut(1, 0).character = 'D';
+        terminal.screen.grid.get_mut(1, 0).character = 'D';
         terminal.process_input(b"\n");
 
         // Scroll up to view 'A','B'.
@@ -19078,7 +19147,7 @@ mod tests {
         assert_eq!(top_before, 'A');
 
         // New line arrives — viewport must still show the same top row.
-        terminal.grid.get_mut(1, 0).character = 'E';
+        terminal.screen.grid.get_mut(1, 0).character = 'E';
         terminal.process_input(b"\n");
         let after = terminal.get_visible_cells();
         assert_eq!(after[0][0].character, 'A');
@@ -19087,36 +19156,36 @@ mod tests {
     #[test]
     fn ind_preserves_column_and_scrolls_like_vte() {
         let mut terminal = TerminalState::new(4, 2);
-        terminal.grid.get_mut(0, 0).character = 'A';
-        terminal.grid.get_mut(1, 0).character = 'B';
-        terminal.cursor_row = 1;
-        terminal.cursor_col = 2;
+        terminal.screen.grid.get_mut(0, 0).character = 'A';
+        terminal.screen.grid.get_mut(1, 0).character = 'B';
+        terminal.screen.cursor_row = 1;
+        terminal.screen.cursor_col = 2;
 
         terminal.process_input(b"\x1bD");
 
-        assert_eq!(terminal.cursor_row, 1);
-        assert_eq!(terminal.cursor_col, 2);
+        assert_eq!(terminal.screen.cursor_row, 1);
+        assert_eq!(terminal.screen.cursor_col, 2);
         assert_eq!(terminal.scrollback.len(), 1);
         assert_eq!(terminal.scrollback[0].decompress()[0].character, 'A');
-        assert_eq!(terminal.grid[0][0].character, 'B');
+        assert_eq!(terminal.screen.grid[0][0].character, 'B');
     }
 
     #[test]
     fn ri_scrolls_region_down_at_top_margin() {
         let mut terminal = TerminalState::new(4, 4);
         terminal.process_input(b"\x1b[2;3r");
-        terminal.grid.get_mut(1, 0).character = 'B';
-        terminal.grid.get_mut(2, 0).character = 'C';
-        terminal.cursor_row = 1;
-        terminal.cursor_col = 2;
+        terminal.screen.grid.get_mut(1, 0).character = 'B';
+        terminal.screen.grid.get_mut(2, 0).character = 'C';
+        terminal.screen.cursor_row = 1;
+        terminal.screen.cursor_col = 2;
 
         terminal.process_input(b"\x1bM");
 
-        assert_eq!(terminal.cursor_row, 1);
-        assert_eq!(terminal.cursor_col, 2);
-        assert_eq!(terminal.grid[1][0].character, ' ');
-        assert_eq!(terminal.grid[2][0].character, 'B');
-        assert_eq!(terminal.grid[3][0].character, ' ');
+        assert_eq!(terminal.screen.cursor_row, 1);
+        assert_eq!(terminal.screen.cursor_col, 2);
+        assert_eq!(terminal.screen.grid[1][0].character, ' ');
+        assert_eq!(terminal.screen.grid[2][0].character, 'B');
+        assert_eq!(terminal.screen.grid[3][0].character, ' ');
     }
 
     #[test]
@@ -19124,8 +19193,8 @@ mod tests {
         let mut terminal = TerminalState::new(4, 4);
         // Set a partial scroll region and a selection on the main buffer.
         terminal.process_input(b"\x1b[2;3r");
-        assert_eq!(terminal.scroll_region_top, 1);
-        assert_eq!(terminal.scroll_region_bottom, 2);
+        assert_eq!(terminal.screen.scroll_region_top, 1);
+        assert_eq!(terminal.screen.scroll_region_bottom, 2);
         terminal.start_selection((0, 0));
         terminal.update_selection((1, 1));
         assert!(terminal.selection.is_some());
@@ -19138,8 +19207,8 @@ mod tests {
             terminal.selection.is_none(),
             "selection must clear on alt switch"
         );
-        assert_eq!(terminal.scroll_region_top, 0);
-        assert_eq!(terminal.scroll_region_bottom, 3);
+        assert_eq!(terminal.screen.scroll_region_top, 0);
+        assert_eq!(terminal.screen.scroll_region_bottom, 3);
 
         // Restore some region & selection in alt buffer, then leave.
         terminal.process_input(b"\x1b[1;2r");
@@ -19152,8 +19221,8 @@ mod tests {
             terminal.selection.is_none(),
             "selection must clear on alt restore"
         );
-        assert_eq!(terminal.scroll_region_top, 0);
-        assert_eq!(terminal.scroll_region_bottom, 3);
+        assert_eq!(terminal.screen.scroll_region_top, 0);
+        assert_eq!(terminal.screen.scroll_region_bottom, 3);
     }
 
     #[test]
@@ -19162,25 +19231,25 @@ mod tests {
 
         let mut scrolled_up = TerminalState::new(4, 3);
         scrolled_up.process_input(b"\x1b[48;2;40;44;52m\x1b[3;1H\n");
-        assert!(scrolled_up.grid[2]
+        assert!(scrolled_up.screen.grid[2]
             .iter()
             .all(|cell| cell.background == expected));
 
         let mut scrolled_down = TerminalState::new(4, 3);
         scrolled_down.process_input(b"\x1b[48;2;40;44;52m\x1b[1;1H\x1bM");
-        assert!(scrolled_down.grid[0]
+        assert!(scrolled_down.screen.grid[0]
             .iter()
             .all(|cell| cell.background == expected));
 
         let mut inserted = TerminalState::new(4, 3);
         inserted.process_input(b"\x1b[48;2;40;44;52m\x1b[2;1H\x1b[L");
-        assert!(inserted.grid[1]
+        assert!(inserted.screen.grid[1]
             .iter()
             .all(|cell| cell.background == expected));
 
         let mut deleted = TerminalState::new(4, 3);
         deleted.process_input(b"\x1b[48;2;40;44;52m\x1b[2;1H\x1b[M");
-        assert!(deleted.grid[2]
+        assert!(deleted.screen.grid[2]
             .iter()
             .all(|cell| cell.background == expected));
     }
@@ -19192,16 +19261,16 @@ mod tests {
 
         terminal.process_input(b"\x1b[?1049h");
         terminal.process_input(b"\x1b[44m");
-        assert_eq!(terminal.current_bg, Color::Blue);
+        assert_eq!(terminal.screen.current_bg, Color::Blue);
 
         terminal.on_resize(6, 2);
         terminal.process_input(b"\x1b[?1049l");
 
-        assert_eq!(terminal.current_bg, Color::Default);
+        assert_eq!(terminal.screen.current_bg, Color::Default);
         assert_eq!(terminal.global_bg, Color::Default);
-        assert_eq!(terminal.grid[0][4].background, Color::Default);
-        assert_eq!(terminal.grid[0][5].background, Color::Default);
-        assert_eq!(terminal.grid[1][0].background, Color::Default);
+        assert_eq!(terminal.screen.grid[0][4].background, Color::Default);
+        assert_eq!(terminal.screen.grid[0][5].background, Color::Default);
+        assert_eq!(terminal.screen.grid[1][0].background, Color::Default);
     }
 
     #[test]
@@ -19217,7 +19286,7 @@ mod tests {
         terminal.process_input(b"\x1b]4;1;#102030\x1b\\");
         terminal.process_input(b"\x1b[?1049l");
 
-        assert_eq!(terminal.cursor_shape, CursorShape::Underline);
+        assert_eq!(terminal.screen.cursor_shape, CursorShape::Underline);
         assert_eq!(terminal.colors.dynamic_fg, Some((0x11, 0x22, 0x33)));
         assert_eq!(terminal.colors.dynamic_bg, Some((0x44, 0x55, 0x66)));
         assert_eq!(
@@ -19239,6 +19308,7 @@ mod tests {
         assert_eq!(terminal.scrollback[1].decompress()[0].character, 't');
         assert_eq!(terminal.scrollback[2].decompress()[0].character, 't');
         assert!(terminal
+            .screen
             .grid
             .iter()
             .flatten()
@@ -19294,27 +19364,43 @@ mod tests {
         for mode in [47, 1047, 1049] {
             let mut terminal = TerminalState::new(12, 6);
             terminal.process_input(b"\x1b[2;5H\x1b7\x1b[31;44m\x1b[3;12HX");
-            let saved_background = terminal.current_bg;
-            let primary_id = terminal.grid.raw_row_id(2).expect("tracked primary row");
+            let saved_background = terminal.screen.current_bg;
+            let primary_id = terminal
+                .screen
+                .grid
+                .raw_row_id(2)
+                .expect("tracked primary row");
 
             terminal.process_input(format!("\x1b[?{mode}h").as_bytes());
-            assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 0));
-            assert!(!terminal.pending_wrap);
-            assert_ne!(terminal.grid.raw_row_id(2), Some(primary_id));
+            assert_eq!(
+                (terminal.screen.cursor_row, terminal.screen.cursor_col),
+                (0, 0)
+            );
+            assert!(!terminal.screen.pending_wrap);
+            assert_ne!(terminal.screen.grid.raw_row_id(2), Some(primary_id));
 
             terminal.process_input(b"\x1b[33;42m\x1b[4;6H\x1b[?1049h\x1b[?7l");
-            assert_eq!((terminal.cursor_row, terminal.cursor_col), (3, 5));
+            assert_eq!(
+                (terminal.screen.cursor_row, terminal.screen.cursor_col),
+                (3, 5)
+            );
             terminal.process_input(format!("\x1b[?{mode}l").as_bytes());
-            assert_eq!(terminal.grid.raw_row_id(2), Some(primary_id));
-            assert_eq!((terminal.cursor_row, terminal.cursor_col), (2, 11));
-            assert_eq!(terminal.current_bg, saved_background);
-            assert!(terminal.pending_wrap);
+            assert_eq!(terminal.screen.grid.raw_row_id(2), Some(primary_id));
+            assert_eq!(
+                (terminal.screen.cursor_row, terminal.screen.cursor_col),
+                (2, 11)
+            );
+            assert_eq!(terminal.screen.current_bg, saved_background);
+            assert!(terminal.screen.pending_wrap);
             assert!(!terminal.protocol.modes().contains(&7));
 
             terminal.process_input(b"\x1b8");
-            assert_eq!((terminal.cursor_row, terminal.cursor_col), (1, 4));
-            assert_eq!(terminal.current_bg, Color::Default);
-            assert!(!terminal.pending_wrap);
+            assert_eq!(
+                (terminal.screen.cursor_row, terminal.screen.cursor_col),
+                (1, 4)
+            );
+            assert_eq!(terminal.screen.current_bg, Color::Default);
+            assert!(!terminal.screen.pending_wrap);
             assert!(!terminal.protocol.modes().contains(&7));
         }
     }
@@ -19325,17 +19411,17 @@ mod tests {
 
         terminal.process_input(b"abcd");
 
-        assert_eq!(terminal.cursor_row, 0);
-        assert_eq!(terminal.cursor_col, 3);
-        assert!(terminal.pending_wrap);
+        assert_eq!(terminal.screen.cursor_row, 0);
+        assert_eq!(terminal.screen.cursor_col, 3);
+        assert!(terminal.screen.pending_wrap);
         assert!(terminal.scrollback.is_empty());
 
         terminal.process_input(b"X");
 
-        assert_eq!(terminal.cursor_row, 1);
-        assert_eq!(terminal.cursor_col, 1);
-        assert_eq!(terminal.grid[1][0].character, 'X');
-        assert!(terminal.grid.row_wrapped()[0]);
+        assert_eq!(terminal.screen.cursor_row, 1);
+        assert_eq!(terminal.screen.cursor_col, 1);
+        assert_eq!(terminal.screen.grid[1][0].character, 'X');
+        assert!(terminal.screen.grid.row_wrapped()[0]);
     }
 
     #[test]
@@ -19345,12 +19431,12 @@ mod tests {
         terminal.process_input(b"\x1b[?7l");
         terminal.process_input(b"abcd");
 
-        assert_eq!(terminal.cursor_row, 0);
-        assert_eq!(terminal.cursor_col, 2);
-        assert!(!terminal.pending_wrap);
-        assert_eq!(terminal.grid[0][0].character, 'a');
-        assert_eq!(terminal.grid[0][1].character, 'b');
-        assert_eq!(terminal.grid[0][2].character, 'd');
+        assert_eq!(terminal.screen.cursor_row, 0);
+        assert_eq!(terminal.screen.cursor_col, 2);
+        assert!(!terminal.screen.pending_wrap);
+        assert_eq!(terminal.screen.grid[0][0].character, 'a');
+        assert_eq!(terminal.screen.grid[0][1].character, 'b');
+        assert_eq!(terminal.screen.grid[0][2].character, 'd');
     }
 
     #[test]
@@ -19359,21 +19445,21 @@ mod tests {
 
         terminal.process_input(b"P>");
         terminal.process_input(b"\x1b7");
-        assert!(!terminal.pending_wrap);
+        assert!(!terminal.screen.pending_wrap);
 
         terminal.process_input(b"\x1b[6GR");
-        assert_eq!(terminal.cursor_col, 5);
-        assert!(terminal.pending_wrap);
+        assert_eq!(terminal.screen.cursor_col, 5);
+        assert!(terminal.screen.pending_wrap);
 
         terminal.process_input(b"\x1b8");
-        assert_eq!(terminal.cursor_row, 0);
-        assert_eq!(terminal.cursor_col, 2);
-        assert!(!terminal.pending_wrap);
+        assert_eq!(terminal.screen.cursor_row, 0);
+        assert_eq!(terminal.screen.cursor_col, 2);
+        assert!(!terminal.screen.pending_wrap);
 
         terminal.process_input(b"x");
-        assert_eq!(terminal.cursor_row, 0);
-        assert_eq!(terminal.cursor_col, 3);
-        assert_eq!(terminal.grid[0][2].character, 'x');
+        assert_eq!(terminal.screen.cursor_row, 0);
+        assert_eq!(terminal.screen.cursor_col, 3);
+        assert_eq!(terminal.screen.grid[0][2].character, 'x');
     }
 
     #[test]
@@ -19387,9 +19473,9 @@ mod tests {
         terminal.process_input(b"\x1b[?1049l");
 
         assert!(!terminal.is_alt_buffer_active());
-        assert_eq!(terminal.grid[0][0].character, 'm');
-        assert_eq!(terminal.grid[1][1].character, 'X');
-        assert_eq!(terminal.grid[1][2].character, 'Y');
+        assert_eq!(terminal.screen.grid[0][0].character, 'm');
+        assert_eq!(terminal.screen.grid[1][1].character, 'X');
+        assert_eq!(terminal.screen.grid[1][2].character, 'Y');
     }
 
     #[test]
@@ -19402,7 +19488,7 @@ mod tests {
         terminal.set_disable_alt_screen(true);
 
         assert!(!terminal.is_alt_buffer_active());
-        assert_eq!(terminal.grid[0][0].character, 'm');
+        assert_eq!(terminal.screen.grid[0][0].character, 'm');
         terminal.process_input(b"\x1b[?1049h");
         assert!(!terminal.is_alt_buffer_active());
     }
@@ -20196,7 +20282,7 @@ mod tests {
         assert!(if output_start < terminal.scrollback.len() {
             terminal.scrollback[output_start].is_wrapped()
         } else {
-            terminal.grid.row_wrapped()[output_start - terminal.scrollback.len()]
+            terminal.screen.grid.row_wrapped()[output_start - terminal.scrollback.len()]
         });
         assert_eq!(terminal.zone_output_line_row(id, 0), None);
         assert_eq!(terminal.zone_output_line_row(id, 1), Some(output_start));
@@ -20620,7 +20706,7 @@ mod tests {
                 terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n");
                 terminal.process_input(&output.as_bytes()[..split]);
                 terminal.process_input(&output.as_bytes()[split..]);
-                let live: String = terminal.grid[1]
+                let live: String = terminal.screen.grid[1]
                     .iter()
                     .filter(|cell| !cell.flags.wide_continuation())
                     .map(|cell| cell.character)
@@ -20639,15 +20725,15 @@ mod tests {
             for command in ['@', 'P'] {
                 let mut terminal = TerminalState::new(8, 8);
                 terminal.process_batch(text.as_bytes());
-                assert!(terminal.pending_wrap);
+                assert!(terminal.screen.pending_wrap);
                 let cursor = terminal.get_cursor_pos();
                 terminal.process_batch(format!("\x1b[{command}").as_bytes());
-                assert!(terminal.pending_wrap);
+                assert!(terminal.screen.pending_wrap);
                 assert_eq!(terminal.get_cursor_pos(), cursor);
                 terminal.process_batch(b"Z");
                 assert_eq!(terminal.get_cursor_pos(), (1, 1));
-                assert!(terminal.grid.row_wrapped()[0]);
-                assert_eq!(terminal.grid.get(1, 0).character, 'Z');
+                assert!(terminal.screen.grid.row_wrapped()[0]);
+                assert_eq!(terminal.screen.grid.get(1, 0).character, 'Z');
             }
         }
     }
@@ -20689,48 +20775,48 @@ mod tests {
                                 let mut expected = TerminalState::new(cols, 8);
                                 actual.process_batch(setup.as_bytes());
                                 expected.process_batch(setup.as_bytes());
-                                let row = actual.cursor_row;
-                                let row_id = actual.grid.raw_row_id(row);
-                                let wraps = actual.grid.row_wrapped().to_vec();
+                                let row = actual.screen.cursor_row;
+                                let row_id = actual.screen.grid.raw_row_id(row);
+                                let wraps = actual.screen.grid.row_wrapped().to_vec();
                                 let cursor = actual.get_cursor_pos();
-                                let pending_wrap = actual.pending_wrap;
+                                let pending_wrap = actual.screen.pending_wrap;
                                 // Prime the visible cache before changing cells.
                                 let _ = actual.get_visible_cells();
                                 let before_version = actual.grid_version;
                                 let n = count.max(1).min(cols - column);
                                 let blank = expected.create_blank_cell();
-                                blank_reference_pair(&mut expected.grid[row], column, blank);
+                                blank_reference_pair(&mut expected.screen.grid[row], column, blank);
                                 if command == '@' {
                                     for _ in 0..n {
-                                        expected.grid.insert_cell_in_row(row, column, blank);
+                                        expected.screen.grid.insert_cell_in_row(row, column, blank);
                                     }
-                                    if expected.grid[row][cols - 1].flags.wide() {
-                                        expected.grid[row][cols - 1] = blank;
+                                    if expected.screen.grid[row][cols - 1].flags.wide() {
+                                        expected.screen.grid[row][cols - 1] = blank;
                                     }
                                 } else {
                                     blank_reference_pair(
-                                        &mut expected.grid[row],
+                                        &mut expected.screen.grid[row],
                                         column + n,
                                         blank,
                                     );
                                     for _ in 0..n {
-                                        expected.grid.remove_cell_from_row(row, column);
-                                        *expected.grid.get_mut(row, cols - 1) = blank;
+                                        expected.screen.grid.remove_cell_from_row(row, column);
+                                        *expected.screen.grid.get_mut(row, cols - 1) = blank;
                                     }
                                 }
                                 actual.process_batch(&sequence.as_bytes()[..split]);
                                 actual.process_batch(&sequence.as_bytes()[split..]);
-                                assert_eq!(actual.grid.to_vec(), expected.grid.to_vec(),
+                                assert_eq!(actual.screen.grid.to_vec(), expected.screen.grid.to_vec(),
                                     "cols={cols} text={text:?} col={column} count={count} command={command} split={split}");
                                 assert_eq!(
                                     actual.get_visible_cells().as_ref(),
-                                    &expected.grid.to_vec()
+                                    &expected.screen.grid.to_vec()
                                 );
                                 assert!(actual.row_versions[row] > before_version);
-                                assert_eq!(actual.grid.raw_row_id(row), row_id);
-                                assert_eq!(actual.grid.row_wrapped(), wraps);
+                                assert_eq!(actual.screen.grid.raw_row_id(row), row_id);
+                                assert_eq!(actual.screen.grid.row_wrapped(), wraps);
                                 assert_eq!(actual.get_cursor_pos(), cursor);
-                                assert_eq!(actual.pending_wrap, pending_wrap);
+                                assert_eq!(actual.screen.pending_wrap, pending_wrap);
                             }
                         }
                     }
@@ -20759,7 +20845,7 @@ mod tests {
                                 terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n");
                                 terminal.process_input(&output.as_bytes()[..split]);
                                 terminal.process_input(&output.as_bytes()[split..]);
-                                let live: String = terminal.grid[1]
+                                let live: String = terminal.screen.grid[1]
                                     .iter()
                                     .filter(|cell| !cell.flags.wide_continuation())
                                     .map(|cell| cell.character)
@@ -21155,7 +21241,10 @@ mod tests {
     #[test]
     fn a_click_left_of_the_cursor_walks_back_to_it() {
         let terminal = terminal_at_prompt(32, 4, "echo hello");
-        assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 12));
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (0, 12)
+        );
         assert_eq!(
             terminal.click_cursor_move(0, 7, true),
             b"\x1b[D".repeat(5),
@@ -21172,7 +21261,10 @@ mod tests {
         assert!(terminal.click_cursor_move(0, 30, true).is_empty());
 
         terminal.process_input(b"\x1b[D\x1b[D\x1b[D");
-        assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 6));
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (0, 6)
+        );
         assert_eq!(terminal.click_cursor_move(0, 30, true), b"\x1b[C".repeat(3));
     }
 
@@ -21189,7 +21281,7 @@ mod tests {
         ghost: &str,
     ) -> super::TerminalState {
         let mut terminal = terminal_at_prompt(cols, rows, typed);
-        let col = terminal.cursor_col;
+        let col = terminal.screen.cursor_col;
         terminal.process_input(format!("\x1b[38;5;8m{ghost}\x1b[0m\x1b[{}G", col + 1).as_bytes());
         terminal
     }
@@ -21200,7 +21292,10 @@ mod tests {
         // grey cells are a preview, and every `Right` spent on them is jsh
         // accepting a command the user never typed.
         let terminal = terminal_with_suggestion(32, 4, "echo he", "llo world");
-        assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 9));
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (0, 9)
+        );
 
         assert!(
             terminal.click_cursor_move(0, 30, true).is_empty(),
@@ -21227,7 +21322,7 @@ mod tests {
         rprompt: &str,
     ) -> super::TerminalState {
         let mut terminal = terminal_at_prompt(cols, rows, typed);
-        let col = terminal.cursor_col;
+        let col = terminal.screen.cursor_col;
         terminal.process_input(
             format!(
                 "\x1b[{}G\x1b[33m{rprompt}\x1b[0m\x1b[{}G",
@@ -21247,7 +21342,10 @@ mod tests {
         // command, not at the duration display parked against the right edge.
         let mut terminal = terminal_with_rprompt(32, 4, "echo hello", "2.3s");
         terminal.process_input(b"\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D");
-        assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 7));
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (0, 7)
+        );
 
         assert_eq!(
             terminal.click_cursor_move(0, 30, true),
@@ -21268,7 +21366,10 @@ mod tests {
         // buffer.
         let mut terminal = terminal_at_prompt(40, 4, "echo 'a          b'");
         terminal.process_input(b"\x1b[D".repeat(15).as_slice());
-        assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 6));
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (0, 6)
+        );
         assert_eq!(
             terminal.click_cursor_move(0, 38, true),
             b"\x1b[C".repeat(15),
@@ -21282,7 +21383,10 @@ mod tests {
         // styled belongs to the buffer, so a click must still travel to it.
         let mut terminal = terminal_at_prompt(32, 4, "echo hello");
         terminal.process_input(b"\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D");
-        assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 7));
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (0, 7)
+        );
         assert_eq!(terminal.click_cursor_move(0, 30, true), b"\x1b[C".repeat(5));
     }
 
@@ -21297,7 +21401,10 @@ mod tests {
         let mut terminal = super::TerminalState::new(32, 4);
         terminal.process_input(b"completed output\r\n");
         terminal.process_input(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\echo hello");
-        assert_eq!((terminal.cursor_row, terminal.cursor_col), (1, 12));
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (1, 12)
+        );
         assert!(
             terminal.click_cursor_move(0, 7, true).is_empty(),
             "history interaction must not synthesize Left/Home for the live editor"
@@ -21313,14 +21420,20 @@ mod tests {
     fn a_click_follows_a_soft_wrap_onto_the_previous_row() {
         // 10 columns: "$ " plus 12 characters wraps onto a second row.
         let terminal = terminal_at_prompt(10, 4, "abcdefghijkl");
-        assert_eq!((terminal.cursor_row, terminal.cursor_col), (1, 4));
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (1, 4)
+        );
         assert_eq!(terminal.click_cursor_move(0, 4, true), b"\x1b[D".repeat(10));
     }
 
     #[test]
     fn wide_characters_cost_one_arrow_each() {
         let terminal = terminal_at_prompt(32, 4, "echo 你好世界");
-        assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 15));
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (0, 15)
+        );
         assert_eq!(
             terminal.click_cursor_move(0, 7, true),
             b"\x1b[D".repeat(4),
@@ -21374,18 +21487,24 @@ mod tests {
     /// Every wide lead must own the continuation beside it, and every
     /// continuation must follow a lead: the renderer relies on both.
     fn assert_wide_pairs_intact(terminal: &TerminalState, row: usize) {
-        let cols = terminal.grid.row_len();
+        let cols = terminal.screen.grid.row_len();
         for col in 0..cols {
-            let cell = terminal.grid.get(row, col);
+            let cell = terminal.screen.grid.get(row, col);
             if cell.flags.wide() {
                 assert!(
-                    col + 1 < cols && terminal.grid.get(row, col + 1).flags.wide_continuation(),
+                    col + 1 < cols
+                        && terminal
+                            .screen
+                            .grid
+                            .get(row, col + 1)
+                            .flags
+                            .wide_continuation(),
                     "lead at {col} lost its continuation"
                 );
             }
             if cell.flags.wide_continuation() {
                 assert!(
-                    col > 0 && terminal.grid.get(row, col - 1).flags.wide(),
+                    col > 0 && terminal.screen.grid.get(row, col - 1).flags.wide(),
                     "continuation at {col} lost its lead"
                 );
             }
@@ -21401,11 +21520,11 @@ mod tests {
         let mut terminal = TerminalState::new(10, 2);
         terminal.process_input("中文\r 中文".as_bytes());
 
-        let lead = terminal.grid.get(0, 1);
+        let lead = terminal.screen.grid.get(0, 1);
         assert_eq!(lead.character, '中');
         assert!(lead.flags.wide());
-        assert!(terminal.grid.get(0, 2).flags.wide_continuation());
-        assert_eq!(terminal.grid.get(0, 3).character, '文');
+        assert!(terminal.screen.grid.get(0, 2).flags.wide_continuation());
+        assert_eq!(terminal.screen.grid.get(0, 3).character, '文');
         assert_wide_pairs_intact(&terminal, 0);
     }
 
@@ -21419,7 +21538,7 @@ mod tests {
         // Insert with the cursor on the continuation half of 中.
         terminal.process_input(b"\x1b[1;4H\x1b[4hX");
 
-        assert_eq!(terminal.grid.get(0, 3).character, 'X');
+        assert_eq!(terminal.screen.grid.get(0, 3).character, 'X');
         assert_wide_pairs_intact(&terminal, 0);
     }
 
@@ -21428,9 +21547,9 @@ mod tests {
         let mut terminal = TerminalState::new(10, 4);
         terminal.process_input(b"a\x0bb\x0cc\x00");
 
-        assert_eq!(terminal.grid.get(0, 0).character, 'a');
-        assert_eq!(terminal.grid.get(1, 1).character, 'b');
-        assert_eq!(terminal.grid.get(2, 2).character, 'c');
+        assert_eq!(terminal.screen.grid.get(0, 0).character, 'a');
+        assert_eq!(terminal.screen.grid.get(1, 1).character, 'b');
+        assert_eq!(terminal.screen.grid.get(2, 2).character, 'c');
         assert_eq!(terminal.get_cursor_pos(), (2, 3));
     }
 
@@ -21443,13 +21562,15 @@ mod tests {
         terminal.process_input(b" ");
         terminal.process_input(b"Ff");
 
-        let row: String = (0..6).map(|c| terminal.grid.get(0, c).character).collect();
+        let row: String = (0..6)
+            .map(|c| terminal.screen.grid.get(0, c).character)
+            .collect();
         assert_eq!(row, "abcdef");
 
         // Designations frost implements still switch the character set.
         terminal.process_input(b"\x1b(0q\x1b(Bq");
-        assert_eq!(terminal.grid.get(0, 6).character, '─');
-        assert_eq!(terminal.grid.get(0, 7).character, 'q');
+        assert_eq!(terminal.screen.grid.get(0, 6).character, '─');
+        assert_eq!(terminal.screen.grid.get(0, 7).character, 'q');
     }
 
     #[test]
@@ -21466,27 +21587,30 @@ mod tests {
     #[test]
     fn frost_cursor_reports_stay_absolute_while_origin_and_wrap_are_pending() {
         let mut terminal = TerminalState::new(12, 6);
-        terminal.scroll_region_top = 2;
-        terminal.scroll_region_bottom = 4;
-        terminal.origin_mode = true;
-        terminal.cursor_row = 3;
-        terminal.cursor_col = 11;
-        terminal.pending_wrap = true;
+        terminal.screen.scroll_region_top = 2;
+        terminal.screen.scroll_region_bottom = 4;
+        terminal.screen.origin_mode = true;
+        terminal.screen.cursor_row = 3;
+        terminal.screen.cursor_col = 11;
+        terminal.screen.pending_wrap = true;
         terminal.process_input(b"\x1b[5n\x1b[?6n\x1b[6n");
         assert_eq!(terminal.get_output(), b"\x1b[0n\x1b[?4;12R\x1b[4;12R");
-        assert_eq!((terminal.cursor_row, terminal.cursor_col), (3, 11));
-        assert!(terminal.pending_wrap);
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (3, 11)
+        );
+        assert!(terminal.screen.pending_wrap);
     }
 
     #[test]
     fn fragmented_frost_cursor_reports_preserve_query_order_and_admission() {
         let mut terminal = TerminalState::new(12, 6);
-        terminal.scroll_region_top = 2;
-        terminal.scroll_region_bottom = 4;
-        terminal.origin_mode = true;
-        terminal.cursor_row = 3;
-        terminal.cursor_col = 11;
-        terminal.pending_wrap = true;
+        terminal.screen.scroll_region_top = 2;
+        terminal.screen.scroll_region_bottom = 4;
+        terminal.screen.origin_mode = true;
+        terminal.screen.cursor_row = 3;
+        terminal.screen.cursor_col = 11;
+        terminal.screen.pending_wrap = true;
 
         terminal.process_input(b"\x1b[?");
         assert!(terminal.get_output().is_empty());
@@ -21498,8 +21622,11 @@ mod tests {
         assert_eq!(terminal.get_output(), b"\x1b[4;12R\x1b[?65;1;9c");
         terminal.process_input(b"c\x1b[?c\x1b[=c\x1b[$c\x1b[>$c\x1b[?6n");
         assert_eq!(terminal.get_output(), b"\x1b[>1;7802;0c\x1b[?4;12R");
-        assert_eq!((terminal.cursor_row, terminal.cursor_col), (3, 11));
-        assert!(terminal.pending_wrap);
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (3, 11)
+        );
+        assert!(terminal.screen.pending_wrap);
     }
 
     /// Kimi Code picks its palette from `CSI ? 996 n`.
@@ -21598,8 +21725,8 @@ mod tests {
         terminal.on_resize(60, 12);
 
         let row = |t: &TerminalState, r: usize| -> String {
-            let text: String = (0..t.grid.row_len())
-                .map(|c| t.grid.get(r, c).character)
+            let text: String = (0..t.screen.grid.row_len())
+                .map(|c| t.screen.grid.get(r, c).character)
                 .collect();
             text.trim_end().to_string()
         };
@@ -21639,10 +21766,10 @@ mod tests {
                     terminal.process_input(&bytes[..split]);
                     terminal.process_input(&bytes[split..]);
                     assert_eq!(
-                        terminal.grid[0][0].character, 'o',
+                        terminal.screen.grid[0][0].character, 'o',
                         "prefix={prefix:?}, cancel={cancel}, split={split}"
                     );
-                    assert_eq!(terminal.grid[0][1].character, 'k');
+                    assert_eq!(terminal.screen.grid[0][1].character, 'k');
                     assert!(terminal.titles.window_title.is_empty());
                 }
             }
@@ -21667,11 +21794,11 @@ mod tests {
                 terminal.process_input(&bytes[..split]);
                 terminal.process_input(&bytes[split..]);
                 assert_eq!(
-                    terminal.grid[0][0].character, 'o',
+                    terminal.screen.grid[0][0].character, 'o',
                     "prefix={prefix:?}, split={split}"
                 );
                 assert_eq!(
-                    terminal.grid[0][1].character, 'k',
+                    terminal.screen.grid[0][1].character, 'k',
                     "prefix={prefix:?}, split={split}"
                 );
                 assert!(!terminal.protocol.modes().contains(&2004));
@@ -21695,8 +21822,8 @@ mod tests {
                 terminal.process_input(&[*byte]);
             }
             assert_eq!(terminal.parser.pending_kind(), super::PendingKind::None);
-            assert_eq!(terminal.grid[0][0].character, 'o');
-            assert_eq!(terminal.grid[0][1].character, 'k');
+            assert_eq!(terminal.screen.grid[0][0].character, 'o');
+            assert_eq!(terminal.screen.grid[0][1].character, 'k');
         }
     }
 
@@ -21808,7 +21935,7 @@ mod tests {
             emit_zone(&mut terminal, 0);
             assert_eq!(terminal.clear_completed_blocks(), 1);
             terminal.process_input(b"newword");
-            terminal.select_word_at(terminal.cursor_row, 1);
+            terminal.select_word_at(terminal.screen.cursor_row, 1);
             assert_eq!(terminal.copy_selection().as_deref(), Some("newword"));
             assert_eq!(terminal.undo_clear_completed_blocks(), 1);
             assert_eq!(terminal.copy_selection().as_deref(), Some("newword"));
@@ -22092,16 +22219,16 @@ mod block_spacing_tests {
             // Stay within the terminal's 512-row allocation limit. Two-byte
             // cells let the fixture reach the byte cap without oversized grids.
             let mut terminal = TerminalState::new(1024, 512);
-            assert_eq!(terminal.grid.rows(), 512);
+            assert_eq!(terminal.screen.grid.rows(), 512);
             for row in 0..511 {
-                for cell in &mut terminal.grid[row] {
+                for cell in &mut terminal.screen.grid[row] {
                     cell.character = 'é';
                 }
             }
-            for cell in &mut terminal.grid[511][..768] {
+            for cell in &mut terminal.screen.grid[511][..768] {
                 cell.character = 'é';
             }
-            terminal.grid[511][768].character = last;
+            terminal.screen.grid[511][768].character = last;
             // 511 * (2048 + newline) + 768 * 2 == CAP - 1 bytes.
             // One ASCII scalar fits exactly; a multibyte final scalar does not.
             let capture = terminal
@@ -22157,12 +22284,12 @@ mod block_spacing_tests {
     fn native_chrome_preserves_raw_cells_and_places_status_before_active_prompt() {
         for compact in [false, true] {
             let mut terminal = fixture(80, 30);
-            let raw = terminal.grid.to_vec();
+            let raw = terminal.screen.grid.to_vec();
             let cursor = terminal.get_cursor_pos();
             let mut policy = native();
             policy.set_block_spacing(!compact);
             let view = terminal.get_projected_viewport_with_policy(true, &policy, 0);
-            assert_eq!(terminal.grid.to_vec(), raw);
+            assert_eq!(terminal.screen.grid.to_vec(), raw);
             assert_eq!(terminal.get_cursor_pos(), cursor);
             assert_eq!(view.cells().len(), 30);
             let status: Vec<_> = view
@@ -22252,11 +22379,11 @@ mod block_spacing_tests {
             ProjectedRowKind::BlockChrome { line: 0, .. }
         ));
         assert_eq!(view.cells()[5][0].character, '$');
-        assert_eq!(terminal.grid.rows(), 30);
-        terminal.grid[29][0].flags.set_dim(true);
+        assert_eq!(terminal.screen.grid.rows(), 30);
+        terminal.screen.grid[29][0].flags.set_dim(true);
         assert_eq!(terminal.native_chrome_tail_rows(&native()), 0);
-        terminal.grid[29][0] = TerminalCell::default();
-        terminal.cursor_row = 28;
+        terminal.screen.grid[29][0] = TerminalCell::default();
+        terminal.screen.cursor_row = 28;
         assert_eq!(terminal.native_chrome_tail_rows(&native()), 1);
     }
 
@@ -22276,8 +22403,8 @@ mod block_spacing_tests {
         terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b[19;1H");
         terminal.process_input(b"                         ");
         terminal.process_input(b"\x1b[1;3H");
-        assert!(terminal.grid.row_wrapped()[18]);
-        assert!(terminal.grid[19]
+        assert!(terminal.screen.grid.row_wrapped()[18]);
+        assert!(terminal.screen.grid[19]
             .iter()
             .all(|cell| *cell == TerminalCell::default()));
         assert_eq!(terminal.native_chrome_tail_rows(&native()), 0);
@@ -22414,7 +22541,7 @@ mod block_spacing_tests {
     fn block_spacing_adds_real_rows_without_changing_terminal_cells_or_columns() {
         for cols in [4, 12, 80] {
             let terminal = fixture(cols, 12);
-            let raw = terminal.grid.to_vec();
+            let raw = terminal.screen.grid.to_vec();
             let cursor = terminal.get_cursor_pos();
             let history = terminal.scrollback.len();
             let identity = terminal.identity_projection_plan(cols);
@@ -22441,7 +22568,7 @@ mod block_spacing_tests {
                 real,
                 terminal.materialize_identity_projection_plan(&identity)
             );
-            assert_eq!(terminal.grid.to_vec(), raw);
+            assert_eq!(terminal.screen.grid.to_vec(), raw);
             assert_eq!(terminal.get_cursor_pos(), cursor);
             assert_eq!(terminal.scrollback.len(), history);
             assert_eq!(spaced.cols, cols);
@@ -22598,7 +22725,7 @@ mod block_spacing_tests {
         );
         let mut wrapped = fixture(24, 8);
         let boundary = wrapped.command_zones[1].prompt_start;
-        wrapped.grid.row_wrapped_mut()[boundary - 1] = true;
+        wrapped.screen.grid.row_wrapped_mut()[boundary - 1] = true;
         let plan = wrapped.collapsed_projection_plan(24, &normal());
         assert_eq!(
             spacer_count(&plan),
@@ -22659,7 +22786,7 @@ mod block_spacing_tests {
         assert_eq!(spacer_count(&plan), MAX_COMMAND_ZONES);
         assert_eq!(
             plan.rows.len(),
-            terminal.scrollback.len() + terminal.grid.rows() + MAX_COMMAND_ZONES
+            terminal.scrollback.len() + terminal.screen.grid.rows() + MAX_COMMAND_ZONES
         );
         for _ in 0..8 {
             let cached = terminal.get_projected_viewport_with_policy(true, &policy, 0);
@@ -22739,8 +22866,9 @@ mod block_spacing_tests {
     }
 
     fn assert_spacing_plan_matches_cold(terminal: &mut TerminalState, policy: &ProjectionPolicy) {
-        let cold = terminal.collapsed_projection_plan(terminal.grid.row_len(), policy);
-        let Some(warm) = terminal.cached_collapsed_projection_plan(terminal.grid.row_len(), policy)
+        let cold = terminal.collapsed_projection_plan(terminal.screen.grid.row_len(), policy);
+        let Some(warm) =
+            terminal.cached_collapsed_projection_plan(terminal.screen.grid.row_len(), policy)
         else {
             assert_eq!(spacer_count(&cold), 0);
             assert!(cold.effective_collapsed.is_empty());
@@ -22834,11 +22962,11 @@ mod unicode_width_023_host_tests {
                 terminal.process_input(&bytes[..split]);
                 terminal.process_input(&bytes[split..]);
                 assert_eq!(
-                    (terminal.cursor_row, terminal.cursor_col),
+                    (terminal.screen.cursor_row, terminal.screen.cursor_col),
                     (0, input.chars().count())
                 );
                 for (col, ch) in input.chars().enumerate() {
-                    let cell = &terminal.grid[0][col];
+                    let cell = &terminal.screen.grid[0][col];
                     assert_eq!(cell.character, ch, "split {split} col {col}");
                     assert!(!cell.flags.wide() && !cell.flags.wide_continuation());
                 }
@@ -22853,13 +22981,19 @@ mod unicode_width_023_host_tests {
             let mut terminal = super::TerminalState::new(4, 3);
             terminal.process_input(&input.as_bytes()[..split]);
             terminal.process_input(&input.as_bytes()[split..]);
-            assert_eq!(terminal.grid[0][2].character, '\u{ff9e}');
-            assert_eq!(terminal.grid[0][3].character, '\u{ff9f}');
-            assert_eq!(terminal.grid[1][0].character, 'Z');
-            assert_eq!((terminal.cursor_row, terminal.cursor_col), (1, 1));
+            assert_eq!(terminal.screen.grid[0][2].character, '\u{ff9e}');
+            assert_eq!(terminal.screen.grid[0][3].character, '\u{ff9f}');
+            assert_eq!(terminal.screen.grid[1][0].character, 'Z');
+            assert_eq!(
+                (terminal.screen.cursor_row, terminal.screen.cursor_col),
+                (1, 1)
+            );
             terminal.process_input(b"\x08Q");
-            assert_eq!(terminal.grid[1][0].character, 'Q');
-            assert_eq!((terminal.cursor_row, terminal.cursor_col), (1, 1));
+            assert_eq!(terminal.screen.grid[1][0].character, 'Q');
+            assert_eq!(
+                (terminal.screen.cursor_row, terminal.screen.cursor_col),
+                (1, 1)
+            );
         }
     }
 }

@@ -91,15 +91,15 @@ fn bounded_discard_bel_and_cancellation_preserve_capture_privacy() {
 fn bounded_osc8_rejection_clears_only_active_link() {
     let mut terminal = TerminalState::new(40, 8);
     terminal.process_input(b"\x1b]8;;https://safe.test\x1b\\A");
-    let old = terminal.grid[0][0].hyperlink_id;
+    let old = terminal.screen.grid[0][0].hyperlink_id;
     assert!(!old.is_none());
     let mut attack = b"\x1b]8;;SECRET".to_vec();
     attack.resize(MAX_PENDING_ESCAPE + 3, b'x');
     terminal.process_input(&attack);
-    assert!(terminal.current_hyperlink.is_none());
+    assert!(terminal.screen.current_hyperlink.is_none());
     terminal.process_input(b"\x1b\\B");
-    assert_eq!(terminal.grid[0][0].hyperlink_id, old);
-    assert!(terminal.grid[0][1].hyperlink_id.is_none());
+    assert_eq!(terminal.screen.grid[0][0].hyperlink_id, old);
+    assert!(terminal.screen.grid[0][1].hyperlink_id.is_none());
     assert!(terminal.get_output().is_empty());
 }
 
@@ -121,7 +121,10 @@ fn bounded_normal_stream_matches_legacy_at_every_split() {
             legacy.process_input(part);
         }
         for row in 0..8 {
-            assert_eq!(strict.grid[row], legacy.grid[row], "cut={cut}");
+            assert_eq!(
+                strict.screen.grid[row], legacy.screen.grid[row],
+                "cut={cut}"
+            );
         }
         assert_eq!(strict.get_cursor_pos(), legacy.get_cursor_pos());
         assert_eq!(strict.titles.window_title, legacy.titles.window_title);
@@ -265,11 +268,11 @@ fn bounded_csi_capacity_reaches_host_without_suffix_execution() {
             terminal.process_input(&bytes[..cut]);
             terminal.process_input(&bytes[cut..]);
             assert_eq!(
-                terminal.grid[0][0].character, 'Z',
+                terminal.screen.grid[0][0].character, 'Z',
                 "zeros={zeros} cut={cut}"
             );
             assert_eq!(
-                terminal.grid[0][0].flags.bold(),
+                terminal.screen.grid[0][0].flags.bold(),
                 zeros == 127,
                 "zeros={zeros} cut={cut}"
             );
@@ -294,7 +297,7 @@ fn bounded_csi_capacity_reaches_host_without_suffix_execution() {
                 zeros == 126,
                 "zeros={zeros} cut={cut}"
             );
-            assert_eq!(terminal.grid[0][0].character, 'Z');
+            assert_eq!(terminal.screen.grid[0][0].character, 'Z');
             assert_eq!(terminal.get_output(), b"\x1b[1;2R");
             assert_eq!(terminal.parser.retained_bytes(), 0);
         }
@@ -316,10 +319,10 @@ fn bounded_cancelled_csi_cannot_change_host_color_or_cursor_mode() {
             assert!(!terminal.is_application_cursor_keys());
             for (col, character) in ['m', 'h', 'Z'].into_iter().enumerate() {
                 assert_eq!(
-                    terminal.grid[0][col].character, character,
+                    terminal.screen.grid[0][col].character, character,
                     "cancel={cancel} cut={cut}"
                 );
-                assert_eq!(terminal.grid[0][col].foreground, Color::Default);
+                assert_eq!(terminal.screen.grid[0][col].foreground, Color::Default);
             }
             assert_eq!(terminal.get_output(), b"\x1b[1;4R");
             assert_eq!(terminal.parser.retained_bytes(), 0);

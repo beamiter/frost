@@ -838,7 +838,7 @@ fn finalized_block_at_viewport_row(
         terminal::ProjectedRowKind::Raw => {}
     }
     let abs_row = projection.view_row_absolute(row)?;
-    let total = terminal.scrollback_len() + terminal.grid.rows();
+    let total = terminal.scrollback_len() + terminal.screen.grid.rows();
     let live_boundary = terminal
         .running_zone_start()
         .or(terminal.live_prompt_row())
@@ -6257,8 +6257,8 @@ impl Session {
             self.transcript_canvas.reconcile(
                 self.projection.scroll_offset(),
                 self.projection.max_scroll_offset(),
-                self.terminal.grid.rows(),
-                self.terminal.grid.cols(),
+                self.terminal.screen.grid.rows(),
+                self.terminal.screen.grid.cols(),
             );
             let row = self.transcript_canvas.row();
             if row != self.projection.scroll_offset() {
@@ -6937,8 +6937,11 @@ fn cancelled_terminal_mouse_report(
     terminal: &terminal::TerminalState,
     modifiers: keyboard::Modifiers,
 ) -> Option<Vec<u8>> {
-    let (col, row) =
-        gesture.app_release_cell(None, terminal.grid.row_len(), terminal.grid.rows())?;
+    let (col, row) = gesture.app_release_cell(
+        None,
+        terminal.screen.grid.row_len(),
+        terminal.screen.grid.rows(),
+    )?;
     let code = match gesture.button {
         MouseButton::Left => 0,
         MouseButton::Middle => 1,
@@ -12731,7 +12734,7 @@ impl Frost {
         }
         let target = self.sessions.get(self.active).and_then(|sess| {
             let terminal = &sess.terminal;
-            let total = terminal.scrollback_len() + terminal.grid.rows();
+            let total = terminal.scrollback_len() + terminal.screen.grid.rows();
             let live_boundary = terminal
                 .running_zone_start()
                 .or(terminal.live_prompt_row())
@@ -15180,8 +15183,8 @@ impl Frost {
                     if let Some((grid_col, grid_row)) = gesture.and_then(|gesture| {
                         gesture.app_release_cell(
                             current,
-                            sess.terminal.grid.row_len(),
-                            sess.terminal.grid.rows(),
+                            sess.terminal.screen.grid.row_len(),
+                            sess.terminal.screen.grid.rows(),
                         )
                     }) {
                         if let Some(report) = sess.terminal.get_mouse_release_report(
@@ -15312,7 +15315,7 @@ impl Frost {
             return false;
         }
         // Retain two context rows between pages of the same continuous session.
-        let page = sess.terminal.grid.rows().saturating_sub(2).max(1) as isize;
+        let page = sess.terminal.screen.grid.rows().saturating_sub(2).max(1) as isize;
         if page_key && sess.transcript_canvas.enabled() {
             let delta = if matches!(key, Key::Named(Named::PageUp)) {
                 page
@@ -26656,7 +26659,7 @@ impl Frost {
     /// [`Self::build_block_paint_rows`] so card painting and the badge anchor can
     /// never disagree about where the live card is.
     fn active_zone_span(terminal: &terminal::TerminalState) -> Option<(usize, usize)> {
-        let total = terminal.scrollback_len() + terminal.grid.rows();
+        let total = terminal.scrollback_len() + terminal.screen.grid.rows();
         let active_start = terminal
             .running_zone_start()
             .or_else(|| terminal.live_prompt_row())?;
@@ -26829,7 +26832,7 @@ impl Frost {
             return Vec::new();
         }
         let terminal = &sess.terminal;
-        let total = terminal.scrollback_len() + terminal.grid.rows();
+        let total = terminal.scrollback_len() + terminal.screen.grid.rows();
         let running = terminal.running_zone_start();
         let live_prompt = terminal.live_prompt_row();
         let live_boundary = running.or(live_prompt).unwrap_or(total);
@@ -27339,7 +27342,7 @@ impl Frost {
                                 zone.completion_provenance,
                             )
                             .map(|mut text| {
-                                let budget = sess.terminal.grid.cols().saturating_sub(3);
+                                let budget = sess.terminal.screen.grid.cols().saturating_sub(3);
                                 if text.chars().count() > budget {
                                     text = text.chars().take(budget).collect();
                                 }
@@ -27392,7 +27395,7 @@ impl Frost {
                 sess.projection.row_view(),
                 (0, 0),
                 false,
-                sess.terminal.cursor_shape,
+                sess.terminal.screen.cursor_shape,
                 self.focused && sess_idx == self.active && self.terminal_input_active(),
                 &self.theme,
                 self.metrics,
@@ -27517,7 +27520,7 @@ impl Frost {
             sess.projection.row_view(),
             sess.cursor,
             sess.cursor_visible,
-            sess.terminal.cursor_shape,
+            sess.terminal.screen.cursor_shape,
             focused,
             &self.theme,
             self.metrics,
@@ -37305,7 +37308,7 @@ mod tests {
         let selected = session.terminal.copy_selection();
         assert!(selected.is_some());
         let before = session.transcript_canvas.position_rows();
-        let page = session.terminal.grid.rows().saturating_sub(2).max(1) as f64;
+        let page = session.terminal.screen.grid.rows().saturating_sub(2).max(1) as f64;
         let start = std::time::Instant::now();
         session.scroll_transcript(page, false, start);
         for frame in 1..=120 {
@@ -41182,7 +41185,7 @@ mod tests {
     #[test]
     fn search_reveal_expands_only_the_matching_block_and_locates_real_output() {
         let mut fixture = search_reveal_fixture();
-        let raw = fixture.terminal.grid.to_vec();
+        let raw = fixture.terminal.screen.grid.to_vec();
         assert!(apply_search_reveal(
             &fixture.target,
             &fixture.search,
@@ -41195,7 +41198,7 @@ mod tests {
         assert!(!fixture.policy.is_collapsed(fixture.target.zone_id));
         assert!(fixture.policy.is_collapsed(fixture.other_zone));
         assert_eq!(
-            fixture.terminal.grid.to_vec(),
+            fixture.terminal.screen.grid.to_vec(),
             raw,
             "reveal only changes presentation"
         );
@@ -42587,8 +42590,11 @@ mod tests {
         assert_eq!(gap_cell, None);
         for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
             let released = take_terminal_mouse_gesture(&mut gestures, 7, button).unwrap();
-            let cell =
-                released.app_release_cell(gap_cell, terminal.grid.row_len(), terminal.grid.rows());
+            let cell = released.app_release_cell(
+                gap_cell,
+                terminal.screen.grid.row_len(),
+                terminal.screen.grid.rows(),
+            );
             assert_eq!(cell, Some((11, 3)));
             let (col, row) = cell.unwrap();
             assert_eq!(
@@ -45939,7 +45945,7 @@ mod tests {
                 .locate_raw_cell_in_projection(&fixture.projection, origin,),
             terminal::ProjectedRawCellLocation::Hidden { .. }
         ));
-        let grid = fixture.terminal.grid.to_vec();
+        let grid = fixture.terminal.screen.grid.to_vec();
         let cursor = fixture.terminal.get_cursor_pos();
         assert!(expand_block_search_hit(
             &fixture.terminal,
@@ -45959,7 +45965,7 @@ mod tests {
             &mut fixture.view_state,
             origin,
         ));
-        assert_eq!(fixture.terminal.grid.to_vec(), grid);
+        assert_eq!(fixture.terminal.screen.grid.to_vec(), grid);
         assert_eq!(fixture.terminal.get_cursor_pos(), cursor);
         assert!(
             !expand_block_search_hit(

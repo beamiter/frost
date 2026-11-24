@@ -2400,7 +2400,7 @@ impl Ide {
                 .map(|frame| (frame.cursor.row, frame.cursor.column))
                 .unwrap_or(s.cursor),
             s.cursor_visible,
-            s.terminal.cursor_shape,
+            s.terminal.screen.cursor_shape,
             self.input_active(),
             &self.theme,
             self.metrics,

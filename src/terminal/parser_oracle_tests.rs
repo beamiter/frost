@@ -77,7 +77,9 @@ fn parser_pending_snapshot(t: &TerminalState, result: &mut BTreeMap<String, Valu
 fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::new();
     macro_rules! fields {
-        ($($field:ident),* $(,)?) => {$(out.insert(stringify!($field).into(), lane(&t.$field));)*};
+        ($owner:expr; $($field:ident),* $(,)?) => {
+            $(out.insert(stringify!($field).into(), lane(&($owner).$field));)*
+        };
     }
     out.insert("window_title".into(), lane(&t.titles.window_title));
     out.insert("icon_title".into(), lane(&t.titles.icon_title));
@@ -90,14 +92,20 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
     );
     out.insert("dynamic_palette".into(), lane(t.colors.dynamic_palette));
     super::replay_protocol::observe(t, &mut out, text_lane);
-    fields!(
-        current_working_dir,
-        organism_idle_cwd,
+    fields!(t.screen;
         current_fg,
         current_bg,
         current_flags,
+    );
+    let link = t.screen.current_hyperlink;
+    out.insert(
+        "current_hyperlink".into(),
+        lane((!link.is_none()).then_some(link.as_raw())),
+    );
+    fields!(t;
+        current_working_dir,
+        organism_idle_cwd,
         global_bg,
-        current_hyperlink,
         osc8_hyperlinks,
         output_buffer,
         pending_clipboard_requests,
@@ -136,33 +144,38 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
     out.insert(
         "cursor".into(),
         lane((
-            t.cursor_row,
-            t.cursor_col,
-            t.cursor_shape,
-            t.pending_wrap,
-            t.last_printed_char,
+            t.screen.cursor_row,
+            t.screen.cursor_col,
+            t.screen.cursor_shape,
+            t.screen.pending_wrap,
+            t.screen.last_printed_char,
         )),
     );
     out.insert(
         "screen".into(),
         lane((
-            t.use_alt_buffer,
-            t.saved_cursor_row,
-            t.saved_cursor_col,
-            t.alt_cursor_row,
-            t.alt_cursor_col,
-            t.scroll_region_top,
-            t.scroll_region_bottom,
+            t.screen.use_alt_buffer,
+            t.screen.saved_cursor_row,
+            t.screen.saved_cursor_col,
+            t.screen.alt_cursor_row,
+            t.screen.alt_cursor_col,
+            t.screen.scroll_region_top,
+            t.screen.scroll_region_bottom,
             t.scroll_offset,
         )),
     );
     out.insert(
         "charsets_tabs".into(),
-        lane((t.g0_charset, t.g1_charset, t.active_charset, &t.tab_stops)),
+        lane((
+            t.screen.g0_charset,
+            t.screen.g1_charset,
+            t.screen.active_charset,
+            &t.screen.tab_stops,
+        )),
     );
     for (name, saved) in [
-        ("saved_cursor", &t.saved_cursor),
-        ("saved_primary", &t.saved_primary_screen_state),
+        ("saved_cursor", &t.screen.saved_state),
+        ("saved_primary", &t.screen.saved_primary_screen_state),
     ] {
         out.insert(
             name.into(),
@@ -178,19 +191,20 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
         "saved_primary_colors".into(),
         lane((
             t.saved_primary_global_bg,
-            t.saved_primary_cursor_shape,
+            t.screen.saved_primary_cursor_shape.unwrap_or_default(),
             t.saved_primary_colors.dynamic_fg,
             t.saved_primary_colors.dynamic_bg,
             t.saved_primary_colors.dynamic_cursor_color,
             t.saved_primary_colors.dynamic_palette,
         )),
     );
-    out.insert("grid_cells".into(), lane(t.grid.to_vec()));
-    out.insert("alt_grid_cells".into(), lane(t.alt_grid.to_vec()));
+    out.insert("grid_cells".into(), lane(t.screen.grid.to_vec()));
+    out.insert("alt_grid_cells".into(), lane(t.screen.alt_grid.to_vec()));
     out.insert(
         "grid_text".into(),
         lane(
-            t.grid
+            t.screen
+                .grid
                 .to_vec()
                 .iter()
                 .map(|r| r.iter().map(|c| c.character).collect::<String>())
@@ -199,7 +213,7 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
     );
     out.insert(
         "wraps".into(),
-        lane((t.grid.row_wrapped(), t.alt_grid.row_wrapped())),
+        lane((t.screen.grid.row_wrapped(), t.screen.alt_grid.row_wrapped())),
     );
     out.insert(
         "history_cells".into(),
