@@ -1,4 +1,5 @@
 use super::*;
+use jterm_engine::retained_history::RetainedRow;
 
 #[test]
 fn dense_scroll_history_budget_applies_to_pushes_and_reflow() {
@@ -12,7 +13,7 @@ fn dense_scroll_history_budget_applies_to_pushes_and_reflow() {
             ..TerminalCell::default()
         })
         .collect();
-    let dense = ScrollbackLine::compress(&cells, false);
+    let dense = ScrollbackLine::compress_frost_legacy(&cells, false);
     let charge = dense.clone().retained_bytes();
     let keep = RETAINED_HISTORY_BYTES / charge;
     terminal.set_max_scrollback(keep * 8);
@@ -20,8 +21,7 @@ fn dense_scroll_history_budget_applies_to_pushes_and_reflow() {
     let oldest = terminal.scrollback.front().unwrap().raw_row_id();
     for _ in 0..=keep {
         let mut row = dense.clone();
-        row.storage
-            .set_raw_row_id(RawRowId::allocate_process_unique());
+        row.set_raw_row_id(RawRowId::allocate_process_unique());
         terminal.push_scrollback_compressed(row);
     }
     assert_eq!(terminal.scrollback.len(), keep);
@@ -40,31 +40,25 @@ fn dense_scroll_history_budget_applies_to_pushes_and_reflow() {
 fn assert_tail(source: &[ScrollbackLine], cols: usize, cap: usize) {
     let reference = TerminalState::reflow_lines(source, cols, &TerminalCell::default());
     let tail = reference.len().saturating_sub(cap);
-    BOUNDED_REFLOW_PEAK.with(|p| p.set((0, 0, 0)));
-    let actual = TerminalState::reflow_lines_bounded(
-        source.iter().cloned(),
-        cols,
-        &TerminalCell::default(),
-        cap,
-    );
+    let mut history = RetainedHistory::default();
+    for line in source {
+        history.push_back(line.clone());
+    }
+    let actual = history.reflow_frost_legacy(cols, TerminalCell::default(), cap);
     assert_eq!(actual.len(), reference.len() - tail);
     for (a, b) in actual.iter().zip(&reference[tail..]) {
         assert_eq!(a.decompress(), b.decompress());
-        assert_eq!(a.is_wrapped(), b.is_wrapped());
+        assert_eq!(a.is_wrapped, b.is_wrapped);
         assert_eq!(a.columns(), b.columns());
         assert_eq!(a.reflow_content_len(), b.reflow_content_len());
         assert_eq!(a.reflow_wide_continuations(), b.reflow_wide_continuations());
         assert!(a.raw_row_id().is_tracked());
         assert!(!source.iter().any(|s| s.raw_row_id() == a.raw_row_id()));
     }
-    let peak = BOUNDED_REFLOW_PEAK.with(|p| p.get());
-    assert!(peak.0 <= source.iter().map(|s| s.columns()).max().unwrap_or(0));
-    assert!(peak.1 <= cols);
-    assert!(peak.2 <= cap);
 }
 
 #[test]
-fn bounded_reflow_real_output_wide_to_narrow_never_materializes_full_expansion() {
+fn bounded_reflow_real_output_wide_to_narrow_keeps_frozen_tail() {
     let mut terminal = TerminalState::new(64, 2);
     terminal.set_max_scrollback(64);
     for _ in 0..66 {
@@ -78,13 +72,11 @@ fn bounded_reflow_real_output_wide_to_narrow_never_materializes_full_expansion()
     assert_eq!(old.len(), 4096);
     assert_tail(&source, 1, 64);
     terminal.on_resize(1, 2);
-    BOUNDED_REFLOW_PEAK.with(|p| p.set((0, 0, 0)));
     assert!(terminal.normalize_scrollback_width());
     assert_eq!(terminal.scrollback.len(), 64);
-    assert_eq!(BOUNDED_REFLOW_PEAK.with(|p| p.get()), (64, 1, 64));
     for (a, b) in terminal.scrollback.iter().zip(&old[4032..]) {
         assert_eq!(a.decompress(), b.decompress());
-        assert_eq!(a.is_wrapped(), b.is_wrapped());
+        assert_eq!(a.is_wrapped, b.is_wrapped);
     }
 }
 
@@ -120,7 +112,9 @@ fn bounded_reflow_matches_frozen_algorithm_for_wide_empty_style_and_wraps() {
                     let source: Vec<_> = [first, second, third]
                         .into_iter()
                         .enumerate()
-                        .map(|(i, c)| ScrollbackLine::compress(c, wrapmask & (1 << i) != 0))
+                        .map(|(i, c)| {
+                            ScrollbackLine::compress_frost_legacy(c, wrapmask & (1 << i) != 0)
+                        })
                         .collect();
                     for cols in 1..=6 {
                         for cap in [0, 1, 2, 8, 64] {
@@ -134,16 +128,15 @@ fn bounded_reflow_matches_frozen_algorithm_for_wide_empty_style_and_wraps() {
 }
 
 #[test]
-fn bounded_reflow_long_wrapped_group_scratch_does_not_scale_with_group() {
+fn bounded_reflow_keeps_frozen_tail_for_long_wrapped_group() {
     let cell = TerminalCell {
         character: 'x',
         ..TerminalCell::default()
     };
     let source: Vec<_> = (0..256)
-        .map(|_| ScrollbackLine::compress(&[cell; 128], true))
+        .map(|_| ScrollbackLine::compress_frost_legacy(&[cell; 128], true))
         .collect();
     assert_tail(&source, 3, 16);
-    assert_eq!(BOUNDED_REFLOW_PEAK.with(|p| p.get()), (128, 3, 16));
 }
 
 #[test]

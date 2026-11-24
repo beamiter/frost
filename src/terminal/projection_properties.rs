@@ -87,7 +87,7 @@ pub(super) fn fixture(case: usize) -> (TerminalState, Vec<Raw>, Vec<ResolvedColl
     for index in 0..12 {
         let cells = corpus(&mut rng);
         let wrapped = index % 3 != 2 && rng.pick(2) == 0;
-        let line = ScrollbackLine::compress(&cells, wrapped);
+        let line = ScrollbackLine::compress_frost_legacy(&cells, wrapped);
         assert_eq!(
             line.decompress(),
             cells,
@@ -287,7 +287,7 @@ fn check_case(case: usize, limit: usize) {
                 .scrollback
                 .iter()
                 .enumerate()
-                .map(|(i, r)| r.layout(i)),
+                .map(|(i, r)| history_row_layout(r, i)),
             [],
             width,
         )
@@ -1078,7 +1078,7 @@ fn fixed_viewport_work_is_independent_of_retained_history() {
         for _ in 0..depth {
             terminal
                 .scrollback
-                .push_back(ScrollbackLine::compress(&cells, false));
+                .push_back(ScrollbackLine::compress_frost_legacy(&cells, false));
         }
         PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|c| c.set(0));
         PROJECTION_HISTORY_LAYOUT_ROWS.with(|c| c.set(0));
@@ -1115,7 +1115,7 @@ fn fixed_viewport_work_is_independent_of_retained_history() {
 }
 
 fn ascii_row(text: &str, wrapped: bool) -> ScrollbackLine {
-    ScrollbackLine::compress(
+    ScrollbackLine::compress_frost_legacy(
         &text
             .chars()
             .map(|character| TerminalCell {
@@ -1145,7 +1145,7 @@ fn selection_anchor_uses_projected_columns_after_join_and_split() {
                 .scrollback
                 .iter()
                 .enumerate()
-                .map(|(i, r)| r.layout(i)),
+                .map(|(i, r)| history_row_layout(r, i)),
             [],
             width,
         );
@@ -1187,7 +1187,7 @@ fn collapsed_prefix_selection_never_retargets_visible_suffix() {
             .scrollback
             .iter()
             .enumerate()
-            .map(|(i, r)| r.layout(i)),
+            .map(|(i, r)| history_row_layout(r, i)),
         [],
         8,
     )
@@ -1224,7 +1224,7 @@ fn materializer_decodes_each_visible_source_once_when_rows_join() {
             .scrollback
             .iter()
             .enumerate()
-            .map(|(i, r)| r.layout(i)),
+            .map(|(i, r)| history_row_layout(r, i)),
         [],
         80,
     );
@@ -1311,7 +1311,7 @@ fn hidden_guard_preserves_suffix_and_trailing_blank_fallback() {
                 .scrollback
                 .iter()
                 .enumerate()
-                .map(|(i, r)| r.layout(i)),
+                .map(|(i, r)| history_row_layout(r, i)),
             [],
             12,
         )
@@ -1383,7 +1383,7 @@ fn wide_collapse_boundaries_and_adjacent_ranges_preserve_survivors() {
     }
     terminal
         .scrollback
-        .push_back(ScrollbackLine::compress(&cells, false));
+        .push_back(ScrollbackLine::compress_frost_legacy(&cells, false));
     let id = terminal.scrollback[0].raw_row_id();
     for width in [1, 2, 3, 8] {
         let collapse = |zone_id, start, end| ResolvedCollapse {
@@ -1403,7 +1403,7 @@ fn wide_collapse_boundaries_and_adjacent_ranges_preserve_survivors() {
                 .scrollback
                 .iter()
                 .enumerate()
-                .map(|(i, r)| r.layout(i)),
+                .map(|(i, r)| history_row_layout(r, i)),
             [],
             width,
         )
@@ -1544,7 +1544,7 @@ fn partial_selection_fixture(case: usize) -> (TerminalState, Vec<Raw>) {
             1 => true,
             _ => rng.pick(2) == 0,
         };
-        let line = ScrollbackLine::compress(&cells, wrapped);
+        let line = ScrollbackLine::compress_frost_legacy(&cells, wrapped);
         assert_eq!(
             line.decompress(),
             cells,
@@ -1576,7 +1576,7 @@ fn seeded_partial_history_selections_match_independent_eager_text() {
                 .scrollback
                 .iter()
                 .enumerate()
-                .map(|(i, row)| row.layout(i)),
+                .map(|(i, row)| history_row_layout(row, i)),
             [],
             width,
         );
@@ -1640,7 +1640,7 @@ fn partial_history_selection_keeps_blank_rows_and_soft_wraps_distinct() {
     wide[2].flags.set_wide_continuation(true);
     terminal
         .scrollback
-        .push_back(ScrollbackLine::compress(&wide, false));
+        .push_back(ScrollbackLine::compress_frost_legacy(&wide, false));
     terminal.scrollback.push_back(ascii_row("    ", false));
     terminal.scrollback.push_back(ascii_row("E   ", false));
     let plan = ProjectionPlan::identity(
@@ -1648,7 +1648,7 @@ fn partial_history_selection_keeps_blank_rows_and_soft_wraps_distinct() {
             .scrollback
             .iter()
             .enumerate()
-            .map(|(i, row)| row.layout(i)),
+            .map(|(i, row)| history_row_layout(row, i)),
         [],
         3,
     );

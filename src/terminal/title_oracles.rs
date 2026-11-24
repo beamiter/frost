@@ -1,6 +1,9 @@
 //! Source-locked original Frost title observer; immutable expected values are external.
 //! Every Debug lane retains the complete value, never fingerprints/truncation.
-use super::{replay_frame_debug::frame_lane, *};
+use super::{
+    replay_frame_debug::{frame_lane, scrollback_lane},
+    *,
+};
 use serde_json::{json, Value};
 fn lane(value: impl std::fmt::Debug) -> Value {
     Value::String(format!("{value:?}"))
@@ -82,8 +85,8 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         "saved_primary_cursor_shape".into(),
         lane(t.screen.saved_primary_cursor_shape.unwrap_or_default()),
     );
+    out.insert("scrollback".into(), scrollback_lane(&t.scrollback));
     fields!(t;
-        scrollback,
         selection,
         projected_selection,
         scroll_offset,
@@ -226,7 +229,7 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
     );
     out.insert("cleared_blocks".into(),t.cleared_blocks.as_ref().map(|s| {
         let mut p=s.provenance.iter().collect::<Vec<_>>();p.sort_by_key(|(id,_)|**id);
-        json!({"scrollback":lane(&s.scrollback),"grid_rows":lane(&s.grid_rows),"zones":zones(&s.zones),"provenance":lane(p),"captured_output_bytes":s.captured_output_bytes,"placements":lane(&s.placements),"images":lane(&s.images)})
+        json!({"scrollback":scrollback_lane(&s.scrollback),"grid_rows":scrollback_lane(&s.grid_rows),"zones":zones(&s.zones),"provenance":lane(p),"captured_output_bytes":s.captured_output_bytes,"placements":lane(&s.placements),"images":lane(&s.images)})
     }).unwrap_or(Value::Null));
     out
 }

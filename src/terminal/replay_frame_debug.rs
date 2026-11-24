@@ -1,8 +1,34 @@
 use std::fmt::Debug;
 use std::sync::LazyLock;
 
+use jterm_engine::ScrollbackLine;
 use regex::Regex;
 use serde_json::Value;
+
+struct FrozenScrollbackRow<'a>(&'a ScrollbackLine);
+
+impl Debug for FrozenScrollbackRow<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let row = self.0;
+        f.debug_struct("ScrollbackLine")
+            .field("data", &row.content())
+            .field("is_wrapped", &row.is_wrapped)
+            .field("cols", &row.columns())
+            .field("raw_row_id", &row.raw_row_id())
+            .field("projected_active_len", &row.reflow_content_len())
+            .field(
+                "projected_wide_continuations",
+                &row.reflow_wide_continuations(),
+            )
+            .finish()
+    }
+}
+
+/// Keep the original row names and compressed bytes in the frozen observers.
+pub(super) fn scrollback_lane<'a>(rows: impl IntoIterator<Item = &'a ScrollbackLine>) -> Value {
+    let rows: Vec<_> = rows.into_iter().map(FrozenScrollbackRow).collect();
+    Value::String(format!("{rows:?}"))
+}
 
 /// Preserve the original frame-stamp representation in sealed replay lanes.
 /// The engine now wraps admitted IDs internally. Keep their exact values and

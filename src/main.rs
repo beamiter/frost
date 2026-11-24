@@ -41368,7 +41368,7 @@ mod tests {
         }
         terminal
             .scrollback
-            .push_back(terminal::ScrollbackLine::compress(&raw, false));
+            .push_back(terminal::ScrollbackLine::compress_frost_legacy(&raw, false));
         terminal.set_scroll_offset(1);
         let projection = terminal.get_projected_viewport(true);
 
@@ -41556,13 +41556,13 @@ mod tests {
         last[0].character = 'Z';
         terminal
             .scrollback
-            .push_back(terminal::ScrollbackLine::compress(&first, false));
+            .push_back(terminal::ScrollbackLine::compress_frost_legacy(&first, false));
         terminal
             .scrollback
-            .push_back(terminal::ScrollbackLine::compress(&empty, false));
+            .push_back(terminal::ScrollbackLine::compress_frost_legacy(&empty, false));
         terminal
             .scrollback
-            .push_back(terminal::ScrollbackLine::compress(&last, false));
+            .push_back(terminal::ScrollbackLine::compress_frost_legacy(&last, false));
         terminal.command_zones.push_back(terminal::CommandZone {
             id: 41,
             prompt_start: 0,

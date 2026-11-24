@@ -223,7 +223,7 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
         lane(
             t.scrollback
                 .iter()
-                .map(|r| (r.decompress(), r.is_wrapped()))
+                .map(|r| (r.decompress(), r.is_wrapped))
                 .collect::<Vec<_>>(),
         ),
     );

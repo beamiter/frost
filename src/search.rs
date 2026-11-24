@@ -482,7 +482,7 @@ impl SearchScratch {
         self.clear();
         // Reserve once even for an oversized row whose buffers were released.
         // Unicode lowercase expansions can still grow the span vector.
-        let columns = line.search_column_count();
+        let columns = line.columns();
         self.text.reserve(columns);
         self.columns.reserve(columns);
         line.visit_search_cells(|column, cell| self.push(column, cell, fold_case));
@@ -799,7 +799,7 @@ impl SearchEngine {
     }
 
     /// Character→cell span for borrowed plain rows. Their cells are narrow
-    /// by construction (see `ScrollbackLine::search_text`), so the character
+    /// by construction (see `SearchLine::from_retained`), so the character
     /// index is the terminal column; match-derived indices are always in
     /// range, keeping this equivalent to the explicit column vectors below.
     fn identity_span(char_index: usize) -> Option<(usize, usize)> {
@@ -1032,6 +1032,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::terminal::search_history_row;
 
     #[test]
     fn history_navigation_restores_draft_and_modes() {
@@ -1725,7 +1726,7 @@ mod tests {
             trailing.flags.set_bold(true);
             row.extend([trailing; 7]);
             row.extend([TerminalCell::default(); 13]);
-            rows.push(ScrollbackLine::compress(&row, n % 2 == 0));
+            rows.push(ScrollbackLine::compress_frost_legacy(&row, n % 2 == 0));
         }
         let decoded: Vec<_> = rows.iter().map(ScrollbackLine::decompress).collect();
         for regex in [false, true] {
@@ -1744,7 +1745,7 @@ mod tests {
                         &mut None,
                     );
                     let actual = SearchEngine::search_lines(
-                        rows.iter().map(ScrollbackLine::search_text),
+                        rows.iter().map(search_history_row),
                         query,
                         regex,
                         case,
@@ -1786,7 +1787,7 @@ mod tests {
             (true, false, 65535, false),
             (true, true, 65535, false),
         ] {
-            let row = ScrollbackLine::compress(&vec![cell; cols], false);
+            let row = ScrollbackLine::compress_frost_legacy(&vec![cell; cols], false);
             let mut preflight = super::SearchScratch::default();
             preflight.scrollback(&row, !use_regex && !case_sensitive);
             assert!(preflight.columns.capacity() > super::SearchScratch::MAX_COLUMN_CAPACITY);
@@ -1794,7 +1795,7 @@ mod tests {
             for live_first in [false, true] {
                 super::OBSERVED_SEARCH_SCRATCH.with(|observed| observed.set(Some((0, 0))));
                 let first = if normal_routing {
-                    let line = row.search_text();
+                    let line = crate::terminal::search_history_row(&row);
                     assert!(matches!(line, SearchLine::Scrollback(_)));
                     line
                 } else {
@@ -1843,7 +1844,8 @@ mod tests {
             foreground: Color::Red,
             ..Default::default()
         };
-        let longest = ScrollbackLine::compress(&vec![cell; usize::from(u16::MAX)], false);
+        let longest =
+            ScrollbackLine::compress_frost_legacy(&vec![cell; usize::from(u16::MAX)], false);
         scratch.scrollback(&longest, true);
         assert_eq!(scratch.columns.len(), 2 * usize::from(u16::MAX));
         assert_eq!(scratch.columns.last().copied(), Some((65534, 65535)));
@@ -1852,7 +1854,7 @@ mod tests {
         scratch.release_oversized();
         assert_eq!(scratch.text.capacity(), 0);
         assert_eq!(scratch.columns.capacity(), 0);
-        let short = ScrollbackLine::compress(&[cell], false);
+        let short = ScrollbackLine::compress_frost_legacy(&[cell], false);
         scratch.scrollback(&short, true);
         assert_eq!(scratch.text, "i\u{307}");
         assert_eq!(scratch.columns, [(0, 1), (0, 1)]);
@@ -1892,7 +1894,7 @@ mod tests {
                 cell,
                 TerminalCell::default(),
             ];
-            let row = ScrollbackLine::compress(&cells, false);
+            let row = ScrollbackLine::compress_frost_legacy(&cells, false);
             for fold in [false, true] {
                 let expected = SearchEngine::line_text_and_columns(&row.decompress(), fold);
                 let mut scratch = super::SearchScratch::default();
@@ -1911,12 +1913,12 @@ mod tests {
             hyperlink_id: crate::terminal::HyperlinkId::from_raw(9),
             ..Default::default()
         };
-        let long = ScrollbackLine::compress(&vec![cell; 600], true);
+        let long = ScrollbackLine::compress_frost_legacy(&vec![cell; 600], true);
         let rows = vec![long; 40];
         let expected: Vec<_> = rows.iter().map(ScrollbackLine::decompress).collect();
         for regex in [false, true] {
             let actual = SearchEngine::search_lines(
-                rows.iter().map(ScrollbackLine::search_text),
+                rows.iter().map(search_history_row),
                 "a",
                 regex,
                 true,
@@ -1940,7 +1942,7 @@ mod tests {
             assert!(actual.1.is_some());
         }
         // No retained text/index can outlive replacement or reordering.
-        let changed = ScrollbackLine::compress(
+        let changed = ScrollbackLine::compress_frost_legacy(
             &[TerminalCell {
                 character: 'z',
                 ..cell
@@ -1949,7 +1951,7 @@ mod tests {
         );
         let rows = [changed.clone(), rows[0].clone(), changed];
         let actual = SearchEngine::search_lines(
-            rows.iter().map(ScrollbackLine::search_text),
+            rows.iter().map(search_history_row),
             "z",
             false,
             true,
@@ -1973,7 +1975,7 @@ mod tests {
             foreground: Color::Red,
             ..Default::default()
         };
-        let long = ScrollbackLine::compress(&vec![cell; usize::from(u16::MAX)], false);
+        let long = ScrollbackLine::compress_frost_legacy(&vec![cell; usize::from(u16::MAX)], false);
         let live = vec![
             TerminalCell {
                 character: 'x',
@@ -1984,12 +1986,14 @@ mod tests {
         for regex in [false, true] {
             for case in [false, true] {
                 let actual = SearchEngine::search_lines(
-                    std::iter::once(long.search_text()).chain((0..100).flat_map(|_| {
-                        [
-                            SearchLine::Text("a x"),
-                            SearchLine::Cells(Cow::Borrowed(&live)),
-                        ]
-                    })),
+                    std::iter::once(crate::terminal::search_history_row(&long)).chain(
+                        (0..100).flat_map(|_| {
+                            [
+                                SearchLine::Text("a x"),
+                                SearchLine::Cells(Cow::Borrowed(&live)),
+                            ]
+                        }),
+                    ),
                     "x",
                     regex,
                     case,
@@ -2025,11 +2029,17 @@ mod tests {
             ..Default::default()
         };
         for cols in [4095, 4096, 4097, 8192, 65535] {
-            let row = ScrollbackLine::compress(&vec![cell; cols], false);
+            let row = ScrollbackLine::compress_frost_legacy(&vec![cell; cols], false);
             if cols <= 4096 {
-                assert!(matches!(row.search_text(), SearchLine::Scrollback(_)));
+                assert!(matches!(
+                    crate::terminal::search_history_row(&row),
+                    SearchLine::Scrollback(_)
+                ));
             } else {
-                assert!(matches!(row.search_text(), SearchLine::Cells(_)));
+                assert!(matches!(
+                    crate::terminal::search_history_row(&row),
+                    SearchLine::Cells(_)
+                ));
             }
             for regex in [false, true] {
                 for case in [false, true] {
@@ -2042,7 +2052,7 @@ mod tests {
                         &mut None,
                     );
                     let actual = SearchEngine::search_lines(
-                        [row.search_text()],
+                        [crate::terminal::search_history_row(&row)],
                         "i",
                         regex,
                         case,

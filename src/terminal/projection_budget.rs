@@ -115,7 +115,7 @@ pub(super) fn history<'a>(
             limits.wide,
             ProjectionResource::WideContinuations,
         )?;
-        let data_bytes = line.storage.search_encoded_bytes();
+        let data_bytes = line.search_encoded_bytes();
         result.source_bytes = add(
             result.source_bytes,
             add(
@@ -148,7 +148,7 @@ pub(super) fn history<'a>(
             limits.rows,
             ProjectionResource::PlanRows,
         )?;
-        if !line.is_wrapped() {
+        if !line.is_wrapped {
             finish_group(
                 &mut result,
                 group_cells,
@@ -239,7 +239,7 @@ mod tests {
     }
     #[test]
     fn exact_single_column_budget_and_next_row_rejected_before_expansion() {
-        let line = ScrollbackLine::compress(
+        let line = ScrollbackLine::compress_frost_legacy(
             &[TerminalCell {
                 character: 'x',
                 ..TerminalCell::default()
@@ -263,7 +263,7 @@ mod tests {
     fn trimmed_styled_blanks_cannot_bypass_source_decode_budget() {
         let mut blank = TerminalCell::default();
         blank.flags.set_bold(true);
-        let line = ScrollbackLine::compress(&[blank; 32], false);
+        let line = ScrollbackLine::compress_frost_legacy(&[blank; 32], false);
         assert_eq!(line.reflow_content_len(), 0);
         let limits = Limits {
             decoded_cells: 31,
@@ -445,7 +445,7 @@ impl super::TerminalState {
             .scrollback
             .len()
             .saturating_sub(add(self.scroll_offset, rows)?);
-        while start > 0 && self.scrollback[start - 1].is_wrapped() {
+        while start > 0 && self.scrollback[start - 1].is_wrapped {
             start -= 1;
         }
         let estimate = history(self.scrollback.iter().skip(start), cols, limits, true)?;
@@ -584,7 +584,7 @@ mod production_tests {
         cell.flags.set_bold(true);
         terminal
             .scrollback
-            .push_back(ScrollbackLine::compress(&[cell; 8], false));
+            .push_back(ScrollbackLine::compress_frost_legacy(&[cell; 8], false));
         terminal.scroll_offset = 1;
         let view = terminal.get_projected_viewport(false);
         assert!(matches!(
@@ -774,7 +774,7 @@ mod cache_tests {
         // Same-length history changes are revision-owned, not length-owned.
         terminal
             .scrollback
-            .replace(0, ScrollbackLine::compress(&[], false))
+            .replace(0, ScrollbackLine::compress_frost_legacy(&[], false))
             .unwrap();
         terminal.bump_history_revision();
         let replaced = terminal.cached_history_estimate(8, limits).unwrap();
@@ -835,7 +835,7 @@ mod scale_tests {
     use crate::terminal::TerminalCell;
     #[test]
     fn hundred_thousand_normal_rows_fit_metadata_only_budget() {
-        let line = ScrollbackLine::compress(
+        let line = ScrollbackLine::compress_frost_legacy(
             &[TerminalCell {
                 character: 'x',
                 ..TerminalCell::default()
@@ -857,7 +857,7 @@ mod scale_tests {
     }
     #[test]
     fn hundred_million_expansion_is_rejected_after_small_metadata_prefix() {
-        let line = ScrollbackLine::compress(
+        let line = ScrollbackLine::compress_frost_legacy(
             &[TerminalCell {
                 character: 'x',
                 ..TerminalCell::default()
@@ -978,7 +978,7 @@ mod decode_tests {
             // Empty default tails still decompress to all32 physical cells.
             terminal
                 .scrollback
-                .push_back(ScrollbackLine::compress(&cells, i != 7));
+                .push_back(ScrollbackLine::compress_frost_legacy(&cells, i != 7));
         }
         terminal.history_revision += 1;
         // Show the history group rather than live-grid-only bottom rows.

@@ -205,7 +205,7 @@ impl TerminalState {
                 .map_or(0, |col| col + 1)
         };
         if absolute < self.scrollback.len() {
-            content_end(&self.scrollback[absolute].decompress())
+            content_end(&decompress_history_row(&self.scrollback[absolute]))
         } else {
             self.screen
                 .grid

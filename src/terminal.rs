@@ -3,7 +3,7 @@ use jterm_engine::grid::{
     WideContinuationProtection,
 };
 use jterm_engine::protocol_state::{ProtocolState, TerminalModes};
-use jterm_engine::retained_history::{RetainedHistory, RetainedRow};
+use jterm_engine::retained_history::RetainedHistory;
 use jterm_engine::screen::{
     default_tab_stops, AlternateRestorePolicy, Charset, ScreenState, TabStopOrigin,
 };
@@ -46,13 +46,14 @@ mod replay_protocol;
 #[cfg(test)]
 mod title_oracles;
 
+pub(crate) use jterm_engine::grid::SearchLine;
 use jterm_engine::parser::{
     CaptureEnd, Event as ParserEvent, Parser, ParserLimits, ParserProfile, PendingKind,
     RejectReason, StringKind,
 };
 pub use jterm_engine::{
-    Color, CursorShape, HyperlinkId, RawRowId, StyleFlags, TerminalCell, TerminalGrid,
-    UnderlineStyle,
+    Color, CursorShape, HyperlinkId, RawRowId, ScrollbackLine, StyleFlags, TerminalCell,
+    TerminalGrid, UnderlineStyle,
 };
 
 use crate::kitty_graphics::{KittyGraphicsState, KittyImage, KittyPlacement};
@@ -66,7 +67,6 @@ use unicode_normalization::UnicodeNormalization;
 
 #[cfg(test)]
 thread_local! {
-    static BOUNDED_REFLOW_PEAK: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
     static PROJECTED_HISTORY_DECOMPRESS_COUNT: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
@@ -218,45 +218,6 @@ pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
     )
 }
 
-#[derive(Clone)]
-pub struct ScrollbackLine {
-    storage: jterm_engine::ScrollbackLine,
-}
-
-impl RetainedRow for ScrollbackLine {
-    fn retained_bytes(&self) -> usize {
-        RetainedRow::retained_bytes(&self.storage)
-    }
-}
-
-impl std::fmt::Debug for ScrollbackLine {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Keep the historical snapshot fields and compressed bytes stable.
-        f.debug_struct("ScrollbackLine")
-            .field("data", &self.storage.content())
-            .field("is_wrapped", &self.is_wrapped())
-            .field("cols", &self.columns())
-            .field("raw_row_id", &self.raw_row_id())
-            .field("projected_active_len", &self.reflow_content_len())
-            .field(
-                "projected_wide_continuations",
-                &self.reflow_wide_continuations(),
-            )
-            .finish()
-    }
-}
-
-/// One searchable buffer row: either borrowed narrow text with an identity
-/// character→column map (the common all-default-attributes scrollback row),
-/// borrowed compressed history, or live cell data. The latter two preserve
-/// the wide/continuation-aware column mapping.
-pub enum SearchLine<'a> {
-    Text(&'a str),
-    Cells(Cow<'a, [TerminalCell]>),
-    /// Borrowed compressed history, streamed into per-query search scratch.
-    Scrollback(&'a ScrollbackLine),
-}
-
 /// Allocation-free geometry needed to plan a projected history document.
 ///
 /// `active_len` is exactly the prefix retained by P0's
@@ -304,90 +265,30 @@ impl RawRowLayout {
     }
 }
 
-impl ScrollbackLine {
-    pub fn compress(cells: &[TerminalCell], is_wrapped: bool) -> Self {
-        Self::compress_with_raw_row_id(cells, is_wrapped, RawRowId::allocate_process_unique())
-    }
+fn decompress_history_row(line: &ScrollbackLine) -> Vec<TerminalCell> {
+    #[cfg(test)]
+    PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.set(count.get() + 1));
+    line.decompress()
+}
 
-    fn compress_with_raw_row_id(
-        cells: &[TerminalCell],
-        is_wrapped: bool,
-        raw_row_id: RawRowId,
-    ) -> Self {
-        let mut storage =
-            jterm_engine::ScrollbackLine::compress_preserving_blink(cells, is_wrapped);
-        storage.set_raw_row_id(raw_row_id);
-        Self { storage }
-    }
+pub(crate) fn search_history_row(line: &ScrollbackLine) -> SearchLine<'_> {
+    SearchLine::from_retained(line, 4096)
+}
 
-    /// Identity of this retained physical scrollback row.
-    pub fn raw_row_id(&self) -> RawRowId {
-        self.storage.raw_row_id()
-    }
-
-    pub fn columns(&self) -> usize {
-        self.storage.columns()
-    }
-
-    pub fn is_wrapped(&self) -> bool {
-        self.storage.is_wrapped
-    }
-
-    fn reflow_content_len(&self) -> usize {
-        self.storage.reflow_content_len()
-    }
-
-    fn reflow_wide_continuations(&self) -> &[u16] {
-        self.storage.reflow_wide_continuations()
-    }
-
-    pub fn decompress(&self) -> Vec<TerminalCell> {
-        #[cfg(test)]
-        PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.set(count.get() + 1));
-        self.storage.decompress()
-    }
-
-    /// Keep Frost's streaming search admission around the shared retained row.
-    /// Oversized encoded rows use the bulk path to limit search scratch churn.
-    pub fn search_text(&self) -> SearchLine<'_> {
-        match self.storage.content() {
-            jterm_engine::ScrollbackContent::Plain(text, _) => SearchLine::Text(text),
-            jterm_engine::ScrollbackContent::Encoded(_) if self.columns() > 4096 => {
-                SearchLine::Cells(Cow::Owned(self.decompress()))
-            }
-            jterm_engine::ScrollbackContent::Encoded(_) => SearchLine::Scrollback(self),
-        }
-    }
-
-    #[allow(dead_code)] // P1 plan core; consumer wiring lands in the collapse slice.
-    fn layout(&self, absolute_row: usize) -> RawRowLayout {
-        #[cfg(test)]
-        PROJECTION_HISTORY_LAYOUT_ROWS.with(|count| count.set(count.get() + 1));
-        RawRowLayout {
-            absolute_row,
-            raw_row: self.raw_row_id(),
-            active_len: self.reflow_content_len(),
-            wide_continuations: self
-                .reflow_wide_continuations()
-                .iter()
-                .copied()
-                .map(usize::from)
-                .collect(),
-            wrapped: self.is_wrapped(),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn cells(&self) -> Vec<TerminalCell> {
-        self.decompress()
-    }
-
-    pub(crate) fn search_column_count(&self) -> usize {
-        self.columns()
-    }
-
-    pub(crate) fn visit_search_cells(&self, visit: impl FnMut(usize, TerminalCell)) {
-        self.storage.visit_search_cells(visit);
+fn history_row_layout(line: &ScrollbackLine, absolute_row: usize) -> RawRowLayout {
+    #[cfg(test)]
+    PROJECTION_HISTORY_LAYOUT_ROWS.with(|count| count.set(count.get() + 1));
+    RawRowLayout {
+        absolute_row,
+        raw_row: line.raw_row_id(),
+        active_len: line.reflow_content_len(),
+        wide_continuations: line
+            .reflow_wide_continuations()
+            .iter()
+            .copied()
+            .map(usize::from)
+            .collect(),
+        wrapped: line.is_wrapped,
     }
 }
 
@@ -2226,7 +2127,7 @@ fn copy_projected_cells(
                     {
                         history_cache = Some((
                             slice.source.absolute_row,
-                            scrollback[slice.source.absolute_row].decompress(),
+                            decompress_history_row(&scrollback[slice.source.absolute_row]),
                         ));
                     }
                     history_cache.as_ref()?.1.as_slice()
@@ -3667,10 +3568,10 @@ impl TerminalState {
 
             let (appended, wrapped) = if absolute_row < self.scrollback.len() {
                 let line = &self.scrollback[absolute_row];
-                let cells = line.decompress();
+                let cells = decompress_history_row(line);
                 (
-                    append_cells(&mut capture, &cells, line.is_wrapped()),
-                    line.is_wrapped(),
+                    append_cells(&mut capture, &cells, line.is_wrapped),
+                    line.is_wrapped,
                 )
             } else {
                 let grid_row = absolute_row - self.scrollback.len();
@@ -4774,7 +4675,7 @@ impl TerminalState {
         let mut end_col = end_col.min(end_width);
         if end_col < end_width {
             let end_cell = if let Some(line) = self.scrollback.get(end_row) {
-                line.decompress().get(end_col).copied()
+                decompress_history_row(line).get(end_col).copied()
             } else {
                 let grid_row = end_row.checked_sub(self.scrollback.len())?;
                 (end_col < self.screen.grid.row_len())
@@ -5424,8 +5325,7 @@ impl TerminalState {
     #[allow(dead_code)] // Used by the Stage A resolver before consumer wiring lands.
     fn retained_cell_is_wide_continuation(&self, absolute_row: usize, col: usize) -> Option<bool> {
         if let Some(line) = self.scrollback.get(absolute_row) {
-            return line
-                .decompress()
+            return decompress_history_row(line)
                 .get(col)
                 .map(|cell| cell.flags.wide_continuation());
         }
@@ -5540,9 +5440,7 @@ impl TerminalState {
         // the grid get fresh identities below, since a dead row's id must not
         // alias when the row is reused (the scroll/erase rule).
         let stashed_grid_rows: Vec<ScrollbackLine> = (0..completed_grid_rows)
-            .map(|row| ScrollbackLine {
-                storage: self.screen.grid.archive_frost_legacy_row(row),
-            })
+            .map(|row| self.screen.grid.archive_frost_legacy_row(row))
             .collect();
         self.cleared_blocks = Some(ClearedBlocksSnapshot {
             scrollback: self.scrollback.take_prefix(retained_scrollback_start),
@@ -5735,7 +5633,7 @@ impl TerminalState {
         let mut logical_line = 1usize;
         for row in start..end.saturating_sub(1) {
             let wrapped = if row < self.scrollback.len() {
-                self.scrollback[row].is_wrapped()
+                self.scrollback[row].is_wrapped
             } else {
                 self.screen
                     .grid
@@ -5823,10 +5721,10 @@ impl TerminalState {
             };
             let (wrapped, chars) = if row < self.scrollback.len() {
                 let line = &self.scrollback[row];
-                let cells = line.decompress();
+                let cells = decompress_history_row(line);
                 (
-                    line.is_wrapped(),
-                    segment_len(&cells, first_col, line.is_wrapped()),
+                    line.is_wrapped,
+                    segment_len(&cells, first_col, line.is_wrapped),
                 )
             } else {
                 let grid_row = row - self.scrollback.len();
@@ -6083,7 +5981,7 @@ impl TerminalState {
         for abs_row in start..end {
             let (mut segment, wrapped) = if abs_row < scrollback_len {
                 let line = &self.scrollback[abs_row];
-                let cells = line.decompress();
+                let cells = decompress_history_row(line);
                 let text: String = cells
                     .iter()
                     .skip(if abs_row == start {
@@ -6094,7 +5992,7 @@ impl TerminalState {
                     .filter(|cell| !cell.flags.wide_continuation())
                     .map(|cell| cell.character)
                     .collect();
-                (text, line.is_wrapped())
+                (text, line.is_wrapped)
             } else {
                 let grid_row = abs_row - scrollback_len;
                 if grid_row >= self.screen.grid.rows() {
@@ -6899,8 +6797,10 @@ impl TerminalState {
         // the prefix-eviction shift used when real rows move into history.
         let selection = self.selection.take();
         for row in first..=last {
-            let line =
-                ScrollbackLine::compress(&self.screen.grid[row], self.screen.grid.row_wrapped[row]);
+            let line = ScrollbackLine::compress_frost_legacy(
+                &self.screen.grid[row],
+                self.screen.grid.row_wrapped[row],
+            );
             self.push_scrollback_compressed_with_options(line, allow_alt_buffer);
         }
         let appended = self.scrollback_pushes.wrapping_sub(before) as usize;
@@ -7095,9 +6995,7 @@ impl TerminalState {
             && !self.inline_cli_owner_active();
         let scrollback_line =
             if scrolls_off_screen_top && (!self.screen.use_alt_buffer || allow_alt_scrollback) {
-                Some(ScrollbackLine {
-                    storage: self.screen.grid.archive_frost_legacy_row(top),
-                })
+                Some(self.screen.grid.archive_frost_legacy_row(top))
             } else {
                 None
             };
@@ -8242,15 +8140,12 @@ impl TerminalState {
     /// encoded history rows are decompressed lazily, and live-grid rows stay
     /// borrowed — a full-buffer search no longer rebuilds every row.
     pub fn search_lines(&self) -> impl Iterator<Item = SearchLine<'_>> + '_ {
-        self.scrollback
-            .iter()
-            .map(ScrollbackLine::search_text)
-            .chain(
-                self.screen
-                    .grid
-                    .iter()
-                    .map(|row| SearchLine::Cells(Cow::Borrowed(row))),
-            )
+        self.scrollback.iter().map(search_history_row).chain(
+            self.screen
+                .grid
+                .iter()
+                .map(|row| SearchLine::Cells(Cow::Borrowed(row))),
+        )
     }
 
     /// Absolute buffer row represented by viewport row zero.
@@ -8738,7 +8633,7 @@ impl TerminalState {
             .scrollback
             .iter()
             .enumerate()
-            .map(|(absolute_row, line)| line.layout(absolute_row));
+            .map(|(absolute_row, line)| history_row_layout(line, absolute_row));
         let history_len = self.scrollback.len();
         let grid_layouts = self
             .screen
@@ -8879,7 +8774,7 @@ impl TerminalState {
                 let row = self.raw_row_id_at_absolute(start)?;
                 let previous = start.checked_sub(1)?;
                 let wrapped = if previous < self.scrollback.len() {
-                    self.scrollback[previous].is_wrapped()
+                    self.scrollback[previous].is_wrapped
                 } else {
                     *self
                         .screen
@@ -8933,7 +8828,7 @@ impl TerminalState {
             let row = self.raw_row_id_at_absolute(start)?;
             let wrapped = start.checked_sub(1).is_some_and(|previous| {
                 if previous < self.scrollback.len() {
-                    self.scrollback[previous].is_wrapped()
+                    self.scrollback[previous].is_wrapped
                 } else {
                     self.screen
                         .grid
@@ -9169,7 +9064,7 @@ impl TerminalState {
             return None;
         }
         let retained_history = old.history_len - evicted;
-        if retained_history > 0 && self.scrollback.get(retained_history - 1)?.is_wrapped() {
+        if retained_history > 0 && self.scrollback.get(retained_history - 1)?.is_wrapped {
             return None;
         }
         // These identities certify a pure append/front-eviction operation,
@@ -9236,7 +9131,7 @@ impl TerminalState {
             .iter()
             .skip(retained_history)
             .enumerate()
-            .map(|(index, line)| line.layout(index));
+            .map(|(index, line)| history_row_layout(line, index));
         let grid_layouts = self.screen.grid.iter().enumerate().map(|(index, cells)| {
             RawRowLayout::from_cells(
                 cells,
@@ -9364,7 +9259,7 @@ impl TerminalState {
                         history_cache
                             .entry(slice.source.absolute_row)
                             .or_insert_with(|| {
-                                self.scrollback[slice.source.absolute_row].decompress()
+                                decompress_history_row(&self.scrollback[slice.source.absolute_row])
                             })
                             .as_slice()
                     } else {
@@ -9400,7 +9295,7 @@ impl TerminalState {
             let mut logical_cells: Vec<TerminalCell> = Vec::new();
             let mut logical_spans: Vec<LineOriginSpan> = Vec::new();
             let mut append_line = |line: &ScrollbackLine, raw_absolute_row: usize| {
-                let decompressed = line.decompress();
+                let decompressed = decompress_history_row(line);
                 let retained = Self::strip_trailing_blanks(&decompressed);
                 let view_col_start = logical_cells.len();
                 logical_cells.extend_from_slice(retained);
@@ -9416,7 +9311,7 @@ impl TerminalState {
             };
 
             append_line(&lines[i], raw_absolute_start + i);
-            while i < lines.len() && lines[i].is_wrapped() {
+            while i < lines.len() && lines[i].is_wrapped {
                 i += 1;
                 if i < lines.len() {
                     append_line(&lines[i], raw_absolute_start + i);
@@ -9551,7 +9446,7 @@ impl TerminalState {
             .scrollback
             .len()
             .saturating_sub(self.scroll_offset + rows);
-        while start_idx > 0 && self.scrollback[start_idx - 1].is_wrapped() {
+        while start_idx > 0 && self.scrollback[start_idx - 1].is_wrapped {
             start_idx -= 1;
         }
         let history: Vec<_> = self.scrollback.iter().skip(start_idx).cloned().collect();
@@ -9849,7 +9744,7 @@ impl TerminalState {
                         history_cache
                             .entry(slice.source.absolute_row)
                             .or_insert_with(|| {
-                                self.scrollback[slice.source.absolute_row].decompress()
+                                decompress_history_row(&self.scrollback[slice.source.absolute_row])
                             })
                             .as_slice()
                     } else {
@@ -11935,7 +11830,7 @@ impl TerminalState {
                 };
 
                 let row_is_wrapped = if abs_row < scrollback_len {
-                    self.scrollback[abs_row].is_wrapped()
+                    self.scrollback[abs_row].is_wrapped
                 } else {
                     let grid_row = abs_row - scrollback_len;
                     grid_row < grid_rows && self.screen.grid.row_wrapped[grid_row]
@@ -11943,7 +11838,7 @@ impl TerminalState {
 
                 if abs_row < scrollback_len {
                     // Read from scrollback
-                    let line = self.scrollback[abs_row].decompress();
+                    let line = decompress_history_row(&self.scrollback[abs_row]);
                     let end = end_col.min(line.len().saturating_sub(1));
                     for cell in line.iter().take(end + 1).skip(start_col) {
                         if !cell.flags.wide_continuation() {
@@ -12021,7 +11916,7 @@ impl TerminalState {
             let mut logical_line: Vec<TerminalCell> = Vec::new();
             let decompressed = lines[i].decompress();
             logical_line.extend_from_slice(Self::strip_trailing_blanks(&decompressed));
-            while i < len && lines[i].is_wrapped() {
+            while i < len && lines[i].is_wrapped {
                 i += 1;
                 if i < len {
                     let dc = lines[i].decompress();
@@ -12031,7 +11926,7 @@ impl TerminalState {
             i += 1;
 
             if logical_line.is_empty() {
-                result.push(ScrollbackLine::compress(
+                result.push(ScrollbackLine::compress_frost_legacy(
                     &vec![*blank_cell; new_cols],
                     false,
                 ));
@@ -12048,11 +11943,11 @@ impl TerminalState {
                 {
                     let mut cell = *cell;
                     cell.flags.set_wide(false);
-                    result.push(ScrollbackLine::compress(&[cell], true));
+                    result.push(ScrollbackLine::compress_frost_legacy(&[cell], true));
                 }
                 if result.len() > group_start {
                     if let Some(last) = result.last_mut() {
-                        last.storage.is_wrapped = false;
+                        last.is_wrapped = false;
                     }
                 }
                 continue;
@@ -12070,52 +11965,14 @@ impl TerminalState {
                 }
                 let mut cells = logical_line[offset..end].to_vec();
                 cells.resize(new_cols, *blank_cell);
-                result.push(ScrollbackLine::compress(&cells, end < logical_line.len()));
+                result.push(ScrollbackLine::compress_frost_legacy(
+                    &cells,
+                    end < logical_line.len(),
+                ));
                 offset = end;
             }
         }
 
-        result
-    }
-
-    /// Reflow into a bounded newest-row tail. Input rows are consumed instead
-    /// of accumulating a decompressed logical line or all expanded output.
-    /// Compress even rows subsequently evicted, preserving fresh row-ID cadence.
-    fn reflow_lines_bounded(
-        lines: impl IntoIterator<Item = ScrollbackLine>,
-        new_cols: usize,
-        blank_cell: &TerminalCell,
-        retain_rows: usize,
-    ) -> RetainedHistory<ScrollbackLine> {
-        let mut result = RetainedHistory::default();
-        let source = lines.into_iter().map(|line| {
-            let cells = line.decompress();
-            #[cfg(test)]
-            BOUNDED_REFLOW_PEAK.with(|peak| {
-                let (source, row, retained) = peak.get();
-                peak.set((source.max(cells.len()), row, retained));
-            });
-            (cells, line.is_wrapped())
-        });
-        jterm_engine::history_reflow::reflow_cell_rows(
-            source,
-            new_cols,
-            *blank_cell,
-            |cells, wrapped| {
-                let line = ScrollbackLine::compress(cells, wrapped);
-                if retain_rows != 0 {
-                    while !result.is_empty() && result.needs_room_for(&line, retain_rows) {
-                        result.pop_front();
-                    }
-                    result.push_back(line);
-                }
-                #[cfg(test)]
-                BOUNDED_REFLOW_PEAK.with(|peak| {
-                    let (source, row, retained) = peak.get();
-                    peak.set((source, row.max(cells.len()), retained.max(result.len())));
-                });
-            },
-        );
         result
     }
 
@@ -12156,10 +12013,11 @@ impl TerminalState {
         let cols = self.screen.grid.row_len().max(1);
         // Historical padding must stay neutral even when a live application has
         // a non-default background active at the instant the resize settles.
-        let blank_cell = TerminalCell::default();
-        let source = std::mem::take(&mut self.scrollback).into_rows();
-        self.scrollback =
-            Self::reflow_lines_bounded(source, cols, &blank_cell, self.max_scrollback);
+        self.scrollback = std::mem::take(&mut self.scrollback).reflow_frost_legacy(
+            cols,
+            TerminalCell::default(),
+            self.max_scrollback,
+        );
         self.bump_history_revision();
         let new_scrollback_len = self.scrollback.len();
         self.kitty_graphics
@@ -12252,7 +12110,7 @@ impl TerminalState {
         }
         let geometry = self.screen.resize_frost_legacy(rows, cols);
         for line in geometry.transferred {
-            self.push_scrollback_compressed(ScrollbackLine { storage: line });
+            self.push_scrollback_compressed(line);
         }
         if !self.screen.use_alt_buffer && geometry.old_rows > rows {
             // A resize can evict retained rows. Rebase command-zone anchors
@@ -14176,7 +14034,7 @@ mod tests {
     }
 
     use super::{
-        AgentPromptStatus, ClipboardReadKind, Color, CursorShape, HyperlinkId,
+        history_row_layout, AgentPromptStatus, ClipboardReadKind, Color, CursorShape, HyperlinkId,
         IdleBackgroundOutput, ScrollbackLine, TerminalCell, TerminalState, ZoneOutputExport,
         MAX_COMMAND_ZONES, MAX_OSC8_ID_BYTES, MAX_OSC8_URI_BYTES, MAX_PENDING_ESCAPE,
         MAX_TERMINAL_TITLE_CHARS,
@@ -14197,8 +14055,8 @@ mod tests {
         cell.flags.set_bold(true);
         cell.flags.set_blink(true);
         // Frost's retained format includes blink in extra_flags.
-        let line = ScrollbackLine::compress(&[cell], false);
-        let jterm_engine::ScrollbackContent::Encoded(encoded) = line.storage.content() else {
+        let line = ScrollbackLine::compress_frost_legacy(&[cell], false);
+        let jterm_engine::ScrollbackContent::Encoded(encoded) = line.content() else {
             panic!("styled row must use encoded storage");
         };
         assert_eq!(encoded, [1, b'A', 0, 0, 1, 4, 0x34, 0x12, 1]);
@@ -14360,7 +14218,7 @@ mod tests {
         cells[2].character = 'B';
         cells[2].flags.set_strikethrough(true);
 
-        let restored = ScrollbackLine::compress(&cells, false).decompress();
+        let restored = ScrollbackLine::compress_frost_legacy(&cells, false).decompress();
 
         assert_eq!(restored.len(), cells.len());
         for (column, (actual, expected)) in restored.iter().zip(&cells).enumerate() {
@@ -14393,10 +14251,10 @@ mod tests {
         encoded_cells[4].character = '中';
         encoded_cells[4].flags.set_wide(true);
         encoded_cells[5].flags.set_wide_continuation(true);
-        let encoded = ScrollbackLine::compress(&encoded_cells, true);
+        let encoded = ScrollbackLine::compress_frost_legacy(&encoded_cells, true);
 
         super::PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.set(0));
-        let layout = encoded.layout(17);
+        let layout = history_row_layout(&encoded, 17);
         assert_eq!(layout.absolute_row, 17);
         assert_eq!(layout.raw_row, encoded.raw_row_id());
         assert_eq!(layout.active_len, 6);
@@ -14411,14 +14269,20 @@ mod tests {
         let mut plain_cells = vec![TerminalCell::default(); 8];
         plain_cells[0].character = 'A';
         plain_cells[1].character = 'B';
-        let plain = ScrollbackLine::compress(&plain_cells, false).layout(3);
+        let plain = history_row_layout(
+            &ScrollbackLine::compress_frost_legacy(&plain_cells, false),
+            3,
+        );
         assert_eq!(plain.active_len, 2);
         assert!(plain.wide_continuations.is_empty());
         assert!(!plain.wrapped);
 
         let mut styled_blank = vec![TerminalCell::default(); 8];
         styled_blank[3].foreground = Color::Red;
-        let styled_blank = ScrollbackLine::compress(&styled_blank, false).layout(4);
+        let styled_blank = history_row_layout(
+            &ScrollbackLine::compress_frost_legacy(&styled_blank, false),
+            4,
+        );
         assert_eq!(
             styled_blank.active_len, 0,
             "P0 history reflow strips a trailing foreground-styled blank"
@@ -14426,7 +14290,10 @@ mod tests {
 
         let mut decorated_blank = vec![TerminalCell::default(); 8];
         decorated_blank[3].flags.set_bold(true);
-        let decorated_blank = ScrollbackLine::compress(&decorated_blank, false).layout(5);
+        let decorated_blank = history_row_layout(
+            &ScrollbackLine::compress_frost_legacy(&decorated_blank, false),
+            5,
+        );
         assert_eq!(
             decorated_blank.active_len, 0,
             "P0 history reflow strips a trailing style-only blank"
@@ -14434,7 +14301,10 @@ mod tests {
 
         let mut background_blank = vec![TerminalCell::default(); 8];
         background_blank[3].background = Color::Blue;
-        let background_blank = ScrollbackLine::compress(&background_blank, false).layout(6);
+        let background_blank = history_row_layout(
+            &ScrollbackLine::compress_frost_legacy(&background_blank, false),
+            6,
+        );
         assert_eq!(
             background_blank.active_len, 4,
             "P0 history reflow retains a trailing background-painted blank"
@@ -14455,9 +14325,9 @@ mod tests {
             second[0].character = 'B';
             second[1].character = 'C';
             let history = vec![
-                ScrollbackLine::compress(&first, true),
-                ScrollbackLine::compress(&second, false),
-                ScrollbackLine::compress(&[TerminalCell::default(); 7], false),
+                ScrollbackLine::compress_frost_legacy(&first, true),
+                ScrollbackLine::compress_frost_legacy(&second, false),
+                ScrollbackLine::compress_frost_legacy(&[TerminalCell::default(); 7], false),
             ];
             for line in &history {
                 terminal.push_scrollback_compressed(line.clone());
@@ -14491,11 +14361,11 @@ mod tests {
                 if cols == 1 {
                     for slice in &mut expected {
                         let line = &history[slice.source.absolute_row];
-                        slice.narrow_wide_body = line
-                            .layout(slice.source.absolute_row)
-                            .wide_continuations
-                            .binary_search(&(slice.source.col_start + 1))
-                            .is_ok();
+                        slice.narrow_wide_body =
+                            history_row_layout(line, slice.source.absolute_row)
+                                .wide_continuations
+                                .binary_search(&(slice.source.col_start + 1))
+                                .is_ok();
                     }
                 }
                 assert_eq!(planned.raw_slices.as_slice(), expected, "width {cols}");
@@ -14513,16 +14383,16 @@ mod tests {
         let mut background = vec![TerminalCell::default(); 8];
         background[3].background = Color::Blue;
         let history = vec![
-            ScrollbackLine::compress(&foreground, false),
-            ScrollbackLine::compress(&style, false),
-            ScrollbackLine::compress(&background, false),
+            ScrollbackLine::compress_frost_legacy(&foreground, false),
+            ScrollbackLine::compress_frost_legacy(&style, false),
+            ScrollbackLine::compress_frost_legacy(&background, false),
         ];
 
         let plan = super::ProjectionPlan::identity(
             history
                 .iter()
                 .enumerate()
-                .map(|(row, line)| line.layout(row)),
+                .map(|(row, line)| history_row_layout(line, row)),
             std::iter::empty(),
             2,
         );
@@ -14551,7 +14421,7 @@ mod tests {
         wide[0].character = '中';
         wide[0].flags.set_wide(true);
         wide[1].flags.set_wide_continuation(true);
-        terminal.push_scrollback_compressed(ScrollbackLine::compress(&wide, true));
+        terminal.push_scrollback_compressed(ScrollbackLine::compress_frost_legacy(&wide, true));
         terminal.screen.grid.get_mut(0, 0).character = 'G';
         terminal.screen.grid.row_wrapped[0] = true;
 
@@ -14585,10 +14455,9 @@ mod tests {
         let mut history_cells = vec![TerminalCell::default(); 6];
         history_cells[0].character = 'h';
         history_cells[1].foreground = Color::Red;
-        terminal.push_scrollback_compressed(ScrollbackLine::compress_with_raw_row_id(
+        terminal.push_scrollback_compressed(ScrollbackLine::compress_preserving_blink(
             &history_cells,
             false,
-            super::RawRowId::UNTRACKED,
         ));
 
         let plan = terminal.identity_projection_plan(6);
@@ -14628,12 +14497,13 @@ mod tests {
         cells[0].character = 'x';
         cells[0].foreground = Color::Red;
         for _ in 0..10_000 {
-            terminal.push_scrollback_compressed(ScrollbackLine::compress(&cells, false));
+            terminal
+                .push_scrollback_compressed(ScrollbackLine::compress_frost_legacy(&cells, false));
         }
-        assert!(terminal.scrollback.iter().all(|line| matches!(
-            line.storage.content(),
-            jterm_engine::ScrollbackContent::Encoded(_)
-        )));
+        assert!(terminal
+            .scrollback
+            .iter()
+            .all(|line| matches!(line.content(), jterm_engine::ScrollbackContent::Encoded(_))));
 
         super::PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.set(0));
         super::PROJECTED_HISTORY_LAYOUT_BYTE_SCAN_COUNT.with(|count| count.set(0));
@@ -15241,7 +15111,8 @@ mod tests {
         cells[0].character = 'x';
         cells[0].foreground = Color::Red;
         for _ in 0..10_000 {
-            terminal.push_scrollback_compressed(ScrollbackLine::compress(&cells, false));
+            terminal
+                .push_scrollback_compressed(ScrollbackLine::compress_frost_legacy(&cells, false));
         }
         let identity = terminal.identity_projection_plan(80);
         let collapses: Vec<_> = (0..128)
@@ -15299,7 +15170,8 @@ mod tests {
         let mut cells = vec![TerminalCell::default(); 80];
         cells[0].character = 'x';
         for _ in 0..10_000 {
-            terminal.push_scrollback_compressed(ScrollbackLine::compress(&cells, false));
+            terminal
+                .push_scrollback_compressed(ScrollbackLine::compress_frost_legacy(&cells, false));
         }
         let base = terminal.get_projected_viewport(true);
         let mut stale = super::ProjectionPolicy::new();
@@ -15461,7 +15333,8 @@ mod tests {
         cells[0].character = 'x';
         cells[0].foreground = Color::Red;
         for _ in 0..10_000 {
-            terminal.push_scrollback_compressed(ScrollbackLine::compress(&cells, false));
+            terminal
+                .push_scrollback_compressed(ScrollbackLine::compress_frost_legacy(&cells, false));
         }
         let identity = terminal.identity_projection_plan(80);
         let absolute = 5_000;
@@ -16359,9 +16232,9 @@ mod tests {
             first[3].character = 'B';
             let mut second = vec![TerminalCell::default(); 4];
             second[0].character = 'C';
-            let first_line = ScrollbackLine::compress(&first, true);
+            let first_line = ScrollbackLine::compress_frost_legacy(&first, true);
             let first_id = first_line.raw_row_id();
-            let second_line = ScrollbackLine::compress(&second, false);
+            let second_line = ScrollbackLine::compress_frost_legacy(&second, false);
             terminal.push_scrollback_compressed(first_line);
             terminal.push_scrollback_compressed(second_line);
             terminal.set_scroll_offset(terminal.scrollback.len());
@@ -16426,14 +16299,14 @@ mod tests {
         let mut suffix = vec![TerminalCell::default(); 6];
         suffix[0].character = 'A';
         suffix[1].character = 'a';
-        let suffix = ScrollbackLine::compress(&suffix, true);
+        let suffix = ScrollbackLine::compress_frost_legacy(&suffix, true);
         let suffix_id = suffix.raw_row_id();
         let mut prefix = vec![TerminalCell::default(); 6];
         prefix[0].character = 'B';
         prefix[1].character = 'b';
-        let prefix = ScrollbackLine::compress(&prefix, false);
+        let prefix = ScrollbackLine::compress_frost_legacy(&prefix, false);
         let prefix_id = prefix.raw_row_id();
-        let empty = ScrollbackLine::compress(&[TerminalCell::default(); 6], false);
+        let empty = ScrollbackLine::compress_frost_legacy(&[TerminalCell::default(); 6], false);
         let empty_id = empty.raw_row_id();
         terminal.push_scrollback_compressed(suffix);
         terminal.push_scrollback_compressed(prefix);
@@ -16467,7 +16340,8 @@ mod tests {
         for ch in ['A', 'B', 'C', 'D'] {
             let mut cells = vec![TerminalCell::default(); 4];
             cells[0].character = ch;
-            terminal.push_scrollback_compressed(ScrollbackLine::compress(&cells, false));
+            terminal
+                .push_scrollback_compressed(ScrollbackLine::compress_frost_legacy(&cells, false));
         }
         terminal.set_scroll_offset(terminal.scrollback.len());
 
@@ -17712,7 +17586,7 @@ mod tests {
         cells[1].flags.set_wide(true);
         cells[2].flags.set_wide_continuation(true);
         cells[3].character = 'B';
-        let source = vec![ScrollbackLine::compress(&cells, false)];
+        let source = vec![ScrollbackLine::compress_frost_legacy(&cells, false)];
 
         let reflowed = TerminalState::reflow_lines(&source, 2, &TerminalCell::default());
         let rows: Vec<_> = reflowed.iter().map(ScrollbackLine::decompress).collect();
@@ -19308,15 +19182,15 @@ mod tests {
         // The first three rows scrolled into history: plain text stays a
         // borrowed string while styled/wide rows keep encoded cell data.
         assert!(matches!(
-            terminal.scrollback[0].storage.content(),
+            terminal.scrollback[0].content(),
             jterm_engine::ScrollbackContent::Plain(..)
         ));
         assert!(matches!(
-            terminal.scrollback[1].storage.content(),
+            terminal.scrollback[1].content(),
             jterm_engine::ScrollbackContent::Encoded(_)
         ));
         assert!(matches!(
-            terminal.scrollback[2].storage.content(),
+            terminal.scrollback[2].content(),
             jterm_engine::ScrollbackContent::Encoded(_)
         ));
 
@@ -19936,7 +19810,7 @@ mod tests {
         let output_start = zone.output_start.expect("retained output rows");
 
         assert!(if output_start < terminal.scrollback.len() {
-            terminal.scrollback[output_start].is_wrapped()
+            terminal.scrollback[output_start].is_wrapped
         } else {
             terminal.screen.grid.row_wrapped[output_start - terminal.scrollback.len()]
         });

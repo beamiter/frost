@@ -14,7 +14,7 @@ fn fixture(text: &[&str]) -> TerminalState {
         }
         terminal
             .scrollback
-            .push_back(ScrollbackLine::compress(&cells, false));
+            .push_back(ScrollbackLine::compress_frost_legacy(&cells, false));
     }
     terminal
 }

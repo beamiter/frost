@@ -160,10 +160,12 @@ fn cli_scope_rebases_on_eviction_and_prefix_restoration() {
     let floor = terminal.inline_cli_scope_floor().unwrap();
     terminal.on_scrollback_rows_inserted(5);
     for _ in 0..5 {
-        terminal.scrollback.push_front(ScrollbackLine::compress(
-            &vec![TerminalCell::default(); 40],
-            false,
-        ));
+        terminal
+            .scrollback
+            .push_front(ScrollbackLine::compress_frost_legacy(
+                &vec![TerminalCell::default(); 40],
+                false,
+            ));
     }
     terminal.bump_history_revision();
     assert_eq!(terminal.inline_cli_scope_floor(), Some(floor + 5));
