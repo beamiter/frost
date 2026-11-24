@@ -1,7 +1,7 @@
 use jterm_engine::grid::{
-    AsciiOverwritePolicy, RegionDirection, RegionWrapPolicy, WideCellEditPolicy,
-    WideContinuationProtection,
+    AsciiOverwritePolicy, RegionDirection, RegionWrapPolicy, WideContinuationProtection,
 };
+use jterm_engine::mode_mutation::{apply_frost_mode, FrostModeEffect, ModeNamespace};
 use jterm_engine::protocol_state::{ProtocolState, TerminalModes};
 use jterm_engine::retained_history::RetainedHistory;
 use jterm_engine::screen::{
@@ -6462,21 +6462,6 @@ impl TerminalState {
         }
     }
 
-    /// IRM (insert mode): shift cells at/after `col` right by `count`, dropping the
-    /// rightmost `count` cells off the end of the row.
-    fn shift_cells_right(&mut self, row: usize, col: usize, count: usize) {
-        let blank = self.create_blank_cell();
-        if self.screen.grid.insert_blank_cells(
-            row,
-            col,
-            count,
-            blank,
-            WideCellEditPolicy::ClearBoundaryPairs,
-        ) {
-            self.mark_row_dirty(row);
-        }
-    }
-
     /// Merge a zero-width combining mark into the preceding base cell when the
     /// pair has a single precomposed form (NFC); otherwise drop it.
     fn combine_with_previous(&mut self, mark: char) {
@@ -6508,15 +6493,6 @@ impl TerminalState {
             cell.character = c0;
             self.mark_row_dirty(self.screen.cursor_row);
         }
-    }
-
-    fn save_cursor(&mut self) {
-        self.screen.save_cursor(self.protocol.modes().contains(&7));
-    }
-
-    fn restore_cursor(&mut self) {
-        // FrostLegacyV1 restores the drawing state and keeps the live DECAWM.
-        let _ = self.screen.restore_cursor();
     }
 
     fn put_char(&mut self, ch: char, track_idle_output: bool) {
@@ -6560,7 +6536,7 @@ impl TerminalState {
 
         // IRM insert mode (mode 4): make room by shifting the row right.
         if self.screen.insert_mode {
-            self.shift_cells_right(self.screen.cursor_row, self.screen.cursor_col, width);
+            self.screen.insert_frost_legacy_blanks(width);
         }
 
         self.screen.grid.overwrite_graphic(
@@ -7209,8 +7185,10 @@ impl TerminalState {
                     } => {
                         if intermediates.is_empty() {
                             match final_byte {
-                                b'7' => self.save_cursor(),
-                                b'8' => self.restore_cursor(),
+                                b'7' => self.screen.save_cursor_state(&self.protocol),
+                                b'8' => {
+                                    let _ = self.screen.restore_cursor();
+                                }
                                 b'E' => {
                                     self.screen.pending_wrap = false;
                                     self.next_line();
@@ -7363,7 +7341,8 @@ impl TerminalState {
                             self.output_buffer.extend(bytes);
                         }
                         Effect::GlobalBackground(color) => self.global_bg = color,
-                        Effect::Row(_) | Effect::CursorReposition { .. } | Effect::Bell => {
+                        Effect::Row(mutation) => self.mark_row_dirty(mutation.row),
+                        Effect::CursorReposition { .. } | Effect::Bell => {
                             unreachable!("Frost local CSI produced an unexpected effect")
                         }
                     }
@@ -7418,20 +7397,6 @@ impl TerminalState {
                 3 => self.erase_saved_lines(),
                 _ => {}
             },
-            'K' => {
-                let cols = self.screen.grid.row_len();
-                let span = match params.first().copied().unwrap_or(0) {
-                    0 => self.screen.cursor_col..cols,
-                    1 => 0..self.screen.cursor_col + 1,
-                    2 => 0..cols,
-                    _ => return,
-                };
-                let blank = self.create_blank_cell();
-                self.screen
-                    .grid
-                    .erase_cells(self.screen.cursor_row, span, blank);
-                self.mark_row_dirty(self.screen.cursor_row);
-            }
             'L' | 'M' => {
                 let direction = if cmd == 'L' {
                     RegionDirection::Down
@@ -7458,68 +7423,6 @@ impl TerminalState {
                     }
                 }
                 self.mark_rows_dirty(cursor, bottom);
-            }
-            's' => {
-                if private_prefix.is_none() && intermediates.is_empty() {
-                    self.save_cursor();
-                }
-            }
-            'u' => {
-                if intermediates.is_empty() {
-                    match private_prefix {
-                        None => {
-                            self.restore_cursor();
-                        }
-                        Some(b'?') => {
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] query current kitty flags -> {}",
-                                self.protocol.keyboard_enhancement_flags()
-                            );
-                            let response =
-                                format!("\x1b[?{}u", self.protocol.keyboard_enhancement_flags());
-                            self.output_buffer.extend_from_slice(response.as_bytes());
-                        }
-                        Some(b'=') => {
-                            let flags = params.first().copied().unwrap_or(0);
-                            let mode = params.get(1).copied().unwrap_or(1);
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] set kitty flags flags={} mode={} previous={}",
-                                flags,
-                                mode,
-                                self.protocol.keyboard_enhancement_flags()
-                            );
-                            self.protocol.set_keyboard_enhancement_flags(flags, mode);
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] new kitty flags={}",
-                                self.protocol.keyboard_enhancement_flags()
-                            );
-                        }
-                        Some(b'>') => {
-                            let flags = params.first().copied().unwrap_or(0);
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] push kitty flags current={} new={}",
-                                self.protocol.keyboard_enhancement_flags(),
-                                flags
-                            );
-                            self.protocol.push_keyboard_enhancement_flags(flags);
-                        }
-                        Some(b'<') => {
-                            let count = params.first().copied().unwrap_or(1) as usize;
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] pop kitty flags count={} current={} stack_depth={}",
-                                count,
-                                self.protocol.keyboard_enhancement_flags(),
-                                self.protocol.keyboard_enhancement_stack().len()
-                            );
-                            self.protocol.pop_keyboard_enhancement_flags(count);
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] new kitty flags={}",
-                                self.protocol.keyboard_enhancement_flags()
-                            );
-                        }
-                        _ => {}
-                    }
-                }
             }
             'S' => {
                 // Scroll up (Scroll Up, SU) - content moves up, new lines appear at bottom
@@ -7574,47 +7477,15 @@ impl TerminalState {
                 let response = format!("\x1b[?997;{scheme}n");
                 self.output_buffer.extend(response.as_bytes());
             }
-            'h' => {
-                // Set mode: DECSET (CSI ? Pn h) vs ANSI SM (CSI Pn h). The two
-                // share parameter numbers (e.g. 4 = DECSCLM private vs IRM ANSI),
-                // so the private prefix must be threaded through.
-                let private = private_prefix == Some(b'?');
+            'h' | 'l' => {
+                let namespace = if private_prefix == Some(b'?') {
+                    ModeNamespace::DecPrivate
+                } else {
+                    ModeNamespace::Ansi
+                };
                 for &mode in params {
-                    self.set_mode(mode, private);
+                    self.apply_mode(namespace, mode, cmd == 'h');
                 }
-            }
-            'l' => {
-                // Reset mode: DECRST (CSI ? Pn l) vs ANSI RM (CSI Pn l).
-                let private = private_prefix == Some(b'?');
-                for &mode in params {
-                    self.reset_mode(mode, private);
-                }
-            }
-            '@' => {
-                let count = params.first().copied().unwrap_or(1).max(1) as usize;
-                self.shift_cells_right(self.screen.cursor_row, self.screen.cursor_col, count);
-            }
-            'P' => {
-                let count = params.first().copied().unwrap_or(1).max(1) as usize;
-                let blank = self.create_blank_cell();
-                self.screen.grid.delete_cells(
-                    self.screen.cursor_row,
-                    self.screen.cursor_col,
-                    count,
-                    blank,
-                    WideCellEditPolicy::ClearBoundaryPairs,
-                );
-                self.mark_row_dirty(self.screen.cursor_row);
-            }
-            'X' => {
-                let count = params.first().copied().unwrap_or(1).max(1) as usize;
-                let blank = self.create_blank_cell();
-                self.screen.grid.erase_cells(
-                    self.screen.cursor_row,
-                    self.screen.cursor_col..self.screen.cursor_col.saturating_add(count),
-                    blank,
-                );
-                self.mark_row_dirty(self.screen.cursor_row);
             }
             'q' if private_prefix == Some(b'>')
                 && intermediates.is_empty()
@@ -7645,7 +7516,7 @@ impl TerminalState {
         self.watch_batch.boundary = true;
         self.watch_batch.interrupted = true;
         if self.screen.use_alt_buffer {
-            self.reset_mode(1049, true);
+            self.leave_alternate_screen(1049);
         }
         self.record_reset_interrupted_agent_command();
         self.screen.current_fg = Color::Default;
@@ -7756,186 +7627,98 @@ impl TerminalState {
         self.mark_rows_dirty(0, self.screen.grid.rows().saturating_sub(1));
     }
 
-    fn set_mode(&mut self, mode: u16, private: bool) {
-        if !private {
-            // ANSI Set Mode (CSI Pn h). The only one we implement is IRM (4).
-            // Everything else (GATM 1, ERM 6, VEM 7, LNM 20, …) is ignored so
-            // it can't collide with the identically-numbered DEC private modes.
-            if mode == 4 {
-                self.screen.insert_mode = true;
-            }
-            return;
-        }
-        // Revoke even a mode round-trip hidden inside one PTY batch. A fresh
-        // view must not reinterpret an already queued local scroll as app input.
-        if matches!(mode, 1000..=1003 | 1005 | 1006 | 1015)
-            && !self.protocol.modes().contains(&mode)
-        {
-            self.projection_scroll_guard.revoke();
-        }
-        match mode {
-            4 => {
-                // DECSCLM (smooth scroll) — accepted and ignored. Must NOT fall
-                // through to the IRM bit that ANSI mode 4 uses.
-            }
-            25 => {
-                // Show cursor (mode 25)
-                self.protocol.modes_mut().insert(25);
-            }
-            1004 => {
-                // Focus event reporting
-                self.protocol.modes_mut().insert(1004);
-            }
-            2004 => {
-                // Bracketed paste mode
-                self.protocol.modes_mut().insert(2004);
-            }
-            1000..=1003 => {
-                // Mouse reporting modes
-                self.protocol.modes_mut().insert(mode);
-            }
-            1006 => {
-                // SGR mouse reporting format
-                self.protocol.modes_mut().insert(mode);
-            }
-            1048 => {
-                // Save cursor (DECSC equivalent), no buffer switch.
-                self.save_cursor();
-                self.protocol.modes_mut().insert(1048);
-            }
-            47 | 1047 | 1049 => {
-                if self.disable_alt_screen || self.screen.use_alt_buffer {
-                    return;
+    fn apply_mode(&mut self, namespace: ModeNamespace, mode: u16, enabled: bool) {
+        let effect = apply_frost_mode(
+            &mut self.screen,
+            &mut self.protocol,
+            namespace,
+            mode,
+            enabled,
+        );
+        // Apply host effects before the next parameter, even when a single
+        // input batch toggles the mode back to its starting state.
+        match effect {
+            FrostModeEffect::None => {}
+            FrostModeEffect::MouseReportingChanged => self.projection_scroll_guard.revoke(),
+            FrostModeEffect::AlternateScreen => {
+                if enabled {
+                    self.enter_alternate_screen(mode);
+                } else {
+                    self.leave_alternate_screen(mode);
                 }
-                self.saved_primary_global_bg = self.global_bg;
-                self.screen.saved_primary_cursor_shape = Some(self.screen.cursor_shape);
-                self.saved_primary_colors = self.colors.clone();
-                self.scroll_offset = 0;
-                self.provisional_alt_snapshot = None;
-
-                // Frost saves the primary cursor and clears the alternate grid
-                // for 47, 1047 and 1049 alike.
-                let autowrap = self.protocol.modes().contains(&7);
-                let entered = self
-                    .screen
-                    .alternate_screen_controls()
-                    .enter(true, autowrap);
-                debug_assert!(entered);
-                self.protocol.switch_screen();
-                self.watch_batch.interrupted = true;
-                self.watch_batch.boundary = true;
-                self.projection_scroll_guard.revoke();
-                self.organism_idle_cwd = None;
-                self.screen.current_hyperlink = HyperlinkId::NONE;
-                self.clear_text_selection();
-                self.clear_screen();
-                self.protocol.modes_mut().insert(mode);
             }
-            2026 => {
-                // Synchronized output: suppress rendering until cleared
-                self.protocol.modes_mut().insert(2026);
-                self.sync_output_active = true;
-                self.sync_output_start
-                    .get_or_insert_with(std::time::Instant::now);
+            FrostModeEffect::SynchronizedOutput => {
+                if enabled {
+                    self.protocol.modes_mut().insert(2026);
+                    self.sync_output_active = true;
+                    self.sync_output_start
+                        .get_or_insert_with(std::time::Instant::now);
+                } else {
+                    self.finish_synchronized_output();
+                }
             }
-            6 => self.screen.cursor_controls().set_origin_mode(true),
-            7 => {
-                // Autowrap mode
-                self.protocol.modes_mut().insert(7);
-            }
-            // Keep Frost's legacy admission independent of engine profiles.
-            1 | 66 | 1005 | 1015 | 2031 | 5522 => self.protocol.modes_mut().insert(mode),
-            _ => {}
         }
     }
 
-    fn reset_mode(&mut self, mode: u16, private: bool) {
-        if !private {
-            // ANSI Reset Mode (CSI Pn l). Only IRM (4) is implemented.
-            if mode == 4 {
-                self.screen.insert_mode = false;
-            }
+    fn enter_alternate_screen(&mut self, mode: u16) {
+        if self.disable_alt_screen || self.screen.use_alt_buffer {
             return;
         }
-        // Revoke even a mode round-trip hidden inside one PTY batch. A fresh
-        // view must not reinterpret an already queued local scroll as app input.
-        if matches!(mode, 1000..=1003 | 1005 | 1006 | 1015) && self.protocol.modes().contains(&mode)
-        {
-            self.projection_scroll_guard.revoke();
-        }
-        match mode {
-            4 => {
-                // DECSCLM reset — ignored (see set_mode).
-            }
-            25 => {
-                // Hide cursor
-                self.protocol.modes_mut().remove(&25);
-            }
-            1004 => {
-                // Disable focus event reporting
-                self.protocol.modes_mut().remove(&1004);
-            }
-            2004 => {
-                // Disable bracketed paste mode
-                self.protocol.modes_mut().remove(&2004);
-            }
-            1000..=1003 => {
-                // Disable mouse reporting
-                self.protocol.modes_mut().remove(&mode);
-            }
-            1006 => {
-                // Disable SGR mouse reporting format
-                self.protocol.modes_mut().remove(&mode);
-            }
-            1048 => {
-                // Restore cursor (DECRC equivalent), no buffer switch.
-                self.restore_cursor();
-                self.protocol.modes_mut().remove(&1048);
-            }
-            47 | 1047 | 1049 => {
-                if let Some(effect) = self
-                    .screen
-                    .alternate_screen_controls()
-                    .leave(AlternateRestorePolicy::Frost)
-                {
-                    self.protocol.switch_screen();
-                    self.watch_batch.interrupted = true;
-                    self.watch_batch.boundary = true;
-                    self.projection_scroll_guard.revoke();
-                    // Whatever the alternate screen last left in scrollback is
-                    // all that remains of it, so it stops being provisional.
-                    self.provisional_alt_snapshot = None;
-                    self.protocol.modes_mut().remove(&mode);
-                    // Likewise, alt-screen OSC 8 state never leaks back onto
-                    // newly printed primary-screen cells.
-                    self.screen.current_hyperlink = HyperlinkId::NONE;
+        self.saved_primary_global_bg = self.global_bg;
+        self.screen.saved_primary_cursor_shape = Some(self.screen.cursor_shape);
+        self.saved_primary_colors = self.colors.clone();
+        self.scroll_offset = 0;
+        self.provisional_alt_snapshot = None;
 
-                    self.clear_text_selection();
-                    self.global_bg = self.saved_primary_global_bg;
-                    self.saved_primary_global_bg = Color::Default;
-                    if let Some(shape) = self.screen.saved_primary_cursor_shape {
-                        self.screen.cursor_shape = shape;
-                    }
-                    self.colors = self.saved_primary_colors.clone();
-                    self.saved_primary_colors.reset_dynamic();
+        // Frost saves the primary cursor and clears the alternate grid
+        // for 47, 1047 and 1049 alike.
+        let autowrap = self.protocol.modes().contains(&7);
+        let entered = self
+            .screen
+            .alternate_screen_controls()
+            .enter(true, autowrap);
+        debug_assert!(entered);
+        self.protocol.switch_screen();
+        self.watch_batch.interrupted = true;
+        self.watch_batch.boundary = true;
+        self.projection_scroll_guard.revoke();
+        self.organism_idle_cwd = None;
+        self.screen.current_hyperlink = HyperlinkId::NONE;
+        self.clear_text_selection();
+        self.clear_screen();
+        self.protocol.modes_mut().insert(mode);
+    }
 
-                    // Mark all rows dirty after grid swap to force full re-render
-                    // Increment by rows+1 to trigger grid_version_jumped in ui.rs
-                    self.grid_version += effect.dirty_rows.len() as u64 + 1;
-                    self.row_versions.fill(self.grid_version);
-                }
-            }
-            2026 => {
-                self.finish_synchronized_output();
-            }
-            6 => self.screen.cursor_controls().set_origin_mode(false),
-            7 => {
-                // Disable autowrap
-                self.protocol.modes_mut().remove(&7);
-            }
-            1 | 66 | 1005 | 1015 | 2031 | 5522 => self.protocol.modes_mut().remove(&mode),
-            _ => {}
+    fn leave_alternate_screen(&mut self, mode: u16) {
+        let Some(effect) = self
+            .screen
+            .alternate_screen_controls()
+            .leave(AlternateRestorePolicy::Frost)
+        else {
+            return;
+        };
+        self.protocol.switch_screen();
+        self.watch_batch.interrupted = true;
+        self.watch_batch.boundary = true;
+        self.projection_scroll_guard.revoke();
+        // The alternate screen's retained snapshot is now permanent.
+        self.provisional_alt_snapshot = None;
+        self.protocol.modes_mut().remove(&mode);
+        // Alternate OSC 8 state never leaks onto the primary screen.
+        self.screen.current_hyperlink = HyperlinkId::NONE;
+
+        self.clear_text_selection();
+        self.global_bg = self.saved_primary_global_bg;
+        self.saved_primary_global_bg = Color::Default;
+        if let Some(shape) = self.screen.saved_primary_cursor_shape {
+            self.screen.cursor_shape = shape;
         }
+        self.colors = self.saved_primary_colors.clone();
+        self.saved_primary_colors.reset_dynamic();
+
+        // Force a full re-render after the grid swap.
+        self.grid_version += effect.dirty_rows.len() as u64 + 1;
+        self.row_versions.fill(self.grid_version);
     }
 
     /// Number of lines currently retained in scrollback (above the live grid).
@@ -8095,7 +7878,7 @@ impl TerminalState {
         // buffer must first restore the primary buffer. The option only blocks
         // future *entries*; exit sequences are always honored.
         if disable_alt_screen && !self.disable_alt_screen && self.screen.use_alt_buffer {
-            self.reset_mode(1049, true);
+            self.leave_alternate_screen(1049);
         }
         self.disable_alt_screen = disable_alt_screen;
     }
@@ -18312,6 +18095,34 @@ mod tests {
     }
 
     #[test]
+    fn mixed_dec_modes_commit_in_wire_order_before_queries() {
+        for (modes, expected) in [
+            (
+                "6;1049",
+                &b"\x1b[?6;1$y\x1b[?1049;1$y\x1b[1;1R\x1b[?6;1$y\x1b[?1049;2$y\x1b[2;1R"[..],
+            ),
+            (
+                "1049;6",
+                &b"\x1b[?6;1$y\x1b[?1049;1$y\x1b[1;1R\x1b[?6;2$y\x1b[?1049;2$y\x1b[4;5R"[..],
+            ),
+        ] {
+            let input = format!(
+                "\x1b[2;4r\x1b[4;5H\x1b[?{modes}h\x1b[?6;1049$p\x1b[6n\x1b[?1049l\x1b[?6;1049$p\x1b[6n"
+            );
+            for split in 0..=input.len() {
+                let mut terminal = TerminalState::new(12, 5);
+                terminal.process_input(&input.as_bytes()[..split]);
+                terminal.process_input(&input.as_bytes()[split..]);
+                assert_eq!(
+                    terminal.get_output(),
+                    expected,
+                    "modes={modes}, split={split}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn report_all_keys_follows_the_kitty_flag_not_theme_notifications() {
         let mut terminal = TerminalState::new(8, 2);
 
@@ -20061,7 +19872,7 @@ mod tests {
     #[test]
     fn bulk_row_edits_preserve_pending_wrap() {
         for text in ["abcdefgh", "abcdef界"] {
-            for command in ['@', 'P'] {
+            for command in ['@', 'P', 'K', 'X'] {
                 let mut terminal = TerminalState::new(8, 8);
                 terminal.process_batch(text.as_bytes());
                 assert!(terminal.screen.pending_wrap);

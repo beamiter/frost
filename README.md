@@ -1274,7 +1274,7 @@ reads local history without modifying it or calling a model service.
 
 Frost uses the shared `jterm_core` session catalog and read-only Workspace
 controllers. Cargo locks the core, engine and runtime at
-`f3ae773392556297fca5b885fbba4b43e74eb544`. The shared session actor handles
+`d328196239443dffe78ea7a8a79f5fcbc373d1d6`. The shared session actor handles
 terminal and Vim9 PTY input and output. Frost retains its title admission,
 outbound sanitization, RIS title retention and display projection. The
 `packaging/jterm-core-*` archives record earlier source revisions with their
