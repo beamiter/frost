@@ -254,6 +254,7 @@ fn index_refresh_cannot_acknowledge_a_rejected_input_or_reactivate_old_hits() {
     assert!(!state.install_cache(block_mode::BlockSearchCacheBuild {
         zones: build.cache,
         older_not_indexed: false,
+        partial_outputs: 0,
         resident_bytes: 0,
     }));
     assert_eq!(state.query_error, diagnostic);

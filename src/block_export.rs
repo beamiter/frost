@@ -7,6 +7,7 @@
 use crate::block_mode;
 use crate::persistence;
 use crate::terminal::{TerminalState, ZoneOutputExport};
+use jterm_core::screen_replay::CapturedExecutionSource;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::io::{self, Write};
@@ -54,6 +55,8 @@ pub struct SessionExportBlock {
     /// Both the retained output snapshot and its original scrollback rows are
     /// gone. Kept distinct from a command that genuinely printed nothing.
     pub output_unavailable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_source: Option<CapturedExecutionSource>,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
@@ -191,7 +194,7 @@ impl SessionExportSnapshot {
 
 impl SessionExportBlock {
     fn markdown(&self) -> String {
-        block_mode::markdown_export_with_lifecycle(
+        let mut markdown = block_mode::markdown_export_with_lifecycle(
             &block_mode::MarkdownBlock {
                 command: self.command.as_deref(),
                 output: &self.output,
@@ -206,7 +209,14 @@ impl SessionExportBlock {
             self.output_unavailable,
             self.start_mark_seen,
             self.completion_provenance,
-        )
+        );
+        if let Some(source) = &self.output_source {
+            markdown.push_str(&format!("\n- {source}\n"));
+            if source.execution.head_dropped {
+                markdown.push_str("- The beginning of the captured output was lost.\n");
+            }
+        }
+        markdown
     }
 }
 
@@ -265,8 +275,10 @@ fn snapshot_zone(
         id: zone.id,
         command: zone.command.clone(),
         output,
-        output_truncated,
+        output_truncated: output_truncated || zone.output_source.as_ref()
+            .is_some_and(|source| source.execution.head_dropped),
         output_unavailable,
+        output_source: zone.output_source.clone(),
         exit_code: zone.exit_code,
         duration_ms: zone.duration_ms,
         finished_at_ms: zone.finished_at_ms,
@@ -623,6 +635,7 @@ mod tests {
             output: output.to_string(),
             output_truncated: false,
             output_unavailable: false,
+            output_source: None,
             exit_code: Some(0),
             duration_ms: Some(1250),
             finished_at_ms: Some(0),
@@ -644,6 +657,53 @@ mod tests {
             blocks,
             selection_only: false,
         }
+    }
+
+    #[test]
+    fn completed_export_locates_original_pty_bytes_across_read_boundaries() {
+        let start = b"\x1bc\x1b]133;A\x07$ \x1b]133;B\x07printf result\r\n\x1b]133;C;id=witness;cmdline_url=printf%20result\x1b\\";
+        let output = b"\x1b[31mresult\x1b[0m\r\n\x1b]133;D;99;id=stale\x07";
+        let end = b"\x1b]133;D;0;id=witness\x07";
+        let tail = [output.as_slice(), end.as_slice()].concat();
+        for split in 0..=start.len().max(tail.len()) {
+            let mut terminal = TerminalState::new(80, 12);
+            let start_split = split.min(start.len());
+            terminal.process_input(&start[..start_split]);
+            terminal.process_input(&start[start_split..]);
+            terminal.on_resize(91, 15);
+            let tail_split = split.min(tail.len());
+            terminal.process_input(&tail[..tail_split]);
+            terminal.process_input(&tail[tail_split..]);
+            let snapshot = snapshot_session(&terminal, 42).unwrap();
+            assert_eq!(snapshot.blocks.len(), 1);
+            assert_eq!(snapshot.blocks[0].exit_code, Some(0));
+            let document: serde_json::Value = serde_json::from_slice(
+                &serialize_session(&snapshot, SessionExportFormat::Json).unwrap(),
+            )
+            .unwrap();
+            let source = &document["blocks"][0]["output_source"];
+            assert_eq!(source["output_bytes"]["start"], start.len());
+            assert_eq!(source["output_bytes"]["end"], start.len() + output.len());
+            assert_eq!(source["start_event"], 3);
+            assert_eq!(source["end_event"], 5);
+            assert_eq!(source["start_size"], serde_json::json!([80, 12]));
+            assert_eq!(source["capture_size"], serde_json::json!([91, 15]));
+            assert!(source["execution_id"].as_str().is_some());
+            assert!(source["stream_id"].as_str().is_some());
+        }
+    }
+
+    #[test]
+    fn completed_export_reports_an_evicted_output_head() {
+        let mut terminal = TerminalState::new(80, 4);
+        terminal.set_max_scrollback(1);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07printf result\r\n\x1b]133;C;cmdline_url=printf%20result\x07");
+        terminal.process_input(&b"result\r\n".repeat(32));
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        let snapshot = snapshot_session(&terminal, 42).unwrap();
+        let block = &snapshot.blocks[0];
+        assert!(block.output_source.as_ref().unwrap().execution.head_dropped);
+        assert!(block.markdown().contains("The beginning of the captured output was lost."));
     }
 
     #[test]

@@ -2356,6 +2356,7 @@ struct BlockSearchState {
     filter_context: Option<BlockSearchFilterContext>,
     /// The source or resident budget omitted at least one older zone.
     older_not_indexed: bool,
+    partial_outputs: usize,
     /// Finalized-zone set represented by the current/in-flight cache.
     zone_version: BlockSearchZoneVersion,
     query: String,
@@ -2436,6 +2437,7 @@ impl BlockSearchState {
     fn install_cache(&mut self, build: block_mode::BlockSearchCacheBuild) -> bool {
         self.cache = build.zones;
         self.older_not_indexed = build.older_not_indexed;
+        self.partial_outputs = build.partial_outputs;
         self.loading = false;
         if self.query_error.is_some() {
             self.match_pending = false;
@@ -2642,6 +2644,7 @@ impl BlockSearchState {
         // path that ACTS on a hit is gated on `loading`.
         self.cache = Vec::new();
         self.older_not_indexed = false;
+        self.partial_outputs = 0;
         self.matched_intent = None;
         self.matched_eligible.clear();
     }
@@ -2715,7 +2718,14 @@ impl BlockSearchState {
         if self.older_not_indexed {
             label.push_str(" · older blocks not indexed");
         }
+        self.append_output_coverage(&mut label);
         label
+    }
+
+    fn append_output_coverage(&self, label: &mut String) {
+        if self.scope.includes_output() && self.partial_outputs > 0 {
+            label.push_str(" · some outputs are incomplete");
+        }
     }
 }
 
@@ -13508,11 +13518,18 @@ impl Frost {
     fn block_search_source_snapshot(sess: &Session) -> block_mode::BlockSearchSourceSnapshot {
         block_mode::bounded_block_search_sources(
             sess.terminal.command_zones.iter().rev().map(|zone| {
-                block_mode::BlockSearchSource::new(
-                    zone.id,
-                    zone.command.clone(),
-                    sess.terminal.zone_output_text(zone.id),
-                )
+                use terminal::ZoneOutputExport;
+                let (output, incomplete) = match sess.terminal.zone_output_export_capped(zone.id) {
+                    Some(ZoneOutputExport::Available { text, truncated }) => (Some(text), truncated),
+                    Some(ZoneOutputExport::Empty) => (None, false),
+                    Some(ZoneOutputExport::Unavailable) | None => (None, true),
+                };
+                let head_dropped = zone.output_source.as_ref()
+                    .is_some_and(|source| source.execution.head_dropped);
+                let mut source =
+                    block_mode::BlockSearchSource::new(zone.id, zone.command.clone(), output);
+                source.output_partial = incomplete || head_dropped;
+                source
             }),
             block_mode::BLOCK_SEARCH_SOURCE_MAX_BYTES,
         )
@@ -25123,7 +25140,7 @@ impl Frost {
                 &bookmarked_zone_ids,
                 state.scope,
             );
-            let empty = if state.filter == BlockSearchFilter::Unread && filter_counts[5] == 0 {
+            let mut empty = if state.filter == BlockSearchFilter::Unread && filter_counts[5] == 0 {
                 "No unread blocks. New completions appear here while you read older output; Go live marks them seen.".to_string()
             } else {
                 block_search_empty_message(
@@ -25135,6 +25152,7 @@ impl Frost {
                     state.older_not_indexed,
                 )
             };
+            state.append_output_coverage(&mut empty);
             body = body.push(
                 container(
                     text(empty)
@@ -41641,6 +41659,7 @@ mod tests {
             command_exact: false,
             cwd: None,
             captured_output: None,
+            output_source: None,
             captured_output_evicted: false,
             output_preview: String::new(),
             start_mark_seen: true,

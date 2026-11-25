@@ -1665,6 +1665,7 @@ pub struct BlockSearchSource {
     pub zone_id: u64,
     pub command: Option<String>,
     pub output: Option<String>,
+    pub output_partial: bool,
 }
 
 impl BlockSearchSource {
@@ -1673,6 +1674,7 @@ impl BlockSearchSource {
             zone_id,
             command,
             output,
+            output_partial: false,
         }
     }
 
@@ -1811,6 +1813,7 @@ impl CachedBlockSearchZone {
 pub struct BlockSearchCacheBuild {
     pub zones: Vec<CachedBlockSearchZone>,
     pub older_not_indexed: bool,
+    pub partial_outputs: usize,
     pub resident_bytes: usize,
 }
 
@@ -1829,6 +1832,7 @@ pub fn build_block_search_cache(
         older_not_indexed: snapshot.older_not_indexed,
         resident_bytes: vec_bytes,
         zones,
+        partial_outputs: 0,
     };
     if vec_bytes > max_bytes {
         build.older_not_indexed |= !snapshot.sources.is_empty();
@@ -1836,6 +1840,7 @@ pub fn build_block_search_cache(
     }
 
     for source in snapshot.sources {
+        let output_partial = source.output_partial;
         let zone = CachedBlockSearchZone::from_source(source);
         let bytes = zone.payload_bytes();
         if build.resident_bytes.saturating_add(bytes) > max_bytes {
@@ -1843,6 +1848,7 @@ pub fn build_block_search_cache(
             break;
         }
         build.resident_bytes += bytes;
+        build.partial_outputs += usize::from(output_partial);
         build.zones.push(zone);
     }
     build.zones.reverse();

@@ -1,3 +1,5 @@
+use jterm_core::screen_replay::{CapturedExecutionSource, RunningExecutionSource};
+use jterm_engine::command_blocks::{ShellMarkerClock, ShellMarkerPosition};
 use jterm_engine::grid::{AsciiOverwritePolicy, RegionDirection, WideContinuationProtection};
 use jterm_engine::mode_mutation::{apply_frost_mode, FrostModeEffect, ModeNamespace};
 use jterm_engine::protocol_state::{ProtocolState, TerminalModes};
@@ -2377,6 +2379,7 @@ pub struct CommandZone {
     /// `None` once the [`TerminalState::MAX_CAPTURED_OUTPUT_BYTES`] budget
     /// evicted it, in which case live extraction is the fallback.
     pub captured_output: Option<(String, bool)>,
+    pub output_source: Option<CapturedExecutionSource>,
     /// Display-only bounded preview, cached with this stable finalized zone.
     pub output_preview: String,
     /// A non-blank [`Self::captured_output`] snapshot was actually discarded
@@ -3015,6 +3018,10 @@ pub struct TerminalState {
     /// the last three slots and a completion that supplied them would be
     /// naming a Start this terminal never saw.
     current_command_start_lifecycle: Option<StartLifecycle>,
+    shell_marker_clock: ShellMarkerClock,
+    output_stream: Option<uuid::Uuid>,
+    running_output_source: Option<RunningExecutionSource>,
+    current_output_head_dropped: bool,
     /// Scrollback rows trimmed from the front that [`Self::command_zones`] has
     /// not been rebased for yet. Non-zero only inside one ingest batch or one
     /// trimming call; every path that can observe a zone's rows settles it
@@ -3195,6 +3202,10 @@ impl TerminalState {
             current_command_id: None,
             current_command_start_id: None,
             current_command_start_lifecycle: None,
+            shell_marker_clock: ShellMarkerClock::default(),
+            output_stream: None,
+            running_output_source: None,
+            current_output_head_dropped: false,
             pending_zone_row_trim: 0,
             consumed_execution_ids: VecDeque::new(),
             current_command_started_at: None,
@@ -3874,7 +3885,12 @@ impl TerminalState {
     /// Dispatch a completed OSC payload (`ESC ]` and the BEL/ST terminator
     /// already stripped), shared by the in-buffer parse and the fragmented
     /// `pending_osc` resume path.
-    fn handle_osc_payload(&mut self, payload_bytes: &[u8], terminator: &'static [u8]) {
+    fn handle_osc_payload(
+        &mut self,
+        payload_bytes: &[u8],
+        terminator: &'static [u8],
+        packet_end: Option<u64>,
+    ) {
         self.osc_reply_terminator = terminator;
         if let Ok(payload) = std::str::from_utf8(payload_bytes) {
             let (command, value) = payload.split_once(';').unwrap_or((payload, ""));
@@ -3941,7 +3957,15 @@ impl TerminalState {
                         }
                     }
                 } else if command == "133" {
-                    self.handle_osc_133(value);
+                    let position = match value.split(';').next() {
+                        Some("A" | "B" | "C" | "D") => self.shell_marker_clock.osc(
+                            packet_end,
+                            payload_bytes.len(),
+                            terminator == OSC_BEL,
+                        ),
+                        _ => None,
+                    };
+                    self.handle_osc_133(value, position);
                 } else if command == "52" {
                     self.handle_osc_52(value);
                 } else if command == "5522" {
@@ -3957,7 +3981,7 @@ impl TerminalState {
         }
     }
 
-    fn handle_osc_133(&mut self, value: &str) {
+    fn handle_osc_133(&mut self, value: &str, position: Option<ShellMarkerPosition>) {
         use jterm_core::execution_journal::{
             is_valid_jsh_cwd, is_valid_jsh_execution_id, is_valid_jsh_session_id,
         };
@@ -4163,7 +4187,7 @@ impl TerminalState {
                 if carry_dirty_edit {
                     self.pending_prompt_typeahead = true;
                 }
-                self.finalize_stale_zone(absolute_row);
+                self.finalize_stale_zone(absolute_row, position);
                 self.finalize_idle_background_output();
                 self.record_abandoned_armed_agent_command();
                 // Prompt start. Any leftover execution timestamp belongs to a
@@ -4245,6 +4269,13 @@ impl TerminalState {
                 // Command executed (output begins)
                 if let ZoneState::CommandStarted(prompt_start, cmd_start) = self.current_zone_state
                 {
+                    let size = (
+                        self.screen.grid.row_len() as u16,
+                        self.screen.grid.rows() as u16,
+                    );
+                    self.running_output_source =
+                        position.map(|position| RunningExecutionSource::new(position, size));
+                    self.current_output_head_dropped = false;
                     self.organism_idle_cwd = None;
                     // Anything printed while the prompt was idle stays inline
                     // when a command starts before the next A; Anvil/Forge do
@@ -4463,6 +4494,9 @@ impl TerminalState {
                     absolute_row,
                     self.screen.cursor_col,
                 );
+                let captured_output =
+                    self.capture_zone_output(out_start, output_end, output_start_col);
+                let output_source = self.finish_output_source(position, captured_output.as_ref());
                 let zone = CommandZone {
                     id: 0, // assigned by push_command_zone
                     prompt_start,
@@ -4477,11 +4511,8 @@ impl TerminalState {
                     command_truncated,
                     command_exact: self.current_command_exact,
                     cwd,
-                    captured_output: self.capture_zone_output(
-                        out_start,
-                        output_end,
-                        output_start_col,
-                    ),
+                    captured_output,
+                    output_source,
                     captured_output_evicted: false,
                     output_preview: String::new(),
                     start_mark_seen: true,
@@ -4870,6 +4901,7 @@ impl TerminalState {
                 cwd,
                 captured_output: Some(captured_output),
                 captured_output_evicted: false,
+                output_source: None,
                 output_preview: String::new(),
                 start_mark_seen: false,
                 completion_provenance: crate::block_mode::CompletionProvenance::BoundaryInferred,
@@ -4911,7 +4943,7 @@ impl TerminalState {
     /// provenance-tagged completion event so a locally correlated Agent wait
     /// can terminate cleanly; persistence and notifications explicitly accept
     /// only `ShellReported` events.
-    fn finalize_stale_zone(&mut self, boundary_row: usize) {
+    fn finalize_stale_zone(&mut self, boundary_row: usize, position: Option<ShellMarkerPosition>) {
         let ZoneState::OutputStarted(prompt_start, cmd_start, out_start) = self.current_zone_state
         else {
             return;
@@ -4926,6 +4958,8 @@ impl TerminalState {
             boundary_row,
             self.screen.cursor_col,
         );
+        let captured_output = self.capture_zone_output(out_start, output_end, output_start_col);
+        let output_source = self.finish_output_source(position, captured_output.as_ref());
         let zone = CommandZone {
             id: 0, // assigned by push_command_zone
             prompt_start,
@@ -4940,7 +4974,8 @@ impl TerminalState {
             command_truncated: self.current_command_truncated,
             command_exact: self.current_command_exact,
             cwd,
-            captured_output: self.capture_zone_output(out_start, output_end, output_start_col),
+            captured_output,
+            output_source,
             captured_output_evicted: false,
             output_preview: String::new(),
             start_mark_seen: true,
@@ -4986,6 +5021,25 @@ impl TerminalState {
         self.current_command_text
             .clone()
             .filter(|command| !command.trim().is_empty())
+    }
+
+    fn finish_output_source(
+        &mut self,
+        position: Option<ShellMarkerPosition>,
+        captured_output: Option<&(String, bool)>,
+    ) -> Option<CapturedExecutionSource> {
+        let (start, end) = self.running_output_source.take().zip(position)?;
+        let stream = *self.output_stream.get_or_insert_with(uuid::Uuid::new_v4);
+        let mut execution = start.finish(stream, end)?;
+        execution.head_dropped = self.current_output_head_dropped;
+        execution.tail_dropped = captured_output.is_some_and(|(_, capped)| *capped);
+        Some(CapturedExecutionSource {
+            execution,
+            capture_size: (
+                self.screen.grid.row_len() as u16,
+                self.screen.grid.rows() as u16,
+            ),
+        })
     }
 
     fn wall_clock_ms() -> Option<u64> {
@@ -5179,6 +5233,7 @@ impl TerminalState {
             .map(|row| row.saturating_sub(count));
         if live_output_start_trimmed {
             self.current_output_start_col = Some(0);
+            self.current_output_head_dropped = true;
         }
         if let Some(pending) = self.idle_background_output.as_mut() {
             pending.rows_evicted |= live_prompt_trimmed || pending.start_row < count;
@@ -7026,6 +7081,7 @@ impl TerminalState {
 
     fn process_input_inner(&mut self, input: &[u8]) {
         self.parser.begin_feed();
+        let stream_start = self.shell_marker_clock.begin_feed(input.len());
         let mut at = 0;
         let mut capture_active = false;
         loop {
@@ -7125,6 +7181,7 @@ impl TerminalState {
                         StringKind::Osc => self.handle_osc_payload(
                             &payload,
                             if bel_terminated { OSC_BEL } else { OSC_ST },
+                            stream_start.map(|start| start + at as u64),
                         ),
                         StringKind::Apc
                             if jterm_core::kitty_graphics::is_graphics_payload(&payload) =>
@@ -7424,6 +7481,7 @@ impl TerminalState {
         self.current_command_id = None;
         self.current_command_start_id = None;
         self.current_command_start_lifecycle = None;
+        self.running_output_source = None;
         self.current_command_started_at = None;
         self.last_archived_screen_snapshot.clear();
         self.last_synced_primary_screen_snapshot.clear();
@@ -13011,7 +13069,7 @@ mod tests {
         let oversized = format!("C;cwd={}", "a".repeat(16 * 1024 + 1));
         terminal.process_input(b"\x1b]133;A\x07$ ");
         terminal.process_input(b"\x1b]133;B\x07ls\r\n");
-        terminal.handle_osc_133(&oversized);
+        terminal.handle_osc_133(&oversized, None);
         terminal.process_input(b"\x1b]133;D;0\x07");
         assert_eq!(terminal.command_zones[2].cwd, None);
 
