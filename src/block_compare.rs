@@ -220,6 +220,7 @@ impl Frost {
             ids: ids.clone(),
             title: format!("Compare output · #{} → #{}", ids[0], ids[1]),
             body: "Comparing the two retained output snapshots…".into(),
+            annotations: None,
             commands: None,
             command_error: None,
             bracketed: false,
