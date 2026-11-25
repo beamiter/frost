@@ -17256,12 +17256,21 @@ impl Frost {
     /// Snapshot every retained finalized block in the active pane, then serialize and
     /// durably write it off the UI thread. The snapshot is bounded before the
     /// task starts, and the worker owns it, so later output/session churn cannot
-    /// change the document halfway through an export.
+    /// change the document halfway through an export. The palette exposes
+    /// this read-only action in both Block and Chat.
     fn block_export_session_task(
         &mut self,
         format: block_export::SessionExportFormat,
     ) -> Task<Message> {
-        if !self.ensure_block_action_available("Block session export") {
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        if sess.terminal.is_alt_buffer_active() || !self.active_projection_interaction_allowed() {
+            self.push_toast(
+                "Block session export unavailable while a full-screen program is active"
+                    .to_string(),
+                ToastKind::Info,
+            );
             return Task::none();
         }
         if self.block_export_in_flight {
@@ -17271,9 +17280,6 @@ impl Frost {
             );
             return Task::none();
         }
-        let Some(sess) = self.sessions.get(self.active) else {
-            return Task::none();
-        };
         if sess.terminal.command_zones.is_empty() {
             let message = self.block_absent_toast("retained command blocks to export");
             self.push_toast(message, ToastKind::Info);
