@@ -138,11 +138,13 @@ pub fn prepare_repaired_snapshot(
     }
 }
 
-/// 单个会话快照（frost 仅需要 cwd 来重新 spawn）。
-#[derive(Debug, Clone, Serialize)]
+/// Local spawn directory and the identity of any completed-pane history.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SessionSnapshot {
     #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_history_id: Option<uuid::Uuid>,
 }
 
 /// 分屏布局快照:重启后恢复分屏方向、各 pane 占比与对应的会话。
@@ -271,6 +273,7 @@ enum SnapshotField {
     Tabs,
     ActiveTab,
     Cwd,
+    PaneHistoryId,
     Mode,
     Ratios,
     Panes,
@@ -312,6 +315,7 @@ impl serde::de::Visitor<'_> for SnapshotFieldVisitor {
             "tabs" => SnapshotField::Tabs,
             "active_tab" => SnapshotField::ActiveTab,
             "cwd" => SnapshotField::Cwd,
+            "pane_history_id" => SnapshotField::PaneHistoryId,
             "mode" => SnapshotField::Mode,
             "ratios" => SnapshotField::Ratios,
             "panes" => SnapshotField::Panes,
@@ -427,6 +431,7 @@ impl<'de> serde::de::Visitor<'de> for SessionSeed<'_> {
         use serde::de::Error as _;
 
         let mut cwd: Option<Option<String>> = None;
+        let mut pane_history_id = jterm_core::bounded_json::DeferredRawField::default();
         while let Some(key) = map.next_key::<SnapshotField>()? {
             match key {
                 SnapshotField::Cwd => {
@@ -437,14 +442,26 @@ impl<'de> serde::de::Visitor<'de> for SessionSeed<'_> {
                         budget: self.budget,
                     })?);
                 }
+                SnapshotField::PaneHistoryId => pane_history_id.read(&mut map)?,
                 _ => {
                     map.next_value::<serde::de::IgnoredAny>()?;
                 }
             }
         }
-        Ok(SessionSnapshot {
-            cwd: cwd.unwrap_or(None),
-        })
+        let id = match pane_history_id.optional::<serde_json::Error>("pane_history_id") {
+            Ok(None) => Ok(None),
+            Ok(Some(value)) => serde_json::from_str::<Option<uuid::Uuid>>(value.get()),
+            Err(error) => Err(error),
+        };
+        let pane_history_id = match id {
+            Ok(None) => None,
+            Ok(Some(id)) if !id.is_nil() => Some(id),
+            _ => {
+                self.budget.report.add(RepairKind::InvalidPaneHistory, 1);
+                None
+            }
+        };
+        Ok(SessionSnapshot { cwd: cwd.unwrap_or(None), pane_history_id })
     }
 }
 
@@ -1732,8 +1749,17 @@ impl SessionsSnapshot {
             );
             self.sessions.truncate(MAX_RESTORED_SESSIONS);
         }
+        let mut seen_history_ids = std::collections::HashSet::new();
+        let duplicate_history_ids: std::collections::HashSet<_> = self.sessions.iter()
+            .filter_map(|session| session.pane_history_id)
+            .filter(|&id| !seen_history_ids.insert(id))
+            .collect();
         let mut invalid_cwds = 0usize;
         for session in &mut self.sessions {
+            if session.pane_history_id.is_some_and(|id| id.is_nil() || duplicate_history_ids.contains(&id)) {
+                session.pane_history_id = None;
+                warnings.add(RepairKind::InvalidPaneHistory, 1);
+            }
             if session
                 .cwd
                 .as_ref()
@@ -2102,6 +2128,34 @@ mod tests {
         let (mut snapshot, mut report) = decode_bounded_snapshot(contents).unwrap();
         report.merge(snapshot.sanitize());
         (snapshot, report)
+    }
+
+    #[test]
+    fn pane_history_ids_leave_legacy_layouts_readable_and_refuse_ambiguous_ownership() {
+        let unique = uuid::Uuid::new_v4();
+        let duplicate = uuid::Uuid::new_v4();
+        let contents = serde_json::json!({
+            "version": 2,
+            "sessions": [
+                {"cwd": "/legacy"},
+                {"cwd": "/first", "pane_history_id": duplicate},
+                {"cwd": "/second", "pane_history_id": duplicate},
+                {"cwd": "/third", "pane_history_id": unique},
+                {"cwd": "/fourth", "pane_history_id": "invalid"},
+            ],
+        });
+        let (snapshot, report) = decoded_report(&contents.to_string());
+        assert_eq!(report.count(RepairKind::InvalidPaneHistory), 3);
+        assert_eq!(snapshot.sessions.len(), 5);
+        assert_eq!(snapshot.sessions[0].cwd.as_deref(), Some("/legacy"));
+        assert_eq!(
+            snapshot.sessions.iter().map(|session| session.pane_history_id).collect::<Vec<_>>(),
+            vec![None, None, None, Some(unique), None]
+        );
+        let encoded = snapshot.to_json().unwrap();
+        let (restored, report) = decoded_report(&encoded);
+        assert_eq!(restored.sessions[3].pane_history_id, Some(unique));
+        assert_eq!(report.count(RepairKind::InvalidPaneHistory), 0);
     }
 
     #[test]
@@ -2529,6 +2583,7 @@ mod tests {
         let snapshot = SessionsSnapshot::new(
             vec![SessionSnapshot {
                 cwd: Some("/tmp".to_string()),
+                pane_history_id: None,
             }],
             Some(0),
             Vec::new(),
@@ -2749,9 +2804,9 @@ mod tests {
         // V[ 0, H[2, 1] ] — a genuinely nested tmux-style layout.
         let snap = SessionsSnapshot::new(
             vec![
-                SessionSnapshot { cwd: None },
-                SessionSnapshot { cwd: None },
-                SessionSnapshot { cwd: None },
+                SessionSnapshot::default(),
+                SessionSnapshot::default(),
+                SessionSnapshot::default(),
             ],
             Some(1),
             vec![TabSnapshot {
@@ -2839,6 +2894,7 @@ mod tests {
             sessions: vec![
                 SessionSnapshot {
                     cwd: Some("x".repeat(MAX_RESTORED_CWD_BYTES + 1)),
+                    pane_history_id: None,
                 };
                 MAX_RESTORED_SESSIONS + 10
             ],
@@ -2895,7 +2951,7 @@ mod tests {
         };
         let snapshot = SessionsSnapshot {
             version: 2,
-            sessions: vec![SessionSnapshot { cwd: None }],
+            sessions: vec![SessionSnapshot::default()],
             active_index: Some(0),
             split: None,
             tree: None,
@@ -2961,12 +3017,15 @@ mod tests {
             sessions: vec![
                 SessionSnapshot {
                     cwd: Some("/tmp/\u{202e}hidden".to_string()),
+                    pane_history_id: None,
                 },
                 SessionSnapshot {
                     cwd: Some("/tmp/\u{200b}zwsp".to_string()),
+                    pane_history_id: None,
                 },
                 SessionSnapshot {
                     cwd: Some("/tmp/safe".to_string()),
+                    pane_history_id: None,
                 },
             ],
             active_index: Some(0),
@@ -3006,7 +3065,7 @@ mod tests {
         };
         let snapshot = SessionsSnapshot {
             version: 2,
-            sessions: vec![SessionSnapshot { cwd: None }],
+            sessions: vec![SessionSnapshot::default()],
             active_index: Some(0),
             split: None,
             tree: None,
@@ -3365,6 +3424,7 @@ mod tests {
             (0..4)
                 .map(|index| SessionSnapshot {
                     cwd: Some(format!("/session-{index}")),
+                    pane_history_id: None,
                 })
                 .collect(),
             Some(2),
@@ -3419,7 +3479,7 @@ mod tests {
     #[test]
     fn missing_restored_active_tab_follows_the_session_including_orphans() {
         let mut snapshot = SessionsSnapshot::new(
-            (0..3).map(|_| SessionSnapshot { cwd: None }).collect(),
+            (0..3).map(|_| SessionSnapshot::default()).collect(),
             Some(2),
             vec![tab(leaf(0), Some(0))],
             Some(0),
@@ -3431,7 +3491,7 @@ mod tests {
         assert!(snapshot.tree.is_none());
 
         let mut snapshot = SessionsSnapshot::new(
-            (0..3).map(|_| SessionSnapshot { cwd: None }).collect(),
+            (0..3).map(|_| SessionSnapshot::default()).collect(),
             Some(2),
             vec![tab(leaf(0), Some(0)), tab(leaf(2), Some(2))],
             None,
@@ -3444,7 +3504,7 @@ mod tests {
     #[test]
     fn all_failed_restores_clear_every_saved_reference() {
         let mut snapshot = SessionsSnapshot::new(
-            vec![SessionSnapshot { cwd: None }],
+            vec![SessionSnapshot::default()],
             Some(0),
             vec![tab(leaf(0), Some(0))],
             Some(0),
@@ -3467,9 +3527,10 @@ mod tests {
     #[test]
     fn prune_sessions_is_identity_when_everything_is_kept() {
         let sessions = vec![
-            SessionSnapshot { cwd: None },
+            SessionSnapshot::default(),
             SessionSnapshot {
                 cwd: Some("/tmp".to_string()),
+                pane_history_id: None,
             },
         ];
         let tabs = vec![
@@ -3501,10 +3562,11 @@ mod tests {
     fn prune_sessions_remaps_leaves_focus_and_active_indices() {
         // 会话 1 是任务终端，被剔除；会话 2 顺移为 1。
         let sessions = vec![
-            SessionSnapshot { cwd: None },
-            SessionSnapshot { cwd: None },
+            SessionSnapshot::default(),
+            SessionSnapshot::default(),
             SessionSnapshot {
                 cwd: Some("/work".to_string()),
+                pane_history_id: None,
             },
         ];
         let tabs = vec![
@@ -3534,7 +3596,7 @@ mod tests {
 
     #[test]
     fn prune_sessions_drops_tabs_left_without_panes_and_repairs_focus() {
-        let sessions = vec![SessionSnapshot { cwd: None }, SessionSnapshot { cwd: None }];
+        let sessions = vec![SessionSnapshot::default(), SessionSnapshot::default()];
         // 标签页 0 只含被剔除的会话 0，整体移除；标签页 1 的焦点恰好指向
         // 被剔除的会话，回退到幸存树的第一个叶子。
         let tabs = vec![
@@ -3560,7 +3622,7 @@ mod tests {
 
     #[test]
     fn prune_sessions_handles_every_session_excluded() {
-        let sessions = vec![SessionSnapshot { cwd: None }];
+        let sessions = vec![SessionSnapshot::default()];
         let tabs = vec![tab(leaf(0), Some(0))];
         let pruned = prune_sessions(sessions, tabs, Some(0), Some(0), &[false]);
         assert!(pruned.sessions.is_empty());
@@ -3571,7 +3633,7 @@ mod tests {
 
     #[test]
     fn prune_sessions_fails_closed_on_a_short_keep_list() {
-        let sessions = vec![SessionSnapshot { cwd: None }, SessionSnapshot { cwd: None }];
+        let sessions = vec![SessionSnapshot::default(), SessionSnapshot::default()];
         let tabs = vec![tab(leaf(0), Some(0)), tab(leaf(1), Some(1))];
         // keep 只覆盖第一个会话：其余一律剔除，绝不误留。
         let pruned = prune_sessions(sessions, tabs, Some(1), Some(1), &[true]);

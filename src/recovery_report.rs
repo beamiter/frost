@@ -18,9 +18,10 @@ pub enum RepairKind {
     LayoutPanes,
     LayoutAdjusted,
     ReferencesAdjusted,
+    InvalidPaneHistory,
 }
 
-const KINDS: [RepairKind; 15] = [
+const KINDS: [RepairKind; 16] = [
     RepairKind::ExtraSessions,
     RepairKind::ExtraTabs,
     RepairKind::InvalidCwd,
@@ -36,6 +37,7 @@ const KINDS: [RepairKind; 15] = [
     RepairKind::LayoutPanes,
     RepairKind::LayoutAdjusted,
     RepairKind::ReferencesAdjusted,
+    RepairKind::InvalidPaneHistory,
 ];
 
 impl RepairKind {
@@ -56,6 +58,7 @@ impl RepairKind {
             Self::LayoutPanes => "layouts discarded at the pane limit",
             Self::LayoutAdjusted => "layout ratios or focus were adjusted",
             Self::ReferencesAdjusted => "invalid or duplicate pane references were adjusted",
+            Self::InvalidPaneHistory => "invalid or duplicate completed-pane history identities removed",
         }
     }
 }

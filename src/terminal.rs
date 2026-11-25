@@ -12,6 +12,7 @@ mod visible_rows;
 pub use visible_rows::RowView;
 use visible_rows::VisibleRows;
 mod chat_projection;
+mod completed_history;
 mod projection_budget;
 pub use projection_budget::ProjectionUnavailable;
 #[cfg(test)]
@@ -2380,6 +2381,7 @@ pub struct CommandZone {
     /// evicted it, in which case live extraction is the fallback.
     pub captured_output: Option<(String, bool)>,
     pub output_source: Option<CapturedExecutionSource>,
+    pub(crate) source_shell_id: Option<String>,
     /// Display-only bounded preview, cached with this stable finalized zone.
     pub output_preview: String,
     /// A non-blank [`Self::captured_output`] snapshot was actually discarded
@@ -2950,6 +2952,7 @@ pub struct TerminalState {
     finished_output_provenance: HashMap<u64, FinishedOutputProvenance>,
     /// Next [`CommandZone::id`]; monotonic for the life of the terminal.
     next_zone_id: u64,
+    completed_history_revision: u64,
     current_zone_state: ZoneState,
     /// Bounded evidence that OSC 133 A really began at column zero.
     spacing_prompt_rows: VecDeque<RawRowId>,
@@ -3199,6 +3202,7 @@ impl TerminalState {
             command_zones: VecDeque::new(),
             finished_output_provenance: HashMap::new(),
             next_zone_id: 0,
+            completed_history_revision: 0,
             current_zone_state: ZoneState::default(),
             spacing_prompt_rows: VecDeque::new(),
             watch_generation: Some(0),
@@ -4542,6 +4546,7 @@ impl TerminalState {
                     cwd,
                     captured_output,
                     output_source,
+                    source_shell_id: finished_id.clone(),
                     captured_output_evicted: false,
                     output_preview: String::new(),
                     start_mark_seen: true,
@@ -4654,9 +4659,11 @@ impl TerminalState {
                 .as_ref()
                 .map_or(0, |(text, _)| text.len()),
         );
+        let mut archive_changed = zone.output_source.is_some();
         self.command_zones.push_back(zone);
         if self.command_zones.len() > MAX_COMMAND_ZONES {
             if let Some(evicted) = self.command_zones.pop_front() {
+                archive_changed |= evicted.output_source.is_some();
                 self.finished_output_provenance.remove(&evicted.id);
                 self.captured_output_bytes = self.captured_output_bytes.saturating_sub(
                     evicted
@@ -4667,6 +4674,9 @@ impl TerminalState {
             }
         }
         self.enforce_captured_output_budget(Self::MAX_CAPTURED_OUTPUT_BYTES);
+        if archive_changed {
+            self.mark_completed_history_changed();
+        }
     }
 
     /// Drop the OLDEST zones' snapshots (never the entries themselves) until
@@ -4931,6 +4941,7 @@ impl TerminalState {
                 captured_output: Some(captured_output),
                 captured_output_evicted: false,
                 output_source: None,
+                source_shell_id: None,
                 output_preview: String::new(),
                 start_mark_seen: false,
                 completion_provenance: crate::block_mode::CompletionProvenance::BoundaryInferred,
@@ -5005,6 +5016,7 @@ impl TerminalState {
             cwd,
             captured_output,
             output_source,
+            source_shell_id: self.current_command_id.clone(),
             captured_output_evicted: false,
             output_preview: String::new(),
             start_mark_seen: true,
@@ -5558,6 +5570,7 @@ impl TerminalState {
         self.scroll_offset = 0;
         self.last_archived_screen_snapshot.clear();
         self.last_synced_primary_screen_snapshot.clear();
+        self.mark_completed_history_changed();
         cleared
     }
 
@@ -5626,6 +5639,7 @@ impl TerminalState {
         self.bump_history_revision();
         self.grid_version = self.grid_version.wrapping_add(1);
         self.visible_cells_cache = None;
+        self.mark_completed_history_changed();
         restored
     }
 
@@ -7479,6 +7493,9 @@ impl TerminalState {
         self.pending_saved_line_purge = 0;
         self.projected_saved_lines_held = false;
         self.provisional_alt_snapshot = None;
+        if self.command_zones.iter().any(|zone| zone.output_source.is_some()) {
+            self.mark_completed_history_changed();
+        }
         self.command_zones.clear();
         self.pending_zone_row_trim = 0;
         self.finished_output_provenance.clear();

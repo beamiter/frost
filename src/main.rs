@@ -21,6 +21,7 @@ mod ai_command;
 mod ansi;
 mod block_compare;
 mod block_export;
+mod completed_history;
 mod block_mode;
 mod block_review;
 mod block_search_layout;
@@ -5407,6 +5408,8 @@ impl ResizeRepaint {
 /// A single terminal session: its own PTY child and terminal state.
 struct Session {
     id: usize,
+    pane_history_id: uuid::Uuid,
+    pane_history_writes_blocked: bool,
     ime_identity: Arc<()>,
     terminal: TerminalState,
     pty: SessionActor<Pty>,
@@ -5927,6 +5930,8 @@ impl Session {
         let cursor_visible = terminal.is_cursor_visible();
         Ok(Session {
             id,
+            pane_history_id: uuid::Uuid::new_v4(),
+            pane_history_writes_blocked: false,
             ime_identity: Arc::new(()),
             terminal,
             pty,
@@ -7382,6 +7387,7 @@ struct Frost {
     kitty_handles: std::collections::HashMap<KittyHandleKey, (iced::advanced::image::Handle, u64)>,
     /// Last persisted session-snapshot JSON, to skip redundant disk writes.
     last_session_save: Option<String>,
+    pane_history: completed_history::PaneHistory,
     /// Set when session state that feeds the snapshot may have changed (PTY
     /// output can move the cwd, tab switches move the active index). The periodic
     /// save is skipped while this is false, so a fully idle app does no per-tab
@@ -7599,7 +7605,7 @@ struct Frost {
     /// (no session restore, no snapshot writes) to avoid clobbering its history.
     /// The guard also publishes its descriptor so freshly forked PTY children
     /// close their inherited copies immediately.
-    _instance_lock: Option<session_persistence::InstanceLock>,
+    _instance_lock: Option<Arc<session_persistence::InstanceLock>>,
     is_first_instance: bool,
 }
 
@@ -7631,7 +7637,7 @@ impl Frost {
 
         // Single-instance lock: a second instance starts fresh and never writes
         // the session snapshot, so it cannot clobber the first instance's history.
-        let instance_lock = session_persistence::try_acquire_instance_lock();
+        let instance_lock = session_persistence::try_acquire_instance_lock().map(Arc::new);
         let is_first_instance = instance_lock.is_some();
         if !is_first_instance {
             eprintln!("[SessionPersistence] Another instance is running, starting fresh");
@@ -7756,6 +7762,7 @@ impl Frost {
             links_cache_key: None,
             kitty_handles: std::collections::HashMap::new(),
             last_session_save: None,
+            pane_history: completed_history::PaneHistory::default(),
             session_dirty: true,
             session_writes_blocked,
             last_ingest_us: 0,
@@ -10283,7 +10290,8 @@ impl Frost {
             .enumerate()
         {
             match Session::spawn(config, next_id, cols, rows, snap.cwd.as_deref()) {
-                Ok(session) => {
+                Ok(mut session) => {
+                    completed_history::restore(&path, &mut session, snap.pane_history_id);
                     sessions.push(session);
                     restored[snapshot_index] = true;
                     next_id += 1;
@@ -10299,7 +10307,8 @@ impl Frost {
                         "[SessionPersistence] Cannot restore cwd {cwd:?}: {error}; using default cwd"
                     );
                     match Session::spawn(config, next_id, cols, rows, None) {
-                        Ok(session) => {
+                        Ok(mut session) => {
+                            completed_history::restore(&path, &mut session, snap.pane_history_id);
                             restore_warnings.push(format!(
                                 "Restored missing cwd {cwd:?} in the default folder"
                             ));
@@ -10364,7 +10373,10 @@ impl Frost {
         let snaps: Vec<session_persistence::SessionSnapshot> = self
             .sessions
             .iter()
-            .map(|s| session_persistence::SessionSnapshot { cwd: s.cwd() })
+            .map(|s| session_persistence::SessionSnapshot {
+                cwd: s.cwd(),
+                pane_history_id: (!s.command_owned).then_some(s.pane_history_id),
+            })
             .collect();
         // Task-bound terminals (Agent CLI fallback, validation runs) and any
         // held-open exited transcript stay out of the snapshot: their task
@@ -10425,6 +10437,7 @@ impl Frost {
         };
         match snapshot.save(&path) {
             Ok(()) => {
+                self.pane_history.bind_layout(&path, &snapshot);
                 self.last_session_save = Some(json);
                 self.session_dirty = false;
             }
@@ -10934,6 +10947,13 @@ impl Frost {
         self.ai_chats.persist(self.config.ai_redact_secrets);
         close_diagnostics::record(false, || "flush_session".into());
         self.save_session_snapshot();
+        if self.config.restore_session && !self.session_writes_blocked
+            && jterm_core::execution_journal::output_capture_enabled()
+        {
+            if let Some(owner) = self._instance_lock.as_ref() {
+                self.pane_history.flush(&self.sessions, owner, EXIT_FLUSH_TIMEOUT);
+            }
+        }
         close_diagnostics::record(false, || "flush_journal".into());
         if !jterm_core::execution_journal::flush(EXIT_FLUSH_TIMEOUT) {
             log::warn!("jsh execution journal did not flush before exit");
@@ -22622,6 +22642,13 @@ impl Frost {
                 // feeds the snapshot may have changed since the last save.
                 if self.session_dirty {
                     self.save_session_snapshot();
+                }
+                if self.config.restore_session && !self.session_writes_blocked
+                    && jterm_core::execution_journal::output_capture_enabled()
+                {
+                    if let Some(owner) = self._instance_lock.as_ref() {
+                        self.pane_history.tick(&self.sessions, owner);
+                    }
                 }
                 // Refresh cwd + foreground-process caches for every session so
                 // tab labels reflect both. These are cheap /proc reads at 1.5s
@@ -41666,6 +41693,7 @@ mod tests {
             cwd: None,
             captured_output: None,
             output_source: None,
+            source_shell_id: None,
             captured_output_evicted: false,
             output_preview: String::new(),
             start_mark_seen: true,
@@ -48878,7 +48906,7 @@ mod layout_reference_recovery_tests {
 
     fn snapshot(tabs: Vec<TabSnapshot>) -> SessionsSnapshot {
         SessionsSnapshot::new(
-            vec![SessionSnapshot { cwd: None }; 3],
+            vec![SessionSnapshot::default(); 3],
             Some(2),
             tabs,
             Some(0),
