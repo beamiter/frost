@@ -14,7 +14,7 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 # The engine and core declare the same immutable release source.
-jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "7e7a4fb1c31b89f64deab582d0e1f045706afc9c" }
+jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "53974b89f87086c3f0d7429c4de67d33e2fe6bcd" }
 companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 iced = { version = "0.14", features = ["canvas", "tokio", "advanced", "image", "wgpu"] }
 # Direct handle on the shaper iced embeds (same locked version), used to
@@ -24,7 +24,7 @@ cosmic-text = "=0.19.0"
 # Exact native boundary paired with the pinned local Iced shell patch.
 iced_winit = { version = "=0.14.0", default-features = false }
 libc = "0.2"
-jterm_core = { version = "0.2.0", features = ["terminal-session-actor"], git = "https://github.com/beamiter/jterm_core.git", rev = "7e7a4fb1c31b89f64deab582d0e1f045706afc9c" }
+jterm_core = { version = "0.2.0", features = ["terminal-session-actor"], git = "https://github.com/beamiter/jterm_core.git", rev = "53974b89f87086c3f0d7429c4de67d33e2fe6bcd" }
 tokio = { version = "1", features = ["rt", "sync"] }
 anyhow = "1.0"
 log = "0.4"
@@ -87,7 +87,7 @@ wayland-client = { path = "vendor/wayland-client" }
 zstd = "=0.14.3"
 sha2 = "=0.10.9"
 iced_tiny_skia = { version = "=0.14.1", features = ["geometry"] }
-jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "7e7a4fb1c31b89f64deab582d0e1f045706afc9c" }
+jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "53974b89f87086c3f0d7429c4de67d33e2fe6bcd" }
 
 [patch."https://github.com/beamiter/jcompanion.git"]
 companion-protocol = { path = "vendor/companion-protocol" }
