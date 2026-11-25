@@ -2337,7 +2337,7 @@ pub struct ClipboardReadRequest {
     pub kind: ClipboardReadKind,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CommandZone {
     /// Stable per-terminal identity. Zone *indices* shift whenever scrollback
     /// trimming drops old zones, so anything that remembers a zone across
@@ -2400,6 +2400,35 @@ pub struct CommandZone {
     /// `Option` rows are `None`. Row consumers (stripes, gutter, markers,
     /// prompt jumps, reveal) must skip such zones.
     pub rows_evicted: bool,
+}
+
+// Keep the original semantic trace stable. Source records have separate
+// tests for byte positions and identities across read boundaries.
+impl std::fmt::Debug for CommandZone {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommandZone")
+            .field("id", &self.id)
+            .field("prompt_start", &self.prompt_start)
+            .field("command_start", &self.command_start)
+            .field("output_start", &self.output_start)
+            .field("output_start_col", &self.output_start_col)
+            .field("output_end", &self.output_end)
+            .field("exit_code", &self.exit_code)
+            .field("command", &self.command)
+            .field("duration_ms", &self.duration_ms)
+            .field("finished_at_ms", &self.finished_at_ms)
+            .field("command_truncated", &self.command_truncated)
+            .field("command_exact", &self.command_exact)
+            .field("cwd", &self.cwd)
+            .field("captured_output", &self.captured_output)
+            .field("output_preview", &self.output_preview)
+            .field("captured_output_evicted", &self.captured_output_evicted)
+            .field("start_mark_seen", &self.start_mark_seen)
+            .field("completion_provenance", &self.completion_provenance)
+            .field("rows_evicted", &self.rows_evicted)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
