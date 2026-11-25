@@ -7,6 +7,7 @@
 use crate::block_mode;
 use crate::persistence;
 use crate::terminal::{TerminalState, ZoneOutputExport};
+use jterm_core::completed_history::OutputAnnotations;
 use jterm_core::screen_replay::CapturedExecutionSource;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -57,6 +58,8 @@ pub struct SessionExportBlock {
     pub output_unavailable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_source: Option<CapturedExecutionSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_annotations: Option<OutputAnnotations>,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
@@ -259,8 +262,12 @@ fn snapshot_zone(
             ));
         }
     };
+    let output_annotations = zone.captured_output.as_ref()
+        .filter(|(captured, _)| captured == &output)
+        .and_then(|_| OutputAnnotations::new(&output, zone.captured_annotations.as_deref()?));
     let record_bytes = output
         .len()
+        .saturating_add(output_annotations.as_ref().map_or(0, OutputAnnotations::retained_bytes))
         .saturating_add(zone.command.as_ref().map_or(0, String::len))
         .saturating_add(zone.cwd.as_ref().map_or(0, String::len))
         .saturating_add(128);
@@ -279,6 +286,7 @@ fn snapshot_zone(
             .is_some_and(|source| source.execution.head_dropped),
         output_unavailable,
         output_source: zone.output_source.clone(),
+        output_annotations,
         exit_code: zone.exit_code,
         duration_ms: zone.duration_ms,
         finished_at_ms: zone.finished_at_ms,
@@ -636,6 +644,7 @@ mod tests {
             output_truncated: false,
             output_unavailable: false,
             output_source: None,
+            output_annotations: None,
             exit_code: Some(0),
             duration_ms: Some(1250),
             finished_at_ms: Some(0),

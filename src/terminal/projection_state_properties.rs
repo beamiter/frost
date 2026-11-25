@@ -30,6 +30,7 @@ fn seeded_terminal_resize_collapse_and_mode_entry_points() {
                 command_exact: false,
                 cwd: None,
                 captured_output: None,
+                captured_annotations: None,
                 output_source: None,
                 source_shell_id: None,
                 output_preview: String::new(),

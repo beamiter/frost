@@ -1,4 +1,8 @@
 //! Bounded, pane-local reading history. IDs are terminal identities, never indices.
+use jterm_engine::archived_text::ArchiveAnnotations;
+
+const PREVIEW_CLIPPED: &str = "\n[Preview clipped; copy/export retains the available capture]";
+
 #[derive(Debug, Default)]
 pub struct ReadingHistory {
     visits: Vec<u64>,
@@ -73,9 +77,79 @@ pub fn preview(value: &str, limit: usize) -> String {
         }
     }
     if clipped {
-        text.push_str("\n[Preview clipped; copy/export retains the available capture]");
+        text.push_str(PREVIEW_CLIPPED);
     }
     text
+}
+
+pub fn preview_annotations(
+    value: &str,
+    preview: &str,
+    annotations: &ArchiveAnnotations,
+) -> Option<ArchiveAnnotations> {
+    let prefix = if value.starts_with(preview) {
+        preview
+    } else {
+        let prefix = preview.strip_suffix(PREVIEW_CLIPPED)?;
+        value.starts_with(prefix).then_some(prefix)?
+    };
+    let mut projected = annotations.clone();
+    projected.retain_head_tail(prefix.len(), 0..0, 0);
+    (!projected.is_empty() && projected.valid_for(preview)).then_some(projected)
+}
+
+pub fn styled_spans<'a>(
+    text: &'a str,
+    annotations: &ArchiveAnnotations,
+    theme: &crate::theme::Theme,
+) -> Vec<iced::widget::text::Span<'a>> {
+    use crate::color::{resolve_bg_with_palette, resolve_fg_with_palette};
+    use iced::{
+        font::{Style, Weight},
+        widget::text::Span,
+        Font,
+    };
+    use jterm_engine::{Color, UnderlineStyle};
+
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    for span in &annotations.spans {
+        spans.push(Span::new(&text[offset..span.bytes.start]));
+        let style = span.style;
+        let flags = style.flags;
+        let mut foreground =
+            resolve_fg_with_palette(style.foreground, theme, None, flags.bold(), flags.dim());
+        let mut background = resolve_bg_with_palette(style.background, theme, None);
+        if flags.inverse() {
+            std::mem::swap(&mut foreground, &mut background);
+        }
+        let font = Font {
+            weight: if flags.bold() {
+                Weight::Bold
+            } else {
+                Weight::Normal
+            },
+            style: if flags.italic() {
+                Style::Italic
+            } else {
+                Style::Normal
+            },
+            ..Font::MONOSPACE
+        };
+        spans.push(
+            Span::new(&text[span.bytes.clone()])
+                .font(font)
+                .color(foreground)
+                .background_maybe(
+                    (flags.inverse() || style.background != Color::Default).then_some(background),
+                )
+                .underline(flags.underline() != UnderlineStyle::None)
+                .strikethrough(flags.strikethrough()),
+        );
+        offset = span.bytes.end;
+    }
+    spans.push(Span::new(&text[offset..]));
+    spans
 }
 
 #[cfg(test)]

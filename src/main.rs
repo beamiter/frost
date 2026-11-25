@@ -2844,6 +2844,7 @@ struct BlockReview {
     ids: Vec<u64>,
     title: String,
     body: String,
+    annotations: Option<jterm_engine::archived_text::ArchiveAnnotations>,
     commands: Option<String>,
     command_error: Option<String>,
     bracketed: bool,
@@ -25585,6 +25586,7 @@ impl Frost {
         } else {
             status
         };
+        let mut annotated = None;
         let body = format!(
             "Command\n{}\n\nWorking directory\n{}\n\nResult\n{}\nDuration: {}\nFinished (Unix ms): {}\n\nProvenance\n{}\nCommand: {}{}\nRows: {}\nOutput source: {}\n\nOutput (text preview; images remain in the terminal)\n{}",
             block_review::preview(
@@ -25629,30 +25631,45 @@ impl Frost {
                 "Live retained rows / no text capture"
             },
             match terminal.zone_output_export_capped(id) {
-                Some(terminal::ZoneOutputExport::Available { text, truncated }) => format!(
-                    "Capture: {}\nPreview: {}\n\n{}",
-                    if truncated {
-                        "TRUNCATED by terminal budget"
-                    } else {
-                        "Available retained text"
-                    },
-                    if text.len() > 65536 {
-                        "Clipped to 64 KiB; copy/export retains the available capture"
-                    } else {
-                        "Retained text shown below"
-                    },
-                    block_review::preview(&text, 65536)
-                ),
+                Some(terminal::ZoneOutputExport::Available { text, truncated }) => {
+                    let preview = block_review::preview(&text, 65536);
+                    annotated = zone.captured_output.as_ref()
+                        .filter(|(captured, _)| captured == &text)
+                        .and_then(|_| block_review::preview_annotations(
+                            &text, &preview, zone.captured_annotations.as_deref()?,
+                        ))
+                        .map(|attributes| (preview.len(), attributes));
+                    format!(
+                        "Capture: {}\nPreview: {}\n\n{preview}",
+                        if truncated { "TRUNCATED by terminal budget" } else { "Available retained text" },
+                        if text.len() > 65536 {
+                            "Clipped to 64 KiB; copy/export retains the available capture"
+                        } else {
+                            "Retained text shown below"
+                        },
+                    )
+                }
                 Some(terminal::ZoneOutputExport::Unavailable) =>
                     "Unavailable: captured output was evicted".into(),
                 _ => "No non-blank text output captured".into(),
             }
         );
+        let annotations = annotated.map(|(preview_len, mut attributes)| {
+            let offset = body.len() - preview_len;
+            for bytes in attributes.spans.iter_mut().map(|span| &mut span.bytes)
+                .chain(attributes.links.iter_mut().map(|link| &mut link.bytes))
+            {
+                bytes.start += offset;
+                bytes.end += offset;
+            }
+            attributes
+        });
         Some(BlockReview {
             session_id,
             ids: vec![id],
             title: format!("Block #{id} · details"),
             body,
+            annotations,
             commands: None,
             command_error: None,
             bracketed: false,
@@ -25799,6 +25816,7 @@ impl Frost {
             ids,
             title: "Review selected commands".into(),
             body,
+            annotations: None,
             commands: commands.map(|commands| commands.text),
             command_error,
             bracketed,
@@ -25985,11 +26003,21 @@ impl Frost {
         let status = text(status)
             .size(self.effective_font_size())
             .wrapping(text::Wrapping::Word);
-        let preview = text(&review.body)
-            .size(self.effective_font_size())
-            .font(iced::Font::MONOSPACE)
-            .wrapping(text::Wrapping::Word)
-            .width(Length::Fill);
+        let preview: Element<'_, Message> = if let Some(annotations) = &review.annotations {
+            iced::widget::rich_text(block_review::styled_spans(&review.body, annotations, &self.theme))
+                .size(self.effective_font_size())
+                .font(iced::Font::MONOSPACE)
+                .wrapping(text::Wrapping::Word)
+                .width(Length::Fill)
+                .into()
+        } else {
+            text(&review.body)
+                .size(self.effective_font_size())
+                .font(iced::Font::MONOSPACE)
+                .wrapping(text::Wrapping::Word)
+                .width(Length::Fill)
+                .into()
+        };
         // A short/narrow window cannot reserve a wrapped heading, status and
         // actions as well as a useful preview. Let the heading scroll in that
         // case; the action row still owns its measured height outside the
@@ -39396,6 +39424,7 @@ mod tests {
             ids: vec![1, 2],
             title: String::new(),
             body: String::new(),
+            annotations: None,
             commands: Some("echo one\necho two".into()),
             command_error: None,
             bracketed: true,
@@ -39478,6 +39507,7 @@ mod tests {
             ids: vec![4, 9],
             title: String::new(),
             body: String::new(),
+            annotations: None,
             commands: Some("echo one\necho two".into()),
             command_error: None,
             bracketed: true,
@@ -41692,6 +41722,7 @@ mod tests {
             command_exact: false,
             cwd: None,
             captured_output: None,
+            captured_annotations: None,
             output_source: None,
             source_shell_id: None,
             captured_output_evicted: false,

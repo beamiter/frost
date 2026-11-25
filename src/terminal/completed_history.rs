@@ -1,4 +1,4 @@
-use super::{CommandZone, TerminalState, MAX_COMMAND_ZONES};
+use super::{Arc, CommandZone, TerminalState, MAX_COMMAND_ZONES};
 use jterm_core::completed_history::{Card, Checkpoint, Output, MAX_RETAINED_TEXT_BYTES};
 use std::io;
 
@@ -51,28 +51,24 @@ impl TerminalState {
                 source,
                 output: None,
             };
-            let Some(text_budget) = remaining.checked_sub(card.retained_text_bytes()) else {
+            let Some(payload_budget) = remaining.checked_sub(card.retained_bytes()) else {
                 break;
             };
-            remaining = text_budget;
-            if let Some((text, truncated)) = zone.captured_output.as_ref() {
-                if text.len() <= remaining {
-                    remaining -= text.len();
-                    card.output = Some(Output {
-                        text: text.clone(),
-                        truncated: *truncated,
-                        // Frost's original capture exposes the retained text
-                        // length and an explicit cap flag, not a measured total.
-                        total_bytes: text.len() as u64,
-                    });
-                }
+            card.output = if let Some((text, truncated)) = zone.captured_output.as_ref() {
+                // Frost exposes the retained length and a cap flag.
+                Output::capture(
+                    text,
+                    *truncated,
+                    text.len() as u64,
+                    zone.captured_annotations.as_deref(),
+                    payload_budget,
+                )
             } else if !zone.captured_output_evicted && !card.source.execution.head_dropped {
-                card.output = Some(Output {
-                    text: String::new(),
-                    truncated: false,
-                    total_bytes: 0,
-                });
-            }
+                Output::capture("", false, 0, None, payload_budget)
+            } else {
+                None
+            };
+            remaining = payload_budget - card.output.as_ref().map_or(0, Output::retained_bytes);
             cards.push(card);
         }
         cards.reverse();
@@ -93,19 +89,23 @@ impl TerminalState {
         self.next_zone_id = next_sequence - 1;
         for card in cards {
             let captured_output_evicted = card.output.is_none();
-            let captured_output = card
+            let (captured_output, captured_annotations) = card
                 .output
                 .filter(|output| !output.text.is_empty())
-                .map(|output| (output.text, output.truncated));
-            self.captured_output_bytes +=
-                captured_output.as_ref().map_or(0, |(text, _)| text.len());
+                .map_or((None, None), |output| {
+                    let attributes = output
+                        .annotations
+                        .and_then(|annotations| annotations.restore(&output.text))
+                        .map(Arc::new);
+                    (Some((output.text, output.truncated)), attributes)
+                });
             let output_preview = captured_output
                 .as_ref()
                 .filter(|(_, capped)| !capped)
                 .map_or_else(String::new, |(text, _)| {
                     crate::fold_preview::from_plain(text)
                 });
-            self.command_zones.push_back(CommandZone {
+            let zone = CommandZone {
                 id: card.sequence - 1,
                 prompt_start: 0,
                 command_start: None,
@@ -120,6 +120,7 @@ impl TerminalState {
                 command_exact: card.command_exact,
                 cwd: card.cwd,
                 captured_output,
+                captured_annotations,
                 output_source: Some(card.source),
                 source_shell_id: Some(card.shell_id),
                 output_preview,
@@ -127,7 +128,9 @@ impl TerminalState {
                 start_mark_seen: card.start_mark_seen,
                 completion_provenance: card.completion.into(),
                 rows_evicted: true,
-            });
+            };
+            self.captured_output_bytes += zone.captured_bytes();
+            self.command_zones.push_back(zone);
         }
         // Cached pane projection predates restored metadata, even though no
         // live terminal rows have changed or were supplied by the checkpoint.
@@ -142,7 +145,7 @@ mod tests {
 
     #[test]
     fn restored_card_keeps_its_source_without_reattaching_old_rows() {
-        const EXECUTION: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07source proof\r\n\x1b]133;C;id=proof;cmdline_url=source%20proof\x07visible\r\n\x1b]133;D;0;id=proof\x07";
+        const EXECUTION: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07source proof\r\n\x1b]133;C;id=proof;cmdline_url=source%20proof\x07\x1b[1;38;2;31;171;193mvisible\x1b[0m\r\n\x1b]133;D;0;id=proof\x07";
         let mut source = TerminalState::new(80, 24);
         source.process_input(EXECUTION);
         let old_id = source.command_zones[0].id;
@@ -156,6 +159,15 @@ mod tests {
         assert!(restored.command_zones[0].rows_evicted);
         assert_eq!(restored.command_zones[0].id, old_id);
         assert_eq!(restored.command_zones[0].output_source, old_source);
+        let zone = &restored.command_zones[0];
+        let annotations = zone.captured_annotations.as_ref().unwrap();
+        let output = &zone.captured_output.as_ref().unwrap().0;
+        assert_eq!(&output[annotations.spans[0].bytes.clone()], "visible");
+        assert_eq!(
+            annotations.spans[0].style.foreground,
+            super::super::Color::Rgb(31, 171, 193)
+        );
+        assert!(annotations.spans[0].style.flags.bold());
         assert_eq!(
             restored.zone_output_text(old_id).unwrap().trim_end(),
             "visible"

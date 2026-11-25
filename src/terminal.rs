@@ -1,4 +1,5 @@
 use jterm_core::screen_replay::{CapturedExecutionSource, RunningExecutionSource};
+use jterm_engine::archived_text::{ArchiveAnnotationBuilder, ArchiveAnnotations, ArchiveStyle};
 use jterm_engine::command_blocks::{ShellMarkerClock, ShellMarkerPosition};
 use jterm_engine::grid::{AsciiOverwritePolicy, RegionDirection, WideContinuationProtection};
 use jterm_engine::mode_mutation::{apply_frost_mode, FrostModeEffect, ModeNamespace};
@@ -2380,6 +2381,7 @@ pub struct CommandZone {
     /// `None` once the [`TerminalState::MAX_CAPTURED_OUTPUT_BYTES`] budget
     /// evicted it, in which case live extraction is the fallback.
     pub captured_output: Option<(String, bool)>,
+    pub captured_annotations: Option<Arc<ArchiveAnnotations>>,
     pub output_source: Option<CapturedExecutionSource>,
     pub(crate) source_shell_id: Option<String>,
     /// Display-only bounded preview, cached with this stable finalized zone.
@@ -2402,6 +2404,22 @@ pub struct CommandZone {
     /// `Option` rows are `None`. Row consumers (stripes, gutter, markers,
     /// prompt jumps, reveal) must skip such zones.
     pub rows_evicted: bool,
+}
+
+impl CommandZone {
+    fn captured_bytes(&self) -> usize {
+        self.captured_output.as_ref().map_or(0, |(text, _)| text.len())
+            + self.captured_annotations.as_deref().map_or(0, ArchiveAnnotations::retained_bytes)
+    }
+
+    fn retire_capture(&mut self) -> usize {
+        let bytes = self.captured_bytes();
+        self.captured_output = None;
+        self.captured_annotations = None;
+        self.captured_output_evicted = true;
+        self.output_preview.clear();
+        bytes
+    }
 }
 
 // Keep the original semantic trace stable. Source records have separate
@@ -4527,7 +4545,7 @@ impl TerminalState {
                     absolute_row,
                     self.screen.cursor_col,
                 );
-                let captured_output =
+                let (captured_output, captured_annotations) =
                     self.capture_zone_output(out_start, output_end, output_start_col);
                 let output_source = self.finish_output_source(position, captured_output.as_ref());
                 let zone = CommandZone {
@@ -4545,6 +4563,7 @@ impl TerminalState {
                     command_exact: self.current_command_exact,
                     cwd,
                     captured_output,
+                    captured_annotations,
                     output_source,
                     source_shell_id: finished_id.clone(),
                     captured_output_evicted: false,
@@ -4654,23 +4673,14 @@ impl TerminalState {
             self.finished_output_provenance
                 .insert(zone.id, provenance.clone());
         }
-        self.captured_output_bytes = self.captured_output_bytes.saturating_add(
-            zone.captured_output
-                .as_ref()
-                .map_or(0, |(text, _)| text.len()),
-        );
+        self.captured_output_bytes = self.captured_output_bytes.saturating_add(zone.captured_bytes());
         let mut archive_changed = zone.output_source.is_some();
         self.command_zones.push_back(zone);
         if self.command_zones.len() > MAX_COMMAND_ZONES {
             if let Some(evicted) = self.command_zones.pop_front() {
                 archive_changed |= evicted.output_source.is_some();
                 self.finished_output_provenance.remove(&evicted.id);
-                self.captured_output_bytes = self.captured_output_bytes.saturating_sub(
-                    evicted
-                        .captured_output
-                        .as_ref()
-                        .map_or(0, |(text, _)| text.len()),
-                );
+                self.captured_output_bytes = self.captured_output_bytes.saturating_sub(evicted.captured_bytes());
             }
         }
         self.enforce_captured_output_budget(Self::MAX_CAPTURED_OUTPUT_BYTES);
@@ -4694,10 +4704,10 @@ impl TerminalState {
             else {
                 break;
             };
-            if let Some((text, _)) = zone.captured_output.take() {
-                self.captured_output_bytes = self.captured_output_bytes.saturating_sub(text.len());
-                zone.captured_output_evicted = true;
-                zone.output_preview.clear();
+            let source_changed = zone.output_source.is_some();
+            self.captured_output_bytes = self.captured_output_bytes.saturating_sub(zone.retire_capture());
+            if source_changed {
+                self.mark_completed_history_changed();
             }
         }
     }
@@ -4843,13 +4853,16 @@ impl TerminalState {
         start: usize,
         end: usize,
         start_col: usize,
-    ) -> Option<(String, bool)> {
-        let (out, capped) =
-            self.rows_text_from_column(start, end, start_col, Self::ZONE_OUTPUT_CAP_BYTES);
+    ) -> (Option<(String, bool)>, Option<Arc<ArchiveAnnotations>>) {
+        let mut attributes = ArchiveAnnotationBuilder::default();
+        let (out, capped) = self.collect_output_rows(start, end, start_col, Self::ZONE_OUTPUT_CAP_BYTES, Some(&mut attributes));
         if out.trim().is_empty() {
-            None
+            (None, None)
         } else {
-            Some((out, capped))
+            let annotations = attributes.finish()
+                .filter(|annotations| annotations.valid_for(&out))
+                .map(Arc::new);
+            (Some((out, capped)), annotations)
         }
     }
 
@@ -4939,6 +4952,7 @@ impl TerminalState {
                 command_exact: false,
                 cwd,
                 captured_output: Some(captured_output),
+                captured_annotations: None,
                 captured_output_evicted: false,
                 output_source: None,
                 source_shell_id: None,
@@ -4998,7 +5012,8 @@ impl TerminalState {
             boundary_row,
             self.screen.cursor_col,
         );
-        let captured_output = self.capture_zone_output(out_start, output_end, output_start_col);
+        let (captured_output, captured_annotations) =
+            self.capture_zone_output(out_start, output_end, output_start_col);
         let output_source = self.finish_output_source(position, captured_output.as_ref());
         let zone = CommandZone {
             id: 0, // assigned by push_command_zone
@@ -5015,6 +5030,7 @@ impl TerminalState {
             command_exact: self.current_command_exact,
             cwd,
             captured_output,
+            captured_annotations,
             output_source,
             source_shell_id: self.current_command_id.clone(),
             captured_output_evicted: false,
@@ -5622,12 +5638,7 @@ impl TerminalState {
         while self.command_zones.len() > MAX_COMMAND_ZONES {
             if let Some(evicted) = self.command_zones.pop_front() {
                 self.finished_output_provenance.remove(&evicted.id);
-                self.captured_output_bytes = self.captured_output_bytes.saturating_sub(
-                    evicted
-                        .captured_output
-                        .as_ref()
-                        .map_or(0, |(text, _)| text.len()),
-                );
+                self.captured_output_bytes = self.captured_output_bytes.saturating_sub(evicted.captured_bytes());
                 restored = restored.saturating_sub(1);
             }
         }
@@ -6068,6 +6079,17 @@ impl TerminalState {
         start_col: usize,
         max_bytes: usize,
     ) -> (String, bool) {
+        self.collect_output_rows(start, end, start_col, max_bytes, None)
+    }
+
+    fn collect_output_rows(
+        &self,
+        start: usize,
+        end: usize,
+        start_col: usize,
+        max_bytes: usize,
+        mut annotations: Option<&mut ArchiveAnnotationBuilder>,
+    ) -> (String, bool) {
         let scrollback_len = self.scrollback.len();
         let end = end.min(scrollback_len + self.screen.grid.rows());
         if end <= start {
@@ -6076,46 +6098,40 @@ impl TerminalState {
         let mut out = String::new();
         let mut capped = false;
         for abs_row in start..end {
-            let (mut segment, wrapped) = if abs_row < scrollback_len {
+            let (cells, wrapped) = if abs_row < scrollback_len {
                 let line = &self.scrollback[abs_row];
-                let cells = decompress_history_row(line);
-                let text: String = cells
-                    .iter()
-                    .skip(if abs_row == start {
-                        start_col.min(cells.len())
-                    } else {
-                        0
-                    })
-                    .filter(|cell| !cell.flags.wide_continuation())
-                    .map(|cell| cell.character)
-                    .collect();
-                (text, line.is_wrapped)
+                (Cow::Owned(decompress_history_row(line)), line.is_wrapped)
             } else {
                 let grid_row = abs_row - scrollback_len;
                 if grid_row >= self.screen.grid.rows() {
                     break;
                 }
-                let first_col = if abs_row == start {
-                    start_col.min(self.screen.grid.row_len())
-                } else {
-                    0
-                };
-                let text: String = (first_col..self.screen.grid.row_len())
-                    .map(|col| self.screen.grid.get(grid_row, col))
-                    .filter(|cell| !cell.flags.wide_continuation())
-                    .map(|cell| cell.character)
-                    .collect();
-                (text, self.screen.grid.row_wrapped[grid_row])
+                (Cow::Borrowed(&self.screen.grid[grid_row]), self.screen.grid.row_wrapped[grid_row])
             };
-            if !wrapped {
-                // Hard line end: trailing cell padding is not real output.
-                segment.truncate(segment.trim_end_matches(' ').len());
-            }
-            if out.len().saturating_add(segment.len()) > max_bytes {
+            let first_col = if abs_row == start { start_col.min(cells.len()) } else { 0 };
+            let cells = &cells[first_col..];
+            let column_end = if wrapped { cells.len() } else {
+                cells.iter().rposition(|cell| !cell.flags.wide_continuation() && cell.character != ' ')
+                    .map_or(0, |last| last + 1)
+            };
+            let visible = cells[..column_end].iter().filter(|cell| !cell.flags.wide_continuation());
+            let row_bytes: usize = visible.clone().map(|cell| cell.character.len_utf8()).sum();
+            if out.len().saturating_add(row_bytes) > max_bytes {
                 capped = true;
                 break;
             }
-            out.push_str(&segment);
+            for cell in visible {
+                let start = out.len();
+                out.push(cell.character);
+                if let Some(attributes) = annotations.as_deref_mut() {
+                    let link = usize::from(cell.hyperlink_id.as_raw()).checked_sub(1)
+                        .and_then(|index| self.osc8_hyperlinks.get(index))
+                        .map(|link| link.uri.as_str());
+                    attributes.push(start..out.len(), ArchiveStyle::from_rendition(
+                        cell.foreground, cell.background, Color::Default, cell.flags,
+                    ), link);
+                }
+            }
             if !wrapped && abs_row + 1 < end {
                 if out.len() == max_bytes {
                     capped = true;
@@ -21335,7 +21351,7 @@ mod block_spacing_tests {
             // 511 * (2048 + newline) + 768 * 2 == CAP - 1 bytes.
             // One ASCII scalar fits exactly; a multibyte final scalar does not.
             let capture = terminal
-                .capture_zone_output(0, 512, 0)
+                .capture_zone_output(0, 512, 0).0
                 .expect("nonempty normalized output");
             assert_eq!(capture.1, last != 'x');
             if last == 'x' {
