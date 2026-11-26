@@ -33,9 +33,19 @@ fn classify(command: &str, reading_agent_only: bool) -> bool {
             continue;
         }
         let name = match word {
+            "@openai/codex" => "codex",
+            word if word
+                .strip_prefix("@openai/codex@")
+                .is_some_and(|version| !version.is_empty()) =>
+            {
+                "codex"
+            }
             "@anthropic-ai/claude-code" => "claude",
             "@google/gemini-cli" => "gemini",
-            _ => word.rsplit('/').next().unwrap_or(word),
+            _ => match word.rsplit('/').next().unwrap_or(word) {
+                "codex.js" => "codex",
+                name => name,
+            },
         };
         match name {
             "command" | "exec" => {
@@ -85,6 +95,13 @@ fn classify(command: &str, reading_agent_only: bool) -> bool {
             "npx" | "bunx" => {
                 if matches!(args.peek(), Some(&"--yes" | &"-y" | &"--no-install")) {
                     args.next();
+                }
+            }
+            "npm" => {
+                // Only admit npm's explicit executable boundary. Package
+                // install/script options must not look like an active CLI.
+                if args.next() != Some("exec") || args.next() != Some("--") {
+                    return false;
                 }
             }
             "pnpm" => {
@@ -344,6 +361,10 @@ mod reading_tests {
             "claude",
             "env FOO=bar npx -y @anthropic-ai/claude-code",
             "command /opt/bin/codex resume abc",
+            "npx -y @openai/codex@latest --no-alt-screen",
+            "pnpm dlx @openai/codex@0.172.0",
+            "npm exec -- codex --no-alt-screen",
+            "/opt/openai/codex/bin/codex.js --no-alt-screen",
         ] {
             assert!(reads(command), "{command}");
         }
@@ -355,6 +376,12 @@ mod reading_tests {
             "claude --print test",
             "claude --help",
             "ssh host codex",
+            "npx -y @openai/codex@latest exec task",
+            "npm exec -- codex exec task",
+            "/opt/openai/codex/bin/codex.js --help",
+            "npm run codex",
+            "npm exec echo codex",
+            "npx @openai/codex-tools@latest",
         ] {
             assert!(!reads(command), "{command}");
         }

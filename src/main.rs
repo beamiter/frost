@@ -15454,7 +15454,10 @@ impl Frost {
             return false;
         };
         let page_key = matches!(key, Key::Named(Named::PageUp | Named::PageDown));
-        if !mods.shift() && !(page_key && sess.reading_agent()) {
+        let inline_page = page_key && sess.reading_agent();
+        // With no retained inline rows, do not swallow the child's own
+        // unmodified paging keys. Explicit Shift paging is still host-owned.
+        if !mods.shift() && (!inline_page || sess.projection.max_scroll_offset() == 0) {
             return false;
         }
         // Retain two context rows between pages of the same continuous session.
@@ -15465,7 +15468,9 @@ impl Frost {
             } else {
                 -page
             };
-            if sess.scroll_transcript(delta as f64, false, std::time::Instant::now()) {
+            // A keyboard page is a destination, not a wheel impulse. Set it
+            // immediately so busy synchronized repaints cannot starve the step.
+            if sess.scroll_transcript(delta as f64, inline_page, std::time::Instant::now()) {
                 sess.refresh();
             }
             return true;
@@ -37802,6 +37807,10 @@ mod tests {
         assert!((session.transcript_canvas.position_rows() - before - page).abs() < 0.001);
         assert_eq!(session.terminal.copy_selection(), selected);
         assert!(!session.transcript_canvas.following());
+        assert!(session.scroll_transcript(-page, true, start));
+        session.refresh();
+        assert!((session.transcript_canvas.position_rows() - before).abs() < 0.001);
+        assert_eq!(session.terminal.copy_selection(), selected);
     }
 
     #[cfg(target_os = "linux")]
