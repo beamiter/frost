@@ -562,19 +562,25 @@ impl Window {
     pub fn invalidate_native_frame_feedback(&self) {
         match self {
             #[cfg(x11_platform)] Self::X(window) => window.invalidate_native_frame_feedback(),
-            #[cfg(wayland_platform)] Self::Wayland(_) => {},
+            #[cfg(wayland_platform)] Self::Wayland(window) => window.invalidate_native_frame_feedback(),
+        }
+    }
+    pub fn native_frame_feedback_is_surface_bound(&self) -> bool {
+        match self {
+            #[cfg(x11_platform)] Self::X(_) => false,
+            #[cfg(wayland_platform)] Self::Wayland(window) => window.native_frame_feedback_is_surface_bound(),
         }
     }
     pub fn begin_native_frame_feedback(&self, pass: u64, width: u32, height: u32) -> bool {
         match self {
             #[cfg(x11_platform)] Self::X(window) => window.begin_native_frame_feedback(pass, width, height),
-            #[cfg(wayland_platform)] Self::Wayland(_) => false,
+            #[cfg(wayland_platform)] Self::Wayland(window) => window.begin_native_frame_feedback(pass, width, height),
         }
     }
     pub fn finish_native_frame_feedback(&self, pass: u64, published: bool) {
         match self {
             #[cfg(x11_platform)] Self::X(window) => window.finish_native_frame_feedback(pass, published),
-            #[cfg(wayland_platform)] Self::Wayland(_) => {},
+            #[cfg(wayland_platform)] Self::Wayland(window) => window.finish_native_frame_feedback(pass, published),
         }
     }
 

@@ -58,6 +58,7 @@ class Smoke:
                         WGPU_BACKEND='vulkan', RUST_LOG='warn,iced_wgpu::window::compositor=info')
         config = home / '.config/frost'
         config.mkdir(parents=True)
+        config.chmod(0o700)
         self.config = config / 'config.toml'
         (home / '.bash_profile').write_text(r"""export HISTFILE=/dev/null
 exec 9>>"$FROST_SMOKE_SHELL_TRACE"
@@ -204,6 +205,14 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
             (self.out / (name + '.ocr-transform.json')).write_text(json.dumps({
                 'raw_frame': name + '.png', 'crop': [offset_x, offset_y, crop_w, crop_h],
                 'scale': 3, 'required_text': ['Closing Frost', 'Eva disconnected', 'Close anyway']
+            }, indent=2))
+        else:
+            source = self.out / (name + '.ocr.png')
+            self.run(['convert', str(self.out / (name + '.png')),
+                      '-colorspace', 'Gray', '-negate', str(source)], capture_output=True)
+            (self.out / (name + '.ocr-transform.json')).write_text(json.dumps({
+                'raw_frame': name + '.png', 'scale': 1,
+                'algorithm': 'ImageMagick -colorspace Gray -negate'
             }, indent=2))
         tsv = self.run(['tesseract', str(source), 'stdout',
                         '--psm', '11', 'tsv'], text=True, capture_output=True).stdout
@@ -485,6 +494,7 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
 
     def exercise(self, mode):
         self.config.write_text('shell = "/bin/bash"\nterminal_mode = "' + mode + '"\ninitial_width = 1100\ninitial_height = 760\nrestore_session = false\n')
+        self.config.chmod(0o600)
         app = self.spawn([str(self.binary)], 'frost-' + mode)
         try:
             wait_for(self.app_window, 'Frost window ' + mode)

@@ -98,8 +98,8 @@ fn unrelated_host_modes_cannot_enable_mouse_reports() {
     assert!(terminal.get_mouse_report(0, 0, 0).is_none());
     assert!(terminal.get_mouse_release_report(0, 0, 0).is_none());
     terminal.process_input(b"\x1b[4h");
-    assert!(terminal.screen.insert_mode);
-    assert!(terminal.screen.origin_mode);
+    assert!(terminal.vt.screen.insert_mode);
+    assert!(terminal.vt.screen.origin_mode);
 }
 
 #[test]

@@ -263,6 +263,15 @@ cargo build --release --locked
 ./scripts/uninstall.sh            # 一并移除；配置与历史保留
 ```
 
+在精简的 Ubuntu 24.04 或 26.04 X11 环境中运行预编译版时，frost 启动时会动态加载
+`libxkbcommon-x11-0`，还需要可用的图形驱动。以下 Mesa 软件渲染依赖已在两个版本上验证。
+
+```bash
+sudo apt-get install --no-install-recommends \
+  libxkbcommon-x11-0 libegl1 libegl-mesa0 libgl1 libglx-mesa0 \
+  libgl1-mesa-dri libvulkan1 mesa-vulkan-drivers
+```
+
 安装脚本会把六个 workflow 示例一并复制到运行时数据目录。默认前缀会遵循
 `XDG_DATA_HOME`，未设置时对应
 `~/.local/share/frost/workflows/`；标准 `/usr`、`/usr/local` 前缀则由

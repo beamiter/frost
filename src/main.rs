@@ -9,6 +9,7 @@ use jterm_core::pane_layout::{
     set_divider_share, split_node_rect, Axis, DividerId, PaneDirection, PaneRect, PaneTree,
 };
 use jterm_core::pty_input::{self, PasteModes, PastePolicy, UnbracketedMultiline};
+use jterm_protocol::terminal::Attachment as TerminalAttachment;
 mod agent;
 mod agent_model_stream;
 mod agent_sessions;
@@ -100,8 +101,10 @@ mod session_persistence;
 mod sidebar;
 mod sidebar_resize;
 mod terminal;
+mod terminal_attachment;
 mod terminal_ime;
 mod terminal_view;
+mod observer;
 mod theme;
 mod transcript_canvas;
 mod ui_typography;
@@ -842,7 +845,7 @@ fn finalized_block_at_viewport_row(
         terminal::ProjectedRowKind::Raw => {}
     }
     let abs_row = projection.view_row_absolute(row)?;
-    let total = terminal.scrollback_len() + terminal.screen.grid.rows();
+    let total = terminal.scrollback_len() + terminal.vt.screen.grid.rows();
     let live_boundary = terminal
         .running_zone_start()
         .or(terminal.live_prompt_row())
@@ -4656,34 +4659,43 @@ fn main() -> iced::Result {
         ..Default::default()
     };
     let native_enter_ownership = native_enter::install();
-    iced::application(
+    iced::daemon(
         move || {
-            Frost::new(
+            let (id, open) = iced::window::open(win.clone());
+            let (mut state, boot) = Frost::new(
                 config.clone(),
                 config_diagnostic.clone(),
                 config_revision.clone(),
                 Arc::clone(&native_enter_ownership),
-            )
+            );
+            state.owner_window = Some(id);
+            (state, Task::batch([boot, open.map(Message::OwnerWindowOpened)]))
         },
         Frost::update,
-        Frost::view,
+        Frost::view_window,
     )
-    .title(Frost::title)
+    .title(|state: &Frost, id| observer::title(observer::role(state.owner_window, id, state.observers.contains_key(&id)), || state.title()))
     .subscription(Frost::subscription)
-    .theme(Frost::iced_theme)
+    .theme(|state: &Frost, _| Some(state.iced_theme()))
     .style(Frost::app_style)
-    .scale_factor(Frost::scale_factor)
+    .scale_factor(|state: &Frost, _| state.scale_factor())
     // MSAA forces wgpu down the multisample path; on Intel/Mesa that triggers
     // the "manual shader clears for srgb textures" path, which flashes the whole
     // surface on heavy redraws (e.g. multi-line `ls` output). Glyph and quad
     // rendering don't benefit from geometry MSAA, so disabling it is free here.
     .antialiasing(false)
-    .window(win)
     .run()
 }
 
 #[derive(Debug, Clone)]
 enum Message {
+    NativeWindowEvent(iced::window::Id, Box<Message>),
+    NativeWindowClosed,
+    OwnerWindowOpened(iced::window::Id),
+    OpenObserver(observer::Target),
+    ChangeTerminalView(TerminalAttachment, bool),
+    ObserverOpened(iced::window::Id),
+    CloseObserver(iced::window::Id),
     RemoteDesktop(remote_desktop::Event),
     /// Explicit confirmation to exit a quarantined process, including live jobs.
     ExitAfterInputOverload,
@@ -5001,18 +5013,18 @@ enum Message {
     /// Stable release of a host-owned collapsed-output summary row.
     SummaryActivate(usize, SummaryActivation),
     /// Clipboard result scoped to the stable session that requested the paste.
-    Pasted(usize, Option<String>),
+    Pasted(TerminalAttachment, Option<String>),
     /// One decoded local path delivered by the window system's file-drop event.
     ImageDropped(std::path::PathBuf),
     /// Text appended by search-replace or a sidebar path pick. Both sources
     /// can contain terminal/file-system controlled bytes, so this is an
     /// untrusted paste and never receives the control-preserving policy.
-    PromptInsert(usize, String),
+    PromptInsert(TerminalAttachment, String),
     /// A command recalled from history onto the prompt. Unlike `PromptInsert`
     /// it kills the pending line first: a recall that merely appends is glued
     /// to whatever the user had half-typed (the failure mode forge shipped),
     /// and the mangled line is one Enter away from running.
-    PromptRecall(usize, String),
+    PromptRecall(TerminalAttachment, String),
     /// System clipboard contents read in response to an OSC 52 query from the
     /// app running in the session identified by the file descriptor.
     Osc52Query(usize, RawFd, u64, &'static [u8], Option<String>),
@@ -5409,6 +5421,7 @@ impl ResizeRepaint {
 /// A single terminal session: its own PTY child and terminal state.
 struct Session {
     id: usize,
+    view_attachment: terminal_attachment::TerminalViewAttachment,
     pane_history_id: uuid::Uuid,
     pane_history_writes_blocked: bool,
     ime_identity: Arc<()>,
@@ -5897,7 +5910,15 @@ impl Session {
             },
         )
         .map_err(|error| PtyLaunchError::ExecConfirmed(std::io::Error::other(error)))?;
-        let watch_source = organism_watch::SourceAuthority::from_runtime(pty.output_source());
+        let runtime_source = pty.output_source();
+        let runtime_epoch = runtime_source
+            .and_then(|epoch| u32::try_from(epoch).ok())
+            .ok_or_else(|| {
+                PtyLaunchError::ExecConfirmed(std::io::Error::other(
+                    "terminal runtime epoch unavailable",
+                ))
+            })?;
+        let watch_source = organism_watch::SourceAuthority::from_runtime(runtime_source);
         let inline_agent_launch = command_argv
             .map(crate::immersive_command::reading_agent_argv)
             .unwrap_or_else(|| {
@@ -5931,6 +5952,7 @@ impl Session {
         let cursor_visible = terminal.is_cursor_visible();
         Ok(Session {
             id,
+            view_attachment: terminal_attachment::TerminalViewAttachment::new(runtime_epoch),
             pane_history_id: uuid::Uuid::new_v4(),
             pane_history_writes_blocked: false,
             ime_identity: Arc::new(()),
@@ -6166,7 +6188,7 @@ impl Session {
     }
 
     fn presentation_held(&self) -> bool {
-        self.resize_repaint.is_some() || self.terminal.sync_output_active
+        self.resize_repaint.is_some() || self.terminal.vt.sync_output.active
     }
 
     fn inline_text_frame(&self) -> Option<InlineTextFrame> {
@@ -6196,7 +6218,7 @@ impl Session {
         }
         self.terminal.check_sync_output_timeout(now);
         if self.resize_repaint.as_ref().is_some_and(|repaint| {
-            now >= repaint.limit || (!self.terminal.sync_output_active && now >= repaint.publish_at)
+            now >= repaint.limit || (!self.terminal.vt.sync_output.active && now >= repaint.publish_at)
         }) {
             self.resize_repaint = None;
         }
@@ -6289,8 +6311,8 @@ impl Session {
             self.transcript_canvas.reconcile(
                 self.projection.scroll_offset(),
                 self.projection.max_scroll_offset(),
-                self.terminal.screen.grid.rows(),
-                self.terminal.screen.grid.cols(),
+                self.terminal.vt.screen.grid.rows(),
+                self.terminal.vt.screen.grid.cols(),
             );
             let row = self.transcript_canvas.row();
             if row != self.projection.scroll_offset() {
@@ -6312,8 +6334,8 @@ impl Session {
                 .canvas_viewport(&self.projection, &self.projection_policy);
         } else if self.projection_block_mode
             && self.projection_policy.is_chat()
-            && !self.terminal.is_alt_buffer_active()
-            && self.terminal.chat_surface() == chat_mode::ChatSurface::Passthrough
+            && (self.terminal.is_alt_buffer_active()
+                || self.terminal.chat_surface() == chat_mode::ChatSurface::Passthrough)
         {
             self.transcript_canvas.park();
         } else {
@@ -6421,6 +6443,16 @@ impl Session {
         self.terminal.scroll_to_bottom();
         self.projection_view_state.scroll_to_bottom();
         self.refresh();
+    }
+
+    /// Input follows the native cursor. A Chat reader keeps their separate
+    /// transcript anchor while the dock or a fullscreen child handles it.
+    fn scroll_after_input(&mut self) {
+        self.terminal.scroll_to_bottom();
+        if !self.projection_policy.is_chat() {
+            self.transcript_canvas.navigate(0);
+            self.projection_view_state.scroll_to_bottom();
+        }
     }
 
     /// Navigate OSC 133 prompt boundaries in the currently displayed
@@ -6573,7 +6605,8 @@ impl Session {
     }
 
     fn can_queue_user_bytes(&self, len: usize) -> bool {
-        !iced::advanced::subscription::Event::input_overloaded()
+        self.view_attachment.attached()
+            && !iced::advanced::subscription::Event::input_overloaded()
             && self.pty.can_queue_user_input(len).is_ok()
     }
 
@@ -6770,9 +6803,7 @@ impl Session {
         }
         self.block_selection.clear();
         self.terminal.clear_text_selection();
-        self.terminal.scroll_to_bottom();
-        self.projection_view_state.scroll_to_bottom();
-        self.transcript_canvas.navigate(0);
+        self.scroll_after_input();
     }
 
     /// Queue data in-order. The actor either accepts the complete message or
@@ -6800,7 +6831,7 @@ impl Session {
         // pre-check `transcript_read_only` to show the read-only hint; this
         // guard catches every remaining user-write path (mouse reports,
         // Agent payloads) silently.
-        if self.transcript_read_only() {
+        if self.transcript_read_only() || !self.view_attachment.attached() {
             return false;
         }
         match self.pty.write(data) {
@@ -6971,8 +7002,8 @@ fn cancelled_terminal_mouse_report(
 ) -> Option<Vec<u8>> {
     let (col, row) = gesture.app_release_cell(
         None,
-        terminal.screen.grid.row_len(),
-        terminal.screen.grid.rows(),
+        terminal.vt.screen.grid.row_len(),
+        terminal.vt.screen.grid.rows(),
     )?;
     let code = match gesture.button {
         MouseButton::Left => 0,
@@ -7260,6 +7291,8 @@ fn overlay_release_disposition(
 }
 
 struct Frost {
+    owner_window: Option<iced::window::Id>,
+    observers: std::collections::HashMap<iced::window::Id, observer::View>,
     eva: Option<eva_companion::Eva>,
     eva_preview_pose: jterm_core::companion_host::atlas::Pose,
     eva_preview_mood: jterm_core::companion_host::atlas::Mood,
@@ -7678,6 +7711,8 @@ impl Frost {
             || jterm_core::companion_host::shared_mode_requested())
         .then(eva_companion::Eva::new);
         let mut app = Frost {
+            owner_window: None,
+            observers: std::collections::HashMap::new(),
             eva,
             eva_preview_pose: jterm_core::companion_host::atlas::Pose::Idle,
             eva_preview_mood: jterm_core::companion_host::atlas::Mood::Neutral,
@@ -8478,15 +8513,23 @@ impl Frost {
     fn sync_terminal_ime_owner(&mut self) {
         let owner = (self.focused && self.terminal_input_active())
             .then(|| {
-                self.sessions
-                    .get(self.active)
-                    .map(|session| terminal_ime::Owner {
-                        session: session.id,
-                        instance: Arc::clone(&session.ime_identity),
+                self.sessions.get(self.active).and_then(|session| {
+                    session.view_attachment.input_owner().map(|instance| {
+                        terminal_ime::Owner {
+                            session: session.id,
+                            instance,
+                        }
                     })
+                })
             })
             .flatten();
         if self.terminal_ime.sync(owner) {
+            // A pane is not a native window. Retire the real platform context
+            // as well as our old owner's display/admission state, so the next
+            // pane starts a fresh composition rather than extending old text.
+            if let Some(window) = self.owner_window {
+                iced_winit::ime_control::reset(window);
+            }
             for session in &mut self.sessions {
                 session.terminal.clear_preedit();
                 session.refresh();
@@ -8495,11 +8538,10 @@ impl Frost {
     }
 
     fn terminal_input_active(&self) -> bool {
-        !self.reference_navigation_drawer_visible()
-            && !self
-                .sessions
-                .get(self.active)
-                .is_some_and(|s| self.vim9_tabs.contains_key(&s.id))
+        self.sessions.get(self.active).is_some_and(|session| {
+            session.view_attachment.attached() && !self.vim9_tabs.contains_key(&session.id)
+        })
+            && !self.reference_navigation_drawer_visible()
             && !self.search.is_open
             && !self.search_replace.is_open
             && !self.agent_sessions.open
@@ -8558,7 +8600,7 @@ impl Frost {
             .iter()
             .find(|session| session.id == session_id)
             .is_some_and(|session| {
-                session
+                session.view_attachment.attached() && session
                     .terminal
                     .projection_interaction_allowed(&session.projection)
             })
@@ -8566,7 +8608,7 @@ impl Frost {
 
     fn active_projection_interaction_allowed(&self) -> bool {
         self.sessions.get(self.active).is_some_and(|session| {
-            session
+            session.view_attachment.attached() && session
                 .terminal
                 .projection_interaction_allowed(&session.projection)
         })
@@ -9285,7 +9327,7 @@ impl Frost {
                 }
             }
             SidebarMenuAction::Preview => {
-                if !menu.is_dir && menu.targets.len() == 1 && !self.sidebar.location.is_remote() {
+                if !menu.is_dir && menu.targets.len() == 1 {
                     self.preview_file_tree_path(&menu.path)
                 } else {
                     Task::none()
@@ -9618,10 +9660,10 @@ impl Frost {
         #[cfg(not(target_os = "linux"))]
         let _ = path;
         let mut local_actions = Vec::new();
-        if targets_len == 1 && !is_dir && !self.sidebar.location.is_remote() {
+        if targets_len == 1 && !is_dir {
             let available = |action| (action, true, sidebar_menu_action_label(action, targets_len));
             #[cfg(target_os = "linux")]
-            if notebook::is_path(path) {
+            if !self.sidebar.location.is_remote() && notebook::is_path(path) {
                 local_actions.push(available(SidebarMenuAction::OpenNotebook));
             }
             local_actions.push(available(SidebarMenuAction::Preview));
@@ -10131,7 +10173,12 @@ impl Frost {
     /// Compare only the bounded visible tree (at most MAX_PANES leaves), using
     /// stable identities so background closes/reindexing are harmless.
     fn sync_terminal_pane_owners(&mut self) {
-        let session_id = |index| self.sessions.get(index).map(|session: &Session| session.id);
+        let session_id = |index: usize| {
+            self.sessions
+                .get(index)
+                .filter(|session| session.view_attachment.attached())
+                .map(|session| session.id)
+        };
         let tab = self.tabs.get(self.active_tab);
         // PTY output visits this boundary frequently. Walk the borrowed tree
         // without allocating when ownership is unchanged; only changes capture.
@@ -11630,6 +11677,9 @@ impl Frost {
     fn resize_session(&mut self, index: usize, cols: usize, rows: usize) -> Option<usize> {
         let (pixel_w, pixel_h) = self.grid_pixel_size(cols, rows);
         if let Some(sess) = self.sessions.get_mut(index) {
+            if !sess.view_attachment.attached() {
+                return None;
+            }
             sess.terminal.set_viewport_pixel_size(pixel_w, pixel_h);
             let old_dimensions = sess.terminal.get_dimensions();
             if old_dimensions != (cols, rows) {
@@ -11975,9 +12025,7 @@ impl Frost {
                 // A PTY-bound keystroke dismisses the block selection.
                 if !sess.terminal.inline_cli_owner_active() {
                     sess.block_selection.clear();
-                    sess.terminal.scroll_to_bottom();
-                    sess.transcript_canvas.navigate(0);
-                    sess.projection_view_state.scroll_to_bottom();
+                    sess.scroll_after_input();
                 }
                 let accepted = sess.write_pty(bytes);
                 sess.note_cli_keyboard_input(bytes, accepted);
@@ -12025,8 +12073,8 @@ impl Frost {
                 self.edit_copy_task(matches!(cmd, C::EditCopyBlockOutput))
             }
             C::EditPaste => {
-                let id = self.sessions.get(self.active)?.id;
-                iced::clipboard::read().map(move |text| Message::Pasted(id, text))
+                let view = self.sessions.get(self.active)?.view_attachment.input_ticket()?;
+                iced::clipboard::read().map(move |text| Message::Pasted(view.clone(), text))
             }
             C::SearchOpen => {
                 self.search.toggle();
@@ -12801,7 +12849,7 @@ impl Frost {
         }
         let target = self.sessions.get(self.active).and_then(|sess| {
             let terminal = &sess.terminal;
-            let total = terminal.scrollback_len() + terminal.screen.grid.rows();
+            let total = terminal.scrollback_len() + terminal.vt.screen.grid.rows();
             let live_boundary = terminal
                 .running_zone_start()
                 .or(terminal.live_prompt_row())
@@ -14174,10 +14222,10 @@ impl Frost {
     /// to the pending line; command recall goes through
     /// [`Self::recall_into_active_pane`] instead.
     fn type_into_active_pane(&mut self, text: String) -> Task<Message> {
-        let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
+        let Some(view) = self.sessions.get(self.active).and_then(|session| session.view_attachment.input_ticket()) else {
             return Task::none();
         };
-        Task::done(Message::PromptInsert(id, text))
+        Task::done(Message::PromptInsert(view, text))
     }
 
     /// History recall: replace the prompt's pending line with `command`. Still
@@ -14190,11 +14238,15 @@ impl Frost {
     }
 
     fn recall_into_session(&mut self, id: usize, command: String) -> Task<Message> {
+        let Some(view) = self.sessions.iter().find(|session| session.id == id)
+            .and_then(|session| session.view_attachment.input_ticket()) else {
+            return Task::none();
+        };
         // Claim any held Enter before asynchronous prompt revalidation, not
         // only after a successful write or a keyboard-based confirmation.
         self.native_enter_ownership.lock().claim_pressed();
         self.prompt_recall_enter_latch.begin_recall();
-        Task::done(Message::PromptRecall(id, command))
+        Task::done(Message::PromptRecall(view, command))
     }
 
     /// Re-check prompt ownership at the final PTY-write boundary. A recall is
@@ -14269,9 +14321,7 @@ impl Frost {
                         // Preserve the same selection, scrolling and refresh effects.
                         if !sess.terminal.inline_cli_owner_active() {
                             sess.block_selection.clear();
-                            sess.terminal.scroll_to_bottom();
-                            sess.transcript_canvas.navigate(0);
-                            sess.projection_view_state.scroll_to_bottom();
+                            sess.scroll_after_input();
                         }
                         let written = sess.write_pty(bytes);
                         sess.note_cli_keyboard_input(bytes, written);
@@ -14444,11 +14494,7 @@ impl Frost {
             return match workflows::render(&workflow, &std::collections::HashMap::new())
                 .and_then(crate::workflow_picker::insertable_rendered_command)
             {
-                Ok(command) => {
-                    self.native_enter_ownership.lock().claim_pressed();
-                    self.prompt_recall_enter_latch.begin_recall();
-                    Task::done(Message::PromptRecall(target_session_id, command))
-                }
+                Ok(command) => self.recall_into_session(target_session_id, command),
                 Err(error) => {
                     log::warn!("workflow render failed: {error}");
                     self.push_toast(
@@ -14574,6 +14620,10 @@ impl Frost {
                 "Workflow insertion may be incomplete. Some text may have reached the terminal; inspect the prompt before retrying.",
                 ToastKind::Warning,
             );
+        } else if let Some(original) = self.sessions.iter().position(|session| session.id == id) {
+            // The write was admitted to the form's original PTY. Return to
+            // that pane so the user can review the draft before running it.
+            self.focus_session(original);
         }
         Task::none()
     }
@@ -14594,6 +14644,25 @@ impl Frost {
         if chrome_shortcut(key, mods) == Some(ChromeShortcut::Workflows) {
             self.workflow_overlay = None;
             return Some(Task::none());
+        }
+        if (mods.control() || mods.alt() || mods.logo())
+            && matches!(
+                self.workflow_overlay.as_ref(),
+                Some(workflow_picker::WorkflowOverlay::Args(_))
+            )
+        {
+            use keybindings::Command as C;
+            let command = resolve_keybinding_command(&self.keybindings, key, mods);
+            if let Some(command @ (C::SessionNext
+                | C::SessionPrev
+                | C::PaneFocusNext
+                | C::PaneFocusPrev
+                | C::PaneFocusLeft
+                | C::PaneFocusRight
+                | C::PaneFocusUp
+                | C::PaneFocusDown)) = command {
+                return self.dispatch_command(command);
+            }
         }
         match self.workflow_overlay.as_mut()? {
             workflow_picker::WorkflowOverlay::Args(_) => match key {
@@ -15194,9 +15263,9 @@ impl Frost {
                         }
                     },
                     MouseButton::Middle => {
-                        let id = sess.id;
+                        let Some(view) = sess.view_attachment.input_ticket() else { return Task::none() };
                         return iced::clipboard::read_primary()
-                            .map(move |text| Message::Pasted(id, text));
+                            .map(move |text| Message::Pasted(view.clone(), text));
                     }
                     MouseButton::Right => {}
                 }
@@ -15257,8 +15326,8 @@ impl Frost {
                     if let Some((grid_col, grid_row)) = gesture.and_then(|gesture| {
                         gesture.app_release_cell(
                             current,
-                            sess.terminal.screen.grid.row_len(),
-                            sess.terminal.screen.grid.rows(),
+                            sess.terminal.vt.screen.grid.row_len(),
+                            sess.terminal.vt.screen.grid.rows(),
                         )
                     }) {
                         if let Some(report) = sess.terminal.get_mouse_release_report(
@@ -15389,7 +15458,7 @@ impl Frost {
             return false;
         }
         // Retain two context rows between pages of the same continuous session.
-        let page = sess.terminal.screen.grid.rows().saturating_sub(2).max(1) as isize;
+        let page = sess.terminal.vt.screen.grid.rows().saturating_sub(2).max(1) as isize;
         if page_key && sess.transcript_canvas.enabled() {
             let delta = if matches!(key, Key::Named(Named::PageUp)) {
                 page
@@ -15917,10 +15986,10 @@ impl Frost {
             }
             PaletteAction::Copy => self.edit_copy_task(false),
             PaletteAction::Paste => {
-                let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
+                let Some(view) = self.sessions.get(self.active).and_then(|session| session.view_attachment.input_ticket()) else {
                     return Task::none();
                 };
-                iced::clipboard::read().map(move |text| Message::Pasted(id, text))
+                iced::clipboard::read().map(move |text| Message::Pasted(view.clone(), text))
             }
             PaletteAction::OpenSearch => {
                 self.search.toggle();
@@ -17319,7 +17388,255 @@ impl Frost {
         self.start_block_export(snapshot, format, "session blocks")
     }
 
+    fn change_terminal_view(&mut self, ticket: TerminalAttachment, attach: bool) -> Task<Message> {
+        let Some(index) = self.sessions.iter().position(|session| {
+            session.view_attachment.can_switch(&ticket, attach)
+                && !self.vim9_tabs.contains_key(&session.id)
+        }) else {
+            return Task::none();
+        };
+        if !self.layout().contains_session(index) || (self.pane_zoomed && index != self.active) {
+            return Task::none();
+        }
+        if !attach {
+            for gesture in retire_closing_terminal_mouse_gestures(
+                self.sessions[index].id,
+                &mut self.terminal_mouse_gestures,
+                &mut self.click_tracker,
+            ) {
+                self.finish_cancelled_terminal_mouse_gesture(gesture);
+            }
+        }
+        let session = &mut self.sessions[index];
+        if session.view_attachment.switch(&ticket, attach) {
+            session.terminal.clear_preedit();
+            let owner = session.view_attachment.ticket();
+            log::debug!(
+                "terminal view attached={attach} session={} epoch={} generation={}",
+                owner.session,
+                owner.epoch,
+                owner.generation,
+            );
+            self.reference_tools_selection = None;
+            self.relayout();
+            self.refresh_active_context();
+            self.sync_terminal_ime_owner();
+        }
+        Task::none()
+    }
+
+    fn view_input_session(&self, view: &TerminalAttachment) -> Option<usize> {
+        self.sessions
+            .iter()
+            .find(|session| {
+                session.view_attachment.attached() && session.view_attachment.matches(view)
+            })
+            .map(|session| session.id)
+    }
+
+    fn observer_frame(&self, session: &Session) -> observer::Frame {
+        observer::Frame {
+            projection: Arc::clone(&session.projection),
+            cursor: session.cursor,
+            cursor_visible: session.cursor_visible,
+            cursor_shape: session.terminal.vt.screen.cursor_shape,
+            palette: *session.terminal.palette_overrides(),
+            foreground: session.terminal.foreground_override(),
+            background: session.terminal.background_override(),
+            cursor_color: session.terminal.cursor_override(),
+            images: self.kitty_images(session),
+        }
+    }
+
+    fn open_observer(&mut self, target: observer::Target) -> Task<Message> {
+        if self.observers.len() >= observer::MAX_VIEWS {
+            return Task::none();
+        }
+        // Resolve the rendered factory's original generation, never self.active.
+        let Some(index) = self
+            .sessions
+            .iter()
+            .position(|session| target.matches(session.id, &session.ime_identity))
+        else {
+            return Task::none();
+        };
+        if !self.sessions[index].view_attachment.attached() {
+            self.sessions[index].refresh();
+        }
+        let session = &self.sessions[index];
+        let frame = self.observer_frame(session);
+        let pid = session.child_pid;
+        let (id, task) = iced::window::open(iced::window::Settings {
+            size: Size::new(720.0, 440.0),
+            exit_on_close_request: false,
+            platform_specific: iced::window::settings::PlatformSpecific {
+                application_id: WINDOW_APP_ID.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        self.observers.insert(
+            id,
+            observer::View {
+                target,
+                pid,
+                latest: frame,
+                closed: false,
+            },
+        );
+        self.reference_tools_selection = None;
+        task.map(Message::ObserverOpened)
+    }
+
+    fn refresh_observers(&mut self) {
+        let updates: Vec<_> = self
+            .observers
+            .iter()
+            .map(|(id, view)| {
+                let owner = self
+                    .sessions
+                    .iter()
+                    .find(|session| view.target.matches(session.id, &session.ime_identity));
+                (
+                    *id,
+                    owner.map(|session| {
+                        (self.observer_frame(session), session.transcript_read_only())
+                    }),
+                )
+            })
+            .collect();
+        for (id, frame) in updates {
+            if let Some(view) = self.observers.get_mut(&id) {
+                if let Some((frame, ended)) = frame {
+                    view.latest = frame;
+                    view.closed |= ended;
+                } else {
+                    view.closed = true;
+                }
+            }
+        }
+    }
+
+    fn view_window(&self, id: iced::window::Id) -> Element<'_, Message> {
+        let Some(view) = self.observers.get(&id) else {
+            return if self.owner_window == Some(id) {
+                self.view()
+            } else {
+                Space::new().into()
+            };
+        };
+        let frame = &view.latest;
+        let state = if view.closed {
+            "Owner closed · last published viewport"
+        } else {
+            "Read only · owner controls input and terminal size"
+        };
+        let header = row![
+            text(format!(
+                "Pane {} · PTY owner {} · {state}",
+                view.target.id + 1,
+                view.pid
+            ))
+            .size(14),
+            Space::new().width(Length::Fill),
+            button("Close observer").on_press(Message::CloseObserver(id)),
+        ]
+        .spacing(12)
+        .align_y(iced::Alignment::Center);
+        // The same admitted rows/image handles and existing painter; no new
+        // terminal, no callbacks into owner input/scroll/IME and no grid fitting.
+        let terminal: Element<'_, Message> = TermWidget::new(
+            frame.projection.row_view(),
+            frame.cursor,
+            frame.cursor_visible,
+            frame.cursor_shape,
+            false,
+            &self.theme,
+            self.metrics,
+            self.mono,
+            self.cjk_mono,
+            self.symbol_mono,
+            self.math_symbol,
+            self.nerd_symbol,
+            Vec::new(),
+            frame.projection.scroll_offset(),
+            frame.projection.max_scroll_offset(),
+        )
+        .dynamic_palette(&frame.palette)
+        .dynamic_defaults(frame.foreground, frame.background, frame.cursor_color)
+        .images(frame.images.clone())
+        .into();
+        container(
+            column![
+                header,
+                container(terminal)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .clip(true)
+            ]
+            .spacing(8),
+        )
+        .padding(8)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(container::rounded_box)
+        .into()
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
+        let message = match message {
+            Message::NativeWindowEvent(id, message) => {
+                if observer::role(self.owner_window, id, self.observers.contains_key(&id))
+                    == Some(observer::Role::Observer)
+                {
+                    if matches!(*message, Message::NativeWindowClosed) {
+                        self.observers.remove(&id);
+                        return Task::none();
+                    }
+                    return if matches!(*message, Message::WindowClose) {
+                        self.update(Message::CloseObserver(id))
+                    } else {
+                        Task::none()
+                    };
+                }
+                if observer::role(self.owner_window, id, false) != Some(observer::Role::Owner) {
+                    return Task::none();
+                }
+                if matches!(*message, Message::NativeWindowClosed) {
+                    self.owner_window = None;
+                    return self.exit_flushing_durable_state();
+                }
+                *message
+            }
+            Message::OwnerWindowOpened(id) => {
+                if self.owner_window == Some(id) {
+                    return self.update(Message::Eva(eva_companion::Event::Bind(id)));
+                }
+                return Task::none();
+            }
+            Message::OpenObserver(target) => return self.open_observer(target),
+            Message::ObserverOpened(id) => {
+                // An open result queued after view cancellation owns no data.
+                return if self.observers.contains_key(&id) {
+                    Task::none()
+                } else {
+                    iced::window::close(id)
+                };
+            }
+            Message::CloseObserver(id) => {
+                if self.observers.remove(&id).is_some() {
+                    return iced::window::close(id);
+                }
+                return Task::none();
+            }
+            message => message,
+        };
+        let task = self.update_owner(message);
+        self.refresh_observers();
+        task
+    }
+
+    fn update_owner(&mut self, message: Message) -> Task<Message> {
         if iced::advanced::subscription::Event::input_overloaded() {
             // The latch was set synchronously by admission. Reject even a
             // Return, widget submit, or paste already in the downstream sink.
@@ -17520,6 +17837,9 @@ impl Frost {
             self.sync_organism_watch();
         }
         match message {
+            Message::NativeWindowEvent(..) | Message::NativeWindowClosed | Message::OwnerWindowOpened(..)
+                | Message::OpenObserver(..) | Message::ObserverOpened(..)
+                | Message::CloseObserver(..) => {},
             Message::Eva(event) => self.eva_event(event),
             Message::ReferenceToolsToggle => {
                 self.native_enter_ownership.lock().claim_held();
@@ -17813,6 +18133,10 @@ impl Frost {
             }
             Message::PtyOutput(id, fd, data, watch_stamp) => {
                 let t0 = std::time::Instant::now();
+                let observed = self
+                    .observers
+                    .values()
+                    .any(|view| !view.closed && view.target.id == id);
                 let is_active_output = native_companion::active_output(
                     self.sessions
                         .get(self.active)
@@ -17862,7 +18186,9 @@ impl Frost {
                     sess.block_selection.retain(&retained_block_ids);
                     sess.block_bookmarks.retain(&retained_block_ids);
                     sess.flush_responses();
-                    sess.refresh();
+                    if sess.view_attachment.attached() || observed {
+                        sess.refresh();
+                    }
                     clip_set = sess.terminal.take_osc52_clipboard_set();
                     clip_queries =
                         std::iter::from_fn(|| sess.terminal.take_osc52_clipboard_query()).collect();
@@ -19872,12 +20198,12 @@ impl Frost {
                         &session_key,
                         Some(code),
                     );
-                    if task_bound {
+                    if task_bound || !self.sessions[index].view_attachment.attached() {
                         self.organism.forget_session(id);
                         let session = &mut self.sessions[index];
                         session.hold_after_exit = true;
                         session.resize_repaint = None;
-                        if session.terminal.sync_output_active {
+                        if session.terminal.vt.sync_output.active {
                             session.terminal.finish_synchronized_output();
                         }
                         session.refresh();
@@ -20661,9 +20987,7 @@ impl Frost {
                             // (any PTY-bound key, not Escape specifically).
                             if !sess.terminal.inline_cli_owner_active() {
                                 sess.block_selection.clear();
-                                sess.terminal.scroll_to_bottom();
-                                sess.transcript_canvas.navigate(0);
-                                sess.projection_view_state.scroll_to_bottom();
+                                sess.scroll_after_input();
                             }
                             let accepted = sess.write_pty(&bytes);
                             sess.note_cli_keyboard_input(&bytes, accepted);
@@ -20741,9 +21065,7 @@ impl Frost {
                             // as `encode_key` and the paste paths.
                             if !sess.terminal.inline_cli_owner_active() {
                                 sess.block_selection.clear();
-                                sess.terminal.scroll_to_bottom();
-                                sess.transcript_canvas.navigate(0);
-                                sess.projection_view_state.scroll_to_bottom();
+                                sess.scroll_after_input();
                             }
                             let accepted = sess.write_pty(text.as_bytes());
                             sess.note_cli_keyboard_input(text.as_bytes(), accepted);
@@ -20988,18 +21310,22 @@ impl Frost {
                 }
                 match image_drop::prompt_payload(&[path]) {
                     Ok(payload) => {
-                        let Some(id) = self.sessions.get(self.active).map(|session| session.id)
+                        let Some(view) = self.sessions.get(self.active).and_then(|session| session.view_attachment.input_ticket())
                         else {
                             return Task::none();
                         };
-                        return Task::done(Message::PromptInsert(id, payload));
+                        return Task::done(Message::PromptInsert(view, payload));
                     }
                     Err(error) => {
                         self.push_toast(format!("Image drop rejected: {error}"), ToastKind::Warning)
                     }
                 }
             }
-            Message::Pasted(id, Some(text)) => {
+            Message::ChangeTerminalView(ticket, attach) => return self.change_terminal_view(ticket, attach),
+            Message::Pasted(view, Some(text)) => {
+                let Some(id) = self.view_input_session(&view) else {
+                    return Task::none();
+                };
                 match crate::review_text::sanitize_prompt_payload(
                     &text,
                     MAX_PTY_WRITE_QUEUE_BYTES,
@@ -21021,7 +21347,10 @@ impl Frost {
                 }
             }
             Message::Pasted(_, None) => {}
-            Message::PromptInsert(id, text) => {
+            Message::PromptInsert(view, text) => {
+                let Some(id) = self.view_input_session(&view) else {
+                    return Task::none();
+                };
                 match crate::review_text::sanitize_prompt_payload(
                     &text,
                     crate::review_text::MAX_PROMPT_INSERT_BYTES,
@@ -21040,7 +21369,10 @@ impl Frost {
                     ),
                 }
             }
-            Message::PromptRecall(id, command) => {
+            Message::PromptRecall(view, command) => {
+                let Some(id) = self.view_input_session(&view) else {
+                    return Task::none();
+                };
                 // Recall replays a row the history picker showed, so it must
                 // accept everything that picker accepts.
                 match crate::review_text::sanitize_untrusted_single_line(
@@ -21170,17 +21502,16 @@ impl Frost {
             // to ask, and only while the button that started them is held.
             // `latest()` resolves the single application window.
             Message::WindowDrag => {
-                return iced::window::latest().and_then(iced::window::drag);
+                return self.owner_window.map(iced::window::drag).unwrap_or_else(Task::none);
             }
             Message::WindowResizeDrag(direction) => {
-                return iced::window::latest()
-                    .and_then(move |id| iced::window::drag_resize(id, direction));
+                return self.owner_window.map(|id| iced::window::drag_resize(id, direction)).unwrap_or_else(Task::none);
             }
             Message::WindowMinimize => {
-                return iced::window::latest().and_then(|id| iced::window::minimize(id, true));
+                return self.owner_window.map(|id| iced::window::minimize(id, true)).unwrap_or_else(Task::none);
             }
             Message::WindowToggleMaximize => {
-                return iced::window::latest().and_then(iced::window::toggle_maximize);
+                return self.owner_window.map(iced::window::toggle_maximize).unwrap_or_else(Task::none);
             }
             Message::TabDragStart(id) => {
                 if self.tab_index_by_id(id).is_some() {
@@ -22208,9 +22539,7 @@ impl Frost {
                 }
                 if token.kind() == chat_mode::ControlKind::Submit {
                     sess.block_selection.clear();
-                    sess.terminal.scroll_to_bottom();
-                    sess.transcript_canvas.navigate(0);
-                    sess.projection_view_state.scroll_to_bottom();
+                    sess.scroll_after_input();
                 }
                 if !sess.managed_remote
                     && self.organism.is_local(sess.id)
@@ -26788,7 +27117,7 @@ impl Frost {
     /// [`Self::build_block_paint_rows`] so card painting and the badge anchor can
     /// never disagree about where the live card is.
     fn active_zone_span(terminal: &terminal::TerminalState) -> Option<(usize, usize)> {
-        let total = terminal.scrollback_len() + terminal.screen.grid.rows();
+        let total = terminal.scrollback_len() + terminal.vt.screen.grid.rows();
         let active_start = terminal
             .running_zone_start()
             .or_else(|| terminal.live_prompt_row())?;
@@ -26961,7 +27290,7 @@ impl Frost {
             return Vec::new();
         }
         let terminal = &sess.terminal;
-        let total = terminal.scrollback_len() + terminal.screen.grid.rows();
+        let total = terminal.scrollback_len() + terminal.vt.screen.grid.rows();
         let running = terminal.running_zone_start();
         let live_prompt = terminal.live_prompt_row();
         let live_boundary = running.or(live_prompt).unwrap_or(total);
@@ -27471,7 +27800,7 @@ impl Frost {
                                 zone.completion_provenance,
                             )
                             .map(|mut text| {
-                                let budget = sess.terminal.screen.grid.cols().saturating_sub(3);
+                                let budget = sess.terminal.vt.screen.grid.cols().saturating_sub(3);
                                 if text.chars().count() > budget {
                                     text = text.chars().take(budget).collect();
                                 }
@@ -27505,6 +27834,21 @@ impl Frost {
     /// cells, selection, search, links, image placement and pointer routing.
     fn pane_view(&self, sess_idx: usize) -> Element<'_, Message> {
         let sess = &self.sessions[sess_idx];
+        if !sess.view_attachment.attached() {
+            let state = if sess.transcript_read_only() {
+                "Terminal exited · output retained"
+            } else {
+                "Terminal view detached · session still running"
+            };
+            return container(column![
+                text(state).size(self.effective_font_size()),
+                button("Reattach terminal view")
+                    .on_press(Message::ChangeTerminalView(sess.view_attachment.ticket(), true)),
+            ].spacing(12))
+                .padding(20)
+                .center(Length::Fill)
+                .into();
+        }
         if let Some(editor) = self.vim9_tabs.get(&sess.id) {
             let id = sess.id;
             return editor
@@ -27524,7 +27868,7 @@ impl Frost {
                 sess.projection.row_view(),
                 (0, 0),
                 false,
-                sess.terminal.screen.cursor_shape,
+                sess.terminal.vt.screen.cursor_shape,
                 self.focused && sess_idx == self.active && self.terminal_input_active(),
                 &self.theme,
                 self.metrics,
@@ -27649,7 +27993,7 @@ impl Frost {
             sess.projection.row_view(),
             sess.cursor,
             sess.cursor_visible,
-            sess.terminal.screen.cursor_shape,
+            sess.terminal.vt.screen.cursor_shape,
             focused,
             &self.theme,
             self.metrics,
@@ -34886,7 +35230,7 @@ impl Frost {
                     .map(|(id, message)| Message::EmbeddedVim(id, Box::new(message))),
             );
         }
-        let events = iced::event::listen_with(|event, status, id| match event {
+        let events = iced::event::listen_with(|event, status, id| (match event {
             iced::Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
                 Some(Message::ModifiersChanged(m))
             }
@@ -34970,6 +35314,7 @@ impl Frost {
             iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
             iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
             iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::WindowClose),
+            iced::Event::Window(iced::window::Event::Closed) => Some(Message::NativeWindowClosed),
             // Catch every left-button release so a tab drag that ends outside
             // any tab still clears `dragging_tab`. When the release lands on a
             // tab, mouse_area's on_release fires Message::TabDragEnd first
@@ -34981,7 +35326,7 @@ impl Frost {
                 iced::touch::Event::FingerLifted { .. } | iced::touch::Event::FingerLost { .. },
             ) => Some(Message::TabDragCancel),
             _ => None,
-        });
+        }).map(|message| Message::NativeWindowEvent(id, Box::new(message))));
         subs.push(events);
         // Native presented-frame notifications avoid synchronous layout recursion
         // in Widget::update. Invisible or settled panes own no frame stream.
@@ -34991,9 +35336,10 @@ impl Frost {
                 && session.transcript_canvas.animating()
             {
                 subs.push(
-                    iced::window::frames()
-                        .with((session.id, self.terminal_interaction_epoch))
-                        .map(|((id, epoch), _)| Message::TranscriptFrame(id, epoch)),
+                    iced::event::listen_raw(|event, _status, window| {
+                        matches!(event, iced::Event::Window(iced::window::Event::RedrawRequested(_))).then_some(window)
+                    }).with((session.id, self.terminal_interaction_epoch))
+                        .map(|((id, epoch), window)| Message::NativeWindowEvent(window, Box::new(Message::TranscriptFrame(id, epoch)))) ,
                 );
             }
         }
@@ -35073,9 +35419,9 @@ impl Frost {
             // Iced supplies no native snapshot of buttons pressed outside this
             // window; only observed button-down/drag state is claimed here.
             subs.push(iced::event::listen_with(if live_visible {
-                |event, _status, _id| organism_pointer_event(event, true)
+                |event, _status, id| organism_pointer_event(event, true).map(|message| Message::NativeWindowEvent(id, Box::new(message)))
             } else {
-                |event, _status, _id| organism_pointer_event(event, false)
+                |event, _status, id| organism_pointer_event(event, false).map(|message| Message::NativeWindowEvent(id, Box::new(message)))
             }));
         }
         if self.organism_interaction_eligible() {
@@ -35097,12 +35443,12 @@ impl Frost {
         // the terminal itself only reports motion while dragging.
         if self.hovered_tab.is_some() {
             subs.push(iced::event::listen_with(
-                |event, _status, _id| match event {
+                |event, _status, id| (match event {
                     iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
                         Some(Message::TabPointerMoved(position))
                     }
                     _ => None,
-                },
+                }).map(|message| Message::NativeWindowEvent(id, Box::new(message))),
             ));
         }
         // Same trick for the file-ops menu anchor: track the window-space
@@ -35110,12 +35456,12 @@ impl Frost {
         // so motion elsewhere never rebuilds the view.
         if self.sidebar_hovered && self.files_surface_visible() {
             subs.push(iced::event::listen_with(
-                |event, _status, _id| match event {
+                |event, _status, id| (match event {
                     iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
                         Some(Message::SidebarPointerMoved(position))
                     }
                     _ => None,
-                },
+                }).map(|message| Message::NativeWindowEvent(id, Box::new(message))),
             ));
         }
         // Transfer progress poll: four updates a second while one runs, which
@@ -37444,7 +37790,7 @@ mod tests {
         let selected = session.terminal.copy_selection();
         assert!(selected.is_some());
         let before = session.transcript_canvas.position_rows();
-        let page = session.terminal.screen.grid.rows().saturating_sub(2).max(1) as f64;
+        let page = session.terminal.vt.screen.grid.rows().saturating_sub(2).max(1) as f64;
         let start = std::time::Instant::now();
         session.scroll_transcript(page, false, start);
         for frame in 1..=120 {
@@ -37545,7 +37891,7 @@ mod tests {
                 session.terminal.process_batch(partial_update);
                 session.refresh();
             }
-            assert!(session.terminal.sync_output_active);
+            assert!(session.terminal.vt.sync_output.active);
             assert!(!session.terminal.projection_interaction_allowed(&published));
             session.terminal.update_inline_text_selection((row + 1, 7));
             assert_eq!(
@@ -37763,7 +38109,7 @@ mod tests {
         for required in [
             "self.focused",
             "self.terminal_input_active()",
-            "session.ime_identity",
+            "session.view_attachment.input_owner()",
             "clear_preedit",
         ] {
             assert!(sync.contains(required));
@@ -38231,7 +38577,7 @@ mod tests {
             .0;
         assert!(accept.contains("(state.target_session_id(), workflow)"));
         assert!(accept.contains("WorkflowArgsState::new(target_session_id, workflow)"));
-        assert!(accept.contains("Message::PromptRecall(target_session_id, command)"));
+        assert!(accept.contains("self.recall_into_session(target_session_id, command)"));
         assert!(accept.contains("let id = form.target_session_id();"));
         assert!(!accept.contains("self.active"));
         assert!(!accept.contains("recall_into_active_pane"));
@@ -41323,7 +41669,7 @@ mod tests {
     #[test]
     fn search_reveal_expands_only_the_matching_block_and_locates_real_output() {
         let mut fixture = search_reveal_fixture();
-        let raw = fixture.terminal.screen.grid.to_vec();
+        let raw = fixture.terminal.vt.screen.grid.to_vec();
         assert!(apply_search_reveal(
             &fixture.target,
             &fixture.search,
@@ -41336,7 +41682,7 @@ mod tests {
         assert!(!fixture.policy.is_collapsed(fixture.target.zone_id));
         assert!(fixture.policy.is_collapsed(fixture.other_zone));
         assert_eq!(
-            fixture.terminal.screen.grid.to_vec(),
+            fixture.terminal.vt.screen.grid.to_vec(),
             raw,
             "reveal only changes presentation"
         );
@@ -42739,8 +43085,8 @@ mod tests {
             let released = take_terminal_mouse_gesture(&mut gestures, 7, button).unwrap();
             let cell = released.app_release_cell(
                 gap_cell,
-                terminal.screen.grid.row_len(),
-                terminal.screen.grid.rows(),
+                terminal.vt.screen.grid.row_len(),
+                terminal.vt.screen.grid.rows(),
             );
             assert_eq!(cell, Some((11, 3)));
             let (col, row) = cell.unwrap();
@@ -46092,7 +46438,7 @@ mod tests {
                 .locate_raw_cell_in_projection(&fixture.projection, origin,),
             terminal::ProjectedRawCellLocation::Hidden { .. }
         ));
-        let grid = fixture.terminal.screen.grid.to_vec();
+        let grid = fixture.terminal.vt.screen.grid.to_vec();
         let cursor = fixture.terminal.get_cursor_pos();
         assert!(expand_block_search_hit(
             &fixture.terminal,
@@ -46112,7 +46458,7 @@ mod tests {
             &mut fixture.view_state,
             origin,
         ));
-        assert_eq!(fixture.terminal.screen.grid.to_vec(), grid);
+        assert_eq!(fixture.terminal.vt.screen.grid.to_vec(), grid);
         assert_eq!(fixture.terminal.get_cursor_pos(), cursor);
         assert!(
             !expand_block_search_hit(

@@ -183,7 +183,7 @@ with open("captured", "wb", buffering=0) as output:
     assert!(host.sessions[0].pty.input_backlog().is_err());
     let session_count = host.sessions.len();
     for message in [
-        Message::Pasted(0, Some("printf SHOULD_NOT_RUN\n".into())),
+        Message::Pasted(host.sessions[0].view_attachment.ticket(), Some("printf SHOULD_NOT_RUN\n".into())),
         Message::AgentSubmit,
         Message::AiChatsSubmit,
         Message::SidebarDialogSubmit,

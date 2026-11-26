@@ -1445,6 +1445,7 @@ mod tests {
         let moved = root.0.join("moved");
         let other = root.0.join("other");
         fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(&other).unwrap();
         fs::write(parent.join("snapshot"), b"original").unwrap();
         fs::write(other.join("snapshot"), b"unrelated").unwrap();
@@ -1471,13 +1472,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn failed_atomic_snapshot_publish_cleans_the_validated_parent() {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{symlink, PermissionsExt};
 
         let root = Scratch::new("snapshot-parent-cleanup");
         let parent = root.0.join("parent");
         let moved = root.0.join("moved");
         let other = root.0.join("other");
         fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(parent.join("snapshot")).unwrap();
         fs::create_dir(&other).unwrap();
         fs::write(other.join("snapshot"), b"unrelated").unwrap();

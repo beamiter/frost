@@ -31,6 +31,7 @@ pub mod conversion;
 
 /// Frost opt-in native key ownership boundary; see FROST_PATCH.md.
 pub mod native_events;
+pub mod ime_control;
 pub mod presentation_observer;
 
 mod error;
@@ -1204,7 +1205,9 @@ async fn run_instance<P>(
                         };
                         #[cfg(target_os = "linux")]
                         let (result, published) = if feedback.is_some() {
-                            wgpu_hal::vulkan::publication::observe(present)
+                            if window.raw.native_frame_feedback_is_surface_bound() {
+                                wgpu_hal::vulkan::publication::observe_submission(present)
+                            } else { wgpu_hal::vulkan::publication::observe(present) }
                         } else { (present(), false) };
                         #[cfg(not(target_os = "linux"))]
                         let (result, published) = (present(), false);

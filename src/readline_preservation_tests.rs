@@ -160,7 +160,7 @@ fn run_child(root: &Path) {
             Arc::clone(&app.sessions[0].ime_identity),
         );
         let cursor = app.sessions[0].terminal.get_cursor_pos();
-        let original_cols = app.sessions[0].terminal.screen.grid.cols();
+        let original_cols = app.sessions[0].terminal.vt.screen.grid.cols();
         assert!(app.sessions[0].terminal.scrollback_len() > 0);
 
         // Real command dispatch and reducers, not a source-text assertion.
@@ -245,7 +245,7 @@ fn run_child(root: &Path) {
             .unwrap();
         assert_eq!(app.sessions.len(), 2);
         assert_eq!(app.active, 1);
-        assert!(app.sessions[0].terminal.screen.grid.cols() < original_cols);
+        assert!(app.sessions[0].terminal.vt.screen.grid.cols() < original_cols);
         assert!(app.history_reflow_sessions.contains(&original.0));
         wait_prompt(&mut app, 1);
         assert_eq!(

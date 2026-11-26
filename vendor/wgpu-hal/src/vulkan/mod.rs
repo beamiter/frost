@@ -1665,6 +1665,7 @@ impl crate::Queue for Queue {
                 }
             })?
         };
+        publication::submitted();
         if publication_id != 0 {
             let wait = khr::present_wait::Device::new(&ssc.device.instance.raw, &ssc.device.raw);
             // The swapchain remains locked/live throughout the wait. Timeout,

@@ -69,6 +69,8 @@ where
 
         let _ = self.aliases.insert(window.id(), id);
 
+        crate::ime_control::register(id, &window);
+
         let _ = self.entries.insert(
             id,
             Window {
@@ -141,6 +143,7 @@ where
 
     pub fn remove(&mut self, id: Id) -> Option<Window<P, C>> {
         let window = self.entries.remove(&id)?;
+        crate::ime_control::unregister(id);
         let _ = self.aliases.remove(&window.raw.id());
 
         Some(window)

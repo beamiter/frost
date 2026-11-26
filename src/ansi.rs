@@ -7,7 +7,6 @@
 //! without ever allocating from untrusted cursor coordinates without a cap.
 
 use std::collections::BTreeMap;
-use unicode_normalization::UnicodeNormalization;
 
 const MAX_GRID_ROWS: usize = 100_000;
 const MAX_GRID_COLS: usize = 10_000;
@@ -197,12 +196,7 @@ fn combine_with_previous(
     if *base == '\0' {
         return;
     }
-    let mut combined = String::with_capacity(8);
-    combined.push(*base);
-    combined.push(mark);
-    let normalized: String = combined.nfc().collect();
-    let mut chars = normalized.chars();
-    if let (Some(character), None) = (chars.next(), chars.next()) {
+    if let Some(character) = jterm_engine::screen::compose_scalar_pair(*base, mark) {
         *base = character;
     }
 }
@@ -1206,3 +1200,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ansi_composition_oracles.rs"]
+mod composition_oracles;

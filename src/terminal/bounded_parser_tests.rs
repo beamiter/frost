@@ -27,11 +27,11 @@ fn bounded_private_strings_never_leak_and_capture_recovers_in_same_feed() {
             terminal.process_input(&packet[..cut]);
             terminal.process_input(&packet[cut..]);
             assert_eq!(
-                terminal.parser.rejected_count(),
+                terminal.vt.parser.rejected_count(),
                 1,
                 "intro={intro} cut={cut}"
             );
-            assert_eq!(terminal.parser.retained_bytes(), 0);
+            assert_eq!(terminal.vt.parser.retained_bytes(), 0);
             assert!(terminal.get_output().is_empty());
             assert!(terminal.titles.window_title.is_empty());
             let raw = terminal
@@ -91,15 +91,15 @@ fn bounded_discard_bel_and_cancellation_preserve_capture_privacy() {
 fn bounded_osc8_rejection_clears_only_active_link() {
     let mut terminal = TerminalState::new(40, 8);
     terminal.process_input(b"\x1b]8;;https://safe.test\x1b\\A");
-    let old = terminal.screen.grid[0][0].hyperlink_id;
+    let old = terminal.vt.screen.grid[0][0].hyperlink_id;
     assert!(!old.is_none());
     let mut attack = b"\x1b]8;;SECRET".to_vec();
     attack.resize(MAX_PENDING_ESCAPE + 3, b'x');
     terminal.process_input(&attack);
-    assert!(terminal.screen.current_hyperlink.is_none());
+    assert!(terminal.vt.screen.current_hyperlink.is_none());
     terminal.process_input(b"\x1b\\B");
-    assert_eq!(terminal.screen.grid[0][0].hyperlink_id, old);
-    assert!(terminal.screen.grid[0][1].hyperlink_id.is_none());
+    assert_eq!(terminal.vt.screen.grid[0][0].hyperlink_id, old);
+    assert!(terminal.vt.screen.grid[0][1].hyperlink_id.is_none());
     assert!(terminal.get_output().is_empty());
 }
 
@@ -109,7 +109,7 @@ fn bounded_normal_stream_matches_legacy_at_every_split() {
     for cut in 0..=bytes.len() {
         let mut strict = ready();
         let mut legacy = ready();
-        legacy.parser = Parser::with_profile(
+        legacy.vt.parser = Parser::with_profile(
             ParserLimits {
                 pending_bytes: MAX_PENDING_ESCAPE,
                 kitty_recovery_bytes: jterm_core::kitty_graphics::MAX_CONTROL_BYTES,
@@ -122,7 +122,7 @@ fn bounded_normal_stream_matches_legacy_at_every_split() {
         }
         for row in 0..8 {
             assert_eq!(
-                strict.screen.grid[row], legacy.screen.grid[row],
+                strict.vt.screen.grid[row], legacy.vt.screen.grid[row],
                 "cut={cut}"
             );
         }
@@ -140,7 +140,7 @@ fn bounded_normal_stream_matches_legacy_at_every_split() {
                 .map(|p| p.raw_bytes()),
             "capture cut={cut}"
         );
-        assert_eq!(strict.parser.rejected_count(), 0);
+        assert_eq!(strict.vt.parser.rejected_count(), 0);
     }
 }
 
@@ -154,14 +154,14 @@ fn bounded_exact_payload_limit_and_plus_one_are_consumer_partition_invariant() {
             for cut in [0, 2, MAX_PENDING_ESCAPE + 1, packet.len() - 2, packet.len()] {
                 let mut terminal = ready();
                 terminal.process_input(&packet[..cut]);
-                assert!(terminal.parser.retained_bytes() <= MAX_PENDING_ESCAPE + 3);
+                assert!(terminal.vt.parser.retained_bytes() <= MAX_PENDING_ESCAPE + 3);
                 terminal.process_input(&packet[cut..]);
                 assert_eq!(
-                    terminal.parser.rejected_count(),
+                    terminal.vt.parser.rejected_count(),
                     u64::from(payload_len > MAX_PENDING_ESCAPE),
                     "intro={intro} payload={payload_len} cut={cut}"
                 );
-                assert_eq!(terminal.parser.retained_bytes(), 0);
+                assert_eq!(terminal.vt.parser.retained_bytes(), 0);
                 assert_eq!(
                     terminal
                         .idle_background_output
@@ -198,7 +198,7 @@ fn bounded_small_kitty_can_sub_do_not_reflect_old_error_reply() {
                     .raw_bytes(),
                 b"beforeZ"
             );
-            assert_eq!(terminal.parser.retained_bytes(), 0);
+            assert_eq!(terminal.vt.parser.retained_bytes(), 0);
         }
     }
 }
@@ -268,11 +268,11 @@ fn bounded_csi_capacity_reaches_host_without_suffix_execution() {
             terminal.process_input(&bytes[..cut]);
             terminal.process_input(&bytes[cut..]);
             assert_eq!(
-                terminal.screen.grid[0][0].character, 'Z',
+                terminal.vt.screen.grid[0][0].character, 'Z',
                 "zeros={zeros} cut={cut}"
             );
             assert_eq!(
-                terminal.screen.grid[0][0].flags.bold(),
+                terminal.vt.screen.grid[0][0].flags.bold(),
                 zeros == 127,
                 "zeros={zeros} cut={cut}"
             );
@@ -281,7 +281,7 @@ fn bounded_csi_capacity_reaches_host_without_suffix_execution() {
                 b"\x1b[1;2R",
                 "zeros={zeros} cut={cut}"
             );
-            assert_eq!(terminal.parser.retained_bytes(), 0);
+            assert_eq!(terminal.vt.parser.retained_bytes(), 0);
         }
     }
     for zeros in [126, 127, 128] {
@@ -297,9 +297,9 @@ fn bounded_csi_capacity_reaches_host_without_suffix_execution() {
                 zeros == 126,
                 "zeros={zeros} cut={cut}"
             );
-            assert_eq!(terminal.screen.grid[0][0].character, 'Z');
+            assert_eq!(terminal.vt.screen.grid[0][0].character, 'Z');
             assert_eq!(terminal.get_output(), b"\x1b[1;2R");
-            assert_eq!(terminal.parser.retained_bytes(), 0);
+            assert_eq!(terminal.vt.parser.retained_bytes(), 0);
         }
     }
 }
@@ -319,13 +319,13 @@ fn bounded_cancelled_csi_cannot_change_host_color_or_cursor_mode() {
             assert!(!terminal.is_application_cursor_keys());
             for (col, character) in ['m', 'h', 'Z'].into_iter().enumerate() {
                 assert_eq!(
-                    terminal.screen.grid[0][col].character, character,
+                    terminal.vt.screen.grid[0][col].character, character,
                     "cancel={cancel} cut={cut}"
                 );
-                assert_eq!(terminal.screen.grid[0][col].foreground, Color::Default);
+                assert_eq!(terminal.vt.screen.grid[0][col].foreground, Color::Default);
             }
             assert_eq!(terminal.get_output(), b"\x1b[1;4R");
-            assert_eq!(terminal.parser.retained_bytes(), 0);
+            assert_eq!(terminal.vt.parser.retained_bytes(), 0);
         }
     }
 }

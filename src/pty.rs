@@ -11,6 +11,8 @@ mod unix_pty {
     use jterm_core::native_pty_launch::{
         launch_pty, PtyLaunch, PtyLaunchError, StartupError, StartupStage, WorkingDirectory,
     };
+    use jterm_core::pty_io::{resize_master, write_native_master, PtyWriteAttempt};
+    use jterm_core::session_actor::WriteOutcome;
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
     use std::path::Path;
     use std::sync::OnceLock;
@@ -21,12 +23,7 @@ mod unix_pty {
     // immediately, and anything slower is not worth waiting on.
     const JSH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum ChildLifecycle {
-        Running,
-        TerminationStarted,
-        Reaped,
-    }
+    use jterm_core::process::{NativeChildPhase as ChildLifecycle, NativePtyChild};
 
     /// This process's own `PATH`, for the `host::` resolvers. `None` means "no
     /// search path" there rather than "use ours", so it is passed explicitly.
@@ -284,10 +281,8 @@ mod unix_pty {
 
     pub struct Pty {
         master: OwnedFd,
-        child_pid: i32,
+        child: NativePtyChild,
         session: companion_host::pty_session::PtySession,
-        exit_code_cached: Option<i32>,
-        lifecycle: ChildLifecycle,
     }
 
     impl Pty {
@@ -500,16 +495,14 @@ mod unix_pty {
             .adopt(|master, child_pid| {
                 Ok(Self {
                     master,
-                    child_pid,
+                    child: NativePtyChild::new(child_pid)?,
                     session: companion_host::pty_session::PtySession::capture(child_pid),
-                    exit_code_cached: None,
-                    lifecycle: ChildLifecycle::Running,
                 })
             })
         }
 
         pub fn get_child_pid(&self) -> i32 {
-            self.child_pid
+            self.child.pid()
         }
 
         pub fn session_activity(&self) -> companion_host::pty_session::Activity {
@@ -523,62 +516,35 @@ mod unix_pty {
         /// Single non-blocking write. Returns bytes written, `Ok(0)` if the
         /// buffer is full (WouldBlock), or an error for a real failure.
         pub fn write(&mut self, data: &[u8]) -> Result<usize> {
-            // One nonblocking syscall shares the fault linearization fence.
-            // EINTR retries release it, so a fault cannot starve behind retries.
-            loop {
-                match self.write_once(data) {
-                    Ok(count) => return Ok(count),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(0),
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(anyhow!("Failed to write to PTY: {error}")),
-                }
+            let outcome = write_native_master(self.master.as_fd(), data, Self::write_admitted)
+                .map_err(|error| anyhow!("Failed to write to PTY: {error}"))?;
+            match outcome {
+                WriteOutcome::Written(count) => Ok(count),
+                WriteOutcome::WouldBlock => Ok(0),
             }
         }
 
-        fn write_once(&self, data: &[u8]) -> std::io::Result<usize> {
-            iced::advanced::subscription::Event::with_native_input_write(|| {
-                // SAFETY: master is still owned and data is readable for the syscall.
-                let count =
-                    unsafe { libc::write(self.master_fd(), data.as_ptr().cast(), data.len()) };
-                if count < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(count as usize)
-                }
-            })
-            .unwrap_or_else(|| {
-                Err(std::io::Error::other(
-                    "native input overloaded; restart required",
-                ))
-            })
+        fn write_admitted(attempt: PtyWriteAttempt<'_>) -> std::io::Result<usize> {
+            iced::advanced::subscription::Event::with_native_input_write(|| attempt.run())
+                .unwrap_or_else(|| {
+                    Err(std::io::Error::other(
+                        "native input overloaded; restart required",
+                    ))
+                })
         }
 
         pub(crate) fn child_is_running(&self) -> bool {
-            self.lifecycle == ChildLifecycle::Running
-                && matches!(Self::observe_child_exit(self.child_pid), Ok(None))
+            self.child.phase() == ChildLifecycle::Running
+                && matches!(Self::observe_child_exit(self.child.pid()), Ok(None))
         }
 
         pub fn resize(&mut self, cols: usize, rows: usize) -> Result<()> {
-            // SAFETY: win_size 是有效的栈上变量，符合 libc::winsize 的内存布局。
-            // ioctl TIOCSWINSZ 调用是标准的 PTY 窗口大小设置操作。
-            unsafe {
-                let win_size = libc::winsize {
-                    ws_row: pty_dimension(rows),
-                    ws_col: pty_dimension(cols),
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
-                };
-
-                if libc::ioctl(
-                    self.master_fd(),
-                    libc::TIOCSWINSZ,
-                    (&win_size) as *const _ as *mut libc::c_void,
-                ) < 0
-                {
-                    return Err(anyhow!("Failed to resize PTY"));
-                }
-            }
-            Ok(())
+            resize_master(
+                self.master.as_fd(),
+                pty_dimension(cols),
+                pty_dimension(rows),
+            )
+            .map_err(|_| anyhow!("Failed to resize PTY"))
         }
 
         /// The child's real exit status once reaped (negative = `-signal`),
@@ -586,12 +552,12 @@ mod unix_pty {
         /// Task terminals report this to the task reducer on PTY EOF.
         pub fn exited_code(&mut self) -> Option<i32> {
             let _ = self.is_alive();
-            self.exit_code_cached
+            self.child.cached_code()
         }
 
         #[cfg(test)]
         pub(crate) fn cached_exit_code(&self) -> Option<i32> {
-            self.exit_code_cached
+            self.child.cached_code()
         }
 
         /// Observe a child's exit status without consuming it (`waitid` with
@@ -616,150 +582,21 @@ mod unix_pty {
             }
         }
 
-        /// The direct child is known to be exited but deliberately unreaped.
-        /// Kill its still-owned private process group first — background jobs
-        /// the shell left behind must not survive a natural leader exit — then
-        /// consume the original leader status exactly once. SIGKILL cannot
-        /// change a status that is already waitable, so a successful exit
-        /// keeps its real code.
-        fn finish_observed_exit(&mut self) -> std::io::Result<i32> {
-            if let Some(code) = self.exit_code_cached {
-                return Ok(code);
-            }
-            // The wait owner retains the zombie anchor through this bounded
-            // drain, including jobs in other process groups of the session.
-            self.session.drain_after_exit()?;
-            // SAFETY: WNOWAIT kept child_pid unreaped, so its process-group ID
-            // cannot be recycled between this signal and the waitpid below.
-            let killed = unsafe { libc::kill(-self.child_pid, libc::SIGKILL) };
-            if killed < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    // Preserve the zombie ownership anchor and retry rather
-                    // than publishing completion while a group we failed to
-                    // terminate may still be active.
-                    return Err(error);
-                }
-            }
-
-            let mut status = 0;
-            let result = loop {
-                // SAFETY: the observed child is waitable and still owned by
-                // this Pty. is_alive/terminate serialize on `&mut self`, and
-                // the detached reaper only runs after TerminationStarted, so
-                // no other path can wait on this child concurrently.
-                let result = unsafe { libc::waitpid(self.child_pid, &mut status, 0) };
-                if result >= 0 {
-                    break result;
-                }
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ECHILD) {
-                    // Already reaped elsewhere despite the anchor; the status
-                    // is unknown and must not masquerade as a clean exit.
-                    self.exit_code_cached = Some(-1);
-                    self.lifecycle = ChildLifecycle::Reaped;
-                    return Ok(-1);
-                }
-                if error.raw_os_error() != Some(libc::EINTR) {
-                    return Err(error);
-                }
-            };
-            if result != self.child_pid {
-                return Err(std::io::Error::other(
-                    "waitpid returned no status for an observed PTY exit",
-                ));
-            }
-            let code = jterm_core::process::decode_wait_status(status)
-                .and_then(jterm_core::process::ChildExitOutcome::negative_signal_code)
-                .unwrap_or(-1);
-            self.exit_code_cached = Some(code);
-            self.lifecycle = ChildLifecycle::Reaped;
-            Ok(code)
-        }
-
         pub fn is_alive(&mut self) -> bool {
-            // A detached reaper owns TerminationStarted children. Never issue a
-            // second waitpid (or later signal) for a pid once teardown begins.
-            if self.lifecycle != ChildLifecycle::Running || self.exit_code_cached.is_some() {
-                return false;
-            }
-
-            match Self::observe_child_exit(self.child_pid) {
-                Ok(None) => true,
-                Ok(Some(_)) => match self.finish_observed_exit() {
-                    Ok(_) => false,
-                    Err(error) => {
-                        log::warn!("[PTY] could not finish observed PTY child exit: {error}");
-                        true
-                    }
-                },
-                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
-                    // Already reaped elsewhere. The status is unknown, so
-                    // stop polling without reporting a successful task exit.
-                    self.exit_code_cached = Some(-1);
-                    self.lifecycle = ChildLifecycle::Reaped;
-                    false
-                }
-                Err(error) => {
-                    // Conservatively keep the process live: an unrelated
-                    // waitid failure is not evidence that the PID was reaped.
-                    log::warn!("[PTY] waitid(WNOWAIT) failed while checking PTY child: {error}");
-                    true
-                }
-            }
+            let session = &self.session;
+            self.child.is_alive(|| session.drain_after_exit())
         }
 
         pub fn terminate(&mut self) -> Result<()> {
-            if self.begin_termination() {
-                let child_pid = self.child_pid;
-                std::thread::spawn(move || {
-                    std::thread::sleep(TERMINATION_GRACE);
-                    Self::kill_and_reap(child_pid);
-                });
-            }
+            let session = &self.session;
+            self.child
+                .terminate(TERMINATION_GRACE, || session.drain_after_exit());
             Ok(())
         }
 
         fn begin_termination(&mut self) -> bool {
-            // Neither a completed natural exit nor a previously delegated
-            // termination can target this numeric PID again.
-            if self.lifecycle != ChildLifecycle::Running || !self.is_alive() {
-                return false;
-            }
-            self.lifecycle = ChildLifecycle::TerminationStarted;
-            self.exit_code_cached = Some(-libc::SIGTERM);
-            // SAFETY: this live child is a session/process-group leader and
-            // its PID is still owned by this Pty.
-            unsafe {
-                let _ = libc::kill(-self.child_pid, libc::SIGHUP);
-                let _ = libc::kill(self.child_pid, libc::SIGTERM);
-            }
-            true
-        }
-
-        fn kill_and_reap(child_pid: i32) {
-            // Keep the zombie PID/PGID anchor until the final group signal.
-            // An ECHILD from observation means another owner consumed it.
-            if let Err(error) = Self::observe_child_exit(child_pid) {
-                if error.raw_os_error() != Some(libc::ECHILD) {
-                    log::warn!("could not observe terminating PTY child: {error}");
-                }
-                return;
-            }
-            // SAFETY: the owned leader has not been reaped, and waitpid
-            // targets only that direct child after signaling.
-            unsafe {
-                let _ = libc::kill(-child_pid, libc::SIGKILL);
-                let _ = libc::kill(child_pid, libc::SIGKILL);
-                let mut status = 0;
-                loop {
-                    if libc::waitpid(child_pid, &mut status, 0) >= 0
-                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
-                    {
-                        break;
-                    }
-                }
-            }
+            let session = &self.session;
+            self.child.begin_termination(|| session.drain_after_exit())
         }
     }
 
@@ -784,7 +621,6 @@ mod unix_pty {
             &mut self,
             data: &[u8],
         ) -> Result<jterm_core::session_actor::WriteOutcome, String> {
-            use jterm_core::session_actor::WriteOutcome;
             match Pty::write(self, data).map_err(|error| error.to_string())? {
                 0 => Ok(WriteOutcome::WouldBlock),
                 count => Ok(WriteOutcome::Written(count)),
@@ -819,11 +655,14 @@ mod unix_pty {
         }
 
         fn observe_before_reap_pid(&self) -> Option<i32> {
-            Some(self.child_pid)
+            Some(self.child.pid())
         }
 
         fn write_control_byte(&mut self, byte: u8) -> bool {
-            matches!(self.write_once(&[byte]), Ok(1))
+            matches!(
+                Self::write_admitted(PtyWriteAttempt::new(self.master.as_fd(), &[byte])),
+                Ok(1)
+            )
         }
 
         fn input_admitted() -> bool {
@@ -839,10 +678,7 @@ mod unix_pty {
         }
 
         fn force_kill_and_reap(&mut self) {
-            if self.lifecycle == ChildLifecycle::TerminationStarted {
-                Self::kill_and_reap(self.child_pid);
-                self.lifecycle = ChildLifecycle::Reaped;
-            }
+            self.child.finish_termination();
         }
     }
 
@@ -984,7 +820,7 @@ mod unix_pty {
 
             pty.terminate().expect("terminate the leader");
             pty.terminate().expect("repeated terminate is harmless");
-            assert_eq!(pty.lifecycle, ChildLifecycle::TerminationStarted);
+            assert_eq!(pty.child.phase(), ChildLifecycle::TerminationStarted);
             // Do not reap here: the detached thread is the sole wait owner.
             std::thread::sleep(Duration::from_millis(850));
             let leader_handled_term = leader_exited.exists();
@@ -993,7 +829,7 @@ mod unix_pty {
             let observed = unsafe {
                 libc::waitid(
                     libc::P_PID,
-                    pty.child_pid as libc::id_t,
+                    pty.child.pid() as libc::id_t,
                     &mut info,
                     libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
                 )
@@ -1016,13 +852,13 @@ mod unix_pty {
         fn terminate_is_idempotent_at_the_lifecycle_boundary() {
             let mut pty = Pty::new_with_cwd(80, 24, Some("/"), None, Some("/bin/sh"), None)
                 .expect("start /bin/sh in a PTY");
-            assert_eq!(pty.lifecycle, ChildLifecycle::Running);
+            assert_eq!(pty.child.phase(), ChildLifecycle::Running);
 
             pty.terminate().expect("first terminate succeeds");
-            assert_eq!(pty.lifecycle, ChildLifecycle::TerminationStarted);
+            assert_eq!(pty.child.phase(), ChildLifecycle::TerminationStarted);
 
             pty.terminate().expect("repeated terminate is a no-op");
-            assert_eq!(pty.lifecycle, ChildLifecycle::TerminationStarted);
+            assert_eq!(pty.child.phase(), ChildLifecycle::TerminationStarted);
         }
 
         #[test]
@@ -1055,7 +891,7 @@ mod unix_pty {
             // Observing the natural exit killed the group and reaped the
             // leader exactly once, preserving its real status.
             assert_eq!(pty.exited_code(), Some(0));
-            assert_eq!(pty.lifecycle, ChildLifecycle::Reaped);
+            assert_eq!(pty.child.phase(), ChildLifecycle::Reaped);
 
             // The old reap-first path published the exit while the background
             // child remained alive. Give that child enough time to prove it
@@ -1079,8 +915,8 @@ mod unix_pty {
             // establish success, and task terminals must not report it as 0.
             let mut status = 0;
             loop {
-                let result = unsafe { libc::waitpid(pty.child_pid, &mut status, 0) };
-                if result == pty.child_pid {
+                let result = unsafe { libc::waitpid(pty.child.pid(), &mut status, 0) };
+                if result == pty.child.pid() {
                     break;
                 }
                 assert_eq!(
@@ -1090,7 +926,7 @@ mod unix_pty {
             }
             assert!(!pty.is_alive());
             assert_eq!(pty.exited_code(), Some(-1));
-            assert_eq!(pty.lifecycle, ChildLifecycle::Reaped);
+            assert_eq!(pty.child.phase(), ChildLifecycle::Reaped);
         }
 
         #[test]
@@ -1098,7 +934,7 @@ mod unix_pty {
             let argv = vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                "sleep 0.2; exit 7".to_string(),
+                "IFS= read -r release || exit 8; exit 7".to_string(),
             ];
             let mut pty = Pty::new_with_cwd(80, 24, Some("/"), None, None, Some(&argv))
                 .expect("spawn observe test shell");
@@ -1107,6 +943,8 @@ mod unix_pty {
             // While the child runs, observation reports liveness without
             // disturbing a later reap.
             assert_eq!(Pty::observe_child_exit(child_pid).unwrap(), None);
+            let release = b"exit\n";
+            assert_eq!(pty.write(release).unwrap(), release.len());
 
             let deadline = Instant::now() + Duration::from_secs(2);
             let observed = loop {
@@ -1121,8 +959,13 @@ mod unix_pty {
             assert_eq!(observed, 7);
 
             // WNOWAIT left the status in place: is_alive still reaps the real
-            // code instead of finding an empty wait queue.
-            assert!(!pty.is_alive());
+            // code. An incomplete session drain keeps the wait owner for the
+            // next poll, so give it a bounded window to finish.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while pty.is_alive() {
+                assert!(Instant::now() < deadline, "observed child was not reaped");
+                std::thread::sleep(Duration::from_millis(10));
+            }
             assert_eq!(pty.exited_code(), Some(7));
         }
     }

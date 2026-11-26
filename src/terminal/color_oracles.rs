@@ -56,7 +56,7 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         lane(t.saved_primary_colors.dynamic_palette),
     );
     super::replay_protocol::observe(t, &mut out, Value::String);
-    fields!(t.screen;
+    fields!(t.vt.screen;
         use_alt_buffer,
         cursor_row,
         cursor_col,
@@ -77,16 +77,27 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         g1_charset,
         active_charset,
     );
-    let link = t.screen.current_hyperlink;
+    let link = t.vt.screen.current_hyperlink;
     out.insert(
         "current_hyperlink".into(),
         lane((!link.is_none()).then_some(link.as_raw())),
     );
     out.insert(
         "saved_primary_cursor_shape".into(),
-        lane(t.screen.saved_primary_cursor_shape.unwrap_or_default()),
+        lane(t.vt.screen.saved_primary_cursor_shape.unwrap_or_default()),
     );
     out.insert("scrollback".into(), scrollback_lane(&t.scrollback));
+    out.insert(
+        "pending_osc52_clipboard_set".into(),
+        lane(&t.osc52.pending_set),
+    );
+    out.insert(
+        "pending_osc52_clipboard_queries".into(),
+        lane(&t.osc52.pending_queries),
+    );
+    fields!(t.osc5522; pending_clipboard_requests, pending_paste_password);
+    out.insert("osc8_hyperlinks".into(), lane(t.osc8.snapshot_targets()));
+    out.insert("sync_output_active".into(), lane(t.vt.sync_output.active));
     fields!(t;
         selection,
         projected_selection,
@@ -109,8 +120,6 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         preedit_text,
         preedit_selection,
         output_buffer,
-        pending_clipboard_requests,
-        pending_paste_password,
         grid_version,
         row_versions,
         frame_revision,
@@ -119,12 +128,8 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         projection_plan_cache,
         next_projected_view_revision,
         next_projection_plan_revision,
-        osc8_hyperlinks,
-        sync_output_active,
         last_archived_screen_snapshot,
         last_synced_primary_screen_snapshot,
-        pending_osc52_clipboard_set,
-        pending_osc52_clipboard_queries,
         next_zone_id,
         current_zone_state,
         spacing_prompt_rows,
@@ -162,7 +167,7 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         current_command_truncated,
         captured_output_bytes,
     );
-    for (name, g) in [("grid", &t.screen.grid), ("alt_grid", &t.screen.alt_grid)] {
+    for (name, g) in [("grid", &t.vt.screen.grid), ("alt_grid", &t.vt.screen.alt_grid)] {
         out.insert(
             name.into(),
             lane((
@@ -176,10 +181,10 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         );
     }
     for (name, s) in [
-        ("saved_cursor", &t.screen.saved_state),
+        ("saved_cursor", &t.vt.screen.saved_state),
         (
             "saved_primary_screen_state",
-            &t.screen.saved_primary_screen_state,
+            &t.vt.screen.saved_primary_screen_state,
         ),
     ] {
         out.insert(
@@ -192,7 +197,7 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
             })),
         );
     }
-    out.insert("parser".into(), lane(t.parser.snapshot()));
+    out.insert("parser".into(), lane(t.vt.parser.snapshot()));
     out.insert(
         "visible_cells_cache".into(),
         frame_lane(&t.visible_cells_cache),
@@ -207,15 +212,13 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
     );
     out.insert(
         "sync_output_start".into(),
-        json!(t.sync_output_start.is_some()),
+        json!(t.vt.sync_output.started.is_some()),
     );
     out.insert(
         "current_command_started_at".into(),
         json!(t.current_command_started_at.is_some()),
     );
-    let mut links = t.osc8_hyperlink_keys.iter().collect::<Vec<_>>();
-    links.sort_by_key(|(_, id)| **id);
-    out.insert("osc8_hyperlink_keys".into(), lane(links));
+    out.insert("osc8_hyperlink_keys".into(), lane(t.osc8.snapshot_keys()));
     let mut provenance = t.finished_output_provenance.iter().collect::<Vec<_>>();
     provenance.sort_by_key(|(id, _)| **id);
     out.insert("finished_output_provenance".into(), lane(provenance));
@@ -267,8 +270,8 @@ fn seed(which: usize) -> ObservedSeed {
     t.max_scrollback = 8;
     // First seed only in the dedicated worker must start the global ID domain.
     if which == 0 && std::env::var_os("FROST_COLOR_ALLOCATOR_FIRST").is_some() {
-        assert_eq!(t.screen.grid.row_ids()[0], RawRowId::new(1));
-        assert_eq!(t.screen.alt_grid.row_ids()[0], RawRowId::new(6));
+        assert_eq!(t.vt.screen.grid.row_ids()[0], RawRowId::new(1));
+        assert_eq!(t.vt.screen.alt_grid.row_ids()[0], RawRowId::new(6));
         std::env::remove_var("FROST_COLOR_ALLOCATOR_FIRST");
     }
     // Actual production batches establish history, rich cells, output provenance,
@@ -356,9 +359,9 @@ fn seed(which: usize) -> ObservedSeed {
     t.ime_enabled = true;
     t.pending_notifications
         .push(("title-sentinel".into(), "keep".into()));
-    t.pending_osc52_clipboard_set = Some("clipboard-sentinel".into());
-    t.pending_paste_password = Some("password-sentinel-not-a-real-secret".into());
-    t.pending_clipboard_requests.push(ClipboardReadRequest {
+    t.osc52.pending_set = Some("clipboard-sentinel".into());
+    t.osc5522.pending_paste_password = Some("password-sentinel-not-a-real-secret".into());
+    t.osc5522.pending_clipboard_requests.push(ClipboardReadRequest {
         kind: ClipboardReadKind::MimeData("text/plain".into()),
     });
     t.set_default_colors(
@@ -417,9 +420,13 @@ fn seed(which: usize) -> ObservedSeed {
         ));
         t.selection = None;
         // Synthetic retained undo sentinel, not a user-visible clear operation.
+        let mut archived = t.scrollback.empty_sibling();
+        for line in t.scrollback.iter().cloned() {
+            assert!(archived.push_back(line));
+        }
         t.cleared_blocks = Some(ClearedBlocksSnapshot {
-            scrollback: t.scrollback.iter().cloned().collect(),
-            grid_rows: vec![],
+            scrollback: archived,
+            grid_rows: t.scrollback.empty_sibling(),
             zones: t.command_zones.clone(),
             provenance: t.finished_output_provenance.clone(),
             captured_output_bytes: t.captured_output_bytes,

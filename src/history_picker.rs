@@ -889,7 +889,7 @@ mod tests {
         assert!(keyboard.contains("self.recall_into_session(id, command)"));
         assert!(!keyboard.contains("recall_into_active_pane"));
         let delivery = source
-            .split_once("            Message::PromptRecall(id, command) => {")
+            .split_once("            Message::PromptRecall(view, command) => {")
             .unwrap()
             .1
             .split_once("            Message::Resized(size)")

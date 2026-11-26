@@ -100,10 +100,10 @@ fn install(terminal: &mut TerminalState, plan: ProjectionPlan) {
         scrollback_pushes: 0,
         full_screen_scroll_revision: 0,
         grid_row_ids: Default::default(),
-        row_identity_revision: terminal.screen.grid.identity_revision(),
-        rows: terminal.screen.grid.rows(),
+        row_identity_revision: terminal.vt.screen.grid.identity_revision(),
+        rows: terminal.vt.screen.grid.rows(),
         cols: WIDTH,
-        row_wrapped: terminal.screen.grid.row_wrapped.iter().copied().collect(),
+        row_wrapped: terminal.vt.screen.grid.row_wrapped.iter().copied().collect(),
         policy_revision: plan.policy_revision,
         policy_ids: Default::default(),
         block_spacing: false,
@@ -122,7 +122,7 @@ fn install(terminal: &mut TerminalState, plan: ProjectionPlan) {
 
 fn viewport(terminal: &mut TerminalState, offset: usize) -> ProjectedViewport {
     let plan = &terminal.projection_plan_cache.as_ref().unwrap().1;
-    let m = terminal.materialize_projection_plan(plan, offset, terminal.screen.grid.rows(), WIDTH);
+    let m = terminal.materialize_projection_plan(plan, offset, terminal.vt.screen.grid.rows(), WIDTH);
     let (raw_span_index, raw_row_index) = TerminalState::projection_indexes(&m.provenance);
     let mut view = ProjectedViewport {
         unavailable: None,
@@ -136,7 +136,7 @@ fn viewport(terminal: &mut TerminalState, offset: usize) -> ProjectedViewport {
         source_revision: ProjectionSourceRevision {
             grid: 0,
             history: terminal.history_revision,
-            row_identity: terminal.screen.grid.identity_revision(),
+            row_identity: terminal.vt.screen.grid.identity_revision(),
             alternate_screen: false,
         },
         view_revision: plan.plan_revision,
@@ -165,8 +165,8 @@ fn viewport(terminal: &mut TerminalState, offset: usize) -> ProjectedViewport {
     view.source_revision = ProjectionSourceRevision {
         grid: terminal.grid_version,
         history: terminal.history_revision,
-        row_identity: terminal.screen.grid.identity_revision(),
-        alternate_screen: terminal.screen.use_alt_buffer,
+        row_identity: terminal.vt.screen.grid.identity_revision(),
+        alternate_screen: terminal.vt.screen.use_alt_buffer,
     };
     view.view_revision = terminal.next_projected_view_revision;
     terminal.next_projected_view_revision += 1;

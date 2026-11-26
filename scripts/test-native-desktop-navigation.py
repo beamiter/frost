@@ -90,6 +90,26 @@ with tempfile.TemporaryDirectory() as directory:
     assert json.loads((Path(directory) / (name + '.ocr-transform.json')).read_text())['crop'] == [256, 315, 768, 270]
     smoke.close()
 
+# A standard frame uses the recorded palette transform without changing
+# click coordinates or relaxing the required visible owner labels.
+with tempfile.TemporaryDirectory() as directory:
+    smoke = module.Smoke(Path('/not-executed'), 'x11', Path(directory))
+    smoke.screenshot = lambda name: (Path(directory) / (name + '.png')).write_bytes(b'raw-frame')
+    tsv = 'level\ttext\tleft\ttop\twidth\theight\n5\tObserved\t101\t202\t40\t10\n'
+    commands = []
+    def run(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(stdout=tsv if command[0] == 'tesseract' else '')
+    smoke.run = run
+    name, observed = smoke.observe_frame('standard')
+    assert commands[0][2:-1] == ['-colorspace', 'Gray', '-negate']
+    assert commands[1][1] == str(Path(directory) / (name + '.ocr.png'))
+    assert [observed[0][key] for key in ('left', 'top', 'width', 'height')] == ['101', '202', '40', '10']
+    assert (Path(directory) / (name + '.png')).read_bytes() == b'raw-frame'
+    assert json.loads((Path(directory) / (name + '.ocr-transform.json')).read_text())['scale'] == 1
+    assert module.Smoke.surface_state(observed) is None
+    smoke.close()
+
 print('Native visible-owner navigation and exact disconnected-close observation passed')
 
 # The recovery banner moves the column body. Absolute native overlays must

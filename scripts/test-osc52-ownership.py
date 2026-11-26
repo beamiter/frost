@@ -5,6 +5,7 @@ No OS clipboard or PTY is opened. Terminal encoding and platform scheduling are
 explicit test doubles; native cargo tests separately exercise real encoding.
 """
 import os
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -30,7 +31,16 @@ methods = '\n'.join(item(source, 'fn ' + name + '(') for name in (
     'finish_host_clipboard_read', 'release_host_clipboard_read', 'session_by_identity'))
 callback = item(source, 'Message::Osc52Query(id, fd, generation, terminator, content) =>')
 cap = source.split('const MAX_CLIPBOARD_RESPONSE_BYTES:', 1)[1].split(';', 1)[0]
-query = item(terminal, 'if data == "?"')
+assert 'self.osc52.admit(' in item(terminal, 'fn handle_osc_52(')
+if 'JTERM_ENGINE_SOURCE' in os.environ:
+    engine = Path(os.environ['JTERM_ENGINE_SOURCE'])
+else:
+    metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--offline', '--locked', '--format-version=1'], cwd=root))
+    engine = Path(next(p['manifest_path'] for p in metadata['packages'] if p['name'] == 'jterm_engine')).parent
+clipboard = (engine / 'src/clipboard.rs').read_text()
+query = item(clipboard, 'if data == "?"').replace('self.pending_queries', 'self.pending_osc52_clipboard_queries')
+query = query.replace('MAX_CLIPBOARD_QUERIES', clipboard.split('pub const MAX_CLIPBOARD_QUERIES: usize = ', 1)[1].split(';', 1)[0])
+query = query.replace('terminator', 'self.osc_reply_terminator')
 # Bind the actual async message producer and close path to the tested gates.
 compact = ''.join(source.split())
 assert '.map(move|c|{Message::Osc52Query(id,fd,generation,terminator,c)}).abortable()' in compact

@@ -30,7 +30,7 @@ impl TerminalState {
             shell_integration: prompt || running,
             prompt_ready: prompt && !self.prompt_submission_pending && !self.prompt_cancel_pending,
             command_running: running,
-            alternate_screen: self.screen.use_alt_buffer,
+            alternate_screen: self.vt.screen.use_alt_buffer,
         }
     }
 
@@ -50,19 +50,19 @@ impl TerminalState {
     /// Observe each parsed control before a later control in the same read can
     /// undo it. This lifecycle-only latch contains no input or command bytes.
     pub(super) fn note_chat_native_takeover(&mut self) {
-        if self.screen.use_alt_buffer || self.chat_native_takeover {
+        if self.vt.screen.use_alt_buffer || self.chat_native_takeover {
             return;
         }
         if let ZoneState::OutputStarted(_, _, output_start) = self.current_zone_state {
             self.chat_native_takeover = self.is_mouse_enabled()
                 || !self.kitty_graphics.get_placements().is_empty()
-                || self.scrollback.len() + self.screen.cursor_row
+                || self.scrollback.len() + self.vt.screen.cursor_row
                     < output_start.saturating_sub(self.pending_zone_row_trim);
         }
     }
 
     pub(super) fn chat_plan_key(&self, policy: &ProjectionPolicy) -> Option<ChatPlanKey> {
-        if !policy.chat || self.screen.use_alt_buffer {
+        if !policy.chat || self.vt.screen.use_alt_buffer {
             return None;
         }
         let surface = self.chat_surface();
@@ -96,11 +96,11 @@ impl TerminalState {
             return None;
         }
         if let ZoneState::OutputStarted(_, _, output_start) = self.current_zone_state {
-            if self.scrollback.len() + self.screen.cursor_row < output_start {
+            if self.scrollback.len() + self.vt.screen.cursor_row < output_start {
                 return None;
             }
         }
-        let total = self.scrollback.len() + self.screen.grid.rows();
+        let total = self.scrollback.len() + self.vt.screen.grid.rows();
         let prompt = self.live_prompt_row();
         if prompt.is_some_and(|start| {
             self.raw_row_id_at_absolute(start)
@@ -114,20 +114,20 @@ impl TerminalState {
             .or(completed_start)
         {
             let occupied = self
-                .screen
+                .vt.screen
                 .grid
                 .iter()
                 .enumerate()
                 .rev()
                 .find(|(row, cells)| {
-                    self.screen.grid.row_wrapped[*row]
+                    self.vt.screen.grid.row_wrapped[*row]
                         || cells.iter().any(|cell| *cell != TerminalCell::default())
                 })
                 .map_or(self.scrollback.len(), |(row, _)| {
                     self.scrollback.len() + row + 1
                 });
             occupied
-                .max(self.scrollback.len() + self.screen.cursor_row + 1)
+                .max(self.scrollback.len() + self.vt.screen.cursor_row + 1)
                 .max(self.active_app_extent_row().map_or(0, |row| row + 1))
                 .max(start.saturating_add(CHAT_MIN_INPUT_ROWS))
                 .min(total)
@@ -136,13 +136,13 @@ impl TerminalState {
         };
         // A prompt taller than the viewport must retain the native viewport
         // and cursor scrolling rather than hiding rows in a tiny composer.
-        if prompt.is_some_and(|start| keep_end.saturating_sub(start) + 2 >= self.screen.grid.rows())
+        if prompt.is_some_and(|start| keep_end.saturating_sub(start) + 2 >= self.vt.screen.grid.rows())
         {
             return None;
         }
         let companion_rows = if let Some(start) = prompt {
             policy.organism_rows.min(
-                self.screen
+                self.vt.screen
                     .grid
                     .rows()
                     .saturating_sub(keep_end.saturating_sub(start) + 3),
@@ -168,12 +168,12 @@ impl TerminalState {
             keep_end,
             companion_rows,
             running_command,
-            live_command_versions: (0..self.screen.grid.rows())
+            live_command_versions: (0..self.vt.screen.grid.rows())
                 .filter_map(|row| {
                     let absolute = self.scrollback.len() + row;
                     if running_command.is_some_and(|(start, end)| (start..end).contains(&absolute))
                     {
-                        return Some((self.screen.grid.row_ids()[row], self.row_versions[row]));
+                        return Some((self.vt.screen.grid.row_ids()[row], self.row_versions[row]));
                     }
                     let index = self
                         .command_zones
@@ -181,7 +181,7 @@ impl TerminalState {
                         .checked_sub(1)?;
                     let zone = &self.command_zones[index];
                     (zone.command.is_some() && zone.output_start.is_some_and(|end| absolute < end))
-                        .then_some((self.screen.grid.row_ids()[row], self.row_versions[row]))
+                        .then_some((self.vt.screen.grid.row_ids()[row], self.row_versions[row]))
                 })
                 .collect(),
         })
@@ -207,7 +207,7 @@ impl TerminalState {
         if absolute < self.scrollback.len() {
             content_end(&decompress_history_row(&self.scrollback[absolute]))
         } else {
-            self.screen
+            self.vt.screen
                 .grid
                 .iter()
                 .nth(absolute - self.scrollback.len())
@@ -222,7 +222,7 @@ impl TerminalState {
         revision: u64,
     ) -> ProjectionPlan {
         let cols = plan.cols;
-        let total = self.scrollback.len() + self.screen.grid.rows();
+        let total = self.scrollback.len() + self.vt.screen.grid.rows();
         let active_start = self.running_zone_start().or(key.prompt).unwrap_or(total);
         let zones: Vec<_> = self
             .command_zones
@@ -627,7 +627,7 @@ mod tests {
         command(&mut terminal, "echo hello", "hello");
         command(&mut terminal, "echo again", "again");
         prompt(&mut terminal);
-        let grid = terminal.screen.grid.to_vec();
+        let grid = terminal.vt.screen.grid.to_vec();
         let cursor = terminal.get_cursor_pos();
         let mut policy = policy();
         let mut state = ProjectionViewState::new();
@@ -651,7 +651,7 @@ mod tests {
                 .chat_rows()
                 .iter()
                 .any(|row| row.role == ChatRole::Composer));
-            assert_eq!(terminal.screen.grid.to_vec(), grid);
+            assert_eq!(terminal.vt.screen.grid.to_vec(), grid);
             assert_eq!(terminal.get_cursor_pos(), cursor);
             for (row, cells) in view.cells().iter().enumerate() {
                 for (col, cell) in cells.iter().enumerate() {
@@ -668,7 +668,7 @@ mod tests {
         let mut terminal = TerminalState::new(40, 18);
         command(&mut terminal, "echo hello", "hello");
         prompt(&mut terminal);
-        let grid = terminal.screen.grid.to_vec();
+        let grid = terminal.vt.screen.grid.to_vec();
         let mut state = ProjectionViewState::new();
         let view = snapshot(&mut terminal, &mut state);
         let command = view
@@ -704,7 +704,7 @@ mod tests {
         assert_eq!(view.chat_rows()[output].left_col, 0);
         assert_eq!(view.chat_rows()[output].command_cols, None);
         assert_eq!(view.cells()[output][0].character, 'h');
-        assert_eq!(terminal.screen.grid.to_vec(), grid);
+        assert_eq!(terminal.vt.screen.grid.to_vec(), grid);
         for (row, cells) in view.cells().iter().enumerate() {
             for (col, cell) in cells.iter().enumerate() {
                 if *cell != TerminalCell::default() {
@@ -714,7 +714,7 @@ mod tests {
                     assert_eq!(view.raw_to_view(origin), Some(ViewportCell { row, col }));
                     let raw = terminal.retained_absolute_for_raw(origin.row).unwrap();
                     assert_eq!(
-                        terminal.screen.grid[raw - terminal.scrollback.len()][origin.col],
+                        terminal.vt.screen.grid[raw - terminal.scrollback.len()][origin.col],
                         *cell
                     );
                 }
@@ -739,7 +739,7 @@ mod tests {
         let mut state = ProjectionViewState::new();
         let live = snapshot(&mut terminal, &mut state);
         let raw = terminal
-            .raw_cell_origin_at_absolute(terminal.scrollback.len() + terminal.screen.cursor_row, 2)
+            .raw_cell_origin_at_absolute(terminal.scrollback.len() + terminal.vt.screen.cursor_row, 2)
             .unwrap();
         let live_cell = live.raw_to_view(raw).unwrap();
         state.scroll(5, &live);
@@ -753,8 +753,8 @@ mod tests {
         assert_ne!(history.document_start(), live.document_start());
         terminal.select_word_in_projection(&history, live_cell.row, live_cell.col);
         assert_eq!(terminal.copy_selection().as_deref(), Some("draft"));
-        assert_eq!(terminal.screen.grid.cols(), 40);
-        assert_eq!(terminal.screen.grid.rows(), 14);
+        assert_eq!(terminal.vt.screen.grid.cols(), 40);
+        assert_eq!(terminal.vt.screen.grid.rows(), 14);
     }
 
     #[test]
@@ -845,7 +845,7 @@ mod tests {
         terminal.process_input(
             b"for x in one two; do\r\n> echo $x\r\ncompletion-a completion-b\x1b[1A\r",
         );
-        let dimensions = (terminal.screen.grid.cols(), terminal.screen.grid.rows());
+        let dimensions = (terminal.vt.screen.grid.cols(), terminal.vt.screen.grid.rows());
         let mut state = ProjectionViewState::new();
         for _ in 0..4 {
             let view = snapshot(&mut terminal, &mut state);
@@ -859,7 +859,7 @@ mod tests {
             assert!(text.contains("echo $x"));
             assert_eq!(
                 dimensions,
-                (terminal.screen.grid.cols(), terminal.screen.grid.rows())
+                (terminal.vt.screen.grid.cols(), terminal.vt.screen.grid.rows())
             );
         }
         terminal.process_input(b"\x1b[15;1H\x1b[41m \x1b[0m\x1b[2;1H");
@@ -884,7 +884,7 @@ mod tests {
         );
         prompt(&mut terminal);
         terminal.process_batch(b"/current/path");
-        let raw_wraps = terminal.screen.grid.row_wrapped.to_vec();
+        let raw_wraps = terminal.vt.screen.grid.row_wrapped.to_vec();
         let detector = crate::link::LinkDetector::new(crate::link::LinkDetectionConfig::default());
         let mut state = ProjectionViewState::new();
         let initial = snapshot(&mut terminal, &mut state);
@@ -924,7 +924,7 @@ mod tests {
             ));
         }
         assert!(checked_seam && checked_contiguous);
-        assert_eq!(terminal.screen.grid.row_wrapped.as_slice(), raw_wraps);
+        assert_eq!(terminal.vt.screen.grid.row_wrapped.as_slice(), raw_wraps);
     }
 
     #[test]
@@ -1130,8 +1130,8 @@ mod tests {
             .any(|row| row.role == ChatRole::Output && row.left_col == 0 && row.app_eligible));
         let cursor = terminal
             .raw_cell_origin_at_absolute(
-                terminal.scrollback.len() + terminal.screen.cursor_row,
-                terminal.screen.cursor_col,
+                terminal.scrollback.len() + terminal.vt.screen.cursor_row,
+                terminal.vt.screen.cursor_col,
             )
             .unwrap();
         assert!(view.raw_to_view(cursor).is_some());
@@ -1306,7 +1306,7 @@ mod tests {
             .map(|cell| cell.character)
             .collect::<String>()
             == output));
-        assert_eq!(terminal.screen.grid.cols(), 40);
+        assert_eq!(terminal.vt.screen.grid.cols(), 40);
     }
     #[derive(Debug, PartialEq, Eq)]
     struct SessionParityIdentityMismatch {
@@ -1352,14 +1352,14 @@ mod tests {
                         }
                     }
                     let draft_text = step.expected.draft_text.as_ref().map(|draft| {
-                        let row: String = terminal.screen.grid.to_vec()[terminal.screen.cursor_row]
+                        let row: String = terminal.vt.screen.grid.to_vec()[terminal.vt.screen.cursor_row]
                             .iter()
                             .filter(|cell| !cell.flags.wide_continuation())
                             .map(|cell| cell.character)
                             .collect();
                         // Ignore only native grid padding; the corpus retains the prompt space.
                         assert_eq!(
-                            terminal.screen.cursor_col,
+                            terminal.vt.screen.cursor_col,
                             draft
                                 .chars()
                                 .map(crate::char_width::cached_char_width)
@@ -1406,8 +1406,8 @@ mod tests {
                     assert_eq!(observed, expected, "{context}");
                     // Project the same native model in all modes. No recorder,
                     // command execution, or shell editor is introduced by Chat.
-                    let grid = terminal.screen.grid.to_vec();
-                    let cursor = (terminal.screen.cursor_row, terminal.screen.cursor_col);
+                    let grid = terminal.vt.screen.grid.to_vec();
+                    let cursor = (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col);
                     let zones = format!("{:?}", terminal.command_zones);
                     let command = (
                         terminal.current_command_id.clone(),
@@ -1424,12 +1424,12 @@ mod tests {
                             &mut view_state,
                         );
                         assert_eq!(
-                            terminal.screen.grid.to_vec(),
+                            terminal.vt.screen.grid.to_vec(),
                             grid,
                             "{context}: mode {mode} changed cells"
                         );
                         assert_eq!(
-                            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+                            (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col),
                             cursor,
                             "{context}"
                         );

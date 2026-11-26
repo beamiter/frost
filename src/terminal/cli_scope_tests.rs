@@ -27,7 +27,7 @@ fn scoped_document(terminal: &mut TerminalState) -> String {
         .inline_cli_projection_policy()
         .expect("known primary CLI scope");
     let plan = terminal
-        .cached_collapsed_projection_plan(terminal.screen.grid.row_len(), &policy)
+        .cached_collapsed_projection_plan(terminal.vt.screen.grid.row_len(), &policy)
         .unwrap();
     terminal
         .materialize_identity_projection_plan(&plan)

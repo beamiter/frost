@@ -9,7 +9,7 @@ pub(super) fn observe(
     out: &mut BTreeMap<String, Value>,
     lane: impl Fn(String) -> Value,
 ) {
-    let protocol = &terminal.protocol;
+    let protocol = &terminal.vt.protocol;
     let mut bits = 0u64;
     for (index, mode) in [
         7, 25, 1000, 1001, 1002, 1003, 1004, 1006, 1049, 2004, 2026, 2031, 5522, 1, 4, 6, 1005,
@@ -19,8 +19,8 @@ pub(super) fn observe(
     .enumerate()
     {
         let enabled = match mode {
-            4 => terminal.screen.insert_mode,
-            6 => terminal.screen.origin_mode,
+            4 => terminal.vt.screen.insert_mode,
+            6 => terminal.vt.screen.origin_mode,
             _ => protocol.modes().contains(&mode),
         };
         bits |= u64::from(enabled) << index;

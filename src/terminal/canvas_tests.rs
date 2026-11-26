@@ -81,9 +81,9 @@ fn canvas_materializes_only_viewport_plus_one_row_and_reuses_document_plan() {
     let canvas = terminal.canvas_viewport(&base, &policy);
     assert_eq!(PROJECTION_PLAN_BUILD_COUNT.with(|count| count.get()), 0);
     assert!(
-        PROJECTION_MATERIALIZED_ROWS.with(|count| count.get()) <= terminal.screen.grid.rows() + 1
+        PROJECTION_MATERIALIZED_ROWS.with(|count| count.get()) <= terminal.vt.screen.grid.rows() + 1
     );
-    assert_eq!(terminal.screen.grid.rows(), 8);
+    assert_eq!(terminal.vt.screen.grid.rows(), 8);
     assert_eq!(canvas.cells().len(), 9);
 }
 
@@ -251,7 +251,7 @@ fn native_canvas_overscan_preserves_raw_cells_provenance_and_pty_size() {
             terminal.process_input(format!("marker {index:03} 界\r\n").as_bytes());
         }
         let policy = ProjectionPolicy::new();
-        let dimensions = (terminal.screen.grid.rows(), terminal.screen.grid.cols());
+        let dimensions = (terminal.vt.screen.grid.rows(), terminal.vt.screen.grid.cols());
         for offset in [0, 1, 12, terminal.scrollback_len()] {
             terminal.set_scroll_offset(offset);
             let base = terminal.get_projected_viewport(block_mode);
@@ -270,7 +270,7 @@ fn native_canvas_overscan_preserves_raw_cells_provenance_and_pty_size() {
             assert_eq!(terminal.copy_selection(), copied);
             terminal.clear_text_selection();
             assert_eq!(
-                (terminal.screen.grid.rows(), terminal.screen.grid.cols()),
+                (terminal.vt.screen.grid.rows(), terminal.vt.screen.grid.cols()),
                 dimensions
             );
             for row in 0..base.cells().len() {

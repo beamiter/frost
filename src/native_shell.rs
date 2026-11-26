@@ -2516,6 +2516,20 @@ impl Frost {
             .style(move |_, status| theme::popup_button_style(&self.theme, selected, status));
             rows = rows.push(mouse_area(row).on_enter(Message::ReferenceToolsSelect(index)));
         }
+        let mut extra_rows = 0;
+        if let Some(session) = self.sessions.get(self.active) {
+            if session.view_attachment.attached() && !self.vim9_tabs.contains_key(&session.id) {
+                rows = rows.push(button("Detach terminal view")
+                    .on_press(Message::ChangeTerminalView(session.view_attachment.ticket(), false))
+                    .width(Length::Fill).height(popup::ROW_HEIGHT));
+                extra_rows += 1;
+            }
+            let target = crate::observer::Target::capture(session.id, &session.ime_identity);
+            rows = rows.push(button(text(format!("Open read-only observer · pane {}", session.id + 1)).size(12))
+                .on_press_maybe((self.observers.len() < crate::observer::MAX_VIEWS).then_some(Message::OpenObserver(target)))
+                .width(Length::Fill).height(popup::ROW_HEIGHT));
+            extra_rows += 1;
+        }
         let menu = container(rows)
             .width(popup::WIDTH)
             .padding(popup::PADDING)
@@ -2523,7 +2537,7 @@ impl Frost {
         let layout = self.reference_layout();
         let left = (layout.center.x + shell::COMPOSER_INSET + 270.0)
             .min((self.win_size.width - popup::WIDTH - 8.0).max(0.0));
-        let height = popup::COMMANDS.len() as f32 * popup::ROW_HEIGHT + 2.0 * popup::PADDING + 1.0;
+        let height = (popup::COMMANDS.len() + extra_rows) as f32 * popup::ROW_HEIGHT + 2.0 * popup::PADDING + 1.0;
         let top = (layout.composer.y + shell::COMPOSER_CONTROL_BOTTOM - 8.0 - height)
             .max(shell::TITLEBAR_HEIGHT);
         container(opaque(menu))

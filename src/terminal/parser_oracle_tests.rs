@@ -33,7 +33,7 @@ fn text_lane(text: String) -> Value {
 // offsets and the complete active UTF-8 bytes remain independently observable.
 // After extraction only these field reads may be mapped to parser.snapshot().
 fn parser_pending_snapshot(t: &TerminalState, result: &mut BTreeMap<String, Value>) {
-    let pending = t.parser.snapshot();
+    let pending = t.vt.parser.snapshot();
     for (name, bytes) in [
         ("pending_escape", &pending.pending_escape),
         ("pending_apc", &pending.pending_apc),
@@ -74,7 +74,7 @@ fn parser_pending_snapshot(t: &TerminalState, result: &mut BTreeMap<String, Valu
     );
 }
 
-fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
+pub(super) fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::new();
     macro_rules! fields {
         ($owner:expr; $($field:ident),* $(,)?) => {
@@ -92,28 +92,33 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
     );
     out.insert("dynamic_palette".into(), lane(t.colors.dynamic_palette));
     super::replay_protocol::observe(t, &mut out, text_lane);
-    fields!(t.screen;
+    fields!(t.vt.screen;
         current_fg,
         current_bg,
         current_flags,
     );
-    let link = t.screen.current_hyperlink;
+    let link = t.vt.screen.current_hyperlink;
     out.insert(
         "current_hyperlink".into(),
         lane((!link.is_none()).then_some(link.as_raw())),
     );
+    out.insert(
+        "pending_osc52_clipboard_set".into(),
+        lane(&t.osc52.pending_set),
+    );
+    out.insert(
+        "pending_osc52_clipboard_queries".into(),
+        lane(&t.osc52.pending_queries),
+    );
+    fields!(t.osc5522; pending_clipboard_requests, pending_paste_password);
+    out.insert("osc8_hyperlinks".into(), lane(t.osc8.snapshot_targets()));
+    out.insert("sync_output_active".into(), lane(t.vt.sync_output.active));
     fields!(t;
         current_working_dir,
         organism_idle_cwd,
         global_bg,
-        osc8_hyperlinks,
         output_buffer,
-        pending_clipboard_requests,
-        pending_paste_password,
-        pending_osc52_clipboard_set,
-        pending_osc52_clipboard_queries,
         pending_notifications,
-        sync_output_active,
         osc_reply_terminator,
         current_zone_state,
         next_zone_id,
@@ -144,38 +149,38 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
     out.insert(
         "cursor".into(),
         lane((
-            t.screen.cursor_row,
-            t.screen.cursor_col,
-            t.screen.cursor_shape,
-            t.screen.pending_wrap,
-            t.screen.last_printed_char,
+            t.vt.screen.cursor_row,
+            t.vt.screen.cursor_col,
+            t.vt.screen.cursor_shape,
+            t.vt.screen.pending_wrap,
+            t.vt.screen.last_printed_char,
         )),
     );
     out.insert(
         "screen".into(),
         lane((
-            t.screen.use_alt_buffer,
-            t.screen.saved_cursor_row,
-            t.screen.saved_cursor_col,
-            t.screen.alt_cursor_row,
-            t.screen.alt_cursor_col,
-            t.screen.scroll_region_top,
-            t.screen.scroll_region_bottom,
+            t.vt.screen.use_alt_buffer,
+            t.vt.screen.saved_cursor_row,
+            t.vt.screen.saved_cursor_col,
+            t.vt.screen.alt_cursor_row,
+            t.vt.screen.alt_cursor_col,
+            t.vt.screen.scroll_region_top,
+            t.vt.screen.scroll_region_bottom,
             t.scroll_offset,
         )),
     );
     out.insert(
         "charsets_tabs".into(),
         lane((
-            t.screen.g0_charset,
-            t.screen.g1_charset,
-            t.screen.active_charset,
-            &t.screen.tab_stops,
+            t.vt.screen.g0_charset,
+            t.vt.screen.g1_charset,
+            t.vt.screen.active_charset,
+            &t.vt.screen.tab_stops,
         )),
     );
     for (name, saved) in [
-        ("saved_cursor", &t.screen.saved_state),
-        ("saved_primary", &t.screen.saved_primary_screen_state),
+        ("saved_cursor", &t.vt.screen.saved_state),
+        ("saved_primary", &t.vt.screen.saved_primary_screen_state),
     ] {
         out.insert(
             name.into(),
@@ -191,19 +196,19 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
         "saved_primary_colors".into(),
         lane((
             t.saved_primary_global_bg,
-            t.screen.saved_primary_cursor_shape.unwrap_or_default(),
+            t.vt.screen.saved_primary_cursor_shape.unwrap_or_default(),
             t.saved_primary_colors.dynamic_fg,
             t.saved_primary_colors.dynamic_bg,
             t.saved_primary_colors.dynamic_cursor_color,
             t.saved_primary_colors.dynamic_palette,
         )),
     );
-    out.insert("grid_cells".into(), lane(t.screen.grid.to_vec()));
-    out.insert("alt_grid_cells".into(), lane(t.screen.alt_grid.to_vec()));
+    out.insert("grid_cells".into(), lane(t.vt.screen.grid.to_vec()));
+    out.insert("alt_grid_cells".into(), lane(t.vt.screen.alt_grid.to_vec()));
     out.insert(
         "grid_text".into(),
         lane(
-            t.screen
+            t.vt.screen
                 .grid
                 .to_vec()
                 .iter()
@@ -214,8 +219,8 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
     out.insert(
         "wraps".into(),
         lane((
-            t.screen.grid.row_wrapped.as_slice(),
-            t.screen.alt_grid.row_wrapped.as_slice(),
+            t.vt.screen.grid.row_wrapped.as_slice(),
+            t.vt.screen.alt_grid.row_wrapped.as_slice(),
         )),
     );
     out.insert(
@@ -473,7 +478,7 @@ fn record(
     // This frozen pre-extraction oracle includes old unsafe overflow/reply
     // semantics. Keep its scope explicitly historical; production bounded
     // behavior is covered separately and must not rewrite these fixtures.
-    terminal.parser = jterm_engine::parser::Parser::with_profile(
+    terminal.vt.parser = jterm_engine::parser::Parser::with_profile(
         jterm_engine::parser::ParserLimits {
             pending_bytes: MAX_PENDING_ESCAPE,
             kitty_recovery_bytes: jterm_core::kitty_graphics::MAX_CONTROL_BYTES,

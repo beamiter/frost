@@ -34,8 +34,8 @@ impl Fixture {
             let cursor = self
                 .terminal
                 .raw_cell_origin_at_absolute(
-                    self.terminal.scrollback.len() + self.terminal.screen.cursor_row,
-                    self.terminal.screen.cursor_col,
+                    self.terminal.scrollback.len() + self.terminal.vt.screen.cursor_row,
+                    self.terminal.vt.screen.cursor_col,
                 )
                 .unwrap();
             assert!(

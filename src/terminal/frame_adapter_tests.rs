@@ -63,7 +63,7 @@ impl TerminalState {
         )
     }
     fn original_visible_cells(&mut self) -> std::sync::Arc<Vec<Vec<TerminalCell>>> {
-        if self.screen.use_alt_buffer {
+        if self.vt.screen.use_alt_buffer {
             self.scroll_offset = 0;
         }
         if let Some((cached_version, cached_offset, ref cells, _)) =
@@ -75,9 +75,9 @@ impl TerminalState {
         }
 
         // Cache miss - rebuild
-        let rows = self.screen.grid.rows();
+        let rows = self.vt.screen.grid.rows();
         let cols = if rows > 0 {
-            self.screen.grid.row_len()
+            self.vt.screen.grid.row_len()
         } else {
             80
         };
@@ -102,7 +102,7 @@ impl TerminalState {
                     && buf.iter().all(|r| r.len() == cols);
                 if can_incremental {
                     let base = prev_version.unwrap_or(0);
-                    for (r, (dst, chunk)) in buf.iter_mut().zip(self.screen.grid.iter()).enumerate()
+                    for (r, (dst, chunk)) in buf.iter_mut().zip(self.vt.screen.grid.iter()).enumerate()
                     {
                         if self.row_versions[r] > base {
                             dst.clear();
@@ -111,7 +111,7 @@ impl TerminalState {
                     }
                 } else {
                     buf.resize_with(rows, Vec::new);
-                    for (dst, chunk) in buf.iter_mut().zip(self.screen.grid.iter()) {
+                    for (dst, chunk) in buf.iter_mut().zip(self.vt.screen.grid.iter()) {
                         dst.clear();
                         dst.extend_from_slice(chunk);
                     }
@@ -129,7 +129,7 @@ impl TerminalState {
 
         let (cells, origin_spans) = if self.scroll_offset == 0 {
             // Fast path (shared allocation): fresh copy of current grid.
-            (self.screen.grid.to_vec(), None)
+            (self.vt.screen.grid.to_vec(), None)
         } else {
             let (cells, spans) = self.materialize_scrolled_viewport(rows, cols);
             (cells, Some(std::sync::Arc::new(spans)))
@@ -206,20 +206,20 @@ fn frame_adapter_retained_copy_control() {
         *row_control
     );
     // Host cursor preferences can change without a PTY/grid revision.
-    terminal.screen.cursor_shape = CursorShape::Beam;
+    terminal.vt.screen.cursor_shape = CursorShape::Beam;
     let shape_frame = terminal.get_live_cell_frame();
     assert_eq!(shape_frame.cursor().shape, CursorShape::Beam);
     assert_eq!(new_frame_cells(&row_frame, &shape_frame), 0);
-    terminal.protocol.modes_mut().remove(&25);
+    terminal.vt.protocol.modes_mut().remove(&25);
     let hidden = terminal.get_live_cell_frame();
     assert!(!hidden.cursor().visible);
-    terminal.protocol.modes_mut().insert(25);
+    terminal.vt.protocol.modes_mut().insert(25);
     let shown = terminal.get_live_cell_frame();
     assert!(shown.cursor().visible);
     assert_eq!(new_frame_cells(&hidden, &shown), 0);
 
     let before = terminal.get_projected_viewport(false);
-    terminal.screen.cursor_shape = CursorShape::Underline;
+    terminal.vt.screen.cursor_shape = CursorShape::Underline;
     let after = terminal.get_projected_viewport(false);
     assert_eq!(
         before.cells.raw_frame().unwrap().cursor().shape,
@@ -281,8 +281,8 @@ fn frame_adapter_layout_and_alternate_are_full_boundaries() {
     let shrunk = terminal.get_live_cell_frame();
     assert!(shrunk.cursor().row < 1 && shrunk.cursor().col < 2);
     // Legacy host state could temporarily be outside the new viewport.
-    terminal.screen.cursor_row = 3;
-    terminal.screen.cursor_col = 6;
+    terminal.vt.screen.cursor_row = 3;
+    terminal.vt.screen.cursor_col = 6;
     let exceptional = terminal.get_live_cell_frame();
     assert_eq!(exceptional.cursor().paint_position(), (0, 1));
     assert!(!exceptional.cursor().visible);

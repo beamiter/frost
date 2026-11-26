@@ -170,7 +170,7 @@ mod tests {
         }
         assert_eq!(
             std::mem::size_of_val(&report),
-            15 * std::mem::size_of::<usize>()
+            16 * std::mem::size_of::<usize>()
         );
         assert!(report.summary().len() < 1024);
         assert!(report.summary().is_ascii());

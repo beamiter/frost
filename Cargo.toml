@@ -14,7 +14,8 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 # The engine and core declare the same immutable release source.
-jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "53974b89f87086c3f0d7429c4de67d33e2fe6bcd" }
+jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e" }
+jterm_protocol = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e" }
 companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 iced = { version = "0.14", features = ["canvas", "tokio", "advanced", "image", "wgpu"] }
 # Direct handle on the shaper iced embeds (same locked version), used to
@@ -24,7 +25,7 @@ cosmic-text = "=0.19.0"
 # Exact native boundary paired with the pinned local Iced shell patch.
 iced_winit = { version = "=0.14.0", default-features = false }
 libc = "0.2"
-jterm_core = { version = "0.2.0", features = ["terminal-session-actor"], git = "https://github.com/beamiter/jterm_core.git", rev = "53974b89f87086c3f0d7429c4de67d33e2fe6bcd" }
+jterm_core = { version = "0.2.0", features = ["terminal-session-actor"], git = "https://github.com/beamiter/jterm_core.git", rev = "06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e" }
 tokio = { version = "1", features = ["rt", "sync"] }
 anyhow = "1.0"
 log = "0.4"
@@ -40,7 +41,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 toml = "1.1"
 dirs = "7.0"
-unicode-normalization = "0.1"
 regex = "1.13"
 fuzzy-matcher = "0.3"
 uuid = { version = "1.23", features = ["v4", "serde"] }
@@ -83,11 +83,13 @@ wayland-client = { path = "vendor/wayland-client" }
 
 
 [dev-dependencies]
+# Frozen pre-migration NFC bodies stay independent of shared screen composition.
+unicode-normalization = "=0.1.26"
 # Bounded immutable title-oracle transport (already present in the lockfile).
 zstd = "=0.14.3"
 sha2 = "=0.10.9"
 iced_tiny_skia = { version = "=0.14.1", features = ["geometry"] }
-jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "53974b89f87086c3f0d7429c4de67d33e2fe6bcd" }
+jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e" }
 
 [patch."https://github.com/beamiter/jcompanion.git"]
 companion-protocol = { path = "vendor/companion-protocol" }

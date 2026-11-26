@@ -1,6 +1,6 @@
-//! Read-only, bounded local previews. Never invoke an opener, shell or web renderer.
+//! Read-only, bounded previews bound to their original local or remote source.
 use crate::preview_navigation::{match_background, ImageZoom, SourceMatches};
-use crate::{native_shell::InspectorTab, sidebar, Frost, Message, ToastKind};
+use crate::{native_shell::InspectorTab, remote_fs, sidebar, Frost, Message, ToastKind};
 use iced::widget::{
     button, checkbox, column, container, pick_list, rich_text, row, scrollable, span, text,
     text_input, Space,
@@ -180,6 +180,14 @@ struct ReadTarget {
     base: PathBuf,
     relative: PathBuf,
     fallback: Option<(PathBuf, usize, Option<usize>)>,
+    remote: Option<RemoteRead>,
+}
+
+#[derive(Clone)]
+struct RemoteRead {
+    host: jterm_core::jsh_remote::RemoteHostConfig,
+    label: String,
+    generation: u64,
 }
 
 impl ReadTarget {
@@ -194,6 +202,7 @@ impl ReadTarget {
             base: cwd.into(),
             relative,
             fallback,
+            remote: None,
         })
     }
 
@@ -212,6 +221,13 @@ impl ReadTarget {
             base: PathBuf::from("/"),
             relative: relative.to_path_buf(),
             fallback: None,
+            remote: None,
+        })
+    }
+
+    fn is_current(&self, sidebar: &sidebar::Sidebar) -> bool {
+        self.remote.as_ref().is_none_or(|remote| {
+            sidebar.accepts_generation(remote.generation) && !sidebar.location_change_pending()
         })
     }
 
@@ -220,7 +236,15 @@ impl ReadTarget {
             base,
             mut relative,
             fallback,
+            remote,
         } = self;
+        if let Some(remote) = remote {
+            let path = base.join(relative);
+            let (image, limit, _) = preview_format(&path);
+            let bytes = remote_fs::read_preview(&remote.host, &path, limit as usize)
+                .map_err(|error| error.to_string())?;
+            return decode_preview(bytes, path, None, image);
+        }
         let mut location = None;
         let file = match open_regular(&base, &relative) {
             Ok(file) => file,
@@ -264,11 +288,7 @@ pub(crate) fn load(path: &str, cwd: &Path) -> Result<Preview, String> {
     ReadTarget::reference(path, cwd)?.load()
 }
 
-fn read_preview(
-    mut file: std::fs::File,
-    path: PathBuf,
-    location: Option<(usize, Option<usize>)>,
-) -> Result<Preview, String> {
+fn preview_format(path: &Path) -> (bool, u64, &'static str) {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -281,6 +301,15 @@ fn read_preview(
     } else {
         (64 * 1024, "Text preview exceeds the 64 KiB limit")
     };
+    (image, limit, size_error)
+}
+
+fn read_preview(
+    mut file: std::fs::File,
+    path: PathBuf,
+    location: Option<(usize, Option<usize>)>,
+) -> Result<Preview, String> {
+    let (image, limit, size_error) = preview_format(&path);
     let length = file.metadata().map_err(|error| error.to_string())?.len();
     if length > limit {
         return Err(size_error.into());
@@ -293,6 +322,15 @@ fn read_preview(
     if bytes.len() as u64 > limit {
         return Err(size_error.into());
     }
+    decode_preview(bytes, path, location, image)
+}
+
+fn decode_preview(
+    bytes: Vec<u8>,
+    path: PathBuf,
+    location: Option<(usize, Option<usize>)>,
+    image: bool,
+) -> Result<Preview, String> {
     let content = if image {
         let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
             .with_guessed_format()
@@ -601,7 +639,22 @@ impl Frost {
         let Some(session) = self.sessions.get(self.active) else {
             return Task::none();
         };
-        self.present_file_preview(session.id, ReadTarget::tree_file(path), false)
+        let target = ReadTarget::tree_file(path).and_then(|mut target| {
+            if self.sidebar.location.is_remote() {
+                if self.sidebar.location_change_pending() {
+                    return Err("Wait for the Files source to finish opening".into());
+                }
+                let location = &self.sidebar.location;
+                let hosts = self.sidebar.hosts_snapshot();
+                target.remote = Some(RemoteRead {
+                    host: remote_fs::remote_host(location, hosts).map_err(|error| error.to_string())?.clone(),
+                    label: location.label(hosts),
+                    generation: self.sidebar.generation(),
+                });
+            }
+            Ok(target)
+        });
+        self.present_file_preview(session.id, target, false)
     }
 
     #[cfg(target_os = "linux")]
@@ -692,6 +745,10 @@ impl Frost {
         let Some(page) = &mut self.file_preview.page else {
             return Task::none();
         };
+        if !page.target.is_current(&self.sidebar) {
+            self.file_preview.close();
+            return Task::none();
+        }
         if self.file_preview.reader.is_some() {
             page.notice = Some("Another preview is still reading. Try again shortly.".into());
             return Task::none();
@@ -725,6 +782,9 @@ impl Frost {
         result: Result<Preview, String>,
     ) -> Task<Message> {
         let active = self.sessions.get(self.active).map(|session| session.id);
+        if self.file_preview.page.as_ref().is_some_and(|page| !page.target.is_current(&self.sidebar)) {
+            self.file_preview.close();
+        }
         let Some(page) = self.file_preview.accept_completion(session, token, active) else {
             return Task::none();
         };
@@ -739,6 +799,7 @@ impl Frost {
         let active = self.sessions.get(self.active);
         let Some(page) = self.file_preview.page.as_mut().filter(|page| {
             page.token == token && Some(page.session) == active.map(|session| session.id)
+                && page.target.is_current(&self.sidebar)
         }) else {
             return Task::none();
         };
@@ -897,7 +958,7 @@ impl Frost {
             .file_preview
             .page
             .as_ref()
-            .filter(|page| Some(page.session) == active)
+            .filter(|page| Some(page.session) == active && page.target.is_current(&self.sidebar))
         else {
             return self.sidebar_files_view();
         };
@@ -907,8 +968,11 @@ impl Frost {
                 .padding([4, 8])
                 .style(button::secondary)
         };
+        let title = page.target.remote.as_ref().map_or_else(|| "Local file preview".to_string(), |remote| {
+            format!("Remote file preview · {}", remote.label)
+        });
         let header = row![
-            text("Local file preview").width(Length::Fill),
+            text(title).width(Length::Fill),
             control("Close").on_press(event(Action::Close)),
         ]
         .spacing(6)
@@ -951,7 +1015,7 @@ impl Frost {
         .spacing(4);
         if reading && matches!(page.phase, Phase::Ready(_)) {
             details = details.push(
-                text("Reloading local file…")
+                text("Reloading file…")
                     .size(12)
                     .style(text::secondary),
             );
@@ -961,7 +1025,7 @@ impl Frost {
         }
         body = body.push(details);
         match &page.phase {
-            Phase::Reading => body.push(text("Reading local file…")).into(),
+            Phase::Reading => body.push(text("Reading file…")).into(),
             Phase::Failed(error) => {
                 let body = body.push(control("Retry").on_press(event(Action::Reload)));
                 if let Some(error) = error {

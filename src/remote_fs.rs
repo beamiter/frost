@@ -487,6 +487,44 @@ case "$op" in
     if [ -f "$p" ] && [ -r "$p" ]; then :; else exit 3; fi
     cat "$p" || exit 4
     ;;
+  preview)
+    p=${2:-}; limit=${3:-}
+    case "$p" in /*) ;; *) exit 2 ;; esac
+    case "$limit" in ''|0|*[!0-9]*) exit 2 ;; esac
+    python3 -I -c '
+import os
+import stat
+import sys
+
+path, limit = sys.argv[1], int(sys.argv[2])
+parts = path.split("/")[1:]
+if not parts or any(part in ("", ".", "..") for part in parts):
+    sys.exit(2)
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+directory = os.open("/", directory_flags)
+try:
+    for part in parts[:-1]:
+        next_directory = os.open(part, directory_flags, dir_fd=directory)
+        os.close(directory)
+        directory = next_directory
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(parts[-1], flags, dir_fd=directory), "rb") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            print("Preview requires a regular file", file=sys.stderr)
+            sys.exit(4)
+        if info.st_size > limit:
+            print("File exceeds the preview byte limit", file=sys.stderr)
+            sys.exit(4)
+        data = source.read(limit + 1)
+        if len(data) > limit:
+            print("File exceeds the preview byte limit", file=sys.stderr)
+            sys.exit(4)
+        sys.stdout.buffer.write(data)
+finally:
+    os.close(directory)
+' "$p" "$limit" || exit $?
+    ;;
   put)
     p=${2:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
@@ -1521,6 +1559,17 @@ pub fn start_dir(loc: &FsLocation, hosts: &[RemoteHostConfig]) -> io::Result<Pat
             parse_start_dir_output(&stdout)
         }
     }
+}
+
+/// Read a bounded snapshot from the exact selected remote profile.
+pub(crate) fn read_preview(host: &RemoteHostConfig, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    run_probe(
+        host,
+        "preview",
+        &[remote_path(path)?, &limit.to_string()],
+        LIST_TIMEOUT,
+        limit,
+    )
 }
 
 /// Create one directory. Fails (`AlreadyExists`) when anything is there.

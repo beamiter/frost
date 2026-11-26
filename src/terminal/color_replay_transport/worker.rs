@@ -260,8 +260,10 @@ esac
                     name: WORKER,
                     marker: &self.marker,
                     hash: &self.hash,
-                    listing_deadline: Duration::from_millis(150),
-                    worker_deadline: Duration::from_millis(150),
+                    // The marker requires the shell to be scheduled. Keep
+                    // the fixture bounded below its deliberate 10s hangs.
+                    listing_deadline: Duration::from_secs(1),
+                    worker_deadline: Duration::from_secs(1),
                     diagnostic_limit: 1024,
                     actual_limit: 1024,
                 },
