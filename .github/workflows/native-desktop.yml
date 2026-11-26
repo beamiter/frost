@@ -151,6 +151,10 @@ jobs:
       - name: Exercise X11 production input
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend x11 --output native-smoke-artifacts/x11
+      - name: Verify X11 alternate screen and replies on a hidden Shell tab
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 3
+        run: /usr/bin/python3 scripts/native-background-screen-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --output native-smoke-artifacts/x11-background-screen
       - name: Exercise X11 synthetic inline CLI tab return and resize
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         timeout-minutes: 5

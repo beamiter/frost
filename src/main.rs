@@ -2,6 +2,7 @@ mod agent_cli;
 use crate::theme::ThemeExt as _;
 pub(crate) use jterm_core::char_width;
 use jterm_core::click_cursor;
+use jterm_core::native_pty_launch::PtyLaunchError;
 use jterm_core::organism_companion::{CompanionIntent, CompanionSurface};
 use jterm_core::pane_layout::{
     self, collect_pane_rects, directional_focus_target, equalize_shares, normalized_shares,
@@ -5846,7 +5847,10 @@ impl Session {
             command_argv,
             &child_env,
         )
-        .map_err(|error| anyhow::anyhow!("cannot create terminal session: {error}"))?;
+        .map_err(|error| {
+            let message = format!("cannot create terminal session: {error}");
+            error.context(message)
+        })?;
         let master_fd = pty.master_fd();
         let child_pid = pty.get_child_pid();
         let shell_identity = companion_host::shell_identity::ShellIdentity::capture(
@@ -5865,7 +5869,7 @@ impl Session {
                 coalesce_bytes: PTY_QUEUE_COALESCE_BYTES,
             },
         )
-        .map_err(anyhow::Error::msg)?;
+        .map_err(|error| PtyLaunchError::ExecConfirmed(std::io::Error::other(error)))?;
         let watch_source = organism_watch::SourceAuthority::from_runtime(pty.output_source());
         let inline_agent_launch = command_argv
             .map(crate::immersive_command::reading_agent_argv)
@@ -10243,7 +10247,12 @@ impl Frost {
                     restored[snapshot_index] = true;
                     next_id += 1;
                 }
-                Err(error) if snap.cwd.is_some() => {
+                Err(error)
+                    if snap.cwd.is_some()
+                        && error
+                            .downcast_ref::<PtyLaunchError>()
+                            .is_some_and(PtyLaunchError::failed_working_directory) =>
+                {
                     let cwd = snap.cwd.as_deref().unwrap_or_default();
                     log::warn!(
                         "[SessionPersistence] Cannot restore cwd {cwd:?}: {error}; using default cwd"
@@ -10267,13 +10276,13 @@ impl Frost {
             }
         }
         if sessions.is_empty() {
-            let mut state = default(0).with_recovery(startup_recovery);
-            if let Some(error) = state.diagnostic.take() {
-                restore_warnings.push(error);
+            return RestoredState {
+                diagnostic: Some(crate::review_text::bound_diagnostic_text(
+                    restore_warnings.join("\n"),
+                )),
+                ..RestoredState::default()
             }
-            state.diagnostic = (!restore_warnings.is_empty())
-                .then(|| crate::review_text::bound_diagnostic_text(restore_warnings.join("\n")));
-            return state;
+            .with_recovery(startup_recovery);
         }
         snapshot.retain_restored_sessions(&restored);
         let active = snapshot.active_index.unwrap_or(0).min(sessions.len() - 1);
@@ -48628,7 +48637,7 @@ mod startup_recovery_tests {
     }
 
     #[test]
-    fn source_preserves_loaded_bytes_before_either_fallback() {
+    fn source_preserves_loaded_bytes_before_launch_and_retries_only_failed_cwd() {
         let source = include_str!("main.rs");
         let restore = source
             .split_once("    fn restore_or_spawn(")
@@ -48650,8 +48659,15 @@ mod startup_recovery_tests {
             restore
                 .matches("default(0).with_recovery(startup_recovery)")
                 .count(),
-            2
+            1
         );
+        assert!(restore.contains(".is_some_and(PtyLaunchError::failed_working_directory)"));
+        let exhausted = restore.split_once("if sessions.is_empty()").unwrap().1;
+        let exhausted = exhausted
+            .split_once("snapshot.retain_restored_sessions(")
+            .unwrap()
+            .0;
+        assert!(!exhausted.contains("default(0)"));
         assert!(restore
             .contains("session_writes_blocked: startup_recovery.preservation.writes_blocked()"));
         assert!(restore.contains("SnapshotLoad::Unreadable(reason)"));

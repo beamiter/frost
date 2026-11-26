@@ -2,6 +2,7 @@
 //! 端口自 ember `session_persistence.rs`，精简为 frost 实际需要的字段。
 use crate::recovery_report::RepairKind;
 pub use crate::recovery_report::{PreservationOutcome, RecoveryReport};
+pub use jterm_core::pty_instance_lock::InstanceLock;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -2015,6 +2016,8 @@ pub fn try_acquire_instance_lock() -> Option<InstanceLock> {
     let lock_path = dirs::config_dir()?.join("frost").join("instance.lock");
     let file = try_acquire_instance_lock_at(&lock_path)?;
     InstanceLock::register(file)
+        .inspect_err(|error| log::warn!("[SessionPersistence] {error}"))
+        .ok()
 }
 
 fn try_acquire_instance_lock_at(lock_path: &Path) -> Option<std::fs::File> {
@@ -2062,69 +2065,6 @@ fn try_acquire_instance_lock_at(lock_path: &Path) -> Option<std::fs::File> {
         return None;
     }
     Some(file)
-}
-
-/// flock 绑定在继承的 open-file description 上，而不只是当前进程：fork 之后、
-/// execve 之前锁仍然持有，一个卡住的 pre-exec 子进程可能比主进程活得更久并
-/// 继续占着单实例锁。注册描述符让 PTY 子进程能在 fork 后立即 close 自己那份
-/// 继承拷贝；仅有 `FD_CLOEXEC` 不足以覆盖这个窗口。
-#[cfg(unix)]
-const NO_INSTANCE_LOCK_FD: i32 = -1;
-#[cfg(unix)]
-static INSTANCE_LOCK_FD: std::sync::atomic::AtomicI32 =
-    std::sync::atomic::AtomicI32::new(NO_INSTANCE_LOCK_FD);
-
-/// Capture before `fork`; the child must only use the returned integer with
-/// async-signal-safe `close(2)`.
-#[cfg(unix)]
-pub(crate) fn inherited_instance_lock_fd() -> i32 {
-    INSTANCE_LOCK_FD.load(std::sync::atomic::Ordering::Acquire)
-}
-
-/// Owns the primary-instance lock and publishes its descriptor so a freshly
-/// forked PTY child can close its inherited copy before doing any other work.
-pub struct InstanceLock {
-    // On unix the descriptor is published for PTY children and read back in
-    // Drop; elsewhere the file only needs to stay alive.
-    #[cfg_attr(not(unix), allow(dead_code))]
-    file: std::fs::File,
-}
-
-impl InstanceLock {
-    fn register(file: std::fs::File) -> Option<Self> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            if INSTANCE_LOCK_FD
-                .compare_exchange(
-                    NO_INSTANCE_LOCK_FD,
-                    file.as_raw_fd(),
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Acquire,
-                )
-                .is_err()
-            {
-                log::warn!(
-                    "[SessionPersistence] an instance lock descriptor is already registered"
-                );
-                return None;
-            }
-        }
-        Some(Self { file })
-    }
-}
-
-#[cfg(unix)]
-impl Drop for InstanceLock {
-    fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        let _ = INSTANCE_LOCK_FD.compare_exchange(
-            self.file.as_raw_fd(),
-            NO_INSTANCE_LOCK_FD,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        );
-    }
 }
 
 #[cfg(test)]
@@ -2736,7 +2676,8 @@ mod tests {
         let path = root.join("instance.lock");
         let file = try_acquire_instance_lock_at(&path).expect("first owner acquires lock");
         let owner = InstanceLock::register(file).expect("register the instance lock");
-        let inherited_fd = inherited_instance_lock_fd();
+        use std::os::fd::{AsFd, AsRawFd};
+        let inherited_fd = owner.as_fd().as_raw_fd();
         assert!(inherited_fd >= 0);
 
         let mut ready_pipe = [-1; 2];
@@ -2788,14 +2729,9 @@ mod tests {
         }
 
         drop(owner);
-        assert_eq!(
-            inherited_instance_lock_fd(),
-            NO_INSTANCE_LOCK_FD,
-            "dropping the parent guard must clear the published descriptor"
-        );
         let replacement = try_acquire_instance_lock_at(&path)
             .expect("the live forked child must not retain the lock");
-        drop(replacement);
+        drop(InstanceLock::register(replacement).unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 

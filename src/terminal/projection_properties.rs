@@ -647,8 +647,8 @@ fn check_dense_collapse_case(
     }
     let mut terminal = TerminalState::new(width, original.len());
     for (row, cells) in original.iter().enumerate() {
-        terminal.grid.set_row(row, cells.clone());
-        terminal.grid.row_wrapped_mut()[row] = wrapped[row];
+        terminal.screen.grid.set_row(row, cells.clone());
+        terminal.screen.grid.row_wrapped_mut()[row] = wrapped[row];
     }
     let ids: Vec<_> = (0..original.len())
         .map(|row| terminal.grid.raw_row_id(row).unwrap())
@@ -1238,16 +1238,17 @@ fn materializer_decodes_each_visible_source_once_when_rows_join() {
 fn selected_text_covers_live_wide_partial_reverse_block_and_chrome() {
     let mut terminal = TerminalState::new(8, 2);
     for (col, ch) in ['X', '中', ' ', 'Y', 'é'].into_iter().enumerate() {
-        terminal.grid.get_mut(0, col).character = ch;
+        terminal.screen.grid.get_mut(0, col).character = ch;
     }
-    terminal.grid.get_mut(0, 1).flags.set_wide(true);
+    terminal.screen.grid.get_mut(0, 1).flags.set_wide(true);
     terminal
+        .screen
         .grid
         .get_mut(0, 2)
         .flags
         .set_wide_continuation(true);
     for (col, ch) in "ABCDEFGH".chars().enumerate() {
-        terminal.grid.get_mut(1, col).character = ch;
+        terminal.screen.grid.get_mut(1, col).character = ch;
     }
     let id = terminal.grid.raw_row_id(1).unwrap();
     let plan = terminal.identity_projection_plan(8).splice_native_chrome(
@@ -1743,10 +1744,10 @@ fn seeded_live_grid_raw_endpoint_copy_is_invariant_under_legal_chrome() {
                 }
                 col += 1;
             }
-            terminal.grid.set_row(row, cells.clone());
+            terminal.screen.grid.set_row(row, cells.clone());
             original.push(cells);
             let soft = row + 1 < rows && rng.pick(2) == 0;
-            terminal.grid.row_wrapped_mut()[row] = soft;
+            terminal.screen.grid.row_wrapped_mut()[row] = soft;
             wrapped.push(soft);
             let chrome_rows = 1 + rng.pick(3);
             boundaries.push(ChromeBoundary {

@@ -2,13 +2,19 @@ use super::TerminalState;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-/// Reproduce the frozen Frost observer lanes from the active engine state.
-/// The old mode order is used only to compare against the original `Debug` data.
+/// Read shared engine state using the formats in Frost's frozen replay records.
 pub(super) fn observe(
     terminal: &TerminalState,
     out: &mut BTreeMap<String, Value>,
     lane: impl Fn(String) -> Value,
 ) {
+    let hyperlink = terminal.screen.current_hyperlink;
+    let legacy_hyperlink = (!hyperlink.is_none()).then_some(hyperlink.as_raw());
+    out.insert(
+        "current_hyperlink".into(),
+        lane(format!("{legacy_hyperlink:?}")),
+    );
+
     let protocol = &terminal.protocol;
     let mut bits = 0u64;
     for (index, mode) in [

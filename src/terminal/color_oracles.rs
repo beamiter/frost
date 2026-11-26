@@ -48,7 +48,11 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         "saved_primary_dynamic_palette".into(),
         lane(t.saved_primary_colors.dynamic_palette),
     );
-    super::replay_protocol::observe(t, &mut out, Value::String);
+    super::replay_state::observe(t, &mut out, Value::String);
+    out.insert(
+        "saved_primary_cursor_shape".into(),
+        lane(t.screen.saved_primary_cursor_shape.unwrap_or_default()),
+    );
     fields!(
         scrollback,
         selection,
@@ -70,7 +74,6 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         saved_cursor_row,
         saved_cursor_col,
         saved_primary_global_bg,
-        saved_primary_cursor_shape,
         tab_stops,
         last_printed_char,
         pending_wrap,
@@ -102,7 +105,6 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         projection_plan_cache,
         next_projected_view_revision,
         next_projection_plan_revision,
-        current_hyperlink,
         osc8_hyperlinks,
         sync_output_active,
         last_archived_screen_snapshot,
@@ -160,7 +162,7 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         );
     }
     for (name, s) in [
-        ("saved_cursor", &t.saved_cursor),
+        ("saved_cursor", &t.screen.saved_state),
         ("saved_primary_screen_state", &t.saved_primary_screen_state),
     ] {
         out.insert(

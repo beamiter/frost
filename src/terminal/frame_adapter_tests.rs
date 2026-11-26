@@ -201,7 +201,7 @@ fn frame_adapter_retained_copy_control() {
         *row_control
     );
     // Host cursor preferences can change without a PTY/grid revision.
-    terminal.cursor_shape = CursorShape::Beam;
+    terminal.screen.cursor_shape = CursorShape::Beam;
     let shape_frame = terminal.get_live_cell_frame();
     assert_eq!(shape_frame.cursor().shape, CursorShape::Beam);
     assert_eq!(new_frame_cells(&row_frame, &shape_frame), 0);
@@ -214,7 +214,7 @@ fn frame_adapter_retained_copy_control() {
     assert_eq!(new_frame_cells(&hidden, &shown), 0);
 
     let before = terminal.get_projected_viewport(false);
-    terminal.cursor_shape = CursorShape::Underline;
+    terminal.screen.cursor_shape = CursorShape::Underline;
     let after = terminal.get_projected_viewport(false);
     assert_eq!(
         before.cells.raw_frame().unwrap().cursor().shape,
@@ -276,8 +276,8 @@ fn frame_adapter_layout_and_alternate_are_full_boundaries() {
     let shrunk = terminal.get_live_cell_frame();
     assert!(shrunk.cursor().row < 1 && shrunk.cursor().col < 2);
     // Legacy host state could temporarily be outside the new viewport.
-    terminal.cursor_row = 3;
-    terminal.cursor_col = 6;
+    terminal.screen.cursor_row = 3;
+    terminal.screen.cursor_col = 6;
     let exceptional = terminal.get_live_cell_frame();
     assert_eq!(exceptional.cursor().paint_position(), (0, 1));
     assert!(!exceptional.cursor().visible);

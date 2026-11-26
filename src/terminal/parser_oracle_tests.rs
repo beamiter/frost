@@ -89,7 +89,7 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
         lane(t.colors.dynamic_cursor_color),
     );
     out.insert("dynamic_palette".into(), lane(t.colors.dynamic_palette));
-    super::replay_protocol::observe(t, &mut out, text_lane);
+    super::replay_state::observe(t, &mut out, text_lane);
     fields!(
         current_working_dir,
         organism_idle_cwd,
@@ -97,7 +97,6 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
         current_bg,
         current_flags,
         global_bg,
-        current_hyperlink,
         osc8_hyperlinks,
         output_buffer,
         pending_clipboard_requests,
@@ -161,7 +160,7 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
         lane((t.g0_charset, t.g1_charset, t.active_charset, &t.tab_stops)),
     );
     for (name, saved) in [
-        ("saved_cursor", &t.saved_cursor),
+        ("saved_cursor", &t.screen.saved_state),
         ("saved_primary", &t.saved_primary_screen_state),
     ] {
         out.insert(
@@ -178,7 +177,7 @@ fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
         "saved_primary_colors".into(),
         lane((
             t.saved_primary_global_bg,
-            t.saved_primary_cursor_shape,
+            t.screen.saved_primary_cursor_shape.unwrap_or_default(),
             t.saved_primary_colors.dynamic_fg,
             t.saved_primary_colors.dynamic_bg,
             t.saved_primary_colors.dynamic_cursor_color,
