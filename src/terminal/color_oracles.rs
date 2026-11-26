@@ -55,7 +55,7 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         "saved_primary_dynamic_palette".into(),
         lane(t.saved_primary_colors.dynamic_palette),
     );
-    super::replay_protocol::observe(t, &mut out, Value::String);
+    super::replay_state::observe(t, &mut out, Value::String);
     fields!(t.vt.screen;
         use_alt_buffer,
         cursor_row,
@@ -77,14 +77,9 @@ fn full_snapshot(t: &TerminalState) -> BTreeMap<String, Value> {
         g1_charset,
         active_charset,
     );
-    let link = t.vt.screen.current_hyperlink;
-    out.insert(
-        "current_hyperlink".into(),
-        lane((!link.is_none()).then_some(link.as_raw())),
-    );
     out.insert(
         "saved_primary_cursor_shape".into(),
-        lane(t.vt.screen.saved_primary_cursor_shape.unwrap_or_default()),
+        lane(super::replay_state::saved_primary_cursor_shape(t)),
     );
     out.insert("scrollback".into(), scrollback_lane(&t.scrollback));
     out.insert(

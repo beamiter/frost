@@ -1,8 +1,9 @@
 use super::TerminalState;
+use jterm_engine::grid::CursorShape;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-/// Reproduce the frozen Frost observer lanes from the active engine state.
+/// Read the frozen Frost observer lanes from the active engine state.
 /// The old mode order is used only to compare against the original `Debug` data.
 pub(super) fn observe(
     terminal: &TerminalState,
@@ -25,9 +26,14 @@ pub(super) fn observe(
         };
         bits |= u64::from(enabled) << index;
     }
+    let link = terminal.vt.screen.current_hyperlink;
     out.extend(
         [
             ("modes", format!("TerminalModes {{ bits: {bits} }}")),
+            (
+                "current_hyperlink",
+                format!("{:?}", (!link.is_none()).then_some(link.as_raw())),
+            ),
             (
                 "keyboard_enhancement_flags",
                 protocol.keyboard_enhancement_flags().to_string(),
@@ -56,4 +62,12 @@ pub(super) fn observe(
         .into_iter()
         .map(|(name, value)| (name.into(), lane(value))),
     );
+}
+
+pub(super) fn saved_primary_cursor_shape(terminal: &TerminalState) -> CursorShape {
+    terminal
+        .vt
+        .screen
+        .saved_primary_cursor_shape
+        .unwrap_or_default()
 }

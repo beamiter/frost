@@ -91,16 +91,11 @@ pub(super) fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
         lane(t.colors.dynamic_cursor_color),
     );
     out.insert("dynamic_palette".into(), lane(t.colors.dynamic_palette));
-    super::replay_protocol::observe(t, &mut out, text_lane);
+    super::replay_state::observe(t, &mut out, text_lane);
     fields!(t.vt.screen;
         current_fg,
         current_bg,
         current_flags,
-    );
-    let link = t.vt.screen.current_hyperlink;
-    out.insert(
-        "current_hyperlink".into(),
-        lane((!link.is_none()).then_some(link.as_raw())),
     );
     out.insert(
         "pending_osc52_clipboard_set".into(),
@@ -196,7 +191,7 @@ pub(super) fn snapshot(t: &mut TerminalState) -> BTreeMap<String, Value> {
         "saved_primary_colors".into(),
         lane((
             t.saved_primary_global_bg,
-            t.vt.screen.saved_primary_cursor_shape.unwrap_or_default(),
+            super::replay_state::saved_primary_cursor_shape(t),
             t.saved_primary_colors.dynamic_fg,
             t.saved_primary_colors.dynamic_bg,
             t.saved_primary_colors.dynamic_cursor_color,

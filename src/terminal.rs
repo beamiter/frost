@@ -61,7 +61,7 @@ mod region_ops_oracles;
 #[cfg(test)]
 mod replay_frame_debug;
 #[cfg(test)]
-mod replay_protocol;
+mod replay_state;
 #[cfg(test)]
 mod title_oracles;
 

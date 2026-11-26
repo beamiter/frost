@@ -14,15 +14,16 @@
     "replace only transport/orchestration with bounded fresh Rust zstd replay",
     "Render admitted frame IDs with the original Stamp syntax for exact comparison. Numeric IDs and all other fields are retained.",
     "Use distinct title and color worker fixture directories and recursion markers for concurrent runs.",
-    "Read mode and keyboard observations from the shared ProtocolState using the original Frost lane names and values."
+    "Read mode and keyboard observations from the shared ProtocolState using the original Frost lane names and values.",
+    "Share active hyperlink and saved primary cursor observations across replay observers, preserving the frozen lane formats."
   ],
   "helper_change": "same cfg(test) Kitty observer relocated before tests for Clippy; exact removal restores original complete file",
   "source_sha256": {
-    "src/terminal/title_oracles.rs": "94bb55d84f295e458310a309184d208e55da0542b357a359594ff3398c0b8f16",
+    "src/terminal/title_oracles.rs": "fcd473ade4a4162c2a232e2e2831b202e2e2778bb03f8241fe9c0e183e5282cf",
     "src/terminal/title_replay_transport/mod.rs": "be58e6f3f123d921c547fa59f1c9dd53d405ef0337aa1fca3ddfadac5da86585",
     "src/terminal/title_replay_transport/worker.rs": "8547cc208d3e5df70259d95baca064df74820f20fec56f5fa57ba5b5071560bf",
     "src/terminal/title_replay_transport/lanes.rs": "4987c6bb2eec3c5f7eeb67acfba08239999d957f1a463774a68d78f5b94b2568",
     "src/terminal/replay_frame_debug.rs": "2074085027ec791795f8b483aff06e08358c264b454c901babdd3880fe653ec6",
-    "src/terminal/replay_protocol.rs": "4c4ef05818a05b5c10df0cf31caa14b75829e3d2deb248a091a2e75a2fa76f96"
+    "src/terminal/replay_state.rs": "000679f70aafcc7aa1f09a2522272fd86d3d63b7e4d7a50134f58a8f84b795ad"
   }
 }
