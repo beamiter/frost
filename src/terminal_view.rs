@@ -4587,6 +4587,7 @@ impl<Message> TermWidget<'_, Message> {
                     cell.flags.italic(),
                 );
                 // Blink: during the off phase, blinking cells show no glyph.
+                let concealed = cell.flags.concealed();
                 let blink_hidden = cell.flags.blink() && !self.blink_on;
 
                 // Clickable links keep their terminal color unless hovered.
@@ -4603,7 +4604,7 @@ impl<Message> TermWidget<'_, Message> {
                     }
                 }
 
-                let printable = glyph != ' ' && glyph != '\0' && !blink_hidden;
+                let printable = glyph != ' ' && glyph != '\0' && !blink_hidden && !concealed;
 
                 if printable && !is_wide {
                     if glyph_joins_run(self.metrics, glyph, glyph_font, font) {
@@ -4686,7 +4687,7 @@ impl<Message> TermWidget<'_, Message> {
                     }
                 }
 
-                if is_link || cell.flags.underline() != UnderlineStyle::None {
+                if !concealed && (is_link || cell.flags.underline() != UnderlineStyle::None) {
                     renderer.fill_quad(
                         solid_quad(Rectangle {
                             x,
@@ -4697,11 +4698,22 @@ impl<Message> TermWidget<'_, Message> {
                         Background::Color(fg),
                     );
                 }
-                if cell.flags.strikethrough() {
+                if !concealed && cell.flags.strikethrough() {
                     renderer.fill_quad(
                         solid_quad(Rectangle {
                             x,
                             y: y + ch * 0.5,
+                            width: cw * span,
+                            height: 1.0,
+                        }),
+                        Background::Color(fg),
+                    );
+                }
+                if !concealed && cell.flags.overline() {
+                    renderer.fill_quad(
+                        solid_quad(Rectangle {
+                            x,
+                            y: y + 1.0,
                             width: cw * span,
                             height: 1.0,
                         }),
@@ -5581,7 +5593,7 @@ impl<Message> TermWidget<'_, Message> {
             if self.focused {
                 renderer.fill_quad(solid_quad(shape_bounds), Background::Color(cur));
                 if self.cursor_shape == CursorShape::Block {
-                    if let Some(cell) = cursor_cell {
+                    if let Some(cell) = cursor_cell.filter(|cell| !cell.flags.concealed()) {
                         let glyph = cell.character;
                         if glyph != ' ' && glyph != '\0' {
                             let content = glyph.to_string();

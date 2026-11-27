@@ -3124,11 +3124,13 @@ impl TerminalState {
 
     pub fn new(cols: usize, rows: usize) -> Self {
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
+        let mut screen = ScreenState::new_frost_legacy(rows, cols);
+        screen.enable_extended_rendition();
         TerminalState {
             host_input_focused: false,
             vt: jterm_engine::native_terminal::NativeTerminal::adopt(
                 jterm_engine::native_terminal::NativeProfile::FrostLegacy,
-                ScreenState::new_frost_legacy(rows, cols),
+                screen,
                 ProtocolState::with_modes(Self::initial_protocol_modes()),
                 Parser::with_bounded_profile(
                     ParserLimits {
