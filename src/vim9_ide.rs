@@ -1064,7 +1064,7 @@ impl Ide {
     fn retire_gestures(&mut self) {
         for gesture in &mut self.gestures {
             if let Some(previous) = gesture.take().filter(|g| g.report_to_app) {
-                if let (Some(s), Some((col, row))) = (&mut self.session, previous.last_app_cell) {
+                if let (Some(s), Some((col, row))) = (&mut self.session, previous.last_cell()) {
                     if let Some(bytes) = s.terminal.get_mouse_release_report(
                         mouse_report_code(
                             super::btn_code(previous.button),
@@ -2119,7 +2119,7 @@ impl Ide {
                     session_id: s.id,
                     button,
                     report_to_app: app,
-                    last_app_cell: None,
+                    last_app_position: None,
                     consumed: false,
                 };
                 if app {
@@ -2132,7 +2132,7 @@ impl Ide {
                             y,
                         ) {
                             if s.write_pty(&bytes) {
-                                gesture.last_app_cell = Some((x, y));
+                                gesture.last_app_position = Some(crate::pixel_mouse::ReportPosition::Cell(x, y));
                             }
                         }
                     }
@@ -2183,7 +2183,7 @@ impl Ide {
                                 y,
                             ) {
                                 if s.write_pty(&bytes) {
-                                    gesture.last_app_cell = Some((x, y));
+                                    gesture.last_app_position = Some(crate::pixel_mouse::ReportPosition::Cell(x, y));
                                 }
                             }
                         }
@@ -2210,7 +2210,7 @@ impl Ide {
                 if gesture.report_to_app {
                     let cell =
                         super::projected_live_grid_cell(&s.terminal, &s.projection, row, col)
-                            .or(gesture.last_app_cell);
+                            .or(gesture.last_cell());
                     if let Some((x, y)) = cell {
                         if let Some(bytes) = s.terminal.get_mouse_release_report(
                             mouse_report_code(
@@ -2264,6 +2264,7 @@ impl Ide {
             MouseInput::ScrollToExact { offset } => {
                 s.set_scroll_offset(offset.max(0.0).floor() as usize)
             }
+            MouseInput::AppMotion { .. } => return Task::none(),
         }
         if let Some(s) = &mut self.session {
             s.refresh();

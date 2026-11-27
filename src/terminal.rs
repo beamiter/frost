@@ -7270,6 +7270,11 @@ impl TerminalState {
     }
 
     pub fn set_viewport_pixel_size(&mut self, width: u32, height: u32) {
+        if self.pixel_mouse_mode()
+            && (self.viewport_pixel_width, self.viewport_pixel_height) != (width, height)
+        {
+            self.retire_native_wheel();
+        }
         self.viewport_pixel_width = width;
         self.viewport_pixel_height = height;
     }
@@ -7328,6 +7333,14 @@ impl TerminalState {
         self.vt.protocol
             .modes()
             .get_mouse_release_report(button, col, row)
+    }
+
+    pub fn enable_pixel_mouse(&mut self) {
+        self.vt.protocol.modes_mut().enable_pixel_mouse();
+    }
+
+    pub fn pixel_mouse_mode(&self) -> bool {
+        self.vt.protocol.modes().contains(&1016)
     }
 
     /// Inline agent transcripts are a native reading surface even if the

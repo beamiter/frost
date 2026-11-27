@@ -100,6 +100,7 @@ mod search_replace_panel;
 mod session_persistence;
 mod sidebar;
 mod sidebar_resize;
+mod pixel_mouse;
 mod terminal;
 mod terminal_attachment;
 mod terminal_ime;
@@ -5002,8 +5003,13 @@ enum Message {
     ImeCancelledCommit,
     ModifiersChanged(keyboard::Modifiers),
     /// A mouse interaction within the pane showing the stable session id.
-    MousePane(usize, MouseInput),
-    ProjectedMousePane(usize, ProjectionCallbackIdentity, MouseInput),
+    MousePane(usize, MouseInput, pixel_mouse::ReportCoordinates),
+    ProjectedMousePane(
+        usize,
+        ProjectionCallbackIdentity,
+        MouseInput,
+        pixel_mouse::ReportCoordinates,
+    ),
     ProjectedAction(usize, ProjectionCallbackIdentity, Box<Message>),
     ProjectedTranscriptScroll(
         usize,
@@ -5430,6 +5436,7 @@ struct Session {
     terminal: TerminalState,
     pty: SessionActor<Pty>,
     measured_pty_size: Option<(usize, usize, u16, u16)>,
+    last_pixel_motion: Option<(pixel_mouse::PixelPosition, u8)>,
     child_pid: i32,
     /// Explicit argv owns this PTY as work, even if its root child is the
     /// foreground group. This comes from spawn admission, never a tab title.
@@ -5949,6 +5956,7 @@ impl Session {
                     })
             });
         let mut terminal = TerminalState::new(cols, rows);
+        terminal.enable_pixel_mouse();
         terminal.set_inline_cli_launch(inline_agent_launch);
         terminal.set_max_scrollback(config.scrollback_lines);
         terminal.set_disable_alt_screen(config.disable_alt_screen);
@@ -5977,6 +5985,7 @@ impl Session {
             terminal,
             pty,
             measured_pty_size: None,
+            last_pixel_motion: None,
             child_pid,
             command_owned: command_argv.is_some(),
             inline_agent_launch,
@@ -6706,6 +6715,54 @@ impl Session {
             && self.terminal.native_wheel_generation().is_some()
     }
 
+    fn pixel_mouse_viewport(&self) -> Option<pixel_mouse::PixelViewport> {
+        let size = self.measured_pty_size?;
+        if !self.terminal.pixel_mouse_mode() || self.terminal.get_dimensions() != (size.0, size.1) {
+            return None;
+        }
+        Some(pixel_mouse::PixelViewport {
+            generation: self.terminal.native_wheel_generation()?,
+            size,
+        })
+    }
+
+    fn app_mouse_position(
+        &self,
+        cell: (usize, usize),
+        coordinates: pixel_mouse::ReportCoordinates,
+    ) -> Option<pixel_mouse::ReportPosition> {
+        use pixel_mouse::{ReportCoordinates, ReportPosition};
+        match coordinates {
+            ReportCoordinates::Cell if !self.terminal.pixel_mouse_mode() => {
+                Some(ReportPosition::Cell(cell.0, cell.1))
+            }
+            ReportCoordinates::Pixel(Some((view, offset)))
+                if self.pixel_mouse_viewport() == Some(view) =>
+            {
+                view.position(cell.0, cell.1, offset)
+                    .map(ReportPosition::Pixel)
+            }
+            _ => None,
+        }
+    }
+
+    fn write_pixel_motion(&mut self, position: pixel_mouse::PixelPosition, button: u8) -> bool {
+        let motion = (position, button);
+        if self.last_pixel_motion == Some(motion) {
+            return false;
+        }
+        let accepted = self.terminal
+            .vt
+            .protocol
+            .modes()
+            .get_mouse_report_at(button, position.wire())
+            .is_some_and(|report| self.write_pty(&report));
+        if accepted {
+            self.last_pixel_motion = Some(motion);
+        }
+        accepted
+    }
+
     fn alternate_scroll_generation(&self) -> Option<u64> {
         self.alternate_scroll_active()
             .then(|| self.terminal.native_wheel_generation())
@@ -6740,7 +6797,12 @@ impl Session {
 
     /// Return true when the event belongs to an application (including a
     /// stale app event that must be consumed without scrolling local history).
-    fn dispatch_app_wheel(&mut self, input: MouseInput, report_to_app: bool) -> bool {
+    fn dispatch_app_wheel(
+        &mut self,
+        input: MouseInput,
+        report_to_app: bool,
+        coordinates: pixel_mouse::ReportCoordinates,
+    ) -> bool {
         let MouseInput::Wheel {
             col,
             row,
@@ -6768,11 +6830,13 @@ impl Session {
             if let Some((grid_col, grid_row)) =
                 projected_live_grid_cell(&self.terminal, &self.projection, row, col)
             {
-                for _ in 0..lines.clamp(1, terminal_view::MAX_APP_WHEEL_LINES) {
-                    if let Some(report) =
-                        self.terminal
-                            .get_mouse_report(mouse_report_code(if up { 64 } else { 65 }, false, alt, false), grid_col, grid_row)
-                    {
+                let report = self.app_mouse_position((grid_col, grid_row), coordinates)
+                    .and_then(|position| self.terminal.vt.protocol.modes().get_mouse_report_at(
+                        mouse_report_code(if up { 64 } else { 65 }, false, alt, false),
+                        position.wire(),
+                    ));
+                if let Some(report) = report {
+                    for _ in 0..lines.clamp(1, terminal_view::MAX_APP_WHEEL_LINES) {
                         self.write_pty(&report);
                     }
                 }
@@ -7005,9 +7069,9 @@ struct TerminalMouseGesture {
     session_id: usize,
     button: MouseButton,
     report_to_app: bool,
-    /// Last raw live-grid cell whose press/drag report the PTY accepted. `None`
+    /// Last live-grid position whose press/drag report the PTY accepted. `None`
     /// means no press was sent, so a trailing event must not manufacture one.
-    last_app_cell: Option<(usize, usize)>,
+    last_app_position: Option<pixel_mouse::ReportPosition>,
     /// The app layer claimed this sequence after the widget had already
     /// published an ordinary press (for example an inactive pane whose link
     /// cache was refreshed only after focus moved). Subsequent drag/release
@@ -7082,17 +7146,24 @@ fn reject_chat_press(
         session_id,
         button,
         report_to_app: false,
-        last_app_cell: None,
+        last_app_position: None,
         consumed: true,
     });
     Some(button)
 }
 
 impl TerminalMouseGesture {
+    fn last_cell(self) -> Option<(usize, usize)> {
+        match self.last_app_position? {
+            pixel_mouse::ReportPosition::Cell(col, row) => Some((col, row)),
+            pixel_mouse::ReportPosition::Pixel(_) => None,
+        }
+    }
+
     /// Drag reports require a paired app press and a current raw cell. A
     /// synthetic spacer/history row never inherits an earlier drag position.
     fn app_drag_cell(self, current: Option<(usize, usize)>) -> Option<(usize, usize)> {
-        if !self.report_to_app || self.consumed || self.last_app_cell.is_none() {
+        if !self.report_to_app || self.consumed || self.last_app_position.is_none() {
             return None;
         }
         current
@@ -7110,15 +7181,46 @@ impl TerminalMouseGesture {
         if !self.report_to_app || self.consumed {
             return None;
         }
-        let last = self.last_app_cell?;
+        let (col, row) = self.last_cell()?;
         current.or_else(|| {
             // The pane may have shrunk since the accepted press/drag. Only
             // the saved fallback needs clamping; a current mapping is exact.
             Some((
-                last.0.min(grid_cols.checked_sub(1)?),
-                last.1.min(grid_rows.checked_sub(1)?),
+                col.min(grid_cols.checked_sub(1)?),
+                row.min(grid_rows.checked_sub(1)?),
             ))
         })
+    }
+
+    fn app_release_position(
+        self,
+        terminal: &terminal::TerminalState,
+        current: Option<pixel_mouse::ReportPosition>,
+    ) -> Option<pixel_mouse::ReportPosition> {
+        use pixel_mouse::ReportPosition;
+        if !self.report_to_app || self.consumed {
+            return None;
+        }
+        let last = self.last_app_position?;
+        let (columns, rows) = terminal.get_dimensions();
+        match last {
+            ReportPosition::Cell(..) if !terminal.pixel_mouse_mode() => {
+                let latest = match current {
+                    Some(ReportPosition::Cell(col, row)) => Some((col, row)),
+                    _ => None,
+                };
+                self.app_release_cell(latest, columns, rows)
+                    .map(|(col,row)| ReportPosition::Cell(col, row))
+            }
+            ReportPosition::Pixel(pixel)
+                if terminal.pixel_mouse_mode()
+                    && terminal.native_wheel_generation() == Some(pixel.viewport.generation)
+                    && (columns, rows) == (pixel.viewport.size.0, pixel.viewport.size.1) =>
+            {
+                Some(current.filter(|position| last.same_space(*position)).unwrap_or(last))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -7128,25 +7230,20 @@ fn cancelled_terminal_mouse_report(
     terminal: &terminal::TerminalState,
     modifiers: keyboard::Modifiers,
 ) -> Option<Vec<u8>> {
-    let (col, row) = gesture.app_release_cell(
-        None,
-        terminal.vt.screen.grid.row_len(),
-        terminal.vt.screen.grid.rows(),
-    )?;
+    let position = gesture.app_release_position(terminal, None)?;
     let code = match gesture.button {
         MouseButton::Left => 0,
         MouseButton::Middle => 1,
         MouseButton::Right => 2,
     };
-    terminal.get_mouse_release_report(
+    terminal.vt.protocol.modes().get_mouse_release_report_at(
         mouse_report_code(
             code,
             modifiers.shift(),
             modifiers.alt(),
             modifiers.control(),
         ),
-        col,
-        row,
+        position.wire(),
     )
 }
 
@@ -7360,11 +7457,11 @@ fn terminal_panes_body<'a, Message: 'a, Renderer: iced::advanced::Renderer + 'a>
 
 /// Remember only reports accepted by the gesture's own PTY. Button slots and
 /// stable pane ownership prevent another pane or button from moving this cell.
-fn record_terminal_app_mouse_cell(
+fn record_terminal_app_mouse_position(
     gestures: &mut [Option<TerminalMouseGesture>; 3],
     source_session_id: usize,
     button: MouseButton,
-    cell: (usize, usize),
+    position: pixel_mouse::ReportPosition,
 ) {
     let Some(Some(gesture)) = gestures.get_mut(button.slot()) else {
         return;
@@ -7374,8 +7471,20 @@ fn record_terminal_app_mouse_cell(
         && gesture.report_to_app
         && !gesture.consumed
     {
-        gesture.last_app_cell = Some(cell);
+        gesture.last_app_position = Some(position);
     }
+}
+
+#[cfg(test)]
+fn record_terminal_app_mouse_cell(
+    gestures: &mut [Option<TerminalMouseGesture>; 3],
+    session_id: usize,
+    button: MouseButton,
+    (col, row): (usize, usize),
+) {
+    record_terminal_app_mouse_position(
+        gestures, session_id, button, pixel_mouse::ReportPosition::Cell(col, row),
+    );
 }
 
 /// Only the pane that started a gesture may retire it. Every visible widget
@@ -15023,7 +15132,7 @@ impl Frost {
                         session_id: id,
                         button: MouseButton::Left,
                         report_to_app: false,
-                        last_app_cell: None,
+                        last_app_position: None,
                         consumed: false,
                     });
                 }
@@ -15067,8 +15176,68 @@ impl Frost {
         iced::clipboard::write_primary(text)
     }
 
-    fn handle_mouse(&mut self, source_session_id: usize, input: MouseInput) -> Task<Message> {
+    fn handle_pixel_motion(
+        &mut self,
+        session_id: usize,
+        col: usize,
+        row: usize,
+        coordinates: pixel_mouse::ReportCoordinates,
+    ) {
+        use pixel_mouse::ReportPosition;
+        let gesture = self.terminal_mouse_gestures.iter().flatten().next().copied();
+        if gesture.is_some_and(|held| {
+            held.session_id != session_id || held.consumed || !held.report_to_app
+        }) || (gesture.is_none() && self.modifiers.shift()) {
+            return;
+        }
+        let Some(index) = self.session_index_by_id(session_id) else {
+            return;
+        };
+        if !self.layout().contains_session(index) {
+            return;
+        }
+        let sess = &mut self.sessions[index];
+        if !sess.terminal.application_owns_pointer()
+            || !sess.terminal.vt.protocol.modes().should_report_mouse_motion(gesture.is_some())
+        {
+            return;
+        }
+        let Some(cell) = projected_live_grid_cell(&sess.terminal, &sess.projection, row, col) else {
+            return;
+        };
+        let Some(position @ ReportPosition::Pixel(pixel)) = sess.app_mouse_position(cell, coordinates) else {
+            return;
+        };
+        if gesture.is_some_and(|held| {
+            !held.last_app_position.is_some_and(|last| last.same_space(position))
+        }) {
+            return;
+        }
+        let button = gesture.map_or(3, |held| btn_code(held.button));
+        let report = mouse_report_code(
+            button | 32,
+            self.modifiers.shift(),
+            self.modifiers.alt(),
+            self.modifiers.control(),
+        );
+        let accepted = sess.write_pixel_motion(pixel, report);
+        if let Some(held) = gesture.filter(|_| accepted) {
+            record_terminal_app_mouse_position(
+                &mut self.terminal_mouse_gestures, session_id, held.button, position,
+            );
+        }
+    }
+
+    fn handle_mouse(&mut self,
+        source_session_id: usize,
+        input: MouseInput,
+        coordinates: pixel_mouse::ReportCoordinates,
+    ) -> Task<Message> {
+        use pixel_mouse::ReportPosition;
         if !self.projection_interaction_allowed_for(source_session_id) {
+            if matches!(input, MouseInput::AppMotion { .. }) {
+                return Task::none();
+            }
             cancel_terminal_mouse_gestures_for_pane(
                 &mut self.terminal_mouse_gestures,
                 &mut self.click_tracker,
@@ -15077,6 +15246,10 @@ impl Frost {
             return Task::none();
         }
         self.sync_terminal_pane_owners();
+        if let MouseInput::AppMotion { col, row } = input {
+            self.handle_pixel_motion(source_session_id, col, row, coordinates);
+            return Task::none();
+        }
         let speed = self.config.scroll_speed.max(1) as isize;
         // Validate the exact current cell before *any* terminal action,
         // including clipboard reads and multi-click selection. Consume the
@@ -15281,7 +15454,7 @@ impl Frost {
                     session_id: source_session_id,
                     button,
                     report_to_app,
-                    last_app_cell: None,
+                    last_app_position: None,
                     consumed: false,
                 };
                 self.terminal_mouse_gestures[button.slot()] = Some(gesture);
@@ -15333,6 +15506,7 @@ impl Frost {
             MouseInput::ScrollTo { .. } | MouseInput::ScrollToExact { .. } => {
                 (false, source_session_id, None)
             }
+            MouseInput::AppMotion { .. } => return Task::none(),
         };
 
         // Click-to-place-cursor acts on release, so that a drag which happens
@@ -15367,20 +15541,21 @@ impl Frost {
                 ..
             } => {
                 if report_to_app {
-                    if let Some((grid_col, grid_row)) =
+                    if let Some(position) =
                         projected_live_grid_cell(&sess.terminal, &sess.projection, row, col)
+                        .and_then(|cell| sess.app_mouse_position(cell, coordinates))
                     {
-                        if let Some(report) = sess.terminal.get_mouse_report(
+                        if let Some(report) = sess.terminal.vt.protocol.modes().get_mouse_report_at(
                             mouse_report_code(btn_code(button), shift, alt, ctrl),
-                            grid_col,
-                            grid_row,
+                            position.wire(),
                         ) {
                             if sess.write_pty(&report) {
-                                record_terminal_app_mouse_cell(
+                                sess.last_pixel_motion = None;
+                                record_terminal_app_mouse_position(
                                     &mut self.terminal_mouse_gestures,
                                     target_session_id,
                                     button,
-                                    (grid_col, grid_row),
+                                    position,
                                 );
                             }
                         }
@@ -15447,25 +15622,25 @@ impl Frost {
                     if sess.terminal.is_mouse_motion_enabled() {
                         let current =
                             projected_live_grid_cell(&sess.terminal, &sess.projection, row, col);
-                        if let Some((grid_col, grid_row)) =
-                            gesture.and_then(|gesture| gesture.app_drag_cell(current))
-                        {
-                            if let Some(report) = sess.terminal.get_mouse_report(
-                                mouse_report_code(
-                                    32,
-                                    self.modifiers.shift(),
-                                    self.modifiers.alt(),
-                                    self.modifiers.control(),
-                                ),
-                                grid_col,
-                                grid_row,
-                            ) {
-                                if sess.write_pty(&report) {
-                                    record_terminal_app_mouse_cell(
+                        if let Some(held) = gesture {
+                            let position = held.app_drag_cell(current)
+                                .and_then(|cell| sess.app_mouse_position(cell, coordinates))
+                                .filter(|point| held.last_app_position.is_some_and(|last| last.same_space(*point)));
+                            if let Some(position) = position {
+                                let button = mouse_report_code(32, self.modifiers.shift(), self.modifiers.alt(), self.modifiers.control());
+                                let accepted = match position {
+                                    ReportPosition::Pixel(pixel) => sess.write_pixel_motion(pixel, button),
+                                    ReportPosition::Cell(col, row) => sess
+                                        .terminal
+                                        .get_mouse_report(button, col, row)
+                                        .is_some_and(|report| sess.write_pty(&report)),
+                                };
+                                if accepted {
+                                    record_terminal_app_mouse_position(
                                         &mut self.terminal_mouse_gestures,
                                         target_session_id,
                                         MouseButton::Left,
-                                        (grid_col, grid_row),
+                                        position,
                                     );
                                 }
                             }
@@ -15493,26 +15668,22 @@ impl Frost {
             }
             MouseInput::Release { col, row, button } => {
                 if report_to_app {
-                    let current =
-                        projected_live_grid_cell(&sess.terminal, &sess.projection, row, col);
-                    if let Some((grid_col, grid_row)) = gesture.and_then(|gesture| {
-                        gesture.app_release_cell(
-                            current,
-                            sess.terminal.vt.screen.grid.row_len(),
-                            sess.terminal.vt.screen.grid.rows(),
-                        )
-                    }) {
-                        if let Some(report) = sess.terminal.get_mouse_release_report(
+                    let current = projected_live_grid_cell(&sess.terminal, &sess.projection, row, col)
+                        .and_then(|cell| sess.app_mouse_position(cell, coordinates));
+                    if let Some(position) = gesture
+                        .and_then(|held| held.app_release_position(&sess.terminal, current))
+                    {
+                        if let Some(report) = sess.terminal.vt.protocol.modes().get_mouse_release_report_at(
                             mouse_report_code(
                                 btn_code(button),
                                 self.modifiers.shift(),
                                 self.modifiers.alt(),
                                 self.modifiers.control(),
                             ),
-                            grid_col,
-                            grid_row,
+                            position.wire(),
                         ) {
                             sess.write_pty(&report);
+                            sess.last_pixel_motion = None;
                         }
                     }
                     return Task::none();
@@ -15558,7 +15729,7 @@ impl Frost {
                 }
             }
             MouseInput::Wheel { up, lines, .. } => {
-                if sess.dispatch_app_wheel(input, report_to_app) { return Task::none(); }
+                if sess.dispatch_app_wheel(input, report_to_app, coordinates) { return Task::none(); }
                 let step = speed * lines.max(1) as isize;
                 sess.scroll(if up { step } else { -step });
             }
@@ -15582,6 +15753,7 @@ impl Frost {
                     }
                 }
             }
+            MouseInput::AppMotion { .. } => {}
         }
         Task::none()
     }
@@ -21359,13 +21531,16 @@ impl Frost {
                 }
                 return self.update_message(*action);
             }
-            Message::ProjectedMousePane(session_id, key, input) => {
+            Message::ProjectedMousePane(session_id, key, input, coordinates) => {
                 let Some(index) = self.session_index_by_id(session_id) else {
                     return Task::none();
                 };
                 let session = &self.sessions[index];
                 if projection_callback_is_current(&session.terminal, &session.projection, &key) {
-                    return self.update_message(Message::MousePane(session_id, input));
+                    return self.update_message(Message::MousePane(session_id, input, coordinates));
+                }
+                if matches!(input, MouseInput::AppMotion { .. }) {
+                    return Task::none();
                 }
                 if (session.presentation_held() || session.terminal.inline_text_dragging())
                     && session.inline_text_surface()
@@ -21381,7 +21556,7 @@ impl Frost {
                     );
                     return Task::none();
                 }
-                return self.update_message(Message::MousePane(session_id, input));
+                return self.update_message(Message::MousePane(session_id, input, coordinates));
             }
             Message::ProjectedTranscriptScroll(session_id, key, epoch, rows, precise) => {
                 if !self.sessions.iter().any(|session| {
@@ -21393,7 +21568,7 @@ impl Frost {
                 return self
                     .update_message(Message::TranscriptScroll(session_id, epoch, rows, precise));
             }
-            Message::MousePane(session_id, input) => {
+            Message::MousePane(session_id, input, coordinates) => {
                 if matches!(
                     input,
                     MouseInput::Press { .. }
@@ -21450,6 +21625,9 @@ impl Frost {
                     self.session_dirty = true;
                     self.refresh_active_context();
                 }
+                if matches!(input, MouseInput::AppMotion { .. }) {
+                    return self.handle_mouse(session_id, input, coordinates);
+                }
                 self.organism.retreat();
                 if self.sessions.get(self.active).is_some_and(|s| {
                     s.id == session_id
@@ -21460,7 +21638,7 @@ impl Frost {
                 }) {
                     self.organism.accepted_input();
                 }
-                return self.handle_mouse(session_id, input);
+                return self.handle_mouse(session_id, input, coordinates);
             }
             Message::ImageDropped(path) => {
                 if !self.terminal_input_active() {
@@ -28137,6 +28315,12 @@ impl Frost {
             self.chat_input_ready(session_id),
         );
         let mouse_projection_key = ProjectionCallbackIdentity::capture(&sess.projection);
+        let pixel_mouse = sess.terminal.pixel_mouse_mode();
+        let pixel_viewport = sess.pixel_mouse_viewport();
+        let pixel_tracking = pixel_viewport
+            .filter(|_| sess.terminal.application_owns_pointer())
+            .and_then(|_| sess.terminal.vt.protocol.modes().mouse_report_profile())
+            .map(|profile| profile.tracking);
         let scroll_admission = sess
             .scroll_admission
             .capture(&sess.scroll_identity, transcript_epoch);
@@ -28240,8 +28424,13 @@ impl Frost {
         .shared_shell()
         .blink_on(self.blink_on)
         .opacity(self.config.opacity * glass_shell_tokens::TERMINAL[3] as f32 / 255.0)
-        .on_mouse(move |inp| {
-            Message::ProjectedMousePane(session_id, mouse_projection_key.clone(), inp)
+        .on_mouse_with_offset(pixel_tracking, move |input, offset| {
+            let coordinates = if pixel_mouse {
+                pixel_mouse::ReportCoordinates::Pixel(pixel_viewport.zip(offset))
+            } else {
+                pixel_mouse::ReportCoordinates::Cell
+            };
+            Message::ProjectedMousePane(session_id, mouse_projection_key.clone(), input, coordinates)
         })
         .on_summary(sess.projection.key(), move |activation| {
             Message::ProjectedAction(
@@ -38231,12 +38420,12 @@ os.read(0,1)
             wait(&mut session, marker);
             for (alt, up) in [(false, true), (true, true), (true, false), (false, false)] {
                 let wheel = input(&session, alt, up);
-                assert!(session.dispatch_app_wheel(wheel, true));
+                assert!(session.dispatch_app_wheel(wheel, true, pixel_mouse::ReportCoordinates::Cell));
             }
         }
         wait(&mut session, "ARROW");
         let wheel = input(&session, true, true);
-        assert!(session.dispatch_app_wheel(wheel, false));
+        assert!(session.dispatch_app_wheel(wheel, false, pixel_mouse::ReportCoordinates::Cell));
         wait(&mut session, "DONE");
     }
 
@@ -38329,15 +38518,15 @@ expect(b'.')
                 app_eligible: eligible,
                 alternate_generation: session.alternate_scroll_generation(),
             };
-            assert_eq!(session.dispatch_app_wheel(input, false), ctrl);
+            assert_eq!(session.dispatch_app_wheel(input, false, pixel_mouse::ReportCoordinates::Cell), ctrl);
         }
         let input = wheel(&session, true, 1);
         session.hold_after_exit = true;
-        assert!(session.dispatch_app_wheel(input, false));
+        assert!(session.dispatch_app_wheel(input, false, pixel_mouse::ReportCoordinates::Cell));
         session.hold_after_exit = false;
         let ticket = session.view_attachment.ticket();
         assert!(session.view_attachment.switch(&ticket, false));
-        assert!(session.dispatch_app_wheel(input, false));
+        assert!(session.dispatch_app_wheel(input, false, pixel_mouse::ReportCoordinates::Cell));
         let ticket = session.view_attachment.ticket();
         assert!(session.view_attachment.switch(&ticket, true));
         let invalid = super::MouseInput::Wheel {
@@ -38351,29 +38540,29 @@ expect(b'.')
             app_eligible: true,
             alternate_generation: session.alternate_scroll_generation(),
         };
-        assert!(session.dispatch_app_wheel(invalid, false));
+        assert!(session.dispatch_app_wheel(invalid, false, pixel_mouse::ReportCoordinates::Cell));
         let stale = wheel(&session, true, 1);
         session.terminal.process_batch(b"\x1b[?1h\x1b[?1l");
         session.refresh();
-        assert!(session.dispatch_app_wheel(stale, false));
+        assert!(session.dispatch_app_wheel(stale, false, pixel_mouse::ReportCoordinates::Cell));
         let up = wheel(&session, true, usize::MAX);
-        assert!(session.dispatch_app_wheel(up, false));
+        assert!(session.dispatch_app_wheel(up, false, pixel_mouse::ReportCoordinates::Cell));
         let down = wheel(&session, false, 1);
-        assert!(session.dispatch_app_wheel(down, false));
+        assert!(session.dispatch_app_wheel(down, false, pixel_mouse::ReportCoordinates::Cell));
         wait(&mut session, "CURSOR");
         let up = wheel(&session, true, 1);
-        assert!(session.dispatch_app_wheel(up, false));
+        assert!(session.dispatch_app_wheel(up, false, pixel_mouse::ReportCoordinates::Cell));
         wait(&mut session, "ENHANCED");
         let stale_alt = wheel(&session, false, 1);
-        assert!(session.dispatch_app_wheel(stale_alt, false));
+        assert!(session.dispatch_app_wheel(stale_alt, false, pixel_mouse::ReportCoordinates::Cell));
         wait(&mut session, "TRACK");
         assert!(session.alternate_scroll_generation().is_none());
         assert!(
-            session.dispatch_app_wheel(stale_alt, true),
+            session.dispatch_app_wheel(stale_alt, true, pixel_mouse::ReportCoordinates::Cell),
             "oldalt event consumed beforeSGR"
         );
         let fresh = wheel(&session, true, 1);
-        assert!(session.dispatch_app_wheel(fresh, true));
+        assert!(session.dispatch_app_wheel(fresh, true, pixel_mouse::ReportCoordinates::Cell));
         wait(&mut session, "OFF");
         assert!(session.alternate_scroll_generation().is_none());
         assert!(session.alternate_scroll_bytes(true, 1).is_none());
@@ -42682,7 +42871,7 @@ expect(b'.')
                 session_id,
                 button,
                 report_to_app: true,
-                last_app_cell: Some((2, 3)),
+                last_app_position: Some(crate::pixel_mouse::ReportPosition::Cell(2, 3)),
                 consumed: false,
             })
         };
@@ -42698,7 +42887,7 @@ expect(b'.')
         );
         let left = take_terminal_mouse_gesture(&mut gestures, 7, MouseButton::Left)
             .expect("the original pane must still receive its button release");
-        assert_eq!(left.last_app_cell, Some((2, 3)));
+        assert_eq!(left.last_cell(), Some((2, 3)));
     }
 
     #[test]
@@ -42724,7 +42913,7 @@ expect(b'.')
             session_id: 7,
             button: MouseButton::Left,
             report_to_app: false,
-            last_app_cell: None,
+            last_app_position: None,
             consumed: false,
         });
         cancel_terminal_mouse_gestures_for_pane(&mut gestures, &mut clicks, 9);
@@ -42743,13 +42932,50 @@ expect(b'.')
             session_id: 7,
             button: MouseButton::Left,
             report_to_app: false,
-            last_app_cell: None,
+            last_app_position: None,
             consumed: false,
         });
         let mut clicks = TerminalClickTracker::default();
         cancel_terminal_mouse_gestures_for_pane(&mut gestures, &mut clicks, 7);
         assert!(gestures.iter().all(Option::is_none));
         assert!(clicks.cancelled);
+    }
+
+    #[test]
+    fn pixel_mouse_release_keeps_its_point_until_the_viewport_or_mode_changes() {
+        use pixel_mouse::{PixelPosition, PixelViewport, ReportPosition};
+
+        let mut terminal = TerminalState::new(80, 24);
+        terminal.enable_pixel_mouse();
+        terminal.process_input(b"\x1b[?1002;1016h");
+        terminal.set_viewport_pixel_size(640, 480);
+        let capture = |terminal: &TerminalState, width, height| TerminalMouseGesture {
+            session_id: 7,
+            button: MouseButton::Left,
+            report_to_app: true,
+            last_app_position: Some(ReportPosition::Pixel(PixelPosition {
+                viewport: PixelViewport {
+                    generation: terminal.native_wheel_generation().unwrap(),
+                    size: (80, 24, width, height),
+                },
+                x: 31,
+                y: 51,
+            })),
+            consumed: false,
+        };
+        let modifiers = keyboard::Modifiers::default();
+        let gesture = capture(&terminal, 640, 480);
+        assert_eq!(
+            cancelled_terminal_mouse_report(gesture, &terminal, modifiers).as_deref(),
+            Some(b"\x1b[<0;32;52m".as_slice()),
+        );
+        terminal.set_viewport_pixel_size(960, 720);
+        assert!(cancelled_terminal_mouse_report(gesture, &terminal, modifiers).is_none());
+
+        let gesture = capture(&terminal, 960, 720);
+        terminal.process_input(b"\x1b[?1006h\x1b[?1016h");
+        assert!(terminal.pixel_mouse_mode());
+        assert!(cancelled_terminal_mouse_report(gesture, &terminal, modifiers).is_none());
     }
 
     #[test]
@@ -42760,7 +42986,7 @@ expect(b'.')
                 session_id: 7,
                 button,
                 report_to_app: true,
-                last_app_cell: None,
+                last_app_position: None,
                 consumed: false,
             });
         }
@@ -42792,7 +43018,7 @@ expect(b'.')
                 session_id: 1,
                 button: MouseButton::Right,
                 report_to_app: true,
-                last_app_cell: Some((0, 0)),
+                last_app_position: Some(crate::pixel_mouse::ReportPosition::Cell(0, 0)),
                 consumed: false,
             };
             assert_eq!(
@@ -42829,7 +43055,7 @@ expect(b'.')
                 session_id,
                 button,
                 report_to_app: true,
-                last_app_cell: None,
+                last_app_position: None,
                 consumed: false,
             });
             let pending = gestures[button.slot()].unwrap();
@@ -42876,7 +43102,7 @@ expect(b'.')
             session_id: 7,
             button,
             report_to_app: true,
-            last_app_cell: Some((1, 2)),
+            last_app_position: Some(crate::pixel_mouse::ReportPosition::Cell(1, 2)),
             consumed: false,
         });
         let dragged = gestures[button.slot()].unwrap().app_drag_cell(Some((5, 6)));
@@ -42901,7 +43127,7 @@ expect(b'.')
                 ..pending
             },
         ] {
-            unowned.last_app_cell = None;
+            unowned.last_app_position = None;
             gestures[button.slot()] = Some(unowned);
             record_terminal_app_mouse_cell(&mut gestures, 7, button, (9, 9));
             assert_eq!(gestures[button.slot()], Some(unowned));
@@ -42916,7 +43142,7 @@ expect(b'.')
             ..pending
         });
         record_terminal_app_mouse_cell(&mut gestures, 7, button, (9, 9));
-        assert_eq!(gestures[button.slot()].unwrap().last_app_cell, Some((5, 6)));
+        assert_eq!(gestures[button.slot()].unwrap().last_cell(), Some((5, 6)));
         assert_eq!(take_terminal_mouse_gesture(&mut gestures, 7, button), None);
     }
 
@@ -43374,7 +43600,7 @@ expect(b'.')
             session_id: 7,
             button: MouseButton::Left,
             report_to_app: true,
-            last_app_cell: Some((7, 0)),
+            last_app_position: Some(crate::pixel_mouse::ReportPosition::Cell(7, 0)),
             consumed: false,
         };
         terminal.on_resize(24, 8);
@@ -43534,7 +43760,7 @@ expect(b'.')
                 session_id: 7,
                 button,
                 report_to_app: true,
-                last_app_cell: None,
+                last_app_position: None,
                 consumed: false,
             });
             let (col, row) = live_cell.unwrap();
@@ -43566,7 +43792,7 @@ expect(b'.')
                 session_id: 7,
                 button,
                 report_to_app: true,
-                last_app_cell: None,
+                last_app_position: None,
                 consumed: false,
             });
             assert!(terminal.get_mouse_report(btn_code(button), 23, 7).is_some());
@@ -43613,7 +43839,7 @@ expect(b'.')
             session_id: 7,
             button: MouseButton::Left,
             report_to_app: true,
-            last_app_cell: Some((2, 3)),
+            last_app_position: Some(crate::pixel_mouse::ReportPosition::Cell(2, 3)),
             consumed: false,
         };
         assert_eq!(gesture.app_drag_cell(history_cell), None);
@@ -43637,21 +43863,21 @@ expect(b'.')
             session_id: 7,
             button: MouseButton::Left,
             report_to_app: true,
-            last_app_cell: None,
+            last_app_position: None,
             consumed: false,
         };
         let local_right = TerminalMouseGesture {
             session_id: 8,
             button: MouseButton::Right,
             report_to_app: false,
-            last_app_cell: None,
+            last_app_position: None,
             consumed: false,
         };
         let consumed_middle = TerminalMouseGesture {
             session_id: 8,
             button: MouseButton::Middle,
             report_to_app: false,
-            last_app_cell: None,
+            last_app_position: None,
             consumed: true,
         };
 
@@ -48604,7 +48830,7 @@ expect(b'.')
                 session_id: 42,
                 button,
                 report_to_app: true,
-                last_app_cell: None,
+                last_app_position: None,
                 consumed: false,
             };
             let mut slots = [None; 3];
@@ -48621,7 +48847,7 @@ expect(b'.')
             session_id: 42,
             button: MouseButton::Left,
             report_to_app: false,
-            last_app_cell: None,
+            last_app_position: None,
             consumed: true,
         };
         let mut slots = [Some(consumed), None, None];

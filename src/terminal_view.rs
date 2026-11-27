@@ -273,6 +273,8 @@ pub enum MouseInput {
         row: usize,
         count: u32,
     },
+    /// Pointer motion for an application with physical coordinate reporting.
+    AppMotion { col: usize, row: usize },
     Release {
         col: usize,
         row: usize,
@@ -1162,7 +1164,8 @@ pub struct TermWidget<'a, Message> {
     shift: bool,
     alt: bool,
     ctrl: bool,
-    on_mouse: Option<Box<dyn Fn(MouseInput) -> Message + 'a>>,
+    on_mouse: Option<Box<dyn Fn(MouseInput, Option<crate::pixel_mouse::CellOffset>) -> Message + 'a>>,
+    pixel_tracking: Option<jterm_engine::mouse::MouseTracking>,
     on_summary: Option<Box<dyn Fn(SummaryActivation) -> Message + 'a>>,
     projection_key: Option<ProjectionKey>,
     /// Detected clickable links in visible-grid coordinates (line = grid row).
@@ -1285,6 +1288,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             alt: false,
             ctrl: false,
             on_mouse: None,
+            pixel_tracking: None,
             on_summary: None,
             projection_key: None,
             links: &[],
@@ -1915,7 +1919,17 @@ impl<'a, Message> TermWidget<'a, Message> {
 
     /// Register a callback that maps grid mouse interactions to messages.
     pub fn on_mouse(mut self, f: impl Fn(MouseInput) -> Message + 'a) -> Self {
+        self.on_mouse = Some(Box::new(move |input, _| f(input)));
+        self
+    }
+
+    pub(crate) fn on_mouse_with_offset(
+        mut self,
+        pixel_tracking: Option<jterm_engine::mouse::MouseTracking>,
+        f: impl Fn(MouseInput, Option<crate::pixel_mouse::CellOffset>) -> Message + 'a,
+    ) -> Self {
         self.on_mouse = Some(Box::new(f));
+        self.pixel_tracking = pixel_tracking;
         self
     }
 
@@ -1961,6 +1975,21 @@ impl<'a, Message> TermWidget<'a, Message> {
         let col = ((rel_x / cw) as usize).min(max_col);
         let row = self.canvas.row(rel_y, ch, max_row + 1);
         (col, row)
+    }
+
+    fn cell_offset(
+        &self,
+        pos: Point,
+        bounds: Rectangle,
+        col: usize,
+        row: usize,
+    ) -> Option<crate::pixel_mouse::CellOffset> {
+        self.pixel_tracking?;
+        let left = bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
+        let x = (pos.x - left) / self.metrics.cell_w - col as f32;
+        let y = (pos.y - self.row_y(bounds, row)) / self.metrics.cell_h;
+        ((0.0..1.0).contains(&x) && (0.0..1.0).contains(&y))
+            .then_some(crate::pixel_mouse::CellOffset { x, y })
     }
 
     fn retained_text_input(
@@ -5830,7 +5859,7 @@ where
                 if let Some(input) =
                     self.retained_text_input(state, event, cursor, bounds, viewport)
                 {
-                    shell.publish(on_mouse(input));
+                    shell.publish(on_mouse(input, None));
                 }
             }
             if matches!(event, Event::Mouse(_) | Event::Touch(_)) {
@@ -5981,8 +6010,12 @@ where
             }
         }
 
-        let Some(on_mouse) = self.on_mouse.as_ref() else {
+        let Some(publish_mouse) = self.on_mouse.as_ref() else {
             return;
+        };
+        let on_mouse = |input| publish_mouse(input, None);
+        let on_pointer = |input, col, row, pos| {
+            publish_mouse(input, self.cell_offset(pos, bounds, col, row))
         };
         let state = tree.state.downcast_mut::<State>();
 
@@ -6260,7 +6293,7 @@ where
                     state.link_press = Some((press, self.link_at(col, row).cloned()));
                 }
                 if !link {
-                    shell.publish(on_mouse(press));
+                    shell.publish(on_pointer(press, col, row, pos));
                 }
                 shell.capture_event();
             }
@@ -6306,14 +6339,36 @@ where
                     return;
                 }
                 if !state.dragging {
+                    use jterm_engine::mouse::MouseTracking::{Any, Drag};
+                    if self.pixel_tracking.is_some_and(|tracking| {
+                        tracking == Any
+                            || (tracking == Drag
+                                && state.published_presses.iter().any(|pressed| *pressed))
+                    }) {
+                        if let Some(at) = bounds
+                            .intersection(viewport)
+                            .and_then(|view| cursor.position_over(view))
+                        {
+                            let (col, row) = self.cell_at(at, bounds);
+                            let app_eligible = self.app_mouse_full_grid
+                                || self.blocks.get(row).is_some_and(|block| block.app_eligible);
+                            if app_eligible {
+                                if let Some(offset) = self.cell_offset(at, bounds, col, row) {
+                                    shell.publish(publish_mouse(
+                                        MouseInput::AppMotion { col, row },
+                                        Some(offset),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     return;
                 }
                 let (col, row) = self.cell_at(pos, bounds);
-                shell.publish(on_mouse(MouseInput::Drag {
-                    col,
-                    row,
-                    count: state.click_count,
-                }));
+                shell.publish(on_pointer(
+                    MouseInput::Drag { col, row, count: state.click_count },
+                    col, row, pos,
+                ));
             }
             Event::Mouse(mouse::Event::ButtonReleased(btn)) => {
                 let button = match btn {
@@ -6439,7 +6494,11 @@ where
                 }
                 let pos = cursor.position().unwrap_or(Point::new(bounds.x, bounds.y));
                 let (col, row) = self.cell_at(pos, bounds);
-                shell.publish(on_mouse(MouseInput::Release { col, row, button }));
+                let release = MouseInput::Release { col, row, button };
+                let offset = cursor
+                    .position_over(bounds)
+                    .and_then(|at| self.cell_offset(at, bounds, col, row));
+                shell.publish(publish_mouse(release, offset));
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let (shift, ctrl, alt) = tree.state.downcast_ref::<State>().wheel_modifiers
@@ -6499,7 +6558,7 @@ where
                     shell.capture_event();
                     return;
                 };
-                shell.publish(on_mouse(MouseInput::Wheel {
+                shell.publish(on_pointer(MouseInput::Wheel {
                     col,
                     row,
                     up,
@@ -6509,7 +6568,7 @@ where
                     lines,
                     app_eligible,
                     alternate_generation,
-                }));
+                }, col, row, pos));
                 shell.capture_event();
             }
             _ => {}
@@ -7415,7 +7474,7 @@ mod mode_gesture_tests {
             session_id: 17,
             button,
             report_to_app: app,
-            last_app_cell: app.then_some((7, 2)),
+            last_app_position: app.then_some(crate::pixel_mouse::ReportPosition::Cell(7, 2)),
             consumed: false,
         }
     }
@@ -7658,7 +7717,7 @@ mod mode_gesture_tests {
                 }
                 assert!(crate::cancelled_terminal_mouse_report(
                     crate::TerminalMouseGesture {
-                        last_app_cell: None,
+                        last_app_position: None,
                         ..gesture
                     },
                     &terminal,
