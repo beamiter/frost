@@ -11,7 +11,9 @@ mod unix_pty {
     use jterm_core::native_pty_launch::{
         launch_pty, PtyLaunch, PtyLaunchError, StartupError, StartupStage, WorkingDirectory,
     };
-    use jterm_core::pty_io::{resize_master, write_native_master, PtyWriteAttempt};
+    use jterm_core::pty_io::{
+        resize_master, resize_master_with_pixels, write_native_master, PtyWriteAttempt,
+    };
     use jterm_core::session_actor::WriteOutcome;
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
     use std::path::Path;
@@ -547,6 +549,21 @@ mod unix_pty {
             .map_err(|_| anyhow!("Failed to resize PTY"))
         }
 
+        pub fn resize_with_pixels(
+            &mut self,
+            cols: usize,
+            rows: usize,
+            pixels: (u16, u16),
+        ) -> Result<()> {
+            resize_master_with_pixels(
+                self.master.as_fd(),
+                pty_dimension(cols),
+                pty_dimension(rows),
+                pixels,
+            )
+            .map_err(|error| anyhow!("Failed to resize PTY: {error}"))
+        }
+
         /// The child's real exit status once reaped (negative = `-signal`),
         /// reaping via [`Self::is_alive`] first when the state is still open.
         /// Task terminals report this to the task reducer on PTY EOF.
@@ -629,6 +646,15 @@ mod unix_pty {
 
         fn resize(&mut self, cols: usize, rows: usize) -> Result<(), String> {
             Pty::resize(self, cols, rows).map_err(|error| error.to_string())
+        }
+
+        fn resize_with_pixels(
+            &mut self,
+            cols: usize,
+            rows: usize,
+            pixels: (u16, u16),
+        ) -> Result<(), String> {
+            Pty::resize_with_pixels(self, cols, rows, pixels).map_err(|error| error.to_string())
         }
 
         fn is_alive(&mut self) -> bool {
@@ -990,6 +1016,15 @@ mod windows_pty {
             Err(anyhow!("PTY not available"))
         }
 
+        pub fn resize_with_pixels(
+            &mut self,
+            _cols: usize,
+            _rows: usize,
+            _pixels: (u16, u16),
+        ) -> Result<()> {
+            Err(anyhow!("PTY not available"))
+        }
+
         pub fn is_alive(&self) -> bool {
             false
         }
@@ -1026,6 +1061,34 @@ pub use windows_pty::Pty;
 mod tests {
     #[cfg(unix)]
     use super::unix_pty::Pty;
+
+    #[cfg(unix)]
+    #[test]
+    fn measured_resize_updates_kernel_pixels_on_the_same_grid() {
+        fn window_size(pty: &Pty) -> (u16, u16, u16, u16) {
+            let mut size = libc::winsize {
+                ws_row: 0,
+                ws_col: 0,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            // The live PTY owns the descriptor for the duration of the read.
+            assert_eq!(unsafe { libc::ioctl(pty.master_fd(), libc::TIOCGWINSZ, &mut size) }, 0);
+            (size.ws_col, size.ws_row, size.ws_xpixel, size.ws_ypixel)
+        }
+
+        let argv = ["/bin/sh".to_owned(), "-c".to_owned(), "read -r line".to_owned()];
+        let mut pty = Pty::new_with_cwd(80, 24, None, None, None, Some(&argv)).unwrap();
+        assert_eq!(window_size(&pty), (80, 24, 0, 0));
+        pty.resize_with_pixels(80, 24, (960, 576)).unwrap();
+        assert_eq!(window_size(&pty), (80, 24, 960, 576));
+        pty.resize_with_pixels(80, 24, (1920, 1152)).unwrap();
+        assert_eq!(window_size(&pty), (80, 24, 1920, 1152));
+        pty.resize(80, 24).unwrap();
+        assert_eq!(window_size(&pty), (80, 24, 0, 0));
+        pty.resize_with_pixels(80, 24, (1920, 1152)).unwrap();
+        assert_eq!(window_size(&pty), (80, 24, 1920, 1152));
+    }
 
     #[cfg(unix)]
     #[test]

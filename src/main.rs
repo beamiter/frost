@@ -4692,6 +4692,8 @@ enum Message {
     NativeWindowEvent(iced::window::Id, Box<Message>),
     NativeWindowClosed,
     OwnerWindowOpened(iced::window::Id),
+    InitialWindowScale(iced::window::Id, f32),
+    WindowRescaled(f32),
     OpenObserver(observer::Target),
     ChangeTerminalView(TerminalAttachment, bool),
     ObserverOpened(iced::window::Id),
@@ -5427,6 +5429,7 @@ struct Session {
     ime_identity: Arc<()>,
     terminal: TerminalState,
     pty: SessionActor<Pty>,
+    measured_pty_size: Option<(usize, usize, u16, u16)>,
     child_pid: i32,
     /// Explicit argv owns this PTY as work, even if its root child is the
     /// foreground group. This comes from spawn admission, never a tab title.
@@ -5973,6 +5976,7 @@ impl Session {
             ime_identity: Arc::new(()),
             terminal,
             pty,
+            measured_pty_size: None,
             child_pid,
             command_owned: command_argv.is_some(),
             inline_agent_launch,
@@ -7510,6 +7514,7 @@ struct Frost {
     /// Blink clock phase, toggled by a timer; drives blinking-attribute cells.
     blink_on: bool,
     win_size: Size,
+    native_window_scale: Option<f32>,
     /// Actual allocated window geometry has arrived; never resize retired panes.
     glass_geometry_ready: bool,
     /// Exact bytes this in-memory config was loaded/saved against. `None`
@@ -7904,6 +7909,7 @@ impl Frost {
             debug_open: false,
             blink_on: true,
             win_size,
+            native_window_scale: None,
             glass_geometry_ready: false,
             config_revision,
             config_write_blocked: config_diagnostic.is_some(),
@@ -11808,26 +11814,51 @@ impl Frost {
             .unwrap_or(0)
     }
 
-    fn grid_pixel_size(&self, cols: usize, rows: usize) -> (u32, u32) {
-        let width = (cols as f32 * self.metrics.cell_w).round().max(0.0) as u32;
-        let height = (rows as f32 * self.metrics.cell_h).round().max(0.0) as u32;
+    fn grid_pixel_size(&self, cols: usize, rows: usize, scale: f32) -> (u32, u32) {
+        let width = (f64::from(self.metrics.cell_w) * cols as f64 * f64::from(scale)).round() as u32;
+        let height = (f64::from(self.metrics.cell_h) * rows as f64 * f64::from(scale)).round() as u32;
         (width, height)
+    }
+
+    fn set_native_window_scale(&mut self, scale: f32) {
+        if scale.is_finite() && scale > 0.0 && self.native_window_scale != Some(scale) {
+            self.native_window_scale = Some(scale);
+            self.relayout_terminals(false);
+        }
     }
 
     /// Resize one session's terminal + PTY (no-op when already that size).
     fn resize_session(&mut self, index: usize, cols: usize, rows: usize) -> Option<usize> {
-        let (pixel_w, pixel_h) = self.grid_pixel_size(cols, rows);
+        let scale = self.native_window_scale.map(|scale| scale * self.scale_factor());
+        let (width, height) = self.grid_pixel_size(cols, rows, scale.unwrap_or(1.0));
         if let Some(sess) = self.sessions.get_mut(index) {
             if !sess.view_attachment.attached() {
                 return None;
             }
-            sess.terminal.set_viewport_pixel_size(pixel_w, pixel_h);
             let old_dimensions = sess.terminal.get_dimensions();
-            if old_dimensions != (cols, rows) {
+            let grid_changed = old_dimensions != (cols, rows);
+            if grid_changed {
                 sess.terminal.on_resize(cols, rows);
-                if sess.pty.resize(cols, rows).is_ok() && sess.resize_sensitive_agent() {
-                    sess.resize_repaint = Some(ResizeRepaint::new(std::time::Instant::now()));
+            }
+            let resized = if scale.is_some() {
+                let width = width.clamp(1, u16::MAX.into()) as u16;
+                let height = height.clamp(1, u16::MAX.into()) as u16;
+                let size = (cols, rows, width, height);
+                if sess.measured_pty_size == Some(size) {
+                    true
+                } else if sess.pty.resize_with_pixels(cols, rows, (width, height)).is_ok() {
+                    sess.measured_pty_size = Some(size);
+                    sess.terminal.set_viewport_pixel_size(width.into(), height.into());
+                    true
+                } else {
+                    false
                 }
+            } else {
+                sess.terminal.set_viewport_pixel_size(width, height);
+                grid_changed && sess.pty.resize(cols, rows).is_ok()
+            };
+            if grid_changed && resized && sess.resize_sensitive_agent() {
+                sess.resize_repaint = Some(ResizeRepaint::new(std::time::Instant::now()));
             }
             sess.refresh();
             return (old_dimensions.0 != cols).then_some(sess.id);
@@ -17728,7 +17759,17 @@ impl Frost {
             }
             Message::OwnerWindowOpened(id) => {
                 if self.owner_window == Some(id) {
-                    return self.update(Message::Eva(eva_companion::Event::Bind(id)));
+                    return Task::batch([
+                        self.update(Message::Eva(eva_companion::Event::Bind(id))),
+                        iced::window::scale_factor(id)
+                            .map(move |scale| Message::InitialWindowScale(id, scale)),
+                    ]);
+                }
+                return Task::none();
+            }
+            Message::InitialWindowScale(id, scale) => {
+                if self.owner_window == Some(id) && self.native_window_scale.is_none() {
+                    self.set_native_window_scale(scale);
                 }
                 return Task::none();
             }
@@ -17959,7 +18000,8 @@ impl Frost {
         match message {
             Message::NativeWindowEvent(..) | Message::NativeWindowClosed | Message::OwnerWindowOpened(..)
                 | Message::OpenObserver(..) | Message::ObserverOpened(..)
-                | Message::CloseObserver(..) => {},
+                | Message::CloseObserver(..) | Message::InitialWindowScale(..) => {},
+            Message::WindowRescaled(scale) => self.set_native_window_scale(scale),
             Message::Eva(event) => self.eva_event(event),
             Message::ReferenceToolsToggle => {
                 self.native_enter_ownership.lock().claim_held();
@@ -35410,6 +35452,7 @@ impl Frost {
             iced::Event::InputMethod(_) if status == iced::event::Status::Captured => None,
             iced::Event::InputMethod(ime) => Some(Message::Ime(ime)),
             iced::Event::Window(iced::window::Event::Resized(size)) => Some(Message::Resized(size)),
+            iced::Event::Window(iced::window::Event::Rescaled(scale)) => Some(Message::WindowRescaled(scale)),
             // Drop routing lives in the handler: listen_with takes a plain fn
             // pointer, so no state can be captured here.
             iced::Event::Window(iced::window::Event::FileDropped(path)) => {
