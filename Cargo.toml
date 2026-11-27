@@ -14,8 +14,8 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 # The engine and core declare the same immutable release source.
-jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "23368897350cb451516f230b19a3796345f4695d" }
-jterm_protocol = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "23368897350cb451516f230b19a3796345f4695d" }
+jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "a17fa47f508a024521b11748760742750708609c" }
+jterm_protocol = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "a17fa47f508a024521b11748760742750708609c" }
 companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 iced = { version = "0.14", features = ["canvas", "tokio", "advanced", "image", "wgpu"] }
 # Direct handle on the shaper iced embeds (same locked version), used to
@@ -25,7 +25,7 @@ cosmic-text = "=0.19.0"
 # Exact native boundary paired with the pinned local Iced shell patch.
 iced_winit = { version = "=0.14.0", default-features = false }
 libc = "0.2"
-jterm_core = { version = "0.2.0", features = ["terminal-session-actor"], git = "https://github.com/beamiter/jterm_core.git", rev = "23368897350cb451516f230b19a3796345f4695d" }
+jterm_core = { version = "0.2.0", features = ["terminal-session-actor"], git = "https://github.com/beamiter/jterm_core.git", rev = "a17fa47f508a024521b11748760742750708609c" }
 tokio = { version = "1", features = ["rt", "sync"] }
 anyhow = "1.0"
 log = "0.4"
@@ -89,7 +89,7 @@ unicode-normalization = "=0.1.26"
 zstd = "=0.14.3"
 sha2 = "=0.10.9"
 iced_tiny_skia = { version = "=0.14.1", features = ["geometry"] }
-jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "23368897350cb451516f230b19a3796345f4695d" }
+jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "a17fa47f508a024521b11748760742750708609c" }
 
 [patch."https://github.com/beamiter/jcompanion.git"]
 companion-protocol = { path = "vendor/companion-protocol" }
