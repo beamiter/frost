@@ -20108,7 +20108,10 @@ mod tests {
         terminal.process_input(b"n\x1b[7c\x1b[>123");
         assert_eq!(terminal.get_output(), b"\x1b[4;12R\x1b[?65;1;9c");
         terminal.process_input(b"c\x1b[?c\x1b[=c\x1b[$c\x1b[>$c\x1b[?6n");
-        assert_eq!(terminal.get_output(), b"\x1b[>1;7802;0c\x1b[?4;12R");
+        assert_eq!(
+            terminal.get_output(),
+            b"\x1b[>1;7802;0c\x1bP!|00000000\x1b\\\x1b[?4;12R"
+        );
         assert_eq!(
             (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col),
             (3, 11)
