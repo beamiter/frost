@@ -5812,6 +5812,21 @@ fn apply_theme_colors(terminal: &mut TerminalState, theme: &Theme) {
     terminal.set_ansi_colors(colors.ansi_colors.map(rgb));
 }
 
+/// Apply the final native keyboard owner in two phases so a newly selected
+/// pane never receives FocusIn before the previous pane receives FocusOut.
+fn sync_session_focus_owners(sessions: &mut [Session], selected: Option<usize>) {
+    for (index, session) in sessions.iter_mut().enumerate() {
+        if Some(index) != selected && session.terminal.set_host_input_focused(false) {
+            session.flush_responses();
+        }
+    }
+    if let Some(session) = selected.and_then(|index| sessions.get_mut(index)) {
+        if session.terminal.set_host_input_focused(true) {
+            session.flush_responses();
+        }
+    }
+}
+
 impl Session {
     fn spawn(
         config: &Config,
@@ -8644,6 +8659,23 @@ impl Frost {
                 session.refresh();
             }
         }
+    }
+
+    /// Reconcile logical terminal focus after every owner reducer, including
+    /// early-return tab, pane, modal and attachment transitions.
+    fn sync_terminal_focus_owner(&mut self) {
+        let selected = (self.focused
+            && self.terminal_input_active()
+            && self.layout().contains_session(self.active))
+        .then_some(self.active)
+        .filter(|&index| {
+            self.sessions
+                .get(index)
+                .is_some_and(|session| !session.transcript_read_only())
+        });
+        // Session-local state survives index rebasing and never transfers to
+        // a replacement with the same slot.
+        sync_session_focus_owners(&mut self.sessions, selected);
     }
 
     fn terminal_input_active(&self) -> bool {
@@ -17756,6 +17788,7 @@ impl Frost {
             }
         }
 
+        self.sync_terminal_focus_owner();
         self.sync_terminal_ime_owner();
         self.sync_terminal_pane_owners();
         let geometry_owner = self
@@ -17810,6 +17843,7 @@ impl Frost {
         // message, not after an Iced message batch or a widget tree redraw.
         self.sync_terminal_pane_owners();
         self.sync_terminal_ime_owner();
+        self.sync_terminal_focus_owner();
         let active = self.sessions.get(self.active).map(|s| s.id);
         for (id, editor) in &mut self.vim9_tabs {
             editor.focus_embedded(
@@ -21569,16 +21603,6 @@ impl Frost {
                 // it can't get stuck in the "off" half of a blink.
                 if !f {
                     self.blink_on = true;
-                }
-                if let Some(sess) = self.sessions.get_mut(self.active) {
-                    if sess.terminal.is_focus_event_mode() {
-                        if f {
-                            sess.terminal.emit_focus_in();
-                        } else {
-                            sess.terminal.emit_focus_out();
-                        }
-                        sess.flush_responses();
-                    }
                 }
             }
             Message::NewSession => self.new_session(),
@@ -38015,6 +38039,83 @@ mod tests {
     }
 
 
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_focus_session_handoffs_retire_old_pty_and_preserve_blur_boundaries() {
+        let mut config = super::Config {
+            shell: Some("/bin/sh".into()),
+            ..Default::default()
+        };
+        config.vim9.auto_gui = false;
+        let argv = vec![
+            "/usr/bin/python3".into(),
+            "-c".into(),
+            r#"
+import os,tty,select
+tty.setraw(0)
+os.write(1,b'\x1b[?1004hREADY')
+for index,want in enumerate([b'\x1b[I',b'\x1b[O',b'\x1b[I',b'\x1b[O']):
+ got=b''
+ while len(got)<len(want):got+=os.read(0,len(want)-len(got))
+ assert got==want,got
+ os.write(1,('GOT'+str(index)).encode())
+assert not select.select([0],[],[],.15)[0], 'duplicate focus report'
+os.write(1,b'DONE')
+os.read(0,1)
+"#
+            .into(),
+        ];
+        let mut sessions = (0..2)
+            .map(|id| {
+                super::Session::spawn_argv(&config, id, 40, 10, Some("/tmp"), Some(&argv)).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let wait = |session: &mut super::Session, marker: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Ok(super::SessionEvent::Output(batch)) = session
+                    .pty
+                    .events()
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                {
+                    session.terminal.process_batch(batch.as_bytes());
+                    session.flush_responses();
+                }
+                let text = session
+                    .terminal
+                    .vt
+                    .screen
+                    .grid
+                    .iter()
+                    .map(|row| row.iter().map(|cell| cell.character).collect::<String>())
+                    .collect::<String>();
+                if text.contains(marker) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "missing {marker}");
+            }
+        };
+        super::sync_session_focus_owners(&mut sessions, Some(0));
+        wait(&mut sessions[0], "GOT0");
+        wait(&mut sessions[1], "READY"); // Hidden enable must remain silent.
+        super::sync_session_focus_owners(&mut sessions, Some(0)); // Duplicate.
+        super::sync_session_focus_owners(&mut sessions, Some(1)); // Tab/pane handoff.
+        wait(&mut sessions[0], "GOT1");
+        wait(&mut sessions[1], "GOT0");
+        super::sync_session_focus_owners(&mut sessions, None); // Window blur/modal.
+        wait(&mut sessions[1], "GOT1");
+        super::sync_session_focus_owners(&mut sessions, Some(1));
+        wait(&mut sessions[1], "GOT2");
+        super::sync_session_focus_owners(&mut sessions, None); // Editable overlay.
+        wait(&mut sessions[1], "GOT3");
+        super::sync_session_focus_owners(&mut sessions, Some(0));
+        wait(&mut sessions[0], "GOT2");
+        super::sync_session_focus_owners(&mut sessions, None);
+        super::sync_session_focus_owners(&mut sessions, None); // Duplicate blur.
+        wait(&mut sessions[0], "DONE");
+        wait(&mut sessions[1], "DONE");
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

@@ -2838,6 +2838,8 @@ struct CompletedCommandMetadata {
 }
 
 pub struct TerminalState {
+    /// Current admitted native input owner, independent of terminal resets.
+    host_input_focused: bool,
     pub vt: jterm_engine::native_terminal::NativeTerminal,
     pub scrollback: RetainedHistory<ScrollbackLine>,
     pub selection: Option<Selection>,
@@ -3123,6 +3125,7 @@ impl TerminalState {
     pub fn new(cols: usize, rows: usize) -> Self {
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
         TerminalState {
+            host_input_focused: false,
             vt: jterm_engine::native_terminal::NativeTerminal::adopt(
                 jterm_engine::native_terminal::NativeProfile::FrostLegacy,
                 ScreenState::new_frost_legacy(rows, cols),
@@ -6850,6 +6853,20 @@ impl TerminalState {
     #[allow(dead_code)]
     pub fn is_bracketed_paste_mode(&self) -> bool {
         self.vt.protocol.modes().contains(&2004)
+    }
+
+    /// Report only actual ownership edges; mode enable observes this same state.
+    pub fn set_host_input_focused(&mut self, focused: bool) -> bool {
+        if self.host_input_focused == focused {
+            return false;
+        }
+        self.host_input_focused = focused;
+        if focused {
+            self.emit_focus_in();
+        } else {
+            self.emit_focus_out();
+        }
+        true
     }
 
     #[allow(dead_code)]
@@ -21499,6 +21516,10 @@ mod osc5522_oracles;
 mod frost_control_oracles;
 
 impl jterm_engine::frost_csi::FrostCsiHost for TerminalState {
+    fn focused(&self) -> bool {
+        self.host_input_focused
+    }
+
     fn track_legacy_erase_mutations(&self) -> bool {
         !self.vt.screen.use_alt_buffer
             && !self.finished_output_owners.is_empty()
@@ -21809,5 +21830,35 @@ mod retained_output_content_tests {
         changed.on_resize(10, 4);
         assert_eq!(changed.finished_output_range(id), None);
         coherent(&changed);
+    }
+}
+
+
+#[cfg(test)]
+mod native_focus_owner_tests {
+    use super::TerminalState;
+
+    #[test]
+    fn logical_focus_edges_mode_enable_and_ris_use_the_same_owner() {
+        let mut terminal = TerminalState::new(20, 4);
+        assert!(terminal.set_host_input_focused(true));
+        assert!(terminal.get_output().is_empty());
+        terminal.process_input(b"\x1b[?1004h");
+        assert_eq!(terminal.get_output(), b"\x1b[I");
+        assert!(!terminal.set_host_input_focused(true));
+        terminal.process_input(b"\x1b[?1004h");
+        assert!(terminal.get_output().is_empty());
+        terminal.process_input(b"\x1b[?1004l\x1b[?1004h");
+        assert_eq!(terminal.get_output(), b"\x1b[I");
+        assert!(terminal.set_host_input_focused(false));
+        assert_eq!(terminal.get_output(), b"\x1b[O");
+        terminal.process_input(b"\x1b[?1004l\x1b[?1004h");
+        assert!(terminal.get_output().is_empty());
+        terminal.set_host_input_focused(true);
+        assert_eq!(terminal.get_output(), b"\x1b[I");
+        terminal.process_input(b"\x1bc\x1b[?1004h");
+        assert_eq!(terminal.get_output(), b"\x1b[I");
+        terminal.process_input(b"\x1b[?1004s\x1b[?1004l\x1b[?1004r");
+        assert_eq!(terminal.get_output(), b"\x1b[I");
     }
 }
