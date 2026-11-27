@@ -2434,6 +2434,13 @@ struct FinishedOutputProvenance {
     row_ids: Vec<RawRowId>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FinishedOutputOwner {
+    zone_id: u64,
+    start: usize,
+    end: usize,
+}
+
 /// Export-facing output state for one retained command zone.
 ///
 /// Unlike [`TerminalState::zone_output_text_capped`], this preserves the
@@ -2897,6 +2904,7 @@ pub struct TerminalState {
 
     // P4 优化：行版本化追踪
     pub grid_version: u64,      // 全局网格版本号
+    native_wheel_generation: Option<u64>,
     pub row_versions: Vec<u64>, // 每行的修改版本号
 
     // Cached visible cells to avoid per-frame cloning
@@ -2937,6 +2945,7 @@ pub struct TerminalState {
     // OSC 133 shell integration: command zones for prompt navigation
     pub command_zones: VecDeque<CommandZone>,
     finished_output_provenance: HashMap<u64, FinishedOutputProvenance>,
+    finished_output_owners: HashMap<RawRowId, Vec<FinishedOutputOwner>>,
     /// Next [`CommandZone::id`]; monotonic for the life of the terminal.
     next_zone_id: u64,
     completed_history_revision: u64,
@@ -3162,6 +3171,7 @@ impl TerminalState {
             grid_version: 1,
             // IMPORTANT: row_versions must match grid.rows(), not the parameter 'rows'
             // This ensures dirty tracking works correctly even with scrollback
+            native_wheel_generation: Some(1),
             row_versions: vec![1; rows], // Use 'rows' here since grid.rows() == rows at init
             visible_cells_cache: None,
             frame_revision: 0,
@@ -3188,6 +3198,7 @@ impl TerminalState {
 
             command_zones: VecDeque::new(),
             finished_output_provenance: HashMap::new(),
+            finished_output_owners: HashMap::new(),
             next_zone_id: 0,
             completed_history_revision: 0,
             current_zone_state: ZoneState::default(),
@@ -4531,8 +4542,7 @@ impl TerminalState {
         self.next_zone_id = next_zone_id;
         if let Some(provenance) = provenance.as_mut() {
             provenance.range.zone_id = zone.id;
-            self.finished_output_provenance
-                .insert(zone.id, provenance.clone());
+            self.register_finished_output_provenance(zone.id, provenance.clone());
         }
         self.captured_output_bytes = self
             .captured_output_bytes
@@ -4542,7 +4552,7 @@ impl TerminalState {
         if self.command_zones.len() > MAX_COMMAND_ZONES {
             if let Some(evicted) = self.command_zones.pop_front() {
                 archive_changed |= evicted.output_source.is_some();
-                self.finished_output_provenance.remove(&evicted.id);
+                self.unregister_finished_output_provenance(evicted.id);
                 self.captured_output_bytes = self
                     .captured_output_bytes
                     .saturating_sub(evicted.captured_bytes());
@@ -4592,6 +4602,98 @@ impl TerminalState {
             .unwrap_or(boundary_row)
             .max(boundary_row)
             .min(total_rows)
+    }
+
+    fn invalidate_provenance_projection(&mut self) {
+        self.projection_plan_cache = None;
+        self.projected_viewport_cache = None;
+        self.visible_cells_cache = None;
+    }
+
+    fn register_finished_output_provenance(
+        &mut self,
+        zone_id: u64,
+        provenance: FinishedOutputProvenance,
+    ) {
+        self.unregister_finished_output_provenance(zone_id);
+        let last = provenance.row_ids.len().saturating_sub(1);
+        for (index, &row_id) in provenance.row_ids.iter().enumerate() {
+            let start = if index == 0 {
+                provenance.range.start.col
+            } else {
+                0
+            };
+            let end = if index == last {
+                provenance.range.end.col
+            } else {
+                usize::MAX
+            };
+            if row_id.is_tracked() && start < end {
+                self.finished_output_owners
+                    .entry(row_id)
+                    .or_default()
+                    .push(FinishedOutputOwner {
+                        zone_id,
+                        start,
+                        end,
+                    });
+            }
+        }
+        self.finished_output_provenance.insert(zone_id, provenance);
+        self.invalidate_provenance_projection();
+    }
+
+    fn unregister_finished_output_provenance(&mut self, zone_id: u64) {
+        let Some(provenance) = self.finished_output_provenance.remove(&zone_id) else {
+            return;
+        };
+        for row_id in provenance.row_ids {
+            if let Some(owners) = self.finished_output_owners.get_mut(&row_id) {
+                owners.retain(|owner| owner.zone_id != zone_id);
+                if owners.is_empty() {
+                    self.finished_output_owners.remove(&row_id);
+                }
+            }
+        }
+        self.invalidate_provenance_projection();
+    }
+
+    fn invalidate_finished_output_span(&mut self, row_id: RawRowId, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        let zones: Vec<_> = self
+            .finished_output_owners
+            .get(&row_id)
+            .into_iter()
+            .flatten()
+            .filter(|owner| start < owner.end && owner.start < end)
+            .map(|owner| owner.zone_id)
+            .collect();
+        for zone_id in zones {
+            self.unregister_finished_output_provenance(zone_id);
+        }
+    }
+
+    fn apply_content_mutation(&mut self, mutation: jterm_engine::screen::RowMutation) {
+        if !self.vt.screen.use_alt_buffer && !self.finished_output_owners.is_empty() {
+            self.invalidate_finished_output_span(
+                mutation.row_id,
+                mutation.changed.start,
+                mutation.changed.end,
+            );
+        }
+        self.mark_row_dirty(mutation.row);
+    }
+
+    fn invalidate_live_output_provenance(&mut self) {
+        if self.vt.screen.use_alt_buffer || self.finished_output_owners.is_empty() {
+            return;
+        }
+        let rows: Vec<_> = self.vt.screen.grid.row_ids().to_vec();
+        for row_id in rows {
+            self.invalidate_finished_output_span(row_id, 0, usize::MAX);
+        }
     }
 
     fn bind_finished_output_provenance(
@@ -5055,11 +5157,10 @@ impl TerminalState {
     fn drop_orphaned_output_provenance(&mut self) {
         #[cfg(test)]
         PROVENANCE_ORPHAN_SCAN_COUNT.with(|count| count.set(count.get().saturating_add(1)));
-        self.finished_output_provenance.retain(|zone_id, _| {
-            self.command_zones
-                .iter()
-                .any(|zone| zone.id == *zone_id && !zone.rows_evicted)
-        });
+        let orphaned: Vec<_> = self.finished_output_provenance.keys().copied().filter(|zone_id| {
+            !self.command_zones.iter().any(|zone| zone.id == *zone_id && !zone.rows_evicted)
+        }).collect();
+        for zone_id in orphaned { self.unregister_finished_output_provenance(zone_id); }
     }
 
     /// Rebase every retained command zone for the rows trimmed since the last
@@ -5445,6 +5546,8 @@ impl TerminalState {
             images: stashed_images,
         });
 
+        self.finished_output_owners.clear();
+        self.invalidate_provenance_projection();
         self.kitty_graphics
             .retain_placements_from_buffer_row(live_start);
         self.on_scrollback_rows_trimmed(retained_scrollback_start);
@@ -5504,7 +5607,7 @@ impl TerminalState {
         self.captured_output_bytes = self
             .captured_output_bytes
             .saturating_add(snapshot.captured_output_bytes);
-        self.finished_output_provenance.extend(snapshot.provenance);
+        for (id, provenance) in snapshot.provenance { self.register_finished_output_provenance(id, provenance); }
         let mut restored = snapshot.zones.len();
         for zone in snapshot.zones.into_iter().rev() {
             self.command_zones.push_front(zone);
@@ -5515,7 +5618,7 @@ impl TerminalState {
         // plan on restore with the push path's cap bookkeeping.
         while self.command_zones.len() > MAX_COMMAND_ZONES {
             if let Some(evicted) = self.command_zones.pop_front() {
-                self.finished_output_provenance.remove(&evicted.id);
+                self.unregister_finished_output_provenance(evicted.id);
                 self.captured_output_bytes = self
                     .captured_output_bytes
                     .saturating_sub(evicted.captured_bytes());
@@ -6290,12 +6393,12 @@ impl TerminalState {
             GraphicStep::Composed(mutation) => {
                 #[cfg(test)]
                 graphic_write_oracles::observe(self, "compose");
-                self.mark_row_dirty(mutation.row);
+                self.apply_content_mutation(mutation);
             }
             GraphicStep::Written { mutation, columns } => {
                 #[cfg(test)]
                 graphic_write_oracles::observe(self, "write");
-                self.mark_row_dirty(mutation.row);
+                self.apply_content_mutation(mutation);
                 self.mark_command_echo_extent(columns.start, columns.end);
             }
         }
@@ -6316,7 +6419,7 @@ impl TerminalState {
             NativeAsciiStep::Written { mutation, columns } => {
                 #[cfg(test)]
                 ascii_batch_oracles::observe(self, "write");
-                self.mark_row_dirty(mutation.row);
+                self.apply_content_mutation(mutation);
                 self.mark_command_echo_extent(columns.start, columns.end);
             }
             NativeAsciiStep::ObserveIdle { columns, nonblank } => {
@@ -6833,12 +6936,14 @@ impl TerminalState {
 
     /// DECALN (ESC # 8): fill the entire screen with 'E', used for alignment tests.
     fn decaln(&mut self) {
+        self.invalidate_live_output_provenance();
         self.vt.screen.frost_legacy_alignment_test();
         self.mark_rows_dirty(0, self.vt.screen.grid.rows().saturating_sub(1));
     }
 
     /// RIS (ESC c): reset the terminal to its initial state.
     fn full_reset(&mut self) {
+        self.retire_native_wheel();
         self.projection_scroll_guard.revoke();
         self.watch_batch.boundary = true;
         self.watch_batch.interrupted = true;
@@ -6868,6 +6973,9 @@ impl TerminalState {
         self.command_zones.clear();
         self.pending_zone_row_trim = 0;
         self.finished_output_provenance.clear();
+        self.finished_output_owners.clear();
+        // RIS already changes the history/grid/provenance cache keys. Preserve
+        // its existing cache lifetime; content edits and replacements clear it.
         self.captured_output_bytes = 0;
         // RIS destroys the rows the undo stash points at; it cannot rebuild
         // blocks whose text is gone.
@@ -6939,6 +7047,7 @@ impl TerminalState {
         } else {
             self.archive_visible_screen_to_scrollback();
         }
+        self.invalidate_live_output_provenance();
         let blank = self.create_blank_cell();
         self.vt.screen.grid.fill_cells(blank);
         self.mark_rows_dirty(0, self.vt.screen.grid.rows().saturating_sub(1));
@@ -6952,13 +7061,14 @@ impl TerminalState {
             NativeModeEffect::RevokePasteGrant => {
                 unreachable!("Frost's legacy mode has no Ember grant")
             }
-            NativeModeEffect::MouseReportingChanged => self.projection_scroll_guard.revoke(),
+            NativeModeEffect::MouseReportingChanged => {
+                self.projection_scroll_guard.revoke();
+                self.retire_native_wheel();
+            },
             NativeModeEffect::AlternateScreen { mode, enabled } => {
-                if enabled {
-                    self.enter_alternate_screen(mode);
-                } else {
-                    self.leave_alternate_screen(mode);
-                }
+                let before = self.vt.screen.use_alt_buffer;
+                if enabled { self.enter_alternate_screen(mode); } else { self.leave_alternate_screen(mode); }
+                if before != self.vt.screen.use_alt_buffer { self.retire_native_wheel(); }
             }
             NativeModeEffect::SynchronizedOutput { enabled } => {
                 if enabled {
@@ -7205,6 +7315,21 @@ impl TerminalState {
     /// agent enables mouse reporting for its own TUI.
     pub fn application_owns_pointer(&self) -> bool {
         self.is_mouse_enabled() && self.inline_cli_scope_floor().is_none()
+    }
+
+    pub fn native_wheel_generation(&self) -> Option<u64> {
+        self.native_wheel_generation
+    }
+
+    fn retire_native_wheel(&mut self) {
+        self.native_wheel_generation = self
+            .native_wheel_generation
+            .and_then(|value| value.checked_add(1));
+    }
+
+    /// Explicit DECSET 1007; construction and terminal reset default to off.
+    pub fn is_alternate_scroll(&self) -> bool {
+        self.vt.protocol.modes().contains(&1007)
     }
 
     pub fn is_mouse_enabled(&self) -> bool {
@@ -10820,6 +10945,12 @@ impl TerminalState {
                 }
             }
         }
+        if cols != self.vt.screen.grid.row_len() {
+            let primary = if self.vt.screen.use_alt_buffer { &self.vt.screen.alt_grid } else { &self.vt.screen.grid };
+            let row_ids = primary.row_ids().to_vec();
+            for row_id in row_ids { self.invalidate_finished_output_span(row_id, 0, usize::MAX); }
+        }
+        if rows != self.vt.screen.grid.rows() || cols != self.vt.screen.grid.row_len() { self.retire_native_wheel(); }
         let geometry = self.vt.screen.resize_frost_legacy(rows, cols);
         for line in geometry.transferred {
             self.push_scrollback_compressed(line);
@@ -17225,9 +17356,10 @@ mod tests {
             b"\x1b[=8u\x1b[>16384u\x1b[?12;1007;1034;1036h\x1b[4h\x1b[?6h\x1b[!p\x1b[?u\x1b[4$p\x1b[?6$p",
         );
         assert_eq!(terminal.get_output(), b"\x1b[?16384u\x1b[4;2$y\x1b[?6;2$y");
-        for unsupported in [12, 1007, 1034, 1036] {
+        for unsupported in [12, 1034, 1036] {
             assert!(!terminal.vt.protocol.modes().contains(&unsupported));
         }
+        assert!(!terminal.is_alternate_scroll(), "DECSTR restores explicit1007 default-off");
         assert_eq!(terminal.get_mouse_report(0, 0, 0).unwrap(), b"\x1b[<0;1;1M");
 
         terminal.process_input(b"\x1b[?1049l\x1b[?u\x1b[<0u\x1b[?u\x1b[?1049h\x1b[?u");
@@ -20741,6 +20873,11 @@ mod block_spacing_tests {
         let mut terminal = TerminalState::new(24, 20);
         terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b[19;1H");
         terminal.process_input(b"                         ");
+        assert_eq!(terminal.vt.screen.grid[19][0].character, ' ');
+        assert_ne!(terminal.vt.screen.grid[19][0], TerminalCell::default());
+        // Printed spaces now retain occupancy metadata. Erase the continuation
+        // explicitly so this fixture still probes a truly default blank row.
+        terminal.process_input(b"\x1b[20;1H\x1b[2K");
         terminal.process_input(b"\x1b[1;3H");
         assert!(terminal.vt.screen.grid.row_wrapped[18]);
         assert!(terminal.vt.screen.grid[19]
@@ -21362,6 +21499,12 @@ mod osc5522_oracles;
 mod frost_control_oracles;
 
 impl jterm_engine::frost_csi::FrostCsiHost for TerminalState {
+    fn track_legacy_erase_mutations(&self) -> bool {
+        !self.vt.screen.use_alt_buffer
+            && !self.finished_output_owners.is_empty()
+            && self.vt.screen.grid.row_ids().iter().any(|id| self.finished_output_owners.contains_key(id))
+    }
+
     fn csi_state(&mut self) -> (&mut ScreenState, &mut ProtocolState) {
         (&mut self.vt.screen, &mut self.vt.protocol)
     }
@@ -21428,7 +21571,7 @@ impl jterm_engine::frost_csi::FrostCsiHost for TerminalState {
                     self.output_buffer.extend(bytes);
                 }
                 Effect::GlobalBackground(color) => self.global_bg = color,
-                Effect::Row(mutation) => self.mark_row_dirty(mutation.row),
+                Effect::Row(mutation) => self.apply_content_mutation(mutation),
                 Effect::CursorReposition { .. } | Effect::Bell => {
                     unreachable!("Frost local CSI produced an unexpected effect")
                 }
@@ -21437,7 +21580,7 @@ impl jterm_engine::frost_csi::FrostCsiHost for TerminalState {
                 DisplayEraseStep::ScreenErased => self.inline_cli_screen_erased(),
                 DisplayEraseStep::Mutations(effects) => {
                     for effect in effects {
-                        self.mark_row_dirty(effect.row);
+                        self.apply_content_mutation(effect);
                     }
                 }
                 DisplayEraseStep::DirtyRows(rows) => {
@@ -21532,5 +21675,139 @@ impl jterm_engine::native_terminal::NativeTerminalHost for TerminalState {
             | NativeEffect::Reset
             | NativeEffect::Alignment => unreachable!("Ember-only native effect"),
         }
+    }
+}
+
+#[cfg(test)]
+mod retained_output_content_tests {
+    use super::*;
+    fn completed(payload: &[u8]) -> (TerminalState, u64) {
+        let mut t = TerminalState::new(20, 4);
+        t.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07");
+        t.process_input(payload);
+        t.process_input(b"\x1b]133;D;0\x07");
+        let id = t.command_zones.back().unwrap().id;
+        assert!(t.finished_output_range(id).is_some());
+        (t, id)
+    }
+    fn coherent(t: &TerminalState) {
+        for (row, owners) in &t.finished_output_owners {
+            assert!(!owners.is_empty());
+            for owner in owners {
+                assert!(t.finished_output_provenance[&owner.zone_id]
+                    .row_ids
+                    .contains(row));
+            }
+        }
+    }
+    #[test]
+    fn content_edits_invalidate_live_ranges_but_keep_captured_output() {
+        for edit in [
+            b"\x1b[1;6HZ".as_slice(),
+            b"\x1b[1;6;1;8$z",
+            b"\x1b[88;1;6;1;8$x",
+            b"\x1b[1;6H\x1b[K",
+            b"\x1b[1;6H\x1b[X",
+            b"\x1b[1;6H\x1b[@",
+            b"\x1b[1;6H\x1b[P",
+            b"\x1b[1;6H\x1b[J",
+            b"\x1b[1;8H\x1b[1J",
+            b"\x1b[1;6H\x1b[1'}",
+            b"\x1b#8",
+            b"\x1b[2J",
+        ] {
+            let (mut t, id) = completed(b"OUT");
+            let captured = t.zone_output_text_capped(id).unwrap();
+            t.process_input(edit);
+            assert_eq!(t.finished_output_range(id), None, "edit {edit:?}");
+            assert_eq!(
+                t.zone_output_text_capped(id),
+                Some(captured),
+                "archive {edit:?}"
+            );
+            assert!(t
+                .finished_output_owners
+                .values()
+                .flatten()
+                .all(|o| o.zone_id != id));
+            coherent(&t);
+        }
+    }
+    #[test]
+    fn style_cursor_protection_and_same_row_neighbors_keep_their_ranges() {
+        let (mut t, first) = completed(b"\x1b[1\"qOUT\x1b[0\"q");
+        let first_range = t.finished_output_range(first).unwrap();
+        t.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07NEXT\x1b]133;D;0\x07");
+        let second = t.command_zones.back().unwrap().id;
+        let second_range = t.finished_output_range(second).unwrap();
+        t.process_input(b"\x1b[2*x\x1b[1;1;1;20;1$r\x1b[1;6H\x1b[?2K");
+        assert_eq!(t.finished_output_range(first), Some(first_range));
+        assert_eq!(
+            t.finished_output_range(second),
+            None,
+            "unprotected neighbor erased"
+        );
+        // A separate ordinary same-row suffix mutation must not invalidate OUT.
+        t.process_input(b"\x1b[1;10HZ");
+        assert_eq!(t.finished_output_range(first), Some(first_range));
+        assert_ne!(first_range, second_range);
+        t.process_input(b"\x1b[1;6HX");
+        assert_eq!(t.finished_output_range(first), None);
+        coherent(&t);
+    }
+    #[test]
+    fn provenance_replacement_clears_same_count_projection_caches() {
+        let (mut t, id) = completed(b"OUT");
+        let mut policy = ProjectionPolicy::new();
+        policy.collapse(id);
+        t.cached_collapsed_projection_plan(20, &policy);
+        t.get_projected_viewport_with_policy(true, &policy, 0);
+        assert!(t.projection_plan_cache.is_some());
+        let count = t.finished_output_provenance.len();
+        let provenance = t.finished_output_provenance[&id].clone();
+        t.register_finished_output_provenance(id, provenance);
+        assert_eq!(t.finished_output_provenance.len(), count);
+        assert!(t.projection_plan_cache.is_none());
+        assert!(t.projected_viewport_cache.is_none());
+        coherent(&t);
+    }
+
+    #[test]
+    fn wide_combining_alternate_scroll_resize_and_undo_boundaries() {
+        let (mut wide, id) = completed("界".as_bytes());
+        wide.process_input(b"\x1b[1;7HX");
+        assert_eq!(wide.finished_output_range(id), None);
+        let (mut combining, id) = completed(b"e");
+        combining.process_input("\u{301}".as_bytes());
+        assert_eq!(combining.finished_output_range(id), None);
+        let (mut t, id) = completed(b"OUT");
+        let range = t.finished_output_range(id);
+        t.process_input(b"\x1b[?1049h\x1b[2JX\x1b[?1049l");
+        assert_eq!(t.finished_output_range(id), range);
+        t.on_resize(20, 4);
+        assert_eq!(t.finished_output_range(id), range);
+        t.process_input(b"\x1b[4;1H\n");
+        assert_eq!(
+            t.finished_output_range(id),
+            range,
+            "row moving into history retains ownership"
+        );
+        t.process_input(b"\x1b[2J");
+        assert_eq!(
+            t.finished_output_range(id),
+            range,
+            "existing archived rows survive live erase"
+        );
+        assert_eq!(t.clear_completed_blocks(), 1);
+        assert!(t.finished_output_owners.is_empty());
+        assert_eq!(t.undo_clear_completed_blocks(), 1);
+        assert_eq!(t.finished_output_range(id), range);
+        coherent(&t);
+        t.process_input(b"\x1bc");
+        assert!(t.finished_output_owners.is_empty());
+        let (mut changed, id) = completed(b"OUT");
+        changed.on_resize(10, 4);
+        assert_eq!(changed.finished_output_range(id), None);
+        coherent(&changed);
     }
 }

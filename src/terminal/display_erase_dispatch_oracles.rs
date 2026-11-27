@@ -71,6 +71,54 @@ fn seeded(seed: usize, pending: bool, protected: bool) -> TerminalState {
     t
 }
 
+/// Independent DECSED model: select display positions, then erase whole valid
+/// character units only when neither half is DECSCA protected. No engine erase
+/// or mutation-planning helper participates in the expected result.
+fn expected_selective_display(mut terminal: TerminalState, params: &[u16]) -> TerminalState {
+    let before = terminal.vt.screen.grid.to_vec();
+    let mode = params.first().copied().unwrap_or(0);
+    let cursor = (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col);
+    let blank = TerminalCell {
+        background: terminal.vt.screen.current_bg,
+        ..TerminalCell::default()
+    };
+    let mut erased = false;
+    for (row, cells) in before.iter().enumerate() {
+        let mut col = 0;
+        let mut touched = false;
+        while col < cells.len() {
+            let flags = cells[col].flags;
+            let paired = flags.wide()
+                && !flags.wide_continuation()
+                && col + 1 < cells.len()
+                && cells[col + 1].flags.wide_continuation()
+                && !cells[col + 1].flags.wide();
+            let end = col + if paired { 2 } else { 1 };
+            let selected = (col..end).any(|column| match mode {
+                0 => row > cursor.0 || (row == cursor.0 && column >= cursor.1),
+                1 => row < cursor.0 || (row == cursor.0 && column <= cursor.1),
+                2 => true,
+                _ => false,
+            });
+            if selected && cells[col..end].iter().all(|cell| !cell.flags.protected()) {
+                for column in col..end {
+                    *terminal.vt.screen.grid.get_mut(row, column) = blank;
+                }
+                touched = true;
+                erased = true;
+            }
+            col = end;
+        }
+        if touched {
+            terminal.mark_row_dirty(row);
+        }
+    }
+    if erased {
+        terminal.vt.screen.pending_wrap = false;
+    }
+    terminal
+}
+
 fn run(
     mut t: TerminalState,
     params: &[u16],
@@ -79,7 +127,14 @@ fn run(
     original: bool,
 ) -> std::collections::BTreeMap<String, serde_json::Value> {
     if original {
-        t.frozen_display_erase_dispatch(params, prefix, intermediates);
+        if prefix == Some(b'?')
+            && intermediates.is_empty()
+            && params.first().copied().unwrap_or(0) <= 2
+        {
+            t = expected_selective_display(t, params);
+        } else {
+            t.frozen_display_erase_dispatch(params, prefix, intermediates);
+        }
     } else {
         t.handle_escape_sequence(params, b"", 'J', prefix, intermediates);
     }
@@ -87,7 +142,7 @@ fn run(
 }
 
 #[test]
-fn display_erase_admission_mutations_and_order_match_frozen_host() {
+fn display_erase_admission_matches_frozen_legacy_and_independent_dec_selective_model() {
     for seed in [0, 3, 7] {
         for pending in [false, true] {
             for protected in [false, true] {
@@ -109,5 +164,32 @@ fn display_erase_admission_mutations_and_order_match_frozen_host() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn selective_display_erase_preserves_real_frost_protected_wide_glyph_at_clipped_boundaries() {
+    for request in [
+        b"\x1b[1;2H\x1b[?J".as_slice(),
+        b"\x1b[1;1H\x1b[?1J",
+        b"\x1b[?2J",
+    ] {
+        let mut terminal = TerminalState::new(8, 3);
+        terminal.process_input("\x1b[1\"q界\x1b[0\"qX".as_bytes());
+        assert!(terminal.vt.screen.grid.get(0, 0).flags.protected());
+        assert!(!terminal.vt.screen.grid.get(0, 1).flags.protected());
+        let glyph = [
+            *terminal.vt.screen.grid.get(0, 0),
+            *terminal.vt.screen.grid.get(0, 1),
+        ];
+        terminal.process_input(request);
+        assert_eq!(
+            [
+                *terminal.vt.screen.grid.get(0, 0),
+                *terminal.vt.screen.grid.get(0, 1)
+            ],
+            glyph,
+            "{request:?}"
+        );
     }
 }

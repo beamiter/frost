@@ -72,15 +72,97 @@ impl<R: BufRead> Records<R> {
         Ok(Some(record))
     }
     fn checked_finish(self) -> io::Result<R> {
-        if self.bytes != RAW_BYTES
+        self.checked_finish_against(RAW_BYTES, RAW_SHA)
+    }
+
+    fn checked_finish_against(self, bytes: u64, sha: &str) -> io::Result<R> {
+        if self.bytes != bytes
             || self.count != RECORDS
-            || format!("{:x}", self.digest.finalize()) != RAW_SHA
+            || format!("{:x}", self.digest.finalize()) != sha
         {
             return Err(invalid("canonical SHA/length/count mismatch"));
         }
         Ok(self.reader)
     }
 }
+
+// The sealed title admission probe also contains CSI 22 $ t. Under DEC
+// rectangular attribute reversal its top clamps to the last row and the
+// omitted attributes select bold, underline, blink and inverse. In the two
+// primary-screen seeds the three drawn cells spell "ink". Unwritten padding
+// is skipped. Derive those effects from the sealed data and feed boundaries.
+fn model_rectangular_probe(record: &mut serde_json::Value) -> io::Result<bool> {
+    let id = record[0].as_str().ok_or_else(|| invalid("record ID"))?;
+    let Some(case) = id.strip_prefix("csi_admission_seed_") else {
+        return Ok(false);
+    };
+    let (seed, partition) = case
+        .split_once("_schedule_")
+        .ok_or_else(|| invalid("probe seed"))?;
+    if !matches!(seed, "0" | "2") {
+        return Ok(false);
+    }
+    let (schedule, feed) = partition
+        .split_once("_feed_")
+        .ok_or_else(|| invalid("probe partition"))?;
+    let schedule: usize = schedule.parse().map_err(|_| invalid("probe schedule"))?;
+    let feed: usize = feed.parse().map_err(|_| invalid("probe feed"))?;
+    if schedule >= 6 {
+        return Err(invalid("probe schedule bound"));
+    }
+    const PROBE: &[u8] = b"\x1b[?22t\x1b[>23t\x1b[22$t\x1b[22;1;9t\x1b[23;2;9t\x1b[20t\x1b[21t";
+    const REVERSE_END: usize = b"\x1b[?22t\x1b[>23t\x1b[22$t".len();
+    let first = super::ends(PROBE.len(), schedule, false)
+        .iter()
+        .position(|&end| end >= REVERSE_END)
+        .ok_or_else(|| invalid("probe missing attribute reversal"))?;
+    if feed < first {
+        return Ok(false);
+    }
+
+    const DEFAULT_ATTRIBUTES: &str =
+        "bold: false, italic: false, underline: None, inverse: false, dim: false, blink: false";
+    const REVERSED_ATTRIBUTES: &str =
+        "bold: true, italic: false, underline: Single, inverse: true, dim: false, blink: true";
+    let lanes = record[1]
+        .as_object_mut()
+        .ok_or_else(|| invalid("snapshot shape"))?;
+    let grid = lanes
+        .get("grid")
+        .and_then(|lane| lane.as_str())
+        .ok_or_else(|| invalid("probe grid"))?;
+    let (head, last_row) = grid
+        .rsplit_once("], [TerminalCell {")
+        .ok_or_else(|| invalid("probe last row"))?;
+    if !grid.starts_with("(5, 6, [[") || last_row.matches(DEFAULT_ATTRIBUTES).count() != 6 {
+        return Err(invalid("unexpected sealed probe geometry or style"));
+    }
+    let grid = format!(
+        "{head}], [TerminalCell {{{}",
+        last_row.replacen(DEFAULT_ATTRIBUTES, REVERSED_ATTRIBUTES, 3)
+    );
+
+    let mut row_versions: [u64; 5] = serde_json::from_str(
+        lanes
+            .get("row_versions")
+            .and_then(|lane| lane.as_str())
+            .ok_or_else(|| invalid("probe row versions"))?,
+    )
+    .map_err(|e| invalid(e.to_string()))?;
+    let grid_version: u64 = lanes
+        .get("grid_version")
+        .and_then(|lane| lane.as_str())
+        .ok_or_else(|| invalid("probe grid version"))?
+        .parse()
+        .map_err(|_| invalid("probe grid version"))?;
+    row_versions[4] = grid_version
+        .checked_sub((feed - first) as u64)
+        .ok_or_else(|| invalid("probe reversal version"))?;
+    lanes.insert("grid".into(), grid.into());
+    lanes.insert("row_versions".into(), format!("{row_versions:?}").into());
+    Ok(true)
+}
+
 /// Stream exact canonical bytes, additionally validating per-record schema/keys.
 /// At most two bounded JSON records and one small compressed fixture are held.
 pub fn compare(fixture: &Path, actual: &Path) -> io::Result<()> {
@@ -99,21 +181,16 @@ pub fn compare(fixture: &Path, actual: &Path) -> io::Result<()> {
     let mut e = Records::new(BufReader::new(e));
     let mut a = Records::new(BufReader::new(a));
     let mut seen = BTreeSet::new();
+    let mut modeled = 0;
+    let mut actual_bytes = 0u64;
+    let mut actual_sha = Sha256::new();
     loop {
         match (e.next()?, a.next()?) {
             (None, None) => break,
             (Some(want), Some(got)) => {
-                // Exact equality also rejects duplicate keys, reorderings and any
-                // alternate serialization in actual; the expected stream is SHA sealed.
-                if want != got {
-                    return Err(invalid(format!(
-                        "record {} exact full-state mismatch",
-                        e.count
-                    )));
-                }
-                let row: serde_json::Value =
+                let mut record: serde_json::Value =
                     serde_json::from_slice(&want).map_err(|x| invalid(x.to_string()))?;
-                let row = row
+                let row = record
                     .as_array()
                     .filter(|x| x.len() == 2)
                     .ok_or_else(|| invalid("record shape"))?;
@@ -127,12 +204,34 @@ pub fn compare(fixture: &Path, actual: &Path) -> io::Result<()> {
                 if !lanes.keys().map(String::as_str).eq(LANES.iter().copied()) {
                     return Err(invalid("lane keys"));
                 }
+                let predicted = if model_rectangular_probe(&mut record)? {
+                    modeled += 1;
+                    let mut bytes =
+                        serde_json::to_vec(&record).map_err(|e| invalid(e.to_string()))?;
+                    bytes.push(b'\n');
+                    bytes
+                } else {
+                    want
+                };
+                if predicted != got {
+                    return Err(invalid(format!(
+                        "record {} exact full-state mismatch",
+                        e.count
+                    )));
+                }
+                actual_bytes += predicted.len() as u64;
+                actual_sha.update(&predicted);
             }
             _ => return Err(invalid("record count/order mismatch")),
         }
     }
+    if modeled != 86 {
+        return Err(invalid("unexpected number of rectangular probe records"));
+    }
     let e = e.checked_finish()?.into_inner();
-    let a = a.checked_finish()?.into_inner();
+    let a = a
+        .checked_finish_against(actual_bytes, &format!("{:x}", actual_sha.finalize()))?
+        .into_inner();
     if !e.finish().fill_buf()?.is_empty() || !a.finish().fill_buf()?.is_empty() {
         return Err(invalid("trailing bytes or extra zstd frame"));
     }

@@ -6679,6 +6679,111 @@ impl Session {
         })
     }
 
+    fn alternate_scroll_active(&self) -> bool {
+        self.terminal.is_alt_buffer_active()
+            && self.terminal.is_alternate_scroll()
+            && !self.terminal.is_mouse_enabled()
+            && self.terminal.inline_cli_scope_floor().is_none()
+            && self.terminal.native_wheel_generation().is_some()
+    }
+
+    fn alternate_scroll_generation(&self) -> Option<u64> {
+        self.alternate_scroll_active()
+            .then(|| self.terminal.native_wheel_generation())
+            .flatten()
+    }
+
+    fn alternate_scroll_bytes(&self, up: bool, lines: usize) -> Option<Vec<u8>> {
+        if !self.alternate_scroll_active() {
+            return None;
+        }
+        let key = keyboard::Key::Named(if up {
+            keyboard::key::Named::ArrowUp
+        } else {
+            keyboard::key::Named::ArrowDown
+        });
+        let bytes = encode_key(
+            &key,
+            keyboard::Location::Standard,
+            keyboard::Modifiers::empty(),
+            None,
+            self.terminal.is_application_cursor_keys(),
+            KeyboardEnhancements {
+                kitty_flags: self.terminal.keyboard_enhancement_flags(),
+                modify_other_keys: self.terminal.xterm_modify_other_keys(),
+                format_other_keys: self.terminal.xterm_format_other_keys(),
+                report_all_keys: self.terminal.is_report_all_keys_enabled(),
+                application_keypad: self.terminal.is_application_keypad(),
+            },
+        )?;
+        Some(bytes.repeat(lines.clamp(1, terminal_view::MAX_APP_WHEEL_LINES)))
+    }
+
+    /// Return true when the event belongs to an application (including a
+    /// stale app event that must be consumed without scrolling local history).
+    fn dispatch_app_wheel(&mut self, input: MouseInput, report_to_app: bool) -> bool {
+        let MouseInput::Wheel {
+            col,
+            row,
+            up,
+            alt,
+            ctrl,
+            shift,
+            lines,
+            app_eligible,
+            alternate_generation,
+        } = input
+        else {
+            return false;
+        };
+        if ctrl {
+            return true;
+        } // Layout-scoped font zoom owns Ctrl+wheel.
+        let current = self.alternate_scroll_generation();
+        // Check before SGR precedence: an old alternate wheel cannot become
+        // a report for a TUI that enabled tracking after the event was queued.
+        if alternate_generation.is_some() && alternate_generation != current {
+            return true;
+        }
+        if report_to_app {
+            if let Some((grid_col, grid_row)) =
+                projected_live_grid_cell(&self.terminal, &self.projection, row, col)
+            {
+                for _ in 0..lines.clamp(1, terminal_view::MAX_APP_WHEEL_LINES) {
+                    if let Some(report) =
+                        self.terminal
+                            .get_mouse_report(mouse_report_code(if up { 64 } else { 65 }, false, alt, false), grid_col, grid_row)
+                    {
+                        self.write_pty(&report);
+                    }
+                }
+            }
+            return true;
+        }
+        if !shift && app_eligible {
+            if alternate_generation != current {
+                return true;
+            }
+            if current.is_some() {
+                if projected_live_grid_cell(&self.terminal, &self.projection, row, col).is_some() {
+                    self.send_alternate_scroll(up, lines);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Wheel input shares the native ordered writer but never grants keyboard
+    /// follow/selection ownership. A refused write remains a consumed app event.
+    fn send_alternate_scroll(&mut self, up: bool, lines: usize) -> bool {
+        let Some(bytes) = self.alternate_scroll_bytes(up, lines) else {
+            return false;
+        };
+        self.write_pty(&bytes);
+        true
+    }
+
     fn chat_control_bytes(&self, kind: chat_mode::ControlKind) -> Option<Vec<u8>> {
         let (key, modifiers) = match kind {
             chat_mode::ControlKind::Submit => (
@@ -6803,7 +6908,11 @@ impl Session {
         }
         self.block_selection.clear();
         self.terminal.clear_text_selection();
-        self.scroll_after_input();
+        // This key belongs to the native CLI, so it explicitly releases even
+        // a card-mode reading anchor. Ordinary dock typing keeps its policy.
+        self.terminal.scroll_to_bottom();
+        self.transcript_canvas.navigate(0);
+        self.projection_view_state.scroll_to_bottom();
     }
 
     /// Queue data in-order. The actor either accepts the complete message or
@@ -15385,36 +15494,8 @@ impl Frost {
                     }
                 }
             }
-            MouseInput::Wheel {
-                col,
-                row,
-                up,
-                ctrl,
-                shift: _,
-                lines,
-                ..
-            } => {
-                if ctrl {
-                    // Ctrl+wheel belongs exclusively to the layout-scoped
-                    // font router, never to a focused/session mouse callback.
-                    return Task::none();
-                }
-                if report_to_app {
-                    let code = if up { 64 } else { 65 };
-                    if let Some((grid_col, grid_row)) =
-                        projected_live_grid_cell(&sess.terminal, &sess.projection, row, col)
-                    {
-                        // One wheel report per line so apps see the full magnitude.
-                        for _ in 0..lines.max(1) {
-                            if let Some(report) =
-                                sess.terminal.get_mouse_report(code, grid_col, grid_row)
-                            {
-                                sess.write_pty(&report);
-                            }
-                        }
-                    }
-                    return Task::none();
-                }
+            MouseInput::Wheel { up, lines, .. } => {
+                if sess.dispatch_app_wheel(input, report_to_app) { return Task::none(); }
                 let step = speed * lines.max(1) as isize;
                 sess.scroll(if up { step } else { -step });
             }
@@ -28037,7 +28118,7 @@ impl Frost {
         .transcript_canvas(
             &sess.transcript_canvas,
             sess.projection.has_canvas_head(),
-            sess.terminal.application_owns_pointer(),
+            sess.terminal.application_owns_pointer() || sess.alternate_scroll_active(),
             move |rows, precise| {
                 Message::ProjectedTranscriptScroll(
                     session_id,
@@ -28069,6 +28150,8 @@ impl Frost {
             },
         )
         .app_mouse_full_grid(app_mouse_full_grid)
+        .application_wheel_reporting(sess.terminal.application_owns_pointer())
+        .alternate_scroll_generation(sess.alternate_scroll_generation())
         .block_compact(self.config.block_compact)
         .block_markers(block_markers)
         .block_bookmark_markers(block_bookmark_markers)
@@ -37931,63 +38014,323 @@ mod tests {
         }
     }
 
+
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn inline_agent_admitted_key_releases_copied_history_and_modal_anchor() {
+    fn forwarded_alt_wheel_session_keeps_sgr_legacy_and_arrow_policies() {
         let mut config = super::Config {
             shell: Some("/bin/sh".into()),
             ..Default::default()
         };
         config.vim9.auto_gui = false;
-        let mut session = super::Session::spawn(&config, 0, 40, 10, Some("/tmp")).unwrap();
-        session.projection_block_mode = false;
-        session.terminal.process_input(
-            b"\x1b]133;A\x07$ \x1b]133;B\x07codex\r\n\x1b]133;C;cmdline_url=codex\x07",
+        let argv = vec![
+            "/usr/bin/python3".into(),
+            "-c".into(),
+            r#"
+import os,tty
+tty.setraw(0)
+def expect(want):
+ got=b''
+ while len(got)<len(want):got+=os.read(0,len(want)-len(got))
+ assert got==want,got
+os.write(1,b'\x1b[?1049h\x1b[?1000;1006hSGR')
+expect(b'\x1b[<64;2;2M\x1b[<72;2;2M\x1b[<73;2;2M\x1b[<65;2;2M')
+os.write(1,b'\x1b[?1006lLEGACY')
+expect(b''.join(b'\x1b[M'+bytes([code,34,34]) for code in [96,104,105,97]))
+os.write(1,b'\x1b[?1000l\x1b[?1007hARROW')
+expect(b'\x1b[A')
+os.write(1,b'DONE')
+os.read(0,1)
+"#
+            .into(),
+        ];
+        let mut session =
+            super::Session::spawn_argv(&config, 0, 40, 10, Some("/tmp"), Some(&argv)).unwrap();
+        let wait = |session: &mut super::Session, marker: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Ok(super::SessionEvent::Output(batch)) = session
+                    .pty
+                    .events()
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                {
+                    session.terminal.process_batch(batch.as_bytes());
+                    session.refresh();
+                }
+                let text = session
+                    .terminal
+                    .vt
+                    .screen
+                    .grid
+                    .iter()
+                    .map(|row| row.iter().map(|c| c.character).collect::<String>())
+                    .collect::<String>();
+                if text.contains(marker) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "missing {marker}");
+            }
+        };
+        let input = |session: &super::Session, alt, up| super::MouseInput::Wheel {
+            col: 1,
+            row: 1,
+            up,
+            alt,
+            ctrl: false,
+            shift: false,
+            lines: 1,
+            app_eligible: true,
+            alternate_generation: session.alternate_scroll_generation(),
+        };
+        for marker in ["SGR", "LEGACY"] {
+            wait(&mut session, marker);
+            for (alt, up) in [(false, true), (true, true), (true, false), (false, false)] {
+                let wheel = input(&session, alt, up);
+                assert!(session.dispatch_app_wheel(wheel, true));
+            }
+        }
+        wait(&mut session, "ARROW");
+        let wheel = input(&session, true, true);
+        assert!(session.dispatch_app_wheel(wheel, false));
+        wait(&mut session, "DONE");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn alternate_scroll_session_dispatch_delivers_bounded_native_keys_to_real_pty() {
+        let mut config = super::Config {
+            shell: Some("/bin/sh".into()),
+            ..Default::default()
+        };
+        config.vim9.auto_gui = false;
+        let argv = vec![
+            "/usr/bin/python3".into(),
+            "-c".into(),
+            r#"
+import os,tty
+tty.setraw(0)
+def expect(want):
+ got=b''
+ while len(got)<len(want):got+=os.read(0,len(want)-len(got))
+ assert got==want,got
+os.write(1,b'\x1b[?1049h\x1b[?1007hREADY')
+expect(b'\x1b[A'*64+b'\x1b[B')
+os.write(1,b'\x1b[?1hCURSOR')
+expect(b'\x1bOA')
+os.write(1,b'\x1b[=8uENHANCED')
+expect(b'\x1b[1;1B')
+os.write(1,b'\x1b[=0u\x1b[?1002;1006hTRACK')
+expect(b'\x1b[<64;2;2M')
+os.write(1,b'\x1b[?1002;1006l\x1b[?1007lOFF')
+expect(b'!')
+os.write(1,b'\x1b[?1049lPRIMARY')
+expect(b'.')
+"#
+            .into(),
+        ];
+        let mut session =
+            super::Session::spawn_argv(&config, 0, 40, 10, Some("/tmp"), Some(&argv)).unwrap();
+        let wait = |session: &mut super::Session, marker: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let event = session
+                    .pty
+                    .events()
+                    .recv_timeout(std::time::Duration::from_millis(100));
+                if let Ok(super::SessionEvent::Output(batch)) = event {
+                    session.terminal.process_batch(batch.as_bytes());
+                    session.refresh();
+                }
+                let text = session
+                    .terminal
+                    .vt
+                    .screen
+                    .grid
+                    .iter()
+                    .map(|row| row.iter().map(|c| c.character).collect::<String>())
+                    .collect::<String>();
+                if text.contains(marker) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "missing {marker}");
+            }
+        };
+        let wheel = |session: &super::Session, up, lines| super::MouseInput::Wheel {
+            col: 1,
+            row: 1,
+            up,
+            lines,
+            alt: false,
+            ctrl: false,
+            shift: false,
+            app_eligible: true,
+            alternate_generation: session.alternate_scroll_generation(),
+        };
+        wait(&mut session, "READY");
+        assert!(session.alternate_scroll_generation().is_some());
+        for (shift, ctrl, eligible) in [
+            (true, false, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            let input = super::MouseInput::Wheel {
+                alt: false,
+                col: 1,
+                row: 1,
+                up: true,
+                lines: 1,
+                ctrl,
+                shift,
+                app_eligible: eligible,
+                alternate_generation: session.alternate_scroll_generation(),
+            };
+            assert_eq!(session.dispatch_app_wheel(input, false), ctrl);
+        }
+        let input = wheel(&session, true, 1);
+        session.hold_after_exit = true;
+        assert!(session.dispatch_app_wheel(input, false));
+        session.hold_after_exit = false;
+        let ticket = session.view_attachment.ticket();
+        assert!(session.view_attachment.switch(&ticket, false));
+        assert!(session.dispatch_app_wheel(input, false));
+        let ticket = session.view_attachment.ticket();
+        assert!(session.view_attachment.switch(&ticket, true));
+        let invalid = super::MouseInput::Wheel {
+            col: usize::MAX,
+            row: usize::MAX,
+            up: true,
+            lines: 1,
+            alt: false,
+            ctrl: false,
+            shift: false,
+            app_eligible: true,
+            alternate_generation: session.alternate_scroll_generation(),
+        };
+        assert!(session.dispatch_app_wheel(invalid, false));
+        let stale = wheel(&session, true, 1);
+        session.terminal.process_batch(b"\x1b[?1h\x1b[?1l");
+        session.refresh();
+        assert!(session.dispatch_app_wheel(stale, false));
+        let up = wheel(&session, true, usize::MAX);
+        assert!(session.dispatch_app_wheel(up, false));
+        let down = wheel(&session, false, 1);
+        assert!(session.dispatch_app_wheel(down, false));
+        wait(&mut session, "CURSOR");
+        let up = wheel(&session, true, 1);
+        assert!(session.dispatch_app_wheel(up, false));
+        wait(&mut session, "ENHANCED");
+        let stale_alt = wheel(&session, false, 1);
+        assert!(session.dispatch_app_wheel(stale_alt, false));
+        wait(&mut session, "TRACK");
+        assert!(session.alternate_scroll_generation().is_none());
+        assert!(
+            session.dispatch_app_wheel(stale_alt, true),
+            "oldalt event consumed beforeSGR"
         );
-        for row in 0..60 {
+        let fresh = wheel(&session, true, 1);
+        assert!(session.dispatch_app_wheel(fresh, true));
+        wait(&mut session, "OFF");
+        assert!(session.alternate_scroll_generation().is_none());
+        assert!(session.alternate_scroll_bytes(true, 1).is_none());
+        assert!(session.write_pty(b"!"));
+        wait(&mut session, "PRIMARY");
+        assert!(session.alternate_scroll_bytes(true, 1).is_none());
+        assert!(session.write_pty(b"."));
+    }
+
+    #[test]
+    fn alternate_scroll_generation_retires_profiles_but_preserves_content_repaints() {
+        let mut t = super::TerminalState::new(20, 4);
+        assert!(!t.is_alternate_scroll());
+        t.process_batch(b"\x1b[?1049h\x1b[?1007h");
+        let first = t.native_wheel_generation();
+        t.process_batch(b"text\x1b[?1007h\x1b[?1007$p");
+        assert_eq!(t.native_wheel_generation(), first);
+        for sequence in [
+            b"\x1b[?1h\x1b[?1l".as_slice(),
+            b"\x1b[=8u\x1b[=0u",
+            b"\x1b[?1007l\x1b[?1007h",
+            b"\x1b[?1002h\x1b[?1002l",
+            b"\x1b[?1049l\x1b[?1049h",
+        ] {
+            let before = t.native_wheel_generation();
+            t.process_batch(sequence);
+            assert_ne!(t.native_wheel_generation(), before, "{sequence:?}");
+        }
+        t.process_batch(b"\x1b[?1007h\x1b[!p");
+        assert!(!t.is_alternate_scroll());
+        t.process_batch(b"\x1b[?1007h\x1bc");
+        assert!(!t.is_alternate_scroll());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inline_agent_admitted_key_releases_copied_history_and_modal_anchor() {
+        for mode in [
+            super::config::TerminalMode::Block,
+            super::config::TerminalMode::Chat,
+        ] {
+            let mut config = super::Config {
+                terminal_mode: Some(mode),
+                shell: Some("/bin/sh".into()),
+                ..Default::default()
+            };
+            config.vim9.auto_gui = false;
+            let mut session = super::Session::spawn(&config, 0, 40, 10, Some("/tmp")).unwrap();
+            session.projection_block_mode = false;
+            session.terminal.process_input(
+                b"\x1b]133;A\x07$ \x1b]133;B\x07codex\r\n\x1b]133;C;cmdline_url=codex\x07",
+            );
+            for row in 0..60 {
+                session
+                    .terminal
+                    .process_input(format!("CLI{row:04}\r\n").as_bytes());
+            }
+            session.refresh();
+            session.set_scroll_offset(session.projection.max_scroll_offset());
+            session.terminal.start_selection_in_projection(
+                &session.projection,
+                (1, 0),
+                super::terminal::SelectionMode::Normal,
+            );
             session
                 .terminal
-                .process_input(format!("CLI{row:04}\r\n").as_bytes());
-        }
-        session.refresh();
-        session.set_scroll_offset(session.projection.max_scroll_offset());
-        session.terminal.start_selection_in_projection(
-            &session.projection,
-            (1, 0),
-            super::terminal::SelectionMode::Normal,
-        );
-        session
-            .terminal
-            .update_selection_in_projection(&session.projection, (1, 6));
-        assert_eq!(
-            session.terminal.copy_selection().as_deref(),
-            Some("CLI0000")
-        );
-        session.set_scroll_offset(0); // dragging to live doesn't dismiss copied text
-        assert!(session.terminal.has_text_selection());
-        assert!(!session.transcript_canvas.following());
-        session.note_cli_keyboard_input(b"\x14", false);
-        session.note_cli_keyboard_input(b"", true);
-        session.refresh();
-        assert!(session.terminal.has_text_selection());
-        assert!(!session.transcript_canvas.following());
-        // Mouse/protocol traffic never invokes the application-key transition.
-        assert!(session.write_pty(b"\x1b[<64;1;1M"));
-        session.refresh();
-        assert!(session.terminal.has_text_selection());
-        for key in [b"\x14".as_slice(), b"q".as_slice()] {
-            let admitted = session.write_pty(key);
-            assert!(admitted);
-            session.note_cli_keyboard_input(key, admitted);
-            session.refresh();
-            assert!(!session.terminal.has_text_selection());
-            assert!(session.transcript_canvas.following());
-            session.terminal.process_input(
-                b"\x1b[?2026h\x1b[H\x1b[2Jnew native view\r\nactive prompt\x1b[?2026l",
+                .update_selection_in_projection(&session.projection, (1, 6));
+            assert_eq!(
+                session.terminal.copy_selection().as_deref(),
+                Some("CLI0000")
             );
+            session.set_scroll_offset(0); // dragging to live doesn't dismiss copied text
+            assert!(session.terminal.has_text_selection());
+            assert!(!session.transcript_canvas.following());
+            session.note_cli_keyboard_input(b"\x14", false);
+            session.note_cli_keyboard_input(b"", true);
             session.refresh();
-            assert_eq!(session.projection.scroll_offset(), 0);
-            assert!(session.transcript_canvas.following());
+            assert!(session.terminal.has_text_selection());
+            assert!(!session.transcript_canvas.following());
+            // Mouse/protocol traffic never invokes the application-key transition.
+            assert!(session.write_pty(b"\x1b[<64;1;1M"));
+            session.refresh();
+            assert!(session.terminal.has_text_selection());
+            session.set_scroll_offset(8);
+            assert!(session.projection.scroll_offset() > 0);
+            for key in [b"\x14".as_slice(), b"q".as_slice()] {
+                let admitted = session.write_pty(key);
+                assert!(admitted);
+                session.note_cli_keyboard_input(key, admitted);
+                session.refresh();
+                assert!(!session.terminal.has_text_selection());
+                assert!(session.transcript_canvas.following());
+                assert_eq!(session.terminal.scroll_offset, 0);
+                assert_eq!(session.projection.scroll_offset(), 0);
+                session.terminal.process_input(
+                    b"\x1b[?2026h\x1b[H\x1b[2Jnew native view\r\nactive prompt\x1b[?2026l",
+                );
+                session.refresh();
+                assert_eq!(session.projection.scroll_offset(), 0);
+                assert!(session.transcript_canvas.following());
+            }
         }
     }
 
@@ -42547,6 +42890,7 @@ mod tests {
             tracker.update(caret_test_press(0, 7), 7, view.key(), false);
             tracker.update(
                 MouseInput::Wheel {
+                alt: false,
                     row: 0,
                     col: 7,
                     up: true,
@@ -42554,6 +42898,7 @@ mod tests {
                     shift: false,
                     lines: 1,
                     app_eligible: false,
+                    alternate_generation: None,
                 },
                 7,
                 view.key(),
@@ -42828,10 +43173,12 @@ mod tests {
                         row: 0,
                         col: 2,
                         up: true,
+                        alt: false,
                         ctrl: false,
                         shift: false,
                         lines: 1,
                         app_eligible: false,
+                        alternate_generation: None,
                     },
                     7,
                     before.key(),

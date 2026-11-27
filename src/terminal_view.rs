@@ -282,6 +282,7 @@ pub enum MouseInput {
         col: usize,
         row: usize,
         up: bool,
+        alt: bool,
         ctrl: bool,
         shift: bool,
         /// Number of whole lines this event scrolls (≥1).
@@ -289,6 +290,8 @@ pub enum MouseInput {
         /// Wheel is over real live/active grid cells (not padding, scrollbar,
         /// or finalized history) and is therefore eligible for app reporting.
         app_eligible: bool,
+        /// Exact arrow-profile authority for an alternate-scroll wheel event.
+        alternate_generation: Option<u64>,
     },
     /// Drag/jump the scrollbar to an absolute scrollback offset
     /// (0 = bottom/live view).
@@ -561,6 +564,34 @@ struct BlockCardSegment {
     selection_active: bool,
     stripe: Option<Color>,
     stripe_strong: bool,
+}
+
+pub(crate) const MAX_APP_WHEEL_LINES: usize = 64;
+
+fn alternate_wheel_generation(
+    generation: Option<u64>,
+    shift: bool,
+    ctrl: bool,
+    app_eligible: bool,
+) -> Option<u64> {
+    if shift || ctrl || !app_eligible {
+        None
+    } else {
+        generation
+    }
+}
+
+fn accumulated_app_wheel(accum: &mut f32, dy: f32) -> Option<(bool, usize)> {
+    if !dy.is_finite() || dy == 0.0 {
+        return None;
+    }
+    if !accum.is_finite() || (*accum != 0.0 && (dy > 0.0) != (*accum > 0.0)) {
+        *accum = 0.0;
+    }
+    *accum += dy.clamp(-(MAX_APP_WHEEL_LINES as f32), MAX_APP_WHEEL_LINES as f32);
+    let whole = accum.trunc();
+    *accum -= whole;
+    (whole != 0.0).then_some((whole > 0.0, whole.abs() as usize))
 }
 
 /// Collect visible cards in O(visible rows). The app has already mapped block
@@ -873,6 +904,9 @@ struct State {
     /// Fractional wheel lines not yet consumed, so sub-line trackpad pixel
     /// deltas accumulate into whole-line scrolls instead of being lost.
     scroll_accum: f32,
+    alternate_generation: Option<u64>,
+    wheel_modifiers: Option<iced::keyboard::Modifiers>,
+    wheel_alt: Option<bool>,
     summary_press: Option<SummaryPress>,
     header_drag_press: Option<(MouseInput, ProjectionKey)>,
     link_press: Option<(MouseInput, Option<crate::link::Link>)>,
@@ -924,6 +958,9 @@ impl Default for State {
             last_click: None,
             click_count: 0,
             scroll_accum: 0.0,
+            alternate_generation: None,
+            wheel_modifiers: None,
+            wheel_alt: None,
             summary_press: None,
             header_drag_press: None,
             link_press: None,
@@ -949,6 +986,20 @@ impl State {
             self.click_count = 0;
         }
         true
+    }
+
+    fn sync_app_wheel_alt(&mut self, alt: Option<bool>) {
+        if self.wheel_alt != alt {
+            self.scroll_accum = 0.0;
+            self.wheel_alt = alt;
+        }
+    }
+
+    fn sync_alternate_generation(&mut self, generation: Option<u64>) {
+        if self.alternate_generation != generation {
+            self.scroll_accum = 0.0;
+            self.alternate_generation = generation;
+        }
     }
 
     /// Focus loss can swallow the release that ends a gesture. Retire every
@@ -1049,6 +1100,8 @@ pub struct TermWidget<'a, Message> {
     canvas_position: Option<f64>,
     canvas_animating: bool,
     canvas_app_mouse: bool,
+    app_wheel_reporting: bool,
+    alternate_generation: Option<u64>,
     on_canvas_scroll: Option<Box<dyn Fn(f64, bool) -> Message + 'a>>,
     on_canvas_pause: Option<Box<dyn Fn() -> Message + 'a>>,
     mode_epoch: u64,
@@ -1182,6 +1235,8 @@ impl<'a, Message> TermWidget<'a, Message> {
             canvas_position: None,
             canvas_animating: false,
             canvas_app_mouse: false,
+            app_wheel_reporting: false,
+            alternate_generation: None,
             on_canvas_scroll: None,
             on_canvas_pause: None,
             shared_shell: false,
@@ -1764,6 +1819,16 @@ impl<'a, Message> TermWidget<'a, Message> {
                 .and_then(|(_, toggle)| toggle.intersection(&clip))
                 .is_some_and(|toggle| toggle.contains(position))
         })
+    }
+
+    pub(crate) fn alternate_scroll_generation(mut self, generation: Option<u64>) -> Self {
+        self.alternate_generation = generation;
+        self
+    }
+
+    pub(crate) fn application_wheel_reporting(mut self, reporting: bool) -> Self {
+        self.app_wheel_reporting = reporting;
+        self
     }
 
     pub fn app_mouse_full_grid(mut self, full_grid: bool) -> Self {
@@ -5708,6 +5773,11 @@ where
         if tree.state.downcast_mut::<State>().reset_on_unfocused(event) {
             return;
         }
+        if let Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) = event {
+            let state = tree.state.downcast_mut::<State>();
+            state.wheel_modifiers = Some(*modifiers);
+            state.sync_app_wheel_alt((self.app_wheel_reporting && !modifiers.shift() && !modifiers.control()).then_some(modifiers.alt()));
+        }
         if !self.projection_available {
             // Keep IME input usable without positioning it at a guessed terminal
             // cell. This is a fixed host surface, not content-derived geometry.
@@ -6360,6 +6430,8 @@ where
                 shell.publish(on_mouse(MouseInput::Release { col, row, button }));
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                let (shift, ctrl, alt) = tree.state.downcast_ref::<State>().wheel_modifiers
+                    .map_or((self.shift,self.ctrl,self.alt), |mods| (mods.shift(),mods.control(),mods.alt()));
                 let Some(pos) = cursor.position_over(bounds) else {
                     return;
                 };
@@ -6395,7 +6467,11 @@ where
                     self.app_mouse_full_grid,
                     block_row.is_some_and(|block| block.app_eligible),
                 );
-                if !self.ctrl && !(self.canvas_app_mouse && app_eligible && !self.shift) {
+                tree.state.downcast_mut::<State>().sync_app_wheel_alt(
+                    (self.app_wheel_reporting && app_eligible && !shift && !ctrl).then_some(alt));
+                let alternate_generation = alternate_wheel_generation(self.alternate_generation, shift, ctrl, app_eligible);
+                tree.state.downcast_mut::<State>().sync_alternate_generation(alternate_generation);
+                if !ctrl && !(self.canvas_app_mouse && app_eligible && !shift) {
                     if let Some(scroll) = &self.on_canvas_scroll {
                         tree.state.downcast_mut::<State>().scroll_accum = 0.0;
                         shell.publish(scroll(f64::from(dy), precise));
@@ -6407,24 +6483,20 @@ where
                 // Alternate-screen/mouse-reporting applications keep their
                 // terminal protocol's whole-line wheel reports.
                 let state = tree.state.downcast_mut::<State>();
-                if state.scroll_accum != 0.0 && (dy > 0.0) != (state.scroll_accum > 0.0) {
-                    state.scroll_accum = 0.0;
-                }
-                state.scroll_accum += dy;
-                let whole = state.scroll_accum.trunc();
-                if whole == 0.0 {
+                let Some((up, lines)) = accumulated_app_wheel(&mut state.scroll_accum, dy) else {
                     shell.capture_event();
                     return;
-                }
-                state.scroll_accum -= whole;
+                };
                 shell.publish(on_mouse(MouseInput::Wheel {
                     col,
                     row,
-                    up: whole > 0.0,
-                    ctrl: self.ctrl,
-                    shift: self.shift,
-                    lines: whole.abs() as usize,
+                    up,
+                    alt,
+                    ctrl,
+                    shift,
+                    lines,
                     app_eligible,
+                    alternate_generation,
                 }));
                 shell.capture_event();
             }
@@ -6591,6 +6663,9 @@ mod focus_state_tests {
             last_click: Some((Instant::now(), 3, 2)),
             click_count: 3,
             scroll_accum: 0.75,
+            alternate_generation: Some(1),
+            wheel_modifiers: Some(iced::keyboard::Modifiers::ALT),
+            wheel_alt: Some(true),
             summary_press: None,
             header_drag_press: None,
             link_press: None,
@@ -6607,6 +6682,7 @@ mod focus_state_tests {
         assert!(state.last_click.is_none());
         assert_eq!(state.click_count, 0);
         assert_eq!(state.scroll_accum, 0.0);
+        assert!(state.wheel_modifiers.is_none() && state.wheel_alt.is_none());
         assert!(state.summary_press.is_none());
         assert!(state.reset_on_unfocused(&Event::Window(iced::window::Event::Unfocused)));
         for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
@@ -8437,5 +8513,74 @@ mod chat_capsule_geometry_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod alternate_wheel_tests {
+    use super::*;
+    #[test]
+    fn bounded_app_wheel_reuses_fraction_and_retires_only_route_boundaries() {
+        let mut state = State::default();
+        state.sync_alternate_generation(Some(1));
+        assert_eq!(accumulated_app_wheel(&mut state.scroll_accum, 0.6), None);
+        state.sync_alternate_generation(Some(1));
+        assert!((state.scroll_accum - 0.6).abs() < 0.001);
+        assert_eq!(
+            accumulated_app_wheel(&mut state.scroll_accum, 0.6),
+            Some((true, 1))
+        );
+        state.sync_alternate_generation(Some(2));
+        assert_eq!(state.scroll_accum, 0.0);
+        assert_eq!(
+            accumulated_app_wheel(&mut state.scroll_accum, f32::MAX),
+            Some((true, 64))
+        );
+        assert_eq!(
+            accumulated_app_wheel(&mut state.scroll_accum, -f32::MAX),
+            Some((false, 64))
+        );
+        assert!(state.scroll_accum.is_finite());
+        state.scroll_accum = 0.75;
+        let local = alternate_wheel_generation(Some(2), true, false, true);
+        assert_eq!(local, None);
+        state.sync_alternate_generation(local);
+        assert_eq!(state.scroll_accum, 0.0);
+        accumulated_app_wheel(&mut state.scroll_accum, 0.75);
+        state.sync_alternate_generation(alternate_wheel_generation(Some(2), false, false, true));
+        assert_eq!(state.scroll_accum, 0.0);
+        assert_eq!(alternate_wheel_generation(Some(2), false, true, true), None);
+        assert_eq!(
+            alternate_wheel_generation(Some(2), false, false, false),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod forwarded_wheel_modifier_tests {
+    use super::*;
+    #[test]
+    fn alt_binding_changes_retire_only_fractional_reports() {
+        let mut state = State::default();
+        for alt in [false, true, false] {
+            state.sync_app_wheel_alt(Some(alt));
+            assert_eq!(accumulated_app_wheel(&mut state.scroll_accum, 0.6), None);
+        }
+        state.sync_app_wheel_alt(Some(true));
+        assert_eq!(accumulated_app_wheel(&mut state.scroll_accum, 0.6), None);
+        assert_eq!(
+            accumulated_app_wheel(&mut state.scroll_accum, 0.5),
+            Some((true, 1))
+        );
+        state.sync_app_wheel_alt(None);
+        assert_eq!(state.scroll_accum, 0.0);
+        // An alternate-scroll route has no Alt mouse binding to change.
+        state.scroll_accum = 0.6;
+        state.sync_app_wheel_alt(None);
+        assert_eq!(
+            accumulated_app_wheel(&mut state.scroll_accum, 0.5),
+            Some((true, 1))
+        );
     }
 }
