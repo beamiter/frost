@@ -1,0 +1,82 @@
+{
+  "682": {
+    "collapsed_projection_cells": {
+      "bytes": 36579,
+      "fnv1a64": "5b77a1c99ba636eb"
+    },
+    "cursor": "(0, 20, Block, false, Some('Z'))",
+    "grid_cells": {
+      "bytes": 36579,
+      "fnv1a64": "5b77a1c99ba636eb"
+    },
+    "grid_text": "[\"mAmBC            ilZ    \", \"                        \", \"                        \", \"                        \", \"                        \", \"                        \"]",
+    "identity_projection_cells": {
+      "bytes": 36579,
+      "fnv1a64": "5b77a1c99ba636eb"
+    }
+  },
+  "737": {
+    "collapsed_projection_cells": {
+      "bytes": 36582,
+      "fnv1a64": "b806878813d170ce"
+    },
+    "cursor": "(0, 18, Block, false, Some('i'))",
+    "grid_cells": {
+      "bytes": 36582,
+      "fnv1a64": "b806878813d170ce"
+    },
+    "grid_text": "[\"mAmBC            i      \", \"                        \", \"                        \", \"                        \", \"                        \", \"                        \"]",
+    "identity_projection_cells": {
+      "bytes": 36582,
+      "fnv1a64": "b806878813d170ce"
+    }
+  },
+  "738": {
+    "collapsed_projection_cells": {
+      "bytes": 36579,
+      "fnv1a64": "b584ba75198e4359"
+    },
+    "cursor": "(0, 19, Block, false, Some('l'))",
+    "grid_cells": {
+      "bytes": 36579,
+      "fnv1a64": "b584ba75198e4359"
+    },
+    "grid_text": "[\"mAmBC            il     \", \"                        \", \"                        \", \"                        \", \"                        \", \"                        \"]",
+    "identity_projection_cells": {
+      "bytes": 36579,
+      "fnv1a64": "b584ba75198e4359"
+    }
+  },
+  "739": {
+    "collapsed_projection_cells": {
+      "bytes": 36579,
+      "fnv1a64": "b584ba75198e4359"
+    },
+    "cursor": "(0, 19, Block, false, Some('l'))",
+    "grid_cells": {
+      "bytes": 36579,
+      "fnv1a64": "b584ba75198e4359"
+    },
+    "grid_text": "[\"mAmBC            il     \", \"                        \", \"                        \", \"                        \", \"                        \", \"                        \"]",
+    "identity_projection_cells": {
+      "bytes": 36579,
+      "fnv1a64": "b584ba75198e4359"
+    }
+  },
+  "740": {
+    "collapsed_projection_cells": {
+      "bytes": 36579,
+      "fnv1a64": "5b77a1c99ba636eb"
+    },
+    "cursor": "(0, 20, Block, false, Some('Z'))",
+    "grid_cells": {
+      "bytes": 36579,
+      "fnv1a64": "5b77a1c99ba636eb"
+    },
+    "grid_text": "[\"mAmBC            ilZ    \", \"                        \", \"                        \", \"                        \", \"                        \", \"                        \"]",
+    "identity_projection_cells": {
+      "bytes": 36579,
+      "fnv1a64": "5b77a1c99ba636eb"
+    }
+  }
+}

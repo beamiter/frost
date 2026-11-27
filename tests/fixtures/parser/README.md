@@ -55,6 +55,22 @@ handles are excluded. Only active UTF-8 bytes and expected length are recorded,
 not inactive buffer padding or stale expected length. Terminal dimensions are
 24 columns by 6 rows, with 32 retained scrollback rows to bound overflow cases.
 
+## Resumed horizontal positioning
+
+The shared VTE recognizes HPR after the legacy scanner resumes `CSI 12 a`
+in two partitions of `csi_cancel`. The test exercises the original bytes
+and verifies the resulting cursor and cell changes using
+`frost-resumed-hpr-reference.json`. It reads the remaining state expectations
+from the original fixture.
+
+The five reference snapshots come from pre-extraction Frost revision
+`4c1196f57249ca6b3f82b7837e4db97c03b4361e` replaying those partitions with
+`CSI 12 C` as the equivalent forward movement. For the cell fingerprints,
+the replay encodes the unset protection flag as `false` and the zero
+hyperlink key as `HyperlinkId(0)`. Replaying the original byte `a` in that
+reference reproduced the frozen cursor, grid and projection expectations
+for both partitions before sampling the movement.
+
 ## Corpus
 
 The 52 short cases cover every two-way cut and selected multipart partitions
@@ -83,17 +99,10 @@ partitions and oversized APC replies in direct versus fragmented delivery.
 
 ## Focused validation
 
-Use the existing validation mirror, whose `src` and `tests` point at this real
-checkout. The local `jterm_core` override is only a validation transport:
+Run the comparison from the Frost checkout.
 
 ```sh
-export CARGO_HOME=/workspace/scratch/9226dcee068a/.cargo-task
-export RUSTUP_HOME=/workspace/scratch/9226dcee068a/.rustup-task
-export PATH="$CARGO_HOME/bin:$PATH"
-cargo test \
-  --config 'patch."https://github.com/beamiter/jterm_core.git".jterm_core.path="/workspace/shared/four-terminals-validation/jterm_core"' \
-  --manifest-path /workspace/shared/four-terminals-validation/frost/Cargo.toml \
-  --locked --bin frost parser_oracle -- --test-threads=1
+cargo test --locked --bin frost historical_legacy_parser_oracle_original_scanner -- --test-threads=1
 ```
 
 The original capture passed in 11.36 seconds and normal comparison in 12.34

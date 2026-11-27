@@ -643,6 +643,14 @@ fn historical_legacy_parser_oracle_original_scanner() {
             actual["inputs"], expected["inputs"],
             "oracle corpus changed"
         );
+        // The shared VTE added HPR in f523f9a. For the snapshots after a
+        // carried CSI 12 a completes, use the pre-extraction Frost replay
+        // with the equivalent CSI 12 C for the cursor and affected cells.
+        let mut hpr_states: BTreeMap<usize, BTreeMap<String, Value>> = serde_json::from_str(
+            include_str!("../../tests/fixtures/parser/frost-resumed-hpr-reference.json"),
+        )
+        .unwrap();
+        assert_eq!(hpr_states.len(), 5);
         let a = actual["records"].as_array().unwrap();
         let b = expected["records"].as_array().unwrap();
         assert_eq!(a.len(), b.len());
@@ -660,13 +668,32 @@ fn historical_legacy_parser_oracle_original_scanner() {
                 .zip(b["states"].as_array().unwrap())
                 .enumerate()
             {
+                let original_id = bi.as_u64().unwrap() as usize;
                 let actual = &actual["snapshots"][ai.as_u64().unwrap() as usize];
-                let expected = &expected["snapshots"][bi.as_u64().unwrap() as usize];
+                let expected = &expected["snapshots"][original_id];
+                let hpr = hpr_states.remove(&original_id);
+                if let Some(hpr) = &hpr {
+                    assert_eq!(a["case"], "csi_cancel");
+                    assert_eq!(
+                        hpr.keys().map(String::as_str).collect::<Vec<_>>(),
+                        [
+                            "collapsed_projection_cells",
+                            "cursor",
+                            "grid_cells",
+                            "grid_text",
+                            "identity_projection_cells",
+                        ]
+                    );
+                }
                 assert_eq!(
                     actual.as_object().unwrap().keys().collect::<Vec<_>>(),
                     expected.as_object().unwrap().keys().collect::<Vec<_>>()
                 );
                 for (lane, want) in expected.as_object().unwrap() {
+                    let want = hpr
+                        .as_ref()
+                        .and_then(|state| state.get(lane))
+                        .unwrap_or(want);
                     assert_eq!(
                         &actual[lane], want,
                         "case {} ends {} feed {} lane {}",
@@ -675,5 +702,6 @@ fn historical_legacy_parser_oracle_original_scanner() {
                 }
             }
         }
+        assert!(hpr_states.is_empty(), "unused resumed HPR expectations");
     }
 }
