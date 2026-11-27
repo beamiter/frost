@@ -5508,7 +5508,7 @@ impl TerminalState {
         // a clear operation.
         let mut stashed_grid_rows = self.scrollback.empty_sibling();
         for row in 0..completed_grid_rows {
-            if !stashed_grid_rows.push_back(self.vt.screen.grid.archive_frost_legacy_row(row)) {
+            if !stashed_grid_rows.push_back(self.vt.screen.archive_frost_legacy_row(row)) {
                 return 0;
             }
         }
@@ -6711,7 +6711,7 @@ impl TerminalState {
         let scrollback_line = (direction == RegionDirection::Up
             && top == 0
             && (!self.vt.screen.use_alt_buffer || allow_alt_scrollback))
-            .then(|| self.vt.screen.grid.archive_frost_legacy_row(top));
+            .then(|| self.vt.screen.archive_frost_legacy_row(top));
 
         let Some(effect) = self.vt.screen.scroll_region_one(
             direction,
