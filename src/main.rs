@@ -37126,6 +37126,30 @@ fn keypad_position(
     Some((keypad, num_locked))
 }
 
+fn keypad_logical_key(key: &keyboard::Key) -> jterm_engine::input::Key {
+    use jterm_engine::input::Key as Logical;
+    use keyboard::{key::Named, Key};
+
+    match key {
+        Key::Named(Named::ArrowLeft) => Logical::ArrowLeft,
+        Key::Named(Named::ArrowRight) => Logical::ArrowRight,
+        Key::Named(Named::ArrowUp) => Logical::ArrowUp,
+        Key::Named(Named::ArrowDown) => Logical::ArrowDown,
+        Key::Named(Named::PageUp) => Logical::PageUp,
+        Key::Named(Named::PageDown) => Logical::PageDown,
+        Key::Named(Named::Home) => Logical::Home,
+        Key::Named(Named::End) => Logical::End,
+        Key::Named(Named::Insert) => Logical::Insert,
+        Key::Named(Named::Delete) => Logical::Delete,
+        Key::Named(Named::Enter) => Logical::Enter,
+        Key::Character(value) => value
+            .chars()
+            .next()
+            .map_or(Logical::Unidentified, Logical::Character),
+        _ => Logical::Unidentified,
+    }
+}
+
 fn encode_key_input(
     key: &keyboard::Key,
     mods: keyboard::Modifiers,
@@ -37134,13 +37158,36 @@ fn encode_key_input(
     enh: KeyboardEnhancements,
     keypad: Option<(jterm_engine::input::KeypadKey, bool)>,
 ) -> Option<Vec<u8>> {
-    use jterm_engine::input::{keypad_begin_sequence, KeypadKey, Modifiers};
+    use jterm_engine::input::{encode_kitty_keypad_press, keypad_begin_sequence, KeypadKey, Modifiers};
     use keyboard::key::Named;
     use keyboard::Key;
 
     let ctrl = mods.control();
     let alt = mods.alt();
+    let wire_modifiers = Modifiers {
+        shift: mods.shift(),
+        alt,
+        ctrl,
+        super_key: mods.logo(),
+    };
 
+    if let Some((position, num_locked)) = keypad.filter(|_| enh.kitty_flags & 0b1001 != 0) {
+        let associated = if enh.kitty_flags & 0b11000 == 0b11000 {
+            text.and_then(kitty_committed_text)
+        } else {
+            None
+        };
+        if let Some(report) = encode_kitty_keypad_press(
+            position,
+            keypad_logical_key(key),
+            wire_modifiers,
+            num_locked,
+            enh.kitty_flags,
+            associated.as_deref(),
+        ) {
+            return Some(report);
+        }
+    }
     // Enhanced keyboard protocols (Kitty / xterm modifyOtherKeys) take
     // precedence when an app has enabled them. Unlike ember/egui, iced puts
     // committed text on this same key event; there is no second text event to
@@ -37175,14 +37222,7 @@ fn encode_key_input(
                 || (matches!(key, Key::Unidentified) && text.is_none()))
         {
             return Some(
-                keypad_begin_sequence(Modifiers {
-                    shift: mods.shift(),
-                    alt,
-                    ctrl,
-                    super_key: mods.logo(),
-                })
-                .into_owned()
-                .into_bytes(),
+                keypad_begin_sequence(wire_modifiers).into_owned().into_bytes(),
             );
         }
     }
@@ -37411,6 +37451,17 @@ fn keyboard_modifier_value(mods: keyboard::Modifiers) -> u8 {
     bits + 1
 }
 
+fn kitty_committed_text(text: &str) -> Option<String> {
+    let cleaned: String = text
+        .chars()
+        .filter(|character| {
+            !character.is_control()
+                && !jterm_core::review_input::is_visual_spoofing_character(*character)
+        })
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
 /// Encode a key press as a Kitty keyboard protocol report (`CSI codepoint;mod u`)
 /// when the app has enabled disambiguation or report-all-keys. Returns `None`
 /// when the protocol is inactive or the key needs no special report.
@@ -37448,20 +37499,7 @@ fn kitty_encode_key(
     // travel in the fields the app asked for: the alternate-key field (flag 4)
     // and/or the associated-text field (flag 16). Without them an app in
     // report-all-keys mode has to derive the case itself.
-    let committed: Option<String> = text.and_then(|t| {
-        let cleaned: String = t
-            .chars()
-            .filter(|character| {
-                !character.is_control()
-                    && !jterm_core::review_input::is_visual_spoofing_character(*character)
-            })
-            .collect();
-        if cleaned.is_empty() {
-            None
-        } else {
-            Some(cleaned)
-        }
-    });
+    let committed = text.and_then(kitty_committed_text);
     let mut key_field = codepoint.to_string();
     if report_alternate_keys && mods.shift() {
         if let Some(shifted) = committed
@@ -46031,6 +46069,58 @@ expect(b'.')
                 Some(false),
             ),
             b"\x1b[E"
+        );
+    }
+
+    #[test]
+    fn kitty_keypad_reports_take_precedence_over_legacy_keypad_mode() {
+        use jterm_engine::input::KeypadKey;
+        use keyboard::{key::Named, Key, Modifiers};
+
+        let mut terminal = TerminalState::new(12, 3);
+        terminal.process_input(b"\x1b=\x1b[>1u");
+        let encode = |terminal: &TerminalState, key, text, keypad| {
+            encode_key_input(
+                &key,
+                Modifiers::NONE,
+                text,
+                terminal.is_application_cursor_keys(),
+                KeyboardEnhancements::from_terminal(terminal),
+                keypad,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            encode(&terminal, Key::Named(Named::Enter), Some("\r"), None),
+            b"\r"
+        );
+        assert_eq!(
+            encode(
+                &terminal,
+                Key::Named(Named::Enter),
+                Some("\r"),
+                Some((KeypadKey::Enter, false)),
+            ),
+            b"\x1b[57414u"
+        );
+        assert_eq!(
+            encode(
+                &terminal,
+                Key::Character("7".into()),
+                Some("7"),
+                Some((KeypadKey::Digit(7), true)),
+            ),
+            b"7"
+        );
+        terminal.process_input(b"\x1b[=24u");
+        assert_eq!(
+            encode(
+                &terminal,
+                Key::Character("7".into()),
+                Some("7\u{202e}"),
+                Some((KeypadKey::Digit(7), true)),
+            ),
+            b"\x1b[57406;129;55u"
         );
     }
 
