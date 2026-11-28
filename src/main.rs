@@ -37126,23 +37126,47 @@ fn keypad_position(
     Some((keypad, num_locked))
 }
 
+fn terminal_named_key(named: &keyboard::key::Named) -> jterm_engine::input::Key {
+    use jterm_engine::input::Key;
+    use keyboard::key::Named;
+
+    match named {
+        Named::ArrowLeft => Key::ArrowLeft,
+        Named::ArrowRight => Key::ArrowRight,
+        Named::ArrowUp => Key::ArrowUp,
+        Named::ArrowDown => Key::ArrowDown,
+        Named::PageUp => Key::PageUp,
+        Named::PageDown => Key::PageDown,
+        Named::Home => Key::Home,
+        Named::End => Key::End,
+        Named::Insert => Key::Insert,
+        Named::Delete => Key::Delete,
+        Named::Enter => Key::Enter,
+        Named::Tab => Key::Tab,
+        Named::Backspace => Key::Backspace,
+        Named::Escape => Key::Escape,
+        Named::F1 => Key::F1,
+        Named::F2 => Key::F2,
+        Named::F3 => Key::F3,
+        Named::F4 => Key::F4,
+        Named::F5 => Key::F5,
+        Named::F6 => Key::F6,
+        Named::F7 => Key::F7,
+        Named::F8 => Key::F8,
+        Named::F9 => Key::F9,
+        Named::F10 => Key::F10,
+        Named::F11 => Key::F11,
+        Named::F12 => Key::F12,
+        _ => Key::Unidentified,
+    }
+}
+
 fn keypad_logical_key(key: &keyboard::Key) -> jterm_engine::input::Key {
     use jterm_engine::input::Key as Logical;
-    use keyboard::{key::Named, Key};
 
     match key {
-        Key::Named(Named::ArrowLeft) => Logical::ArrowLeft,
-        Key::Named(Named::ArrowRight) => Logical::ArrowRight,
-        Key::Named(Named::ArrowUp) => Logical::ArrowUp,
-        Key::Named(Named::ArrowDown) => Logical::ArrowDown,
-        Key::Named(Named::PageUp) => Logical::PageUp,
-        Key::Named(Named::PageDown) => Logical::PageDown,
-        Key::Named(Named::Home) => Logical::Home,
-        Key::Named(Named::End) => Logical::End,
-        Key::Named(Named::Insert) => Logical::Insert,
-        Key::Named(Named::Delete) => Logical::Delete,
-        Key::Named(Named::Enter) => Logical::Enter,
-        Key::Character(value) => value
+        keyboard::Key::Named(named) => terminal_named_key(named),
+        keyboard::Key::Character(value) => value
             .chars()
             .next()
             .map_or(Logical::Unidentified, Logical::Character),
@@ -37158,7 +37182,10 @@ fn encode_key_input(
     enh: KeyboardEnhancements,
     keypad: Option<(jterm_engine::input::KeypadKey, bool)>,
 ) -> Option<Vec<u8>> {
-    use jterm_engine::input::{encode_kitty_keypad_press, keypad_begin_sequence, KeypadKey, Modifiers};
+    use jterm_engine::input::{
+        encode_kitty_keypad_press, encode_kitty_named_press, keypad_begin_sequence,
+        legacy_function_key_sequence, KeypadKey, Modifiers,
+    };
     use keyboard::key::Named;
     use keyboard::Key;
 
@@ -37186,6 +37213,15 @@ fn encode_key_input(
             associated.as_deref(),
         ) {
             return Some(report);
+        }
+    }
+    if enh.kitty_flags & 0b1001 != 0 {
+        if let Key::Named(named) = key {
+            if let Some(report) =
+                encode_kitty_named_press(terminal_named_key(named), wire_modifiers, enh.kitty_flags)
+            {
+                return Some(report);
+            }
         }
     }
     // Enhanced keyboard protocols (Kitty / xterm modifyOtherKeys) take
@@ -37256,11 +37292,11 @@ fn encode_key_input(
                 Named::Space => vec![if ctrl { 0x00 } else { b' ' }],
                 _ => {
                     return legacy_function_key_sequence(
-                        named,
-                        mods,
+                        terminal_named_key(named),
+                        wire_modifiers,
                         app_cursor,
-                        enh.report_all_keys,
-                    );
+                    )
+                    .map(|sequence| sequence.as_bytes().to_vec());
                 }
             };
             if alt {
@@ -37310,73 +37346,6 @@ fn encode_key_input(
         }
         Key::Unidentified => text.map(|t| t.as_bytes().to_vec()),
     }
-}
-
-/// Encode the legacy xterm/terminfo functional-key family. Modified cursor,
-/// editing, and function keys carry a parameter instead of losing Ctrl/Shift
-/// or being represented as an ambiguous ESC prefix.
-fn legacy_function_key_sequence(
-    named: &keyboard::key::Named,
-    mods: keyboard::Modifiers,
-    app_cursor: bool,
-    force_modifier: bool,
-) -> Option<Vec<u8>> {
-    use keyboard::key::Named;
-
-    let csi = |body: &str| format!("\x1b[{body}").into_bytes();
-    let ss3 = |final_byte: char| format!("\x1bO{final_byte}").into_bytes();
-    let has_modifier = mods.shift() || mods.alt() || mods.control() || mods.logo();
-    let modified = force_modifier || has_modifier;
-    let modifier = keyboard_modifier_value(mods);
-    let cursor = |final_byte: char| {
-        if modified {
-            csi(&format!("1;{modifier}{final_byte}"))
-        } else if app_cursor {
-            ss3(final_byte)
-        } else {
-            csi(&final_byte.to_string())
-        }
-    };
-    let tilde = |code: u8| {
-        if modified {
-            csi(&format!("{code};{modifier}~"))
-        } else {
-            csi(&format!("{code}~"))
-        }
-    };
-    let function = |final_byte: char| {
-        if modified {
-            csi(&format!("1;{modifier}{final_byte}"))
-        } else {
-            ss3(final_byte)
-        }
-    };
-
-    Some(match named {
-        Named::ArrowUp => cursor('A'),
-        Named::ArrowDown => cursor('B'),
-        Named::ArrowRight => cursor('C'),
-        Named::ArrowLeft => cursor('D'),
-        Named::Home => cursor('H'),
-        Named::End => cursor('F'),
-        Named::PageUp => tilde(5),
-        Named::PageDown => tilde(6),
-        Named::Delete => tilde(3),
-        Named::Insert => tilde(2),
-        Named::F1 => function('P'),
-        Named::F2 => function('Q'),
-        Named::F3 => function('R'),
-        Named::F4 => function('S'),
-        Named::F5 => tilde(15),
-        Named::F6 => tilde(17),
-        Named::F7 => tilde(18),
-        Named::F8 => tilde(19),
-        Named::F9 => tilde(20),
-        Named::F10 => tilde(21),
-        Named::F11 => tilde(23),
-        Named::F12 => tilde(24),
-        _ => return None,
-    })
 }
 
 /// The base Unicode codepoint a key reports under the Kitty keyboard protocol.
@@ -37478,20 +37447,13 @@ fn kitty_encode_key(
     if !disambiguate && !report_all_keys {
         return None;
     }
-    let codepoint = kitty_text_key_code(key)?;
-    let legacy_c0_exception = matches!(
-        key,
-        keyboard::Key::Named(
-            keyboard::key::Named::Enter
-                | keyboard::key::Named::Tab
-                | keyboard::key::Named::Backspace
-        )
-    );
-    if legacy_c0_exception && !report_all_keys {
-        return None;
-    }
-    let is_escape = matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape));
-    let should_encode = report_all_keys || is_escape || mods.control() || mods.alt() || mods.logo();
+    let codepoint = match key {
+        keyboard::Key::Character(_) | keyboard::Key::Named(keyboard::key::Named::Space) => {
+            kitty_text_key_code(key)?
+        }
+        _ => return None,
+    };
+    let should_encode = report_all_keys || mods.control() || mods.alt() || mods.logo();
     if !should_encode {
         return None;
     }
@@ -38606,7 +38568,7 @@ expect(b'\x1b[A'*64+b'\x1b[B')
 os.write(1,b'\x1b[?1hCURSOR')
 expect(b'\x1bOA')
 os.write(1,b'\x1b[=8uENHANCED')
-expect(b'\x1b[1;1B')
+expect(b'\x1b[B')
 os.write(1,b'\x1b[=0u\x1b[?1002;1006hTRACK')
 expect(b'\x1b[<64;2;2M')
 os.write(1,b'\x1b[?1002;1006l\x1b[?1007lOFF')
@@ -45619,11 +45581,12 @@ expect(b'.')
             None,
             true,
             KeyboardEnhancements {
+                kitty_flags: 8,
                 report_all_keys: true,
                 ..Default::default()
             },
         );
-        assert_eq!(report_all_arrow.as_deref(), Some(&b"\x1b[1;1A"[..]));
+        assert_eq!(report_all_arrow.as_deref(), Some(&b"\x1b[A"[..]));
     }
 
     #[test]
@@ -45684,7 +45647,7 @@ expect(b'.')
             false,
             report_all,
         );
-        assert_eq!(enter.as_deref(), Some(&b"\x1b[13;1u"[..]));
+        assert_eq!(enter.as_deref(), Some(&b"\x1b[13u"[..]));
 
         let disambiguate = KeyboardEnhancements {
             kitty_flags: 0b1,
@@ -45698,7 +45661,7 @@ expect(b'.')
             false,
             disambiguate,
         );
-        assert_eq!(escape.as_deref(), Some(&b"\x1b[27;1u"[..]));
+        assert_eq!(escape.as_deref(), Some(&b"\x1b[27u"[..]));
 
         let legacy_enter = encode_key(
             &keyboard::Key::Named(Named::Enter),
@@ -46070,6 +46033,39 @@ expect(b'.')
             ),
             b"\x1b[E"
         );
+    }
+
+    #[test]
+    fn kitty_named_keys_follow_negotiation_even_with_application_cursor_mode() {
+        use keyboard::key::Named;
+        use keyboard::{Key, Location, Modifiers};
+
+        let mut terminal = TerminalState::new(12, 3);
+        terminal.process_input(b"\x1b[?1h");
+        let encode = |terminal: &TerminalState, named, modifiers| {
+            encode_key(
+                &Key::Named(named),
+                Location::Standard,
+                modifiers,
+                None,
+                terminal.is_application_cursor_keys(),
+                KeyboardEnhancements::from_terminal(terminal),
+            )
+            .unwrap()
+        };
+        let plain = Modifiers::NONE;
+        assert_eq!(encode(&terminal, Named::F3, plain), b"\x1bOR");
+        assert_eq!(encode(&terminal, Named::ArrowUp, plain), b"\x1bOA");
+        terminal.process_input(b"\x1b[>1u");
+        assert_eq!(encode(&terminal, Named::F3, Modifiers::CTRL), b"\x1b[13;5~");
+        assert_eq!(encode(&terminal, Named::ArrowUp, plain), b"\x1b[A");
+        assert_eq!(encode(&terminal, Named::Enter, plain), b"\r");
+        terminal.process_input(b"\x1b[>8u");
+        assert_eq!(encode(&terminal, Named::Enter, plain), b"\x1b[13u");
+        assert_eq!(encode(&terminal, Named::Tab, plain), b"\x1b[9u");
+        assert_eq!(encode(&terminal, Named::Backspace, plain), b"\x1b[127u");
+        terminal.process_input(b"\x1b[<2u");
+        assert_eq!(encode(&terminal, Named::F3, plain), b"\x1bOR");
     }
 
     #[test]
