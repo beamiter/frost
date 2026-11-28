@@ -28,7 +28,7 @@
     "vendor/companion-protocol/src/strict_json.rs": "164ee7f85ea1922492afb845f2ec56311511a8950985546ed2785be8f98504a1",
     "vendor/companion-protocol/upstream-Cargo.toml": "89c06787e200d75685facc835f0bb000186549b1b35eb62768d876e10eea6428"
   },
-  "frontend_core_revision": "06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e",
+  "frontend_core_revision": "35515940985ff9d91305d8590765ed85d395f7bf",
   "public_companion_base": "9aa569540091524d637a7115b64c587b9177a55b",
   "public_core_base": "1e3d1f0bb0fa9b6463de12edb3e9faee66668c65",
   "schema": 1,
