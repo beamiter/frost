@@ -6784,13 +6784,7 @@ impl Session {
             keyboard::Modifiers::empty(),
             None,
             self.terminal.is_application_cursor_keys(),
-            KeyboardEnhancements {
-                kitty_flags: self.terminal.keyboard_enhancement_flags(),
-                modify_other_keys: self.terminal.xterm_modify_other_keys(),
-                format_other_keys: self.terminal.xterm_format_other_keys(),
-                report_all_keys: self.terminal.is_report_all_keys_enabled(),
-                application_keypad: self.terminal.is_application_keypad(),
-            },
+            KeyboardEnhancements::from_terminal(&self.terminal),
         )?;
         Some(bytes.repeat(lines.clamp(1, terminal_view::MAX_APP_WHEEL_LINES)))
     }
@@ -6884,13 +6878,7 @@ impl Session {
             modifiers,
             None,
             self.terminal.is_application_cursor_keys(),
-            KeyboardEnhancements {
-                kitty_flags: self.terminal.keyboard_enhancement_flags(),
-                modify_other_keys: self.terminal.xterm_modify_other_keys(),
-                format_other_keys: self.terminal.xterm_format_other_keys(),
-                report_all_keys: self.terminal.is_report_all_keys_enabled(),
-                application_keypad: self.terminal.is_application_keypad(),
-            },
+            KeyboardEnhancements::from_terminal(&self.terminal),
         )
     }
 
@@ -21301,13 +21289,7 @@ impl Frost {
                         return Task::none();
                     };
                     let app_cursor = sess.terminal.is_application_cursor_keys();
-                    let enh = KeyboardEnhancements {
-                        kitty_flags: sess.terminal.keyboard_enhancement_flags(),
-                        modify_other_keys: sess.terminal.xterm_modify_other_keys(),
-                        format_other_keys: sess.terminal.xterm_format_other_keys(),
-                        report_all_keys: sess.terminal.is_report_all_keys_enabled(),
-                        application_keypad: sess.terminal.is_application_keypad(),
-                    };
+                    let enh = KeyboardEnhancements::from_terminal(&sess.terminal);
                     if let Some(bytes) =
                         encode_key(&key, location, modifiers, text.as_deref(), app_cursor, enh)
                     {
@@ -37039,6 +37021,20 @@ struct KeyboardEnhancements {
     format_other_keys: u16,
     report_all_keys: bool,
     application_keypad: bool,
+    backarrow_mode: bool,
+}
+
+impl KeyboardEnhancements {
+    fn from_terminal(terminal: &TerminalState) -> Self {
+        Self {
+            kitty_flags: terminal.keyboard_enhancement_flags(),
+            modify_other_keys: terminal.xterm_modify_other_keys(),
+            format_other_keys: terminal.xterm_format_other_keys(),
+            report_all_keys: terminal.is_report_all_keys_enabled(),
+            application_keypad: terminal.is_application_keypad(),
+            backarrow_mode: terminal.backarrow_mode(),
+        }
+    }
 }
 
 /// Translate an iced key press into the bytes to send to the PTY.
@@ -37088,7 +37084,11 @@ fn encode_key(
                         vec![b'\r']
                     }
                 }
-                Named::Backspace => vec![if ctrl { 0x08 } else { 0x7f }],
+                Named::Backspace => {
+                    jterm_engine::input::legacy_backspace_sequence(enh.backarrow_mode, ctrl)
+                        .as_bytes()
+                        .to_vec()
+                }
                 Named::Tab => {
                     if mods.shift() {
                         csi("Z")
@@ -45654,13 +45654,7 @@ expect(b'.')
         terminal.process_input(b"\x1b[?2031h");
         assert!(!terminal.is_report_all_keys_enabled());
 
-        let enh = KeyboardEnhancements {
-            kitty_flags: terminal.keyboard_enhancement_flags(),
-            modify_other_keys: terminal.xterm_modify_other_keys(),
-            format_other_keys: terminal.xterm_format_other_keys(),
-            report_all_keys: terminal.is_report_all_keys_enabled(),
-            application_keypad: terminal.is_application_keypad(),
-        };
+        let enh = KeyboardEnhancements::from_terminal(&terminal);
 
         let shifted = encode_key(
             &keyboard::Key::Character("t".into()),
@@ -45766,6 +45760,36 @@ expect(b'.')
             },
         );
         assert_eq!(only_spoofing.as_deref(), Some(&b"\x1b[116;2u"[..]));
+    }
+
+    #[test]
+    fn backarrow_mode_reaches_the_native_key_encoder() {
+        let mut terminal = TerminalState::new(12, 3);
+        for (packet, backspace, control, report) in [
+            (b"\x1b[?67h", 8, 127, b"\x1b[?67;1$y"),
+            (b"\x1b[?67l", 127, 8, b"\x1b[?67;2$y"),
+        ] {
+            terminal.process_input(packet);
+            terminal.process_input(b"\x1b[?67$p");
+            assert_eq!(terminal.get_output(), report);
+            for (modifiers, expected) in [
+                (keyboard::Modifiers::default(), backspace),
+                (keyboard::Modifiers::CTRL, control),
+            ] {
+                assert_eq!(
+                    encode_key(
+                        &keyboard::Key::Named(Named::Backspace),
+                        keyboard::Location::Standard,
+                        modifiers,
+                        None,
+                        false,
+                        KeyboardEnhancements::from_terminal(&terminal),
+                    )
+                    .unwrap(),
+                    [expected],
+                );
+            }
+        }
     }
 
     #[test]
@@ -48442,6 +48466,7 @@ expect(b'.')
                                                     format_other_keys,
                                                     report_all_keys,
                                                     application_keypad,
+                                                    backarrow_mode: true,
                                                 },
                                             ),
                                             None

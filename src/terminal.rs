@@ -7581,6 +7581,10 @@ impl TerminalState {
         self.vt.protocol.modes().contains(&66)
     }
 
+    pub fn backarrow_mode(&self) -> bool {
+        self.vt.protocol.modes().contains(&67)
+    }
+
     pub fn keyboard_enhancement_flags(&self) -> u16 {
         self.vt.protocol.keyboard_enhancement_flags()
     }

@@ -2069,13 +2069,7 @@ impl Ide {
         }
         self.invalidate_input();
         if let Some(s) = &mut self.session {
-            let enhancements = KeyboardEnhancements {
-                kitty_flags: s.terminal.keyboard_enhancement_flags(),
-                modify_other_keys: s.terminal.xterm_modify_other_keys(),
-                format_other_keys: s.terminal.xterm_format_other_keys(),
-                report_all_keys: s.terminal.is_report_all_keys_enabled(),
-                application_keypad: s.terminal.is_application_keypad(),
-            };
+            let enhancements = KeyboardEnhancements::from_terminal(&s.terminal);
             if let Some(bytes) = super::encode_key(
                 &key,
                 location,
