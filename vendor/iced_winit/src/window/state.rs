@@ -20,6 +20,7 @@ where
     surface_version: u64,
     cursor_position: Option<winit::dpi::PhysicalPosition<f64>>,
     modifiers: winit::keyboard::ModifiersState,
+    native_modifier_sides: u8,
     theme: Option<P::Theme>,
     theme_mode: theme::Mode,
     default_theme: P::Theme,
@@ -76,6 +77,7 @@ where
             surface_version: 0,
             cursor_position: None,
             modifiers: winit::keyboard::ModifiersState::default(),
+            native_modifier_sides: 0,
             theme,
             theme_mode,
             default_theme,
@@ -117,6 +119,13 @@ where
 
     pub fn modifiers(&self) -> winit::keyboard::ModifiersState {
         self.modifiers
+    }
+
+    pub(crate) fn keyboard_metadata(
+        &mut self,
+        event: &WindowEvent,
+    ) -> Option<crate::futures::event::KeyboardMetadata> {
+        conversion::keyboard_metadata(event, self.modifiers, &mut self.native_modifier_sides)
     }
 
     pub fn theme(&self) -> &P::Theme {

@@ -26,9 +26,10 @@ unpolled, exceed the old 100-event limit, exercise mixed events, cancellation,
 aggregate budget saturation, and an oversized IME payload. Tests are run
 explicitly by Frost's test CI job.
 
-The interaction envelope also carries optional Num Lock state for a native
-keypad press. `event::listen_with_keypad` exposes the state with the original event
-and its capture status. Existing listeners keep their original callback shape.
+The interaction envelope carries keyboard metadata through the same ordered
+queue. `event::listen_with_keyboard` exposes the native modifier and lock state
+with each event and its capture status. `event::listen_with_keypad` continues to
+expose Num Lock for keypad presses.
 
 ## Subscription admission budget (Frost host integration required)
 

@@ -54,6 +54,8 @@ mod inspector_layout;
 mod notebook;
 use jterm_core::jterm_remote_client as jwm_remote_session;
 mod keybindings;
+mod keyboard_reports;
+use iced_winit::futures::event::KeyboardMetadata;
 mod kitty_graphics;
 #[cfg(test)]
 #[path = "native_viewport.rs"]
@@ -4735,7 +4737,8 @@ enum Message {
     OpenVim9Ide,
     /// Observe an Enter already consumed by a widget, without repeating its action.
     CapturedEnterPress(iced::window::Id, keyboard::Event),
-    WindowKey(iced::window::Id, keyboard::Event, Option<bool>),
+    WindowKey(iced::window::Id, keyboard::Event, Option<KeyboardMetadata>),
+    CapturedKeyRelease(iced::window::Id, keyboard::key::Physical),
     // AI agent panel (per-command approval agent over jterm_core).
     AgentInput(String),
     AgentSubmit,
@@ -4996,7 +4999,7 @@ enum Message {
     PtyExited(usize, RawFd, i32),
     PtyExitTail(usize, RawFd, jterm_core::exit_status::ExitTail),
     PtyIoError(usize, RawFd, String),
-    Key(keyboard::Event, Option<bool>),
+    Key(keyboard::Event, Option<KeyboardMetadata>),
     /// An input-method (IME) composition event: open/close, pre-edit updates,
     /// and committed text.
     Ime(iced::advanced::input_method::Event),
@@ -7820,6 +7823,7 @@ struct Frost {
     prompt_recall_enter_latch: PromptRecallEnterLatch,
     native_enter_ownership: native_enter::SharedOwnership,
     terminal_ime: terminal_ime::Ownership,
+    keyboard_reports: keyboard_reports::Reports,
     /// Workflow overlay (Ctrl+Shift+M): fuzzy picker over TOML/YAML workflow
     /// files, then a per-argument form before the rendered command is typed
     /// into the active pane for review (never executed).
@@ -8098,6 +8102,7 @@ impl Frost {
             prompt_recall_enter_latch: PromptRecallEnterLatch::default(),
             native_enter_ownership,
             terminal_ime: terminal_ime::Ownership::default(),
+            keyboard_reports: keyboard_reports::Reports::default(),
             workflow_overlay: None,
             workflow_library: jterm_core::workflows::BackgroundRefresh::new(Vec::new()),
             block_search: None,
@@ -8750,6 +8755,9 @@ impl Frost {
                 })
             })
             .flatten();
+        if !self.terminal_ime.owner_matches(owner.as_ref()) {
+            self.keyboard_reports.clear();
+        }
         if self.terminal_ime.sync(owner) {
             // A pane is not a native window. Retire the real platform context
             // as well as our old owner's display/admission state, so the next
@@ -18120,6 +18128,7 @@ impl Frost {
             && matches!(
                 &message,
                 Message::WindowKey(..)
+                    | Message::CapturedKeyRelease(..)
                     | Message::CapturedEnterPress(..)
                     | Message::Ime(..)
                     | Message::ImeCancelledCommit
@@ -20571,7 +20580,12 @@ impl Frost {
                     self.prompt_recall_enter_latch.captured_press(location);
                 }
             }
-            Message::WindowKey(id, event, keypad_num_lock) => {
+            Message::CapturedKeyRelease(id, physical) => {
+                if self.owner_window.is_none_or(|owner| owner == id) {
+                    self.keyboard_reports.discard(physical);
+                }
+            }
+            Message::WindowKey(id, event, native_keyboard) => {
                 let ime_owned = self.terminal_ime.claim_enter(&event);
                 let mut native = self.native_enter_ownership.lock();
                 let native_owned = native.acknowledge(id, &event);
@@ -20582,11 +20596,14 @@ impl Frost {
                 }
                 drop(native);
                 if native_owned || ime_owned {
+                    if let keyboard::Event::KeyReleased { physical_key, .. } = event {
+                        self.keyboard_reports.discard(physical_key);
+                    }
                     return Task::none();
                 }
-                return self.update(Message::Key(event, keypad_num_lock));
+                return self.update(Message::Key(event, native_keyboard));
             }
-            Message::Key(event, keypad_num_lock) => {
+            Message::Key(event, native_keyboard) => {
                 if self.remote_desktop.is_some() {
                     self.native_enter_ownership.lock().claim_held();
                     if matches!(
@@ -20755,7 +20772,7 @@ impl Frost {
                     }
                     return Task::none();
                 }
-                if let keyboard::Event::KeyReleased { key, .. } = &event {
+                if let keyboard::Event::KeyReleased { key, physical_key, .. } = &event {
                     if self.block_search.as_mut().is_some_and(|state| {
                         block_search_bookmark_key_release(
                             key,
@@ -20763,11 +20780,29 @@ impl Frost {
                             &mut state.bookmark_key_claimed,
                         )
                     }) {
+                        self.keyboard_reports.discard(*physical_key);
                         return Task::none();
                     }
+                    if self.focused && self.terminal_input_active() {
+                        if let (Some(metadata), Some(session)) =
+                            (native_keyboard, self.sessions.get_mut(self.active))
+                        {
+                            if !session.transcript_read_only() {
+                                if let Some(bytes) = self.keyboard_reports.release(
+                                    &session.terminal, *physical_key, metadata,
+                                ) {
+                                    session.write_pty(&bytes);
+                                }
+                                return Task::none();
+                            }
+                        }
+                    }
+                    self.keyboard_reports.discard(*physical_key);
+                    return Task::none();
                 }
                 if let keyboard::Event::KeyPressed {
                     key,
+                    modified_key,
                     physical_key,
                     location,
                     modifiers,
@@ -21290,16 +21325,20 @@ impl Frost {
                     let Some(sess) = self.sessions.get_mut(self.active) else {
                         return Task::none();
                     };
-                    let app_cursor = sess.terminal.is_application_cursor_keys();
-                    let enh = KeyboardEnhancements::from_terminal(&sess.terminal);
-                    if let Some(bytes) = encode_key_input(
-                        &key,
-                        modifiers,
-                        text.as_deref(),
-                        app_cursor,
-                        enh,
-                        keypad_position(&key, location, Some(physical_key), keypad_num_lock),
-                    ) {
+                    let prepared = self.keyboard_reports.prepare(
+                        &sess.terminal,
+                        keyboard_reports::Press {
+                            key: &key,
+                            modified_key: &modified_key,
+                            physical: physical_key,
+                            location,
+                            modifiers,
+                            text: text.as_deref(),
+                            repeat,
+                        },
+                        native_keyboard,
+                    );
+                    if let Some(prepared) = prepared.filter(|key| !key.bytes.is_empty()) {
                         if sess.transcript_read_only() {
                             // Held-open task transcript: the PTY is gone, so
                             // typing becomes a visible no-op instead of an EIO
@@ -21312,8 +21351,9 @@ impl Frost {
                                 sess.block_selection.clear();
                                 sess.scroll_after_input();
                             }
-                            let accepted = sess.write_pty(&bytes);
-                            sess.note_cli_keyboard_input(&bytes, accepted);
+                            let accepted = sess.write_pty(&prepared.bytes);
+                            sess.note_cli_keyboard_input(&prepared.bytes, accepted);
+                            self.keyboard_reports.admit(prepared, accepted);
                             if accepted
                                 && self.config.is_chat_mode()
                                 && no_modifier
@@ -35562,8 +35602,10 @@ impl Frost {
                     .map(|(id, message)| Message::EmbeddedVim(id, Box::new(message))),
             );
         }
-        let events = iced_winit::futures::event::listen_with_keypad(|event, status, id, keypad_num_lock| {
-            let event = keypad_logical_event(event, keypad_num_lock);
+        let events = iced_winit::futures::event::listen_with_keyboard(|event, status, id, native_keyboard| {
+            let event = keypad_logical_event(
+                event, native_keyboard.and_then(KeyboardMetadata::keypad_num_lock),
+            );
             let message = match event {
                 iced::Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
                     Some(Message::ModifiersChanged(m))
@@ -35619,11 +35661,15 @@ impl Frost {
                         // confirmation or block search. Let the corresponding latch
                         // see it; this does not redispatch captured key presses.
                         Some(Message::WindowKey(id, event, None))
+                    } else if let (Some(_), keyboard::Event::KeyReleased { physical_key, .. }) =
+                        (native_keyboard, event)
+                    {
+                        Some(Message::CapturedKeyRelease(id, physical_key))
                     } else {
                         None
                     }
                 }
-                iced::Event::Keyboard(k) => Some(Message::WindowKey(id, k, keypad_num_lock)),
+                iced::Event::Keyboard(k) => Some(Message::WindowKey(id, k, native_keyboard)),
                 iced::Event::InputMethod(iced::advanced::input_method::Event::Commit(_))
                     if status == iced::event::Status::Captured =>
                 {
@@ -37184,7 +37230,8 @@ fn encode_key_input(
 ) -> Option<Vec<u8>> {
     use jterm_engine::input::{
         encode_kitty_keypad_press, encode_kitty_named_press, keypad_begin_sequence,
-        legacy_function_key_sequence, KeypadKey, Modifiers,
+        legacy_function_key_sequence, KeypadKey, Modifiers, KITTY_DISAMBIGUATE,
+        KITTY_REPORT_ALL_KEYS, KITTY_REPORT_EVENT_TYPES,
     };
     use keyboard::key::Named;
     use keyboard::Key;
@@ -37243,9 +37290,12 @@ fn encode_key_input(
         return Some(enc);
     }
 
+    let application_keypad = enh.application_keypad
+        && enh.kitty_flags
+            & (u16::from(KITTY_DISAMBIGUATE) | KITTY_REPORT_EVENT_TYPES | KITTY_REPORT_ALL_KEYS)
+            == 0;
     if let Some((keypad, num_locked)) = keypad {
-        if enh.application_keypad
-            && enh.kitty_flags == 0
+        if application_keypad
             && !num_locked
             && mods == keyboard::Modifiers::default()
         {
@@ -37270,7 +37320,7 @@ fn encode_key_input(
         Key::Named(named) => {
             let mut bytes = match named {
                 Named::Enter => {
-                    if enh.application_keypad && keypad == Some((KeypadKey::Enter, false)) {
+                    if application_keypad && keypad == Some((KeypadKey::Enter, false)) {
                         ss3("M")
                     } else {
                         vec![b'\r']
@@ -37420,15 +37470,19 @@ fn keyboard_modifier_value(mods: keyboard::Modifiers) -> u8 {
     bits + 1
 }
 
-fn kitty_committed_text(text: &str) -> Option<String> {
-    let cleaned: String = text
-        .chars()
-        .filter(|character| {
-            !character.is_control()
-                && !jterm_core::review_input::is_visual_spoofing_character(*character)
-        })
-        .collect();
-    (!cleaned.is_empty()).then_some(cleaned)
+fn kitty_committed_text(text: &str) -> Option<std::borrow::Cow<'_, str>> {
+    fn allowed(ch: char) -> bool {
+        !ch.is_control() && !jterm_core::review_input::is_visual_spoofing_character(ch)
+    }
+    if text.is_empty() {
+        return None;
+    }
+    let Some(filtered) = text.find(|ch| !allowed(ch)) else {
+        return Some(std::borrow::Cow::Borrowed(text));
+    };
+    let mut cleaned = String::from(&text[..filtered]);
+    cleaned.extend(text[filtered..].chars().filter(|&ch| allowed(ch)));
+    (!cleaned.is_empty()).then_some(std::borrow::Cow::Owned(cleaned))
 }
 
 /// Encode a key press as a Kitty keyboard protocol report (`CSI codepoint;mod u`)
@@ -38916,10 +38970,10 @@ expect(b'.')
             assert!(sync.contains(required));
         }
         let keys = source
-            .split_once("            Message::WindowKey(id, event, keypad_num_lock) => {")
+            .split_once("            Message::WindowKey(id, event, native_keyboard) => {")
             .unwrap()
             .1
-            .split_once("            Message::Key(event, keypad_num_lock)")
+            .split_once("            Message::Key(event, native_keyboard)")
             .unwrap()
             .0;
         assert!(keys.contains("native.claim_pressed()"));
@@ -48857,7 +48911,7 @@ expect(b'.')
         assert!(!dispatch.contains("Task::done"));
         assert!(!dispatch.contains("write_pty"));
         let key = source
-            .split_once("            Message::Key(event, keypad_num_lock) => {")
+            .split_once("            Message::Key(event, native_keyboard) => {")
             .unwrap()
             .1
             .split_once("            Message::Ime(")
@@ -48884,7 +48938,7 @@ expect(b'.')
     fn palette_navigation_restores_only_its_own_retreat_after_custom_binding_precedence() {
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
         let key = source
-            .split_once("            Message::Key(event, keypad_num_lock) => {")
+            .split_once("            Message::Key(event, native_keyboard) => {")
             .unwrap()
             .1
             .split_once("            Message::Ime(")

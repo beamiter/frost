@@ -10,12 +10,13 @@ On every Iced/winit upgrade, verify the recorded upstream delta, event placement
 
 Native recorder proof covers X11. X11-only and Wayland-only builds are checked separately. Pinned Winit clears its Wayland repeat state and timer on keyboard Enter/Leave and starts repeats from delivered Key(Pressed) events; the missing focus snapshot alone therefore does not establish the same failure there. This is a source-based inference, not real Wayland runtime validation.
 
-## Native keypad lock state
+## Native keyboard reports
 
-Real keypad presses carry the event-time XKB Num Lock state into the existing
-Iced interaction subscription. The state travels with the queued event and its
-widget capture status. Widgets receive the upstream Iced event, and the keypad
-subscription can use the selected logical key for application routing.
+Native key presses and releases carry event-time XKB lock state and
+modifier transitions through the Iced interaction subscription. The inline
+batch metadata stays paired with its event and widget capture status.
+Widgets keep the upstream Iced event, and keypad listeners can still
+retrieve Num Lock for keypad presses.
 
 ## Bounded native clipboard Action reads
 

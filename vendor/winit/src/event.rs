@@ -661,6 +661,18 @@ pub struct KeyEvent {
 }
 
 impl KeyEvent {
+    /// Returns the effective Caps Lock state when XKB translated this event.
+    pub fn caps_lock_active(&self) -> Option<bool> {
+        #[cfg(any(x11_platform, wayland_platform))]
+        {
+            Some(self.platform_specific.caps_lock)
+        }
+        #[cfg(not(any(x11_platform, wayland_platform)))]
+        {
+            None
+        }
+    }
+
     /// Returns the effective Num Lock state when XKB translated this event.
     pub fn num_lock_active(&self) -> Option<bool> {
         #[cfg(any(x11_platform, wayland_platform))]

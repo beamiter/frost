@@ -131,7 +131,7 @@ with open("captured", "wb", buffering=0) as output:
             repeat: false,
         }),
         status: iced::event::Status::Ignored,
-        keypad_num_lock: None,
+        keyboard: None,
     };
     tracker.broadcast(enter);
     pool.run_until_stalled();
@@ -142,7 +142,7 @@ with open("captured", "wb", buffering=0) as output:
             "x".repeat(32 * 1024 * 1024),
         )),
         status: iced::event::Status::Ignored,
-        keypad_num_lock: None,
+        keyboard: None,
     });
     assert!(Event::input_overloaded());
     let downstream = received
@@ -176,13 +176,13 @@ with open("captured", "wb", buffering=0) as output:
     let Event::Interaction {
         window,
         event: iced::Event::Keyboard(key),
-        keypad_num_lock,
+        keyboard: native_keyboard,
         ..
     } = downstream
     else {
         panic!("expected the queued keyboard event");
     };
-    drop(host.update(Message::WindowKey(window, key, keypad_num_lock)));
+    drop(host.update(Message::WindowKey(window, key, native_keyboard)));
     assert!(host.sessions[0].pty.input_backlog().is_err());
     let session_count = host.sessions.len();
     for message in [

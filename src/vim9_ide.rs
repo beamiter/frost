@@ -4,6 +4,7 @@
 //! shell tabs, or persists editor argv. Managed shell entry embeds the same
 //! editor in its source pane. Bridge disconnection is not a child exit.
 
+use iced_winit::futures::event::KeyboardMetadata;
 use super::mouse_report_code;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -25,7 +26,7 @@ use jterm_core::vim9::{
 
 use super::{config, native_enter, terminal, terminal_ime, terminal_view};
 use super::{
-    Config, KeyboardEnhancements, Metrics, MouseButton, MouseInput, Session, TermWidget, Theme,
+    Config, Metrics, MouseButton, MouseInput, Session, TermWidget, Theme,
 };
 
 const HEADER: f32 = 38.0;
@@ -329,7 +330,7 @@ pub(super) enum Message {
         entry_id: uuid::Uuid,
         frame: Option<std::sync::Arc<vim9::Vim9RenderFrame>>,
     },
-    Keyboard(iced::window::Id, keyboard::Event, bool, Option<bool>),
+    Keyboard(iced::window::Id, keyboard::Event, bool, Option<KeyboardMetadata>),
     Modifiers(keyboard::Modifiers),
     Ime(input_method::Event),
     CancelledCommit,
@@ -417,6 +418,7 @@ pub(super) struct Ide {
     modifiers: keyboard::Modifiers,
     native_enter: native_enter::SharedOwnership,
     ime: terminal_ime::Ownership,
+    keyboard_reports: super::keyboard_reports::Reports,
     input_epoch: u64,
     gestures: [Option<super::TerminalMouseGesture>; 3],
     blink_started: Instant,
@@ -1005,6 +1007,7 @@ impl Ide {
             modifiers: keyboard::Modifiers::default(),
             native_enter,
             ime: terminal_ime::Ownership::default(),
+            keyboard_reports: super::keyboard_reports::Reports::default(),
             input_epoch: 0,
             gestures: [None; 3],
             blink_started: Instant::now(),
@@ -1054,6 +1057,9 @@ impl Ide {
                 session: s.id,
                 instance: s.ime_identity.clone(),
             });
+        if !self.ime.owner_matches(owner.as_ref()) {
+            self.keyboard_reports.clear();
+        }
         if self.ime.sync(owner) {
             if let Some(s) = &mut self.session {
                 s.terminal.preedit_text.clear();
@@ -1680,11 +1686,11 @@ impl Ide {
                 }
                 _ => {}
             },
-            Message::Keyboard(id, event, captured, keypad_num_lock) => {
+            Message::Keyboard(id, event, captured, native_keyboard) => {
                 if matches!(event, keyboard::Event::KeyPressed { .. }) {
                     self.scroll.borrow_mut().clear();
                 }
-                return self.key(id, event, captured, keypad_num_lock);
+                return self.key(id, event, captured, native_keyboard);
             }
             Message::Modifiers(modifiers) => self.set_workspace_modifiers(modifiers),
             Message::Ime(event) => {
@@ -1959,7 +1965,7 @@ impl Ide {
         id: iced::window::Id,
         event: keyboard::Event,
         captured: bool,
-        keypad_num_lock: Option<bool>,
+        native_keyboard: Option<KeyboardMetadata>,
     ) -> Task<Message> {
         if self
             .form
@@ -1990,6 +1996,9 @@ impl Ide {
             }
         }
         if captured {
+            if let keyboard::Event::KeyReleased { physical_key, .. } = &event {
+                self.keyboard_reports.discard(*physical_key);
+            }
             self.native_enter.lock().acknowledge_captured(id, &event);
             if self.form.is_some()
                 && matches!(
@@ -2006,19 +2015,37 @@ impl Ide {
             return Task::none();
         }
         if self.native_enter.lock().acknowledge(id, &event) {
+            if let keyboard::Event::KeyReleased { physical_key, .. } = event {
+                self.keyboard_reports.discard(physical_key);
+            }
             return Task::none();
         }
         if self.ime.claim_enter(&event) {
             self.native_enter.lock().claim_pressed();
             return Task::none();
         }
+        if let keyboard::Event::KeyReleased { physical_key, .. } = &event {
+            if self.input_active() {
+                if let (Some(metadata), Some(session)) = (native_keyboard, &mut self.session) {
+                    if let Some(bytes) = self.keyboard_reports.release(
+                        &session.terminal, *physical_key, metadata,
+                    ) {
+                        session.write_pty(&bytes);
+                    }
+                    return Task::none();
+                }
+            }
+            self.keyboard_reports.discard(*physical_key);
+            return Task::none();
+        }
         let keyboard::Event::KeyPressed {
             key,
+            modified_key,
             physical_key,
             location,
             modifiers,
             text: committed,
-            ..
+            repeat,
         } = event
         else {
             return Task::none();
@@ -2071,16 +2098,23 @@ impl Ide {
         }
         self.invalidate_input();
         if let Some(s) = &mut self.session {
-            let enhancements = KeyboardEnhancements::from_terminal(&s.terminal);
-            if let Some(bytes) = super::encode_key_input(
-                &key,
-                modifiers,
-                committed.as_deref(),
-                s.terminal.is_application_cursor_keys(),
-                enhancements,
-                super::keypad_position(&key, location, Some(physical_key), keypad_num_lock),
-            ) {
-                if !s.write_pty(&bytes) {
+            let prepared = self.keyboard_reports.prepare(
+                &s.terminal,
+                super::keyboard_reports::Press {
+                    key: &key,
+                    modified_key: &modified_key,
+                    physical: physical_key,
+                    location,
+                    modifiers,
+                    text: committed.as_deref(),
+                    repeat,
+                },
+                native_keyboard,
+            );
+            if let Some(prepared) = prepared.filter(|key| !key.bytes.is_empty()) {
+                let accepted = s.write_pty(&prepared.bytes);
+                self.keyboard_reports.admit(prepared, accepted);
+                if !accepted {
                     self.error = Some("Vim input queue is full".into());
                 }
                 s.scroll_to_bottom();
@@ -2269,8 +2303,10 @@ impl Ide {
     }
 
     pub(super) fn subscription(&self) -> Subscription<Message> {
-        let events = iced_winit::futures::event::listen_with_keypad(|event, status, id, keypad_num_lock| {
-            let event = super::keypad_logical_event(event, keypad_num_lock);
+        let events = iced_winit::futures::event::listen_with_keyboard(|event, status, id, native_keyboard| {
+            let event = super::keypad_logical_event(
+                event, native_keyboard.and_then(KeyboardMetadata::keypad_num_lock),
+            );
             match event {
                 iced::Event::Keyboard(keyboard::Event::ModifiersChanged(value)) => {
                     Some(Message::Modifiers(value))
@@ -2279,7 +2315,7 @@ impl Ide {
                     id,
                     event,
                     status == iced::event::Status::Captured,
-                    keypad_num_lock,
+                    native_keyboard,
                 )),
                 iced::Event::InputMethod(input_method::Event::Commit(_))
                     if status == iced::event::Status::Captured =>

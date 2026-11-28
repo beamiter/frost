@@ -14,6 +14,6 @@ The native Vim buffer window smoke injects a complete X11 notch, checks exactly
 three source rows and traces intermediate GUI pixel positions. This patch can
 be removed after upgrading to an upstream release with equivalent behavior.
 
-The XKB key builder snapshots the cached effective Num Lock state with each
-translated event on X11 and Wayland. `KeyEvent::num_lock_active` exposes that
-snapshot. Other backends report no state.
+The XKB key builder snapshots the effective Caps Lock and Num Lock state
+with each translated event on X11 and Wayland. `KeyEvent::caps_lock_active`
+and `KeyEvent::num_lock_active` expose those snapshots.

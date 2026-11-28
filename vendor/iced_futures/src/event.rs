@@ -1,8 +1,28 @@
 //! Listen to runtime events.
 use crate::MaybeSend;
 use crate::core::event::{self, Event};
-use crate::core::window;
+use crate::core::{keyboard, window};
 use crate::subscription::{self, Subscription};
+
+/// State sampled with a native keyboard event before widget dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyboardMetadata {
+    /// Modifier state including the current modifier key's transition.
+    pub modifiers: keyboard::Modifiers,
+    /// Caps Lock state from the platform keyboard, when available.
+    pub caps_lock: Option<bool>,
+    /// Num Lock state from the platform keyboard, when available.
+    pub num_lock: Option<bool>,
+    /// Whether this was a keypad press.
+    pub keypad_press: bool,
+}
+
+impl KeyboardMetadata {
+    /// Effective Num Lock for a native keypad press.
+    pub fn keypad_num_lock(self) -> Option<bool> {
+        self.num_lock.filter(|_| self.keypad_press)
+    }
+}
 
 /// Returns a [`Subscription`] to all the ignored runtime events.
 ///
@@ -40,12 +60,24 @@ pub fn listen_with_keypad<Message>(
 where
     Message: 'static + MaybeSend,
 {
+    listen_filtered(f, move |event, status, window, keyboard| {
+        f(event, status, window, keyboard.and_then(KeyboardMetadata::keypad_num_lock))
+    })
+}
+
+/// Like [`listen_with`], with the state sampled for each native key transition.
+pub fn listen_with_keyboard<Message>(
+    f: fn(Event, event::Status, window::Id, Option<KeyboardMetadata>) -> Option<Message>,
+) -> Subscription<Message>
+where
+    Message: 'static + MaybeSend,
+{
     listen_filtered(f, f)
 }
 
 fn listen_filtered<Message>(
     identity: impl std::hash::Hash + 'static,
-    f: impl Fn(Event, event::Status, window::Id, Option<bool>) -> Option<Message>
+    f: impl Fn(Event, event::Status, window::Id, Option<KeyboardMetadata>) -> Option<Message>
         + MaybeSend
         + 'static,
 ) -> Subscription<Message>
@@ -65,8 +97,8 @@ where
             window,
             event,
             status,
-            keypad_num_lock,
-        } => f(event, status, window, keypad_num_lock),
+            keyboard,
+        } => f(event, status, window, keyboard),
     })
 }
 

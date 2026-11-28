@@ -165,22 +165,23 @@ pub fn window_attributes(
     attributes
 }
 
-pub(crate) fn keypad_num_lock(event: &winit::event::WindowEvent) -> Option<bool> {
+pub(crate) fn keyboard_metadata(
+    event: &winit::event::WindowEvent,
+    state: winit::keyboard::ModifiersState,
+    modifier_sides: &mut u8,
+) -> Option<crate::futures::event::KeyboardMetadata> {
+    use crate::core::keyboard::Modifiers;
     use winit::event::{ElementState, WindowEvent};
-    use winit::keyboard::{KeyCode, KeyLocation, PhysicalKey};
+    use winit::keyboard::{Key, KeyCode, KeyLocation, NamedKey, PhysicalKey};
 
-    let WindowEvent::KeyboardInput {
-        event,
-        is_synthetic: false,
-        ..
-    } = event
-    else {
+    if matches!(event, WindowEvent::Focused(false)) {
+        *modifier_sides = 0;
+    }
+    let WindowEvent::KeyboardInput { event, is_synthetic: false, .. } = event else {
         return None;
     };
-    if event.state != ElementState::Pressed {
-        return None;
-    }
-    if event.location == KeyLocation::Numpad
+    let down = event.state == ElementState::Pressed;
+    let keypad_press = down && (event.location == KeyLocation::Numpad
         || matches!(
             event.physical_key,
             PhysicalKey::Code(
@@ -203,12 +204,43 @@ pub(crate) fn keypad_num_lock(event: &winit::event::WindowEvent) -> Option<bool>
                     | KeyCode::NumpadEnter
                     | KeyCode::NumpadEqual
             )
-        )
-    {
-        event.num_lock_active()
-    } else {
-        None
+        ));
+    let mut modifiers = self::modifiers(state);
+    let side = match (&event.logical_key, event.physical_key) {
+        (Key::Named(NamedKey::Shift), PhysicalKey::Code(KeyCode::ShiftLeft)) =>
+            Some((0, Modifiers::SHIFT)),
+        (Key::Named(NamedKey::Shift), PhysicalKey::Code(KeyCode::ShiftRight)) =>
+            Some((1, Modifiers::SHIFT)),
+        (Key::Named(NamedKey::Control), PhysicalKey::Code(KeyCode::ControlLeft)) =>
+            Some((2, Modifiers::CTRL)),
+        (Key::Named(NamedKey::Control), PhysicalKey::Code(KeyCode::ControlRight)) =>
+            Some((3, Modifiers::CTRL)),
+        (Key::Named(NamedKey::Alt), PhysicalKey::Code(KeyCode::AltLeft)) =>
+            Some((4, Modifiers::ALT)),
+        (Key::Named(NamedKey::Alt), PhysicalKey::Code(KeyCode::AltRight)) =>
+            Some((5, Modifiers::ALT)),
+        (Key::Named(NamedKey::Super | NamedKey::Meta), PhysicalKey::Code(KeyCode::SuperLeft)) =>
+            Some((6, Modifiers::LOGO)),
+        (Key::Named(NamedKey::Super | NamedKey::Meta), PhysicalKey::Code(KeyCode::SuperRight)) =>
+            Some((7, Modifiers::LOGO)),
+        _ => None,
+    };
+    if let Some((index, modifier)) = side {
+        let bit = 1 << index;
+        if down {
+            *modifier_sides |= bit;
+        } else {
+            *modifier_sides &= !bit;
+        }
+        // Winit can send ModifiersChanged on either side of this event.
+        modifiers.set(modifier, *modifier_sides & (3 << (index & !1)) != 0);
     }
+    Some(crate::futures::event::KeyboardMetadata {
+        modifiers,
+        caps_lock: event.caps_lock_active(),
+        num_lock: event.num_lock_active(),
+        keypad_press,
+    })
 }
 
 /// Converts a winit window event into an iced event.

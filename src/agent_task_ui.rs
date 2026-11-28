@@ -2700,7 +2700,7 @@ mod tests {
             .unwrap();
         assert!(input.contains("&& !self.task_input_owns_keys()"));
         let keys = source
-            .split("            Message::Key(event, keypad_num_lock) => {")
+            .split("            Message::Key(event, native_keyboard) => {")
             .nth(1)
             .unwrap()
             .split("            Message::MousePane(")

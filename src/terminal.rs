@@ -7589,6 +7589,13 @@ impl TerminalState {
         self.vt.protocol.keyboard_enhancement_flags()
     }
 
+    pub fn keyboard_report_state(&self) -> (u16, u64) {
+        (
+            self.keyboard_enhancement_flags(),
+            self.vt.protocol.keyboard_report_generation(),
+        )
+    }
+
     pub fn xterm_modify_other_keys(&self) -> u16 {
         self.vt.protocol.xterm_modify_other_keys()
     }

@@ -34,6 +34,10 @@ pub(crate) struct Ownership {
 }
 
 impl Ownership {
+    pub fn owner_matches(&self, owner: Option<&Owner>) -> bool {
+        self.owner.as_ref() == owner
+    }
+
     /// Called before and after every reducer, including early-return handlers.
     /// Return true when old terminal preedit must be removed from display.
     pub fn sync(&mut self, owner: Option<Owner>) -> bool {

@@ -27,8 +27,8 @@ pub enum Event {
         /// The [`event::Status`] of the interaction.
         status: event::Status,
 
-        /// Num Lock state sampled with a native keypad press, when available.
-        keypad_num_lock: Option<bool>,
+        /// Keyboard state sampled at the native event boundary, when available.
+        keyboard: Option<crate::event::KeyboardMetadata>,
     },
 
     /// The system theme has changed.

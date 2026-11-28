@@ -28,6 +28,7 @@ iced_program.workspace = true
 
 log.workspace = true
 rustc-hash.workspace = true
+smallvec = "1.15"
 thiserror.workspace = true
 tracing.workspace = true
 window_clipboard.workspace = true

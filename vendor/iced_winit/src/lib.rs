@@ -630,7 +630,9 @@ impl ControlReceiver {
     }
 }
 
-type QueuedEvent = (window::Id, core::Event, Option<bool>);
+type QueuedEvent = (
+    window::Id, core::Event, Option<crate::futures::event::KeyboardMetadata>,
+);
 
 async fn run_instance<P>(
     mut program: program::Instance<P>,
@@ -1179,7 +1181,7 @@ async fn run_instance<P>(
                             window: id,
                             event: redraw_event,
                             status: core::event::Status::Ignored,
-                            keypad_num_lock: None,
+                            keyboard: None,
                         });
 
                         window.draw_preedit();
@@ -1410,13 +1412,13 @@ async fn run_instance<P>(
                         } else {
                             window.state.update(&program, &window.raw, &window_event);
 
-                            let keypad_num_lock = conversion::keypad_num_lock(&window_event);
+                            let keyboard = window.state.keyboard_metadata(&window_event);
                             if let Some(event) = conversion::window_event(
                                 window_event,
                                 window.state.scale_factor(),
                                 window.state.modifiers(),
                             ) {
-                                events.push((id, event, keypad_num_lock));
+                                events.push((id, event, keyboard));
                             }
                         }
                     }
@@ -1446,19 +1448,20 @@ async fn run_instance<P>(
                         for (id, window) in window_manager.iter_mut() {
                             let interact_span = debug::interact(id);
                             let mut window_events = vec![];
-                            // Keep the snapshot aligned with the event and avoid allocating
-                            // a parallel vector when this window has no keypad presses.
-                            let mut keypad_locks = Vec::new();
+                            // Keep native metadata aligned through widget dispatch.
+                            // Ordinary key batches stay inline.
+                            let mut key_snapshots =
+                                smallvec::SmallVec::<[(usize, crate::futures::event::KeyboardMetadata); 8]>::new();
 
                             let mut remaining = Vec::new();
-                            for (window_id, event, keypad_num_lock) in events.drain(..) {
+                            for (window_id, event, keyboard) in events.drain(..) {
                                 if window_id == id {
-                                    if let Some(num_lock) = keypad_num_lock {
-                                        keypad_locks.push((window_events.len(), num_lock));
+                                    if let Some(snapshot) = keyboard {
+                                        key_snapshots.push((window_events.len(), snapshot));
                                     }
                                     window_events.push(event);
                                 } else {
-                                    remaining.push((window_id, event, keypad_num_lock));
+                                    remaining.push((window_id, event, keyboard));
                                 }
                             }
                             events = remaining;
@@ -1501,32 +1504,32 @@ async fn run_instance<P>(
                                 }
                             }
 
-                            let mut keypad_locks = keypad_locks.into_iter().peekable();
+                            let mut key_snapshots = key_snapshots.into_iter().peekable();
                             for (index, (event, status)) in window_events
                                 .into_iter()
                                 .zip(statuses)
                                 .enumerate()
                             {
-                                let keypad_num_lock = keypad_locks
+                                let keyboard = key_snapshots
                                     .next_if(|(event_index, _)| *event_index == index)
-                                    .map(|(_, num_lock)| num_lock);
+                                    .map(|(_, snapshot)| snapshot);
                                 runtime.broadcast(subscription::Event::Interaction {
                                     window: id,
                                     event,
                                     status,
-                                    keypad_num_lock,
+                                    keyboard,
                                 });
                             }
 
                             interact_span.finish();
                         }
 
-                        for (id, event, keypad_num_lock) in events.drain(..) {
+                        for (id, event, keyboard) in events.drain(..) {
                             runtime.broadcast(subscription::Event::Interaction {
                                 window: id,
                                 event,
                                 status: core::event::Status::Ignored,
-                                keypad_num_lock,
+                                keyboard,
                             });
                         }
 
