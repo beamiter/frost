@@ -6776,25 +6776,19 @@ impl Session {
         if !self.alternate_scroll_active() {
             return None;
         }
-        let key = if up {
+        let key = keyboard::Key::Named(if up {
             keyboard::key::Named::ArrowUp
         } else {
             keyboard::key::Named::ArrowDown
-        };
-        let enhancements = KeyboardEnhancements::from_terminal(&self.terminal);
-        let kitty_press =
-            keyboard_reports::encode_synthetic_named_press(key, enhancements.kitty_flags);
-        let bytes = match kitty_press {
-            Some(bytes) => bytes,
-            None => encode_key(
-                &keyboard::Key::Named(key),
-                keyboard::Location::Standard,
-                keyboard::Modifiers::empty(),
-                None,
-                self.terminal.is_application_cursor_keys(),
-                enhancements,
-            )?,
-        };
+        });
+        let bytes = encode_key(
+            &key,
+            keyboard::Location::Standard,
+            keyboard::Modifiers::empty(),
+            None,
+            self.terminal.is_application_cursor_keys(),
+            KeyboardEnhancements::from_terminal(&self.terminal),
+        )?;
         match lines.clamp(1, terminal_view::MAX_APP_WHEEL_LINES) {
             1 => Some(bytes),
             lines => Some(bytes.repeat(lines)),
@@ -37254,7 +37248,10 @@ fn encode_key_input(
         super_key: mods.logo(),
     };
 
-    if let Some((position, num_locked)) = keypad.filter(|_| enh.kitty_flags & 0b1001 != 0) {
+    let kitty_key_reports = enh.kitty_flags
+        & (u16::from(KITTY_DISAMBIGUATE) | KITTY_REPORT_EVENT_TYPES | KITTY_REPORT_ALL_KEYS)
+        != 0;
+    if let Some((position, num_locked)) = keypad.filter(|_| kitty_key_reports) {
         let associated = if enh.kitty_flags & 0b11000 == 0b11000 {
             text.and_then(kitty_committed_text)
         } else {
@@ -37271,7 +37268,7 @@ fn encode_key_input(
             return Some(report);
         }
     }
-    if enh.kitty_flags & 0b1001 != 0 {
+    if kitty_key_reports {
         if let Key::Named(named) = key {
             if let Some(report) =
                 encode_kitty_named_press(terminal_named_key(named), wire_modifiers, enh.kitty_flags)
@@ -37299,10 +37296,7 @@ fn encode_key_input(
         return Some(enc);
     }
 
-    let application_keypad = enh.application_keypad
-        && enh.kitty_flags
-            & (u16::from(KITTY_DISAMBIGUATE) | KITTY_REPORT_EVENT_TYPES | KITTY_REPORT_ALL_KEYS)
-            == 0;
+    let application_keypad = enh.application_keypad && !kitty_key_reports;
     if let Some((keypad, num_locked)) = keypad {
         if application_keypad
             && !num_locked
@@ -46136,6 +46130,56 @@ expect(b'.')
         assert_eq!(encode(&terminal, Named::Backspace, plain), b"\x1b[127u");
         terminal.process_input(b"\x1b[<2u");
         assert_eq!(encode(&terminal, Named::F3, plain), b"\x1bOR");
+    }
+
+    #[test]
+    fn event_only_kitty_uses_named_and_keypad_fallback_without_physical_metadata() {
+        use jterm_engine::input::{KeypadKey, KITTY_REPORT_EVENT_TYPES};
+        use keyboard::{key::Named, Key, Modifiers};
+
+        let mut terminal = TerminalState::new(12, 3);
+        terminal.process_input(b"\x1b[?1h\x1b=\x1b[>2u");
+        assert_eq!(
+            terminal.keyboard_enhancement_flags(),
+            KITTY_REPORT_EVENT_TYPES
+        );
+        let enh = KeyboardEnhancements::from_terminal(&terminal);
+        assert_eq!(
+            encode_key_input(
+                &Key::Character("*".into()),
+                Modifiers::CTRL,
+                None,
+                true,
+                enh,
+                Some((KeypadKey::Multiply, false)),
+            )
+            .as_deref(),
+            Some(b"\x1b[42;5u".as_slice())
+        );
+        assert_eq!(
+            encode_key_input(
+                &Key::Named(Named::ArrowUp),
+                Modifiers::NONE,
+                None,
+                true,
+                enh,
+                None,
+            )
+            .as_deref(),
+            Some(b"\x1b[A".as_slice())
+        );
+        assert_eq!(
+            encode_key_input(
+                &Key::Character("7".into()),
+                Modifiers::NONE,
+                Some("7"),
+                true,
+                enh,
+                Some((KeypadKey::Digit(7), true)),
+            )
+            .as_deref(),
+            Some(b"7".as_slice())
+        );
     }
 
     #[test]
