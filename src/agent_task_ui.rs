@@ -2729,7 +2729,12 @@ mod tests {
         let stop = keys
             .find("if task_input {\n                        return Task::none();\n                    }")
             .unwrap();
-        let pty = keys.find("let accepted = sess.write_pty(&bytes)").unwrap();
+        let prepare = keys
+            .find("self.keyboard_reports.prepare(")
+            .expect("terminal key preparation");
+        let pty = keys
+            .find("sess.write_pty(&prepared.bytes)")
+            .expect("prepared terminal key write");
         assert!(owner < dropped && dropped < block_context && block_context < blocks);
         assert!(
             blocks
@@ -2738,7 +2743,7 @@ mod tests {
                     .unwrap()
         );
         assert!(blocks < binding && binding < chrome && chrome < scroll);
-        assert!(scroll < stop && stop < pty);
+        assert!(scroll < stop && stop < prepare && prepare < pty);
         // The composer owns typing too, but its documented toggles work.
         let composer = keys
             .split("if self.task_composer_visible() {")

@@ -6776,20 +6776,29 @@ impl Session {
         if !self.alternate_scroll_active() {
             return None;
         }
-        let key = keyboard::Key::Named(if up {
+        let key = if up {
             keyboard::key::Named::ArrowUp
         } else {
             keyboard::key::Named::ArrowDown
-        });
-        let bytes = encode_key(
-            &key,
-            keyboard::Location::Standard,
-            keyboard::Modifiers::empty(),
-            None,
-            self.terminal.is_application_cursor_keys(),
-            KeyboardEnhancements::from_terminal(&self.terminal),
-        )?;
-        Some(bytes.repeat(lines.clamp(1, terminal_view::MAX_APP_WHEEL_LINES)))
+        };
+        let enhancements = KeyboardEnhancements::from_terminal(&self.terminal);
+        let kitty_press =
+            keyboard_reports::encode_synthetic_named_press(key, enhancements.kitty_flags);
+        let bytes = match kitty_press {
+            Some(bytes) => bytes,
+            None => encode_key(
+                &keyboard::Key::Named(key),
+                keyboard::Location::Standard,
+                keyboard::Modifiers::empty(),
+                None,
+                self.terminal.is_application_cursor_keys(),
+                enhancements,
+            )?,
+        };
+        match lines.clamp(1, terminal_view::MAX_APP_WHEEL_LINES) {
+            1 => Some(bytes),
+            lines => Some(bytes.repeat(lines)),
+        }
     }
 
     /// Return true when the event belongs to an application (including a
@@ -38623,6 +38632,8 @@ os.write(1,b'\x1b[?1hCURSOR')
 expect(b'\x1bOA')
 os.write(1,b'\x1b[=8uENHANCED')
 expect(b'\x1b[B')
+os.write(1,b'\x1b[=2uEVENTS')
+expect(b'\x1b[A\x1b[B')
 os.write(1,b'\x1b[=0u\x1b[?1002;1006hTRACK')
 expect(b'\x1b[<64;2;2M')
 os.write(1,b'\x1b[?1002;1006l\x1b[?1007lOFF')
@@ -38725,6 +38736,11 @@ expect(b'.')
         wait(&mut session, "ENHANCED");
         let stale_alt = wheel(&session, false, 1);
         assert!(session.dispatch_app_wheel(stale_alt, false, pixel_mouse::ReportCoordinates::Cell));
+        wait(&mut session, "EVENTS");
+        for up in [true, false] {
+            let event = wheel(&session, up, 1);
+            assert!(session.dispatch_app_wheel(event, false, pixel_mouse::ReportCoordinates::Cell));
+        }
         wait(&mut session, "TRACK");
         assert!(session.alternate_scroll_generation().is_none());
         assert!(
