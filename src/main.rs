@@ -20767,6 +20767,7 @@ impl Frost {
                 }
                 if let keyboard::Event::KeyPressed {
                     key,
+                    physical_key,
                     location,
                     modifiers,
                     text,
@@ -21290,9 +21291,14 @@ impl Frost {
                     };
                     let app_cursor = sess.terminal.is_application_cursor_keys();
                     let enh = KeyboardEnhancements::from_terminal(&sess.terminal);
-                    if let Some(bytes) =
-                        encode_key(&key, location, modifiers, text.as_deref(), app_cursor, enh)
-                    {
+                    if let Some(bytes) = encode_key_input(
+                        &key,
+                        modifiers,
+                        text.as_deref(),
+                        app_cursor,
+                        enh,
+                        keypad_position(&key, location, Some(physical_key)),
+                    ) {
                         if sess.transcript_read_only() {
                             // Held-open task transcript: the PTY is gone, so
                             // typing becomes a visible no-op instead of an EIO
@@ -37046,6 +37052,69 @@ fn encode_key(
     app_cursor: bool,
     enh: KeyboardEnhancements,
 ) -> Option<Vec<u8>> {
+    encode_key_input(
+        key,
+        mods,
+        text,
+        app_cursor,
+        enh,
+        keypad_position(key, location, None),
+    )
+}
+
+fn keypad_position(
+    key: &keyboard::Key,
+    location: keyboard::Location,
+    physical: Option<keyboard::key::Physical>,
+) -> Option<(jterm_engine::input::KeypadKey, bool)> {
+    use jterm_engine::input::KeypadKey;
+    use keyboard::key::{Code, Named, Physical};
+
+    let keypad = match physical {
+        Some(Physical::Code(code)) => match code {
+            Code::Numpad0 => KeypadKey::Digit(0),
+            Code::Numpad1 => KeypadKey::Digit(1),
+            Code::Numpad2 => KeypadKey::Digit(2),
+            Code::Numpad3 => KeypadKey::Digit(3),
+            Code::Numpad4 => KeypadKey::Digit(4),
+            Code::Numpad5 => KeypadKey::Digit(5),
+            Code::Numpad6 => KeypadKey::Digit(6),
+            Code::Numpad7 => KeypadKey::Digit(7),
+            Code::Numpad8 => KeypadKey::Digit(8),
+            Code::Numpad9 => KeypadKey::Digit(9),
+            Code::NumpadDecimal => KeypadKey::Decimal,
+            Code::NumpadDivide => KeypadKey::Divide,
+            Code::NumpadMultiply => KeypadKey::Multiply,
+            Code::NumpadSubtract => KeypadKey::Subtract,
+            Code::NumpadAdd => KeypadKey::Add,
+            Code::NumpadEnter => KeypadKey::Enter,
+            Code::NumpadEqual => KeypadKey::Equal,
+            Code::NumpadComma => KeypadKey::Separator,
+            _ => return None,
+        },
+        _ if location == keyboard::Location::Numpad
+            && matches!(key, keyboard::Key::Named(Named::Enter)) =>
+        {
+            KeypadKey::Enter
+        }
+        _ => return None,
+    };
+    // Iced reports the selected logical key. Numeric text on these positions
+    // is the layout's numeric layer, and keeps its locale-specific spelling.
+    let num_locked = matches!(keypad, KeypadKey::Digit(_) | KeypadKey::Decimal)
+        && matches!(key, keyboard::Key::Character(_));
+    Some((keypad, num_locked))
+}
+
+fn encode_key_input(
+    key: &keyboard::Key,
+    mods: keyboard::Modifiers,
+    text: Option<&str>,
+    app_cursor: bool,
+    enh: KeyboardEnhancements,
+    keypad: Option<(jterm_engine::input::KeypadKey, bool)>,
+) -> Option<Vec<u8>> {
+    use jterm_engine::input::{keypad_begin_sequence, KeypadKey, Modifiers};
     use keyboard::key::Named;
     use keyboard::Key;
 
@@ -37071,6 +37140,30 @@ fn encode_key(
         return Some(enc);
     }
 
+    if let Some((keypad, num_locked)) = keypad {
+        if enh.application_keypad
+            && enh.kitty_flags == 0
+            && !num_locked
+            && mods == keyboard::Modifiers::default()
+        {
+            if let Some(bytes) = keypad.application_sequence() {
+                return Some(bytes.to_vec());
+            }
+        }
+        if keypad == KeypadKey::Digit(5) && matches!(key, Key::Named(Named::Clear)) {
+            return Some(
+                keypad_begin_sequence(Modifiers {
+                    shift: mods.shift(),
+                    alt,
+                    ctrl,
+                    super_key: mods.logo(),
+                })
+                .into_owned()
+                .into_bytes(),
+            );
+        }
+    }
+
     let csi = |c: &str| -> Vec<u8> { format!("\x1b[{c}").into_bytes() };
     let ss3 = |c: &str| -> Vec<u8> { format!("\x1bO{c}").into_bytes() };
 
@@ -37078,7 +37171,7 @@ fn encode_key(
         Key::Named(named) => {
             let mut bytes = match named {
                 Named::Enter => {
-                    if enh.application_keypad && location == keyboard::Location::Numpad {
+                    if enh.application_keypad && keypad.is_some_and(|(key, _)| key == KeypadKey::Enter) {
                         ss3("M")
                     } else {
                         vec![b'\r']
@@ -45790,6 +45883,37 @@ expect(b'.')
                 );
             }
         }
+    }
+
+    #[test]
+    fn application_keypad_reaches_the_native_encoder_with_numeric_layer_override() {
+        use keyboard::key::{Code, Named, Physical};
+
+        let mut terminal = TerminalState::new(12, 3);
+        let modifiers = keyboard::Modifiers::default();
+        let encode = |terminal: &TerminalState, key, physical| {
+            encode_key_input(
+                &key,
+                modifiers,
+                None,
+                terminal.is_application_cursor_keys(),
+                KeyboardEnhancements::from_terminal(terminal),
+                keypad_position(&key, keyboard::Location::Numpad, Some(Physical::Code(physical))),
+            )
+            .unwrap()
+        };
+        let named = keyboard::Key::Named;
+        assert_eq!(encode(&terminal, named(Named::Home), Code::Numpad7), b"\x1b[H");
+        terminal.process_input(b"\x1b=");
+        assert_eq!(encode(&terminal, named(Named::Home), Code::Numpad7), b"\x1bOw");
+        assert_eq!(encode(&terminal, named(Named::Clear), Code::Numpad5), b"\x1bOu");
+        assert_eq!(encode(&terminal, named(Named::Delete), Code::NumpadDecimal), b"\x1bOn");
+        assert_eq!(encode(&terminal, keyboard::Key::Character("+".into()), Code::NumpadAdd), b"\x1bOk");
+        assert_eq!(encode(&terminal, keyboard::Key::Character("7".into()), Code::Numpad7), b"7");
+        assert_eq!(encode(&terminal, keyboard::Key::Character(",".into()), Code::NumpadDecimal), b",");
+        assert_eq!(encode(&terminal, named(Named::Enter), Code::Enter), b"\r");
+        terminal.process_input(b"\x1b>");
+        assert_eq!(encode(&terminal, named(Named::Clear), Code::Numpad5), b"\x1b[E");
     }
 
     #[test]

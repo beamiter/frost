@@ -2013,6 +2013,7 @@ impl Ide {
         }
         let keyboard::Event::KeyPressed {
             key,
+            physical_key,
             location,
             modifiers,
             text: committed,
@@ -2070,13 +2071,13 @@ impl Ide {
         self.invalidate_input();
         if let Some(s) = &mut self.session {
             let enhancements = KeyboardEnhancements::from_terminal(&s.terminal);
-            if let Some(bytes) = super::encode_key(
+            if let Some(bytes) = super::encode_key_input(
                 &key,
-                location,
                 modifiers,
                 committed.as_deref(),
                 s.terminal.is_application_cursor_keys(),
                 enhancements,
+                super::keypad_position(&key, location, Some(physical_key)),
             ) {
                 if !s.write_pty(&bytes) {
                     self.error = Some("Vim input queue is full".into());
