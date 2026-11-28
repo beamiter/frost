@@ -630,6 +630,8 @@ impl ControlReceiver {
     }
 }
 
+type QueuedEvent = (window::Id, core::Event, Option<bool>);
+
 async fn run_instance<P>(
     mut program: program::Instance<P>,
     mut runtime: Runtime<P::Executor, Proxy<P::Message>, Action<P::Message>>,
@@ -897,6 +899,7 @@ async fn run_instance<P>(
                         position: window.position(),
                         size: window.logical_size(),
                     }),
+                    None,
                 ));
 
                 if clipboard.window_id().is_none() {
@@ -1176,6 +1179,7 @@ async fn run_instance<P>(
                             window: id,
                             event: redraw_event,
                             status: core::event::Status::Ignored,
+                            keypad_num_lock: None,
                         });
 
                         window.draw_preedit();
@@ -1406,12 +1410,13 @@ async fn run_instance<P>(
                         } else {
                             window.state.update(&program, &window.raw, &window_event);
 
+                            let keypad_num_lock = conversion::keypad_num_lock(&window_event);
                             if let Some(event) = conversion::window_event(
                                 window_event,
                                 window.state.scale_factor(),
                                 window.state.modifiers(),
                             ) {
-                                events.push((id, event));
+                                events.push((id, event, keypad_num_lock));
                             }
                         }
                     }
@@ -1441,13 +1446,19 @@ async fn run_instance<P>(
                         for (id, window) in window_manager.iter_mut() {
                             let interact_span = debug::interact(id);
                             let mut window_events = vec![];
+                            // Keep the snapshot aligned with the event and avoid allocating
+                            // a parallel vector when this window has no keypad presses.
+                            let mut keypad_locks = Vec::new();
 
                             let mut remaining = Vec::new();
-                            for (window_id, event) in events.drain(..) {
+                            for (window_id, event, keypad_num_lock) in events.drain(..) {
                                 if window_id == id {
+                                    if let Some(num_lock) = keypad_num_lock {
+                                        keypad_locks.push((window_events.len(), num_lock));
+                                    }
                                     window_events.push(event);
                                 } else {
-                                    remaining.push((window_id, event));
+                                    remaining.push((window_id, event, keypad_num_lock));
                                 }
                             }
                             events = remaining;
@@ -1490,25 +1501,32 @@ async fn run_instance<P>(
                                 }
                             }
 
-                            for (event, status) in window_events
+                            let mut keypad_locks = keypad_locks.into_iter().peekable();
+                            for (index, (event, status)) in window_events
                                 .into_iter()
-                                .zip(statuses.into_iter())
+                                .zip(statuses)
+                                .enumerate()
                             {
+                                let keypad_num_lock = keypad_locks
+                                    .next_if(|(event_index, _)| *event_index == index)
+                                    .map(|(_, num_lock)| num_lock);
                                 runtime.broadcast(subscription::Event::Interaction {
                                     window: id,
                                     event,
                                     status,
+                                    keypad_num_lock,
                                 });
                             }
 
                             interact_span.finish();
                         }
 
-                        for (id, event) in events.drain(..) {
+                        for (id, event, keypad_num_lock) in events.drain(..) {
                             runtime.broadcast(subscription::Event::Interaction {
                                 window: id,
                                 event,
                                 status: core::event::Status::Ignored,
+                                keypad_num_lock,
                             });
                         }
 
@@ -1670,7 +1688,7 @@ fn run_action<'a, P, C>(
     program: &'a program::Instance<P>,
     runtime: &mut Runtime<P::Executor, Proxy<P::Message>, Action<P::Message>>,
     compositor: &mut Option<C>,
-    events: &mut Vec<(window::Id, core::Event)>,
+    events: &mut Vec<QueuedEvent>,
     messages: &mut Vec<P::Message>,
     clipboard: &mut Clipboard,
     control_sender: &mut ControlSender,
@@ -1740,7 +1758,7 @@ fn run_action<'a, P, C>(
                             .unwrap_or_else(Clipboard::unconnected);
                     }
 
-                    events.push((id, core::Event::Window(core::window::Event::Closed)));
+                    events.push((id, core::Event::Window(core::window::Event::Closed), None));
                 }
 
                 if window_manager.is_empty() {

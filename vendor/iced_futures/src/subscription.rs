@@ -26,6 +26,9 @@ pub enum Event {
 
         /// The [`event::Status`] of the interaction.
         status: event::Status,
+
+        /// Num Lock state sampled with a native keypad press, when available.
+        keypad_num_lock: Option<bool>,
     },
 
     /// The system theme has changed.

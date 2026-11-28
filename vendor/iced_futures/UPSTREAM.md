@@ -26,6 +26,10 @@ unpolled, exceed the old 100-event limit, exercise mixed events, cancellation,
 aggregate budget saturation, and an oversized IME payload. Tests are run
 explicitly by Frost's test CI job.
 
+The interaction envelope also carries optional Num Lock state for a native
+keypad press. `event::listen_with_keypad` exposes the state with the original event
+and its capture status. Existing listeners keep their original callback shape.
+
 ## Subscription admission budget (Frost host integration required)
 
 The native subscription inbox now admits at most 8,192 event copies and 16 MiB

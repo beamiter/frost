@@ -2700,7 +2700,7 @@ mod tests {
             .unwrap();
         assert!(input.contains("&& !self.task_input_owns_keys()"));
         let keys = source
-            .split("            Message::Key(event) => {")
+            .split("            Message::Key(event, keypad_num_lock) => {")
             .nth(1)
             .unwrap()
             .split("            Message::MousePane(")
@@ -2729,9 +2729,7 @@ mod tests {
         let stop = keys
             .find("if task_input {\n                        return Task::none();\n                    }")
             .unwrap();
-        let pty = keys
-            .find("encode_key(&key, location, modifiers, text.as_deref(), app_cursor, enh)")
-            .unwrap();
+        let pty = keys.find("let accepted = sess.write_pty(&bytes)").unwrap();
         assert!(owner < dropped && dropped < block_context && block_context < blocks);
         assert!(
             blocks

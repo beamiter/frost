@@ -165,6 +165,52 @@ pub fn window_attributes(
     attributes
 }
 
+pub(crate) fn keypad_num_lock(event: &winit::event::WindowEvent) -> Option<bool> {
+    use winit::event::{ElementState, WindowEvent};
+    use winit::keyboard::{KeyCode, KeyLocation, PhysicalKey};
+
+    let WindowEvent::KeyboardInput {
+        event,
+        is_synthetic: false,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    if event.state != ElementState::Pressed {
+        return None;
+    }
+    if event.location == KeyLocation::Numpad
+        || matches!(
+            event.physical_key,
+            PhysicalKey::Code(
+                KeyCode::Numpad0
+                    | KeyCode::Numpad1
+                    | KeyCode::Numpad2
+                    | KeyCode::Numpad3
+                    | KeyCode::Numpad4
+                    | KeyCode::Numpad5
+                    | KeyCode::Numpad6
+                    | KeyCode::Numpad7
+                    | KeyCode::Numpad8
+                    | KeyCode::Numpad9
+                    | KeyCode::NumpadDecimal
+                    | KeyCode::NumpadComma
+                    | KeyCode::NumpadDivide
+                    | KeyCode::NumpadMultiply
+                    | KeyCode::NumpadSubtract
+                    | KeyCode::NumpadAdd
+                    | KeyCode::NumpadEnter
+                    | KeyCode::NumpadEqual
+            )
+        )
+    {
+        event.num_lock_active()
+    } else {
+        None
+    }
+}
+
 /// Converts a winit window event into an iced event.
 pub fn window_event(
     event: winit::event::WindowEvent,

@@ -10,6 +10,13 @@ On every Iced/winit upgrade, verify the recorded upstream delta, event placement
 
 Native recorder proof covers X11. X11-only and Wayland-only builds are checked separately. Pinned Winit clears its Wayland repeat state and timer on keyboard Enter/Leave and starts repeats from delivered Key(Pressed) events; the missing focus snapshot alone therefore does not establish the same failure there. This is a source-based inference, not real Wayland runtime validation.
 
+## Native keypad lock state
+
+Real keypad presses carry the event-time XKB Num Lock state into the existing
+Iced interaction subscription. The state travels with the queued event and its
+widget capture status. Widgets receive the upstream Iced event, and the keypad
+subscription can use the selected logical key for application routing.
+
 ## Bounded native clipboard Action reads
 
 The R04 extension also modifies src/clipboard.rs and the Clipboard::Read Action branch in src/lib.rs. On Linux, it opts into window_clipboard's bounded owned provider and submits reads without waiting on the GUI thread. Cancellation follows the oneshot receiver; unavailable, oversized, expired, or cancelled reads resolve without clipboard text. Admission is capped at eight, and provider-enforced payload and decoded output limits are 1 MiB with an absolute three-second deadline. Clipboard contents are never logged.

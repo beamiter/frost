@@ -4735,7 +4735,7 @@ enum Message {
     OpenVim9Ide,
     /// Observe an Enter already consumed by a widget, without repeating its action.
     CapturedEnterPress(iced::window::Id, keyboard::Event),
-    WindowKey(iced::window::Id, keyboard::Event),
+    WindowKey(iced::window::Id, keyboard::Event, Option<bool>),
     // AI agent panel (per-command approval agent over jterm_core).
     AgentInput(String),
     AgentSubmit,
@@ -4996,7 +4996,7 @@ enum Message {
     PtyExited(usize, RawFd, i32),
     PtyExitTail(usize, RawFd, jterm_core::exit_status::ExitTail),
     PtyIoError(usize, RawFd, String),
-    Key(keyboard::Event),
+    Key(keyboard::Event, Option<bool>),
     /// An input-method (IME) composition event: open/close, pre-edit updates,
     /// and committed text.
     Ime(iced::advanced::input_method::Event),
@@ -17973,14 +17973,14 @@ impl Frost {
             };
         }
 
-        if let Message::WindowKey(id, _) | Message::CapturedEnterPress(id, _) = &message {
+        if let Message::WindowKey(id, ..) | Message::CapturedEnterPress(id, _) = &message {
             if let Some(eva) = self.eva.as_mut() {
                 eva.bind(*id);
             }
         }
         if matches!(
             &message,
-            Message::WindowKey(_, keyboard::Event::KeyPressed { .. })
+            Message::WindowKey(_, keyboard::Event::KeyPressed { .. }, _)
                 | Message::Ime(_)
                 | Message::Pasted(..)
         ) {
@@ -18408,6 +18408,7 @@ impl Frost {
                         _,
                         keyboard::Event::KeyPressed { key, modifiers, .. },
                         false,
+                        _,
                     ) = message.as_ref()
                     {
                         if let Some(command) =
@@ -20016,7 +20017,7 @@ impl Frost {
             }
             Message::AgentSessionsCapturedNavigation(event) => {
                 if self.agent_sessions.open && !self.agent_sessions.editing() {
-                    return self.update(Message::Key(event));
+                    return self.update(Message::Key(event, None));
                 }
             }
             Message::AgentSessionsScope(enabled) => {
@@ -20558,7 +20559,7 @@ impl Frost {
                 // let the Escape fall through to the PTY after all. Recursion
                 // is one level deep — the key chain never emits OverlayEscape.
                 if self.overlay_owns_escape() {
-                    return self.update(Message::Key(event));
+                    return self.update(Message::Key(event, None));
                 }
             }
             Message::CapturedEnterPress(id, event) => {
@@ -20570,7 +20571,7 @@ impl Frost {
                     self.prompt_recall_enter_latch.captured_press(location);
                 }
             }
-            Message::WindowKey(id, event) => {
+            Message::WindowKey(id, event, keypad_num_lock) => {
                 let ime_owned = self.terminal_ime.claim_enter(&event);
                 let mut native = self.native_enter_ownership.lock();
                 let native_owned = native.acknowledge(id, &event);
@@ -20583,9 +20584,9 @@ impl Frost {
                 if native_owned || ime_owned {
                     return Task::none();
                 }
-                return self.update(Message::Key(event));
+                return self.update(Message::Key(event, keypad_num_lock));
             }
-            Message::Key(event) => {
+            Message::Key(event, keypad_num_lock) => {
                 if self.remote_desktop.is_some() {
                     self.native_enter_ownership.lock().claim_held();
                     if matches!(
@@ -21297,7 +21298,7 @@ impl Frost {
                         text.as_deref(),
                         app_cursor,
                         enh,
-                        keypad_position(&key, location, Some(physical_key)),
+                        keypad_position(&key, location, Some(physical_key), keypad_num_lock),
                     ) {
                         if sess.transcript_read_only() {
                             // Held-open task transcript: the PTY is gone, so
@@ -35561,104 +35562,108 @@ impl Frost {
                     .map(|(id, message)| Message::EmbeddedVim(id, Box::new(message))),
             );
         }
-        let events = iced::event::listen_with(|event, status, id| (match event {
-            iced::Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
-                Some(Message::ModifiersChanged(m))
-            }
-            // When an overlay text input is focused it captures the keys it
-            // consumes (typing, Backspace, cursor movement). Dropping captured
-            // keyboard events here keeps them from also reaching the terminal,
-            // so editing the search/palette query never double-inputs.
-            // ...except Escape. A focused iced text_input consumes Escape to
-            // blur itself and captures the event, so the first press never
-            // reached the overlay that should have closed — every panel took
-            // two presses, with the query input silently dead in between. The
-            // handler re-delivers this only while an overlay owns Escape, so
-            // it can never become a stray byte to the foreground program.
-            iced::Event::Keyboard(event) if status == iced::event::Status::Captured => {
-                if captured_key_is_overlay_escape(&event) {
-                    Some(Message::OverlayEscape(event))
-                } else if let keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
-                    ..
-                } = &event
-                {
-                    Some(Message::CapturedEnterPress(id, event))
-                } else if matches!(
-                    &event,
-                    keyboard::Event::KeyPressed {
-                        key: keyboard::Key::Named(
-                            keyboard::key::Named::Home | keyboard::key::Named::End
-                        ),
+        let events = iced_winit::futures::event::listen_with_keypad(|event, status, id, keypad_num_lock| {
+            let event = keypad_logical_event(event, keypad_num_lock);
+            let message = match event {
+                iced::Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
+                    Some(Message::ModifiersChanged(m))
+                }
+                // When an overlay text input is focused it captures the keys it
+                // consumes (typing, Backspace, cursor movement). Dropping captured
+                // keyboard events here keeps them from also reaching the terminal,
+                // so editing the search/palette query never double-inputs.
+                // ...except Escape. A focused iced text_input consumes Escape to
+                // blur itself and captures the event, so the first press never
+                // reached the overlay that should have closed — every panel took
+                // two presses, with the query input silently dead in between. The
+                // handler re-delivers this only while an overlay owns Escape, so
+                // it can never become a stray byte to the foreground program.
+                iced::Event::Keyboard(event) if status == iced::event::Status::Captured => {
+                    if captured_key_is_overlay_escape(&event) {
+                        Some(Message::OverlayEscape(event))
+                    } else if let keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Enter),
                         ..
-                    }
-                ) || matches!(&event, keyboard::Event::KeyPressed { key: keyboard::Key::Character(value), modifiers, .. } if modifiers.control() && value.eq_ignore_ascii_case("l"))
-                {
-                    // A session picker owns list-edge navigation even when its
-                    // search field also handles the caret key. Other surfaces
-                    // retain the widget's captured behavior without redispatch.
-                    Some(Message::AgentSessionsCapturedNavigation(event))
-                } else if captured_key_is_enter_release(&event)
-                    || matches!(
+                    } = &event
+                    {
+                        Some(Message::CapturedEnterPress(id, event))
+                    } else if matches!(
                         &event,
-                        keyboard::Event::KeyReleased {
-                            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                        keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Named(
+                                keyboard::key::Named::Home | keyboard::key::Named::End
+                            ),
                             ..
                         }
-                    )
-                    || matches!(
-                        &event,
-                        keyboard::Event::KeyReleased { key, .. }
-                            if block_search_is_bookmark_key(key)
-                    )
-                {
-                    // A focused widget may capture a release owned by history
-                    // confirmation or block search. Let the corresponding latch
-                    // see it; this does not redispatch captured key presses.
-                    Some(Message::WindowKey(id, event))
-                } else {
-                    None
+                    ) || matches!(&event, keyboard::Event::KeyPressed { key: keyboard::Key::Character(value), modifiers, .. } if modifiers.control() && value.eq_ignore_ascii_case("l"))
+                    {
+                        // A session picker owns list-edge navigation even when its
+                        // search field also handles the caret key. Other surfaces
+                        // retain the widget's captured behavior without redispatch.
+                        Some(Message::AgentSessionsCapturedNavigation(event))
+                    } else if captured_key_is_enter_release(&event)
+                        || matches!(
+                            &event,
+                            keyboard::Event::KeyReleased {
+                                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                                ..
+                            }
+                        )
+                        || matches!(
+                            &event,
+                            keyboard::Event::KeyReleased { key, .. }
+                                if block_search_is_bookmark_key(key)
+                        )
+                    {
+                        // A focused widget may capture a release owned by history
+                        // confirmation or block search. Let the corresponding latch
+                        // see it; this does not redispatch captured key presses.
+                        Some(Message::WindowKey(id, event, None))
+                    } else {
+                        None
+                    }
                 }
-            }
-            iced::Event::Keyboard(k) => Some(Message::WindowKey(id, k)),
-            iced::Event::InputMethod(iced::advanced::input_method::Event::Commit(_))
-                if status == iced::event::Status::Captured =>
-            {
-                Some(Message::ImeCancelledCommit)
-            }
-            iced::Event::InputMethod(_) if status == iced::event::Status::Captured => None,
-            iced::Event::InputMethod(ime) => Some(Message::Ime(ime)),
-            iced::Event::Window(iced::window::Event::Resized(size)) => Some(Message::Resized(size)),
-            iced::Event::Window(iced::window::Event::Rescaled(scale)) => Some(Message::WindowRescaled(scale)),
-            // Drop routing lives in the handler: listen_with takes a plain fn
-            // pointer, so no state can be captured here.
-            iced::Event::Window(iced::window::Event::FileDropped(path)) => {
-                Some(Message::FileDropped(path))
-            }
-            // Hovered files drive the import hint; the position the drop lands
-            // at comes from the row-hover tracking, these events carry none.
-            iced::Event::Window(iced::window::Event::FileHovered(_)) => {
-                Some(Message::SidebarDropHover(true))
-            }
-            iced::Event::Window(iced::window::Event::FilesHoveredLeft) => {
-                Some(Message::SidebarDropHover(false))
-            }
-            iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
-            iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
-            iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::WindowClose),
-            iced::Event::Window(iced::window::Event::Closed) => Some(Message::NativeWindowClosed),
-            // Catch every left-button release so a tab drag that ends outside
-            // any tab still clears `dragging_tab`. When the release lands on a
-            // tab, mouse_area's on_release fires Message::TabDragEnd first
-            // (which already consumes `dragging_tab`), so this becomes a no-op.
-            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
-                Some(Message::TabDragCancel)
-            }
-            iced::Event::Touch(
-                iced::touch::Event::FingerLifted { .. } | iced::touch::Event::FingerLost { .. },
-            ) => Some(Message::TabDragCancel),
-            _ => None,
-        }).map(|message| Message::NativeWindowEvent(id, Box::new(message))));
+                iced::Event::Keyboard(k) => Some(Message::WindowKey(id, k, keypad_num_lock)),
+                iced::Event::InputMethod(iced::advanced::input_method::Event::Commit(_))
+                    if status == iced::event::Status::Captured =>
+                {
+                    Some(Message::ImeCancelledCommit)
+                }
+                iced::Event::InputMethod(_) if status == iced::event::Status::Captured => None,
+                iced::Event::InputMethod(ime) => Some(Message::Ime(ime)),
+                iced::Event::Window(iced::window::Event::Resized(size)) => Some(Message::Resized(size)),
+                iced::Event::Window(iced::window::Event::Rescaled(scale)) => Some(Message::WindowRescaled(scale)),
+                // Drop routing lives in the handler: listen_with takes a plain fn
+                // pointer, so no state can be captured here.
+                iced::Event::Window(iced::window::Event::FileDropped(path)) => {
+                    Some(Message::FileDropped(path))
+                }
+                // Hovered files drive the import hint; the position the drop lands
+                // at comes from the row-hover tracking, these events carry none.
+                iced::Event::Window(iced::window::Event::FileHovered(_)) => {
+                    Some(Message::SidebarDropHover(true))
+                }
+                iced::Event::Window(iced::window::Event::FilesHoveredLeft) => {
+                    Some(Message::SidebarDropHover(false))
+                }
+                iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
+                iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
+                iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::WindowClose),
+                iced::Event::Window(iced::window::Event::Closed) => Some(Message::NativeWindowClosed),
+                // Catch every left-button release so a tab drag that ends outside
+                // any tab still clears `dragging_tab`. When the release lands on a
+                // tab, mouse_area's on_release fires Message::TabDragEnd first
+                // (which already consumes `dragging_tab`), so this becomes a no-op.
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+                    Some(Message::TabDragCancel)
+                }
+                iced::Event::Touch(
+                    iced::touch::Event::FingerLifted { .. } | iced::touch::Event::FingerLost { .. },
+                ) => Some(Message::TabDragCancel),
+                _ => None,
+            };
+            message.map(|message| Message::NativeWindowEvent(id, Box::new(message)))
+        });
         subs.push(events);
         // Native presented-frame notifications avoid synchronous layout recursion
         // in Widget::update. Invisible or settled panes own no frame stream.
@@ -37058,14 +37063,29 @@ fn encode_key(
         text,
         app_cursor,
         enh,
-        keypad_position(key, location, None),
+        keypad_position(key, location, None, None),
     )
+}
+
+/// Iced's base key can still be Home when XKB selected a keypad digit.
+fn keypad_logical_event(mut event: iced::Event, keypad_num_lock: Option<bool>) -> iced::Event {
+    if let (
+        Some(_),
+        iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key, modified_key, ..
+        }),
+    ) = (keypad_num_lock, &mut event)
+    {
+        key.clone_from(modified_key);
+    }
+    event
 }
 
 fn keypad_position(
     key: &keyboard::Key,
     location: keyboard::Location,
     physical: Option<keyboard::key::Physical>,
+    keypad_num_lock: Option<bool>,
 ) -> Option<(jterm_engine::input::KeypadKey, bool)> {
     use jterm_engine::input::KeypadKey;
     use keyboard::key::{Code, Named, Physical};
@@ -37099,10 +37119,10 @@ fn keypad_position(
         }
         _ => return None,
     };
-    // Iced reports the selected logical key. Numeric text on these positions
-    // is the layout's numeric layer, and keeps its locale-specific spelling.
-    let num_locked = matches!(keypad, KeypadKey::Digit(_) | KeypadKey::Decimal)
-        && matches!(key, keyboard::Key::Character(_));
+    let num_locked = keypad_num_lock.unwrap_or_else(|| {
+        matches!(keypad, KeypadKey::Digit(_) | KeypadKey::Decimal)
+            && matches!(key, keyboard::Key::Character(_))
+    });
     Some((keypad, num_locked))
 }
 
@@ -37150,7 +37170,10 @@ fn encode_key_input(
                 return Some(bytes.to_vec());
             }
         }
-        if keypad == KeypadKey::Digit(5) && matches!(key, Key::Named(Named::Clear)) {
+        if keypad == KeypadKey::Digit(5)
+            && (matches!(key, Key::Named(Named::Clear))
+                || (matches!(key, Key::Unidentified) && text.is_none()))
+        {
             return Some(
                 keypad_begin_sequence(Modifiers {
                     shift: mods.shift(),
@@ -37171,7 +37194,7 @@ fn encode_key_input(
         Key::Named(named) => {
             let mut bytes = match named {
                 Named::Enter => {
-                    if enh.application_keypad && keypad.is_some_and(|(key, _)| key == KeypadKey::Enter) {
+                    if enh.application_keypad && keypad == Some((KeypadKey::Enter, false)) {
                         ss3("M")
                     } else {
                         vec![b'\r']
@@ -38893,10 +38916,10 @@ expect(b'.')
             assert!(sync.contains(required));
         }
         let keys = source
-            .split_once("            Message::WindowKey(id, event) => {")
+            .split_once("            Message::WindowKey(id, event, keypad_num_lock) => {")
             .unwrap()
             .1
-            .split_once("            Message::Key(event)")
+            .split_once("            Message::Key(event, keypad_num_lock)")
             .unwrap()
             .0;
         assert!(keys.contains("native.claim_pressed()"));
@@ -45898,7 +45921,12 @@ expect(b'.')
                 None,
                 terminal.is_application_cursor_keys(),
                 KeyboardEnhancements::from_terminal(terminal),
-                keypad_position(&key, keyboard::Location::Numpad, Some(Physical::Code(physical))),
+                keypad_position(
+                    &key,
+                    keyboard::Location::Numpad,
+                    Some(Physical::Code(physical)),
+                    None,
+                ),
             )
             .unwrap()
         };
@@ -45914,6 +45942,96 @@ expect(b'.')
         assert_eq!(encode(&terminal, named(Named::Enter), Code::Enter), b"\r");
         terminal.process_input(b"\x1b>");
         assert_eq!(encode(&terminal, named(Named::Clear), Code::Numpad5), b"\x1b[E");
+    }
+
+    #[test]
+    fn xkb_keypad_lock_uses_the_selected_key_and_keeps_the_event_identity() {
+        use keyboard::key::{Code, Named, Physical};
+        use keyboard::{Event, Key, Location, Modifiers};
+
+        let mut terminal = TerminalState::new(12, 3);
+        terminal.process_input(b"\x1b=");
+        let encode = |terminal: &TerminalState, code, key, modified_key, text, num_lock| {
+            let event = keypad_logical_event(
+                iced::Event::Keyboard(Event::KeyPressed {
+                    key,
+                    modified_key,
+                    physical_key: Physical::Code(code),
+                    location: Location::Numpad,
+                    modifiers: Modifiers::NONE,
+                    text,
+                    repeat: true,
+                }),
+                num_lock,
+            );
+            let iced::Event::Keyboard(Event::KeyPressed {
+                key,
+                physical_key,
+                location,
+                modifiers,
+                text,
+                repeat: true,
+                ..
+            }) = event
+            else {
+                panic!("expected the original keypad press");
+            };
+            assert_eq!(physical_key, Physical::Code(code));
+            assert_eq!(location, Location::Numpad);
+            assert_eq!(modifiers, Modifiers::NONE);
+            encode_key_input(
+                &key,
+                modifiers,
+                text.as_deref(),
+                terminal.is_application_cursor_keys(),
+                KeyboardEnhancements::from_terminal(terminal),
+                keypad_position(&key, location, Some(physical_key), num_lock),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            encode(
+                &terminal,
+                Code::Numpad7,
+                Key::Named(Named::Home),
+                Key::Character("7".into()),
+                Some("7".into()),
+                Some(true),
+            ),
+            b"7"
+        );
+        let keys: [(Code, Key, &str, &[u8], &[u8]); 3] = [
+            (Code::NumpadComma, Key::Character(".".into()), ".", b".", b"\x1bOl"),
+            (Code::NumpadAdd, Key::Character("+".into()), "+", b"+", b"\x1bOk"),
+            (Code::NumpadEnter, Key::Named(Named::Enter), "\r", b"\r", b"\x1bOM"),
+        ];
+        for (code, key, text, locked, unlocked) in keys {
+            for (num_lock, expected) in [(true, locked), (false, unlocked)] {
+                assert_eq!(
+                    encode(
+                        &terminal,
+                        code,
+                        key.clone(),
+                        key.clone(),
+                        Some(text.into()),
+                        Some(num_lock),
+                    ),
+                    expected,
+                );
+            }
+        }
+        terminal.process_input(b"\x1b>");
+        assert_eq!(
+            encode(
+                &terminal,
+                Code::Numpad5,
+                Key::Unidentified,
+                Key::Unidentified,
+                None,
+                Some(false),
+            ),
+            b"\x1b[E"
+        );
     }
 
     #[test]
@@ -48653,7 +48771,7 @@ expect(b'.')
         assert!(!dispatch.contains("Task::done"));
         assert!(!dispatch.contains("write_pty"));
         let key = source
-            .split_once("            Message::Key(event) => {")
+            .split_once("            Message::Key(event, keypad_num_lock) => {")
             .unwrap()
             .1
             .split_once("            Message::Ime(")
@@ -48680,7 +48798,7 @@ expect(b'.')
     fn palette_navigation_restores_only_its_own_retreat_after_custom_binding_precedence() {
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
         let key = source
-            .split_once("            Message::Key(event) => {")
+            .split_once("            Message::Key(event, keypad_num_lock) => {")
             .unwrap()
             .1
             .split_once("            Message::Ime(")

@@ -329,7 +329,7 @@ pub(super) enum Message {
         entry_id: uuid::Uuid,
         frame: Option<std::sync::Arc<vim9::Vim9RenderFrame>>,
     },
-    Keyboard(iced::window::Id, keyboard::Event, bool),
+    Keyboard(iced::window::Id, keyboard::Event, bool, Option<bool>),
     Modifiers(keyboard::Modifiers),
     Ime(input_method::Event),
     CancelledCommit,
@@ -1680,11 +1680,11 @@ impl Ide {
                 }
                 _ => {}
             },
-            Message::Keyboard(id, event, captured) => {
+            Message::Keyboard(id, event, captured, keypad_num_lock) => {
                 if matches!(event, keyboard::Event::KeyPressed { .. }) {
                     self.scroll.borrow_mut().clear();
                 }
-                return self.key(id, event, captured);
+                return self.key(id, event, captured, keypad_num_lock);
             }
             Message::Modifiers(modifiers) => self.set_workspace_modifiers(modifiers),
             Message::Ime(event) => {
@@ -1959,6 +1959,7 @@ impl Ide {
         id: iced::window::Id,
         event: keyboard::Event,
         captured: bool,
+        keypad_num_lock: Option<bool>,
     ) -> Task<Message> {
         if self
             .form
@@ -2077,7 +2078,7 @@ impl Ide {
                 committed.as_deref(),
                 s.terminal.is_application_cursor_keys(),
                 enhancements,
-                super::keypad_position(&key, location, Some(physical_key)),
+                super::keypad_position(&key, location, Some(physical_key), keypad_num_lock),
             ) {
                 if !s.write_pty(&bytes) {
                     self.error = Some("Vim input queue is full".into());
@@ -2268,29 +2269,33 @@ impl Ide {
     }
 
     pub(super) fn subscription(&self) -> Subscription<Message> {
-        let events = iced::event::listen_with(|event, status, id| match event {
-            iced::Event::Keyboard(keyboard::Event::ModifiersChanged(value)) => {
-                Some(Message::Modifiers(value))
+        let events = iced_winit::futures::event::listen_with_keypad(|event, status, id, keypad_num_lock| {
+            let event = super::keypad_logical_event(event, keypad_num_lock);
+            match event {
+                iced::Event::Keyboard(keyboard::Event::ModifiersChanged(value)) => {
+                    Some(Message::Modifiers(value))
+                }
+                iced::Event::Keyboard(event) => Some(Message::Keyboard(
+                    id,
+                    event,
+                    status == iced::event::Status::Captured,
+                    keypad_num_lock,
+                )),
+                iced::Event::InputMethod(input_method::Event::Commit(_))
+                    if status == iced::event::Status::Captured =>
+                {
+                    Some(Message::CancelledCommit)
+                }
+                iced::Event::InputMethod(_) if status == iced::event::Status::Captured => None,
+                iced::Event::InputMethod(event) => Some(Message::Ime(event)),
+                iced::Event::Window(iced::window::Event::Resized(size)) => {
+                    Some(Message::WindowResize(size))
+                }
+                iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
+                iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
+                iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::Close),
+                _ => None,
             }
-            iced::Event::Keyboard(event) => Some(Message::Keyboard(
-                id,
-                event,
-                status == iced::event::Status::Captured,
-            )),
-            iced::Event::InputMethod(input_method::Event::Commit(_))
-                if status == iced::event::Status::Captured =>
-            {
-                Some(Message::CancelledCommit)
-            }
-            iced::Event::InputMethod(_) if status == iced::event::Status::Captured => None,
-            iced::Event::InputMethod(event) => Some(Message::Ime(event)),
-            iced::Event::Window(iced::window::Event::Resized(size)) => {
-                Some(Message::WindowResize(size))
-            }
-            iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
-            iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
-            iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::Close),
-            _ => None,
         });
         let mut subscriptions =
             vec![

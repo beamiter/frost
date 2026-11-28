@@ -28,6 +28,7 @@ fn interaction(event: UiEvent) -> Event {
         window: window::Id::unique(),
         event,
         status: event::Status::Ignored,
+        keypad_num_lock: None,
     }
 }
 

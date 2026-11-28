@@ -29,10 +29,33 @@ pub fn listen_with<Message>(
 where
     Message: 'static + MaybeSend,
 {
+    listen_filtered(f, move |event, status, window, _| f(event, status, window))
+}
+
+/// Like [`listen_with`], with the effective Num Lock state for native keypad
+/// presses on platforms that report it.
+pub fn listen_with_keypad<Message>(
+    f: fn(Event, event::Status, window::Id, Option<bool>) -> Option<Message>,
+) -> Subscription<Message>
+where
+    Message: 'static + MaybeSend,
+{
+    listen_filtered(f, f)
+}
+
+fn listen_filtered<Message>(
+    identity: impl std::hash::Hash + 'static,
+    f: impl Fn(Event, event::Status, window::Id, Option<bool>) -> Option<Message>
+        + MaybeSend
+        + 'static,
+) -> Subscription<Message>
+where
+    Message: 'static + MaybeSend,
+{
     #[derive(Hash)]
     struct EventsWith;
 
-    subscription::filter_map((EventsWith, f), move |event| match event {
+    subscription::filter_map((EventsWith, identity), move |event| match event {
         subscription::Event::Interaction {
             event: Event::Window(window::Event::RedrawRequested(_)),
             ..
@@ -42,7 +65,8 @@ where
             window,
             event,
             status,
-        } => f(event, status, window),
+            keypad_num_lock,
+        } => f(event, status, window, keypad_num_lock),
     })
 }
 
@@ -65,6 +89,7 @@ where
             window,
             event,
             status,
+            ..
         } => f(event, status, window),
         subscription::Event::SystemThemeChanged(_) => None,
     })
